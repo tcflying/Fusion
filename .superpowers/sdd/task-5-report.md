@@ -10,6 +10,7 @@
   - `session run list`
   - `session run wait`
 - Validates session/run ids, bounded unique participant lists, canonical backend keys, run status, participant result count, and returned run metadata.
+- Rejects response correlation mismatches: every start/get/list/wait response must return the requested session id, and get/wait must return the requested run id.
 - Represents mixed participant outcomes as `partial_failure`; one failed participant does not convert unrelated Fusion tasks to blocked.
 - Added `withHappierOperationMetadata(...)` to merge session/run/call/sidechain ids into the owning Fusion run's existing `resultJson` field under `happierOperation`; no second task/run store was introduced.
 - Exported the operation surface from the Happier plugin package.
@@ -26,7 +27,7 @@
 
 All Fusion commands ran from `G:\codex-project\fusion\.worktrees\happier-runtime`.
 
-- Plugin test suite: 60/60 passed across 5 files.
+- Plugin test suite: 62/62 passed across 5 files.
 - Plugin TypeScript check: passed.
 - Plugin build: passed.
 - `git diff --check`: passed.

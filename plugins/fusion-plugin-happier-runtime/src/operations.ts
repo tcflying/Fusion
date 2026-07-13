@@ -117,6 +117,22 @@ function requiredText(value: unknown, field: string, maximum = 512): string {
   return result;
 }
 
+function expectedSessionId(value: unknown, requested: string, operation: string): string {
+  const returned = requiredText(value, "sessionId");
+  if (returned !== requested) {
+    throw new HappierCliError("session", `Happier ${operation} returned a mismatched session id`);
+  }
+  return returned;
+}
+
+function expectedRunId(value: unknown, requested: string, operation: string): string {
+  const returned = requiredText(value, "runId");
+  if (returned !== requested) {
+    throw new HappierCliError("protocol", `Happier ${operation} returned a mismatched run id`);
+  }
+  return returned;
+}
+
 function optionalFlag(args: string[], flag: string, value: string | undefined): void {
   if (value === undefined) return;
   args.push(flag, requiredText(value, flag, 4_096));
@@ -156,10 +172,11 @@ function expectedParticipantKeys(operation: HappierOperation, participants: read
 function parseStartResult(
   raw: unknown,
   operation: HappierOperation,
+  expectedSessionIdValue: string,
   expectedParticipants: readonly string[],
 ): HappierOperationStartResult {
   if (!isRecord(raw)) throw new HappierCliError("protocol", `Happier ${operation} start returned invalid data`);
-  const sessionId = requiredText(raw.sessionId, "sessionId");
+  const sessionId = expectedSessionId(raw.sessionId, expectedSessionIdValue, `${operation} start`);
   if (!Array.isArray(raw.results) || raw.results.length !== expectedParticipants.length) {
     throw new HappierCliError("protocol", `Happier ${operation} start returned an invalid participant result count`);
   }
@@ -242,7 +259,7 @@ async function startOperation(
   for (const [flag, value] of extraFlags) optionalFlag(args, flag, value);
   args.push("--json");
   const raw = await invokeHappierJsonForKind(args, `session_${operation}_start`, settings, signal);
-  return parseStartResult(raw, operation, participants);
+  return parseStartResult(raw, operation, sessionId, participants);
 }
 
 export function startHappierReview(
@@ -332,7 +349,9 @@ export async function readHappierRun(
   args.push("--json");
   const raw = await invokeHappierJsonForKind(args, "session_run_get", settings, signal);
   if (!isRecord(raw) || !isRecord(raw.run)) throw new HappierCliError("protocol", "Happier run get returned invalid data");
-  return { ...raw, sessionId: requiredText(raw.sessionId, "sessionId"), run: parseRunState(raw.run) } as HappierRunReadResult;
+  const run = parseRunState(raw.run);
+  expectedRunId(run.runId, runId, "run get");
+  return { ...raw, sessionId: expectedSessionId(raw.sessionId, sessionId, "run get"), run } as HappierRunReadResult;
 }
 
 export async function listHappierRuns(
@@ -356,7 +375,7 @@ export async function listHappierRuns(
   args.push("--json");
   const raw = await invokeHappierJsonForKind(args, "session_run_list", settings, signal);
   if (!isRecord(raw) || !Array.isArray(raw.runs)) throw new HappierCliError("protocol", "Happier run list returned invalid data");
-  return { ...raw, sessionId: requiredText(raw.sessionId, "sessionId"), runs: raw.runs.map(parseRunState) } as HappierRunListResult;
+  return { ...raw, sessionId: expectedSessionId(raw.sessionId, sessionId, "run list"), runs: raw.runs.map(parseRunState) } as HappierRunListResult;
 }
 
 export async function waitForHappierRun(
@@ -379,8 +398,8 @@ export async function waitForHappierRun(
   const raw = await invokeHappierJsonForKind(args, "session_run_wait", settings, signal);
   if (!isRecord(raw)) throw new HappierCliError("protocol", "Happier run wait returned invalid data");
   return {
-    sessionId: requiredText(raw.sessionId, "sessionId"),
-    runId: requiredText(raw.runId, "runId"),
+    sessionId: expectedSessionId(raw.sessionId, sessionId, "run wait"),
+    runId: expectedRunId(raw.runId, runId, "run wait"),
     status: parseRunStatus(raw.status),
   };
 }

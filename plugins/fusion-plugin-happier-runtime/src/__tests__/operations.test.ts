@@ -136,4 +136,42 @@ describe("Happier multi-agent operations", () => {
     });
     await expect(readHappierRun("sess-1", "run-1")).rejects.toThrow(/run status/i);
   });
+
+  it("rejects mismatched session ids across start and run operations", async () => {
+    const run = {
+      runId: "run-1",
+      callId: "call-1",
+      sidechainId: "side-1",
+      intent: "review",
+      backendTarget: { kind: "builtInAgent", agentId: "claude" },
+      status: "running",
+    };
+    invokeHappierJsonForKind
+      .mockResolvedValueOnce({ sessionId: "sess-other", results: [{ key: "claude", ok: true, result: { runId: "run-1", callId: "call-1", sidechainId: "side-1" } }] })
+      .mockResolvedValueOnce({ sessionId: "sess-other", run })
+      .mockResolvedValueOnce({ sessionId: "sess-other", runs: [run] })
+      .mockResolvedValueOnce({ sessionId: "sess-other", runId: "run-1", status: "succeeded" });
+
+    await expect(startHappierReview({ sessionId: "sess-1", engines: ["claude"], instructions: "Review." })).rejects.toThrow(/session id/i);
+    await expect(readHappierRun("sess-1", "run-1")).rejects.toThrow(/session id/i);
+    await expect(listHappierRuns("sess-1")).rejects.toThrow(/session id/i);
+    await expect(waitForHappierRun("sess-1", "run-1")).rejects.toThrow(/session id/i);
+  });
+
+  it("rejects mismatched run ids from get and wait", async () => {
+    const run = {
+      runId: "run-other",
+      callId: "call-1",
+      sidechainId: "side-1",
+      intent: "review",
+      backendTarget: { kind: "builtInAgent", agentId: "claude" },
+      status: "running",
+    };
+    invokeHappierJsonForKind
+      .mockResolvedValueOnce({ sessionId: "sess-1", run })
+      .mockResolvedValueOnce({ sessionId: "sess-1", runId: "run-other", status: "succeeded" });
+
+    await expect(readHappierRun("sess-1", "run-1")).rejects.toThrow(/run id/i);
+    await expect(waitForHappierRun("sess-1", "run-1")).rejects.toThrow(/run id/i);
+  });
 });
