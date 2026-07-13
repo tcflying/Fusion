@@ -91,3 +91,77 @@ export type HappierSessionCreateResult = HappierJsonRecord & { sessionId: string
 export type HappierSessionMessageResult = HappierJsonRecord & { sessionId: string; localId?: string | null; waited?: boolean };
 export type HappierSessionStatusResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord };
 export type HappierSessionHistoryResult = HappierJsonRecord & { sessionId: string; format: string; messages: unknown[] };
+
+export type HappierRuntimeState =
+  | "starting"
+  | "ready"
+  | "running"
+  | "waitingOnInput"
+  | "recovering"
+  | "blocked"
+  | "completed"
+  | "failed";
+
+export interface AgentRuntimeContext {
+  sessionPurpose?: string;
+  toolMode?: "coding" | "readonly";
+  customToolNames?: string[];
+  requestedSkillNames?: string[];
+}
+
+export interface AgentRuntimeOptions {
+  cwd: string;
+  systemPrompt: string;
+  tools?: "coding" | "readonly";
+  onText?: (text: string) => void;
+  onThinking?: (text: string) => void;
+  onToolStart?: (toolName: string, args?: unknown) => void;
+  onToolEnd?: (toolName: string, isError: boolean, result?: unknown) => void;
+  defaultProvider?: string;
+  defaultModelId?: string;
+  defaultThinkingLevel?: string;
+  runtimeContext?: AgentRuntimeContext;
+  /** Native id loaded from the canonical Fusion CLI session record. */
+  sessionId?: string | null;
+}
+
+export interface HappierSessionState {
+  status: HappierRuntimeState;
+  messages: unknown[];
+  errorMessage?: string;
+}
+
+export interface HappierAgentSession {
+  model: undefined;
+  cwd: string;
+  systemPrompt: string;
+  messages: unknown[];
+  state: HappierSessionState;
+  thinkingLevel: string | undefined;
+  sessionId: string;
+  lastModelDescription: string;
+  callbacks: Pick<AgentRuntimeOptions, "onText" | "onThinking" | "onToolStart" | "onToolEnd">;
+  runtimeContext?: AgentRuntimeContext;
+  dispose(): void;
+}
+
+export type AgentSession = HappierAgentSession;
+
+export interface AgentSessionResult {
+  session: AgentSession;
+  sessionFile?: string;
+}
+
+export interface AgentRuntime {
+  readonly id: string;
+  readonly name: string;
+  createSession(options: AgentRuntimeOptions): Promise<AgentSessionResult>;
+  promptWithFallback(session: AgentSession, prompt: string, options?: unknown): Promise<void>;
+  describeModel(session: AgentSession): string;
+}
+
+export type HappierRecoveryErrorCode =
+  | "session-missing"
+  | "session-not-resumable"
+  | "status-check-failed"
+  | "ambiguous-send-unresolved";
