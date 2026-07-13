@@ -1,115 +1,118 @@
-# Task 2 Report — Runtime adapter and durable session identity
+# Task 2 Follow-up Report — Runtime adapter and durable session identity
 
 Status: DONE
 
-## Scope
+## Reopen reason
 
-- Implemented `HappierRuntimeAdapter` with the Task 1 JSON CLI wrappers.
-- Added durable native-id reuse, restart reconciliation, typed recovery failures, bounded ambiguous-send reconciliation, runtime states, and plugin registration.
-- Added lifecycle, restart, recovery, ambiguous-send, registration, event, and secret-boundary tests.
-- Did not modify `packages/core`, start services, or use/touch port 4040.
+Independent review correctly found that the first Task 2 commit (`b98dbe196`) used a plugin-local `AgentRuntimeOptions.sessionId` shape that no engine caller supplied. It also allowed a duplicate send after ambiguous absence, treated `send --wait` metadata as output, lacked per-session serialization, used a local `definePlugin` identity, and had divergent versions. Those claims are superseded by this report.
 
-## Canonical persistence audit
+## Real engine and persistence path
 
-The existing canonical CLI session record is already durable:
+- The production runtime creation path is `createResolvedAgentSession` → resolved plugin runtime → `runtime.createSession(AgentRuntimeOptions)`.
+- `packages/engine/src/agent-runtime.ts` now owns `AgentRuntimeNativeSessionBinding` and `createCliSessionNativeSessionBinding`.
+- The helper reads `CliSession.nativeSessionId` from the canonical `CliSessionStore` and persists through `CliSessionStore.updateSession(..., { nativeSessionId })`.
+- Happier imports the real engine contract from `@fusion/engine/agent-runtime`; the plugin-local fake runtime option interfaces were removed.
+- A newly-created Happier id is awaited through `persistNativeSessionId` before history or send. Persistence failure blocks and sends zero messages.
+- A fresh binding after restart re-reads the durable id. The adapter starts in recovery, calls official status, and only then sends. Missing/non-resumable records remain blocked and are never silently replaced.
+- No core source/schema change was needed: `CliSession.nativeSessionId` and `CliSessionStore.updateSession` were already durable canonical storage.
 
-- `packages/core/src/cli-session-types.ts:136` declares `CliSession.nativeSessionId`.
-- `packages/core/src/cli-session-store.ts:87,153,165-178,297-299` reads, creates, inserts, and updates the field.
-- `packages/core/src/db.ts:1542,5000` includes the SQLite column/schema migration.
-- `packages/core/src/__tests__/cli-session-store.test.ts:75-89` updates the id and reopens a fresh store on the same database, proving the same value survives restart.
-
-Audit decision: reuse the existing persisted native id as `session.sessionId`; no core type, store, schema, or test change was needed.
-
-Fresh focused audit proof:
+Focused engine integration proof uses the actual `createResolvedAgentSession`, actual `HappierRuntimeAdapter`, and an actual SQLite-backed `CliSessionStore` to prove:
 
 ```text
-corepack pnpm --filter @fusion/core exec vitest run src/__tests__/cli-session-store.test.ts --silent=passed-only --reporter=dot
-Test Files  1 passed (1)
-Tests       11 passed (11)
-Exit code: 0
+first runtime create -> hp_engine_durable persisted before send
+fresh CliSessionStore + fresh adapter -> hp_engine_durable loaded
+official status call -> second send
+createHappierSession call count = 1
 ```
+
+## Runtime behavior fixed
+
+- A WeakMap-backed queue serializes all work for one runtime session. `Promise.all` on two first prompts creates one native session and sends in order. Different session objects can send concurrently.
+- Ambiguous timeout/process/server/daemon outcomes perform one bounded status/history reconciliation and never resend. Only a newly-added matching user message after the pre-send watermark proves acceptance; history absence yields typed `ambiguous-send-unresolved` with state `blocked` and one send total.
+- Each send captures bounded pre-send history, calls official `send --wait`, then reads bounded official history and status. Assistant output is selected from newly-added messages, correlated with `localId` when available, and emitted through `onText`; old assistant text is not replayed.
+- Final runtime state is mapped from official status. Explicit `resumable:true` overrides `active:false`; explicit non-resumability blocks.
+- The outer error handler preserves `blocked` for missing, non-resumable, persistence, and unresolved ambiguous recovery failures.
+- `definePlugin` is imported from `@fusion/plugin-sdk`. Package, JSON manifest, runtime metadata, plugin manifest, and loaded-event versions are all `0.2.73`, with a test enforcing equality.
+- No provider credential or secret surface was added.
 
 ## TDD evidence
 
-### Initial RED
+### Critical-review RED
 
 Command:
 
 ```text
-corepack pnpm --filter @fusion-plugin-examples/happier-runtime test
+corepack pnpm --filter @fusion-plugin-examples/happier-runtime exec vitest run src/__tests__/runtime-adapter.test.ts src/__tests__/index.test.ts --silent=passed-only --reporter=dot
 ```
 
-Observed at 2026-07-13 16:05:59 UTC+8:
+Observed 2026-07-13 19:40:55 UTC+8:
 
 ```text
-Test Files  2 failed | 2 passed (4)
-Tests       2 failed | 36 passed (38)
+Test Files  2 failed (2)
+Tests       12 failed | 3 passed (15)
 ```
 
-Expected failures:
+Failures covered missing canonical persistence, restart reuse, blocked-state preservation, concurrent creation, send serialization, assistant output/no replay, no-resend ambiguity, persistence-before-send, real SDK registration, and version equality.
 
-- `runtime-adapter.test.ts`: `runtime-adapter.js` did not exist.
-- `index.test.ts`: the Task 1 entrypoint had no default plugin registration (`plugin` was undefined).
-
-### Contract-shape RED
-
-After replacing invented test shapes with Task 1's actual official JSON shapes (`session.active` and `{ type, text }` history content):
-
-```text
-corepack pnpm --filter @fusion-plugin-examples/happier-runtime exec vitest run src/__tests__/runtime-adapter.test.ts --silent=passed-only --reporter=dot
-Test Files  1 failed (1)
-Tests       4 failed | 3 passed (7)
-Start       2026-07-13 19:15:08 UTC+8
-```
-
-Expected failures: active sessions were not recognized as resumable and accepted messages in official raw-history form were not recognized.
-
-GREEN after the minimal adapter fix:
-
-```text
-Test Files  1 passed (1)
-Tests       7 passed (7)
-Start       2026-07-13 19:15:30 UTC+8
-```
-
-### Recovery-state RED
-
-Added assertions that missing and non-resumable persisted sessions become visibly `blocked`:
+Engine binding RED at 2026-07-13 19:41:04 UTC+8:
 
 ```text
 Test Files  1 failed (1)
-Tests       2 failed | 5 passed (7)
-Start       2026-07-13 19:16:09 UTC+8
-Expected: blocked
-Received: recovering
+Tests       2 failed (2)
+TypeError: createCliSessionNativeSessionBinding is not a function
 ```
 
-GREEN after the state transition fix:
+### Critical-review GREEN
+
+Focused adapter/registration GREEN at 2026-07-13 19:46:41 UTC+8:
+
+```text
+Test Files  2 passed (2)
+Tests       15 passed (15)
+```
+
+Direct engine/store/adapter integration GREEN at 2026-07-13 19:49:28 UTC+8:
 
 ```text
 Test Files  1 passed (1)
-Tests       7 passed (7)
-Start       2026-07-13 19:16:21 UTC+8
+Tests       3 passed (3)
 ```
 
-## Implemented behavior
+### Explicit inactive-resumable RED/GREEN
 
-- First prompt calls `createHappierSession` once and writes the returned native id directly to the Fusion runtime session's `sessionId`.
-- Subsequent prompts use the same id.
-- A session constructed with a persisted id calls official status before send; the tests assert call order.
-- `session.active === true`, explicit resumability, or an allowlisted official live state proves resumability.
-- Missing and non-resumable sessions throw `HappierRecoveryError` with stable codes and never call create/send replacement paths.
-- Runtime states are limited to `starting`, `ready`, `running`, `waitingOnInput`, `recovering`, `blocked`, `completed`, and `failed`.
-- Ambiguous timeout/process/server/daemon sends perform exactly one status call and one bounded history call. A matching accepted prompt is not resent; an absent prompt permits at most one resend; unresolved reconciliation throws a typed failure.
-- Plugin metadata exposes runtime id `happier`, emits `happier-runtime:loaded`, retains no provider credential setting, and logs only a static runtime-loaded fact.
-- Registration calls a `definePlugin` identity binding statically constrained to the exact `@fusion/plugin-sdk` helper signature. This preserves the SDK helper contract while preventing the package entrypoint from evaluating the SDK's broad core re-exports during Task 1 CLI tests.
+The plan-required `active:false, resumable:true` case was added separately.
+
+RED at 2026-07-13 19:50:56 UTC+8:
+
+```text
+Test Files  1 failed (1)
+Tests       1 failed | 12 passed (13)
+HappierRecoveryError: Happier session hp_session_1 is not resumable
+```
+
+GREEN at 2026-07-13 19:51:12 UTC+8:
+
+```text
+Test Files  1 passed (1)
+Tests       13 passed (13)
+```
+
+### Build/test discovery regression
+
+Running package test and build concurrently exposed that Vitest could discover generated `dist/__tests__` mid-run (`1 failed | 66 passed`). The package test script was narrowed to `vitest run src ...`. With `dist` present, the stable package test is GREEN:
+
+```text
+Test Files  3 passed (3)
+Tests       34 passed (34)
+Start       2026-07-13 19:52:26 UTC+8
+```
 
 ## Final verification
 
 ```text
 corepack pnpm --filter @fusion-plugin-examples/happier-runtime test
-Test Files  6 passed (6)
-Tests       54 passed (54)
+Test Files  3 passed (3)
+Tests       34 passed (34)
 Exit code: 0
 
 corepack pnpm --filter @fusion-plugin-examples/happier-runtime typecheck
@@ -120,19 +123,30 @@ corepack pnpm --filter @fusion-plugin-examples/happier-runtime build
 tsc
 Exit code: 0
 
-node --input-type=module -e <dist import assertions>
-{"pluginId":"fusion-plugin-happier-runtime","runtimeId":"happier","adapter":"function"}
+corepack pnpm --filter @fusion/engine exec vitest run src/__tests__/agent-runtime-native-session.test.ts --silent=passed-only --reporter=dot
+Test Files  1 passed (1)
+Tests       3 passed (3)
 Exit code: 0
 
-git diff --check
+corepack pnpm --filter @fusion/engine typecheck
+tsc --noEmit
+Exit code: 0
+
+corepack pnpm --filter @fusion/engine build
+tsc
+Exit code: 0
+
+node --input-type=module -e <dist import assertions>
+{"pluginId":"fusion-plugin-happier-runtime","pluginVersion":"0.2.73","runtimeId":"happier","runtimeVersion":"0.2.73","adapter":"function"}
 Exit code: 0
 ```
 
-`git diff --check` emitted only the repository's Windows LF-to-CRLF notices for tracked TypeScript files; it found no whitespace errors.
+`git diff --check` is run again immediately before commit. It may print the repository's Windows LF-to-CRLF notices; those are not whitespace errors.
 
-## Boundaries
+## Boundaries and audit notes
 
-- No `packages/core` source changes.
-- No service starts/stops.
-- No port 4040 operations.
-- No credential, secret, Kimi, or Moonshot configuration or routing.
+- No `packages/core` source/schema file changed.
+- No service was started or stopped; port 4040 was not touched.
+- No Kimi/Moonshot route, configuration, or package was used.
+- Generated `.codegraph` was removed before final verification at the user's request.
+- A root offline install attempt was blocked by an unrelated uncached WhatsApp dependency tarball. It downloaded nothing and changed no lock data. The single deterministic workspace link for `@fusion/engine` was added to `pnpm-lock.yaml`; package tests, typecheck, build, and dist import all pass.

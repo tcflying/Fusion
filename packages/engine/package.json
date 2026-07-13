@@ -18,6 +18,11 @@
       "types": "./src/index.ts",
       "source": "./src/index.ts",
       "import": "./dist/index.js"
+    },
+    "./agent-runtime": {
+      "types": "./src/agent-runtime.ts",
+      "source": "./src/agent-runtime.ts",
+      "import": "./dist/agent-runtime.js"
     }
   },
   "publishConfig": {

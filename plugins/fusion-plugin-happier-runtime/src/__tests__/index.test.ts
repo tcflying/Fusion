@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import plugin, {
   HAPPIER_RUNTIME_ID,
   happierRuntimeFactory,
@@ -6,6 +7,21 @@ import plugin, {
 } from "../index.js";
 
 describe("Happier runtime plugin registration", () => {
+  it("uses the real SDK helper and one package/manifest/runtime version", () => {
+    const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+    const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
+    const manifestJson = JSON.parse(readFileSync(new URL("../../manifest.json", import.meta.url), "utf8")) as {
+      version: string;
+      runtime?: { version?: string };
+    };
+
+    expect(source).toMatch(/import\s*\{\s*definePlugin\s*\}\s*from\s*["']@fusion\/plugin-sdk["']/);
+    expect(plugin.manifest.version).toBe(packageJson.version);
+    expect(happierRuntimeMetadata.version).toBe(packageJson.version);
+    expect(manifestJson.version).toBe(packageJson.version);
+    expect(manifestJson.runtime?.version).toBe(packageJson.version);
+  });
+
   it("registers metadata and creates the runtime without provider credentials", async () => {
     expect(plugin.manifest.id).toBe("fusion-plugin-happier-runtime");
     expect(plugin.runtime?.metadata).toEqual(happierRuntimeMetadata);

@@ -4,7 +4,10 @@ import { EventEmitter } from "node:events";
 
 const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn() }));
 
-vi.mock("node:child_process", () => ({ spawn: mockSpawn }));
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
+  spawn: mockSpawn,
+}));
 
 import {
   buildHappierInvocation,

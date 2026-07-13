@@ -925,6 +925,8 @@ export {
   type AgentPromptResult,
   type AgentRuntime,
   type AgentRuntimeOptions,
+  type AgentRuntimeNativeSessionBinding,
+  createCliSessionNativeSessionBinding,
   type AgentSessionResult,
 } from "./agent-runtime.js";
 export { askAcpOnce, type AskAcpOnceOptions, type AskAcpOnceResult } from "./cli-agent-ask.js";

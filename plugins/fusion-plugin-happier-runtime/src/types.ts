@@ -5,6 +5,22 @@
  * these types deliberately contain no credential-setting surface.
  */
 
+import type {
+  AgentRuntime,
+  AgentRuntimeNativeSessionBinding,
+  AgentRuntimeOptions,
+  AgentSessionResult,
+} from "@fusion/engine/agent-runtime";
+
+export type {
+  AgentRuntime,
+  AgentRuntimeNativeSessionBinding,
+  AgentRuntimeOptions,
+  AgentSessionResult,
+} from "@fusion/engine/agent-runtime";
+
+export type AgentSession = Parameters<AgentRuntime["promptWithFallback"]>[0];
+
 export const HAPPIER_BACKENDS = ["codex", "claude", "opencode"] as const;
 
 export type HappierBackend = (typeof HAPPIER_BACKENDS)[number];
@@ -102,36 +118,13 @@ export type HappierRuntimeState =
   | "completed"
   | "failed";
 
-export interface AgentRuntimeContext {
-  sessionPurpose?: string;
-  toolMode?: "coding" | "readonly";
-  customToolNames?: string[];
-  requestedSkillNames?: string[];
-}
-
-export interface AgentRuntimeOptions {
-  cwd: string;
-  systemPrompt: string;
-  tools?: "coding" | "readonly";
-  onText?: (text: string) => void;
-  onThinking?: (text: string) => void;
-  onToolStart?: (toolName: string, args?: unknown) => void;
-  onToolEnd?: (toolName: string, isError: boolean, result?: unknown) => void;
-  defaultProvider?: string;
-  defaultModelId?: string;
-  defaultThinkingLevel?: string;
-  runtimeContext?: AgentRuntimeContext;
-  /** Native id loaded from the canonical Fusion CLI session record. */
-  sessionId?: string | null;
-}
-
 export interface HappierSessionState {
   status: HappierRuntimeState;
   messages: unknown[];
   errorMessage?: string;
 }
 
-export interface HappierAgentSession {
+export interface HappierAgentSessionShape {
   model: undefined;
   cwd: string;
   systemPrompt: string;
@@ -141,27 +134,18 @@ export interface HappierAgentSession {
   sessionId: string;
   lastModelDescription: string;
   callbacks: Pick<AgentRuntimeOptions, "onText" | "onThinking" | "onToolStart" | "onToolEnd">;
-  runtimeContext?: AgentRuntimeContext;
+  runtimeContext?: AgentRuntimeOptions["runtimeContext"];
+  nativeSession: AgentRuntimeNativeSessionBinding;
+  needsReconciliation: boolean;
   dispose(): void;
 }
 
-export type AgentSession = HappierAgentSession;
-
-export interface AgentSessionResult {
-  session: AgentSession;
-  sessionFile?: string;
-}
-
-export interface AgentRuntime {
-  readonly id: string;
-  readonly name: string;
-  createSession(options: AgentRuntimeOptions): Promise<AgentSessionResult>;
-  promptWithFallback(session: AgentSession, prompt: string, options?: unknown): Promise<void>;
-  describeModel(session: AgentSession): string;
-}
+export type HappierAgentSession = AgentSession & HappierAgentSessionShape;
 
 export type HappierRecoveryErrorCode =
   | "session-missing"
   | "session-not-resumable"
   | "status-check-failed"
+  | "native-session-binding-missing"
+  | "native-session-persistence-failed"
   | "ambiguous-send-unresolved";

@@ -15,7 +15,7 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
+import type { CliSessionStore, PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -45,6 +45,37 @@ export interface AgentMcpServerConfig {
 }
 
 export type AgentRuntimeMcpServerConfig = ResolvedMcpServerDefinition | AgentMcpServerConfig;
+
+/**
+ * Durable native-session identity owned by a canonical Fusion CLI session.
+ * Runtime adapters must await persistence before sending work to a newly
+ * created native session.
+ */
+export interface AgentRuntimeNativeSessionBinding {
+  nativeSessionId: string | null;
+  persistNativeSessionId(nativeSessionId: string): Promise<void> | void;
+}
+
+/**
+ * FNXC:HappierRuntime 2026-07-13-19:42:
+ * Bridge the canonical CliSessionStore record into the AgentRuntime creation
+ * path. A fresh binding re-reads durable state, so a restarted runtime receives
+ * the same native id instead of relying on plugin-local option shapes.
+ */
+export function createCliSessionNativeSessionBinding(
+  store: Pick<CliSessionStore, "getSession" | "updateSession">,
+  cliSessionId: string,
+): AgentRuntimeNativeSessionBinding {
+  const session = store.getSession(cliSessionId);
+  if (!session) throw new Error(`CLI session not found: ${cliSessionId}`);
+  return {
+    nativeSessionId: session.nativeSessionId,
+    persistNativeSessionId: async (nativeSessionId: string) => {
+      const updated = store.updateSession(cliSessionId, { nativeSessionId });
+      if (!updated) throw new Error(`CLI session not found: ${cliSessionId}`);
+    },
+  };
+}
 
 export function normalizeAgentRuntimeMcpServers(
   servers: AgentRuntimeMcpServerConfig[] | undefined,
@@ -114,6 +145,8 @@ export interface AgentRuntimeOptions {
   defaultThinkingLevel?: string;
   /** Optional pre-configured SessionManager for persistence */
   sessionManager?: SessionManager;
+  /** Canonical Fusion CLI-session binding for native runtime identity. */
+  nativeSession?: AgentRuntimeNativeSessionBinding;
   /** Optional skill selection context */
   skillSelection?: SkillSelectionContext;
   /** Convenience: skill names to include in the session */

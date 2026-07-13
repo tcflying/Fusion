@@ -5,6 +5,7 @@
  */
 
 import { HappierRuntimeAdapter } from "./runtime-adapter.js";
+import { definePlugin } from "@fusion/plugin-sdk";
 import type {
   FusionPlugin,
   PluginContext,
@@ -12,16 +13,8 @@ import type {
   PluginRuntimeManifestMetadata,
 } from "@fusion/plugin-sdk";
 
-/*
-FNXC:HappierRuntime 2026-07-13-19:17:
-The SDK definePlugin helper is an identity function. Keep its exact signature
-as a type-only dependency so importing the Happier CLI contract does not also
-evaluate the SDK's broad core re-exports.
-*/
-const definePlugin: typeof import("@fusion/plugin-sdk").definePlugin = (definition) => definition;
-
 export const HAPPIER_RUNTIME_ID = "happier";
-export const HAPPIER_RUNTIME_VERSION = "0.2.0";
+export const HAPPIER_RUNTIME_VERSION = "0.2.73";
 
 export const happierRuntimeMetadata: PluginRuntimeManifestMetadata = {
   runtimeId: HAPPIER_RUNTIME_ID,
