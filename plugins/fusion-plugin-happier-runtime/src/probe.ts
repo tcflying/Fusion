@@ -44,7 +44,7 @@ function selectedBackend(settings: HappierCliSettings): HappierBackend {
 }
 
 function backendHelpArgs(backend: HappierBackend): string[] {
-  return backend === "claude" ? ["--help"] : [backend, "--help"];
+  return [backend, "--help"];
 }
 
 function defaultRun(commandArgs: readonly string[], settings: HappierCliSettings): Promise<ProbeCommandResult> {

@@ -56,7 +56,7 @@ function runner(results: Record<string, unknown>): HappierProbeDependencies {
 
 describe("probeHappierRuntime", () => {
   it("reports a missing executable without probing later layers", async () => {
-    const health = await probeHappierRuntime({}, runner({ "--help": new Error("ENOENT token=secret") }));
+    const health = await probeHappierRuntime({}, runner({ "claude --help": new Error("ENOENT token=secret") }));
     expect(health).toMatchObject({ discovered: false, executable: false, ready: false });
     expect(health.details).toEqual(["executable-not-found"]);
     expect(JSON.stringify(health)).not.toContain("secret");
@@ -64,7 +64,7 @@ describe("probeHappierRuntime", () => {
 
   it("does not treat an executable but unauthenticated runtime as ready", async () => {
     const health = await probeHappierRuntime({}, runner({
-      "--help": help,
+      "claude --help": help,
       "auth status --json": authMissing,
       "status --json": status({
         report: { authProfiles: [{ isActive: true, reachability: "not-probed" }] },
@@ -77,7 +77,7 @@ describe("probeHappierRuntime", () => {
 
   it("distinguishes an unreachable server", async () => {
     const health = await probeHappierRuntime({}, runner({
-      "--help": help,
+      "claude --help": help,
       "auth status --json": {
         exitCode: 0,
         stdout: JSON.stringify({ v: 1, ok: false, kind: "auth_status", error: { code: "server_unreachable" } }),
@@ -94,7 +94,7 @@ describe("probeHappierRuntime", () => {
 
   it("distinguishes a stopped daemon", async () => {
     const health = await probeHappierRuntime({}, runner({
-      "--help": help,
+      "claude --help": help,
       "auth status --json": authOk,
       "status --json": status({ daemonStatus: { daemon: { running: false }, auth: { authenticated: true } } }),
       "profiles list --json": profiles,
@@ -114,7 +114,7 @@ describe("probeHappierRuntime", () => {
 
   it("requires every layer for full readiness", async () => {
     const health = await probeHappierRuntime({}, runner({
-      "--help": help,
+      "claude --help": help,
       "auth status --json": authOk,
       "status --json": status(),
       "profiles list --json": profiles,
@@ -134,7 +134,7 @@ describe("probeHappierRuntime", () => {
 
   it("fails closed on malformed status JSON", async () => {
     const health = await probeHappierRuntime({}, runner({
-      "--help": help,
+      "claude --help": help,
       "auth status --json": authOk,
       "status --json": { exitCode: 0, stdout: "token=top-secret not-json" },
       "profiles list --json": profiles,
@@ -146,7 +146,7 @@ describe("probeHappierRuntime", () => {
 
   it("reports timeouts without leaking exception text", async () => {
     const health = await probeHappierRuntime({}, runner({
-      "--help": new HappierCliError("timeout", "Bearer should-not-leak"),
+      "claude --help": new HappierCliError("timeout", "Bearer should-not-leak"),
     }));
     expect(health.details).toEqual(["executable-timeout"]);
     expect(JSON.stringify(health)).not.toContain("should-not-leak");
