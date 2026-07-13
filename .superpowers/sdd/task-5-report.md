@@ -38,6 +38,7 @@ All Fusion commands ran from `G:\codex-project\fusion\.worktrees\happier-runtime
   - run get: reached official command, returned `not_authenticated`
   - run list: reached official command, returned `not_authenticated`
   - run wait: reached official command, returned `not_authenticated`
+- Independent final review of `76e132d..36b46e5`: CLEAN.
 
 ## Evidence boundary
 
