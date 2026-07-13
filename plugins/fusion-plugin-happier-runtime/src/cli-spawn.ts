@@ -7,6 +7,8 @@ import {
   type HappierCliInvocation,
   type HappierCliSettings,
   type HappierErrorCode,
+  type HappierFailureEnvelope,
+  type HappierJsonEnvelope,
   type HappierJsonRecord,
   type HappierMessageInput,
   type HappierSessionCreateInput,
@@ -14,21 +16,69 @@ import {
   type HappierSessionHistoryResult,
   type HappierSessionMessageResult,
   type HappierSessionStatusResult,
+  type HappierSuccessEnvelope,
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+const REDACTED = "[REDACTED]";
+const SENSITIVE_KEYS = new Set([
+  "accesstoken",
+  "apikey",
+  "authorization",
+  "bearertoken",
+  "clientsecret",
+  "encryptionkey",
+  "key",
+  "password",
+  "privatekey",
+  "secret",
+  "token",
+]);
 
 const BEARER_RE = /\bBearer\s+[^\s"'`,;\]}]+/gi;
-const SENSITIVE_ASSIGNMENT_RE = /(\b(?:token|secret|password|api[_-]?key|authorization|key)\b\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;\]}]+)/gi;
+const SENSITIVE_ASSIGNMENT_RE = /(["']?)(access(?:[_-]?token|[_-]?key)|client[_-]?secret|private[_-]?key|authorization|bearer[_-]?token|token|secret|password|key)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;\]}]+)/gi;
+
+function normalizeKey(key: string): string {
+  return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEYS.has(normalizeKey(key));
+}
+
+function redactValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nested]) => [key, isSensitiveKey(key) ? REDACTED : redactValue(nested)]),
+    );
+  }
+  return value;
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  return Buffer.byteLength(value, "utf8") <= maxBytes ? value : Buffer.from(value, "utf8").subarray(0, maxBytes).toString("utf8");
+}
 
 /**
- * FNXC:HappierRuntime 2026-07-13-14:48:
- * CLI diagnostics may contain auth or provider material. Redact bearer values
- * and named token/secret/key fields before they enter an error or test report.
+ * FNXC:HappierRuntime 2026-07-13-15:18:
+ * CLI diagnostics may contain auth or provider material. Redact nested JSON
+ * values by camelCase, snake_case, and kebab-case key names before diagnostics
+ * enter an error or test report.
  */
-export function redactHappierOutput(raw: string): string {
-  return raw.replace(BEARER_RE, "Bearer [REDACTED]").replace(SENSITIVE_ASSIGNMENT_RE, "$1[REDACTED]");
+export function redactHappierOutput(raw: string, maxBytes = DEFAULT_MAX_OUTPUT_BYTES): string {
+  let redacted: string;
+  try {
+    redacted = JSON.stringify(redactValue(JSON.parse(raw))) ?? REDACTED;
+  } catch {
+    redacted = raw
+      .replace(BEARER_RE, "Bearer [REDACTED]")
+      .replace(SENSITIVE_ASSIGNMENT_RE, (match, quote: string, key: string, separator: string) => {
+        return isSensitiveKey(key) ? `${quote}${key}${quote}${separator}${REDACTED}` : match;
+      });
+  }
+  return truncateUtf8(redacted, Math.max(1, Math.floor(maxBytes)));
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -61,8 +111,9 @@ export function resolveHappierCliSettings(
     webappUrl: nonEmptyString(settings?.webappUrl) ?? nonEmptyString(process.env.HAPPIER_WEBAPP_URL),
     profile: nonEmptyString(settings?.profile) ?? nonEmptyString(process.env.HAPPIER_PROFILE),
     timeoutMs: positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
-    maxOutputBytes: Math.floor(
-      positiveNumber(settings?.maxOutputBytes ?? process.env.HAPPIER_CLI_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES),
+    maxOutputBytes: Math.max(
+      1,
+      Math.floor(positiveNumber(settings?.maxOutputBytes ?? process.env.HAPPIER_CLI_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES)),
     ),
   };
 }
@@ -83,26 +134,59 @@ export function buildHappierInvocation(commandArgs: readonly string[], settings:
   return { command: resolved.executable, args };
 }
 
-/** Parse exactly one non-null JSON object and redact malformed payloads. */
-export async function parseHappierJson<T extends HappierJsonRecord = HappierJsonRecord>(raw: string): Promise<T> {
+function isRecord(value: unknown): value is HappierJsonRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function invalidEnvelope(reason: string, raw: string, maxBytes: number): HappierCliError {
+  return new HappierCliError(
+    "invalid-json",
+    `Happier CLI returned an invalid JSON envelope: ${reason}; output=${redactHappierOutput(raw, maxBytes)}`,
+  );
+}
+
+/** Parse and validate Happier's exact `{v,ok,kind,data|error}` envelope. */
+export async function parseHappierJson<T = unknown>(
+  raw: string,
+  maxBytes = DEFAULT_MAX_OUTPUT_BYTES,
+): Promise<HappierJsonEnvelope<T>> {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(raw.trim());
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("JSON envelope must be an object");
-    }
-    return parsed as T;
+    parsed = JSON.parse(raw.trim());
   } catch (error) {
     const reason = error instanceof Error ? error.message : "invalid JSON";
-    throw new HappierCliError("invalid-json", `Happier CLI returned invalid JSON: ${redactHappierOutput(reason)}; output=${redactHappierOutput(raw)}`);
+    throw invalidEnvelope(reason, raw, maxBytes);
+  }
+
+  if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.ok !== "boolean" || typeof parsed.kind !== "string" || !parsed.kind.trim()) {
+    throw invalidEnvelope("expected v=1, boolean ok, and non-empty kind", raw, maxBytes);
+  }
+  if (parsed.ok === true && !("data" in parsed)) throw invalidEnvelope("success envelope is missing data", raw, maxBytes);
+  if (parsed.ok === false && (!isRecord(parsed.error) || typeof parsed.error.code !== "string" || !parsed.error.code.trim())) {
+    throw invalidEnvelope("failure envelope is missing error.code", raw, maxBytes);
+  }
+  return parsed as unknown as HappierJsonEnvelope<T>;
+}
+
+class BoundedOutputAccumulator {
+  private readonly chunks: Buffer[] = [];
+  private size = 0;
+
+  constructor(private readonly maxBytes: number) {}
+
+  append(chunk: Buffer): boolean {
+    if (this.size + chunk.byteLength > this.maxBytes) return false;
+    this.chunks.push(Buffer.from(chunk));
+    this.size += chunk.byteLength;
+    return true;
+  }
+
+  toString(): string {
+    return Buffer.concat(this.chunks, this.size).toString("utf8");
   }
 }
 
-function appendBounded(current: string, chunk: Buffer, maxBytes: number): string {
-  const combined = Buffer.concat([Buffer.from(current, "utf8"), chunk]);
-  return combined.subarray(0, maxBytes).toString("utf8");
-}
-
-function classifyFailure(raw: string): HappierErrorCode {
+function classifyProcessFailure(raw: string): HappierErrorCode {
   const lower = raw.toLowerCase();
   if (/auth|unauthori|forbidden|login|credential/.test(lower)) return "authentication";
   if (/daemon/.test(lower)) return "daemon";
@@ -112,25 +196,49 @@ function classifyFailure(raw: string): HappierErrorCode {
   return "process";
 }
 
-function recordErrorMessage(payload: HappierJsonRecord): string | undefined {
-  const candidate = payload.error ?? (payload.ok === false ? payload.message ?? payload.status : undefined);
-  if (typeof candidate === "string" && candidate.trim()) return candidate;
-  if (candidate && typeof candidate === "object") {
-    const message = (candidate as HappierJsonRecord).message;
-    if (typeof message === "string" && message.trim()) return message;
+function mapOfficialErrorCode(code: string): HappierErrorCode {
+  switch (code.toLowerCase().replace(/[-\s]/g, "_")) {
+    case "not_authenticated":
+    case "authentication_required":
+    case "auth_required":
+    case "unauthorized":
+    case "forbidden":
+    case "invalid_token":
+    case "token_expired":
+      return "authentication";
+    case "server_unreachable":
+    case "server_unavailable":
+    case "connection_failed":
+    case "network_error":
+      return "server";
+    case "daemon_unavailable":
+    case "daemon_not_running":
+      return "daemon";
+    case "backend_unavailable":
+    case "backend_not_found":
+    case "provider_unavailable":
+    case "model_unavailable":
+      return "backend";
+    case "session_not_found":
+    case "session_archived":
+    case "session_unavailable":
+    case "invalid_session":
+    case "session_create_failed":
+    case "session_send_failed":
+      return "session";
+    default:
+      return "process";
   }
-  return undefined;
 }
 
-function ensureNoErrorEnvelope(payload: HappierJsonRecord): void {
-  const message = recordErrorMessage(payload);
-  if (!message) return;
-  const redacted = redactHappierOutput(message);
-  throw new HappierCliError(classifyFailure(redacted), `Happier CLI request failed: ${redacted}`);
+function throwOfficialFailure(envelope: HappierFailureEnvelope): never {
+  const officialCode = envelope.error.code.trim();
+  const message = typeof envelope.error.message === "string" && envelope.error.message.trim() ? envelope.error.message : officialCode;
+  throw new HappierCliError(mapOfficialErrorCode(officialCode), `Happier CLI request failed: ${redactHappierOutput(message)}`, undefined, officialCode);
 }
 
 /**
- * FNXC:HappierRuntime 2026-07-13-14:48:
+ * FNXC:HappierRuntime 2026-07-13-15:18:
  * The integration boundary is the official JSON CLI. Keep process execution
  * shell-free, bounded, abortable, and independent from port 4040 or services.
  */
@@ -138,16 +246,18 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
   commandArgs: readonly string[],
   settings?: HappierCliSettings,
   signal?: AbortSignal,
+  expectedKind?: string,
 ): Promise<T> {
   const resolved = resolveHappierCliSettings(settings);
   const invocation = buildHappierInvocation(commandArgs, resolved);
   const maxOutputBytes = resolved.maxOutputBytes;
 
   return new Promise<T>((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
+    const stdout = new BoundedOutputAccumulator(maxOutputBytes);
+    const stderr = new BoundedOutputAccumulator(maxOutputBytes);
+    let child: ReturnType<typeof spawn> | undefined;
     let timer: NodeJS.Timeout | undefined;
+    let settled = false;
 
     const finishReject = (error: HappierCliError): void => {
       if (settled) return;
@@ -165,16 +275,26 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       resolve(value);
     };
 
-    const onAbort = (): void => {
+    function terminate(): void {
       try {
-        child.kill("SIGTERM");
+        child?.kill("SIGTERM");
       } catch {
         // The process may have already exited.
       }
-      finishReject(new HappierCliError("timeout", "Happier CLI invocation aborted"));
-    };
+    }
 
-    let child: ReturnType<typeof spawn>;
+    function onAbort(): void {
+      terminate();
+      finishReject(new HappierCliError("timeout", "Happier CLI invocation aborted"));
+    }
+
+    function onOutput(stream: "stdout" | "stderr", chunk: Buffer): void {
+      const accumulator = stream === "stdout" ? stdout : stderr;
+      if (accumulator.append(chunk)) return;
+      terminate();
+      finishReject(new HappierCliError("output-limit", `Happier CLI ${stream} exceeded the ${maxOutputBytes}-byte output limit`));
+    }
+
     try {
       child = spawn(invocation.command, invocation.args, {
         shell: false,
@@ -182,16 +302,12 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      finishReject(new HappierCliError("process", `Happier CLI spawn failed: ${redactHappierOutput(message)}`));
+      finishReject(new HappierCliError("process", `Happier CLI spawn failed: ${redactHappierOutput(message, maxOutputBytes)}`));
       return;
     }
 
     timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // The process may have already exited.
-      }
+      terminate();
       finishReject(new HappierCliError("timeout", `Happier CLI timed out after ${resolved.timeoutMs}ms`));
     }, resolved.timeoutMs);
 
@@ -203,46 +319,57 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = appendBounded(stdout, chunk, maxOutputBytes);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = appendBounded(stderr, chunk, maxOutputBytes);
-    });
+    child.stdout?.on("data", (chunk: Buffer) => onOutput("stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => onOutput("stderr", chunk));
 
     child.once("error", (error: NodeJS.ErrnoException) => {
       finishReject(
-        new HappierCliError("process", `Happier CLI process error: ${redactHappierOutput(error.message)}`, {
-          stdout: redactHappierOutput(stdout),
-          stderr: redactHappierOutput(stderr),
+        new HappierCliError("process", `Happier CLI process error: ${redactHappierOutput(error.message, maxOutputBytes)}`, {
+          stdout: redactHappierOutput(stdout.toString(), maxOutputBytes),
+          stderr: redactHappierOutput(stderr.toString(), maxOutputBytes),
         }),
       );
     });
 
     child.once("close", (exitCode: number | null) => {
       if (settled) return;
-      if (exitCode !== 0) {
-        const diagnostic = redactHappierOutput([stdout, stderr].filter(Boolean).join("\n"));
-        finishReject(
-          new HappierCliError(classifyFailure(diagnostic), `Happier CLI exited with code ${String(exitCode)}: ${diagnostic}`, {
-            exitCode,
-            stdout: redactHappierOutput(stdout),
-            stderr: redactHappierOutput(stderr),
-          }),
-        );
-        return;
-      }
+      const rawStdout = stdout.toString();
+      const rawStderr = stderr.toString();
 
-      void parseHappierJson<T>(stdout).then(
-        (payload) => {
-          try {
-            ensureNoErrorEnvelope(payload);
-            finishResolve(payload);
-          } catch (error) {
-            finishReject(error instanceof HappierCliError ? error : new HappierCliError("process", String(error)));
+      void parseHappierJson<unknown>(rawStdout, maxOutputBytes).then(
+        (envelope) => {
+          if (expectedKind && envelope.kind !== expectedKind) {
+            finishReject(new HappierCliError("invalid-json", `Expected Happier envelope kind ${expectedKind}, received ${envelope.kind}`));
+            return;
           }
+          if (!envelope.ok) {
+            try {
+              throwOfficialFailure(envelope);
+            } catch (error) {
+              finishReject(error instanceof HappierCliError ? error : new HappierCliError("process", String(error)));
+            }
+            return;
+          }
+          if (exitCode !== 0) {
+            finishReject(new HappierCliError("process", `Happier CLI returned success JSON with exit code ${String(exitCode)}`));
+            return;
+          }
+          if (!isRecord(envelope.data)) {
+            finishReject(new HappierCliError("invalid-json", "Happier success envelope data must be an object"));
+            return;
+          }
+          finishResolve(envelope.data as T);
         },
         (error: unknown) => {
+          if (exitCode !== 0) {
+            const diagnostic = redactHappierOutput([rawStdout, rawStderr].filter(Boolean).join("\n"), maxOutputBytes);
+            finishReject(new HappierCliError(classifyProcessFailure(diagnostic), `Happier CLI exited with code ${String(exitCode)}: ${diagnostic}`, {
+              exitCode,
+              stdout: redactHappierOutput(rawStdout, maxOutputBytes),
+              stderr: redactHappierOutput(rawStderr, maxOutputBytes),
+            }));
+            return;
+          }
           finishReject(error instanceof HappierCliError ? error : new HappierCliError("invalid-json", String(error)));
         },
       );
@@ -251,51 +378,42 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
 }
 
 function ensureRecord(value: unknown, operation: string): HappierJsonRecord {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new HappierCliError("session", `Happier ${operation} returned an invalid result envelope`);
-  }
-  return value as HappierJsonRecord;
+  if (!isRecord(value)) throw new HappierCliError("session", `Happier ${operation} returned an invalid result data object`);
+  return value;
 }
 
-function validateSessionId(sessionId: string): string {
-  if (!sessionId.trim() || /[\u0000-\u001f\u007f]/.test(sessionId) || sessionId.length > 512) {
+function trimSessionId(value: unknown): string {
+  if (typeof value !== "string") throw new HappierCliError("session", "Happier session id must be a string");
+  const trimmed = value.trim();
+  if (!trimmed || /[\u0000-\u001f\u007f]/.test(trimmed) || trimmed.length > 512) {
     throw new HappierCliError("session", "Happier session id is invalid");
   }
-  return sessionId;
+  return trimmed;
 }
 
 function validateBackend(backend: HappierBackend): HappierBackend {
-  if (!HAPPIER_BACKENDS.includes(backend)) {
-    throw new HappierCliError("backend", `Unsupported Happier backend: ${String(backend)}`);
-  }
+  if (!HAPPIER_BACKENDS.includes(backend)) throw new HappierCliError("backend", `Unsupported Happier backend: ${String(backend)}`);
   return backend;
 }
 
 function validatePositiveInteger(value: number, field: string): number {
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new HappierCliError("session", `${field} must be a positive integer`);
-  }
+  if (!Number.isInteger(value) || value <= 0) throw new HappierCliError("session", `${field} must be a positive integer`);
   return value;
 }
 
-function findSessionId(payload: HappierJsonRecord): string | undefined {
-  const direct = payload.sessionId ?? payload.session_id ?? payload.id;
-  if (typeof direct === "string" && direct.trim()) return direct;
-  const nested = payload.session;
-  if (nested && typeof nested === "object" && !Array.isArray(nested)) {
-    const nestedRecord = nested as HappierJsonRecord;
-    const nestedId = nestedRecord.sessionId ?? nestedRecord.session_id ?? nestedRecord.id;
-    if (typeof nestedId === "string" && nestedId.trim()) return nestedId;
-  }
-  return undefined;
+function expectedSessionId(payload: HappierJsonRecord, requested: string, operation: string): string {
+  const returned = trimSessionId(payload.sessionId);
+  if (returned !== requested) throw new HappierCliError("session", `Happier ${operation} returned a mismatched session id`);
+  return returned;
 }
 
-function withSessionId(payload: HappierJsonRecord, sessionId: string, operation: string): HappierJsonRecord & { sessionId: string } {
-  const returnedId = findSessionId(payload);
-  if (returnedId && returnedId !== sessionId) {
-    throw new HappierCliError("session", `Happier ${operation} returned a mismatched session id`);
-  }
-  return { ...payload, sessionId };
+function invokeForKind<T extends HappierJsonRecord>(
+  commandArgs: readonly string[],
+  kind: string,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<T> {
+  return invokeHappierJson<T>(commandArgs, settings, signal, kind);
 }
 
 export async function createHappierSession(
@@ -303,20 +421,19 @@ export async function createHappierSession(
   settings?: HappierCliSettings,
   signal?: AbortSignal,
 ): Promise<HappierSessionCreateResult> {
-  if (!input.cwd.trim() || !input.title.trim()) {
-    throw new HappierCliError("session", "Happier session cwd and title are required");
-  }
-  const payload = ensureRecord(
-    await invokeHappierJson(
+  if (!input.cwd.trim() || !input.title.trim()) throw new HappierCliError("session", "Happier session cwd and title are required");
+  const data = ensureRecord(
+    await invokeForKind(
       ["session", "create", "--path", input.cwd, "--backend", validateBackend(input.backend), "--title", input.title, "--json"],
+      "session_create",
       settings,
       signal,
     ),
     "session create",
   );
-  const sessionId = findSessionId(payload);
-  if (!sessionId) throw new HappierCliError("session", "Happier session create returned no session id");
-  return { ...payload, sessionId: validateSessionId(sessionId) } as HappierSessionCreateResult;
+  if (!isRecord(data.session) || typeof data.created !== "boolean") throw new HappierCliError("session", "Happier session create returned invalid data");
+  const sessionId = trimSessionId(data.session.id);
+  return { ...data, sessionId, session: data.session, created: data.created } as HappierSessionCreateResult;
 }
 
 export async function sendHappierMessage(
@@ -324,18 +441,22 @@ export async function sendHappierMessage(
   settings?: HappierCliSettings,
   signal?: AbortSignal,
 ): Promise<HappierSessionMessageResult> {
-  const sessionId = validateSessionId(input.sessionId);
+  const sessionId = trimSessionId(input.sessionId);
   if (!input.message.trim()) throw new HappierCliError("session", "Happier message is required");
   const timeoutSeconds = validatePositiveInteger(input.timeoutSeconds, "timeoutSeconds");
-  const payload = ensureRecord(
-    await invokeHappierJson(
+  const data = ensureRecord(
+    await invokeForKind(
       ["session", "send", sessionId, input.message, "--wait", "--timeout", String(timeoutSeconds), "--json"],
+      "session_send",
       settings,
       signal,
     ),
     "session send",
   );
-  return withSessionId(payload, sessionId, "session send") as HappierSessionMessageResult;
+  const returnedSessionId = expectedSessionId(data, sessionId, "session send");
+  if (data.localId !== undefined && data.localId !== null && typeof data.localId !== "string") throw new HappierCliError("session", "Happier session send returned an invalid localId");
+  if (data.waited !== undefined && typeof data.waited !== "boolean") throw new HappierCliError("session", "Happier session send returned an invalid waited flag");
+  return { ...data, sessionId: returnedSessionId } as HappierSessionMessageResult;
 }
 
 export async function getHappierSessionStatus(
@@ -343,12 +464,13 @@ export async function getHappierSessionStatus(
   settings?: HappierCliSettings,
   signal?: AbortSignal,
 ): Promise<HappierSessionStatusResult> {
-  const validatedSessionId = validateSessionId(sessionId);
-  const payload = ensureRecord(
-    await invokeHappierJson(["session", "status", validatedSessionId, "--json"], settings, signal),
-    "session status",
-  );
-  return withSessionId(payload, validatedSessionId, "session status") as HappierSessionStatusResult;
+  const requested = trimSessionId(sessionId);
+  const data = ensureRecord(await invokeForKind(["session", "status", requested, "--json"], "session_status", settings, signal), "session status");
+  if (!isRecord(data.session)) throw new HappierCliError("session", "Happier session status returned invalid session data");
+  const returned = trimSessionId(data.session.id);
+  if (returned !== requested) throw new HappierCliError("session", "Happier session status returned a mismatched session id");
+  if (data.agentState !== undefined && data.agentState !== null && !isRecord(data.agentState)) throw new HappierCliError("session", "Happier session status returned invalid agentState data");
+  return { ...data, sessionId: returned, session: data.session } as HappierSessionStatusResult;
 }
 
 export async function getHappierSessionHistory(
@@ -357,17 +479,20 @@ export async function getHappierSessionHistory(
   settingsOrLimit?: HappierCliSettings | number,
   signal?: AbortSignal,
 ): Promise<HappierSessionHistoryResult> {
-  const validatedSessionId = validateSessionId(sessionId);
+  const requested = trimSessionId(sessionId);
   const limit = typeof limitOrSettings === "number" ? limitOrSettings : typeof settingsOrLimit === "number" ? settingsOrLimit : 50;
   const settings = typeof limitOrSettings === "number" ? (typeof settingsOrLimit === "object" ? settingsOrLimit : undefined) : limitOrSettings;
   validatePositiveInteger(limit, "limit");
-  const payload = ensureRecord(
-    await invokeHappierJson(
-      ["session", "history", validatedSessionId, "--limit", String(limit), "--format", "raw", "--json"],
+  const data = ensureRecord(
+    await invokeForKind(
+      ["session", "history", requested, "--limit", String(limit), "--format", "raw", "--json"],
+      "session_history",
       settings,
       signal,
     ),
     "session history",
   );
-  return withSessionId(payload, validatedSessionId, "session history") as HappierSessionHistoryResult;
+  const returned = expectedSessionId(data, requested, "session history");
+  if (typeof data.format !== "string" || !data.format.trim() || !Array.isArray(data.messages)) throw new HappierCliError("session", "Happier session history returned invalid data");
+  return { ...data, sessionId: returned, format: data.format, messages: data.messages } as HappierSessionHistoryResult;
 }

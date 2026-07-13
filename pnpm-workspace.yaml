@@ -42,6 +42,7 @@ packages:
   - "plugins/fusion-plugin-cli-printing-press"
   - "plugins/fusion-plugin-openclaw-runtime"
   - "plugins/fusion-plugin-hermes-runtime"
+  - "plugins/fusion-plugin-happier-runtime"
   - "plugins/fusion-plugin-droid-runtime"
   - "plugins/fusion-plugin-acp-runtime"
   - "plugins/fusion-plugin-cursor-runtime"

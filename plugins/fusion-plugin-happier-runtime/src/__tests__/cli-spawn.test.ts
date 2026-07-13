@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 
@@ -17,6 +17,17 @@ import {
   sendHappierMessage,
 } from "../cli-spawn.js";
 import type { HappierCliSettings } from "../types.js";
+
+const CREATE_SUCCESS =
+  '{"v":1,"ok":true,"kind":"session_create","data":{"session":{"id":" sess_integration_create_123 ","tag":"MyTag","title":"My Title","active":true},"created":true}}';
+const SEND_SUCCESS =
+  '{"v":1,"ok":true,"kind":"session_send","data":{"sessionId":"sess_integration_send_123","localId":"local-1","waited":true}}';
+const STATUS_SUCCESS =
+  '{"v":1,"ok":true,"kind":"session_status","data":{"session":{"id":"sess_integration_status_123","active":true},"agentState":{"pendingRequestsCount":0,"controlledByUser":false}}}';
+const HISTORY_SUCCESS =
+  '{"v":1,"ok":true,"kind":"session_history","data":{"sessionId":"sess_integration_history_123","format":"raw","messages":[{"id":"message-1","role":"user","content":{"type":"text","text":"hello"}}]}}';
+const AUTH_FAILURE =
+  '{"v":1,"ok":false,"kind":"session_send","error":{"code":"not_authenticated","message":"accessToken=do-not-leak"}}';
 
 function settings(overrides: Partial<HappierCliSettings> = {}): HappierCliSettings {
   return {
@@ -49,6 +60,20 @@ function fakeChild(): {
     kill,
   };
 }
+
+beforeEach(() => {
+  for (const key of [
+    "HAPPIER_CLI_EXECUTABLE",
+    "HAPPIER_CLI_ENTRYPOINT",
+    "HAPPIER_SERVER_URL",
+    "HAPPIER_WEBAPP_URL",
+    "HAPPIER_PROFILE",
+    "HAPPIER_CLI_TIMEOUT_MS",
+    "HAPPIER_CLI_MAX_OUTPUT_BYTES",
+  ]) {
+    vi.stubEnv(key, "");
+  }
+});
 
 afterEach(() => {
   mockSpawn.mockReset();
@@ -101,24 +126,53 @@ describe("Happier CLI settings and invocation", () => {
   });
 });
 
-describe("Happier JSON parsing and invocation", () => {
-  it("rejects non-JSON and redacts sensitive output", async () => {
-    await expect(parseHappierJson('token=secret-value bearer abc123')).rejects.toMatchObject({
-      code: "invalid-json",
+describe("Happier official JSON envelopes", () => {
+  it("parses the official success envelope shape", async () => {
+    await expect(parseHappierJson(CREATE_SUCCESS)).resolves.toEqual({
+      v: 1,
+      ok: true,
+      kind: "session_create",
+      data: {
+        session: { id: " sess_integration_create_123 ", tag: "MyTag", title: "My Title", active: true },
+        created: true,
+      },
     });
-    await expect(parseHappierJson('token=secret-value bearer abc123')).rejects.not.toThrow("secret-value");
-    await expect(parseHappierJson('token=secret-value bearer abc123')).rejects.not.toThrow("abc123");
   });
 
-  it("maps a nonzero authentication process to a stable error code", async () => {
+  it("rejects malformed JSON with bounded, recursively redacted diagnostics", async () => {
+    const raw = '{"accessToken":"access-secret","nested":{"client_secret":"client-secret","private-key":"private-secret"';
+
+    await expect(parseHappierJson(raw, 80)).rejects.toMatchObject({ code: "invalid-json" });
+    await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("access-secret");
+    await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("client-secret");
+    await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("private-secret");
+    await expect(parseHappierJson(raw, 80)).rejects.toSatisfy((error: Error) => error.message.length < 240);
+  });
+
+  it("maps the official error code before considering any message text", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
-    const promise = invokeHappierJson(["auth", "status", "--json"], settings());
-    fake.stderr("authentication failed token=secret-value");
+    const promise = invokeHappierJson(["session", "send", "abc", "hello", "--json"], settings());
+    fake.stdout(AUTH_FAILURE);
     fake.close(1);
 
-    await expect(promise).rejects.toMatchObject({ code: "authentication" });
-    await expect(promise).rejects.not.toThrow("secret-value");
+    await expect(promise).rejects.toMatchObject({ code: "authentication", officialCode: "not_authenticated" });
+    await expect(promise).rejects.not.toThrow("do-not-leak");
+  });
+});
+
+describe("Happier JSON process boundary", () => {
+  it("returns data from an official success envelope", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = invokeHappierJson(["session", "status", "abc", "--json"], settings());
+    fake.stdout(STATUS_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).resolves.toEqual({
+      session: { id: "sess_integration_status_123", active: true },
+      agentState: { pendingRequestsCount: 0, controlledByUser: false },
+    });
   });
 
   it("times out and terminates a hanging process", async () => {
@@ -130,39 +184,67 @@ describe("Happier JSON parsing and invocation", () => {
     expect(fake.kill).toHaveBeenCalled();
   });
 
-  it("maps spawn failures and redacts bounded diagnostics", async () => {
+  it("terminates when stdout exceeds the hard output cap", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = invokeHappierJson(["session", "status", "abc", "--json"], settings({ maxOutputBytes: 8 }));
+    fake.stdout("123456789");
+
+    await expect(promise).rejects.toMatchObject({ code: "output-limit" });
+    expect(fake.kill).toHaveBeenCalled();
+  });
+
+  it("terminates when stderr exceeds the hard output cap", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = invokeHappierJson(["session", "status", "abc", "--json"], settings({ maxOutputBytes: 8 }));
+    fake.stderr("123456789");
+
+    await expect(promise).rejects.toMatchObject({ code: "output-limit" });
+    expect(fake.kill).toHaveBeenCalled();
+  });
+
+  it("terminates and rejects when the caller aborts", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const controller = new AbortController();
+    const promise = invokeHappierJson(["session", "status", "abc", "--json"], settings(), controller.signal);
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ code: "timeout" });
+    expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("maps nonzero process failures using textual fallback and redacts diagnostics", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
     const promise = invokeHappierJson(["session", "status", "abc", "--json"], settings());
-    fake.error(Object.assign(new Error("backend key=secret-value unavailable"), { code: "ENOENT" }));
+    fake.stderr("authentication failed accessToken=secret-value");
+    fake.close(1);
 
-    await expect(promise).rejects.toMatchObject({ code: "process" });
+    await expect(promise).rejects.toMatchObject({ code: "authentication" });
     await expect(promise).rejects.not.toThrow("secret-value");
   });
 
-  it("rejects a non-object JSON envelope", async () => {
+  it("maps spawn failures to process errors", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
     const promise = invokeHappierJson(["session", "status", "abc", "--json"], settings());
-    fake.stdout("[]");
-    fake.close(0);
+    fake.error(Object.assign(new Error("spawn unavailable"), { code: "ENOENT" }));
 
-    await expect(promise).rejects.toMatchObject({ code: "invalid-json" });
+    await expect(promise).rejects.toMatchObject({ code: "process" });
   });
 });
 
 describe("Happier session wrappers", () => {
-  it("constructs official session commands and validates the returned id", async () => {
+  it("constructs the official create command and trims data.session.id", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
-    const promise = createHappierSession(
-      { cwd: "G:\\repo", backend: "codex", title: "Task 1" },
-      settings(),
-    );
-    fake.stdout('{"sessionId":"hp_session_1"}');
+    const promise = createHappierSession({ cwd: "G:\\repo", backend: "codex", title: "Task 1" }, settings());
+    fake.stdout(CREATE_SUCCESS);
     fake.close(0);
 
-    await expect(promise).resolves.toMatchObject({ sessionId: "hp_session_1" });
+    await expect(promise).resolves.toMatchObject({ sessionId: "sess_integration_create_123", created: true });
     expect(mockSpawn).toHaveBeenCalledWith(
       "happier",
       ["session", "create", "--path", "G:\\repo", "--backend", "codex", "--title", "Task 1", "--json"],
@@ -170,32 +252,50 @@ describe("Happier session wrappers", () => {
     );
   });
 
-  it("constructs send, status, and raw history commands", async () => {
+  it("constructs exact send, status, and raw history commands from official data", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
 
     const sendPromise = sendHappierMessage(
-      { sessionId: "hp_session_1", message: "hello", timeoutSeconds: 30 },
+      { sessionId: " sess_integration_send_123 ", message: "hello", timeoutSeconds: 30 },
       settings(),
     );
-    fake.stdout('{"status":"completed"}');
+    fake.stdout(SEND_SUCCESS);
     fake.close(0);
-    await expect(sendPromise).resolves.toMatchObject({ sessionId: "hp_session_1" });
+    await expect(sendPromise).resolves.toMatchObject({ sessionId: "sess_integration_send_123", localId: "local-1", waited: true });
 
-    const statusPromise = getHappierSessionStatus("hp_session_1", settings());
-    fake.stdout('{"status":"ready"}');
+    const statusPromise = getHappierSessionStatus(" sess_integration_status_123 ", settings());
+    fake.stdout(STATUS_SUCCESS);
     fake.close(0);
-    await expect(statusPromise).resolves.toMatchObject({ sessionId: "hp_session_1" });
+    await expect(statusPromise).resolves.toMatchObject({ sessionId: "sess_integration_status_123", session: expect.any(Object) });
 
-    const historyPromise = getHappierSessionHistory("hp_session_1", 10, settings());
-    fake.stdout('{"messages":[]}');
+    const historyPromise = getHappierSessionHistory("sess_integration_history_123", 10, settings());
+    fake.stdout(HISTORY_SUCCESS);
     fake.close(0);
-    await expect(historyPromise).resolves.toMatchObject({ sessionId: "hp_session_1" });
+    await expect(historyPromise).resolves.toMatchObject({ sessionId: "sess_integration_history_123", messages: expect.any(Array) });
 
     expect(mockSpawn.mock.calls.map((call) => call[1])).toEqual([
-      ["session", "send", "hp_session_1", "hello", "--wait", "--timeout", "30", "--json"],
-      ["session", "status", "hp_session_1", "--json"],
-      ["session", "history", "hp_session_1", "--limit", "10", "--format", "raw", "--json"],
+      ["session", "send", "sess_integration_send_123", "hello", "--wait", "--timeout", "30", "--json"],
+      ["session", "status", "sess_integration_status_123", "--json"],
+      ["session", "history", "sess_integration_history_123", "--limit", "10", "--format", "raw", "--json"],
     ]);
+  });
+
+  it("rejects invalid official session data instead of inventing an id", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = createHappierSession({ cwd: "G:\\repo", backend: "codex", title: "Task 1" }, settings());
+    fake.stdout('{"v":1,"ok":true,"kind":"session_create","data":{"created":true}}');
+    fake.close(0);
+
+    await expect(promise).rejects.toMatchObject({ code: "session" });
+  });
+});
+
+describe("package entrypoint", () => {
+  it("exports the Task 1 contract from src/index.ts", async () => {
+    const entry = await import("../index.js");
+    expect(entry.createHappierSession).toBeTypeOf("function");
+    expect(entry.invokeHappierJson).toBeTypeOf("function");
   });
 });

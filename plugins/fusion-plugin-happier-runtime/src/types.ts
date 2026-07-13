@@ -27,6 +27,7 @@ export interface HappierCliInvocation {
 export type HappierErrorCode =
   | "process"
   | "timeout"
+  | "output-limit"
   | "invalid-json"
   | "authentication"
   | "server"
@@ -45,6 +46,7 @@ export class HappierCliError extends Error {
       stdout?: string;
       stderr?: string;
     },
+    readonly officialCode?: string,
   ) {
     super(message);
     Object.setPrototypeOf(this, new.target.prototype);
@@ -52,6 +54,26 @@ export class HappierCliError extends Error {
 }
 
 export type HappierJsonRecord = Record<string, unknown>;
+
+export interface HappierSuccessEnvelope<T = unknown> {
+  v: 1;
+  ok: true;
+  kind: string;
+  data: T;
+}
+
+export interface HappierFailureEnvelope {
+  v: 1;
+  ok: false;
+  kind: string;
+  error: {
+    code: string;
+    message?: string;
+    [key: string]: unknown;
+  };
+}
+
+export type HappierJsonEnvelope<T = unknown> = HappierSuccessEnvelope<T> | HappierFailureEnvelope;
 
 export interface HappierSessionCreateInput {
   cwd: string;
@@ -65,7 +87,7 @@ export interface HappierMessageInput {
   timeoutSeconds: number;
 }
 
-export type HappierSessionCreateResult = HappierJsonRecord & { sessionId: string };
-export type HappierSessionMessageResult = HappierJsonRecord & { sessionId: string };
-export type HappierSessionStatusResult = HappierJsonRecord & { sessionId: string };
-export type HappierSessionHistoryResult = HappierJsonRecord & { sessionId: string };
+export type HappierSessionCreateResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord; created: boolean };
+export type HappierSessionMessageResult = HappierJsonRecord & { sessionId: string; localId?: string | null; waited?: boolean };
+export type HappierSessionStatusResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord };
+export type HappierSessionHistoryResult = HappierJsonRecord & { sessionId: string; format: string; messages: unknown[] };
