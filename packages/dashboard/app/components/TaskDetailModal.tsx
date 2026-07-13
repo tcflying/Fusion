@@ -307,7 +307,7 @@ export interface CliSessionSummaryRecord {
 export function buildHappierContinuationCommand(session: CliSessionSummaryRecord | null): string | null {
   if (session?.adapterId !== "happier" || !session.nativeSessionId?.trim()) return null;
   const quotedId = session.nativeSessionId.trim().replace(/'/g, "''");
-  return `happier session send '${quotedId}' '<message>' --wait`;
+  return `happier session send '${quotedId}' '<message>' --wait --timeout 300`;
 }
 
 type CliTabVisibility =

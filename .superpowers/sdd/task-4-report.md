@@ -12,7 +12,7 @@
 
 All commands ran from `G:\codex-project\fusion\.worktrees\happier-runtime`.
 
-- Happier runtime card tests: 2/2 passed.
+- Happier runtime card tests: 3/3 passed, including a regression that save-only does not trigger a second probe.
 - Happier status route tests: 2/2 passed.
 - Task terminal continuation tests: 7/7 passed.
 - Plugin manager runtime toggle target: 1/1 passed.
@@ -22,6 +22,11 @@ All commands ran from `G:\codex-project\fusion\.worktrees\happier-runtime`.
 - Dashboard production build passed (7,031 modules); only existing Vite chunk/static-import warnings were emitted.
 - Standalone dashboard app TypeScript commands exceeded the local timeout without diagnostics; this is recorded as unproven rather than passed.
 - `git diff --check` passed.
+
+## Independent review follow-up
+
+- Fixed the reviewer's medium finding by removing the `busy`-driven probe effect. Initial health now runs exactly once after settings load; Save remains save-only, while Test and Save & Test explicitly probe.
+- Made the copied wait bound explicit as `--timeout 300`, matching the current Happier CLI default and documentation. `--json` remains intentionally omitted because this button copies a human terminal command, not a machine-consumed command.
 
 ## Remaining boundary
 

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../api", () => ({
@@ -8,13 +8,15 @@ vi.mock("../../api", () => ({
   updatePluginSettings: vi.fn(),
 }));
 
-import { fetchHappierStatus, fetchPluginSettings, fetchPlugins } from "../../api";
+import { fetchHappierStatus, fetchPluginSettings, fetchPlugins, updatePluginSettings } from "../../api";
 import { HappierRuntimeCard } from "../HappierRuntimeCard";
 
 describe("HappierRuntimeCard", () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     vi.mocked(fetchPluginSettings).mockResolvedValue({ backend: "codex" });
     vi.mocked(fetchPlugins).mockResolvedValue([]);
+    vi.mocked(updatePluginSettings).mockResolvedValue({});
     vi.mocked(fetchHappierStatus).mockResolvedValue({
       discovered: true,
       executable: true,
@@ -45,5 +47,13 @@ describe("HappierRuntimeCard", () => {
     expect(Array.from((select as HTMLSelectElement).options).map((option) => option.value)).toEqual(["codex", "claude", "opencode"]);
     expect(screen.queryByLabelText(/token|api key|password/i)).toBeNull();
     expect(screen.getByText(/credentials are deliberately not accepted/i)).toBeTruthy();
+  });
+
+  it("probes once on mount and does not spawn another probe after save-only", async () => {
+    render(<HappierRuntimeCard />);
+    await waitFor(() => expect(fetchHappierStatus).toHaveBeenCalledTimes(1));
+    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
+    await waitFor(() => expect(updatePluginSettings).toHaveBeenCalledTimes(1));
+    expect(fetchHappierStatus).toHaveBeenCalledTimes(1);
   });
 });

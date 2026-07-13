@@ -71,11 +71,14 @@ export function HappierRuntimeCard() {
 
   useEffect(() => {
     Promise.all([fetchPluginSettings(PLUGIN_ID), fetchPlugins()])
-      .then(([raw, plugins]) => {
+      .then(async ([raw, plugins]) => {
         if (!mounted.current) return;
-        setSettings(settingsFromRecord(raw));
+        const nextSettings = settingsFromRecord(raw);
+        setSettings(nextSettings);
         const plugin = plugins.find((candidate) => candidate.id === PLUGIN_ID);
         setRuntimeDisabled(plugin ? !plugin.enabled : false);
+        const nextHealth = await fetchHappierStatus(nextSettings);
+        if (mounted.current) setHealth(nextHealth);
       })
       .catch((error) => {
         if (mounted.current) setToast({ kind: "err", message: error instanceof Error ? error.message : String(error) });
@@ -98,8 +101,6 @@ export function HappierRuntimeCard() {
       return null;
     }
   }, [payload]);
-
-  useEffect(() => { if (busy === null) void probe(); }, [busy, probe]);
 
   const test = useCallback(async () => {
     setBusy("testing");
