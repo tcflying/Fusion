@@ -411,13 +411,28 @@ function expectedSessionId(payload: HappierJsonRecord, requested: string, operat
   return returned;
 }
 
-function invokeForKind<T extends HappierJsonRecord>(
+function isTransientWindowsStartupFailure(error: unknown): boolean {
+  if (!(error instanceof HappierCliError) || error.code !== "process") return false;
+  const diagnostic = [error.message, error.details?.stderr, error.details?.stdout].filter(Boolean).join("\n");
+  return /\b(?:EBUSY|EPERM|ETXTBSY)\b|resource busy or locked|text file busy/iu.test(diagnostic);
+}
+
+/** Retry only transient process-startup file locks; never retry command or authentication failures. */
+export async function invokeHappierJsonForKind<T extends HappierJsonRecord>(
   commandArgs: readonly string[],
   kind: string,
   settings?: HappierCliSettings,
   signal?: AbortSignal,
 ): Promise<T> {
-  return invokeHappierJson<T>(commandArgs, settings, signal, kind);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await invokeHappierJson<T>(commandArgs, settings, signal, kind);
+    } catch (error) {
+      if (attempt === 2 || signal?.aborted || !isTransientWindowsStartupFailure(error)) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, attempt === 0 ? 75 : 250));
+    }
+  }
+  throw new HappierCliError("process", "Happier CLI startup retry exhausted");
 }
 
 export async function createHappierSession(
@@ -427,7 +442,7 @@ export async function createHappierSession(
 ): Promise<HappierSessionCreateResult> {
   if (!input.cwd.trim() || !input.title.trim()) throw new HappierCliError("session", "Happier session cwd and title are required");
   const data = ensureRecord(
-    await invokeForKind(
+    await invokeHappierJsonForKind(
       ["session", "create", "--path", input.cwd, "--backend", validateBackend(input.backend), "--title", input.title, "--json"],
       "session_create",
       settings,
@@ -453,7 +468,7 @@ export async function sendHappierMessage(
   }
   const timeoutSeconds = validatePositiveInteger(input.timeoutSeconds, "timeoutSeconds");
   const data = ensureRecord(
-    await invokeForKind(
+    await invokeHappierJsonForKind(
       ["session", "send", sessionId, input.message, "--local-id", localId, "--wait", "--timeout", String(timeoutSeconds), "--json"],
       "session_send",
       settings,
@@ -474,7 +489,7 @@ export async function archiveHappierSession(
 ): Promise<void> {
   const requested = trimSessionId(sessionId);
   const data = ensureRecord(
-    await invokeForKind(["session", "archive", requested, "--json"], "session_archive", settings, signal),
+    await invokeHappierJsonForKind(["session", "archive", requested, "--json"], "session_archive", settings, signal),
     "session archive",
   );
   expectedSessionId(data, requested, "session archive");
@@ -486,7 +501,7 @@ export async function getHappierSessionStatus(
   signal?: AbortSignal,
 ): Promise<HappierSessionStatusResult> {
   const requested = trimSessionId(sessionId);
-  const data = ensureRecord(await invokeForKind(["session", "status", requested, "--json"], "session_status", settings, signal), "session status");
+  const data = ensureRecord(await invokeHappierJsonForKind(["session", "status", requested, "--json"], "session_status", settings, signal), "session status");
   if (!isRecord(data.session)) throw new HappierCliError("session", "Happier session status returned invalid session data");
   const returned = trimSessionId(data.session.id);
   if (returned !== requested) throw new HappierCliError("session", "Happier session status returned a mismatched session id");
@@ -505,7 +520,7 @@ export async function getHappierSessionHistory(
   const settings = typeof limitOrSettings === "number" ? (typeof settingsOrLimit === "object" ? settingsOrLimit : undefined) : limitOrSettings;
   validatePositiveInteger(limit, "limit");
   const data = ensureRecord(
-    await invokeForKind(
+    await invokeHappierJsonForKind(
       ["session", "history", requested, "--limit", String(limit), "--format", "raw", "--json"],
       "session_history",
       settings,

@@ -252,6 +252,22 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
+  it("retries a bounded transient Windows startup file lock", async () => {
+    const locked = fakeChild();
+    const recovered = fakeChild();
+    mockSpawn.mockReturnValueOnce(locked.child).mockReturnValueOnce(recovered.child);
+
+    const promise = createHappierSession({ cwd: "G:\\repo", backend: "codex", title: "Task 1" }, settings());
+    locked.stderr("Error: EBUSY: resource busy or locked, open 'cli-module.js'");
+    locked.close(1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+    recovered.stdout(CREATE_SUCCESS);
+    recovered.close(0);
+
+    await expect(promise).resolves.toMatchObject({ sessionId: "sess_integration_create_123" });
+  });
+
   it("constructs the official create command and trims data.session.id", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);

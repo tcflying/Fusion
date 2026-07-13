@@ -56,6 +56,7 @@ const plugin: FusionPlugin = definePlugin({
 export default plugin;
 
 export * from "./cli-spawn.js";
+export * from "./operations.js";
 export * from "./probe.js";
 export * from "./types.js";
 export { HappierRecoveryError, HappierRuntimeAdapter } from "./runtime-adapter.js";
