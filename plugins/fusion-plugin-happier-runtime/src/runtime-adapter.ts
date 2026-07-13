@@ -5,7 +5,10 @@
  * private queue; ambiguous sends are reconciled once and are never resent.
  */
 
+import { randomUUID } from "node:crypto";
+
 import {
+  archiveHappierSession,
   createHappierSession,
   getHappierSessionHistory,
   getHappierSessionStatus,
@@ -32,6 +35,7 @@ import {
 } from "./types.js";
 
 const HISTORY_LIMIT = 250;
+const bindingQueues = new Map<string, Promise<void>>();
 const RESUMABLE_STATES = new Set([
   "active",
   "idle",
@@ -45,6 +49,7 @@ const RESUMABLE_STATES = new Set([
 
 interface ParsedHistoryRow {
   id: string;
+  localId?: string;
   createdAt: number;
   role: string;
   text?: string;
@@ -163,14 +168,16 @@ function parseRawHistoryRows(history: HappierSessionHistoryResult): ParsedHistor
     const role = nonEmptyString(record?.role)?.toLowerCase();
     const createdAt = record?.createdAt;
     const raw = asRecord(record?.raw);
+    const localId = record?.localId === undefined ? undefined : nonEmptyString(record.localId);
     if (!id || !role || typeof createdAt !== "number" || !Number.isFinite(createdAt) || !raw) {
       throw new Error(`invalid raw history row at index ${postIndex}`);
     }
+    if (record?.localId !== undefined && !localId) throw new Error(`invalid raw history localId at index ${postIndex}`);
     if (seenIds.has(id)) throw new Error(`duplicate raw history row id ${id}`);
     if (createdAt < priorCreatedAt) throw new Error(`raw history order regressed at row ${id}`);
     seenIds.add(id);
     priorCreatedAt = createdAt;
-    return { id, createdAt, role, text: rawContentText(raw), postIndex };
+    return { id, ...(localId ? { localId } : {}), createdAt, role, text: rawContentText(raw), postIndex };
   });
 }
 
@@ -220,12 +227,12 @@ function rowsAfterWatermark(
 function correlatePromptOutput(
   watermark: HistoryWatermark,
   history: HappierSessionHistoryResult,
-  prompt: string,
+  localId: string,
 ): { added: ParsedHistoryRow[]; assistant: ParsedHistoryRow[] } {
   const added = rowsAfterWatermark(watermark, history);
-  const matchingUsers = added.filter((row) => row.role === "user" && row.text === prompt);
+  const matchingUsers = added.filter((row) => row.role === "user" && row.localId === localId);
   if (matchingUsers.length !== 1) {
-    throw new Error(`expected one post-watermark matching user row, received ${matchingUsers.length}`);
+    throw new Error(`expected one post-watermark user row for localId ${localId}, received ${matchingUsers.length}`);
   }
   const userIndex = matchingUsers[0].postIndex;
   const assistant = added.filter((row) =>
@@ -251,8 +258,6 @@ export class HappierRuntimeAdapter implements AgentRuntime {
   private readonly settings: ReturnType<typeof resolveHappierCliSettings>;
   private readonly backend: HappierBackend;
   private readonly timeoutSeconds: number;
-  private readonly sessionQueues = new WeakMap<object, Promise<void>>();
-
   constructor(settings?: Record<string, unknown> | HappierCliSettings) {
     const raw = (settings ?? {}) as Record<string, unknown>;
     this.settings = resolveHappierCliSettings(settings);
@@ -303,11 +308,13 @@ export class HappierRuntimeAdapter implements AgentRuntime {
   promptWithFallback(session: AgentSession, prompt: string, _options?: unknown): Promise<void> {
     if (!prompt.trim()) return Promise.reject(new HappierCliError("session", "Happier message is required"));
     const happierSession = asHappierSession(session) as HappierAgentSession & { needsPersistence: boolean };
-    const prior = this.sessionQueues.get(session) ?? Promise.resolve();
+    const queueKey = happierSession.nativeSession.key;
+    const prior = bindingQueues.get(queueKey) ?? Promise.resolve();
     const current = prior.catch(() => undefined).then(() => this.runPrompt(happierSession, prompt));
-    this.sessionQueues.set(session, current);
+    const tail = current.then(() => undefined, () => undefined);
+    bindingQueues.set(queueKey, tail);
     return current.finally(() => {
-      if (this.sessionQueues.get(session) === current) this.sessionQueues.delete(session);
+      if (bindingQueues.get(queueKey) === tail) bindingQueues.delete(queueKey);
     });
   }
 
@@ -321,31 +328,7 @@ export class HappierRuntimeAdapter implements AgentRuntime {
   ): Promise<void> {
     let localUserMessageAdded = false;
     try {
-      if (!session.sessionId) {
-        session.state.status = "starting";
-        const created = await createHappierSession(
-          { cwd: session.cwd, backend: this.backend, title: "Fusion Happier session" },
-          this.settings,
-        );
-        session.sessionId = created.sessionId;
-        session.needsPersistence = true;
-      }
-
-      if (session.needsPersistence) {
-        try {
-          await session.nativeSession.persistNativeSessionId(session.sessionId);
-          session.nativeSession.nativeSessionId = session.sessionId;
-          session.needsPersistence = false;
-        } catch (error) {
-          session.state.status = "blocked";
-          throw new HappierRecoveryError(
-            "native-session-persistence-failed",
-            `Unable to persist Happier session ${session.sessionId}`,
-            session.sessionId,
-            error,
-          );
-        }
-      }
+      await this.ensureNativeSession(session);
 
       if (session.needsReconciliation) {
         await this.reconcilePersistedSession(session);
@@ -369,17 +352,18 @@ export class HappierRuntimeAdapter implements AgentRuntime {
       session.messages.push({ role: "user", content: prompt });
       session.state.messages = session.messages;
       localUserMessageAdded = true;
+      const localId = `fusion-${randomUUID()}`;
 
       try {
         await sendHappierMessage(
-          { sessionId: session.sessionId, message: prompt, timeoutSeconds: this.timeoutSeconds },
+          { sessionId: session.sessionId, message: prompt, localId, timeoutSeconds: this.timeoutSeconds },
           this.settings,
         );
         const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
         const status = await getHappierSessionStatus(session.sessionId, this.settings);
         let correlated: ReturnType<typeof correlatePromptOutput>;
         try {
-          correlated = correlatePromptOutput(watermark, history, prompt);
+          correlated = correlatePromptOutput(watermark, history, localId);
           if (correlated.assistant.length === 0) {
             throw new Error("successful --wait history contained no correlated assistant text");
           }
@@ -395,8 +379,17 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         this.recordAssistantOutput(session, correlated.assistant);
         session.state.status = statusToRuntimeState(status) ?? "ready";
       } catch (error) {
+        if (error instanceof HappierCliError && error.code === "protocol") {
+          session.state.status = "blocked";
+          throw new HappierRecoveryError(
+            "history-reconciliation-failed",
+            `Happier send response could not be correlated for session ${session.sessionId}`,
+            session.sessionId,
+            error,
+          );
+        }
         if (!isAmbiguousSendError(error)) throw error;
-        const reconciled = await this.reconcileAmbiguousSend(session, watermark, prompt, error);
+        const reconciled = await this.reconcileAmbiguousSend(session, watermark, localId, error);
         this.recordAssistantOutput(session, reconciled.added);
         session.state.status = statusToRuntimeState(reconciled.status) ?? "ready";
       }
@@ -415,6 +408,74 @@ export class HappierRuntimeAdapter implements AgentRuntime {
       }
       throw error;
     }
+  }
+
+  private async ensureNativeSession(
+    session: HappierAgentSession & { needsPersistence: boolean },
+  ): Promise<void> {
+    let persisted: string | null;
+    try {
+      persisted = await session.nativeSession.refreshNativeSessionId();
+    } catch (error) {
+      session.state.status = "blocked";
+      throw new HappierRecoveryError(
+        "native-session-persistence-failed",
+        "Unable to refresh the canonical Fusion native session id",
+        session.sessionId,
+        error,
+      );
+    }
+    if (persisted) {
+      const learnedPersistedId = !session.sessionId;
+      if (session.sessionId && session.sessionId !== persisted) {
+        session.state.status = "blocked";
+        throw new HappierRecoveryError(
+          "native-session-persistence-failed",
+          `Canonical native session changed from ${session.sessionId} to ${persisted}`,
+          session.sessionId,
+        );
+      }
+      session.sessionId = persisted;
+      session.nativeSession.nativeSessionId = persisted;
+      session.needsPersistence = false;
+      if (learnedPersistedId) session.needsReconciliation = true;
+      return;
+    }
+
+    session.state.status = "starting";
+    const created = await createHappierSession(
+      { cwd: session.cwd, backend: this.backend, title: "Fusion Happier session" },
+      this.settings,
+    );
+    let claim: { claimed: boolean; nativeSessionId: string };
+    try {
+      claim = await session.nativeSession.claimNativeSessionId(created.sessionId);
+    } catch (error) {
+      session.state.status = "blocked";
+      throw new HappierRecoveryError(
+        "native-session-persistence-failed",
+        `Unable to atomically claim Happier session ${created.sessionId}`,
+        created.sessionId,
+        error,
+      );
+    }
+    if (!claim.claimed && claim.nativeSessionId !== created.sessionId) {
+      try {
+        await archiveHappierSession(created.sessionId, this.settings);
+      } catch (error) {
+        session.state.status = "blocked";
+        throw new HappierRecoveryError(
+          "native-session-persistence-failed",
+          `Native session claim lost to ${claim.nativeSessionId}; failed to archive orphan ${created.sessionId}`,
+          claim.nativeSessionId,
+          error,
+        );
+      }
+      session.needsReconciliation = true;
+    }
+    session.sessionId = claim.nativeSessionId;
+    session.nativeSession.nativeSessionId = claim.nativeSessionId;
+    session.needsPersistence = false;
   }
 
   private async reconcilePersistedSession(session: HappierAgentSession): Promise<void> {
@@ -445,13 +506,13 @@ export class HappierRuntimeAdapter implements AgentRuntime {
   private async reconcileAmbiguousSend(
     session: HappierAgentSession,
     watermark: HistoryWatermark,
-    prompt: string,
+    localId: string,
     originalError: unknown,
   ): Promise<HistoryReconciliation> {
     try {
       const status = await getHappierSessionStatus(session.sessionId, this.settings);
       const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
-      const correlated = correlatePromptOutput(watermark, history, prompt);
+      const correlated = correlatePromptOutput(watermark, history, localId);
       return { status, history, added: correlated.assistant };
     } catch (error) {
       if (error instanceof HappierRecoveryError) throw error;

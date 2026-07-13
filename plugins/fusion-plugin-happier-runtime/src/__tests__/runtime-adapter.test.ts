@@ -5,6 +5,7 @@ import type { HappierAgentSession } from "../types.js";
 
 const cli = vi.hoisted(() => ({
   resolveHappierCliSettings: vi.fn(() => ({ executable: "happier", timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })),
+  archiveHappierSession: vi.fn(async () => undefined),
   createHappierSession: vi.fn(),
   sendHappierMessage: vi.fn(),
   getHappierSessionStatus: vi.fn(),
@@ -17,6 +18,7 @@ import { HappierRecoveryError, HappierRuntimeAdapter } from "../runtime-adapter.
 
 type RawHistoryRow = {
   id: string;
+  localId?: string;
   createdAt: number;
   role: string;
   raw: Record<string, unknown>;
@@ -24,6 +26,7 @@ type RawHistoryRow = {
 
 let nextSessionNumber: number;
 let nextMessageNumber: number;
+let nextBindingNumber: number;
 let histories: Map<string, RawHistoryRow[]>;
 
 function rawTextRow(
@@ -31,8 +34,9 @@ function rawTextRow(
   createdAt: number,
   role: RawHistoryRow["role"],
   text: string,
+  localId?: string,
 ): RawHistoryRow {
-  return { id, createdAt, role, raw: { content: { type: "text", text } } };
+  return { id, ...(localId ? { localId } : {}), createdAt, role, raw: { content: { type: "text", text } } };
 }
 
 function rawCodexRow(id: string, createdAt: number, text: string): RawHistoryRow {
@@ -52,13 +56,29 @@ function historyFor(sessionId: string): RawHistoryRow[] {
   return created;
 }
 
-function nativeBinding(nativeSessionId: string | null = null) {
-  const persistNativeSessionId = vi.fn(async () => undefined);
+function nativeBinding(nativeSessionId: string | null = null, key = `binding-${nextBindingNumber++}`) {
+  let persisted = nativeSessionId;
+  const refreshNativeSessionId = vi.fn(async () => persisted);
+  const claimNativeSessionId = vi.fn(async (candidate: string) => {
+    if (!persisted) {
+      persisted = candidate;
+      binding.nativeSessionId = candidate;
+      return { claimed: true, nativeSessionId: candidate };
+    }
+    return { claimed: false, nativeSessionId: persisted };
+  });
+  const persistNativeSessionId = vi.fn(async (candidate: string) => {
+    const result = await claimNativeSessionId(candidate);
+    if (result.nativeSessionId !== candidate) throw new Error("native id already claimed");
+  });
   const binding: AgentRuntimeNativeSessionBinding = {
+    key,
     nativeSessionId,
+    refreshNativeSessionId,
+    claimNativeSessionId,
     persistNativeSessionId,
   };
-  return { binding, persistNativeSessionId };
+  return { binding, refreshNativeSessionId, claimNativeSessionId, persistNativeSessionId };
 }
 
 function makeOptions(
@@ -86,6 +106,7 @@ describe("HappierRuntimeAdapter", () => {
     vi.resetAllMocks();
     nextSessionNumber = 1;
     nextMessageNumber = 1;
+    nextBindingNumber = 1;
     histories = new Map();
 
     cli.createHappierSession.mockImplementation(async () => {
@@ -93,11 +114,11 @@ describe("HappierRuntimeAdapter", () => {
       historyFor(sessionId);
       return { sessionId, session: { id: sessionId }, created: true };
     });
-    cli.sendHappierMessage.mockImplementation(async ({ sessionId, message }: { sessionId: string; message: string }) => {
-      const localId = `user-${nextMessageNumber++}`;
+    cli.sendHappierMessage.mockImplementation(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
+      const userId = `user-${nextMessageNumber++}`;
       const assistantId = `assistant-${nextMessageNumber++}`;
       historyFor(sessionId).push(
-        rawTextRow(localId, nextMessageNumber * 1_000, "user", message),
+        rawTextRow(userId, nextMessageNumber * 1_000, "user", message, localId),
         rawTextRow(assistantId, nextMessageNumber * 1_000 + 1, "assistant", `reply:${message}`),
       );
       return { sessionId, localId, waited: true };
@@ -119,9 +140,9 @@ describe("HappierRuntimeAdapter", () => {
     await runtime.promptWithFallback(result.session, "second prompt");
 
     expect(cli.createHappierSession).toHaveBeenCalledTimes(1);
-    expect(native.persistNativeSessionId).toHaveBeenCalledOnce();
-    expect(native.persistNativeSessionId).toHaveBeenCalledWith("hp_session_1");
-    expect(native.persistNativeSessionId.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(native.claimNativeSessionId).toHaveBeenCalledOnce();
+    expect(native.claimNativeSessionId).toHaveBeenCalledWith("hp_session_1");
+    expect(native.claimNativeSessionId.mock.invocationCallOrder[0]).toBeLessThan(
       cli.sendHappierMessage.mock.invocationCallOrder[0],
     );
     expect(cli.sendHappierMessage).toHaveBeenNthCalledWith(
@@ -140,7 +161,7 @@ describe("HappierRuntimeAdapter", () => {
     await runtime.promptWithFallback(result.session, "after restart");
 
     expect(cli.createHappierSession).not.toHaveBeenCalled();
-    expect(native.persistNativeSessionId).not.toHaveBeenCalled();
+    expect(native.claimNativeSessionId).not.toHaveBeenCalled();
     expect(cli.getHappierSessionStatus).toHaveBeenCalledWith("hp_session_1", expect.anything());
     expect(cli.sendHappierMessage).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: "hp_session_1", message: "after restart" }),
@@ -152,23 +173,15 @@ describe("HappierRuntimeAdapter", () => {
   });
 
   it("reuses and reconciles the id persisted by a previous runtime instance", async () => {
-    let persistedNativeSessionId: string | null = null;
-    const firstBinding: AgentRuntimeNativeSessionBinding = {
-      nativeSessionId: null,
-      persistNativeSessionId: async (nativeSessionId) => {
-        persistedNativeSessionId = nativeSessionId;
-      },
-    };
+    const firstBinding = nativeBinding(null, "restart-binding");
     const firstRuntime = new HappierRuntimeAdapter({ backend: "codex" });
-    const firstSession = await firstRuntime.createSession(makeOptions(firstBinding));
+    const firstSession = await firstRuntime.createSession(makeOptions(firstBinding.binding));
     await firstRuntime.promptWithFallback(firstSession.session, "before restart");
 
-    expect(persistedNativeSessionId).toBe("hp_session_1");
+    expect(firstBinding.binding.nativeSessionId).toBe("hp_session_1");
     const restartedRuntime = new HappierRuntimeAdapter({ backend: "codex" });
-    const restartedSession = await restartedRuntime.createSession(makeOptions({
-      nativeSessionId: persistedNativeSessionId,
-      persistNativeSessionId: async () => undefined,
-    }));
+    const restartedBinding = nativeBinding(firstBinding.binding.nativeSessionId, "restart-binding");
+    const restartedSession = await restartedRuntime.createSession(makeOptions(restartedBinding.binding));
     await restartedRuntime.promptWithFallback(restartedSession.session, "after restart");
 
     expect(cli.createHappierSession).toHaveBeenCalledTimes(1);
@@ -244,6 +257,53 @@ describe("HappierRuntimeAdapter", () => {
     ]);
   });
 
+  it("serializes concurrent first prompts across adapter and session objects sharing one canonical key", async () => {
+    let persisted: string | null = null;
+    const makeSharedBinding = (): AgentRuntimeNativeSessionBinding => ({
+      key: "shared-canonical-session",
+      nativeSessionId: persisted,
+      refreshNativeSessionId: async () => persisted,
+      claimNativeSessionId: async (candidate) => {
+        if (!persisted) {
+          persisted = candidate;
+          return { claimed: true, nativeSessionId: candidate };
+        }
+        return { claimed: false, nativeSessionId: persisted };
+      },
+      persistNativeSessionId: async () => undefined,
+    });
+    const firstRuntime = new HappierRuntimeAdapter({ backend: "codex" });
+    const secondRuntime = new HappierRuntimeAdapter({ backend: "codex" });
+    const first = await firstRuntime.createSession(makeOptions(makeSharedBinding()));
+    const second = await secondRuntime.createSession(makeOptions(makeSharedBinding()));
+
+    await Promise.all([
+      firstRuntime.promptWithFallback(first.session, "shared first"),
+      secondRuntime.promptWithFallback(second.session, "shared second"),
+    ]);
+
+    expect(cli.createHappierSession).toHaveBeenCalledTimes(1);
+    expect(persisted).toBe("hp_session_1");
+    expect(first.session.sessionId).toBe("hp_session_1");
+    expect(second.session.sessionId).toBe("hp_session_1");
+  });
+
+  it("keeps the atomic claim winner and archives a cross-process loser", async () => {
+    const binding = nativeBinding(null, "cas-loser");
+    binding.claimNativeSessionId.mockResolvedValueOnce({ claimed: false, nativeSessionId: "hp_winner" });
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(binding.binding));
+
+    await runtime.promptWithFallback(result.session, "use winner");
+
+    expect(cli.archiveHappierSession).toHaveBeenCalledWith("hp_session_1", expect.anything());
+    expect(result.session.sessionId).toBe("hp_winner");
+    expect(cli.sendHappierMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "hp_winner", message: "use winner" }),
+      expect.anything(),
+    );
+  });
+
   it("serializes sends for one runtime session", async () => {
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -310,12 +370,12 @@ describe("HappierRuntimeAdapter", () => {
   });
 
   it("emits official Codex agent message rows as assistant output", async () => {
-    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
       historyFor(sessionId).push(
-        rawTextRow("codex-user", 2_000, "user", message),
+        rawTextRow("codex-user", 2_000, "user", message, localId),
         rawCodexRow("codex-agent", 2_001, "codex provider text"),
       );
-      return { sessionId, waited: true };
+      return { sessionId, localId, waited: true };
     });
     const onText = vi.fn();
     const runtime = new HappierRuntimeAdapter({ backend: "codex" });
@@ -327,9 +387,9 @@ describe("HappierRuntimeAdapter", () => {
   });
 
   it("accepts an ambiguous send only when bounded history positively proves acceptance", async () => {
-    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
       historyFor(sessionId).push(
-        rawTextRow("accepted-user", 2_000, "user", message),
+        rawTextRow("accepted-user", 2_000, "user", message, localId),
         rawTextRow("accepted-assistant", 2_001, "assistant", "accepted reply"),
       );
       throw new HappierCliError("timeout", "send timed out");
@@ -356,6 +416,37 @@ describe("HappierRuntimeAdapter", () => {
     });
     expect((result.session as HappierAgentSession).state.status).toBe("blocked");
     expect(cli.getHappierSessionStatus).toHaveBeenCalledTimes(1);
+    expect(cli.sendHappierMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not accept another surface's identical text without the exact local id", async () => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+      historyFor(sessionId).push(
+        rawTextRow("other-user", 2_000, "user", message, "other-surface-id"),
+        rawTextRow("other-assistant", 2_001, "assistant", "other reply"),
+      );
+      throw new HappierCliError("timeout", "send timed out");
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding().binding, { onText }));
+
+    await expect(runtime.promptWithFallback(result.session, "same text")).rejects.toMatchObject({
+      code: "ambiguous-send-unresolved",
+    });
+    expect(onText).not.toHaveBeenCalled();
+    expect(cli.sendHappierMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a mismatched send response correlation id without retrying", async () => {
+    cli.sendHappierMessage.mockRejectedValueOnce(new HappierCliError("protocol", "mismatched localId"));
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding().binding));
+
+    await expect(runtime.promptWithFallback(result.session, "protocol mismatch")).rejects.toMatchObject({
+      code: "history-reconciliation-failed",
+    });
+    expect((result.session as HappierAgentSession).state.status).toBe("blocked");
     expect(cli.sendHappierMessage).toHaveBeenCalledTimes(1);
   });
 
@@ -432,7 +523,7 @@ describe("HappierRuntimeAdapter", () => {
 
   it("blocks before send when native-id persistence fails", async () => {
     const native = nativeBinding();
-    native.persistNativeSessionId.mockRejectedValue(new Error("database unavailable"));
+    native.claimNativeSessionId.mockRejectedValue(new Error("database unavailable"));
     const runtime = new HappierRuntimeAdapter({ backend: "codex" });
     const result = await runtime.createSession(makeOptions(native.binding));
 

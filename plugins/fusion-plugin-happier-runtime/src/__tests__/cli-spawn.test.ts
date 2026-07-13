@@ -10,6 +10,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
 }));
 
 import {
+  archiveHappierSession,
   buildHappierInvocation,
   createHappierSession,
   getHappierSessionHistory,
@@ -28,7 +29,7 @@ const SEND_SUCCESS =
 const STATUS_SUCCESS =
   '{"v":1,"ok":true,"kind":"session_status","data":{"session":{"id":"sess_integration_status_123","active":true},"agentState":{"pendingRequestsCount":0,"controlledByUser":false}}}';
 const HISTORY_SUCCESS =
-  '{"v":1,"ok":true,"kind":"session_history","data":{"sessionId":"sess_integration_history_123","format":"raw","messages":[{"id":"message-1","role":"user","content":{"type":"text","text":"hello"}}]}}';
+  '{"v":1,"ok":true,"kind":"session_history","data":{"sessionId":"sess_integration_history_123","format":"raw","messages":[{"id":"message-1","localId":"local-1","createdAt":1,"role":"user","raw":{"content":{"type":"text","text":"hello"}}}]}}';
 const AUTH_FAILURE =
   '{"v":1,"ok":false,"kind":"session_send","error":{"code":"not_authenticated","message":"accessToken=do-not-leak"}}';
 
@@ -271,7 +272,7 @@ describe("Happier session wrappers", () => {
     mockSpawn.mockReturnValue(fake.child);
 
     const sendPromise = sendHappierMessage(
-      { sessionId: " sess_integration_send_123 ", message: "hello", timeoutSeconds: 30 },
+      { sessionId: " sess_integration_send_123 ", message: "hello", localId: "local-1", timeoutSeconds: 30 },
       settings(),
     );
     fake.stdout(SEND_SUCCESS);
@@ -289,7 +290,7 @@ describe("Happier session wrappers", () => {
     await expect(historyPromise).resolves.toMatchObject({ sessionId: "sess_integration_history_123", messages: expect.any(Array) });
 
     expect(mockSpawn.mock.calls.map((call) => call[1])).toEqual([
-      ["session", "send", "sess_integration_send_123", "hello", "--wait", "--timeout", "30", "--json"],
+      ["session", "send", "sess_integration_send_123", "hello", "--local-id", "local-1", "--wait", "--timeout", "30", "--json"],
       ["session", "status", "sess_integration_status_123", "--json"],
       ["session", "history", "sess_integration_history_123", "--limit", "10", "--format", "raw", "--json"],
     ]);
@@ -303,6 +304,34 @@ describe("Happier session wrappers", () => {
     fake.close(0);
 
     await expect(promise).rejects.toMatchObject({ code: "session" });
+  });
+
+  it("rejects a send response whose local id does not match the requested idempotency key", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = sendHappierMessage(
+      { sessionId: "sess_integration_send_123", message: "hello", localId: "expected-local", timeoutSeconds: 30 },
+      settings(),
+    );
+    fake.stdout(SEND_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).rejects.toMatchObject({ code: "protocol" });
+  });
+
+  it("constructs the official archive command used to clean up a lost native-session claim", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = archiveHappierSession("sess_orphan", settings());
+    fake.stdout('{"v":1,"ok":true,"kind":"session_archive","data":{"sessionId":"sess_orphan","archivedAt":1}}');
+    fake.close(0);
+
+    await expect(promise).resolves.toBeUndefined();
+    expect(mockSpawn).toHaveBeenLastCalledWith(
+      "happier",
+      ["session", "archive", "sess_orphan", "--json"],
+      expect.objectContaining({ shell: false, stdio: ["ignore", "pipe", "pipe"] }),
+    );
   });
 });
 

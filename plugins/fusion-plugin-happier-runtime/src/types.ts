@@ -49,6 +49,7 @@ export type HappierErrorCode =
   | "server"
   | "daemon"
   | "backend"
+  | "protocol"
   | "session";
 
 export class HappierCliError extends Error {
@@ -100,6 +101,7 @@ export interface HappierSessionCreateInput {
 export interface HappierMessageInput {
   sessionId: string;
   message: string;
+  localId: string;
   timeoutSeconds: number;
 }
 
@@ -108,6 +110,7 @@ export type HappierSessionMessageResult = HappierJsonRecord & { sessionId: strin
 export type HappierSessionStatusResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord };
 export interface HappierRawHistoryRow {
   id: string;
+  localId?: string;
   createdAt: number;
   role: string;
   raw: Record<string, unknown>;

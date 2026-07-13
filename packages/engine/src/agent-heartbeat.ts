@@ -2887,7 +2887,7 @@ export class HeartbeatMonitor {
           cwd: sessionCwd,
           systemPrompt: systemPromptFinal,
           systemPromptLayers: heartbeatLayers,
-          nativeSession: createTaskStoreNativeSessionBinding({
+          nativeSession: await createTaskStoreNativeSessionBinding({
             runtimeHint: heartbeatRuntimeHint,
             taskStore,
             sessionKey: `heartbeat:${agentId}:${run.id}`,

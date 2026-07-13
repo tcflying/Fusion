@@ -12140,7 +12140,7 @@ export class TaskExecutor {
             cwd: worktreePath,
             systemPrompt: executorSystemPromptFinal,
             systemPromptLayers: executorLayers,
-            nativeSession: createTaskStoreNativeSessionBinding({
+            nativeSession: await createTaskStoreNativeSessionBinding({
               runtimeHint: executorRuntimeHint,
               taskStore: this.store,
               sessionKey: `executor:${task.id}:primary`,
@@ -12579,7 +12579,7 @@ export class TaskExecutor {
                   cwd: worktreePath,
                   systemPrompt: executorSystemPromptFinal,
                   systemPromptLayers: executorLayers,
-                  nativeSession: createTaskStoreNativeSessionBinding({
+                  nativeSession: await createTaskStoreNativeSessionBinding({
                     runtimeHint: executorRuntimeHint,
                     taskStore: this.store,
                     sessionKey: `executor:${task.id}:primary`,
@@ -15510,7 +15510,7 @@ Do not refactor, rename broadly, or make opportunistic improvements.
 5. Do NOT make any git commits — just fix the code
 6. You MAY modify any files needed to make the verification pass, including files unrelated to this task's original change. Pre-existing build/test breakage is in scope: fix it. Prefer the smallest change that makes verification green.
 7. If you cannot fix the issue within scope, explain why and what evidence indicates a deeper/root problem`,
-        nativeSession: createTaskStoreNativeSessionBinding({
+        nativeSession: await createTaskStoreNativeSessionBinding({
           runtimeHint: verificationRuntimeHint,
           taskStore: this.store,
           sessionKey: `executor:${task.id}:verification-fix:${retryNumber}`,
@@ -16644,7 +16644,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath,
         systemPrompt: stepSystemPrompt,
-        nativeSession: createTaskStoreNativeSessionBinding({
+        nativeSession: await createTaskStoreNativeSessionBinding({
           runtimeHint: workflowRuntimeHint,
           taskStore: this.store,
           sessionKey: `executor:${task.id}:workflow:${workflowStep.name}:${attemptLabel}:${worktreePath}`,
@@ -19678,7 +19678,7 @@ Child agent: ${agent.id} (${name})`;
             pluginRunner: this.options.pluginRunner,
             cwd: childWorktreePath,
             systemPrompt: childSystemPrompt,
-            nativeSession: createTaskStoreNativeSessionBinding({
+            nativeSession: await createTaskStoreNativeSessionBinding({
               runtimeHint: childRuntimeHint,
               taskStore: this.store,
               sessionKey: `executor:${taskId}:child:${agent.id}`,

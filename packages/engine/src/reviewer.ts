@@ -465,7 +465,7 @@ export async function reviewStep(
       systemPrompt: reviewerSystemPromptFinal,
       systemPromptLayers: layers,
       nativeSession: options.store
-        ? createTaskStoreNativeSessionBinding({
+        ? await createTaskStoreNativeSessionBinding({
             runtimeHint: reviewerRuntimeHint,
             taskStore: options.store,
             sessionKey: `reviewer:${taskId}:${stepNumber}:${reviewType}:${cwd}:${sessionOrdinal}`,

@@ -2,37 +2,38 @@
 
 Status: IMPLEMENTED, PENDING INDEPENDENT RE-REVIEW
 
-## Scope completed
+## Runtime and persistence
 
-- Added a real `AgentRuntimeNativeSessionBinding` backed by Fusion's canonical `CliSessionStore`.
-- Wired Happier native-session persistence through production executor, workflow, child-agent, verification-fix, reviewer, and heartbeat session creation paths.
-- Reused a deterministic Fusion CLI-session record so a fresh process reloads the same Happier session id instead of creating a second remote session.
-- Serialized sends per runtime session and failed closed when the native-session binding is absent.
-- Reconciled sends against Happier's official raw history envelope: `{ id, createdAt, role, raw }`.
-- Captured a pre-send history watermark, required exactly one post-watermark matching user row, and only accepted assistant output after that row.
-- On timeout/process/server/daemon ambiguity, performed one bounded status/history reconciliation and never resent the prompt automatically.
+- Production executor, workflow, verification-fix, child-agent, reviewer, and heartbeat paths create canonical `CliSessionStore` bindings.
+- Each binding exposes a stable project/session key, a current-id refresh, and an atomic compare-and-set claim.
+- `CliSessionStore.claimNativeSessionId` uses one SQL update guarded by `nativeSessionId IS NULL`; a losing contender cannot overwrite the winner.
+- All adapter/session objects with the same canonical key share one process-wide prompt queue, so concurrent first prompts create one Happier session and subsequent sends to that native session remain ordered.
+- An extreme cross-process claim loser keeps the canonical winner and archives its newly-created orphan through the official Happier CLI. Cleanup failure is surfaced as blocked instead of silently leaking or replacing the winner.
 
-## Verification run on 2026-07-13 (UTC+8)
+## Protocol-level message correlation
+
+- Happier commit `84f8235` adds official `session send --local-id`, validates it, passes it to the existing idempotent send service, and exposes `localId` in raw history rows.
+- Fusion generates one unpredictable `fusion-<uuid>` before each send and passes it through the CLI.
+- Successful and ambiguous send reconciliation require exactly one post-watermark user row with that exact `localId`; identical text from another surface is not evidence.
+- The adapter never automatically resends an ambiguous prompt. Missing, duplicate, truncated, or mismatched evidence blocks the session.
+- Assistant output is accepted only after the correlated user row.
+
+## Local verification on 2026-07-13 (UTC+8)
 
 ```text
-corepack pnpm --filter @fusion-plugin-examples/happier-runtime test
-  PASS: 3 files, 38 tests
+Happier:
+  CLI focused tests: 3 files, 45 tests passed
+  protocol action executor: 1 file, 26 tests passed
+  @happier-dev/cli typecheck: passed
 
-corepack pnpm --filter @fusion/engine exec vitest run src/__tests__/agent-runtime-native-session.test.ts --project=engine-default --reporter=dot
-  PASS: 1 file, 3 tests
-
-corepack pnpm --filter @fusion-plugin-examples/happier-runtime typecheck
-  PASS
-
-corepack pnpm --filter @fusion-plugin-examples/happier-runtime build
-  PASS
-
-corepack pnpm --filter @fusion/engine typecheck
-  PASS
+Fusion:
+  @fusion-plugin-examples/happier-runtime: 3 files, 44 tests passed
+  @fusion/core cli-session-store: 1 file, 12 tests passed
+  @fusion/engine native-session production integration: 1 file, 3 tests passed
+  plugin/core/engine typecheck: passed
+  plugin build: passed
 ```
-
-The package-level `@fusion/engine test -- agent-runtime-native-session.test.ts` command did not filter the suite as intended and the Windows process exited with code `3221225477`. The exact-file Vitest invocation above is the valid focused proof; the full engine suite is not claimed green.
 
 ## Evidence boundary
 
-This proves local contract, persistence, production call-site wiring, type safety, and official raw-history parsing fixtures. It does not yet prove a live authenticated Happier session because the local Happier stack is currently unauthenticated and its daemon is stopped.
+This proves local contracts, SQL claim behavior, cross-adapter concurrency, production binding persistence, exact raw-history correlation, redaction boundaries, and focused builds. It does not yet prove a live authenticated Happier provider session because the local stack remains unauthenticated and its daemon is stopped. No full monorepo suite is claimed green.

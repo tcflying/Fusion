@@ -83,4 +83,27 @@ pgDescribe("CliSessionStore PostgreSQL persistence", () => {
       insert.mockRestore();
     }
   });
+
+  it("atomically claims an empty native session id without overwriting the winner", async () => {
+    const first = await CliSessionStore.create(h.layer(), "project-a");
+    const session = first.createSession({
+      id: "cli-native-claim",
+      projectId: "project-a",
+      adapterId: "happier",
+      purpose: "execute",
+    });
+    await first.flush();
+    const second = await CliSessionStore.create(h.layer(), "project-a");
+
+    const [firstClaim, secondClaim] = await Promise.all([
+      first.claimNativeSessionId(session.id, "native-first"),
+      second.claimNativeSessionId(session.id, "native-second"),
+    ]);
+
+    const winner = firstClaim?.claimed ? "native-first" : "native-second";
+    expect([firstClaim, secondClaim]).toContainEqual({ claimed: true, nativeSessionId: winner });
+    expect([firstClaim, secondClaim]).toContainEqual({ claimed: false, nativeSessionId: winner });
+    await first.flush();
+    expect((await CliSessionStore.create(h.layer(), "project-a")).getSession(session.id)?.nativeSessionId).toBe(winner);
+  });
 });

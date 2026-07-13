@@ -1,15 +1,13 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync } from "node:fs";
-import { rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { CliSessionStore, Database, TaskStore } from "@fusion/core";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { CliSessionStore } from "@fusion/core";
+import { createSharedPgTaskStoreTestHarness, pgDescribe, type SharedPgTaskStoreHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
 import { createCliSessionNativeSessionBinding } from "../agent-runtime.js";
 import type { PluginRunner } from "../plugin-runner.js";
 import { reviewStep } from "../reviewer.js";
 
 const cli = vi.hoisted(() => ({
   resolveHappierCliSettings: vi.fn(() => ({ executable: "happier", timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })),
+  archiveHappierSession: vi.fn(async () => undefined),
   createHappierSession: vi.fn(),
   sendHappierMessage: vi.fn(),
   getHappierSessionStatus: vi.fn(),
@@ -28,28 +26,22 @@ vi.mock("../pi.js", async (importOriginal) => {
 
 import { HappierRuntimeAdapter } from "../../../../plugins/fusion-plugin-happier-runtime/src/runtime-adapter.js";
 
-describe("AgentRuntime native session persistence binding", () => {
-  let tmpDir: string;
-  let fusionDir: string;
-  let database: Database;
+pgDescribe("AgentRuntime native session persistence binding", () => {
+  const h: SharedPgTaskStoreHarness = createSharedPgTaskStoreTestHarness({
+    prefix: "fusion_agent_runtime_native_session",
+  });
   let store: CliSessionStore;
 
-  beforeAll(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "fusion-agent-runtime-native-session-"));
-    fusionDir = join(tmpDir, ".fusion");
-    database = new Database(fusionDir, { inMemory: true });
-    database.init();
-    store = new CliSessionStore(fusionDir, database);
-  });
+  beforeAll(h.beforeAll);
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    await h.beforeEach();
     vi.clearAllMocks();
+    store = await CliSessionStore.create(h.layer(), "project-happier");
   });
 
-  afterAll(async () => {
-    database.close();
-    await rm(tmpDir, { recursive: true, force: true });
-  });
+  afterEach(h.afterEach);
+  afterAll(h.afterAll);
 
   it("persists a created native id and exposes it to a fresh runtime binding", async () => {
     const fusionSession = store.createSession({
@@ -64,7 +56,8 @@ describe("AgentRuntime native session persistence binding", () => {
     expect(firstRuntimeBinding.nativeSessionId).toBeNull();
     await firstRuntimeBinding.persistNativeSessionId("hp_session_durable");
 
-    const restartedStore = new CliSessionStore(fusionDir, database);
+    await store.flush();
+    const restartedStore = await CliSessionStore.create(h.layer(), "project-happier");
     const restartedRuntimeBinding = createCliSessionNativeSessionBinding({ store: restartedStore, sessionId: fusionSession.id });
     expect(restartedRuntimeBinding.nativeSessionId).toBe("hp_session_durable");
   });
@@ -76,10 +69,8 @@ describe("AgentRuntime native session persistence binding", () => {
   });
 
   it("wires persistence through the production reviewer path and reloads it for a fresh runtime", async () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), "fusion-happier-reviewer-project-"));
-    const globalRoot = mkdtempSync(join(tmpdir(), "fusion-happier-reviewer-global-"));
-    const taskStore = new TaskStore(projectRoot, globalRoot, { inMemoryDb: true });
-    await taskStore.init();
+    const taskStore = h.store();
+    const projectRoot = taskStore.getRootDir();
     const task = await taskStore.createTask({
       title: "Happier production reviewer binding",
       description: "Exercise the actual reviewStep orchestration path",
@@ -106,12 +97,13 @@ describe("AgentRuntime native session persistence binding", () => {
       format: "raw",
       messages: [...(histories.get(sessionId) ?? [])],
     }));
-    cli.sendHappierMessage.mockImplementation(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+    cli.sendHappierMessage.mockImplementation(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
       const messages = histories.get(sessionId) ?? [];
       messageNumber += 1;
       messages.push(
         {
           id: `user-${messageNumber}`,
+          localId,
           createdAt: messageNumber * 1_000,
           role: "user",
           raw: { content: { type: "text", text: message } },
@@ -124,7 +116,7 @@ describe("AgentRuntime native session persistence binding", () => {
         },
       );
       histories.set(sessionId, messages);
-      return { sessionId, localId: `user-${messageNumber}`, waited: true };
+      return { sessionId, localId, waited: true };
     });
 
     const pluginRunner = {
@@ -169,7 +161,7 @@ describe("AgentRuntime native session persistence binding", () => {
       const first = await reviewStep(projectRoot, task.id, 1, "Runtime", "code", task.description, undefined, reviewOptions);
       expect(first.verdict).toBe("APPROVE");
 
-      const persistedStore = new CliSessionStore(taskStore.getFusionDir(), taskStore.getDatabase());
+      const persistedStore = await CliSessionStore.create(h.layer(), taskStore.getFusionDir());
       const persistedSessions = persistedStore.listByTask(task.id);
       expect(persistedSessions).toHaveLength(1);
       expect(persistedSessions[0].nativeSessionId).toBe("hp_engine_durable");
@@ -184,9 +176,7 @@ describe("AgentRuntime native session persistence binding", () => {
       expect(restartStatusOrder).toBeDefined();
       expect(restartStatusOrder!).toBeLessThan(cli.sendHappierMessage.mock.invocationCallOrder[1]);
     } finally {
-      taskStore.close();
-      await rm(projectRoot, { recursive: true, force: true });
-      await rm(globalRoot, { recursive: true, force: true });
+      // The shared PostgreSQL harness owns the TaskStore and cleanup lifecycle.
     }
   });
 });

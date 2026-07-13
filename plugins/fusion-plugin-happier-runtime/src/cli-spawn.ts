@@ -447,10 +447,14 @@ export async function sendHappierMessage(
 ): Promise<HappierSessionMessageResult> {
   const sessionId = trimSessionId(input.sessionId);
   if (!input.message.trim()) throw new HappierCliError("session", "Happier message is required");
+  const localId = input.localId.trim();
+  if (!localId || localId.length > 128 || !/^[A-Za-z0-9._:-]+$/u.test(localId)) {
+    throw new HappierCliError("session", "Happier message localId is invalid");
+  }
   const timeoutSeconds = validatePositiveInteger(input.timeoutSeconds, "timeoutSeconds");
   const data = ensureRecord(
     await invokeForKind(
-      ["session", "send", sessionId, input.message, "--wait", "--timeout", String(timeoutSeconds), "--json"],
+      ["session", "send", sessionId, input.message, "--local-id", localId, "--wait", "--timeout", String(timeoutSeconds), "--json"],
       "session_send",
       settings,
       signal,
@@ -458,9 +462,22 @@ export async function sendHappierMessage(
     "session send",
   );
   const returnedSessionId = expectedSessionId(data, sessionId, "session send");
-  if (data.localId !== undefined && data.localId !== null && typeof data.localId !== "string") throw new HappierCliError("session", "Happier session send returned an invalid localId");
+  if (data.localId !== localId) throw new HappierCliError("protocol", "Happier session send returned a mismatched localId");
   if (data.waited !== undefined && typeof data.waited !== "boolean") throw new HappierCliError("session", "Happier session send returned an invalid waited flag");
   return { ...data, sessionId: returnedSessionId } as HappierSessionMessageResult;
+}
+
+export async function archiveHappierSession(
+  sessionId: string,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<void> {
+  const requested = trimSessionId(sessionId);
+  const data = ensureRecord(
+    await invokeForKind(["session", "archive", requested, "--json"], "session_archive", settings, signal),
+    "session archive",
+  );
+  expectedSessionId(data, requested, "session archive");
 }
 
 export async function getHappierSessionStatus(

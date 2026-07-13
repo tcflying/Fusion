@@ -10,7 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
 import { fromJson } from "./db-helpers.js";
@@ -214,6 +214,52 @@ export class CliSessionStore extends EventEmitter<CliSessionStoreEvents> {
     return updated;
   }
 
+  /**
+   * FNXC:HappierRuntime 2026-07-21-17:02:
+   * A native Happier session may be created by competing recovery workers.
+   * Claim it through PostgreSQL rather than the in-memory cache so only one
+   * worker owns it after a restart or multi-process race.
+   */
+  async claimNativeSessionId(id: string, candidate: string): Promise<
+    { claimed: boolean; nativeSessionId: string } | undefined
+  > {
+    const nativeSessionId = candidate.trim();
+    if (!nativeSessionId) throw new Error("Native session id is required");
+    const now = new Date().toISOString();
+    const [winner] = await this.layer.db
+      .update(schema.project.cliSessions)
+      .set({ nativeSessionId, updatedAt: now })
+      .where(and(
+        eq(schema.project.cliSessions.id, id),
+        eq(schema.project.cliSessions.ownerProjectId, this.projectId),
+        isNull(schema.project.cliSessions.nativeSessionId),
+      ))
+      .returning({ nativeSessionId: schema.project.cliSessions.nativeSessionId });
+    const claimed = winner !== undefined;
+    const persistedNativeSessionId = winner?.nativeSessionId ?? (await this.layer.db
+      .select({ nativeSessionId: schema.project.cliSessions.nativeSessionId })
+      .from(schema.project.cliSessions)
+      .where(and(
+        eq(schema.project.cliSessions.id, id),
+        eq(schema.project.cliSessions.ownerProjectId, this.projectId),
+      )))[0]?.nativeSessionId;
+    if (!persistedNativeSessionId) {
+      if (!this.sessions.has(id)) return undefined;
+      throw new Error(`CLI session ${id} has no native session id after claim`);
+    }
+    const session = this.sessions.get(id);
+    if (session && session.nativeSessionId !== persistedNativeSessionId) {
+      const updated = { ...session, nativeSessionId: persistedNativeSessionId, updatedAt: now };
+      this.sessions.set(id, updated);
+      this.emit("cli-session:updated", updated);
+    }
+    if (claimed) {
+      this.sessions.set(id, { ...session!, nativeSessionId: persistedNativeSessionId, updatedAt: now });
+    }
+    return { claimed, nativeSessionId: persistedNativeSessionId };
+  }
+
+  /** Delete a CLI session record. */
   deleteSession(id: string): boolean {
     if (!this.sessions.delete(id)) return false;
     this.enqueue(() => this.layer.db
