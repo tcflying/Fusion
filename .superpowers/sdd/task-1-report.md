@@ -45,6 +45,7 @@ The generated importer now links `@fusion/plugin-sdk` and pins the package's `@t
 - Maps official `error.code` values first, retaining textual classification only for malformed/non-envelope process failures.
 - Extracts create ids from `data.session.id`; validates send/status/history data and trims safe session ids.
 - Recursively redacts camelCase, snake_case, and kebab-case sensitive keys, including access tokens, client secrets, private keys, API keys, authorization, and nested values.
+- Applies the same Bearer and sensitive-assignment redaction rules to every string leaf, preserving nonsecret text in parseable JSON diagnostics.
 - Uses a hard-capped streaming accumulator. Any stdout/stderr overflow terminates the child and returns `output-limit`.
 - Preserves shell-free spawn, timeout termination, and AbortSignal cancellation.
 - Adds the real `src/index.ts` package entrypoint and coherent package exports.
@@ -71,6 +72,27 @@ Test Files  1 passed (1)
 Tests       17 passed (17)
 ```
 
+The independent review found a parseable-invalid-envelope leak in string leaves. The narrow regression was run RED first:
+
+```powershell
+corepack pnpm --filter @fusion-plugin-examples/happier-runtime exec vitest run src/__tests__/cli-spawn.test.ts -t "redacts textual secrets in parseable invalid-envelope diagnostics"
+```
+
+RED result:
+
+```text
+Test Files  1 failed (1)
+Tests       1 failed | 17 skipped (18)
+Received: ... output={"message":"Bearer live-token; ..."}
+```
+
+After the minimal `redactValue` string-leaf fix, the same focused test passed:
+
+```text
+Test Files  1 passed (1)
+Tests       1 passed | 17 skipped (18)
+```
+
 ## Final package verification
 
 ```powershell
@@ -83,9 +105,11 @@ corepack pnpm --filter @fusion-plugin-examples/happier-runtime build
 Results:
 
 - frozen install: PASS, `Lockfile is up to date, resolution step is skipped`;
-- exact package test: PASS, 1 file and 17/17 tests;
+- exact package test: PASS, 2 files and 35/35 tests;
 - exact package typecheck: PASS, exit 0;
 - exact package build: PASS, exit 0;
 - built entrypoint import: PASS, printed `function function`.
+
+The review follow-up also passed `git diff --check` before commit.
 
 No service was started, port 4040 was not touched, and no Kimi/Moonshot route or credential was added.

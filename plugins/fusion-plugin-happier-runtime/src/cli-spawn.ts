@@ -47,6 +47,14 @@ function isSensitiveKey(key: string): boolean {
   return SENSITIVE_KEYS.has(normalizeKey(key));
 }
 
+function redactText(value: string): string {
+  return value
+    .replace(BEARER_RE, "Bearer [REDACTED]")
+    .replace(SENSITIVE_ASSIGNMENT_RE, (match, quote: string, key: string, separator: string) => {
+      return isSensitiveKey(key) ? `${quote}${key}${quote}${separator}${REDACTED}` : match;
+    });
+}
+
 function redactValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(redactValue);
   if (value && typeof value === "object") {
@@ -54,7 +62,7 @@ function redactValue(value: unknown): unknown {
       Object.entries(value).map(([key, nested]) => [key, isSensitiveKey(key) ? REDACTED : redactValue(nested)]),
     );
   }
-  return value;
+  return typeof value === "string" ? redactText(value) : value;
 }
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -72,11 +80,7 @@ export function redactHappierOutput(raw: string, maxBytes = DEFAULT_MAX_OUTPUT_B
   try {
     redacted = JSON.stringify(redactValue(JSON.parse(raw))) ?? REDACTED;
   } catch {
-    redacted = raw
-      .replace(BEARER_RE, "Bearer [REDACTED]")
-      .replace(SENSITIVE_ASSIGNMENT_RE, (match, quote: string, key: string, separator: string) => {
-        return isSensitiveKey(key) ? `${quote}${key}${quote}${separator}${REDACTED}` : match;
-      });
+    redacted = redactText(raw);
   }
   return truncateUtf8(redacted, Math.max(1, Math.floor(maxBytes)));
 }

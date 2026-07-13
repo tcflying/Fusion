@@ -149,6 +149,17 @@ describe("Happier official JSON envelopes", () => {
     await expect(parseHappierJson(raw, 80)).rejects.toSatisfy((error: Error) => error.message.length < 240);
   });
 
+  it("redacts textual secrets in parseable invalid-envelope diagnostics", async () => {
+    const raw = '{"message":"Bearer live-token; accessToken=live-access; keep this context"}';
+
+    await expect(parseHappierJson(raw)).rejects.toMatchObject({ code: "invalid-json" });
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("live-token");
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("live-access");
+    await expect(parseHappierJson(raw)).rejects.toThrow("Bearer [REDACTED]");
+    await expect(parseHappierJson(raw)).rejects.toThrow("accessToken=[REDACTED]");
+    await expect(parseHappierJson(raw)).rejects.toThrow("keep this context");
+  });
+
   it("maps the official error code before considering any message text", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
