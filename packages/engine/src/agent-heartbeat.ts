@@ -88,6 +88,7 @@ import { promptWithFallback } from "./pi.js";
 import { withRateLimitRetry } from "./rate-limit-retry.js";
 import { buildAgentGatedActionSummary } from "./permanent-agent-gating.js";
 import { createResolvedAgentSession, extractRuntimeHint, resolveHeartbeatSessionModels, resolveExecutorFallbackThinkingLevel } from "./agent-session-helpers.js";
+import { createTaskStoreNativeSessionBinding } from "./agent-runtime.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
 import { buildSessionSkillContextSync } from "./session-skill-context.js";
@@ -2868,6 +2869,7 @@ export class HeartbeatMonitor {
         }
 
         const heartbeatSessionModels = resolveHeartbeatSessionModels(heartbeatModelSettings, agent.runtimeConfig);
+        const heartbeatRuntimeHint = extractRuntimeHint(agent.runtimeConfig);
         /*
          * FNXC:McpConfig 2026-06-26-00:00:
          * Heartbeat runs are coding-capable agent-work sessions, so configured MCP servers must be resolved with the waking agent identity and forwarded like executor/chat lanes. Log only server counts and resolution error counts; resolved env/header contents may contain materialized secrets.
@@ -2880,11 +2882,19 @@ export class HeartbeatMonitor {
         // Create agent session
         const { session } = await createResolvedAgentSession({
           sessionPurpose: "heartbeat",
-          runtimeHint: extractRuntimeHint(agent.runtimeConfig),
+          runtimeHint: heartbeatRuntimeHint,
           pluginRunner: this.pluginRunner,
           cwd: sessionCwd,
           systemPrompt: systemPromptFinal,
           systemPromptLayers: heartbeatLayers,
+          nativeSession: createTaskStoreNativeSessionBinding({
+            runtimeHint: heartbeatRuntimeHint,
+            taskStore,
+            sessionKey: `heartbeat:${agentId}:${run.id}`,
+            taskId: taskId ?? null,
+            purpose: "execute",
+            worktreePath: sessionCwd,
+          }),
           tools: "coding",
           customTools: heartbeatTools,
           defaultProvider: heartbeatSessionModels.defaultProvider,

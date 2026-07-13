@@ -15,20 +15,39 @@ vi.mock("../cli-spawn.js", () => cli);
 
 import { HappierRecoveryError, HappierRuntimeAdapter } from "../runtime-adapter.js";
 
-type HistoryMessage = {
+type RawHistoryRow = {
   id: string;
-  role: "user" | "assistant";
-  content: { type: "text"; text: string };
+  createdAt: number;
+  role: string;
+  raw: Record<string, unknown>;
 };
 
 let nextSessionNumber: number;
 let nextMessageNumber: number;
-let histories: Map<string, HistoryMessage[]>;
+let histories: Map<string, RawHistoryRow[]>;
 
-function historyFor(sessionId: string): HistoryMessage[] {
+function rawTextRow(
+  id: string,
+  createdAt: number,
+  role: RawHistoryRow["role"],
+  text: string,
+): RawHistoryRow {
+  return { id, createdAt, role, raw: { content: { type: "text", text } } };
+}
+
+function rawCodexRow(id: string, createdAt: number, text: string): RawHistoryRow {
+  return {
+    id,
+    createdAt,
+    role: "agent",
+    raw: { content: { type: "codex", provider: "codex", data: { type: "message", message: text } } },
+  };
+}
+
+function historyFor(sessionId: string): RawHistoryRow[] {
   const existing = histories.get(sessionId);
   if (existing) return existing;
-  const created: HistoryMessage[] = [];
+  const created: RawHistoryRow[] = [];
   histories.set(sessionId, created);
   return created;
 }
@@ -78,8 +97,8 @@ describe("HappierRuntimeAdapter", () => {
       const localId = `user-${nextMessageNumber++}`;
       const assistantId = `assistant-${nextMessageNumber++}`;
       historyFor(sessionId).push(
-        { id: localId, role: "user", content: { type: "text", text: message } },
-        { id: assistantId, role: "assistant", content: { type: "text", text: `reply:${message}` } },
+        rawTextRow(localId, nextMessageNumber * 1_000, "user", message),
+        rawTextRow(assistantId, nextMessageNumber * 1_000 + 1, "assistant", `reply:${message}`),
       );
       return { sessionId, localId, waited: true };
     });
@@ -277,7 +296,7 @@ describe("HappierRuntimeAdapter", () => {
 
   it("emits only newly-produced assistant text after successful --wait metadata", async () => {
     histories.set("hp_session_1", [
-      { id: "old-assistant", role: "assistant", content: { type: "text", text: "old output" } },
+      rawTextRow("old-assistant", 1_000, "assistant", "old output"),
     ]);
     const onText = vi.fn();
     const runtime = new HappierRuntimeAdapter({ backend: "codex" });
@@ -290,11 +309,28 @@ describe("HappierRuntimeAdapter", () => {
     expect(onText.mock.calls.flat().join("\n")).toBe("reply:new prompt");
   });
 
+  it("emits official Codex agent message rows as assistant output", async () => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+      historyFor(sessionId).push(
+        rawTextRow("codex-user", 2_000, "user", message),
+        rawCodexRow("codex-agent", 2_001, "codex provider text"),
+      );
+      return { sessionId, waited: true };
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding().binding, { onText }));
+
+    await runtime.promptWithFallback(result.session, "official codex output");
+
+    expect(onText).toHaveBeenCalledWith("codex provider text");
+  });
+
   it("accepts an ambiguous send only when bounded history positively proves acceptance", async () => {
     cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
       historyFor(sessionId).push(
-        { id: "accepted-user", role: "user", content: { type: "text", text: message } },
-        { id: "accepted-assistant", role: "assistant", content: { type: "text", text: "accepted reply" } },
+        rawTextRow("accepted-user", 2_000, "user", message),
+        rawTextRow("accepted-assistant", 2_001, "assistant", "accepted reply"),
       );
       throw new HappierCliError("timeout", "send timed out");
     });
@@ -320,6 +356,77 @@ describe("HappierRuntimeAdapter", () => {
     });
     expect((result.session as HappierAgentSession).state.status).toBe("blocked");
     expect(cli.getHappierSessionStatus).toHaveBeenCalledTimes(1);
+    expect(cli.sendHappierMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the pre-send marker disappears from the bounded window", async () => {
+    histories.set("hp_session_1", [
+      rawTextRow("watermark-marker", 1_000, "assistant", "existing output"),
+    ]);
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+      histories.set(sessionId, [
+        rawTextRow("new-user", 2_000, "user", message),
+        rawTextRow("new-assistant", 2_001, "assistant", "must not emit"),
+      ]);
+      return { sessionId, localId: "new-user", waited: true };
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding("hp_session_1").binding, { onText }));
+
+    await expect(runtime.promptWithFallback(result.session, "window truncated")).rejects.toMatchObject({
+      name: "HappierRecoveryError",
+      code: "history-reconciliation-failed",
+    });
+    expect((result.session as HappierAgentSession).state.status).toBe("blocked");
+    expect(onText).not.toHaveBeenCalled();
+    expect(cli.sendHappierMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the bounded window drops an older watermark row", async () => {
+    histories.set("hp_session_1", [
+      rawTextRow("watermark-oldest", 900, "assistant", "older output"),
+      rawTextRow("watermark-latest", 1_000, "assistant", "latest output"),
+    ]);
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+      histories.set(sessionId, [
+        rawTextRow("watermark-latest", 1_000, "assistant", "latest output"),
+        rawTextRow("truncated-user", 2_000, "user", message),
+        rawTextRow("truncated-assistant", 2_001, "assistant", "must not emit"),
+      ]);
+      return { sessionId, localId: "truncated-user", waited: true };
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding("hp_session_1").binding, { onText }));
+
+    await expect(runtime.promptWithFallback(result.session, "partial window truncation")).rejects.toMatchObject({
+      name: "HappierRecoveryError",
+      code: "history-reconciliation-failed",
+    });
+    expect((result.session as HappierAgentSession).state.status).toBe("blocked");
+    expect(onText).not.toHaveBeenCalled();
+  });
+
+  it("blocks an ambiguous send when the bounded window lost the pre-send marker", async () => {
+    histories.set("hp_session_1", [
+      rawTextRow("ambiguous-marker", 1_000, "assistant", "existing output"),
+    ]);
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message }: { sessionId: string; message: string }) => {
+      histories.set(sessionId, [
+        rawTextRow("ambiguous-user", 2_000, "user", message),
+        rawTextRow("ambiguous-assistant", 2_001, "assistant", "unprovable output"),
+      ]);
+      throw new HappierCliError("timeout", "send timed out");
+    });
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding("hp_session_1").binding));
+
+    await expect(runtime.promptWithFallback(result.session, "ambiguous truncated")).rejects.toMatchObject({
+      name: "HappierRecoveryError",
+      code: "ambiguous-send-unresolved",
+    });
+    expect((result.session as HappierAgentSession).state.status).toBe("blocked");
     expect(cli.sendHappierMessage).toHaveBeenCalledTimes(1);
   });
 

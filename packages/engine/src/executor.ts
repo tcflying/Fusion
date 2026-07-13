@@ -107,6 +107,7 @@ import {
   resolveValidatorThinkingLevel,
   resolveValidatorFallbackThinkingLevel,
 } from "./agent-session-helpers.js";
+import { createTaskStoreNativeSessionBinding } from "./agent-runtime.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
 import { proseSignalsClearApproval, extractJsonObjectCandidates, type ReviewVerdict, type ReviewResult } from "./reviewer.js";
@@ -12139,6 +12140,14 @@ export class TaskExecutor {
             cwd: worktreePath,
             systemPrompt: executorSystemPromptFinal,
             systemPromptLayers: executorLayers,
+            nativeSession: createTaskStoreNativeSessionBinding({
+              runtimeHint: executorRuntimeHint,
+              taskStore: this.store,
+              sessionKey: `executor:${task.id}:primary`,
+              taskId: task.id,
+              purpose: "execute",
+              worktreePath,
+            }),
             tools: "coding",
             customTools,
             onText: agentLogger.onText,
@@ -12570,6 +12579,14 @@ export class TaskExecutor {
                   cwd: worktreePath,
                   systemPrompt: executorSystemPromptFinal,
                   systemPromptLayers: executorLayers,
+                  nativeSession: createTaskStoreNativeSessionBinding({
+                    runtimeHint: executorRuntimeHint,
+                    taskStore: this.store,
+                    sessionKey: `executor:${task.id}:primary`,
+                    taskId: task.id,
+                    purpose: "execute",
+                    worktreePath,
+                  }),
                   tools: "coding",
                   customTools,
                   onText: agentLogger.onText,
@@ -15461,6 +15478,7 @@ export class TaskExecutor {
 
       // Resolve model using the executor's model hierarchy
       const assignedRuntimeConfig = await this.getAssignedAgentRuntimeConfig(task.assignedAgentId);
+      const verificationRuntimeHint = extractRuntimeHint(assignedRuntimeConfig);
       const { provider: executorProvider, modelId: executorModelId } = resolveExecutorSessionModel(
         task.modelProvider,
         task.modelId,
@@ -15473,6 +15491,7 @@ export class TaskExecutor {
       // Create the fix agent session
       const { session } = await createResolvedAgentSession({
         sessionPurpose: "executor",
+        runtimeHint: verificationRuntimeHint,
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath, // Run in the task's worktree
         systemPrompt: `You are a verification fix agent running during task execution in a worktree.
@@ -15491,6 +15510,14 @@ Do not refactor, rename broadly, or make opportunistic improvements.
 5. Do NOT make any git commits — just fix the code
 6. You MAY modify any files needed to make the verification pass, including files unrelated to this task's original change. Pre-existing build/test breakage is in scope: fix it. Prefer the smallest change that makes verification green.
 7. If you cannot fix the issue within scope, explain why and what evidence indicates a deeper/root problem`,
+        nativeSession: createTaskStoreNativeSessionBinding({
+          runtimeHint: verificationRuntimeHint,
+          taskStore: this.store,
+          sessionKey: `executor:${task.id}:verification-fix:${retryNumber}`,
+          taskId: task.id,
+          purpose: "execute",
+          worktreePath,
+        }),
         tools: "coding",
         onText: logger.onText,
         onThinking: logger.onThinking,
@@ -16617,6 +16644,14 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath,
         systemPrompt: stepSystemPrompt,
+        nativeSession: createTaskStoreNativeSessionBinding({
+          runtimeHint: workflowRuntimeHint,
+          taskStore: this.store,
+          sessionKey: `executor:${task.id}:workflow:${workflowStep.name}:${attemptLabel}:${worktreePath}`,
+          taskId: task.id,
+          purpose: "execute",
+          worktreePath,
+        }),
         tools: toolMode,
         defaultProvider: provider,
         defaultModelId: modelId,
@@ -19643,6 +19678,14 @@ Child agent: ${agent.id} (${name})`;
             pluginRunner: this.options.pluginRunner,
             cwd: childWorktreePath,
             systemPrompt: childSystemPrompt,
+            nativeSession: createTaskStoreNativeSessionBinding({
+              runtimeHint: childRuntimeHint,
+              taskStore: this.store,
+              sessionKey: `executor:${taskId}:child:${agent.id}`,
+              taskId,
+              purpose: "execute",
+              worktreePath: childWorktreePath,
+            }),
             tools: "coding",
             defaultProvider: childExecutorProvider,
             defaultModelId: childExecutorModelId,

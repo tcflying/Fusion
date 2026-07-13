@@ -106,7 +106,13 @@ export interface HappierMessageInput {
 export type HappierSessionCreateResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord; created: boolean };
 export type HappierSessionMessageResult = HappierJsonRecord & { sessionId: string; localId?: string | null; waited?: boolean };
 export type HappierSessionStatusResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord };
-export type HappierSessionHistoryResult = HappierJsonRecord & { sessionId: string; format: string; messages: unknown[] };
+export interface HappierRawHistoryRow {
+  id: string;
+  createdAt: number;
+  role: string;
+  raw: Record<string, unknown>;
+}
+export type HappierSessionHistoryResult = HappierJsonRecord & { sessionId: string; format: string; messages: HappierRawHistoryRow[] };
 
 export type HappierRuntimeState =
   | "starting"
@@ -148,4 +154,5 @@ export type HappierRecoveryErrorCode =
   | "status-check-failed"
   | "native-session-binding-missing"
   | "native-session-persistence-failed"
+  | "history-reconciliation-failed"
   | "ambiguous-send-unresolved";

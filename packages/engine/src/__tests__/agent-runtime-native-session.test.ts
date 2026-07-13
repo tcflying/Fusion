@@ -3,10 +3,10 @@ import { mkdtempSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CliSessionStore, Database } from "@fusion/core";
+import { CliSessionStore, Database, TaskStore } from "@fusion/core";
 import { createCliSessionNativeSessionBinding } from "../agent-runtime.js";
-import { createResolvedAgentSession } from "../agent-session-helpers.js";
 import type { PluginRunner } from "../plugin-runner.js";
+import { reviewStep } from "../reviewer.js";
 
 const cli = vi.hoisted(() => ({
   resolveHappierCliSettings: vi.fn(() => ({ executable: "happier", timeoutMs: 30_000, maxOutputBytes: 1024 * 1024 })),
@@ -19,12 +19,12 @@ const cli = vi.hoisted(() => ({
 vi.mock("../../../../plugins/fusion-plugin-happier-runtime/src/cli-spawn.js", () => cli);
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() })),
+  reviewerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
-vi.mock("../pi.js", () => ({
-  createFnAgent: vi.fn(),
-  promptWithFallback: vi.fn(),
-  describeModel: vi.fn(() => "pi/default"),
-}));
+vi.mock("../pi.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pi.js")>();
+  return { ...actual, createFnAgent: vi.fn() };
+});
 
 import { HappierRuntimeAdapter } from "../../../../plugins/fusion-plugin-happier-runtime/src/runtime-adapter.js";
 
@@ -59,31 +59,38 @@ describe("AgentRuntime native session persistence binding", () => {
       projectId: "project-happier",
       adapterId: "happier",
     });
-    const firstRuntimeBinding = createCliSessionNativeSessionBinding(store, fusionSession.id);
+    const firstRuntimeBinding = createCliSessionNativeSessionBinding({ store, sessionId: fusionSession.id });
 
     expect(firstRuntimeBinding.nativeSessionId).toBeNull();
     await firstRuntimeBinding.persistNativeSessionId("hp_session_durable");
 
     const restartedStore = new CliSessionStore(fusionDir, database);
-    const restartedRuntimeBinding = createCliSessionNativeSessionBinding(restartedStore, fusionSession.id);
+    const restartedRuntimeBinding = createCliSessionNativeSessionBinding({ store: restartedStore, sessionId: fusionSession.id });
     expect(restartedRuntimeBinding.nativeSessionId).toBe("hp_session_durable");
   });
 
   it("fails closed when the owning Fusion session no longer exists", async () => {
-    expect(() => createCliSessionNativeSessionBinding(store, "cli-missing")).toThrow(
+    expect(() => createCliSessionNativeSessionBinding({ store, sessionId: "cli-missing" })).toThrow(
       /CLI session not found/,
     );
   });
 
-  it("persists then reconciles one Happier id through the real engine runtime path", async () => {
-    const fusionSession = store.createSession({
-      id: "cli-happier-engine-path",
-      taskId: "FN-HAPPIER-ENGINE",
-      purpose: "execute",
-      projectId: "project-happier",
-      adapterId: "happier",
+  it("wires persistence through the production reviewer path and reloads it for a fresh runtime", async () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), "fusion-happier-reviewer-project-"));
+    const globalRoot = mkdtempSync(join(tmpdir(), "fusion-happier-reviewer-global-"));
+    const taskStore = new TaskStore(projectRoot, globalRoot, { inMemoryDb: true });
+    await taskStore.init();
+    const task = await taskStore.createTask({
+      title: "Happier production reviewer binding",
+      description: "Exercise the actual reviewStep orchestration path",
     });
-    const histories = new Map<string, unknown[]>();
+    const histories = new Map<string, Array<{
+      id: string;
+      createdAt: number;
+      role: "user" | "assistant";
+      raw: { content: { type: "text"; text: string } };
+    }>>();
+    let messageNumber = 0;
     cli.createHappierSession.mockResolvedValue({
       sessionId: "hp_engine_durable",
       session: { id: "hp_engine_durable", active: true },
@@ -101,15 +108,27 @@ describe("AgentRuntime native session persistence binding", () => {
     }));
     cli.sendHappierMessage.mockImplementation(async ({ sessionId, message }: { sessionId: string; message: string }) => {
       const messages = histories.get(sessionId) ?? [];
+      messageNumber += 1;
       messages.push(
-        { id: `user-${messages.length}`, role: "user", content: { type: "text", text: message } },
-        { id: `assistant-${messages.length + 1}`, role: "assistant", content: { type: "text", text: `reply:${message}` } },
+        {
+          id: `user-${messageNumber}`,
+          createdAt: messageNumber * 1_000,
+          role: "user",
+          raw: { content: { type: "text", text: message } },
+        },
+        {
+          id: `assistant-${messageNumber}`,
+          createdAt: messageNumber * 1_000 + 1,
+          role: "assistant",
+          raw: { content: { type: "text", text: "### Verdict: APPROVE\n### Summary\nProduction binding is durable." } },
+        },
       );
       histories.set(sessionId, messages);
-      return { sessionId, localId: `user-${messages.length - 2}`, waited: true };
+      return { sessionId, localId: `user-${messageNumber}`, waited: true };
     });
 
     const pluginRunner = {
+      getPromptContributionsForSurface: vi.fn(async () => []),
       getRuntimeById: vi.fn(() => ({
         pluginId: "fusion-plugin-happier-runtime",
         runtime: {
@@ -126,36 +145,48 @@ describe("AgentRuntime native session persistence binding", () => {
       })),
     } as unknown as PluginRunner;
 
-    const first = await createResolvedAgentSession({
-      sessionPurpose: "executor",
-      runtimeHint: "happier",
+    const assignedAgent = {
+      id: "agent-happier-reviewer",
+      name: "Happier reviewer",
+      runtimeConfig: { runtimeHint: "happier" },
+      memory: undefined,
+    };
+    const agentStore = {
+      getAgent: vi.fn(async () => assignedAgent),
+      listAgents: vi.fn(async () => []),
+    };
+    const reviewOptions = {
+      store: taskStore,
+      taskId: task.id,
+      task: { ...task, assignedAgentId: assignedAgent.id },
+      rootDir: projectRoot,
       pluginRunner,
-      cwd: tmpDir,
-      systemPrompt: "first runtime",
-      nativeSession: createCliSessionNativeSessionBinding(store, fusionSession.id),
-    });
-    await (first.session as unknown as { promptWithFallback(prompt: string): Promise<void> })
-      .promptWithFallback("before restart");
+      agentStore,
+      settings: await taskStore.getSettings(),
+    } as const;
 
-    expect(store.getSession(fusionSession.id)?.nativeSessionId).toBe("hp_engine_durable");
-    const restartedStore = new CliSessionStore(fusionDir, database);
-    const restarted = await createResolvedAgentSession({
-      sessionPurpose: "executor",
-      runtimeHint: "happier",
-      pluginRunner,
-      cwd: tmpDir,
-      systemPrompt: "restarted runtime",
-      nativeSession: createCliSessionNativeSessionBinding(restartedStore, fusionSession.id),
-    });
-    await (restarted.session as unknown as { promptWithFallback(prompt: string): Promise<void> })
-      .promptWithFallback("after restart");
+    try {
+      const first = await reviewStep(projectRoot, task.id, 1, "Runtime", "code", task.description, undefined, reviewOptions);
+      expect(first.verdict).toBe("APPROVE");
 
-    expect(cli.createHappierSession).toHaveBeenCalledTimes(1);
-    expect(restarted.session.sessionId).toBe("hp_engine_durable");
-    const restartStatusOrder = cli.getHappierSessionStatus.mock.invocationCallOrder.find(
-      (order) => order > cli.sendHappierMessage.mock.invocationCallOrder[0],
-    );
-    expect(restartStatusOrder).toBeDefined();
-    expect(restartStatusOrder!).toBeLessThan(cli.sendHappierMessage.mock.invocationCallOrder[1]);
+      const persistedStore = new CliSessionStore(taskStore.getFusionDir(), taskStore.getDatabase());
+      const persistedSessions = persistedStore.listByTask(task.id);
+      expect(persistedSessions).toHaveLength(1);
+      expect(persistedSessions[0].nativeSessionId).toBe("hp_engine_durable");
+
+      const restarted = await reviewStep(projectRoot, task.id, 1, "Runtime", "code", task.description, undefined, reviewOptions);
+      expect(restarted.verdict).toBe("APPROVE");
+      expect(cli.createHappierSession).toHaveBeenCalledTimes(1);
+      expect(cli.sendHappierMessage).toHaveBeenCalledTimes(2);
+      const restartStatusOrder = cli.getHappierSessionStatus.mock.invocationCallOrder.find(
+        (order) => order > cli.sendHappierMessage.mock.invocationCallOrder[0],
+      );
+      expect(restartStatusOrder).toBeDefined();
+      expect(restartStatusOrder!).toBeLessThan(cli.sendHappierMessage.mock.invocationCallOrder[1]);
+    } finally {
+      taskStore.close();
+      await rm(projectRoot, { recursive: true, force: true });
+      await rm(globalRoot, { recursive: true, force: true });
+    }
   });
 });

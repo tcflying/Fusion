@@ -12,7 +12,12 @@ import {
   resolveHappierCliSettings,
   sendHappierMessage,
 } from "./cli-spawn.js";
-import type { HappierCliSettings, HappierSessionHistoryResult, HappierSessionStatusResult } from "./types.js";
+import type {
+  HappierCliSettings,
+  HappierRawHistoryRow,
+  HappierSessionHistoryResult,
+  HappierSessionStatusResult,
+} from "./types.js";
 import {
   HAPPIER_BACKENDS,
   HappierCliError,
@@ -26,7 +31,7 @@ import {
   type HappierRuntimeState,
 } from "./types.js";
 
-const HISTORY_LIMIT = 50;
+const HISTORY_LIMIT = 250;
 const RESUMABLE_STATES = new Set([
   "active",
   "idle",
@@ -38,18 +43,24 @@ const RESUMABLE_STATES = new Set([
   "recoverable",
 ]);
 
-interface NormalizedHistoryMessage {
-  key: string;
-  identifiers: string[];
-  role?: string;
+interface ParsedHistoryRow {
+  id: string;
+  createdAt: number;
+  role: string;
   text?: string;
   postIndex: number;
+}
+
+interface HistoryWatermark {
+  markerId?: string;
+  markerCreatedAt?: number;
+  rowIds: string[];
 }
 
 interface HistoryReconciliation {
   history: HappierSessionHistoryResult;
   status: HappierSessionStatusResult;
-  added: NormalizedHistoryMessage[];
+  added: ParsedHistoryRow[];
 }
 
 export class HappierRecoveryError extends Error {
@@ -105,55 +116,124 @@ function statusToRuntimeState(value: unknown): HappierRuntimeState | undefined {
   return "ready";
 }
 
-function messageText(content: unknown): string | undefined {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    const text = content.map((part) => messageText(part)).filter((part): part is string => part !== undefined).join("");
-    return text || undefined;
-  }
-  if (!content || typeof content !== "object") return undefined;
-  const record = content as Record<string, unknown>;
-  return nonEmptyString(record.text) ?? messageText(record.content);
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
-function normalizeMessage(message: unknown, postIndex: number): NormalizedHistoryMessage {
-  if (!message || typeof message !== "object") {
-    return { key: `value:${JSON.stringify(message)}`, identifiers: [], postIndex };
+function readFirstText(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return undefined;
+  const parts: string[] = [];
+  for (const item of value) {
+    const record = asRecord(item);
+    const text = record?.text ?? record?.content;
+    if (typeof text === "string") parts.push(text);
   }
-  const record = message as Record<string, unknown>;
-  const identifiers = [record.id, record.localId, record.messageId]
-    .map(nonEmptyString)
-    .filter((value): value is string => value !== undefined);
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(message);
-  } catch {
-    serialized = String(message);
+  return parts.length > 0 ? parts.join("") : undefined;
+}
+
+/** Parse only content variants emitted by Happier's official raw transcript row builder. */
+function rawContentText(raw: Record<string, unknown>): string | undefined {
+  const content = asRecord(raw.content);
+  if (!content) return undefined;
+  if (content.type === "text") return readFirstText(content.text);
+  if (content.type === "output") {
+    const data = asRecord(content.data);
+    const message = asRecord(data?.message);
+    return readFirstText(message?.content) ?? (typeof data?.text === "string" ? data.text : undefined);
   }
+  if (content.type === "acp" || content.type === "codex" || content.type === "event") {
+    const data = asRecord(content.data);
+    return data?.type === "message" && typeof data.message === "string" ? data.message : undefined;
+  }
+  return undefined;
+}
+
+function parseRawHistoryRows(history: HappierSessionHistoryResult): ParsedHistoryRow[] {
+  if (history.format !== "raw") {
+    throw new Error(`expected raw history, received ${history.format}`);
+  }
+  const seenIds = new Set<string>();
+  let priorCreatedAt = Number.NEGATIVE_INFINITY;
+  return history.messages.map((message: HappierRawHistoryRow, postIndex) => {
+    const record = asRecord(message);
+    const id = nonEmptyString(record?.id);
+    const role = nonEmptyString(record?.role)?.toLowerCase();
+    const createdAt = record?.createdAt;
+    const raw = asRecord(record?.raw);
+    if (!id || !role || typeof createdAt !== "number" || !Number.isFinite(createdAt) || !raw) {
+      throw new Error(`invalid raw history row at index ${postIndex}`);
+    }
+    if (seenIds.has(id)) throw new Error(`duplicate raw history row id ${id}`);
+    if (createdAt < priorCreatedAt) throw new Error(`raw history order regressed at row ${id}`);
+    seenIds.add(id);
+    priorCreatedAt = createdAt;
+    return { id, createdAt, role, text: rawContentText(raw), postIndex };
+  });
+}
+
+function captureHistoryWatermark(history: HappierSessionHistoryResult): HistoryWatermark {
+  const rows = parseRawHistoryRows(history);
+  const marker = rows.at(-1);
   return {
-    key: identifiers[0] ? `id:${identifiers[0]}` : `value:${serialized}`,
-    identifiers,
-    role: nonEmptyString(record.role)?.toLowerCase(),
-    text: messageText(record.content),
-    postIndex,
+    rowIds: rows.map((row) => row.id),
+    ...(marker ? { markerId: marker.id, markerCreatedAt: marker.createdAt } : {}),
   };
 }
 
-function addedHistoryMessages(before: unknown[], after: unknown[]): NormalizedHistoryMessage[] {
-  const remaining = new Map<string, number>();
-  for (const message of before.map(normalizeMessage)) {
-    remaining.set(message.key, (remaining.get(message.key) ?? 0) + 1);
+function rowsAfterWatermark(
+  watermark: HistoryWatermark,
+  history: HappierSessionHistoryResult,
+): ParsedHistoryRow[] {
+  const rows = parseRawHistoryRows(history);
+  if (!watermark.markerId) return rows;
+
+  const markerIndex = rows.findIndex((row) => row.id === watermark.markerId);
+  if (markerIndex < 0) throw new Error(`pre-send history marker ${watermark.markerId} disappeared`);
+  const marker = rows[markerIndex];
+  if (marker.createdAt !== watermark.markerCreatedAt) {
+    throw new Error(`pre-send history marker ${watermark.markerId} changed timestamp`);
   }
-  const added: NormalizedHistoryMessage[] = [];
-  after.map(normalizeMessage).forEach((message) => {
-    const count = remaining.get(message.key) ?? 0;
-    if (count > 0) {
-      remaining.set(message.key, count - 1);
-    } else {
-      added.push(message);
-    }
-  });
+
+  const preSendIds = new Set(watermark.rowIds);
+  const retainedBeforeMarker = rows
+    .slice(0, markerIndex + 1)
+    .filter((row) => preSendIds.has(row.id))
+    .map((row) => row.id);
+  if (
+    retainedBeforeMarker.length !== watermark.rowIds.length
+    || retainedBeforeMarker.some((id, index) => id !== watermark.rowIds[index])
+    || rows.slice(markerIndex + 1).some((row) => preSendIds.has(row.id))
+  ) {
+    throw new Error("bounded raw history no longer preserves pre-send transcript order");
+  }
+
+  const added = rows.slice(markerIndex + 1);
+  if (added.some((row) => row.createdAt < marker.createdAt)) {
+    throw new Error("post-watermark raw history regressed in time");
+  }
   return added;
+}
+
+function correlatePromptOutput(
+  watermark: HistoryWatermark,
+  history: HappierSessionHistoryResult,
+  prompt: string,
+): { added: ParsedHistoryRow[]; assistant: ParsedHistoryRow[] } {
+  const added = rowsAfterWatermark(watermark, history);
+  const matchingUsers = added.filter((row) => row.role === "user" && row.text === prompt);
+  if (matchingUsers.length !== 1) {
+    throw new Error(`expected one post-watermark matching user row, received ${matchingUsers.length}`);
+  }
+  const userIndex = matchingUsers[0].postIndex;
+  const assistant = added.filter((row) =>
+    row.postIndex > userIndex
+    && (row.role === "assistant" || row.role === "agent")
+    && row.text !== undefined,
+  );
+  return { added, assistant };
 }
 
 function isAmbiguousSendError(error: unknown): boolean {
@@ -272,25 +352,51 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         session.needsReconciliation = false;
       }
 
-      const before = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
+      let watermark: HistoryWatermark;
+      try {
+        const before = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
+        watermark = captureHistoryWatermark(before);
+      } catch (error) {
+        session.state.status = "blocked";
+        throw new HappierRecoveryError(
+          "history-reconciliation-failed",
+          `Unable to capture a trustworthy raw history watermark for Happier session ${session.sessionId}`,
+          session.sessionId,
+          error,
+        );
+      }
       session.state.status = "running";
       session.messages.push({ role: "user", content: prompt });
       session.state.messages = session.messages;
       localUserMessageAdded = true;
 
       try {
-        const result = await sendHappierMessage(
+        await sendHappierMessage(
           { sessionId: session.sessionId, message: prompt, timeoutSeconds: this.timeoutSeconds },
           this.settings,
         );
         const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
         const status = await getHappierSessionStatus(session.sessionId, this.settings);
-        const added = addedHistoryMessages(before.messages, history.messages);
-        this.recordAssistantOutput(session, added, result.localId ?? undefined);
+        let correlated: ReturnType<typeof correlatePromptOutput>;
+        try {
+          correlated = correlatePromptOutput(watermark, history, prompt);
+          if (correlated.assistant.length === 0) {
+            throw new Error("successful --wait history contained no correlated assistant text");
+          }
+        } catch (error) {
+          session.state.status = "blocked";
+          throw new HappierRecoveryError(
+            "history-reconciliation-failed",
+            `Unable to correlate Happier output after send for session ${session.sessionId}`,
+            session.sessionId,
+            error,
+          );
+        }
+        this.recordAssistantOutput(session, correlated.assistant);
         session.state.status = statusToRuntimeState(status) ?? "ready";
       } catch (error) {
         if (!isAmbiguousSendError(error)) throw error;
-        const reconciled = await this.reconcileAmbiguousSend(session, before, prompt, error);
+        const reconciled = await this.reconcileAmbiguousSend(session, watermark, prompt, error);
         this.recordAssistantOutput(session, reconciled.added);
         session.state.status = statusToRuntimeState(reconciled.status) ?? "ready";
       }
@@ -338,24 +444,15 @@ export class HappierRuntimeAdapter implements AgentRuntime {
 
   private async reconcileAmbiguousSend(
     session: HappierAgentSession,
-    before: HappierSessionHistoryResult,
+    watermark: HistoryWatermark,
     prompt: string,
     originalError: unknown,
   ): Promise<HistoryReconciliation> {
     try {
       const status = await getHappierSessionStatus(session.sessionId, this.settings);
       const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
-      const added = addedHistoryMessages(before.messages, history.messages);
-      const accepted = added.some((message) => message.role === "user" && message.text === prompt);
-      if (!accepted) {
-        throw new HappierRecoveryError(
-          "ambiguous-send-unresolved",
-          `Happier send outcome is ambiguous for session ${session.sessionId}`,
-          session.sessionId,
-          originalError,
-        );
-      }
-      return { status, history, added };
+      const correlated = correlatePromptOutput(watermark, history, prompt);
+      return { status, history, added: correlated.assistant };
     } catch (error) {
       if (error instanceof HappierRecoveryError) throw error;
       throw new HappierRecoveryError(
@@ -369,17 +466,8 @@ export class HappierRuntimeAdapter implements AgentRuntime {
 
   private recordAssistantOutput(
     session: HappierAgentSession,
-    added: NormalizedHistoryMessage[],
-    localId?: string,
+    assistantMessages: ParsedHistoryRow[],
   ): void {
-    const localMessage = localId
-      ? added.find((message) => message.identifiers.includes(localId))
-      : undefined;
-    const assistantMessages = added.filter((message) =>
-      message.role === "assistant" &&
-      message.text !== undefined &&
-      (!localMessage || message.postIndex > localMessage.postIndex),
-    );
     for (const message of assistantMessages) {
       session.messages.push({ role: "assistant", content: message.text });
       session.callbacks.onText?.(message.text!);

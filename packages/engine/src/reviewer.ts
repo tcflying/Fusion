@@ -24,6 +24,7 @@ import { isContextLimitError } from "./context-limit-detector.js";
 import { classifyError } from "./transient-error-detector.js";
 import { withRetry } from "./retry-with-backoff.js";
 import { createResolvedAgentSession, extractRuntimeHint, resolveValidatorSessionModel } from "./agent-session-helpers.js";
+import { createTaskStoreNativeSessionBinding } from "./agent-runtime.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { AgentLogger } from "./agent-logger.js";
 import { reviewerLog } from "./logger.js";
@@ -364,6 +365,8 @@ export async function reviewStep(
     && typeof (agentStore as { getAgent?: unknown }).getAgent === "function"
       ? await agentStore.getAgent(assignedAgentId).catch(() => null)
       : null;
+  const reviewerRuntimeHint = extractRuntimeHint(memoryAgent?.runtimeConfig);
+  let reviewerSessionOrdinal = 0;
   const memoryTools = options.rootDir && effectiveSettings?.memoryEnabled !== false
     ? [
         createMemorySearchTool(options.rootDir, effectiveSettings, memoryAgent ? {
@@ -427,6 +430,7 @@ export async function reviewStep(
   const createReviewerSession = async (
     overrides?: { forceProvider?: string; forceModelId?: string },
   ): Promise<import("@earendil-works/pi-coding-agent").AgentSession> => {
+    const sessionOrdinal = reviewerSessionOrdinal++;
     let streamReviewTextFromOnText = false;
     const handleReviewerText = (delta: string) => {
       if (streamReviewTextFromOnText) {
@@ -455,11 +459,21 @@ export async function reviewStep(
 
     const { session } = await createResolvedAgentSession({
       sessionPurpose: "reviewer",
-      runtimeHint: extractRuntimeHint(memoryAgent?.runtimeConfig),
+      runtimeHint: reviewerRuntimeHint,
       pluginRunner: options.pluginRunner,
       cwd,
       systemPrompt: reviewerSystemPromptFinal,
       systemPromptLayers: layers,
+      nativeSession: options.store
+        ? createTaskStoreNativeSessionBinding({
+            runtimeHint: reviewerRuntimeHint,
+            taskStore: options.store,
+            sessionKey: `reviewer:${taskId}:${stepNumber}:${reviewType}:${cwd}:${sessionOrdinal}`,
+            taskId,
+            purpose: "validator",
+            worktreePath: cwd,
+          })
+        : undefined,
       tools: options.allowInlineFixes === true && reviewType === "code" ? "coding" : "readonly",
       customTools: reviewCustomTools,
       onText: handleReviewerText,
@@ -476,7 +490,9 @@ export async function reviewStep(
       settings: effectiveSettings,
       // FNXC:PluginSkills 2026-07-12-00:00: Reviewer sessions use the shared skill context; forward plugin body dirs so requested plugin review skills include their SKILL.md content.
       ...(skillContext?.skillSelectionContext ? { skillSelection: skillContext.skillSelectionContext } : {}),
-      ...(skillContext && skillContext.additionalSkillPaths.length > 0 ? { additionalSkillPaths: skillContext.additionalSkillPaths } : {}),
+      ...(skillContext?.additionalSkillPaths && skillContext.additionalSkillPaths.length > 0
+        ? { additionalSkillPaths: skillContext.additionalSkillPaths }
+        : {}),
       taskId: options.taskId,
       taskTitle: options.taskTitle,
       // FNXC:McpConfig 2026-06-25-22:45: Reviewer and validator sessions resolve the same trusted MCP server set as executor lanes at session creation; secret values are passed only in memory to the runtime guard.

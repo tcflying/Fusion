@@ -15,7 +15,14 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { CliSessionStore, PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
+import { CliSessionStore } from "@fusion/core";
+import type {
+  CliSessionPurpose,
+  PermanentAgentGatingContext,
+  ResolvedMcpServerDefinition,
+  TaskStore,
+} from "@fusion/core";
+import { createHash } from "node:crypto";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -63,18 +70,63 @@ export interface AgentRuntimeNativeSessionBinding {
  * the same native id instead of relying on plugin-local option shapes.
  */
 export function createCliSessionNativeSessionBinding(
-  store: Pick<CliSessionStore, "getSession" | "updateSession">,
-  cliSessionId: string,
+  options: {
+    store: Pick<CliSessionStore, "getSession" | "updateSession">;
+    sessionId: string;
+  },
 ): AgentRuntimeNativeSessionBinding {
-  const session = store.getSession(cliSessionId);
-  if (!session) throw new Error(`CLI session not found: ${cliSessionId}`);
+  const session = options.store.getSession(options.sessionId);
+  if (!session) throw new Error(`CLI session not found: ${options.sessionId}`);
   return {
     nativeSessionId: session.nativeSessionId,
     persistNativeSessionId: async (nativeSessionId: string) => {
-      const updated = store.updateSession(cliSessionId, { nativeSessionId });
-      if (!updated) throw new Error(`CLI session not found: ${cliSessionId}`);
+      const updated = options.store.updateSession(options.sessionId, { nativeSessionId });
+      if (!updated) throw new Error(`CLI session not found: ${options.sessionId}`);
     },
   };
+}
+
+/**
+ * Create or reload the canonical CLI-session record for a production
+ * AgentRuntime session. Other runtimes remain behavior-inert; Happier receives
+ * a real CliSessionStore-backed binding and therefore fails closed if a caller
+ * bypasses this orchestration boundary.
+ */
+export function createTaskStoreNativeSessionBinding(options: {
+  runtimeHint: string | undefined;
+  taskStore: Pick<TaskStore, "getFusionDir" | "getDatabase">;
+  sessionKey: string;
+  taskId?: string | null;
+  purpose: CliSessionPurpose;
+  worktreePath?: string | null;
+}): AgentRuntimeNativeSessionBinding | undefined {
+  if (options.runtimeHint?.trim().toLowerCase() !== "happier") return undefined;
+
+  const database = options.taskStore.getDatabase();
+  const store = new CliSessionStore(options.taskStore.getFusionDir(), database);
+  const digest = createHash("sha256").update(options.sessionKey).digest("hex").slice(0, 24);
+  const sessionId = `cli-happier-${options.purpose}-${digest}`;
+  const projectId = database.getProjectIdentity()?.id ?? options.taskStore.getFusionDir();
+  const existing = store.getSession(sessionId);
+  if (!existing) {
+    store.createSession({
+      id: sessionId,
+      taskId: options.taskId ?? null,
+      purpose: options.purpose,
+      projectId,
+      adapterId: "happier",
+      worktreePath: options.worktreePath ?? null,
+    });
+  } else if (
+    existing.adapterId !== "happier"
+    || existing.purpose !== options.purpose
+    || existing.projectId !== projectId
+    || existing.taskId !== (options.taskId ?? null)
+  ) {
+    throw new Error(`CLI session ${sessionId} does not match the requested Happier runtime owner`);
+  }
+
+  return createCliSessionNativeSessionBinding({ store, sessionId });
 }
 
 export function normalizeAgentRuntimeMcpServers(
