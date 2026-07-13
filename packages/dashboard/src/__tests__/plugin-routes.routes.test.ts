@@ -396,6 +396,17 @@ describe("GET /plugins/:id/settings", () => {
     expect(res.body).toEqual({});
   });
 
+  it("returns empty settings for Happier before its first lazy install", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      Object.assign(new Error('Plugin "fusion-plugin-happier-runtime" not found'), { code: "ENOENT" }),
+    );
+
+    const res = await GET(buildApp(), "/api/plugins/fusion-plugin-happier-runtime/settings");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
   it("supports projectId query param scoping", async () => {
     const scopedPluginStore = createMockPluginStore();
     (scopedPluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -1098,6 +1109,29 @@ describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", (
 
     expect(res.status).toBe(200);
     expect(ensure).toHaveBeenCalledWith("fusion-plugin-hermes-runtime");
+    expect(pluginStore.updatePluginSettings).toHaveBeenCalled();
+  });
+
+  it("auto-installs the Happier runtime on first save", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("Plugin not found"),
+    );
+    (pluginStore.updatePluginSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...FAKE_PLUGIN,
+      id: "fusion-plugin-happier-runtime",
+      settings: { backend: "codex" },
+    });
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-happier-runtime/settings",
+      { settings: { backend: "codex" } },
+    );
+
+    expect(res.status).toBe(200);
+    expect(ensure).toHaveBeenCalledWith("fusion-plugin-happier-runtime");
     expect(pluginStore.updatePluginSettings).toHaveBeenCalled();
   });
 

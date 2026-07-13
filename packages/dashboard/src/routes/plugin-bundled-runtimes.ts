@@ -2,6 +2,7 @@ import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as nodeFs from "node:fs";
 import { hermesRuntimeMetadata } from "@fusion-plugin-examples/hermes-runtime";
+import { happierRuntimeMetadata } from "@fusion-plugin-examples/happier-runtime";
 import { openclawRuntimeMetadata } from "@fusion-plugin-examples/openclaw-runtime";
 
 // Bundled runtime metadata exposed in /api/plugins/runtimes even when the
@@ -20,6 +21,13 @@ export const BUNDLED_PLUGIN_RUNTIMES: Array<{
     name: hermesRuntimeMetadata.name,
     ...(hermesRuntimeMetadata.description ? { description: hermesRuntimeMetadata.description } : {}),
     version: hermesRuntimeMetadata.version ?? "0.0.0",
+  },
+  {
+    pluginId: "fusion-plugin-happier-runtime",
+    runtimeId: happierRuntimeMetadata.runtimeId,
+    name: happierRuntimeMetadata.name,
+    ...(happierRuntimeMetadata.description ? { description: happierRuntimeMetadata.description } : {}),
+    version: happierRuntimeMetadata.version ?? "0.0.0",
   },
   {
     pluginId: "fusion-plugin-openclaw-runtime",
@@ -42,6 +50,7 @@ const BUNDLED_PLUGIN_IDS = new Set([
   "fusion-plugin-whatsapp-chat",
   "fusion-plugin-roadmap",
   "fusion-plugin-hermes-runtime",
+  "fusion-plugin-happier-runtime",
   "fusion-plugin-openclaw-runtime",
   "fusion-plugin-paperclip-runtime",
   "fusion-plugin-cursor-runtime",
