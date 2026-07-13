@@ -10,6 +10,10 @@ import { automationLiveRuns, createAutomationLiveRunCallbacks, createAutomationR
 import { executeScheduleSteps, executeSingleCommand, validateAutomationSteps } from "./automation-step-execution.js";
 import { BUNDLED_PLUGIN_RUNTIMES, extractBundledPluginId, resolveBundledPluginDirInDashboard } from "./plugin-bundled-runtimes.js";
 
+function isPluginNotFoundError(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
 export interface PluginsAutomationRouteDependencies {
   parseLastEventId(req: Request): number | undefined;
   replayBufferedSSE(res: Response, bufferedEvents: Array<{ id: number; event: string; data: string }>): boolean;
@@ -988,7 +992,7 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       const plugin = await pluginStore.getPlugin(id);
       res.json(plugin.settings);
     } catch (err: unknown) {
-      const isNotFoundError = err instanceof Error && (err instanceof Error ? err.message : String(err)).includes("not found");
+      const isNotFoundError = isPluginNotFoundError(err);
       const isBundledFallback = BUNDLED_PLUGIN_RUNTIMES.some((r) => r.pluginId === id);
       if (isNotFoundError && isBundledFallback) {
         // Bundled runtime plugins can be surfaced in settings before they've
@@ -1477,7 +1481,7 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       throw badRequest("Request body must have a 'settings' object");
     }
 
-    // Auto-install bundled runtime plugins (Hermes/OpenClaw/Paperclip) on
+    // Auto-install bundled runtime plugins (Hermes/Happier/OpenClaw/Paperclip) on
     // first save. The Settings UI surfaces these as fallback cards before
     // they're actually registered, so the first PUT must lazily install them
     // rather than 404. The host (CLI) injects ensureBundledPluginInstalled
@@ -1487,7 +1491,10 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
       let alreadyRegistered = true;
       try {
         await pluginStore.getPlugin(id);
-      } catch {
+      } catch (err: unknown) {
+        if (!isPluginNotFoundError(err)) {
+          throw err;
+        }
         alreadyRegistered = false;
       }
       if (!alreadyRegistered) {

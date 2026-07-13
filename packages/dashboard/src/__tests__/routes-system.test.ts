@@ -886,6 +886,18 @@ describe("GET /api/plugins/runtimes", () => {
             factory: () => ({ run: async () => undefined }),
           },
         },
+        {
+          pluginId: "plugin-happier",
+          runtime: {
+            metadata: {
+              runtimeId: "happier",
+              name: "Installed Happier Runtime",
+              description: "Installed Happier runtime wins",
+              version: "9.9.9",
+            },
+            factory: () => ({ run: async () => undefined }),
+          },
+        },
       ],
     };
 
@@ -903,9 +915,12 @@ describe("GET /api/plugins/runtimes", () => {
     });
     const ids = body.map((r) => r.runtimeId);
     expect(ids).toContain("hermes");
+    expect(ids).toContain("happier");
     expect(ids).toContain("paperclip");
     // Only one openclaw entry (installed wins over bundled).
     expect(ids.filter((id) => id === "openclaw")).toHaveLength(1);
+    expect(ids.filter((id) => id === "happier")).toHaveLength(1);
+    expect(body.find((runtime) => runtime.runtimeId === "happier")?.pluginId).toBe("plugin-happier");
   });
 
   it("returns the bundled plugin runtime fallbacks when no plugins are installed", async () => {
@@ -914,7 +929,7 @@ describe("GET /api/plugins/runtimes", () => {
     expect(res.status).toBe(200);
     const body = res.body as Array<{ pluginId: string; runtimeId: string }>;
     const ids = body.map((r) => r.runtimeId).sort();
-    expect(ids).toEqual(["hermes", "openclaw", "paperclip"]);
+    expect(ids).toEqual(["happier", "hermes", "openclaw", "paperclip"]);
   });
 });
 
