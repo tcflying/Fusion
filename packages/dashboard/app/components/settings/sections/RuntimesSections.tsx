@@ -1,4 +1,5 @@
 import { HermesRuntimeCard } from "../../HermesRuntimeCard";
+import { HappierRuntimeCard } from "../../HappierRuntimeCard";
 import { OpenClawRuntimeCard } from "../../OpenClawRuntimeCard";
 import { PaperclipRuntimeCard } from "../../PaperclipRuntimeCard";
 import { useTranslation } from "react-i18next";
@@ -11,6 +12,13 @@ export function HermesRuntimeSection() {
     return (<>
       <h4 className="settings-section-heading">{t("settings.runtimesRuntimes.hermesRuntime", "Hermes Runtime")}</h4>
       <HermesRuntimeCard />
+    </>);
+}
+export function HappierRuntimeSection() {
+    const { t } = useTranslation("app");
+    return (<>
+      <h4 className="settings-section-heading">{t("settings.runtimesRuntimes.happierRuntime", "Happier Runtime")}</h4>
+      <HappierRuntimeCard />
     </>);
 }
 export function OpenClawRuntimeSection() {

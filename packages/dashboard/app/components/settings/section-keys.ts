@@ -217,6 +217,7 @@ export const EXCLUDED_RESET_SECTIONS: Record<string, string> = {
   prompts: "Prompt library entries are managed by their own editor, not bulk-reset here.",
   "cli-agents": "Per-adapter CLI agent settings are managed by their own approval/config flow.",
   "hermes-runtime": "Runtime plugin settings are managed by the plugin's own config surface.",
+  "happier-runtime": "Runtime plugin settings are managed by the plugin's own config surface.",
   "openclaw-runtime": "Runtime plugin settings are managed by the plugin's own config surface.",
   "paperclip-runtime": "Runtime plugin settings are managed by the plugin's own config surface.",
 };

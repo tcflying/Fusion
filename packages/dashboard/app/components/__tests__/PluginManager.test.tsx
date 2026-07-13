@@ -274,6 +274,7 @@ describe("PluginManager", () => {
     expect(screen.getByText("No plugins installed.")).toBeTruthy();
     expect(screen.getByText("Agent Browser")).toBeTruthy();
     expect(screen.getByText("Hermes Runtime")).toBeTruthy();
+    expect(screen.getByText("Happier Runtime")).toBeTruthy();
     expect(screen.getByText("Paperclip Runtime")).toBeTruthy();
     expect(screen.getByText("OpenClaw Runtime")).toBeTruthy();
     expect(screen.getByText("Droid Runtime")).toBeTruthy();

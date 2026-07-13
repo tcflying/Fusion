@@ -679,6 +679,39 @@ export interface HermesProviderStatus {
   ready: boolean;
 }
 
+export interface HappierProviderStatus {
+  discovered: boolean;
+  executable: boolean;
+  server: boolean;
+  authenticated: boolean;
+  daemon: boolean;
+  backend: boolean;
+  ready: boolean;
+  backendId: "codex" | "claude" | "opencode";
+  details: string[];
+}
+
+export interface HappierProviderOptions {
+  executable?: string;
+  entrypoint?: string;
+  serverUrl?: string;
+  webappUrl?: string;
+  profile?: string;
+  backend?: "codex" | "claude" | "opencode";
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+}
+
+/** Probe Happier without transmitting credentials or mutating sessions. */
+export async function fetchHappierStatus(opts: HappierProviderOptions = {}): Promise<HappierProviderStatus> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(opts)) {
+    if (value !== undefined && value !== "") params.set(key, String(value));
+  }
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  return api<HappierProviderStatus>(`/providers/happier/status${suffix}`);
+}
+
 export interface OpenClawProviderStatus {
   binary: RuntimeBinaryStatus;
   ready: boolean;

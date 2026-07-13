@@ -57,6 +57,7 @@ const EXPECTED_EXCLUDED_SECTIONS = [
   "prompts",
   "cli-agents",
   "hermes-runtime",
+  "happier-runtime",
   "openclaw-runtime",
   "paperclip-runtime",
 ];

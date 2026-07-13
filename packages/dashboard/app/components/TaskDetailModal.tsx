@@ -290,6 +290,7 @@ export interface CliSessionSummaryRecord {
   taskId: string | null;
   projectId: string;
   adapterId: string;
+  nativeSessionId?: string | null;
   agentState:
     | "starting"
     | "ready"
@@ -300,6 +301,13 @@ export interface CliSessionSummaryRecord {
     | "needsAttention";
   terminationReason: string | null;
   autonomyPosture?: Record<string, unknown> | null;
+}
+
+/** Build a Windows PowerShell-safe continuation command for a bound Happier session. */
+export function buildHappierContinuationCommand(session: CliSessionSummaryRecord | null): string | null {
+  if (session?.adapterId !== "happier" || !session.nativeSessionId?.trim()) return null;
+  const quotedId = session.nativeSessionId.trim().replace(/'/g, "''");
+  return `happier session send '${quotedId}' '<message>' --wait`;
 }
 
 type CliTabVisibility =
@@ -5374,22 +5382,44 @@ export function TaskDetailContent({
           ) : activeTab === "terminal" ? (
             <div className="detail-section detail-section--terminal">
               {cliSession && cliTabVisibility.kind !== "hidden" ? (
-                <Suspense fallback={<div className="detail-loading"><LoadingSpinner label={t("taskDetail.terminal.loading", "Loading terminal…")} /></div>}>
-                  <LazySessionTerminal
-                    sessionId={cliSession.id}
-                    projectId={projectId}
-                    posture={cliPosture}
-                    readOnly={
-                      cliTabVisibility.kind === "replay" ||
-                      (cliTabVisibility.kind === "live" && cliTabVisibility.readOnly)
-                    }
-                    mode={cliTabVisibility.mode}
-                    showConfirmAdvance={
-                      cliTabVisibility.kind === "live" && cliTabVisibility.showConfirmAdvance
-                    }
-                    onConfirmAdvance={handleConfirmAdvance}
-                  />
-                </Suspense>
+                <>
+                  {buildHappierContinuationCommand(cliSession) ? (
+                    <div className="onboarding-helper-text" data-testid="happier-session-binding">
+                      <strong>Happier Session ID</strong>
+                      <code>{cliSession.nativeSessionId}</code>
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => {
+                          const command = buildHappierContinuationCommand(cliSession);
+                          if (!command) return;
+                          void navigator.clipboard.writeText(command).then(
+                            () => addToast(t("taskDetail.terminal.happierCommandCopied", "Happier continuation command copied."), "success"),
+                            () => addToast(t("taskDetail.terminal.happierCommandCopyFailed", "Could not copy the Happier continuation command."), "error"),
+                          );
+                        }}
+                      >
+                        {t("taskDetail.terminal.copyHappierCommand", "Copy session send command")}
+                      </button>
+                    </div>
+                  ) : null}
+                  <Suspense fallback={<div className="detail-loading"><LoadingSpinner label={t("taskDetail.terminal.loading", "Loading terminal…")} /></div>}>
+                    <LazySessionTerminal
+                      sessionId={cliSession.id}
+                      projectId={projectId}
+                      posture={cliPosture}
+                      readOnly={
+                        cliTabVisibility.kind === "replay" ||
+                        (cliTabVisibility.kind === "live" && cliTabVisibility.readOnly)
+                      }
+                      mode={cliTabVisibility.mode}
+                      showConfirmAdvance={
+                        cliTabVisibility.kind === "live" && cliTabVisibility.showConfirmAdvance
+                      }
+                      onConfirmAdvance={handleConfirmAdvance}
+                    />
+                  </Suspense>
+                </>
               ) : null}
             </div>
           ) : activeTab === "worktree-terminal" && showWorktreeTerminalTab ? (

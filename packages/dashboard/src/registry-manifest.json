@@ -11,6 +11,16 @@
       "tags": ["runtime", "cli", "hermes"]
     },
     {
+      "id": "fusion-plugin-happier-runtime",
+      "name": "Happier Runtime",
+      "description": "Durable Codex, Claude, and OpenCode sessions through Happier.",
+      "version": "0.2.73",
+      "author": "Fusion",
+      "category": "runtime",
+      "path": "./plugins/fusion-plugin-happier-runtime",
+      "tags": ["runtime", "cli", "happier", "session"]
+    },
+    {
       "id": "fusion-plugin-paperclip-runtime",
       "name": "Paperclip Runtime",
       "description": "Runtime provider for Paperclip agent connections.",

@@ -37,6 +37,7 @@ import { GlobalMcpSection } from "./settings/sections/GlobalMcpSection";
 import { GlobalModelsSection } from "./settings/sections/GlobalModelsSection";
 import { AuthenticationSection } from "./settings/sections/AuthenticationSection";
 import {
+  HappierRuntimeSection,
   HermesRuntimeSection,
   OpenClawRuntimeSection,
   PaperclipRuntimeSection,
@@ -312,6 +313,7 @@ const ADVANCED_SETTINGS_SECTION_IDS = new Set([
   "remote",
   "experimental",
   "hermes-runtime",
+  "happier-runtime",
   "openclaw-runtime",
   "paperclip-runtime",
   "scheduled-evals",
@@ -662,6 +664,32 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
 
   { id: "__advanced_header", label: "Advanced", labelKey: "settings.nav.advancedHeader", scope: undefined, isGroupHeader: true },
   { id: "experimental", label: "Experimental Features", labelKey: "settings.nav.experimental", scope: "global", searchableText: ["feature flags", "experiments", "research view", "evals view", "sandbox", "subtask breakdown"] },
+
+  // Runtimes group (plugin runtimes with their own settings)
+  { id: "__runtimes_header", label: "Runtimes", labelKey: "settings.nav.runtimesHeader", scope: undefined, isGroupHeader: true },
+  { id: "hermes-runtime", label: "Hermes", labelKey: "settings.nav.hermesRuntime", scope: "global", searchableText: ["Hermes runtime", "plugin runtime", "printer runtime"] },
+  { id: "happier-runtime", label: "Happier", labelKey: "settings.nav.happierRuntime", scope: "global", searchableText: ["Happier runtime", "Codex session", "Claude session", "OpenCode session", "session bridge"] },
+  { id: "openclaw-runtime", label: "OpenClaw", labelKey: "settings.nav.openclawRuntime", scope: "global", searchableText: ["OpenClaw runtime", "plugin runtime", "open claw"] },
+  { id: "paperclip-runtime", label: "Paperclip", labelKey: "settings.nav.paperclipRuntime", scope: "global", searchableText: ["Paperclip runtime", "plugin runtime"] },
+
+  // Project group (specific to this project)
+  { id: "__project_header", label: "Project", labelKey: "settings.nav.projectHeader", scope: undefined, isGroupHeader: true },
+  { id: "general", label: "Project General", labelKey: "settings.nav.projectGeneral", scope: "project", searchableText: ["project general", "Completion Documentation Automation", "Quick Chat launcher", "ephemeral task-worker agents", "GitHub tracking", "GitLab integration", "chat rooms", "auto-cleanup old chats"] },
+  { id: "commands", label: "Commands & Scripts", labelKey: "settings.nav.commands", scope: "project", searchableText: ["test command", "build command", "verification command", "workflow scripts", "commands"] },
+  { id: "worktrees", label: "Worktrees", labelKey: "settings.nav.worktrees", scope: "project", searchableText: ["worktree directory", "copy files", "recycle worktrees", "branch naming", "sibling branch rename"] },
+  { id: "scheduling", label: "Scheduling & Capacity", labelKey: "settings.nav.scheduling", scope: "project", searchableText: ["max concurrent", "capacity", "stuck tasks", "poll interval", "parallel steps", "scheduler"] },
+  { id: "scheduled-evals", label: "Scheduled Evals", labelKey: "settings.nav.scheduledEvals", scope: "project", searchableText: ["scheduled evals", "evaluation schedule", "eval runs", "quality jobs"] },
+  { id: "node-routing", label: "Node Routing", labelKey: "settings.nav.nodeRouting", scope: "project", searchableText: ["node routing", "routing rules", "node selection", "execution nodes"] },
+  { id: "merge", label: "Merge", labelKey: "settings.nav.merge", scope: "project", searchableText: ["auto merge", "AI merge", "merge strategy", "plan approval", "direct merge", "integration branch", "push after merge"] },
+  { id: "agent-permissions", label: "Agents & Permissions", labelKey: "settings.nav.agentPermissions", scope: "project", searchableText: ["agent provisioning", "approval", "permissions", "policy", "agent creation"] },
+  { id: "memory", label: "Memory", labelKey: "settings.nav.memory", scope: "project", searchableText: ["memory backend", "Dreams", "long-term memory", "qmd", "memory file", "retrieval"] },
+  { id: "backups", label: "Backups", labelKey: "settings.nav.backups", scope: "project", searchableText: ["backup", "restore", "settings export", "settings import"] },
+  { id: "research-project", label: "Research", labelKey: "settings.nav.researchProject", scope: "project", searchableText: ["project research", "research runs", "citations", "search limits", "fetch synthesis"] },
+  { id: "project-models", label: "Project Models", labelKey: "settings.nav.projectModels", scope: "project", searchableText: ["default provider", "default model", "workflow model lanes", "Plan/Triage", "Executor", "Reviewer", "summarization model"] },
+  { id: "secrets", label: "Secrets", labelKey: "settings.nav.secrets", scope: "project", searchableText: ["secrets", "secret storage", "environment", "credentials"] },
+  { id: "mcp", label: "MCP Servers", labelKey: "settings.nav.mcp", scope: "project", searchableText: ["project MCP servers", "workspace MCP", "project tool servers", "mcp config"] },
+  { id: "prompts", label: "Prompts", labelKey: "settings.nav.prompts", scope: "project", searchableText: ["prompt instructions", "PR title prompt", "PR description prompt", "custom prompts"] },
+  { id: "plugins", label: "Plugins", labelKey: "settings.nav.plugins", scope: "project", searchableText: ["Fusion plugins", "Pi extensions", "plugin manager", "extension marketplace"] },
 ];
 
 // FNXC:SettingsNavigation 2026-07-04-00:00: sectionId -> owning group label ("Global"/"Runtimes"/"Project"),
@@ -4473,6 +4501,8 @@ export function SettingsModal({
         );
       case "hermes-runtime":
         return <HermesRuntimeSection />;
+      case "happier-runtime":
+        return <HappierRuntimeSection />;
       case "openclaw-runtime":
         return <OpenClawRuntimeSection />;
       case "paperclip-runtime":

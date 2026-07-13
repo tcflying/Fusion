@@ -7,6 +7,7 @@ import {
   listPaperclipCompanyAgents,
   listPaperclipCompanyAgentsViaCliFacade,
   mintPaperclipKeyViaCli,
+  probeHappierProvider,
   probeHermesProvider,
   probeOpenClawProvider,
   probePaperclipProvider,
@@ -27,6 +28,38 @@ import type { ApiRouteRegistrar } from "./types.js";
  */
 export const registerRuntimeProviderRoutes: ApiRouteRegistrar = (ctx) => {
   const { router, rethrowAsApiError } = ctx;
+
+  router.get("/providers/happier/status", async (req, res) => {
+    try {
+      const backendValue = typeof req.query.backend === "string" ? req.query.backend : undefined;
+      if (backendValue && !["codex", "claude", "opencode"].includes(backendValue)) {
+        throw badRequest("Invalid backend: expected codex, claude, or opencode");
+      }
+      const readString = (value: unknown): string | undefined =>
+        typeof value === "string" && value.trim() ? value.trim().slice(0, 2048) : undefined;
+      const readBoundedNumber = (value: unknown, minimum: number, maximum: number): number | undefined => {
+        if (typeof value !== "string" || !value.trim()) return undefined;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) && parsed > 0
+          ? Math.min(maximum, Math.max(minimum, Math.floor(parsed)))
+          : undefined;
+      };
+      const health = await probeHappierProvider({
+        executable: readString(req.query.executable),
+        entrypoint: readString(req.query.entrypoint),
+        serverUrl: readString(req.query.serverUrl),
+        webappUrl: readString(req.query.webappUrl),
+        profile: readString(req.query.profile),
+        backend: backendValue as "codex" | "claude" | "opencode" | undefined,
+        timeoutMs: readBoundedNumber(req.query.timeoutMs, 1_000, 120_000),
+        maxOutputBytes: readBoundedNumber(req.query.maxOutputBytes, 1_024, 16_777_216),
+      });
+      res.json(health);
+    } catch (err) {
+      if (err instanceof ApiError) throw err;
+      rethrowAsApiError(err);
+    }
+  });
 
   /**
    * GET /providers/hermes/status

@@ -20,6 +20,12 @@ import {
 } from "@fusion-plugin-examples/hermes-runtime";
 
 import {
+  probeHappierRuntime,
+  type HappierCliSettings,
+  type HappierRuntimeHealth,
+} from "@fusion-plugin-examples/happier-runtime";
+
+import {
   probeOpenClawBinary,
   type OpenClawBinaryStatus,
 } from "@fusion-plugin-examples/openclaw-runtime";
@@ -71,6 +77,7 @@ import {
 } from "@fusion-plugin-examples/paperclip-runtime";
 
 export type {
+  HappierRuntimeHealth,
   HermesBinaryStatus,
   HermesProfileSummary,
   MintCliKeyOptions,
@@ -190,6 +197,13 @@ export async function probeHermesProvider(opts?: {
   binaryPath?: string;
 }): Promise<HermesBinaryStatus> {
   return probeHermesBinary(opts);
+}
+
+/** Probe every non-secret Happier runtime layer through official CLI contracts. */
+export async function probeHappierProvider(
+  settings?: HappierCliSettings,
+): Promise<HappierRuntimeHealth> {
+  return probeHappierRuntime(settings);
 }
 
 /**
