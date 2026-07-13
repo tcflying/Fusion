@@ -17,19 +17,20 @@
 ## Windows concurrency hardening
 
 - A six-command real smoke run against the local Happier source CLI produced one transient `EBUSY: resource busy or locked` while concurrent Node processes loaded a shared module.
-- Added a bounded three-attempt startup retry with 75 ms and 250 ms backoff for only `EBUSY`, `EPERM`, `ETXTBSY`, or equivalent file-lock text.
-- Authentication, timeout, protocol, server, daemon, and business failures are never retried by this path.
-- A dedicated regression test proves recovery from the transient startup lock.
+- The initial broad retry was rejected during independent review because a post-spawn failure is ambiguous: the remote mutation may already have happened.
+- The final boundary retries only a synchronous `spawn()` throw containing `EBUSY`, `EPERM`, `ETXTBSY`, or equivalent file-lock text. At that point no child exists, so no Happier operation can have started.
+- Post-spawn file-lock errors, authentication, timeout, abort, protocol, server, daemon, and business failures are surfaced without retry.
+- Regression tests cover safe pre-spawn recovery, post-spawn no-retry, and no-retry behavior for authentication, timeout, and abort.
 
 ## Verification
 
 All Fusion commands ran from `G:\codex-project\fusion\.worktrees\happier-runtime`.
 
-- Plugin test suite: 57/57 passed across 5 files.
+- Plugin test suite: 60/60 passed across 5 files.
 - Plugin TypeScript check: passed.
 - Plugin build: passed.
 - `git diff --check`: passed.
-- Real local smoke against `G:\codex-project\happier\apps\cli\bin\happier.mjs` and `http://localhost:52211`:
+- Real six-way concurrent smoke against the current built CLI `G:\codex-project\happier\apps\cli\package-dist\index.mjs` and `http://127.0.0.1:52211` completed without startup-lock errors:
   - review: reached official command, returned `not_authenticated`
   - plan: reached official command, returned `not_authenticated`
   - delegate: reached official command, returned `not_authenticated`

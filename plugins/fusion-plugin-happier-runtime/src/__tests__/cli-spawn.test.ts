@@ -173,6 +173,7 @@ describe("Happier official JSON envelopes", () => {
 
     await expect(promise).rejects.toMatchObject({ code: "authentication", officialCode: "not_authenticated" });
     await expect(promise).rejects.not.toThrow("do-not-leak");
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -197,6 +198,7 @@ describe("Happier JSON process boundary", () => {
 
     await expect(promise).rejects.toMatchObject({ code: "timeout" });
     expect(fake.kill).toHaveBeenCalled();
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 
   it("terminates when stdout exceeds the hard output cap", async () => {
@@ -228,6 +230,7 @@ describe("Happier JSON process boundary", () => {
 
     await expect(promise).rejects.toMatchObject({ code: "timeout" });
     expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 
   it("maps nonzero process failures using textual fallback and redacts diagnostics", async () => {
@@ -252,20 +255,30 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
-  it("retries a bounded transient Windows startup file lock", async () => {
-    const locked = fakeChild();
+  it("retries a bounded synchronous Windows spawn file lock", async () => {
     const recovered = fakeChild();
-    mockSpawn.mockReturnValueOnce(locked.child).mockReturnValueOnce(recovered.child);
+    mockSpawn
+      .mockImplementationOnce(() => { throw Object.assign(new Error("spawn EBUSY: resource busy or locked"), { code: "EBUSY" }); })
+      .mockReturnValueOnce(recovered.child);
 
     const promise = createHappierSession({ cwd: "G:\\repo", backend: "codex", title: "Task 1" }, settings());
-    locked.stderr("Error: EBUSY: resource busy or locked, open 'cli-module.js'");
-    locked.close(1);
     await new Promise<void>((resolve) => setTimeout(resolve, 100));
     expect(mockSpawn).toHaveBeenCalledTimes(2);
     recovered.stdout(CREATE_SUCCESS);
     recovered.close(0);
 
     await expect(promise).resolves.toMatchObject({ sessionId: "sess_integration_create_123" });
+  });
+
+  it("never retries a post-spawn EBUSY because the command may already have side effects", async () => {
+    const child = fakeChild();
+    mockSpawn.mockReturnValue(child.child);
+    const promise = createHappierSession({ cwd: "G:\\repo", backend: "codex", title: "Task 1" }, settings());
+    child.stderr("Error: EBUSY: resource busy or locked, open 'runtime-module.js'");
+    child.close(1);
+
+    await expect(promise).rejects.toMatchObject({ code: "process" });
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 
   it("constructs the official create command and trims data.session.id", async () => {

@@ -104,4 +104,36 @@ describe("Happier multi-agent operations", () => {
     await expect(startHappierPlan({ sessionId: "sess-1", backends: ["claude,codex"], instructions: "Plan." })).rejects.toThrow(/participant/i);
     expect(invokeHappierJsonForKind).not.toHaveBeenCalled();
   });
+
+  it("rejects missing, duplicate, or malformed participant results", async () => {
+    invokeHappierJsonForKind
+      .mockResolvedValueOnce({ sessionId: "sess-1", results: [] })
+      .mockResolvedValueOnce({
+        sessionId: "sess-1",
+        results: [
+          { key: "claude", ok: true, result: { runId: "run-1", callId: "call-1", sidechainId: "side-1" } },
+          { key: "claude", ok: false, errorCode: "busy" },
+        ],
+      })
+      .mockResolvedValueOnce({ sessionId: "sess-1", results: [{ key: "claude", ok: true, result: { runId: "run-1" } }] });
+
+    await expect(startHappierReview({ sessionId: "sess-1", engines: ["claude"], instructions: "Review." })).rejects.toThrow(/result count/i);
+    await expect(startHappierReview({ sessionId: "sess-1", engines: ["claude", "codex"], instructions: "Review." })).rejects.toThrow(/participant key/i);
+    await expect(startHappierReview({ sessionId: "sess-1", engines: ["claude"], instructions: "Review." })).rejects.toThrow(/run metadata|callId/i);
+  });
+
+  it("rejects invalid run state instead of coercing it", async () => {
+    invokeHappierJsonForKind.mockResolvedValue({
+      sessionId: "sess-1",
+      run: {
+        runId: "run-1",
+        callId: "call-1",
+        sidechainId: "side-1",
+        intent: "review",
+        backendTarget: { kind: "builtInAgent", agentId: "claude" },
+        status: "unknown",
+      },
+    });
+    await expect(readHappierRun("sess-1", "run-1")).rejects.toThrow(/run status/i);
+  });
 });

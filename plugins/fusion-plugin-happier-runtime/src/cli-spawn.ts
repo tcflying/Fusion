@@ -413,11 +413,11 @@ function expectedSessionId(payload: HappierJsonRecord, requested: string, operat
 
 function isTransientWindowsStartupFailure(error: unknown): boolean {
   if (!(error instanceof HappierCliError) || error.code !== "process") return false;
-  const diagnostic = [error.message, error.details?.stderr, error.details?.stdout].filter(Boolean).join("\n");
-  return /\b(?:EBUSY|EPERM|ETXTBSY)\b|resource busy or locked|text file busy/iu.test(diagnostic);
+  if (!error.message.startsWith("Happier CLI spawn failed:")) return false;
+  return /\b(?:EBUSY|EPERM|ETXTBSY)\b|resource busy or locked|text file busy/iu.test(error.message);
 }
 
-/** Retry only transient process-startup file locks; never retry command or authentication failures. */
+/** Retry only synchronous spawn failures, where no child process or side effect can exist. */
 export async function invokeHappierJsonForKind<T extends HappierJsonRecord>(
   commandArgs: readonly string[],
   kind: string,
