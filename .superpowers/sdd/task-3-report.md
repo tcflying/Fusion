@@ -7,6 +7,7 @@
 - Readiness fails closed unless every required layer is true. Diagnostics are fixed bounded codes; raw stdout, stderr, credentials, tokens, and exception text are not returned.
 - Registered `fusion-plugin-happier-runtime` in the canonical Fusion CLI/core/staging/dashboard/desktop/workspace registries. Vite and Vitest aliases point to source, not `dist`.
 - Corrected the desktop registry test's pre-existing POSIX-only expected path so the same assertion verifies Windows paths.
+- Follow-up commit `b141426` makes all selected backends, including Claude, execute their real provider `--help` surface instead of accepting the Happier root help as backend proof.
 
 ## Verification
 
@@ -52,3 +53,7 @@ This is the expected honest state before the user completes Happier authenticati
 
 - Live authenticated create/send/history/archive proof remains for the later E2E task.
 - Server reachability is not inferred from a configured URL. It becomes true only from official reachability evidence or successful authenticated status validation.
+
+## Independent review
+
+- Updated head `b141426` received an independent read-only `CLEAN` verdict after review of false-ready, official-command, redaction, Windows, registry, and test boundaries.
