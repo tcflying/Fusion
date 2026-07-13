@@ -147,6 +147,10 @@ export default defineConfig({
         replacement: resolve(__dirname, "../../plugins/fusion-plugin-hermes-runtime/src/index.ts"),
       },
       {
+        find: /^@fusion-plugin-examples\/happier-runtime$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-happier-runtime/src/index.ts"),
+      },
+      {
         find: /^@fusion-plugin-examples\/openclaw-runtime$/,
         replacement: resolve(__dirname, "../../plugins/fusion-plugin-openclaw-runtime/src/index.ts"),
       },

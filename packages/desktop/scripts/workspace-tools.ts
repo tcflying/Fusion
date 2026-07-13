@@ -102,6 +102,7 @@ async function buildPackage(relativePath: string): Promise<void> {
 export const DASHBOARD_RUNTIME_PLUGIN_PACKAGES = [
   "plugins/fusion-plugin-dependency-graph",
   "plugins/fusion-plugin-hermes-runtime",
+  "plugins/fusion-plugin-happier-runtime",
   "plugins/fusion-plugin-openclaw-runtime",
   "plugins/fusion-plugin-paperclip-runtime",
   "plugins/fusion-plugin-cursor-runtime",

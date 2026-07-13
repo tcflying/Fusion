@@ -35,6 +35,14 @@ export const BUILTIN_PLUGINS: BuiltinPluginCatalogEntry[] = [
     experimental: true,
   },
   {
+    id: "fusion-plugin-happier-runtime",
+    name: "Happier Runtime",
+    description: "Durable Codex, Claude, and OpenCode sessions through the official Happier CLI.",
+    category: "runtime",
+    path: "./plugins/fusion-plugin-happier-runtime",
+    experimental: true,
+  },
+  {
     id: "fusion-plugin-paperclip-runtime",
     name: "Paperclip Runtime",
     description: "Runtime provider for Paperclip agent connections.",

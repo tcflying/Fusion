@@ -269,6 +269,7 @@ describe("plugin commands", () => {
     await expect(runPluginAvailable()).resolves.toBeUndefined();
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining("Installable"));
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining("fusion-plugin-agent-browser"));
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("fusion-plugin-happier-runtime"));
   });
 
   it("exits non-zero when rescan verdict is blocked", async () => {

@@ -116,6 +116,7 @@
     "@fusion-plugin-examples/grok-runtime": "workspace:*",
     "@fusion-plugin-examples/hermes-runtime": "workspace:*",
     "@fusion-plugin-examples/omp-runtime": "workspace:*",
+    "@fusion-plugin-examples/happier-runtime": "workspace:*",
     "@fusion-plugin-examples/openclaw-runtime": "workspace:*",
     "@fusion-plugin-examples/paperclip-runtime": "workspace:*",
     "@fusion-plugin-examples/quality": "workspace:*",

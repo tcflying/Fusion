@@ -278,6 +278,9 @@ importers:
       '@fusion-plugin-examples/grok-runtime':
         specifier: workspace:*
         version: link:../../plugins/fusion-plugin-grok-runtime
+      '@fusion-plugin-examples/happier-runtime':
+        specifier: workspace:*
+        version: link:../../plugins/fusion-plugin-happier-runtime
       '@fusion-plugin-examples/hermes-runtime':
         specifier: workspace:*
         version: link:../../plugins/fusion-plugin-hermes-runtime

@@ -32,6 +32,7 @@ export const BUNDLED_PLUGIN_IDS = [
   "fusion-plugin-whatsapp-chat",
   "fusion-plugin-roadmap",
   "fusion-plugin-hermes-runtime",
+  "fusion-plugin-happier-runtime",
   "fusion-plugin-openclaw-runtime",
   "fusion-plugin-paperclip-runtime",
   "fusion-plugin-cursor-runtime",

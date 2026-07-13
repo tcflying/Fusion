@@ -31,6 +31,7 @@ export interface HappierCliSettings {
   serverUrl?: string;
   webappUrl?: string;
   profile?: string;
+  backend?: HappierBackend;
   timeoutMs?: number;
   maxOutputBytes?: number;
 }

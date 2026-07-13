@@ -523,6 +523,10 @@ export default defineConfig({
         __dirname,
         "../../plugins/fusion-plugin-hermes-runtime/src/index.ts",
       ),
+      "@fusion-plugin-examples/happier-runtime": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-happier-runtime/src/index.ts",
+      ),
       "@fusion-plugin-examples/openclaw-runtime": resolve(
         __dirname,
         "../../plugins/fusion-plugin-openclaw-runtime/src/index.ts",
