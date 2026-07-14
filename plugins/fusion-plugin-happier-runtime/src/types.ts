@@ -162,4 +162,5 @@ export type HappierRecoveryErrorCode =
   | "native-session-binding-missing"
   | "native-session-persistence-failed"
   | "history-reconciliation-failed"
+  | "provider-process-failed"
   | "ambiguous-send-unresolved";

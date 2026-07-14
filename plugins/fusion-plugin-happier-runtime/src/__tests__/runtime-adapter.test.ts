@@ -48,6 +48,15 @@ function rawCodexRow(id: string, createdAt: number, text: string): RawHistoryRow
   };
 }
 
+function rawEventMessageRow(id: string, createdAt: number, text: string): RawHistoryRow {
+  return {
+    id,
+    createdAt,
+    role: "agent",
+    raw: { content: { type: "event", data: { type: "message", message: text } } },
+  };
+}
+
 function historyFor(sessionId: string): RawHistoryRow[] {
   const existing = histories.get(sessionId);
   if (existing) return existing;
@@ -384,6 +393,62 @@ describe("HappierRuntimeAdapter", () => {
     await runtime.promptWithFallback(result.session, "official codex output");
 
     expect(onText).toHaveBeenCalledWith("codex provider text");
+  });
+
+  it("fails closed when Happier returns a provider process error as an agent message", async () => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
+      historyFor(sessionId).push(
+        rawTextRow("failed-user", 2_000, "user", message, localId),
+        rawEventMessageRow("failed-agent", 2_001, "Codex process error: thread/start timed out"),
+      );
+      return { sessionId, localId, waited: true };
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding().binding, { onText }));
+
+    await expect(runtime.promptWithFallback(result.session, "provider failure")).rejects.toMatchObject({
+      name: "HappierRecoveryError",
+      code: "provider-process-failed",
+    });
+    expect((result.session as HappierAgentSession).state.status).toBe("blocked");
+    expect(onText).not.toHaveBeenCalled();
+  });
+
+  it("does not infer a process failure from provider-authored text outside an event row", async () => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
+      historyFor(sessionId).push(
+        rawTextRow("quoted-error-user", 2_000, "user", message, localId),
+        rawCodexRow("quoted-error-agent", 2_001, "Codex process error: this is quoted assistant text"),
+      );
+      return { sessionId, localId, waited: true };
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding().binding, { onText }));
+
+    await expect(runtime.promptWithFallback(result.session, "quote the error prefix")).resolves.toBeUndefined();
+    expect(onText).toHaveBeenCalledWith("Codex process error: this is quoted assistant text");
+  });
+
+  it("fails closed on a provider process error while reconciling an ambiguous send", async () => {
+    cli.sendHappierMessage.mockImplementationOnce(async ({ sessionId, message, localId }: { sessionId: string; message: string; localId: string }) => {
+      historyFor(sessionId).push(
+        rawTextRow("ambiguous-failed-user", 2_000, "user", message, localId),
+        rawEventMessageRow("ambiguous-failed-agent", 2_001, "Codex process error: thread/start timed out"),
+      );
+      throw new HappierCliError("timeout", "send wait timed out");
+    });
+    const onText = vi.fn();
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(nativeBinding().binding, { onText }));
+
+    await expect(runtime.promptWithFallback(result.session, "ambiguous provider failure")).rejects.toMatchObject({
+      name: "HappierRecoveryError",
+      code: "provider-process-failed",
+    });
+    expect((result.session as HappierAgentSession).state.status).toBe("blocked");
+    expect(onText).not.toHaveBeenCalled();
   });
 
   it("accepts an ambiguous send only when bounded history positively proves acceptance", async () => {

@@ -189,7 +189,8 @@ export async function probeHappierRuntime(
       const daemonRecord = isRecord(daemonStatus.daemon) ? daemonStatus.daemon : undefined;
       daemon = daemonRecord?.running === true;
       const reachability = activeReachability(status);
-      if (reachability === "reachable") serverState = "reachable";
+      // FNXC:HappierRuntime 2026-07-14-12:46: Current Happier reports a successfully checked active relay as "verified"; normalize it to Fusion's public reachable state so a healthy native Windows stack is not shown as unavailable.
+      if (reachability === "reachable" || reachability === "verified") serverState = "reachable";
       else if (reachability === "unreachable") serverState = "unreachable";
       server = serverState === "reachable";
       if (!server) details.push(serverState === "unreachable" ? "server-unreachable" : "server-not-probed");

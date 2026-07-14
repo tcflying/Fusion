@@ -52,6 +52,7 @@ interface ParsedHistoryRow {
   localId?: string;
   createdAt: number;
   role: string;
+  contentType?: string;
   text?: string;
   postIndex: number;
 }
@@ -177,7 +178,16 @@ function parseRawHistoryRows(history: HappierSessionHistoryResult): ParsedHistor
     if (createdAt < priorCreatedAt) throw new Error(`raw history order regressed at row ${id}`);
     seenIds.add(id);
     priorCreatedAt = createdAt;
-    return { id, ...(localId ? { localId } : {}), createdAt, role, text: rawContentText(raw), postIndex };
+    const contentType = nonEmptyString(asRecord(raw.content)?.type)?.toLowerCase();
+    return {
+      id,
+      ...(localId ? { localId } : {}),
+      createdAt,
+      role,
+      ...(contentType ? { contentType } : {}),
+      text: rawContentText(raw),
+      postIndex,
+    };
   });
 }
 
@@ -245,6 +255,27 @@ function correlatePromptOutput(
 
 function isAmbiguousSendError(error: unknown): boolean {
   return error instanceof HappierCliError && ["timeout", "process", "server", "daemon"].includes(error.code);
+}
+
+/*
+FNXC:HappierRuntime 2026-07-14-13:02:
+Happier currently records Codex and Claude process failures as agent event
+rows followed by a ready event. They are failure evidence, not assistant
+output, so both normal and ambiguous-send reconciliation must fail closed.
+*/
+function assertNoProviderProcessFailure(rows: ParsedHistoryRow[], sessionId: string): void {
+  const failed = rows.some((row) =>
+    row.contentType === "event"
+    && typeof row.text === "string"
+    && /^(?:Claude|Codex) process error:\s/u.test(row.text),
+  );
+  if (failed) {
+    throw new HappierRecoveryError(
+      "provider-process-failed",
+      `Happier provider process failed for session ${sessionId}`,
+      sessionId,
+    );
+  }
 }
 
 function asHappierSession(session: AgentSession): HappierAgentSession {
@@ -376,6 +407,7 @@ export class HappierRuntimeAdapter implements AgentRuntime {
             error,
           );
         }
+        assertNoProviderProcessFailure(correlated.assistant, session.sessionId);
         this.recordAssistantOutput(session, correlated.assistant);
         session.state.status = statusToRuntimeState(status) ?? "ready";
       } catch (error) {
@@ -390,6 +422,7 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         }
         if (!isAmbiguousSendError(error)) throw error;
         const reconciled = await this.reconcileAmbiguousSend(session, watermark, localId, error);
+        assertNoProviderProcessFailure(reconciled.added, session.sessionId);
         this.recordAssistantOutput(session, reconciled.added);
         session.state.status = statusToRuntimeState(reconciled.status) ?? "ready";
       }

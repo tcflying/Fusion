@@ -195,6 +195,26 @@ describe("probeHappierRuntime", () => {
     });
   });
 
+  it("treats the official verified reachability value as reachable", async () => {
+    const health = await probeHappierRuntime({ backend: "codex" }, runner({
+      "codex --help": help,
+      "auth status --json": authOk,
+      "status --json": status({
+        report: { authProfiles: [{ isActive: true, reachability: "verified" }] },
+      }),
+      "profiles list --json": profiles,
+    }));
+
+    expect(health).toMatchObject({
+      server: true,
+      serverState: "reachable",
+      authenticated: true,
+      daemon: true,
+      backend: true,
+      ready: true,
+    });
+  });
+
   it("does not infer server reachability from authentication when status JSON is malformed", async () => {
     const health = await probeHappierRuntime({}, runner({
       "claude --help": help,
