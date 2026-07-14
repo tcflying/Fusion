@@ -26,7 +26,11 @@ import type {
   PluginContext,
   PluginState,
 } from "@fusion/core";
-import { resolvePluginEntryPath, validatePluginManifest } from "@fusion/core";
+import {
+  resolvePluginEntryPath,
+  validatePluginManifest,
+  validatePluginSettingsPolicy,
+} from "@fusion/core";
 import {
   ApiError,
   badRequest,
@@ -675,6 +679,11 @@ export function createPluginRouter(
 
     if (!settings || typeof settings !== "object") {
       throw badRequest("Request body must have a 'settings' object");
+    }
+
+    const policyErrors = validatePluginSettingsPolicy(id, settings);
+    if (policyErrors.length > 0) {
+      throw badRequest(policyErrors.join(", "));
     }
 
     try {

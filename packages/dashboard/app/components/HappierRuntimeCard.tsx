@@ -19,7 +19,10 @@ const MAX_OUTPUT_BYTES = 16_777_216;
 const DEFAULT_SETTINGS: Required<HappierProviderOptions> = {
   executable: "",
   entrypoint: "",
+  homeDir: "",
+  activeServerId: "",
   serverUrl: "",
+  publicServerUrl: "",
   webappUrl: "",
   profile: "",
   backend: "codex",
@@ -37,7 +40,10 @@ function settingsFromRecord(raw: Record<string, unknown>): Required<HappierProvi
   return {
     executable: typeof raw.executable === "string" ? raw.executable : "",
     entrypoint: typeof raw.entrypoint === "string" ? raw.entrypoint : "",
+    homeDir: typeof raw.homeDir === "string" ? raw.homeDir : "",
+    activeServerId: typeof raw.activeServerId === "string" ? raw.activeServerId : "",
     serverUrl: typeof raw.serverUrl === "string" ? raw.serverUrl : "",
+    publicServerUrl: typeof raw.publicServerUrl === "string" ? raw.publicServerUrl : "",
     webappUrl: typeof raw.webappUrl === "string" ? raw.webappUrl : "",
     profile: typeof raw.profile === "string" ? raw.profile : "",
     backend: backend === "claude" || backend === "opencode" ? backend : "codex",
@@ -46,17 +52,31 @@ function settingsFromRecord(raw: Record<string, unknown>): Required<HappierProvi
   };
 }
 
-function HealthBadge({ label, value }: { label: string; value: boolean }) {
+type HealthBadgeState = "ok" | "error" | "neutral";
+
+function HealthBadge({
+  label,
+  state,
+  detail,
+}: {
+  label: string;
+  state: HealthBadgeState;
+  detail?: string;
+}) {
   return (
     <span
       data-testid={`happier-health-${label.toLowerCase()}`}
-      className={`provider-status-badge ${value ? "provider-status-badge--ok" : "provider-status-badge--error"}`}
-      style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+      className={`provider-status-badge provider-status-badge--${state}`}
+      style={{ display: "inline-flex", alignItems: "center", gap: 6, opacity: state === "neutral" ? 0.72 : 1 }}
     >
-      <span aria-hidden="true">{value ? "●" : "○"}</span>
-      {label}
+      <span aria-hidden="true">{state === "ok" ? "●" : state === "neutral" ? "◌" : "○"}</span>
+      {label}{detail ? ` · ${detail}` : ""}
     </span>
   );
+}
+
+function booleanHealthState(value: boolean): HealthBadgeState {
+  return value ? "ok" : "error";
 }
 
 export function HappierRuntimeCard() {
@@ -157,11 +177,17 @@ export function HappierRuntimeCard() {
       onSaveAndTest={() => void save(true)}
       belowForm={health ? (
         <div aria-live="polite" style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-          <HealthBadge label="CLI" value={health.executable} />
-          <HealthBadge label="Server" value={health.server} />
-          <HealthBadge label="Auth" value={health.authenticated} />
-          <HealthBadge label="Daemon" value={health.daemon} />
-          <HealthBadge label="Backend" value={health.backend} />
+          <HealthBadge label="CLI" state={booleanHealthState(health.executable)} />
+          {/* FNXC:HappierRuntime 2026-07-14-09:54: Unknown reachability is neutral,
+              never rendered as a false server-down alarm. */}
+          <HealthBadge
+            label="Server"
+            state={health.serverState === "not-probed" ? "neutral" : booleanHealthState(health.server)}
+            detail={health.serverState === "not-probed" ? "Not probed" : undefined}
+          />
+          <HealthBadge label="Auth" state={booleanHealthState(health.authenticated)} />
+          <HealthBadge label="Daemon" state={booleanHealthState(health.daemon)} />
+          <HealthBadge label="Backend" state={booleanHealthState(health.backend)} />
         </div>
       ) : null}
     >
@@ -182,8 +208,20 @@ export function HappierRuntimeCard() {
         <input id="happier-entrypoint" value={settings.entrypoint} placeholder="Path to happier.mjs when executable is node" onChange={(event) => setSettings((value) => ({ ...value, entrypoint: event.target.value }))} />
       </div>
       <div className="form-group">
+        <label htmlFor="happier-home-dir">Happier home directory</label>
+        <input id="happier-home-dir" value={settings.homeDir} placeholder="Path to the selected stack CLI home" onChange={(event) => setSettings((value) => ({ ...value, homeDir: event.target.value }))} />
+      </div>
+      <div className="form-group">
+        <label htmlFor="happier-active-server-id">Active server ID</label>
+        <input id="happier-active-server-id" value={settings.activeServerId} placeholder="stack_...__id_default" onChange={(event) => setSettings((value) => ({ ...value, activeServerId: event.target.value }))} />
+      </div>
+      <div className="form-group">
         <label htmlFor="happier-server">Server URL</label>
         <input id="happier-server" type="url" value={settings.serverUrl} placeholder="http://localhost:52211" onChange={(event) => setSettings((value) => ({ ...value, serverUrl: event.target.value }))} />
+      </div>
+      <div className="form-group">
+        <label htmlFor="happier-public-server">Public server URL</label>
+        <input id="happier-public-server" type="url" value={settings.publicServerUrl} placeholder="http://localhost:52211" onChange={(event) => setSettings((value) => ({ ...value, publicServerUrl: event.target.value }))} />
       </div>
       <div className="form-group">
         <label htmlFor="happier-webapp">Web app URL (optional)</label>

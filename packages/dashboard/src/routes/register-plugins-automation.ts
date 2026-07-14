@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import { AutomationStore, RoutineStore, isWebhookTrigger, resolvePluginEntryPath, type RoutineTriggerType, type ScheduleType } from "@fusion/core";
+import { AutomationStore, RoutineStore, isWebhookTrigger, resolvePluginEntryPath, validatePluginSettingsPolicy, type RoutineTriggerType, type ScheduleType } from "@fusion/core";
 import { ApiError, badRequest, conflict, internalError, notFound } from "../api-error.js";
 import { verifyWebhookSignature } from "../github-webhooks.js";
 import { resolvePluginManifest } from "../plugin-routes.js";
@@ -1479,6 +1479,11 @@ export function registerPluginsAutomationRoutes(ctx: ApiRoutesContext, deps: Plu
 
     if (!settings || typeof settings !== "object") {
       throw badRequest("Request body must have a 'settings' object");
+    }
+
+    const policyErrors = validatePluginSettingsPolicy(id, settings);
+    if (policyErrors.length > 0) {
+      throw badRequest(policyErrors.join(", "));
     }
 
     // Auto-install bundled runtime plugins (Hermes/Happier/OpenClaw/Paperclip) on

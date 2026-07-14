@@ -683,6 +683,7 @@ export interface HappierProviderStatus {
   discovered: boolean;
   executable: boolean;
   server: boolean;
+  serverState: "reachable" | "unreachable" | "not-probed";
   authenticated: boolean;
   daemon: boolean;
   backend: boolean;
@@ -694,7 +695,10 @@ export interface HappierProviderStatus {
 export interface HappierProviderOptions {
   executable?: string;
   entrypoint?: string;
+  homeDir?: string;
+  activeServerId?: string;
   serverUrl?: string;
+  publicServerUrl?: string;
   webappUrl?: string;
   profile?: string;
   backend?: "codex" | "claude" | "opencode";
@@ -704,12 +708,10 @@ export interface HappierProviderOptions {
 
 /** Probe Happier without transmitting credentials or mutating sessions. */
 export async function fetchHappierStatus(opts: HappierProviderOptions = {}): Promise<HappierProviderStatus> {
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(opts)) {
-    if (value !== undefined && value !== "") params.set(key, String(value));
-  }
-  const suffix = params.size > 0 ? `?${params.toString()}` : "";
-  return api<HappierProviderStatus>(`/providers/happier/status${suffix}`);
+  return api<HappierProviderStatus>("/providers/happier/status", {
+    method: "POST",
+    body: JSON.stringify(opts),
+  });
 }
 
 export interface OpenClawProviderStatus {

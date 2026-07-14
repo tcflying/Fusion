@@ -111,7 +111,12 @@ export function resolveHappierCliSettings(
   return {
     executable,
     entrypoint,
+    homeDir: nonEmptyString(settings?.homeDir) ?? nonEmptyString(process.env.HAPPIER_HOME_DIR),
+    activeServerId:
+      nonEmptyString(settings?.activeServerId) ?? nonEmptyString(process.env.HAPPIER_ACTIVE_SERVER_ID),
     serverUrl: nonEmptyString(settings?.serverUrl) ?? nonEmptyString(process.env.HAPPIER_SERVER_URL),
+    publicServerUrl:
+      nonEmptyString(settings?.publicServerUrl) ?? nonEmptyString(process.env.HAPPIER_PUBLIC_SERVER_URL),
     webappUrl: nonEmptyString(settings?.webappUrl) ?? nonEmptyString(process.env.HAPPIER_WEBAPP_URL),
     profile: nonEmptyString(settings?.profile) ?? nonEmptyString(process.env.HAPPIER_PROFILE),
     timeoutMs: positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
@@ -119,6 +124,26 @@ export function resolveHappierCliSettings(
       1,
       Math.floor(positiveNumber(settings?.maxOutputBytes ?? process.env.HAPPIER_CLI_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES)),
     ),
+  };
+}
+
+/**
+ * FNXC:HappierRuntime 2026-07-14-09:54:
+ * Preserve the parent environment while pinning every non-secret Happier stack
+ * selector. Credentials remain owned by the official Happier home directory.
+ */
+export function buildHappierProcessEnv(
+  settings: HappierCliSettings,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const resolved = resolveHappierCliSettings(settings);
+  return {
+    ...baseEnv,
+    ...(resolved.homeDir ? { HAPPIER_HOME_DIR: resolved.homeDir } : {}),
+    ...(resolved.activeServerId ? { HAPPIER_ACTIVE_SERVER_ID: resolved.activeServerId } : {}),
+    ...(resolved.serverUrl ? { HAPPIER_SERVER_URL: resolved.serverUrl } : {}),
+    ...(resolved.publicServerUrl ? { HAPPIER_PUBLIC_SERVER_URL: resolved.publicServerUrl } : {}),
+    ...(resolved.webappUrl ? { HAPPIER_WEBAPP_URL: resolved.webappUrl } : {}),
   };
 }
 
@@ -132,6 +157,7 @@ export function buildHappierInvocation(commandArgs: readonly string[], settings:
   const args: string[] = [];
   if (resolved.entrypoint) args.push(resolved.entrypoint);
   if (resolved.serverUrl) args.push("--server-url", resolved.serverUrl);
+  if (resolved.publicServerUrl) args.push("--public-server-url", resolved.publicServerUrl);
   if (resolved.webappUrl) args.push("--webapp-url", resolved.webappUrl);
   if (resolved.profile) args.push("--profile", resolved.profile);
   args.push(...commandArgs);
@@ -303,6 +329,7 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       child = spawn(invocation.command, invocation.args, {
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
+        env: buildHappierProcessEnv(resolved),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

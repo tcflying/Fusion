@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 
 import {
   buildHappierInvocation,
+  buildHappierProcessEnv,
   parseHappierJson,
   redactHappierOutput,
   resolveHappierCliSettings,
@@ -18,6 +19,7 @@ export interface HappierRuntimeHealth {
   discovered: boolean;
   executable: boolean;
   server: boolean;
+  serverState: "reachable" | "unreachable" | "not-probed";
   authenticated: boolean;
   daemon: boolean;
   backend: boolean;
@@ -47,7 +49,10 @@ function backendHelpArgs(backend: HappierBackend): string[] {
   return [backend, "--help"];
 }
 
-function defaultRun(commandArgs: readonly string[], settings: HappierCliSettings): Promise<ProbeCommandResult> {
+export function runHappierProbeCommand(
+  commandArgs: readonly string[],
+  settings: HappierCliSettings,
+): Promise<ProbeCommandResult> {
   const resolved = resolveHappierCliSettings(settings);
   const invocation = buildHappierInvocation(commandArgs, resolved);
 
@@ -75,6 +80,7 @@ function defaultRun(commandArgs: readonly string[], settings: HappierCliSettings
       child = spawn(invocation.command, invocation.args, {
         shell: false,
         stdio: ["ignore", "pipe", "ignore"],
+        env: buildHappierProcessEnv(resolved),
       });
     } catch (error) {
       fail(error instanceof Error ? error : new Error(String(error)));
@@ -134,13 +140,14 @@ function activeReachability(status: HappierJsonRecord): string | undefined {
 /** Probe every required Happier layer without creating or mutating a session. */
 export async function probeHappierRuntime(
   settings: HappierCliSettings = {},
-  dependencies: HappierProbeDependencies = { run: defaultRun },
+  dependencies: HappierProbeDependencies = { run: runHappierProbeCommand },
 ): Promise<HappierRuntimeHealth> {
   const backendId = selectedBackend(settings);
   const details: string[] = [];
   let discovered = false;
   let executable = false;
   let server = false;
+  let serverState: HappierRuntimeHealth["serverState"] = "not-probed";
   let authenticated = false;
   let daemon = false;
   let backend = false;
@@ -156,20 +163,25 @@ export async function probeHappierRuntime(
   }
 
   if (executable) {
-    let authServerReachable = false;
+    let authServerUnreachable = false;
     try {
       const authRaw = await dependencies.run(["auth", "status", "--json"], settings);
       const auth = await parseHappierJson(authRaw.stdout, 64 * 1024);
       authenticated = authRaw.exitCode === 0 && authFromEnvelope(auth);
-      authServerReachable = authenticated;
       if (!authenticated) {
         const errorCode = !auth.ok && typeof auth.error.code === "string" ? auth.error.code : "not_authenticated";
-        if (/server|network|connection/i.test(errorCode)) details.push("server-unreachable");
+        authServerUnreachable = /server|network|connection/i.test(errorCode);
+        if (authServerUnreachable) details.push("server-unreachable");
         details.push("authentication-required");
       }
     } catch (error) {
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "authentication-timeout" : "authentication-invalid");
     }
+
+    // FNXC:HappierRuntime 2026-07-14-10:13: Happier may retain authenticated=true
+    // when network validation is unknown. Only explicit reachability is evidence.
+    if (authServerUnreachable) serverState = "unreachable";
+    server = false;
 
     try {
       const status = parseRawJson(await dependencies.run(["status", "--json"], settings));
@@ -177,11 +189,14 @@ export async function probeHappierRuntime(
       const daemonRecord = isRecord(daemonStatus.daemon) ? daemonStatus.daemon : undefined;
       daemon = daemonRecord?.running === true;
       const reachability = activeReachability(status);
-      server = authServerReachable || reachability === "reachable";
-      if (!server) details.push(reachability === "unreachable" ? "server-unreachable" : "server-not-probed");
+      if (reachability === "reachable") serverState = "reachable";
+      else if (reachability === "unreachable") serverState = "unreachable";
+      server = serverState === "reachable";
+      if (!server) details.push(serverState === "unreachable" ? "server-unreachable" : "server-not-probed");
       if (!daemon) details.push("daemon-stopped");
     } catch (error) {
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "status-timeout" : "status-invalid");
+      if (serverState === "not-probed") details.push("server-not-probed");
     }
 
     try {
@@ -200,6 +215,7 @@ export async function probeHappierRuntime(
     discovered,
     executable,
     server,
+    serverState,
     authenticated,
     daemon,
     backend,

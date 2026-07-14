@@ -1454,7 +1454,12 @@ export type {
   MoveBoardTaskInput,
   UpdateBoardTaskInput,
 } from "./board-action-services.js";
-export { PluginStore } from "./plugin-store.js";
+export {
+  HAPPIER_RUNTIME_PLUGIN_ID,
+  PluginStore,
+  sanitizePersistedPluginSettings,
+  validatePluginSettingsPolicy,
+} from "./plugin-store.js";
 export type { PluginStoreEvents, PluginRegistrationInput, PluginUpdateInput } from "./plugin-store.js";
 export { PluginLoader, resolvePluginEntryPath } from "./plugin-loader.js";
 export {

@@ -1,4 +1,6 @@
-import { ApiError, badRequest } from "../api-error.js";
+import { HAPPIER_RUNTIME_PLUGIN_ID, validatePluginSettingsPolicy } from "@fusion/core";
+import { ApiError, badRequest, unauthorized } from "../api-error.js";
+import { isDaemonAuthActive } from "../auth-middleware.js";
 import {
   discoverPaperclipCli,
   listHermesProviderProfiles,
@@ -18,41 +20,60 @@ import type { ApiRouteRegistrar } from "./types.js";
 /**
  * Registers three read-only status probes for the runtime provider plugins:
  *
+ *   POST /providers/happier/status (bearer-token protected)
  *   GET /providers/hermes/status
  *   GET /providers/openclaw/status
  *   GET /providers/paperclip/status
  *
- * These routes mirror the existing GET /providers/claude-cli/status pattern
- * in register-auth-routes.ts. They intentionally do NOT require authentication
- * because they are introspection endpoints consumed by the provider-card UI.
+ * The Happier probe is different from the other binary-only introspection
+ * routes: official auth status reads credentials and contacts the selected
+ * server, so callers may control its target only behind daemon authentication.
  */
 export const registerRuntimeProviderRoutes: ApiRouteRegistrar = (ctx) => {
   const { router, rethrowAsApiError } = ctx;
 
-  router.get("/providers/happier/status", async (req, res) => {
+  router.post("/providers/happier/status", async (req, res) => {
     try {
-      const backendValue = typeof req.query.backend === "string" ? req.query.backend : undefined;
+      // FNXC:HappierRuntime 2026-07-14-10:13: A tokenless Dashboard must never
+      // become an SSRF or credential-forwarding surface through Happier CLI.
+      if (!isDaemonAuthActive(ctx.options)) {
+        throw unauthorized("Happier probing requires Fusion bearer-token authentication");
+      }
+      if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+        throw badRequest("Request body must be a Happier settings object");
+      }
+      const input = req.body as Record<string, unknown>;
+      const policyErrors = validatePluginSettingsPolicy(HAPPIER_RUNTIME_PLUGIN_ID, input);
+      if (policyErrors.length > 0) throw badRequest(policyErrors.join(", "));
+
+      const backendValue = typeof input.backend === "string" ? input.backend : undefined;
       if (backendValue && !["codex", "claude", "opencode"].includes(backendValue)) {
         throw badRequest("Invalid backend: expected codex, claude, or opencode");
       }
       const readString = (value: unknown): string | undefined =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, 2048) : undefined;
       const readBoundedNumber = (value: unknown, minimum: number, maximum: number): number | undefined => {
-        if (typeof value !== "string" || !value.trim()) return undefined;
-        const parsed = Number(value);
+        const parsed = typeof value === "number"
+          ? value
+          : typeof value === "string" && value.trim()
+            ? Number(value)
+            : Number.NaN;
         return Number.isFinite(parsed) && parsed > 0
           ? Math.min(maximum, Math.max(minimum, Math.floor(parsed)))
           : undefined;
       };
       const health = await probeHappierProvider({
-        executable: readString(req.query.executable),
-        entrypoint: readString(req.query.entrypoint),
-        serverUrl: readString(req.query.serverUrl),
-        webappUrl: readString(req.query.webappUrl),
-        profile: readString(req.query.profile),
+        executable: readString(input.executable),
+        entrypoint: readString(input.entrypoint),
+        homeDir: readString(input.homeDir),
+        activeServerId: readString(input.activeServerId),
+        serverUrl: readString(input.serverUrl),
+        publicServerUrl: readString(input.publicServerUrl),
+        webappUrl: readString(input.webappUrl),
+        profile: readString(input.profile),
         backend: backendValue as "codex" | "claude" | "opencode" | undefined,
-        timeoutMs: readBoundedNumber(req.query.timeoutMs, 1_000, 120_000),
-        maxOutputBytes: readBoundedNumber(req.query.maxOutputBytes, 1_024, 16_777_216),
+        timeoutMs: readBoundedNumber(input.timeoutMs, 1_000, 120_000),
+        maxOutputBytes: readBoundedNumber(input.maxOutputBytes, 1_024, 16_777_216),
       });
       res.json(health);
     } catch (err) {

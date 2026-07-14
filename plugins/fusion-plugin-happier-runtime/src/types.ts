@@ -28,7 +28,10 @@ export type HappierBackend = (typeof HAPPIER_BACKENDS)[number];
 export interface HappierCliSettings {
   executable?: string;
   entrypoint?: string;
+  homeDir?: string;
+  activeServerId?: string;
   serverUrl?: string;
+  publicServerUrl?: string;
   webappUrl?: string;
   profile?: string;
   backend?: HappierBackend;

@@ -37,6 +37,42 @@ import {
   updatePluginInstall as updatePluginInstallAsync,
 } from "./async-plugin-store.js";
 
+export const HAPPIER_RUNTIME_PLUGIN_ID = "fusion-plugin-happier-runtime";
+const HAPPIER_RUNTIME_SETTING_KEYS = new Set([
+  "executable",
+  "entrypoint",
+  "homeDir",
+  "activeServerId",
+  "serverUrl",
+  "publicServerUrl",
+  "webappUrl",
+  "profile",
+  "backend",
+  "timeoutMs",
+  "maxOutputBytes",
+]);
+
+export function validatePluginSettingsPolicy(
+  pluginId: string,
+  settings: Record<string, unknown>,
+): string[] {
+  if (pluginId !== HAPPIER_RUNTIME_PLUGIN_ID) return [];
+  const unsupported = Object.keys(settings).filter((key) => !HAPPIER_RUNTIME_SETTING_KEYS.has(key));
+  return unsupported.length > 0
+    ? [`Unsupported Happier setting(s): ${unsupported.sort().join(", ")}`]
+    : [];
+}
+
+export function sanitizePersistedPluginSettings(
+  pluginId: string,
+  settings: Record<string, unknown>,
+): Record<string, unknown> {
+  if (pluginId !== HAPPIER_RUNTIME_PLUGIN_ID) return settings;
+  return Object.fromEntries(
+    Object.entries(settings).filter(([key]) => HAPPIER_RUNTIME_SETTING_KEYS.has(key)),
+  );
+}
+
 export interface PluginStoreEvents {
   "plugin:registered": [plugin: PluginInstallation];
   "plugin:unregistered": [plugin: PluginInstallation];
@@ -265,6 +301,10 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
   }
 
   private rowToPlugin(install: InstallRow, state?: ProjectStateRow): PluginInstallation {
+    const settings = sanitizePersistedPluginSettings(
+      install.id,
+      fromJson<Record<string, unknown>>(install.settings) || {},
+    );
     return {
       id: install.id,
       name: install.name,
@@ -275,7 +315,7 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       path: install.path,
       enabled: state?.enabled === 1,
       state: (state?.state ?? "installed") as PluginState,
-      settings: fromJson<Record<string, unknown>>(install.settings) || {},
+      settings,
       settingsSchema: fromJson<Record<string, PluginSettingSchema>>(install.settingsSchema),
       error: state?.error || undefined,
       dependencies: fromJson<string[]>(install.dependencies) || [],
@@ -284,6 +324,25 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       createdAt: install.createdAt,
       updatedAt: state?.updatedAt ?? install.updatedAt,
     };
+  }
+
+  private cleanPersistedSettings(install: InstallRow): InstallRow {
+    const settings = fromJson<Record<string, unknown>>(install.settings) || {};
+    const sanitized = sanitizePersistedPluginSettings(install.id, settings);
+    if (Object.keys(settings).length === Object.keys(sanitized).length) return install;
+
+    /*
+     * FNXC:HappierRuntime 2026-07-14-10:13:
+     * Happier owns credentials. Remove legacy unknown fields from the shared
+     * database before any API, CLI, or plugin route can return them.
+     */
+    const updatedAt = new Date().toISOString();
+    const serialized = toJson(sanitized);
+    this.centralDb
+      .prepare("UPDATE plugin_installs SET settings = ?, updatedAt = ? WHERE id = ?")
+      .run(serialized, updatedAt, install.id);
+    this.centralDb.bumpLastModified();
+    return { ...install, settings: serialized, updatedAt };
   }
 
   private getProjectState(pluginId: string): ProjectStateRow | undefined {
@@ -478,6 +537,10 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       }
     }
     const mergedSettings = { ...defaultSettings, ...settings };
+    const policyErrors = validatePluginSettingsPolicy(manifest.id, mergedSettings);
+    if (policyErrors.length > 0) {
+      throw new Error(`Settings validation failed: ${policyErrors.join(", ")}`);
+    }
 
     const now = new Date().toISOString();
 
@@ -544,7 +607,7 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
     if (!install) {
       throw Object.assign(new Error(`Plugin "${id}" not found`), { code: "ENOENT" });
     }
-    return this.rowToPlugin(install, this.getProjectState(id));
+    return this.rowToPlugin(this.cleanPersistedSettings(install), this.getProjectState(id));
   }
 
   async listPlugins(filter?: { enabled?: boolean; state?: PluginState }): Promise<PluginInstallation[]> {
@@ -559,7 +622,9 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       .prepare("SELECT * FROM plugin_installs ORDER BY createdAt ASC")
       .all() as InstallRow[];
 
-    const results = installs.map((install) => this.rowToPlugin(install, this.getProjectState(install.id)));
+    const results = installs.map((install) =>
+      this.rowToPlugin(this.cleanPersistedSettings(install), this.getProjectState(install.id)),
+    );
 
     return results.filter((plugin) => {
       if (filter?.enabled !== undefined && plugin.enabled !== filter.enabled) {
@@ -695,7 +760,10 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
   async updatePluginSettings(id: string, settings: Record<string, unknown>): Promise<PluginInstallation> {
     const plugin = await this.getPlugin(id);
 
-    const validationErrors = this.validateSettingsAgainstSchema(settings, plugin.settingsSchema);
+    const validationErrors = [
+      ...validatePluginSettingsPolicy(id, settings),
+      ...this.validateSettingsAgainstSchema(settings, plugin.settingsSchema),
+    ];
     if (validationErrors.length > 0) {
       throw new Error(`Settings validation failed: ${validationErrors.join(", ")}`);
     }

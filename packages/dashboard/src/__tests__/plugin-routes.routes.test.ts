@@ -1146,6 +1146,22 @@ describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", (
     expect(pluginStore.updatePluginSettings).toHaveBeenCalled();
   });
 
+  it("rejects undeclared Happier settings before install or persistence", async () => {
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-happier-runtime/settings",
+      { settings: { token: "must-not-store" } },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Unsupported Happier setting");
+    expect(ensure).not.toHaveBeenCalled();
+    expect(pluginStore.updatePluginSettings).not.toHaveBeenCalled();
+  });
+
   it("does not auto-install Happier when the plugin store itself fails", async () => {
     (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
       new Error("plugin database unavailable"),

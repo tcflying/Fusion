@@ -69,7 +69,10 @@ beforeEach(() => {
   for (const key of [
     "HAPPIER_CLI_EXECUTABLE",
     "HAPPIER_CLI_ENTRYPOINT",
+    "HAPPIER_HOME_DIR",
+    "HAPPIER_ACTIVE_SERVER_ID",
     "HAPPIER_SERVER_URL",
+    "HAPPIER_PUBLIC_SERVER_URL",
     "HAPPIER_WEBAPP_URL",
     "HAPPIER_PROFILE",
     "HAPPIER_CLI_TIMEOUT_MS",
@@ -91,6 +94,7 @@ describe("Happier CLI settings and invocation", () => {
         executable: "C:\\Program Files\\nodejs\\node.exe",
         entrypoint: "G:\\codex-project\\happier\\apps\\cli\\dist\\index.mjs",
         serverUrl: "http://127.0.0.1:52211",
+        publicServerUrl: "http://localhost:52211",
         webappUrl: "http://127.0.0.1:8081",
       }),
     ).toEqual({
@@ -99,6 +103,8 @@ describe("Happier CLI settings and invocation", () => {
         "G:\\codex-project\\happier\\apps\\cli\\dist\\index.mjs",
         "--server-url",
         "http://127.0.0.1:52211",
+        "--public-server-url",
+        "http://localhost:52211",
         "--webapp-url",
         "http://127.0.0.1:8081",
         "session",
@@ -178,6 +184,56 @@ describe("Happier official JSON envelopes", () => {
 });
 
 describe("Happier JSON process boundary", () => {
+  it("passes the selected Happier stack identity to the child without dropping inherited env", async () => {
+    vi.stubEnv("FUSION_HAPPIER_TEST_MARKER", "preserved");
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const stackSettings = settings({
+      executable: "happier",
+      serverUrl: "http://127.0.0.1:52211",
+      webappUrl: "http://stack.localhost:52211",
+      homeDir: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli",
+      activeServerId: "stack_fusion__id_default",
+      publicServerUrl: "http://localhost:52211",
+    } as Partial<HappierCliSettings> & {
+      homeDir: string;
+      activeServerId: string;
+      publicServerUrl: string;
+    });
+
+    const promise = invokeHappierJson(["auth", "status", "--json"], stackSettings);
+    fake.stdout('{"v":1,"ok":true,"kind":"auth_status","data":{"authenticated":false}}');
+    fake.close(0);
+
+    await expect(promise).resolves.toEqual({ authenticated: false });
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "happier",
+      [
+        "--server-url",
+        "http://127.0.0.1:52211",
+        "--public-server-url",
+        "http://localhost:52211",
+        "--webapp-url",
+        "http://stack.localhost:52211",
+        "auth",
+        "status",
+        "--json",
+      ],
+      expect.objectContaining({
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: expect.objectContaining({
+          FUSION_HAPPIER_TEST_MARKER: "preserved",
+          HAPPIER_HOME_DIR: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli",
+          HAPPIER_ACTIVE_SERVER_ID: "stack_fusion__id_default",
+          HAPPIER_SERVER_URL: "http://127.0.0.1:52211",
+          HAPPIER_PUBLIC_SERVER_URL: "http://localhost:52211",
+          HAPPIER_WEBAPP_URL: "http://stack.localhost:52211",
+        }),
+      }),
+    );
+  });
+
   it("returns data from an official success envelope", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
