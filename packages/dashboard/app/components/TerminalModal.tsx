@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import {
   useState,
   useEffect,
+  useLayoutEffect,
   useRef,
   useCallback,
   useMemo,
@@ -528,6 +529,8 @@ interface TerminalModalProps {
   defaultCwd?: string;
   /** Optional terminal-session namespace, usually the owning task id. */
   scopeId?: string;
+  /** Whether the fixed ExecutorStatusBar footer is currently rendered; reserves space for it in below-mode. */
+  footerVisible?: boolean;
 }
 
 /**
@@ -545,7 +548,7 @@ interface TerminalModalProps {
  * 
  * The terminal spawns a real shell (bash/zsh/powershell based on platform).
  */
-export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandGeneration = 0, projectId, embedded = false, defaultCwd, scopeId }: TerminalModalProps) {
+export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandGeneration = 0, projectId, embedded = false, defaultCwd, scopeId, footerVisible = false }: TerminalModalProps) {
   const { t } = useTranslation("app");
   const [error, setError] = useState<string | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
@@ -1269,6 +1272,13 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
 
     setTerminalWorkspaceMenuPosition({ top, left, width, maxHeight: constrainedHeight });
   }, [getEffectiveViewport]);
+
+  useLayoutEffect(() => {
+    if (!terminalWorkspaceMenuOpen) {
+      return;
+    }
+    updateTerminalWorkspaceMenuPosition();
+  }, [terminalWorkspaceMenuOpen, terminalWorkspaces.length, updateTerminalWorkspaceMenuPosition]);
 
   useEffect(() => {
     if (!terminalWorkspaceMenuOpen) {
@@ -2436,6 +2446,15 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
   // FNXC:Terminal 2026-06-23-04:30: Always carry the base `terminal-modal-overlay` class so the no-dim/no-blur rule applies in EVERY mode (docked, floating, AND the mobile/default sheet that is neither) — the terminal must never dim the page behind it.
   const overlayClassName = `modal-overlay open terminal-modal-overlay${isDockedMode ? " terminal-modal-overlay--docked" : ""}${isFloatingMode ? " terminal-modal-overlay--floating" : ""}`;
   const modalClassName = `modal terminal-modal${isMobileTerminal && !embedded ? " terminal-modal--mobile" : ""}${isDockedMode ? " terminal-modal--docked" : ""}${isFloatingMode ? " terminal-modal--floating" : ""}${isBelowMode ? " terminal-modal--below" : ""}${embedded ? " terminal-modal--embedded" : ""}`;
+  /*
+  FNXC:TerminalWorkspaces 2026-07-13-00:00:
+  The workspace picker menu is portaled to `document.body`, so floating terminal mode must compare it in the same root stacking context as the panel. Keep the menu one layer above the panel's shared `floatingZ`; otherwise the fixed CSS fallback band sits below the 10100+ floating stack and the menu appears invisible behind the modal.
+
+  FNXC:TerminalWorkspaces 2026-07-13-00:00:
+  The portaled listbox has CSS fallback coordinates for non-JS resilience, but it must never paint there during the open-frame measurement pass. Position in a layout effect and keep the menu invisible/non-interactive until the computed trigger-relative coordinates are applied.
+  */
+  const terminalWorkspaceMenuFloatingZ = isFloatingMode ? Math.max(5000, floatingZ + 1) : undefined;
+
   const modalStyle = {
     ...(keyboardOverlap > 0
       ? {
@@ -2511,14 +2530,17 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
         <Settings size={14} />
         <span className="terminal-action-label">{t("terminal.preferences", "Preferences")}</span>
       </button>
+      {/*
+      FNXC:Terminal 2026-07-12-00:00:
+      The terminal footer should not repeat steady-state "Connected" text or persistent zoom/shortcuts/escape help copy because the footer is crowded.
+      Keep only actionable non-connected status text here; the header status dot still conveys the connected state visually.
+      */}
       <span className={`terminal-connection-status ${connectionStatus}`}>
-        {connectionStatus === "connected" && t("terminal.statusConnected", "Connected")}
         {connectionStatus === "connecting" && t("terminal.statusConnecting", "Connecting...")}
         {connectionStatus === "reconnecting" && t("terminal.statusReconnecting", "Reconnecting...")}
         {connectionStatus === "disconnected" && t("terminal.statusDisconnected", "Disconnected")}
       </span>
       {exitCode !== null && <span className="terminal-exit-code" data-testid="terminal-exit-code">{t("terminal.exitLabel", "Exit: {{code}}", { code: exitCode })}</span>}
-      <span className="terminal-shortcuts terminal-shortcuts--header">{t("terminal.helpText", "Ctrl++/- zoom • ⌨ Shortcuts panel • Esc close")}</span>
       {!embedded && !isMobileTerminal && (
         <button
           className="terminal-clear-btn terminal-clear-btn--shortcut terminal-clear-btn--icon"
@@ -2734,14 +2756,18 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
                   className="terminal-workspace-picker-menu"
                   role="listbox"
                   aria-label={t("terminal.selectWorkspace", "Select terminal workspace")}
-                  style={terminalWorkspaceMenuPosition
-                    ? {
-                        top: terminalWorkspaceMenuPosition.top,
-                        left: terminalWorkspaceMenuPosition.left,
-                        width: terminalWorkspaceMenuPosition.width,
-                        maxHeight: terminalWorkspaceMenuPosition.maxHeight,
-                      }
-                    : undefined}
+                  style={{
+                    ...(terminalWorkspaceMenuPosition
+                      ? {
+                          top: terminalWorkspaceMenuPosition.top,
+                          left: terminalWorkspaceMenuPosition.left,
+                          width: terminalWorkspaceMenuPosition.width,
+                          maxHeight: terminalWorkspaceMenuPosition.maxHeight,
+                        }
+                      : {}),
+                    ...(terminalWorkspaceMenuFloatingZ ? { zIndex: terminalWorkspaceMenuFloatingZ } : {}),
+                    ...(!terminalWorkspaceMenuPosition ? { visibility: "hidden", pointerEvents: "none" } : {}),
+                  }}
                   onPointerDown={(event) => event.stopPropagation()}
                 >
                   <button
@@ -3256,8 +3282,19 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
   }
 
   if (isBelowMode) {
+    /*
+    FNXC:TerminalLayout 2026-07-12-18:50:
+    FN-7897 fixed the pinned terminal rendering underneath the fixed ExecutorStatusBar footer.
+    .terminal-below-host is a sibling of .dashboard-project-shell inside .dashboard-project-stack
+    (not a descendant), so it cannot rely on --executor-footer-height inherited from the shell — it
+    must reserve the footer's height itself via the --with-footer modifier, following the same
+    footerVisible-prop convention used by .project-content--with-footer/.left-sidebar-nav--with-footer/.right-dock--with-footer.
+    */
     return (
-      <div className="terminal-below-host" data-testid="terminal-below-host">
+      <div
+        className={`terminal-below-host${footerVisible ? " terminal-below-host--with-footer" : ""}`}
+        data-testid="terminal-below-host"
+      >
         {terminalPanel}
       </div>
     );

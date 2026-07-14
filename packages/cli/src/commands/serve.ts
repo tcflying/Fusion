@@ -29,7 +29,7 @@ import {
   registerBuiltInZaiProvider,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
-import { createServer, GitHubClient, createSkillsAdapter, getProjectSettingsPath, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
+import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
   PeerExchangeService,
@@ -279,11 +279,34 @@ export async function runServe(
   //
   let ntfyProjectId: string | undefined;
   let sharedCentralCore: CentralCore | null = null;
+  /*
+   * FNXC:SqliteFinalRemoval 2026-06-26-11:10:
+   * The SQLite CentralDatabase path is removed (VAL-REMOVAL-005). CentralCore
+   * needs its AsyncDataLayer attached to function against PostgreSQL. We use
+   * the same startup factory the engine uses to resolve the backend, extract
+   * the asyncLayer for CentralCore, then pass the full boot result (including
+   * the TaskStore) as the externalTaskStore for the cwd project's engine so
+   * the connection pool is shared — no second embedded PG instance is started.
+   */
+  let centralBootResult: { taskStore: import("@fusion/core").TaskStore; asyncLayer: import("@fusion/core").AsyncDataLayer; shutdown: () => Promise<void> } | null = null;
   try {
-    sharedCentralCore = new CentralCore();
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    centralBootResult = await createTaskStoreForBackend({ rootDir: cwd });
+    if (centralBootResult) {
+      sharedCentralCore = new CentralCore(undefined, { asyncLayer: centralBootResult.asyncLayer });
+    } else {
+      sharedCentralCore = new CentralCore();
+    }
     await sharedCentralCore.init();
   } catch {
-    // Central DB unavailable or project not registered — backward compatible
+    if (!sharedCentralCore) {
+      sharedCentralCore = new CentralCore();
+      try {
+        await sharedCentralCore.init();
+      } catch {
+        // Non-fatal — engine uses fallback defaults
+      }
+    }
   }
 
   // ── ProjectEngineManager: uniform engine lifecycle for all projects ──
@@ -366,7 +389,11 @@ export async function runServe(
     // Some tests partially mock @fusion/dashboard and omit this export.
   }
 
+  const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
+  const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
+
   const engineManager = new ProjectEngineManager(sharedCentralCore, {
+    cliPackageVersion,
     getMergeStrategy,
     processPullRequestMerge: (s, wd, taskId, pool) =>
       processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool),
@@ -376,6 +403,11 @@ export async function runServe(
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
+    // FNXC:SqliteFinalRemoval 2026-06-26-11:15: share the central boot's TaskStore
+    // as the externalTaskStore so the cwd engine reuses the same connection pool
+    // (no second embedded PG). When centralBootResult is null (legacy mode), the
+    // engine creates its own TaskStore via createTaskStoreForBackend as before.
+    ...(centralBootResult ? { externalTaskStore: centralBootResult.taskStore } : {}),
   });
 
   // Start engines for all registered projects eagerly
@@ -596,7 +628,17 @@ export async function runServe(
     const schemaHooks = pluginLoader.getPluginSchemaInitHooks();
     if (schemaHooks.length > 0) {
       try {
-        await store.getDatabase().runPluginSchemaInits(schemaHooks);
+        /*
+         * FNXC:SqliteFinalRemoval 2026-06-25-16:25:
+         * In backend mode (PostgreSQL), plugin schema inits are handled by the
+         * Drizzle schema applier at startup, not the SQLite Database class.
+         * Skip the SQLite-specific runPluginSchemaInits path in backend mode.
+         */
+        if (store.isBackendMode()) {
+          console.log("[plugins] Schema initialization skipped — backend mode (PostgreSQL Drizzle migrations)");
+        } else {
+          await store.getDatabase().runPluginSchemaInits(schemaHooks);
+        }
       } catch (err) {
         console.error(
           `[plugins] Schema initialization failed: ${err instanceof Error ? err.message : err}`,

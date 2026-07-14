@@ -1,6 +1,6 @@
 import type { WorkflowDefinition, WorkflowDefinitionKind, WorkflowIr, WorkflowIrNode, WorkflowSettingDefinition, TaskStore } from "@fusion/core";
 import { ColumnTraitValidationError, OccupiedColumnsError, InvalidRehomeTargetError, WorkflowIrError, ColumnAgentBindingError, WorkflowSettingRejectionError, SCHEMA_VERSION, assertColumnTraitsValid, layoutForIr, listTraits, listStepParsers, parseWorkflowIr, resolvePlanningSettingsModel, stripApprovalBypassFlags, resolveWorkflowIrById, resolveEffectiveSettingValues, findOrphanedSettingValues, isBuiltinWorkflowId, getBuiltinWorkflow, BUILTIN_WORKFLOW_SETTINGS, AgentStore, validateColumnAgentBindings, resolveWorkflowOptionalSteps, enumeratePromptBearingWorkflowNodes, normalizeWorkflowIcon } from "@fusion/core";
-import { buildSessionSkillContextSync, createFnAgent as engineCreateFnAgent, validateCodeNodeSources } from "@fusion/engine";
+import { buildSessionSkillContextSync, createFnAgent as engineCreateFnAgent, validateCodeNodeSources, validateWorkflowIrDryRun } from "@fusion/engine";
 import { ApiError, badRequest, conflict, notFound, rateLimited } from "../api-error.js";
 import { emitWorkflowSseEvent } from "../sse.js";
 import type { ApiRoutesContext } from "./types.js";
@@ -231,7 +231,7 @@ export function registerWorkflowRoutes(ctx: ApiRoutesContext): void {
     const columns = (ir as { columns?: unknown })?.columns;
     if (!Array.isArray(columns) || !columns.some((c) => c?.agent?.agentId)) return;
 
-    const agentStore = new AgentStore({ rootDir: store.getFusionDir() });
+    const agentStore = new AgentStore({ rootDir: store.getFusionDir(), asyncLayer: store.getAsyncLayer() ?? undefined });
     await agentStore.init();
     const settings = await store.getSettings();
     try {
@@ -301,6 +301,31 @@ export function registerWorkflowRoutes(ctx: ApiRoutesContext): void {
           includeDisabledBuiltins: req.query.includeDisabledBuiltins === "true",
         }),
       );
+    } catch (err: unknown) {
+      if (err instanceof ApiError) throw err;
+      rethrowAsApiError(err);
+    }
+  });
+
+  /**
+   * FNXC:WorkflowRoutes 2026-07-12-00:00:
+   * Workflow validation callers need the create/update validator as a read-only dry run: invalid IR returns a typed validation payload, while persistence and workflow SSE events are forbidden.
+   */
+  router.post("/workflows/validate", async (req, res) => {
+    try {
+      const { store } = await getProjectContext(req);
+      const body = req.body ?? {};
+      const workflowId = typeof body.workflowId === "string" ? body.workflowId.trim() : "";
+      let ir: unknown;
+      if (workflowId) {
+        const def = await store.getWorkflowDefinition(workflowId);
+        if (!def) throw notFound(`Workflow '${workflowId}' not found`);
+        ir = def.ir;
+      } else {
+        ir = requireIr(body);
+      }
+      const result = await validateWorkflowIrDryRun(store, ir, body.confirmPolicyEscalation === true);
+      res.status(200).json(result.valid ? { valid: true } : { valid: false, errors: result.errors });
     } catch (err: unknown) {
       if (err instanceof ApiError) throw err;
       rethrowAsApiError(err);
@@ -481,35 +506,16 @@ export function registerWorkflowRoutes(ctx: ApiRoutesContext): void {
       await assertWorkflowExists(store, workflowId);
       const projectId = store.getWorkflowSettingsProjectId();
       try {
-        // FNXC:ModelLaneDrift 2026-07-08-07:24:
-        // Capture `before` INSIDE the write transaction (paired with `stored`)
-        // so a concurrent patch of the same row cannot pair a stale baseline
-        // with another writer's result (Greptile P2).
-        const { previous: before, stored } = await store.updateWorkflowSettingValuesWithPrevious(
+        const stored = await store.updateWorkflowSettingValues(
           workflowId,
           projectId,
           values as Record<string, unknown>,
         );
         const declarations = await resolveSettingDeclarations(store, workflowId);
-        // Model-lane drift: tasks already pinned to the value being replaced
-        // are never auto-resynced (see getModelLaneDrift), so surface them
-        // here rather than let the change silently orphan those tasks.
-        // FNXC:ModelLaneDrift 2026-07-08-07:24:
-        // When the patched workflow is the project default, no-selection tasks
-        // resolve through it and must be counted, so flag includeNullSelection
-        // then (Greptile P1) — the route holds the concrete default id, not the
-        // internal DEFAULT_WORKFLOW_POOL_ID sentinel getModelLaneDrift checks.
-        const defaultWorkflowId = (await store.getDefaultWorkflowId()) ?? "builtin:coding";
-        const modelDrift = store
-          .getModelLaneDrift(workflowId, before, stored, {
-            includeNullSelection: workflowId === defaultWorkflowId,
-          })
-          .filter((d) => d.taskIds.length > 0);
         res.json({
           stored,
           effective: resolveEffectiveSettingValues(declarations, stored),
           orphaned: findOrphanedSettingValues(declarations, stored),
-          ...(modelDrift.length > 0 ? { modelDrift } : {}),
         });
       } catch (writeErr: unknown) {
         // Typed rejection → 400 with the structured rejections so the client can
@@ -572,7 +578,7 @@ export function registerWorkflowRoutes(ctx: ApiRoutesContext): void {
         }
       }
       const projectId = store.getWorkflowSettingsProjectId();
-      const stored = store.updateWorkflowPromptOverrides(
+      const stored = await store.updateWorkflowPromptOverrides(
         workflowId,
         projectId,
         overrides as Record<string, string | null>,
@@ -918,7 +924,7 @@ export function registerWorkflowRoutes(ctx: ApiRoutesContext): void {
           );
         }
         if (Object.keys(importedPromptOverrides).length > 0) {
-          restoredPromptOverrides = store.updateWorkflowPromptOverrides(
+          restoredPromptOverrides = await store.updateWorkflowPromptOverrides(
             workflow.id,
             workflowProjectId,
             importedPromptOverrides,

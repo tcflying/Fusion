@@ -595,10 +595,14 @@ export function CommandCenter({
         live "on the dashboard under System where we have runtime metrics".
         */
         return (
-          <>
+          <div className="cc-system-tab" data-testid="cc-system-tab">
+            {/*
+            FNXC:SystemPanel 2026-07-12-16:10:
+            The System tab renders a bare SystemControlsArea section fragment followed by SystemStatsArea's own .cc-area wrapper. The tab-level flex container owns the inter-area rhythm so controls, rebuild output, Server logs, and Live system health all share the same --space-lg gap without adding another scroll owner.
+            */}
             <SystemControlsArea projectId={projectId} addToast={addToast} />
             <SystemStatsArea />
-          </>
+          </div>
         );
       case "plugins":
         /*

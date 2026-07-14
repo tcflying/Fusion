@@ -13,8 +13,8 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import * as fusionCore from "@fusion/core";
-import type { AgentState, AgentCapability, AgentUpdateInput, Artifact, ArtifactCreateInput, ArtifactWithTask, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus } from "@fusion/core";
-import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon } from "@fusion/core";
+import type { AgentState, AgentCapability, AgentUpdateInput, Artifact, ArtifactCreateInput, ArtifactWithTask, TaskDocument, TaskDocumentCreateInput, TaskStore, RunMutationContext, MessageStore, Message, SourceType, Settings, ResearchRun, ResearchRunStatus, TaskCreateInput, ReflectionStore, ApprovalRequestStore, ProjectSettings, ChatStore, WorkflowSettingDefinition, GoalStatus, WorkflowIrNode } from "@fusion/core";
+import { listTraits, isBuiltinWorkflowId, AgentStore, validateColumnAgentBindings, ColumnAgentBindingError, ResearchStore, stripApprovalBypassFlags, WorkflowSettingRejectionError, resolveEffectiveSettingsById, resolveWorkflowIrById, findOrphanedSettingValues, BUILTIN_WORKFLOW_SETTINGS, MAX_TASK_LIST_TEXT_CHARS, formatCurrentTaskLine, normalizeWorkflowIcon, parseWorkflowIr, WorkflowIrError, assertColumnTraitsValid, ColumnTraitValidationError } from "@fusion/core";
 import { promoteHeldTask } from "./hold-release.js";
 import { DASHBOARD_USER_ID, dailyMemoryPath, ensureOpenClawMemoryFiles, evaluateImplementationTaskBind, extractAgentProvisioningRequest, getMemoryBackendCapabilities, getProjectMemory, isEphemeralAgent, memoryLongTermPath, normalizeMessageParticipant, reconcileDeterministicDuplicate, resolveAgentProvisioningPolicy, resolveMemoryBackend, resolveResearchSettings, resolveTaskGithubTracking, runDeterministicDuplicateGuard, scheduleQmdProjectMemoryRefresh, searchProjectMemory, shouldSkipBackgroundQmdRefresh } from "@fusion/core";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
@@ -31,6 +31,7 @@ import { MessageDeliveryAutoRecoveryHandler } from "./auto-recovery-handlers/mes
 import { emitGoalRetrievalAudit } from "./goal-anchoring-audit.js";
 import { recordRetry } from "./retry-burned-logger.js";
 import { acquireWorkspaceRepoWorktree, WorkspaceRepoAcquireBusyError } from "./worktree-acquisition.js";
+import { validateCodeNodeSources } from "./code-node-runner.js";
 
 // ── Tool parameter schemas (canonical definitions) ────────────────────────
 
@@ -226,6 +227,30 @@ export const workflowCreateParams = Type.Object({
         "Set true to confirm binding a column to an agent whose permission policy is broader " +
         "(more privileged) than the project default. Required when such a binding is present; " +
         "the create is otherwise rejected naming the offending column.",
+    }),
+  ),
+});
+
+export const workflowValidateParams = Type.Object({
+  workflow_id: Type.Optional(
+    Type.String({
+      description:
+        "Workflow definition ID to dry-run validate (e.g. 'WF-003', or a 'builtin:*' id). " +
+        "Use either workflow_id or ir; validation performs no persistence.",
+    }),
+  ),
+  ir: Type.Optional(
+    Type.Unknown({
+      description:
+        "Inline workflow graph (intermediate representation) to dry-run validate. " +
+        "Use either ir or workflow_id; validation performs no persistence.",
+    }),
+  ),
+  confirm_policy_escalation: Type.Optional(
+    Type.Boolean({
+      description:
+        "Set true to confirm that validating column-agent bindings may allow a broader agent policy. " +
+        "This is checked exactly like create/update but never persists anything.",
     }),
   ),
 });
@@ -1656,7 +1681,7 @@ async function registerArtifactForAgent(
     };
 
     const artifact: Artifact = await store.registerArtifact(input);
-    notifyArtifactRegistered(messageStore, artifact, authorId);
+    void notifyArtifactRegistered(messageStore, artifact, authorId);
     return {
       content: [{
         type: "text" as const,
@@ -1675,7 +1700,6 @@ async function registerArtifactForAgent(
     };
   }
 }
-
 /**
  * FNXC:ArtifactRegistry 2026-06-29-00:00:
  * Agents need a portable way to create task-scoped image artifacts without reading arbitrary local files. `dataBase64` decodes inside the tool and then uses TaskStore's existing binary persistence path so registry rows continue to store only managed artifact URIs.
@@ -1914,7 +1938,7 @@ function hasImageSignature(data: Buffer, mimeType: string): boolean {
   return false;
 }
 
-function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifact: Artifact, authorId: string): void {
+async function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifact: Artifact, authorId: string): Promise<void> {
   if (!messageStore) return;
 
   /*
@@ -1922,7 +1946,7 @@ function notifyArtifactRegistered(messageStore: MessageStore | undefined, artifa
   Artifact-registration mailbox notifications remain best-effort and keep their stable content string, but metadata now carries mimeType so dashboard mailbox surfaces can render document/other artifact affordances from metadata without an extra artifact fetch.
   */
   try {
-    messageStore.sendMessage({
+    await messageStore.sendMessage({
       fromType: "system",
       toType: "user",
       toId: DASHBOARD_USER_ID,
@@ -2295,7 +2319,13 @@ async function assertWorkflowColumnAgentBindings(
 ): Promise<void> {
   const columns = (ir as { columns?: unknown })?.columns;
   if (!Array.isArray(columns) || !columns.some((c) => c?.agent?.agentId)) return;
-  const agentStore = new AgentStore({ rootDir: store.getFusionDir() });
+  // FNXC:SqliteFinalRemoval 2026-06-26-11:05:
+  // In backend mode, pass the AsyncDataLayer so AgentStore delegates to async helpers.
+  const agentLayer = store.getAsyncLayer();
+  const agentStore = new AgentStore({
+    rootDir: store.getFusionDir(),
+    ...(agentLayer ? { asyncLayer: agentLayer } : {}),
+  });
   await agentStore.init();
   const settings = await store.getSettings();
   await validateColumnAgentBindings({ ir, agentStore, settings, confirmPolicyEscalation });
@@ -2316,6 +2346,116 @@ function columnAgentBindingErrorResult(err: ColumnAgentBindingError) {
     content: [{ type: "text" as const, text: `ERROR: ${text}` }],
     details: { columnId: err.columnId, agentId: err.agentId, reason: err.reason },
     isError: true as const,
+  };
+}
+
+export type WorkflowValidateDryRunError =
+  | { type: "workflow-ir"; message: string }
+  | { type: "column-traits"; message: string; violations: unknown[] }
+  | { type: "code-node"; message: string; codeNodeErrors: unknown[] }
+  | { type: "column-agent"; message: string; columnId: string; agentId?: string; reason?: string; policyEscalation?: boolean };
+
+function workflowValidationErrorFromUnknown(err: unknown): WorkflowValidateDryRunError | undefined {
+  if (err instanceof WorkflowIrError) return { type: "workflow-ir", message: err.message };
+  if (err instanceof ColumnTraitValidationError) {
+    return { type: "column-traits", message: err.message, violations: err.violations };
+  }
+  if (err instanceof ColumnAgentBindingError) {
+    return {
+      type: "column-agent",
+      message: err.message,
+      columnId: err.columnId,
+      agentId: err.agentId,
+      reason: err.reason,
+      ...(err.reason === "policy-escalation" ? { policyEscalation: true } : {}),
+    };
+  }
+  return undefined;
+}
+
+/**
+ * FNXC:WorkflowAuthoringTools 2026-07-12-00:00:
+ * Workflow authors need a no-persistence dry run that executes the same IR, trait, code-node, and column-agent checks used before create/update persistence.
+ * Keep validation failures as successful dry-run results so agents can iterate on malformed graphs without mutating workflow rows.
+ */
+export async function validateWorkflowIrDryRun(
+  store: TaskStore,
+  ir: unknown,
+  confirmPolicyEscalation = false,
+): Promise<{ valid: true } | { valid: false; errors: WorkflowValidateDryRunError[] }> {
+  try {
+    const parsed = parseWorkflowIr(ir as Parameters<typeof parseWorkflowIr>[0]);
+    if (parsed.version === "v2") assertColumnTraitsValid(parsed.columns);
+    const codeNodeFailures = await validateCodeNodeSources({ nodes: parsed.nodes as WorkflowIrNode[] });
+    if (codeNodeFailures.length > 0) {
+      return {
+        valid: false,
+        errors: [{
+          type: "code-node",
+          message: `Workflow has ${codeNodeFailures.length} code node(s) that failed to compile`,
+          codeNodeErrors: codeNodeFailures,
+        }],
+      };
+    }
+    await assertWorkflowColumnAgentBindings(store, parsed, confirmPolicyEscalation);
+    return { valid: true };
+  } catch (err: unknown) {
+    const validationError = workflowValidationErrorFromUnknown(err);
+    if (validationError) return { valid: false, errors: [validationError] };
+    throw err;
+  }
+}
+
+export function createWorkflowValidateTool(store: TaskStore): ToolDefinition {
+  return {
+    name: "fn_workflow_validate",
+    label: "Validate Workflow",
+    description:
+      "Dry-run validate a workflow IR by workflow_id or inline ir without creating or mutating any workflow. " +
+      "Runs the same server-side IR, trait, code-node, and column-agent validation as create/update and returns typed errors.",
+    parameters: workflowValidateParams,
+    execute: async (_id: string, params: Static<typeof workflowValidateParams>) => {
+      try {
+        const workflowId = params.workflow_id?.trim();
+        if (!workflowId && params.ir === undefined) {
+          return {
+            content: [{ type: "text" as const, text: "ERROR: workflow_id or ir is required." }],
+            details: { error: "missing-input" },
+            isError: true,
+          };
+        }
+        let ir = params.ir;
+        if (workflowId) {
+          const def = await store.getWorkflowDefinition(workflowId);
+          if (!def) {
+            return {
+              content: [{ type: "text" as const, text: `ERROR: Workflow '${workflowId}' not found.` }],
+              details: { workflowId },
+              isError: true,
+            };
+          }
+          ir = def.ir;
+        }
+        const result = await validateWorkflowIrDryRun(store, ir, params.confirm_policy_escalation === true);
+        if (result.valid) {
+          return {
+            content: [{ type: "text" as const, text: "IR is valid. No workflow was created or mutated." }],
+            details: { valid: true, ...(workflowId ? { workflowId } : {}) },
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `IR is invalid: ${result.errors.map((e) => e.message).join("; ")}` }],
+          details: { valid: false, errors: result.errors, ...(workflowId ? { workflowId } : {}) },
+        };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (err: any) {
+        return {
+          content: [{ type: "text" as const, text: `ERROR: Failed to validate workflow: ${err?.message ?? err}` }],
+          details: {},
+          isError: true,
+        };
+      }
+    },
   };
 }
 
@@ -2744,6 +2884,7 @@ export function createWorkflowAuthoringTools(
   return [
     createWorkflowListTool(store),
     createWorkflowGetTool(store),
+    createWorkflowValidateTool(store),
     createWorkflowSelectTool(store, currentTaskId),
     createWorkflowCreateTool(store, opts),
     createWorkflowUpdateTool(store, opts),
@@ -3008,8 +3149,8 @@ export function createGoalListTool(
     execute: async (_id: string, params: Static<typeof goalListParams>, _signal, _onUpdate, ctx) => {
       const goalStore = store.getGoalStore();
       const status = params.status ?? "active";
-      const goals = status === "all" ? goalStore.listGoals() : goalStore.listGoals({ status });
-      const activeCount = goalStore.listGoals({ status: "active" }).length;
+      const goals = status === "all" ? await goalStore.listGoals() : await goalStore.listGoals({ status });
+      const activeCount = (await goalStore.listGoals({ status: "active" })).length;
       const softWarning = activeCount >= GOAL_LIST_SOFT_WARNING_THRESHOLD;
       const goalEntries = goals.map(buildGoalListDetailsEntry);
 
@@ -3061,7 +3202,7 @@ export function createGoalShowTool(
     parameters: goalShowParams,
     execute: async (_id: string, params: Static<typeof goalShowParams>, _signal, _onUpdate, ctx) => {
       const goalStore = store.getGoalStore();
-      const goal = goalStore.getGoal(params.id);
+      const goal = await goalStore.getGoal(params.id);
       const auditContext = resolveGoalAuditContext(ctx, options?.runContext, options?.taskId);
 
       if (!goal) {
@@ -3614,7 +3755,7 @@ export function createAgentCreateTool(
           operation: `create:${params.name}:${params.role}:${reportsTo}`,
         });
 
-        const request = options.approvalRequestStore.create({
+        const request = await options.approvalRequestStore.create({
           requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
           targetAction: {
             category: "agent_provisioning",
@@ -3734,7 +3875,7 @@ export function createAgentDeleteTool(
           operation: `delete:${target.id}:${params.force === true ? "force" : "normal"}:${params.reassign_to ?? ""}`,
         });
 
-        const request = options.approvalRequestStore.create({
+        const request = await options.approvalRequestStore.create({
           requester: { actorId: callingAgentId, actorType: "agent", actorName: caller?.name ?? callingAgentId },
           targetAction: {
             category: "agent_provisioning",
@@ -4020,7 +4161,7 @@ export function createSendMessageTool(
         }
 
         const result = await deliveryHandler.runWithBoundedRetry({
-          run: async () => Promise.resolve(messageStore.sendMessage({
+          run: async () => messageStore.sendMessage({
             fromId: fromAgentId,
             fromType: "agent",
             toId: recipient.id,
@@ -4028,7 +4169,7 @@ export function createSendMessageTool(
             content,
             type: messageType,
             ...(replyToMessageId ? { metadata: { replyTo: { messageId: replyToMessageId } } } : {}),
-          })),
+          }),
           correlation: { kind: "direct", fromAgentId, toId: recipient.id },
         }, options?.autoRecovery ?? { mode: "deterministic-only", maxRetries: 3 }, async () => {
           const taskId = _ctx?.taskId as string | undefined;
@@ -4122,6 +4263,17 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
     inFlight: new Map(),
   };
 
+  // FNXC:ResearchStore 2026-06-27-12:35:
+  // The ResearchOrchestrator + the research tools' direct reads require the sync
+  // EventEmitter ResearchStore. In PG backend mode getResearchStore() returns the
+  // AsyncResearchStore (CRUD-only), so resolve to the sync store or null and degrade
+  // the research tools — AI research EXECUTION stays unavailable in PG mode (the
+  // dashboard CRUD/lifecycle surface is the ported boundary).
+  const resolveSyncResearchStore = (): ResearchStore | null => {
+    const resolved = options.store.getResearchStore();
+    return resolved instanceof ResearchStore ? resolved : null;
+  };
+
   const ensureOrchestrator = async (): Promise<ResearchOrchestrator | null> => {
     const settings = await options.getSettings();
     const resolved = resolveResearchSettings(settings);
@@ -4141,6 +4293,11 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       return null;
     }
 
+    const syncResearchStore = resolveSyncResearchStore();
+    if (!syncResearchStore) {
+      return null;
+    }
+
     if (!orchestratorState.orchestrator) {
       const stepRunner = new ResearchStepRunner({
         providers: availableProviders
@@ -4148,7 +4305,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
           .filter((provider): provider is NonNullable<typeof provider> => Boolean(provider)),
       });
       orchestratorState.orchestrator = new ResearchOrchestrator({
-        store: options.store.getResearchStore(),
+        store: syncResearchStore,
         stepRunner,
         maxConcurrentRuns: resolved.limits.maxConcurrentRuns,
       });
@@ -4175,7 +4332,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
 
       const registry = orchestratorState.providerRegistry;
       const availableProviderTypes = registry?.getAvailableProviders() ?? [];
-      const runId = orchestrator.createRun({
+      const runId = await orchestrator.createRun({
         providers: availableProviderTypes
           .filter((type) => type !== "llm-synthesis")
           .map((type) => ({ type, config: { maxResults: resolved.limits.maxSourcesPerRun, timeoutMs: resolved.limits.requestTimeoutMs } })),
@@ -4190,7 +4347,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       void runPromise.finally(() => orchestratorState.inFlight.delete(runId));
 
       if (!params.wait_for_completion) {
-        const started = options.store.getResearchStore().getRun(runId);
+        const started = resolveSyncResearchStore()?.getRun(runId);
         if (!started) {
           return {
             content: [{ type: "text" as const, text: `Started research run ${runId} for: ${params.query}` }],
@@ -4207,7 +4364,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       const completed = await Promise.race([
         runPromise,
         new Promise<ResearchRun>((resolve) => setTimeout(() => {
-          const latest = options.store.getResearchStore().getRun(runId);
+          const latest = resolveSyncResearchStore()?.getRun(runId);
           resolve(latest ?? ({
             id: runId,
             query: params.query,
@@ -4235,10 +4392,10 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
     parameters: researchListParams,
     execute: async (_id: string, params: Static<typeof researchListParams>) => {
       const limit = Math.max(1, Math.min(params.limit ?? 10, 50));
-      const runs = options.store.getResearchStore().listRuns({
+      const runs = resolveSyncResearchStore()?.listRuns({
         status: params.status as ResearchRunStatus | undefined,
         limit,
-      });
+      }) ?? [];
       const text = runs.length
         ? runs.map((run) => `- ${run.id} [${run.status}] ${run.query}`).join("\n")
         : "No research runs found.";
@@ -4255,7 +4412,7 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
     description: "Get one research run with structured findings and citations.",
     parameters: researchGetParams,
     execute: async (_id: string, params: Static<typeof researchGetParams>) => {
-      const run = options.store.getResearchStore().getRun(params.id);
+      const run = resolveSyncResearchStore()?.getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text" as const, text: `Research run ${params.id} not found.` }],
@@ -4280,8 +4437,8 @@ export function createResearchTools(options: ResearchToolsOptions): ToolDefiniti
       if (!orchestrator) {
         return researchUnavailable("provider-unavailable", "Research orchestrator is unavailable because research providers are not configured.");
       }
-      const cancelled = orchestrator.cancelRun(params.id);
-      const run = options.store.getResearchStore().getRun(params.id);
+      const cancelled = await orchestrator.cancelRun(params.id);
+      const run = resolveSyncResearchStore()?.getRun(params.id);
       if (!run) {
         return {
           content: [{ type: "text" as const, text: `Research run ${params.id} not found.` }],
@@ -4339,7 +4496,7 @@ export function createPostRoomMessageTool(
       }
 
       try {
-        const isMember = chatStore.listRoomMembers(params.roomId).some((member) => member.agentId === fromAgentId);
+        const isMember = (await chatStore.listRoomMembers(params.roomId)).some((member) => member.agentId === fromAgentId);
         if (!isMember) {
           return {
             content: [{ type: "text" as const, text: `ERROR: Agent ${fromAgentId} is not a member of room ${params.roomId}` }],
@@ -4403,11 +4560,11 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
     return `${value.slice(0, REPLY_CONTEXT_CONTENT_MAX_CHARS - 1)}…`;
   };
 
-  const resolveReplyContext = (msg: Message): {
+  const resolveReplyContext = async (msg: Message): Promise<{
     parentMessageId: string;
     parentMessage: Message | null;
     missingParent: boolean;
-  } | null => {
+  } | null> => {
     const metadata = msg.metadata;
     const parentMessageId = typeof metadata === "object"
       && metadata !== null
@@ -4423,7 +4580,7 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
       return null;
     }
 
-    const parentMessage = messageStore.getMessage(parentMessageId);
+    const parentMessage = await messageStore.getMessage(parentMessageId);
     return {
       parentMessageId,
       parentMessage,
@@ -4447,7 +4604,7 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           limit,
         };
 
-        const messages = messageStore.getInbox(agentId, "agent", filter);
+        const messages = await messageStore.getInbox(agentId, "agent", filter);
 
         if (messages.length === 0) {
           return {
@@ -4456,13 +4613,13 @@ export function createReadMessagesTool(messageStore: MessageStore, agentId: stri
           };
         }
 
-        const messageEntries = messages.map((msg: Message) => {
-          const replyContext = resolveReplyContext(msg);
+        const messageEntries = await Promise.all(messages.map(async (msg: Message) => {
+          const replyContext = await resolveReplyContext(msg);
           return {
             message: msg,
             replyContext,
           };
-        });
+        }));
 
         const lines = messageEntries.map(({ message, replyContext }) => {
           const timestamp = new Date(message.createdAt).toLocaleString();

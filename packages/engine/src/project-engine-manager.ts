@@ -34,6 +34,11 @@ import { runtimeLog } from "./logger.js";
  * These are injected by the CLI layer (dashboard.ts / serve.ts).
  */
 export interface EngineManagerOptions {
+  /**
+   * FNXC:StorageMigrationNotice 2026-07-12-00:00:
+   * The manager carries the resolved CLI package version to each per-project engine so the one-time Postgres-migration inbox message is evaluated per project while remaining gated to the same released runtime version.
+   */
+  cliPackageVersion?: ProjectEngineOptions["cliPackageVersion"];
   getMergeStrategy?: ProjectEngineOptions["getMergeStrategy"];
   processPullRequestMerge?: ProjectEngineOptions["processPullRequestMerge"];
   createGroupPr?: ProjectEngineOptions["createGroupPr"];
@@ -42,6 +47,9 @@ export interface EngineManagerOptions {
   prReconcileGithubOps?: ProjectEngineOptions["prReconcileGithubOps"];
   getTaskMergeBlocker?: ProjectEngineOptions["getTaskMergeBlocker"];
   onInsightRunProcessed?: ProjectEngineOptions["onInsightRunProcessed"];
+  // FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
+  // backend boot so all engines reuse one connection pool (no second embedded PG).
+  externalTaskStore?: ProjectEngineOptions["externalTaskStore"];
 }
 
 /** Default interval for background reconciliation (30 seconds). */
@@ -533,6 +541,7 @@ export class ProjectEngineManager {
   ): ProjectEngineOptions {
     return {
       projectId: project.id,
+      cliPackageVersion: this.options.cliPackageVersion,
       getMergeStrategy: this.options.getMergeStrategy,
       processPullRequestMerge: this.options.processPullRequestMerge,
       createGroupPr: this.options.createGroupPr,
@@ -541,6 +550,10 @@ export class ProjectEngineManager {
       prReconcileGithubOps: this.options.prReconcileGithubOps,
       getTaskMergeBlocker: this.options.getTaskMergeBlocker,
       onInsightRunProcessed: this.options.onInsightRunProcessed,
+      // FNXC:SqliteFinalRemoval 2026-06-26-11:20: forward the shared external
+      // TaskStore so engines reuse the central boot's connection pool instead
+      // of starting a second embedded PostgreSQL on the same data dir.
+      ...(this.options.externalTaskStore ? { externalTaskStore: this.options.externalTaskStore } : {}),
       ...overrides,
     };
   }

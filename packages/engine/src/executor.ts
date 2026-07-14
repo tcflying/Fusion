@@ -16,6 +16,7 @@ import { getUnmetSchedulingDependencies } from "./scheduler.js";
 import { RetryStormError, TaskDeletedError, serializeRetryStormError, isExperimentalFeatureEnabled, resolveWorkflowIrForTask, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, AgentStore } from "@fusion/core";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
+import { moveTaskToReplanColumn, resolveReplanTargetColumn } from "./replan-target.js";
 import type { TaskStep, WorkflowIr, WorkflowFieldDefinition, WorkflowColumnAgent, EffectiveAgentInput, WorkflowWorkEngineDispatchResult } from "@fusion/core";
 import {
   buildWorkflowObservationFromTask,
@@ -191,7 +192,7 @@ import {
   isMissingWorktreeSessionStartFailure,
 } from "./restart-recovery-coordinator.js";
 import { BranchWorktreeAutoRecoveryHandler } from "./auto-recovery-handlers/branch-worktree.js";
-import { autoRecoverWorktreeSessionStartFailure, MAX_WORKTREE_SESSION_RETRIES, PAUSE_ABORT_PARK_ERROR_MARKER, PAUSE_ABORT_PARK_OPERATOR_MARKER } from "./self-healing.js";
+import { autoRecoverWorktreeSessionStartFailure, COMPLETED_BLOCKED_PAUSE_REASON, MAX_WORKTREE_SESSION_RETRIES, PAUSE_ABORT_PARK_ERROR_MARKER, PAUSE_ABORT_PARK_OPERATOR_MARKER } from "./self-healing.js";
 import { ContaminationAutoRecoveryHandler } from "./auto-recovery-handlers/contamination.js";
 import { createFileScopeAutoRecoveryHandler } from "./auto-recovery-handlers/file-scope.js";
 import { ReadonlyViolationError, filterCustomToolsForReadonly } from "./workflow-step-tool-policy.js";
@@ -221,6 +222,7 @@ import {
   createTaskLogTool as sharedCreateTaskLogTool,
   createWorkflowListTool as sharedCreateWorkflowListTool,
   createWorkflowGetTool as sharedCreateWorkflowGetTool,
+  createWorkflowValidateTool as sharedCreateWorkflowValidateTool,
   createWorkflowSelectTool as sharedCreateWorkflowSelectTool,
   createTaskPromoteTool as sharedCreateTaskPromoteTool,
   createWorkflowCreateTool as sharedCreateWorkflowCreateTool,
@@ -515,11 +517,53 @@ const LOOP_COMPACTION_TIMEOUT_MS = 60_000;
 
 const TASK_DONE_REFUSAL_SUFFIX = "Either finish the work and resubmit, or do not call fn_task_done — exit the session and the engine will requeue.";
 
+function countExecuteRequeueTerminalSteps(live: TaskDetail): number {
+  return live.steps?.filter((step) => step.status === "done" || step.status === "skipped").length ?? 0;
+}
+
+function parseExecuteRequeueLoopProgressSignature(signature: string | null | undefined): { terminalStepCount: number; totalSteps: number } | null {
+  if (!signature) return null;
+  try {
+    const parsed = JSON.parse(signature) as { terminalStepCount?: unknown; totalSteps?: unknown };
+    if (typeof parsed.terminalStepCount !== "number" || typeof parsed.totalSteps !== "number") return null;
+    return {
+      terminalStepCount: parsed.terminalStepCount,
+      totalSteps: parsed.totalSteps,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function buildExecuteRequeueLoopSignature(live: TaskDetail): string {
+  /*
+  FNXC:WorkflowLifecycle 2026-07-13-07:42:
+  FN-7941: human reports #2043/#2045/#2046/#2047 showed that FN-7863's raw currentStep/status signature could drift on every execute self-requeue while no step reached a terminal state, resetting the loop counter to 1 forever. Anchor the bounded streak to monotonic terminal-step progress instead: pending/in-progress/currentStep oscillation still counts toward exhaustion, while real done/skipped progress resets the streak and FN-7926 still diverts completed-blocked work before this guard can fail it.
+  */
   return JSON.stringify({
-    currentStep: live.currentStep ?? null,
-    steps: live.steps?.map((step) => step.status) ?? [],
+    terminalStepCount: countExecuteRequeueTerminalSteps(live),
+    totalSteps: live.steps?.length ?? 0,
   });
+}
+
+function buildExecuteRequeueLoopHighWaterSignature(live: TaskDetail, previousSignature: string | null | undefined): { signature: string; madeForwardProgress: boolean } {
+  // FNXC:WorkflowLifecycle 2026-07-13-08:20: derive current terminal-step
+  // progress by parsing buildExecuteRequeueLoopSignature's own output rather
+  // than duplicating countExecuteRequeueTerminalSteps/totalSteps inline, so
+  // the two functions cannot silently drift out of sync.
+  const current = parseExecuteRequeueLoopProgressSignature(buildExecuteRequeueLoopSignature(live));
+  const currentTerminalStepCount = current?.terminalStepCount ?? countExecuteRequeueTerminalSteps(live);
+  const totalSteps = current?.totalSteps ?? (live.steps?.length ?? 0);
+  const previous = parseExecuteRequeueLoopProgressSignature(previousSignature);
+  const previousTerminalStepCount = previous?.terminalStepCount ?? currentTerminalStepCount;
+  const madeForwardProgress = previous != null && currentTerminalStepCount > previousTerminalStepCount;
+  return {
+    madeForwardProgress,
+    signature: JSON.stringify({
+      terminalStepCount: Math.max(previousTerminalStepCount, currentTerminalStepCount),
+      totalSteps,
+    }),
+  };
 }
 
 const TRANSIENT_WORKTREE_TASK_JSON_ENOENT_PATTERN = /ENOENT:\s+no such file or directory,\s+open\s+'([^']+\/\.fusion\/tasks\/([^/]+)\/task\.json)'/;
@@ -2255,7 +2299,7 @@ export class TaskExecutor {
       this.store.setCompletionHandoffAcceptedMarker(task.id, {
         source: `executor:${reason}`,
       });
-      this.store.upsertMergeRequestRecord(task.id, {
+      await this.store.upsertMergeRequestRecord(task.id, {
         state: handedOff.autoMerge === false ? "manual-required" : "queued",
       });
     }
@@ -2278,7 +2322,8 @@ export class TaskExecutor {
 
   private get approvalRequestStore(): ApprovalRequestStore {
     if (!this._approvalRequestStore) {
-      this._approvalRequestStore = new ApprovalRequestStore(this.store.getDatabase());
+      const layer = this.store.getAsyncLayer();
+      this._approvalRequestStore = new ApprovalRequestStore(layer ? null : this.store.getDatabase(), { asyncLayer: layer });
     }
     return this._approvalRequestStore;
   }
@@ -2299,7 +2344,7 @@ export class TaskExecutor {
       taskId,
       runId: taskId ? this.getRunContextFor(taskId)?.runId : undefined,
       permissionPolicy: policy,
-      createApprovalRequest: async (decision, args) => this.approvalRequestStore.create({
+      createApprovalRequest: async (decision, args) => await this.approvalRequestStore.create({
         requester: {
           actorId,
           actorType: "agent",
@@ -2322,11 +2367,11 @@ export class TaskExecutor {
         },
       }),
       findApprovalByDedupeKey: async (dedupeKey) => {
-        const latest = this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
+        const latest = await this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
         return latest ? { id: latest.id, status: latest.status } : null;
       },
       findPendingApprovalByDedupeKey: async (dedupeKey) => {
-        const latest = this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
+        const latest = await this.approvalRequestStore.findLatestByDedupeKey({ requesterActorId: actorId, taskId, dedupeKey });
         return latest?.status === "pending" ? { id: latest.id } : null;
       },
       pauseForApproval: async ({ approvalRequestId, decision }) => {
@@ -2417,7 +2462,7 @@ export class TaskExecutor {
       // payload-bearing (shared helper) and `approvalDedupeKey`/`command`/`cwd`
       // are persisted into targetAction.context so findPendingApprovalRequest
       // can match and the UI can render the payload without re-parsing.
-      createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => this.approvalRequestStore.create({
+      createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => await this.approvalRequestStore.create({
         requester: {
           actorId,
           actorType: "agent",
@@ -2446,7 +2491,7 @@ export class TaskExecutor {
         },
       }),
       findPendingApprovalRequest: async (dedupeKey) => {
-        const pending = this.approvalRequestStore.list({ status: "pending", requesterActorId: actorId, taskId, limit: 100 });
+        const pending = await this.approvalRequestStore.list({ status: "pending", requesterActorId: actorId, taskId, limit: 100 });
         return pending.find((request) => request.targetAction.context?.approvalDedupeKey === dedupeKey) ?? null;
       },
     };
@@ -3958,15 +4003,70 @@ export class TaskExecutor {
     this.workflowRerunWatchdogs.set(taskId, watchdog);
   }
 
-  private async shouldFinalizeCompletedTask(taskId: string, taskDone: boolean): Promise<boolean> {
+  private async parkCompletedBlockedTask(task: Task, completionBlocker: string, source: string, workComplete = this.isTaskWorkComplete(task)): Promise<boolean> {
+    if (task.paused === true || task.userPaused === true) return false;
+    if (task.column === "done" || task.column === "archived") return false;
+    if (!workComplete) return false;
+
+    const message = `Completed work held — ${completionBlocker}; will advance to review when blocker clears`;
+    /*
+    FNXC:WorkflowLifecycle 2026-07-12-23:13:
+    FN-7926: completed work with a persistent `getTaskCompletionBlocker` result must not self-requeue through the execute node. Re-running implementation cannot clear dependency/blockedBy state, so it only feeds FN-7863's generic no-progress backstop and misclassifies good work as `EXECUTION_DISPATCH_LOOP_EXHAUSTED`. Park in a scheduler-skipped todo state, preserve worktree/branch/steps, and reset the FN-7863 signature so the backstop remains reserved for genuinely incomplete no-progress loops.
+    */
+    if (task.column !== "todo") {
+      await this.store.moveTask(task.id, "todo", {
+        preserveProgress: true,
+        preserveResumeState: true,
+        preserveWorktree: true,
+        moveSource: "engine",
+        recoveryRehome: true,
+      });
+    }
+    await this.store.updateTask(task.id, {
+      paused: true,
+      pausedReason: COMPLETED_BLOCKED_PAUSE_REASON,
+      status: "queued",
+      error: null,
+      executeRequeueLoopCount: null,
+      executeRequeueLoopSignature: null,
+    }, this.getRunContextFor(task.id));
+    executorLog.log(`${task.id}: ${message}`);
+    await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+    await this.store.recordRunAuditEvent?.({
+      taskId: task.id,
+      agentId: "executor",
+      runId: generateSyntheticRunId("completed-blocked-park", task.id),
+      domain: "database",
+      mutationType: "task:completed-blocked-parked",
+      target: task.id,
+      metadata: {
+        taskId: task.id,
+        blocker: completionBlocker,
+        source,
+        priorColumn: task.column,
+        priorStatus: task.status ?? null,
+      },
+    });
+    return true;
+  }
+
+  private async getCompletedTaskFinalizationDecision(taskId: string, taskDone: boolean): Promise<"finalize" | "blocked" | "incomplete"> {
     const task = await this.store.getTask(taskId);
     const completionBlocker = await this.getTaskCompletionBlocker(task);
+    const workComplete = taskDone || this.isTaskWorkComplete(task);
     if (completionBlocker) {
       executorLog.log(`${taskId} completion blocked — ${completionBlocker}`);
-      return false;
+      if (workComplete && await this.parkCompletedBlockedTask(task, completionBlocker, "finalization", workComplete)) {
+        return "blocked";
+      }
+      return "incomplete";
     }
-    if (taskDone) return true;
-    return this.isTaskWorkComplete(task);
+    if (workComplete) return "finalize";
+    return "incomplete";
+  }
+
+  private async shouldFinalizeCompletedTask(taskId: string, taskDone: boolean): Promise<boolean> {
+    return await this.getCompletedTaskFinalizationDecision(taskId, taskDone) === "finalize";
   }
 
   private isTaskAlreadyCompleteForNonContinuableSession(task: Task, taskDone: boolean): boolean {
@@ -4486,15 +4586,20 @@ export class TaskExecutor {
         `Plan Review requested a planning revision before execution.\n\nStatus: ${info.status}\nFeedback:\n${feedback}`,
         this.getRunContextFor(taskId),
       );
+      /*
+      FNXC:PlanReviewReplan 2026-07-12-23:20:
+      The replan rebound is workflow-aware: workflows without a "triage" column (Coding
+      (Ideas)) replan in place in their planner column ("todo") instead of being orphaned
+      in an undeclared "triage" column, which the board rendered back in the intake lane.
+      */
+      const replanColumn = await resolveReplanTargetColumn(this.store, taskId);
       await this.store.logEntry(
         taskId,
-        `Plan Review failed — moved to triage for automatic replan (attempt ${nextCount}/${budgetLabel})`,
+        `Plan Review failed — moved to ${replanColumn} for automatic replan (attempt ${nextCount}/${budgetLabel})`,
         optionalStepRevisionLogOutcome(feedback, revisionKey),
         this.getRunContextFor(taskId),
       );
-      if (liveTask.column !== "triage") {
-        await this.store.moveTask(taskId, "triage");
-      }
+      await moveTaskToReplanColumn(this.store, { id: taskId, column: liveTask.column }, replanColumn);
       await this.store.updateTask(taskId, {
         status: "needs-replan",
         error: null,
@@ -6835,19 +6940,19 @@ export class TaskExecutor {
               fallbackProvider: settings.fallbackProvider,
               fallbackModelId: settings.fallbackModelId,
               /*
-               * FNXC:Settings-ThinkingLevel 2026-07-10-00:00:
-               * Step-review model sessions honor per-node `config.thinkingLevel` before task, validator workflow lane, global lane, and default thinking settings.
+               * FNXC:Settings-ThinkingLevel 2026-07-13-00:27:
+               * Step-review model sessions honor per-node `config.thinkingLevel` before the task validator override, then shared task thinking, validator workflow lane, global lane, and default thinking settings.
                */
               defaultThinkingLevel: resolveValidatorThinkingLevel(
                 typeof config.thinkingLevel === "string" && WORKFLOW_THINKING_LEVEL_SET.has(config.thinkingLevel)
                   ? (config.thinkingLevel as ThinkingLevel)
-                  : detail.thinkingLevel,
+                  : detail.validatorThinkingLevel ?? detail.thinkingLevel,
                 settings,
               ),
               fallbackThinkingLevel: resolveValidatorFallbackThinkingLevel(
                 typeof config.thinkingLevel === "string" && WORKFLOW_THINKING_LEVEL_SET.has(config.thinkingLevel)
                   ? (config.thinkingLevel as ThinkingLevel)
-                  : detail.thinkingLevel,
+                  : detail.validatorThinkingLevel ?? detail.thinkingLevel,
                 settings,
               ),
               taskValidatorProvider: detail.validatorModelProvider,
@@ -8214,9 +8319,10 @@ export class TaskExecutor {
     };
   }
 
-  private isLiveSharedBranchGroupMember(live: Pick<TaskDetail, "branchContext">): boolean {
+  private async isLiveSharedBranchGroupMember(live: Pick<TaskDetail, "branchContext">): Promise<boolean> {
     const groupId = live.branchContext?.groupId?.trim();
-    const branchGroup = groupId ? this.store.getBranchGroup(groupId) : null;
+    // FNXC:PostgresCutover 2026-07-10: getBranchGroup is async on the PG branch.
+    const branchGroup = groupId ? await this.store.getBranchGroup(groupId) : null;
     return isLiveSharedBranchGroupMemberIntegration(live, branchGroup);
   }
 
@@ -8236,7 +8342,7 @@ export class TaskExecutor {
     const settings = await this.store.getSettings().catch(() => undefined);
     if (!settings || settings.globalPause === true || settings.enginePaused === true) return false;
     /* FNXC:AutoMergeHold 2026-07-09-17:04: FN-7750 requires retryable pre-merge remediation to treat stale shared-group members as standalone manual-hold rows when global auto-merge is off; only live/open groups retain the shared-member exemption. */
-    if (!allowsAutoMergeProcessing(live, settings) && !this.isLiveSharedBranchGroupMember(live)) return false;
+    if (!allowsAutoMergeProcessing(live, settings) && !(await this.isLiveSharedBranchGroupMember(live))) return false;
     const target = this.latestFailedPreMergeWorkflowStep(live);
     if (!target) return false;
     const budget = await this.resolveFailedPreMergeWorkflowStepBudget(live, target);
@@ -8290,7 +8396,7 @@ export class TaskExecutor {
     } catch {
       return false;
     }
-    const sharedBranchMember = this.isLiveSharedBranchGroupMember(live);
+    const sharedBranchMember = await this.isLiveSharedBranchGroupMember(live);
     if (!sharedBranchMember && !allowsAutoMergeProcessing(live, settings)) return false;
     if (!sharedBranchMember && resolveEffectiveAutoMerge(live, settings) === false) return false;
     if ((live.mergeRetries ?? 0) >= resolveMaxAutoMergeRetries(settings)) return false;
@@ -8359,7 +8465,7 @@ export class TaskExecutor {
       return false;
     }
     /* FNXC:AutoMergeHold 2026-07-09-17:07: FN-7749's benign manual-hold classifier must exclude only live shared-group integrations. FN-7750 stale shared-group members are standalone manual-hold rows and should not be stranded as pause-abort failures. */
-    if (this.isLiveSharedBranchGroupMember(live)) return false;
+    if (await this.isLiveSharedBranchGroupMember(live)) return false;
     return !allowsAutoMergeProcessing(live, settings) || resolveEffectiveAutoMerge(live, settings) === false;
   }
 
@@ -8400,7 +8506,7 @@ export class TaskExecutor {
       return false;
     }
     if (settings.globalPause === true || settings.enginePaused === true) return false;
-    if (!allowsAutoMergeProcessing(live, settings) && !this.isLiveSharedBranchGroupMember(live)) return false;
+    if (!allowsAutoMergeProcessing(live, settings) && !(await this.isLiveSharedBranchGroupMember(live))) return false;
 
     this.clearPausedAborted(live.id);
     this.activeWorktrees.delete(live.id);
@@ -8473,7 +8579,7 @@ export class TaskExecutor {
       return false;
     }
     if (settings.globalPause === true || settings.enginePaused === true) return false;
-    if (!allowsAutoMergeProcessing(live, settings) && !this.isLiveSharedBranchGroupMember(live)) return false;
+    if (!allowsAutoMergeProcessing(live, settings) && !(await this.isLiveSharedBranchGroupMember(live))) return false;
 
     const nextRetries = priorRetries + 1;
     this.clearPausedAborted(live.id);
@@ -8579,7 +8685,7 @@ export class TaskExecutor {
     if (live.column === "in-review") {
       if (live.autoMerge === false) return false;
       if (!settings) return false;
-      const sharedBranchMember = this.isLiveSharedBranchGroupMember(live);
+      const sharedBranchMember = await this.isLiveSharedBranchGroupMember(live);
       if (!sharedBranchMember && !allowsAutoMergeProcessing(live, settings)) return false;
       if (live.mergeDetails?.mergeConfirmed === true) return false;
     }
@@ -9005,6 +9111,33 @@ export class TaskExecutor {
             await this.persistTokenUsage(task.id);
             return;
           }
+          /*
+          FNXC:WorkflowLifecycle 2026-07-12:
+          A pause-abort whose task already reached a terminal SUCCESS column is
+          benign teardown, not an operator problem. The live-acceptance repro:
+          the workflow merge boundary hard-cancels the in-flight executor
+          session when it moves the task in-progress → in-review
+          (abort-in-flight provenance=hard-cancel), the AI merge then lands and
+          the task advances to done — and only afterwards does the aborted
+          graph run reach this sink, where it logged "Workflow graph failure
+          surfaced ... operator action required; retry or explicitly
+          unpause/resume" on a task that finished perfectly. The `status:
+          "failed"` write below was already guarded for done/archived, but the
+          alarming operator-action log entry (and its warn) still fired on
+          every auto-merged task. Treat done/archived like the todo benign
+          case: clear the abort marker, release the worktree slot, log a
+          benign completion note, and never emit the PAUSE_ABORT_PARK markers
+          (so self-healing's recoverPausedAbortFailures has nothing to chase).
+          */
+          if (live.column === "done" || live.column === "archived") {
+            this.clearPausedAborted(task.id);
+            this.activeWorktrees.delete(task.id);
+            const doneBenign = `Workflow graph run ended during ${pauseProvenance} after the task already completed ('${live.column}') — benign, no action needed`;
+            executorLog.log(`${task.id}: ${doneBenign}`);
+            await this.store.logEntry(task.id, doneBenign, undefined, this.getRunContextFor(task.id));
+            await this.persistTokenUsage(task.id);
+            return;
+          }
           const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1] ?? "unknown";
           // FNXC:WorkflowLifecycle 2026-06-20-00:00: build the parked-failure
           // message from the shared markers so self-healing's recoverPausedAbortFailures
@@ -9012,7 +9145,7 @@ export class TaskExecutor {
           const message = `${PAUSE_ABORT_PARK_ERROR_MARKER} ${pauseProvenance} in '${live.column}' at node '${failedNode}' — ${PAUSE_ABORT_PARK_OPERATOR_MARKER}; retry or explicitly unpause/resume after inspecting the task`;
           executorLog.warn(`${task.id}: ${message}`);
           await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
-          if (live.column !== "done" && live.column !== "archived" && live.status == null && live.error == null) {
+          if (live.status == null && live.error == null) {
             await this.store.updateTask(task.id, { error: message, status: "failed" }, this.getRunContextFor(task.id));
           }
           await this.persistTokenUsage(task.id);
@@ -9037,11 +9170,19 @@ export class TaskExecutor {
 
         FNXC:WorkflowLifecycle 2026-07-12-00:00:
         FN-7863: the scheduler's wall-clock dispatchStormCount guard only increments when re-dispatches happen inside its short window; slow execute→pause-abort→todo loops reset that counter every cycle. Count this funnel by execution-progress signature instead, warn early for board-visible monitoring, and terminalize only non-paused live tasks after the bounded no-progress cap while preserving worktree/branch/step progress.
+
+        FNXC:WorkflowLifecycle 2026-07-12-23:14:
+        FN-7926 diverts completed-but-blocked rows before the FN-7863 counter increments. A stable all-done step signature plus unresolved dependency/blockedBy is a waiting state, not an implementation no-progress loop; park it with the specific blocker and let self-healing advance it when `getTaskCompletionBlocker` clears.
         */
-        const signature = buildExecuteRequeueLoopSignature(live);
-        const nextCount = live.executeRequeueLoopSignature === signature
-          ? (live.executeRequeueLoopCount ?? 0) + 1
-          : 1;
+        const completionBlocker = await this.getTaskCompletionBlocker(live);
+        if (completionBlocker && await this.parkCompletedBlockedTask(live, completionBlocker, "execute-requeue")) {
+          await this.persistTokenUsage(task.id);
+          return;
+        }
+        const { signature, madeForwardProgress } = buildExecuteRequeueLoopHighWaterSignature(live, live.executeRequeueLoopSignature);
+        const nextCount = madeForwardProgress || live.executeRequeueLoopSignature == null
+          ? 1
+          : (live.executeRequeueLoopCount ?? 0) + 1;
         if (live.executeRequeueLoopCount !== nextCount || live.executeRequeueLoopSignature !== signature) {
           await this.store.updateTask(task.id, {
             executeRequeueLoopCount: nextCount,
@@ -9417,7 +9558,7 @@ export class TaskExecutor {
     const markerAcceptedByTaskId = new Map<string, boolean>();
     if (settings.mergeRequestContractShadowEnabled === true) {
       for (const depId of liveTask.dependencies) {
-        markerAcceptedByTaskId.set(depId, this.store.getCompletionHandoffAcceptedMarker(depId) !== null);
+        markerAcceptedByTaskId.set(depId, (await this.store.getCompletionHandoffAcceptedMarker(depId)) !== null);
       }
     }
     const unmetDeps = getUnmetSchedulingDependencies(
@@ -9629,8 +9770,9 @@ export class TaskExecutor {
       const staleness = await evaluateSpecStaleness({ settings, promptPath, task });
       if (staleness.isStale) {
         executorLog.warn(`Task ${task.id} specification is stale — ${staleness.reason}`);
-        // Move to triage first, then set status so the task enters triage with needs-replan
-        await this.store.moveTask(task.id, "triage");
+        // Move to the workflow-aware replan column first, then set status so the task
+        // enters it with needs-replan (workflows without "triage" replan in place in todo).
+        await moveTaskToReplanColumn(this.store, task);
         await this.store.updateTask(task.id, { status: "needs-replan" });
         await this.store.logEntry(task.id, staleness.reason, undefined, this.getRunContextFor(task.id));
         return;
@@ -10702,6 +10844,7 @@ export class TaskExecutor {
         this.createArtifactRegisterTool(assignedAgentId ?? "executor", task.id, worktreePath),
         this.createWorkflowListTool(),
         this.createWorkflowGetTool(),
+        this.createWorkflowValidateTool(),
         this.createWorkflowSelectTool(task.id),
         this.createTaskPromoteTool(task.id),
         this.createWorkflowCreateTool(),
@@ -11139,7 +11282,8 @@ export class TaskExecutor {
             }
             this.clearPausedAborted(task.id);
             wasPaused = true;
-            if (await this.shouldFinalizeCompletedTask(task.id, taskDone)) {
+            const finalizationDecision = await this.getCompletedTaskFinalizationDecision(task.id, taskDone);
+            if (finalizationDecision === "finalize") {
               if (await this.shouldDeferCompletionForGlobalPause(task.id, "paused after completion")) {
                 return;
               }
@@ -11157,6 +11301,9 @@ export class TaskExecutor {
               await this.handoffTaskToReview(task, "paused-after-completion");
               this.clearCompletedTaskWatchdog(task.id);
               this.signalTaskComplete(task);
+            } else if (finalizationDecision === "blocked") {
+              await this.persistTokenUsage(task.id);
+              return;
             } else {
               executorLog.log(`${task.id} paused (graceful session exit) — moving to todo`);
               await this.store.logEntry(task.id, "Execution paused — session preserved for resume, moved to todo");
@@ -11692,7 +11839,8 @@ export class TaskExecutor {
           );
           return;
         }
-        if (await this.shouldFinalizeCompletedTask(task.id, taskDone)) {
+        const finalizationDecision = await this.getCompletedTaskFinalizationDecision(task.id, taskDone);
+        if (finalizationDecision === "finalize") {
           if (await this.shouldDeferCompletionForGlobalPause(task.id, "paused after completion")) {
             return;
           }
@@ -11709,6 +11857,9 @@ export class TaskExecutor {
           this.markCompletionFinalized(task.id);
           await this.handoffTaskToReview(task, "paused-after-completion");
           this.signalTaskComplete(task);
+        } else if (finalizationDecision === "blocked") {
+          await this.persistTokenUsage(task.id);
+          return;
         } else {
           executorLog.log(`${task.id} paused — moving to todo`);
           if (worktreePath && existsSync(worktreePath)) {
@@ -12778,6 +12929,10 @@ export class TaskExecutor {
 
   private createWorkflowGetTool(): ToolDefinition {
     return sharedCreateWorkflowGetTool(this.store);
+  }
+
+  private createWorkflowValidateTool(): ToolDefinition {
+    return sharedCreateWorkflowValidateTool(this.store);
   }
 
   private createWorkflowSelectTool(taskId: string): ToolDefinition {
@@ -13894,8 +14049,12 @@ export class TaskExecutor {
               defaultModelId: settings.defaultModelId,
               fallbackProvider: settings.fallbackProvider,
               fallbackModelId: settings.fallbackModelId,
-              fallbackThinkingLevel: resolveValidatorFallbackThinkingLevel(latestDetailForReview.thinkingLevel, settings),
-              defaultThinkingLevel: resolveValidatorThinkingLevel(latestDetailForReview.thinkingLevel, settings),
+              /*
+               * FNXC:Settings-ThinkingLevel 2026-07-13-00:27:
+               * Pre-merge review sessions honor the per-task validator override before shared task thinking, preserving shared-task fallback for legacy tasks.
+               */
+              fallbackThinkingLevel: resolveValidatorFallbackThinkingLevel(latestDetailForReview.validatorThinkingLevel ?? latestDetailForReview.thinkingLevel, settings),
+              defaultThinkingLevel: resolveValidatorThinkingLevel(latestDetailForReview.validatorThinkingLevel ?? latestDetailForReview.thinkingLevel, settings),
               // Task-level validator override (from task)
               taskValidatorProvider: latestDetailForReview.validatorModelProvider,
               taskValidatorModelId: latestDetailForReview.validatorModelId,

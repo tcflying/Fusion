@@ -11,10 +11,23 @@ const dashboardSetup = fileURLToPath(
   new URL("./src/dashboard/test-setup.ts", import.meta.url),
 );
 
+/*
+FNXC:ReportsTests 2026-06-25-16:30:
+The SQLite-to-PostgreSQL cutover (feature delete-sqlite-runtime-final, PHASE A)
+quarantines plugin test files that construct a SQLite-backed store (new TaskStore(...,
+{inMemoryDb: true}) / new Database(...)). The SQLite runtime code is being deleted
+in this feature. Per the AGENTS.md flaky-test deletion ratchet, these tests are
+quarantined on sight. Mirrored in scripts/lib/test-quarantine.json.
+*/
+const quarantinedReportsTests = [
+];
+
 export default defineConfig({
   resolve: {
     alias: {
       "@fusion/core": fileURLToPath(new URL("../../packages/core/src/index.ts", import.meta.url)),
+      // FNXC:Clipboard 2026-07-12-00:00: The reports plugin imports the dashboard clipboard helper through its package subpath export; keep this exact alias ahead of the package root alias so vitest does not collapse the subpath to src/index.ts.
+      "@fusion/dashboard/app/utils/copyToClipboard": fileURLToPath(new URL("../../packages/dashboard/app/utils/copyToClipboard.ts", import.meta.url)),
       "@fusion/dashboard": fileURLToPath(new URL("../../packages/dashboard/src/index.ts", import.meta.url)),
       "@fusion/plugin-sdk": fileURLToPath(new URL("../../packages/plugin-sdk/src/index.ts", import.meta.url)),
     },
@@ -44,7 +57,11 @@ export default defineConfig({
           name: "reports-node",
           environment: "node",
           include: ["src/**/__tests__/**/*.test.{ts,tsx}", "src/**/*.test.{ts,tsx}"],
-          exclude: ["src/dashboard/**/__tests__/**/*.test.{ts,tsx}", "src/dashboard/**/*.test.{ts,tsx}"],
+          exclude: [
+            "src/dashboard/**/__tests__/**/*.test.{ts,tsx}",
+            "src/dashboard/**/*.test.{ts,tsx}",
+            ...quarantinedReportsTests,
+          ],
         },
       },
     ],

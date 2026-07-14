@@ -1,0 +1,417 @@
+/**
+ * FNXC:RuntimeStartupWiring 2026-06-24-10:45:
+ * Integration test for createTaskStoreForBackend against a real PostgreSQL
+ * instance (external mode). Verifies the five-step boot sequence:
+ *   1. resolveBackend() → external.
+ *   2. createConnectionSet opens the pool.
+ *   3. applySchemaBaseline lands the schema.
+ *   4. TaskStore is constructed in backend mode (asyncLayer injected).
+ *   5. shutdown() releases the pool cleanly.
+ *
+ * Skipped when PostgreSQL is unreachable (FUSION_PG_TEST_SKIP=1) so the merge
+ * gate stays green without a running server. Run locally with PG on 5432.
+ */
+
+import { afterEach, describe, it, expect } from "vitest";
+import { execSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { createTaskStoreForBackend } from "../../postgres/startup-factory.js";
+import { mkdirSync } from "node:fs";
+import { DatabaseSync } from "../../sqlite-adapter.js";
+
+const PG_TEST_URL_BASE =
+  process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
+const PG_AVAILABLE =
+  process.env.FUSION_PG_TEST_SKIP !== "1" && Boolean(PG_TEST_URL_BASE);
+
+const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
+
+function uniqueDbName(): string {
+  return `fusion_startup_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function adminExec(statement: string): void {
+  execSync(
+    `psql -h localhost -p 5432 -U ${process.env.USER ?? "postgres"} -d postgres -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
+    { stdio: "pipe", env: process.env },
+  );
+}
+
+pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
+  let rootDir: string;
+  let dbName: string;
+
+  afterEach(async () => {
+    if (dbName) {
+      try {
+        adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
+      } catch {
+        // best-effort
+      }
+    }
+    if (rootDir) {
+      await rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("boots a PostgreSQL-backed TaskStore and the store reports backend mode", async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "startup-factory-pg-"));
+    dbName = uniqueDbName();
+    adminExec(`CREATE DATABASE "${dbName}"`);
+    const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
+
+    const result = await createTaskStoreForBackend({
+      rootDir,
+      env: { DATABASE_URL: testUrl },
+      poolMax: 2,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.backend.mode).toBe("external");
+    expect(result!.taskStore.isBackendMode()).toBe(true);
+    expect(result!.taskStore.getAsyncLayer()).not.toBeNull();
+    // init() in backend mode skips SQLite (no .db file under .fusion).
+    await result!.taskStore.init();
+    await result!.shutdown();
+  });
+
+  it("applies the schema baseline idempotently on repeated boots", async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "startup-factory-pg-idem-"));
+    dbName = uniqueDbName();
+    adminExec(`CREATE DATABASE "${dbName}"`);
+    const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
+
+    const first = await createTaskStoreForBackend({
+      rootDir,
+      env: { DATABASE_URL: testUrl },
+      poolMax: 1,
+    });
+    expect(first).not.toBeNull();
+    await first!.shutdown();
+
+    // Second boot against the same database: baseline is already applied.
+    const second = await createTaskStoreForBackend({
+      rootDir,
+      env: { DATABASE_URL: testUrl },
+      poolMax: 1,
+    });
+    expect(second).not.toBeNull();
+    await second!.shutdown();
+  });
+
+  /*
+   * FNXC:PostgresMigration 2026-07-10:
+   * First-boot auto-migration (review data-loss trap): booting the PG backend
+   * over a project that still has legacy SQLite data must migrate that data
+   * into the empty PostgreSQL database instead of silently starting empty.
+   * The SQLite file is left in place as a backup; a second boot must not
+   * re-migrate (project.tasks no longer empty).
+   */
+  it("auto-migrates legacy SQLite data into an empty PostgreSQL database on first boot", async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "startup-factory-automig-"));
+    dbName = uniqueDbName();
+    adminExec(`CREATE DATABASE "${dbName}"`);
+    const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
+
+    // Seed a minimal legacy fusion.db with one live task.
+    const fusionDir = join(rootDir, ".fusion");
+    mkdirSync(fusionDir, { recursive: true });
+    const legacy = new DatabaseSync(join(fusionDir, "fusion.db"));
+    try {
+      legacy.exec(`CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        description TEXT NOT NULL,
+        "column" TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );`);
+      legacy.prepare(
+        `INSERT INTO tasks (id, title, description, "column", createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run("FN-MIG-1", "Legacy task", "migrated from sqlite", "todo", "2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z");
+    } finally {
+      legacy.close();
+    }
+
+    const first = await createTaskStoreForBackend({
+      rootDir,
+      env: { DATABASE_URL: testUrl },
+    });
+    expect(first).not.toBeNull();
+    try {
+      const migrated = await first!.taskStore.getTask("FN-MIG-1");
+      expect(migrated.title).toBe("Legacy task");
+      expect(migrated.column).toBe("todo");
+
+      /*
+      FNXC:PostgresMigrationBanner 2026-07-12:
+      A successful auto-migration must persist the one-time dashboard notice
+      ("your data was migrated and a backup exists") into project settings,
+      pointing at the retained SQLite backup file, not yet dismissed.
+      */
+      const settings = await first!.taskStore.getSettings();
+      const notice = settings.sqliteMigrationNotice;
+      expect(notice).toBeTruthy();
+      expect(notice!.migratedRows).toBeGreaterThanOrEqual(1);
+      expect(notice!.tables).toBeGreaterThanOrEqual(1);
+      expect(notice!.sqliteBackups).toContain(join(fusionDir, "fusion.db"));
+      expect(notice!.dismissed).toBe(false);
+    } finally {
+      await first!.shutdown();
+    }
+
+    // Second boot: PG is no longer empty — must NOT attempt to re-migrate.
+    const second = await createTaskStoreForBackend({
+      rootDir,
+      env: { DATABASE_URL: testUrl },
+    });
+    expect(second).not.toBeNull();
+    try {
+      const stillThere = await second!.taskStore.getTask("FN-MIG-1");
+      expect(stillThere.title).toBe("Legacy task");
+    } finally {
+      await second!.shutdown();
+    }
+  });
+
+  /*
+  FNXC:MultiProjectIsolation 2026-07-13-21:20:
+  A rootDir-only boot (`fn dashboard` in the project directory — the main
+  cutover path) must still stamp migrated NULL-project_id rows when the
+  central registry knows the project. The previous `if (options.projectId)`
+  guard skipped stamping on exactly this path, so every project-bound reader
+  (engine, project-store-resolver) filtered the migrated tasks out and the
+  board showed empty right after a successful migration.
+  */
+  it("stamps migrated rows with the central-registry project id on a rootDir-only boot", async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "startup-factory-stamp-"));
+    dbName = uniqueDbName();
+    adminExec(`CREATE DATABASE "${dbName}"`);
+    const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
+
+    const fusionDir = join(rootDir, ".fusion");
+    const globalDir = join(rootDir, ".fusion-global");
+    mkdirSync(fusionDir, { recursive: true });
+    mkdirSync(globalDir, { recursive: true });
+
+    const legacy = new DatabaseSync(join(fusionDir, "fusion.db"));
+    try {
+      legacy.exec(`CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        description TEXT NOT NULL,
+        "column" TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );`);
+      legacy.prepare(
+        `INSERT INTO tasks (id, title, description, "column", createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run("FN-STAMP-1", "Stamped task", "migrated from sqlite", "todo", "2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z");
+      // Legacy singleton config row — must be re-keyed from '' to the
+      // registered project id so bound configScope readers still see the
+      // migrated settings (FNXC:CentralProjectIdentity).
+      legacy.exec(`CREATE TABLE IF NOT EXISTS config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        settings TEXT DEFAULT '{}',
+        updatedAt TEXT
+      );`);
+      legacy.prepare(`INSERT INTO config (id, settings, updatedAt) VALUES (1, ?, ?)`).run(
+        JSON.stringify({ taskPrefix: "ST", merger: { mode: "ai" } }),
+        "2026-06-01T00:00:00Z",
+      );
+      // Legacy workflow_settings keyed by the pre-isolation rootDir path string
+      // (real SQLite schema: workflowId, projectId, "values", updatedAt). Must
+      // be re-keyed from the rootDir path to the registered project id so the
+      // bound workflow-settings resolver still sees the migrated VALUES
+      // (FNXC:CentralProjectIdentity 2026-07-13-23:10).
+      legacy.exec(`CREATE TABLE IF NOT EXISTS workflow_settings (
+        workflowId TEXT NOT NULL,
+        projectId TEXT NOT NULL,
+        "values" TEXT DEFAULT '{}',
+        updatedAt TEXT NOT NULL,
+        PRIMARY KEY (workflowId, projectId)
+      );`);
+      legacy.prepare(
+        `INSERT INTO workflow_settings (workflowId, projectId, "values", updatedAt) VALUES (?, ?, ?, ?)`,
+      ).run("wf_default", rootDir, JSON.stringify({ maxWorktrees: 3 }), "2026-06-01T00:00:00Z");
+    } finally {
+      legacy.close();
+    }
+
+    // Legacy central registry that knows this project by its rootDir path.
+    const legacyCentral = new DatabaseSync(join(globalDir, "fusion-central.db"));
+    try {
+      legacyCentral.exec(`CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        createdAt TEXT NOT NULL,
+        updatedAt TEXT NOT NULL
+      );`);
+      legacyCentral.prepare(
+        `INSERT INTO projects (id, name, path, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run("proj_stamp_test", "Stamp Test", rootDir, "active", "2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z");
+    } finally {
+      legacyCentral.close();
+    }
+
+    const boot = await createTaskStoreForBackend({
+      rootDir,
+      globalSettingsDir: globalDir,
+      env: { DATABASE_URL: testUrl },
+    });
+    expect(boot).not.toBeNull();
+    try {
+      const layer = boot!.taskStore.getAsyncLayer()!;
+      /*
+      FNXC:CentralProjectIdentity 2026-07-13-22:00:
+      A rootDir-only boot of a REGISTERED project must bind its layer to the
+      registry id — cwd/rootDir is only the lookup key; identity comes from
+      central.projects.
+      */
+      expect(layer.projectId, "rootDir-only boot must bind to the registered project id").toBe("proj_stamp_test");
+      const rows = (await layer.db.execute(
+        `SELECT id, project_id FROM project.tasks ORDER BY id`,
+      )) as unknown as Array<{ id: string; project_id: string | null }>;
+      expect(rows.map((r) => r.id)).toContain("FN-STAMP-1");
+      for (const row of rows) {
+        expect(row.project_id, `${row.id} must be stamped with the registered project id`).toBe("proj_stamp_test");
+      }
+      // The migrated legacy config row ('' key) must be re-keyed to the
+      // project so bound settings reads see the migrated settings.
+      const configRows = (await layer.db.execute(
+        `SELECT project_id, settings FROM project.config`,
+      )) as unknown as Array<{ project_id: string; settings: { taskPrefix?: string } | null }>;
+      const projectConfig = configRows.find((r) => r.project_id === "proj_stamp_test");
+      expect(projectConfig, "migrated config row must be re-keyed to the project").toBeDefined();
+      expect(projectConfig!.settings?.taskPrefix).toBe("ST");
+      expect(configRows.some((r) => r.project_id === ""), "no orphaned '' config row").toBe(false);
+      /*
+      FNXC:CentralProjectIdentity 2026-07-13-23:10:
+      The migrated workflow_settings row, keyed by the pre-isolation rootDir
+      path string, must be re-keyed to the registered project id so a bound
+      workflow-settings resolver still sees the migrated VALUES. Before the
+      stamping re-key, this row stayed rootDir-keyed and vanished from every
+      project-bound read.
+      */
+      const wfRows = (await layer.db.execute(
+        `SELECT workflow_id, project_id, "values" FROM project.workflow_settings ORDER BY workflow_id`,
+      )) as unknown as Array<{ workflow_id: string; project_id: string; values: { maxWorktrees?: number } | null }>;
+      const wfRow = wfRows.find((r) => r.workflow_id === "wf_default");
+      expect(wfRow, "migrated workflow_settings row must survive the migration").toBeDefined();
+      expect(
+        wfRow!.project_id,
+        "workflow_settings row must be re-keyed from the rootDir path to the registered project id",
+      ).toBe("proj_stamp_test");
+      expect(wfRow!.values?.maxWorktrees).toBe(3);
+      expect(
+        wfRows.some((r) => r.project_id === rootDir),
+        "no workflow_settings row may remain keyed by the rootDir path",
+      ).toBe(false);
+    } finally {
+      await boot!.shutdown();
+    }
+  });
+
+  /*
+  FNXC:CentralProjectIdentity 2026-07-13-23:10:
+  Direct unit-ish coverage of the shared stampMigratedProjectRows helper: seed a
+  freshly-baselined PG schema with unstamped rows (NULL project_id tasks, ''
+  config, rootDir-keyed workflow settings/prompt overrides), run the helper, and
+  assert every table is re-keyed to the supplied project id — including the
+  NOT_EXISTS guard that refuses to clobber a pre-existing per-project row.
+  */
+  it("stampMigratedProjectRows re-keys all partitioned tables to the project id", async () => {
+    rootDir = await mkdtemp(join(tmpdir(), "stamp-helper-"));
+    dbName = uniqueDbName();
+    adminExec(`CREATE DATABASE "${dbName}"`);
+    const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
+    const fakeRootDir = "/legacy/path/to/project";
+
+    const { createConnectionSetFromUrl } = await import("../../postgres/connection.js");
+    const { applySchemaBaseline } = await import("../../postgres/schema-applier.js");
+    const { stampMigratedProjectRows } = await import("../../postgres/migration-stamping.js");
+    const { resolveBackendWithOptions } = await import("../../postgres/backend-resolver.js");
+
+    const connections = await createConnectionSetFromUrl(
+      resolveBackendWithOptions({ databaseUrl: testUrl }),
+      { poolMax: 1, connectTimeoutSeconds: 30 },
+    );
+    try {
+      await applySchemaBaseline(connections.migration);
+      const db = connections.migration;
+
+      // Seed unstamped rows the migrator would have produced.
+      await db.execute(
+        `INSERT INTO project.tasks (id, description, "column", created_at, updated_at)
+         VALUES ('FN-HELP-1', 'd', 'todo', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')`,
+      );
+      await db.execute(
+        `INSERT INTO project.config (project_id, settings, updated_at)
+         VALUES ('', '{"taskPrefix":"HL"}'::jsonb, '2026-06-01T00:00:00Z')`,
+      );
+      await db.execute(
+        `INSERT INTO project.workflow_settings (workflow_id, project_id, "values", updated_at)
+         VALUES ('wf_a', '${fakeRootDir}', '{"maxWorktrees":5}'::jsonb, '2026-06-01T00:00:00Z')`,
+      );
+      // A pre-existing per-project row for wf_b: the rootDir-keyed migrated copy
+      // must NOT clobber it (NOT_EXISTS guard).
+      await db.execute(
+        `INSERT INTO project.workflow_settings (workflow_id, project_id, "values", updated_at)
+         VALUES ('wf_b', 'proj_help', '{"maxWorktrees":9}'::jsonb, '2026-06-01T00:00:00Z')`,
+      );
+      await db.execute(
+        `INSERT INTO project.workflow_settings (workflow_id, project_id, "values", updated_at)
+         VALUES ('wf_b', '${fakeRootDir}', '{"maxWorktrees":1}'::jsonb, '2026-06-01T00:00:00Z')`,
+      );
+      await db.execute(
+        `INSERT INTO project.workflow_prompt_overrides (workflow_id, project_id, overrides, updated_at)
+         VALUES ('wf_a', '${fakeRootDir}', '{"executor":"x"}'::jsonb, '2026-06-01T00:00:00Z')`,
+      );
+
+      const result = await stampMigratedProjectRows(db, { projectId: "proj_help", rootDir: fakeRootDir });
+      expect(result.stamped).toBe(true);
+
+      const tasks = (await db.execute(
+        `SELECT project_id FROM project.tasks WHERE id = 'FN-HELP-1'`,
+      )) as unknown as Array<{ project_id: string | null }>;
+      expect(tasks[0]?.project_id).toBe("proj_help");
+
+      const cfg = (await db.execute(
+        `SELECT project_id FROM project.config ORDER BY project_id`,
+      )) as unknown as Array<{ project_id: string }>;
+      expect(cfg.some((r) => r.project_id === "proj_help")).toBe(true);
+      expect(cfg.some((r) => r.project_id === "")).toBe(false);
+
+      const wf = (await db.execute(
+        `SELECT workflow_id, project_id, "values" FROM project.workflow_settings ORDER BY workflow_id, project_id`,
+      )) as unknown as Array<{ workflow_id: string; project_id: string; values: { maxWorktrees?: number } | null }>;
+      // wf_a re-keyed to proj_help.
+      const wfA = wf.find((r) => r.workflow_id === "wf_a");
+      expect(wfA?.project_id).toBe("proj_help");
+      expect(wfA?.values?.maxWorktrees).toBe(5);
+      // wf_b keeps its pre-existing per-project row (value 9); the rootDir copy
+      // was NOT re-keyed (guard) so it remains keyed by the fake rootDir.
+      const wfBProject = wf.find((r) => r.workflow_id === "wf_b" && r.project_id === "proj_help");
+      expect(wfBProject?.values?.maxWorktrees, "pre-existing per-project row must not be clobbered").toBe(9);
+      const wfBLegacy = wf.find((r) => r.workflow_id === "wf_b" && r.project_id === fakeRootDir);
+      expect(wfBLegacy, "guarded rootDir row is left in place for manual reconciliation").toBeDefined();
+      // No wf_a row remains keyed by the fake rootDir path.
+      expect(wf.some((r) => r.workflow_id === "wf_a" && r.project_id === fakeRootDir)).toBe(false);
+
+      const overrides = (await db.execute(
+        `SELECT project_id FROM project.workflow_prompt_overrides WHERE workflow_id = 'wf_a'`,
+      )) as unknown as Array<{ project_id: string }>;
+      expect(overrides[0]?.project_id).toBe("proj_help");
+
+      // No-op when projectId is empty.
+      const noop = await stampMigratedProjectRows(db, { projectId: "", rootDir: fakeRootDir });
+      expect(noop.stamped).toBe(false);
+    } finally {
+      await connections.close().catch(() => undefined);
+    }
+  });
+});

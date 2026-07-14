@@ -5,6 +5,7 @@ import express from "express";
 import http from "node:http";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -38,7 +39,7 @@ import {
 import * as planningModule from "../planning.js";
 import { __resetSubtaskBreakdownState, subtaskStreamManager } from "../subtask-breakdown.js";
 import * as subtaskBreakdownModule from "../subtask-breakdown.js";
-import { SESSION_CLEANUP_DEFAULT_MAX_AGE_MS, type AiSessionRow } from "../ai-session-store.js";
+import { AiSessionStore, SESSION_CLEANUP_DEFAULT_MAX_AGE_MS, type AiSessionRow } from "../ai-session-store.js";
 import * as usageModule from "../usage.js";
 import * as claudeCliProbeModule from "../claude-cli-probe.js";
 import * as droidCliProbeModule from "../droid-cli-probe.js";
@@ -194,6 +195,9 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
   }>();
 
   return {
+    // FNXC:PostgresCutover 2026-07-05-16:50: routes borrow the AsyncDataLayer
+    // from the scoped store; null = legacy mode for this mock.
+    getAsyncLayer: vi.fn().mockReturnValue(null),
     getTask: vi.fn(),
     listTasks: vi.fn().mockResolvedValue([]),
     searchTasks: vi.fn().mockResolvedValue([]),
@@ -319,26 +323,26 @@ async function REQUEST(
 class MockAiSessionStore extends EventEmitter {
   rows = new Map<string, AiSessionRow>();
 
-  upsert(row: AiSessionRow): void {
+  async upsert(row: AiSessionRow): Promise<void> {
     this.rows.set(row.id, row);
   }
 
-  updateThinking(id: string, thinkingOutput: string): void {
+  async updateThinking(id: string, thinkingOutput: string): Promise<void> {
     const row = this.rows.get(id);
     if (!row) return;
     this.rows.set(id, { ...row, thinkingOutput, updatedAt: new Date().toISOString() });
   }
 
-  delete(id: string): void {
+  async delete(id: string): Promise<void> {
     this.rows.delete(id);
     this.emit("ai_session:deleted", id);
   }
 
-  get(id: string): AiSessionRow | null {
+  async get(id: string): Promise<AiSessionRow | null> {
     return this.rows.get(id) ?? null;
   }
 
-  listRecoverable(): AiSessionRow[] {
+  async listRecoverable(): Promise<AiSessionRow[]> {
     return [...this.rows.values()].filter(
       (row) => row.status === "awaiting_input" || row.status === "generating" || row.status === "error",
     );
@@ -520,9 +524,9 @@ describe("Planning Mode Routes", () => {
 
     async function rehydratePlanningSessionRow(row: AiSessionRow): Promise<string> {
       const mockStore = new MockAiSessionStore();
-      mockStore.upsert(row);
+      await mockStore.upsert(row);
       setAiSessionStore(mockStore as unknown as Parameters<typeof setAiSessionStore>[0]);
-      const recoveredCount = rehydrateFromStore(mockStore as unknown as Parameters<typeof rehydrateFromStore>[0]);
+      const recoveredCount = await rehydrateFromStore(mockStore as unknown as Parameters<typeof rehydrateFromStore>[0]);
       expect(recoveredCount).toBe(1);
       return row.id;
     }
@@ -685,7 +689,20 @@ describe("Planning Mode Routes", () => {
         expect(res.body.error).toContain("customQuestionCount");
       });
 
-      it("accepts optional model params in request body", async () => {
+      it("rejects invalid thinkingLevel", async () => {
+        const res = await REQUEST(
+          buildApp(),
+          "POST",
+          "/api/planning/start-streaming",
+          JSON.stringify({ initialPlan: "Build a user auth system", thinkingLevel: "maximum" }),
+          { "Content-Type": "application/json" },
+        );
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toContain("thinkingLevel");
+      });
+
+      it("accepts optional model params and thinkingLevel in request body", async () => {
         const messages: Array<{ role: string; content: string }> = [];
         const mockAgent = {
           session: {
@@ -719,6 +736,7 @@ describe("Planning Mode Routes", () => {
             initialPlan: "Build a user auth system",
             planningModelProvider: "google",
             planningModelId: "gemini-2.5-pro",
+            thinkingLevel: "high",
           }),
           { "Content-Type": "application/json" },
         );
@@ -732,6 +750,7 @@ describe("Planning Mode Routes", () => {
             expect.objectContaining({
               defaultProvider: "google",
               defaultModelId: "gemini-2.5-pro",
+              defaultThinkingLevel: "high",
             }),
           );
         });
@@ -1246,7 +1265,7 @@ describe("Planning Mode Routes", () => {
         const sessionId = startRes.body.sessionId as string;
 
         const { planningStreamManager, getSession } = await import("../planning.js");
-        const session = getSession(sessionId);
+        const session = await getSession(sessionId);
         expect(session).toBeDefined();
 
         planningStreamManager.broadcast(sessionId, { type: "thinking", data: "first buffered thought" });
@@ -1297,7 +1316,7 @@ describe("Planning Mode Routes", () => {
         // Manually simulate an awaiting_input session by updating the session state
         // In the real app, this happens via respondToPlanning which sets currentQuestion
         const { planningStreamManager, getSession } = await import("../planning.js");
-        const session = getSession(sessionId);
+        const session = await getSession(sessionId);
         expect(session).toBeDefined();
 
         // Simulate the session being in awaiting_input state with a question
@@ -3259,7 +3278,7 @@ describe("Planning Mode Routes", () => {
           responses: { [PLANNING_DEEPEN_CHECKPOINT_ID]: [PLANNING_DEEPEN_PROCEED_OPTION_ID] },
         }), { "Content-Type": "application/json" });
 
-        const session = planningModule.getSession(planningSessionId);
+        const session = await planningModule.getSession(planningSessionId);
         if (!session) {
           throw new Error("Expected planning session to exist");
         }
@@ -3715,18 +3734,21 @@ describe("Saturated-slot regression: heartbeat wake routes", () => {
 
   describe("POST /api/tasks/:id/comments — utility lane independence", () => {
     it("triggers heartbeat wake for assigned agent when task-lane is saturated", async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), "kb-routes-sat-comment-"));
-      const fusionDir = join(tempDir, ".fusion");
-      mkdirSync(fusionDir, { recursive: true });
+      const fusionDir = "/fake/root/.fusion";
 
       try {
         const { AgentStore } = await import("@fusion/core");
-        const agentStore = new AgentStore({ rootDir: fusionDir });
-        await agentStore.init();
-        const agent = await agentStore.createAgent({ name: "Saturated Wake Agent", role: "executor" });
-        await agentStore.updateAgent(agent.id, {
-          runtimeConfig: { messageResponseMode: "immediate" },
-        });
+      /*
+      FNXC:PostgresCutover 2026-07-05-16:50:
+      The legacy `new AgentStore({ rootDir })` runtime was removed
+      (VAL-REMOVAL-005); spy on the prototype instead of seeding a real
+      on-disk agent store. The invariant under test is lane independence of
+      the ROUTE under maxConcurrent=0, not AgentStore persistence.
+      */
+        const agent = { id: "agent-sat-1", name: "Saturated Wake Agent", role: "executor", state: "idle", runtimeConfig: { messageResponseMode: "immediate" } };
+        vi.spyOn(AgentStore.prototype, "init").mockResolvedValue(undefined);
+        vi.spyOn(AgentStore.prototype, "getAgent").mockResolvedValue(agent as never);
+        vi.spyOn(AgentStore.prototype, "getActiveHeartbeatRun").mockResolvedValue(null);
 
         const heartbeatMonitor = {
           executeHeartbeat: vi.fn().mockResolvedValue({ id: "run-sat-1" }),
@@ -3768,26 +3790,27 @@ describe("Saturated-slot regression: heartbeat wake routes", () => {
           }));
         }, { timeout: 1000 });
       } finally {
-        rmSync(tempDir, { recursive: true, force: true });
+        vi.restoreAllMocks();
       }
     });
 
     it("preserves active-run conflict 409 semantics when task-lane is saturated", async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), "kb-routes-sat-active-run-"));
-      const fusionDir = join(tempDir, ".fusion");
-      mkdirSync(fusionDir, { recursive: true });
-      let agentStore: any;
+      const fusionDir = "/fake/root/.fusion";
 
       try {
         const { AgentStore } = await import("@fusion/core");
-        agentStore = new AgentStore({ rootDir: fusionDir });
-        await agentStore.init();
-        const agent = await agentStore.createAgent({ name: "Active Run Agent", role: "executor" });
-        await agentStore.updateAgent(agent.id, {
-          runtimeConfig: { messageResponseMode: "immediate" },
-        });
-        // Start an active run (simulates existing heartbeat)
-        await agentStore.startHeartbeatRun(agent.id);
+      /*
+      FNXC:PostgresCutover 2026-07-05-16:50:
+      The legacy `new AgentStore({ rootDir })` runtime was removed
+      (VAL-REMOVAL-005); spy on the prototype instead of seeding a real
+      on-disk agent store. The invariant under test is lane independence of
+      the ROUTE under maxConcurrent=0, not AgentStore persistence.
+      */
+        const agent = { id: "agent-sat-2", name: "Active Run Agent", role: "executor", state: "running", runtimeConfig: { messageResponseMode: "immediate" } };
+        vi.spyOn(AgentStore.prototype, "init").mockResolvedValue(undefined);
+        vi.spyOn(AgentStore.prototype, "getAgent").mockResolvedValue(agent as never);
+        // Existing active heartbeat run: the wake helper must skip.
+        vi.spyOn(AgentStore.prototype, "getActiveHeartbeatRun").mockResolvedValue({ id: "run-active" } as never);
 
         const heartbeatMonitor = {
           executeHeartbeat: vi.fn().mockResolvedValue({ id: "run-sat-2" }),
@@ -3822,26 +3845,35 @@ describe("Saturated-slot regression: heartbeat wake routes", () => {
         // Active run conflict must still work under saturation
         expect(heartbeatMonitor.executeHeartbeat).not.toHaveBeenCalled();
       } finally {
-        agentStore?.close?.();
-        rmSync(tempDir, { recursive: true, force: true });
+        vi.restoreAllMocks();
       }
     });
   });
 
   describe("POST /api/agents/:id/runs — utility lane independence", () => {
     it("accepts triggering comment wake fields when task-lane is saturated", async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), "kb-routes-sat-agent-runs-"));
-      const fusionDir = join(tempDir, ".fusion");
-      mkdirSync(fusionDir, { recursive: true });
+      const fusionDir = "/fake/root/.fusion";
 
       try {
         const { AgentStore } = await import("@fusion/core");
-        const agentStore = new AgentStore({ rootDir: fusionDir });
-        await agentStore.init();
-        const agent = await agentStore.createAgent({
-          name: "Saturated Run Agent",
-          role: "executor",
-        });
+      /*
+      FNXC:PostgresCutover 2026-07-05-16:50:
+      The legacy `new AgentStore({ rootDir })` runtime was removed
+      (VAL-REMOVAL-005); spy on the prototype instead of seeding a real
+      on-disk agent store. The record-only run-creation path is exercised via
+      startHeartbeatRun/saveRun spies; run enrichment stays real.
+      */
+        const agent = { id: "agent-sat-run-1", name: "Saturated Run Agent", role: "executor", state: "idle" };
+        vi.spyOn(AgentStore.prototype, "init").mockResolvedValue(undefined);
+        vi.spyOn(AgentStore.prototype, "getAgent").mockResolvedValue(agent as never);
+        vi.spyOn(AgentStore.prototype, "getActiveHeartbeatRun").mockResolvedValue(null);
+        vi.spyOn(AgentStore.prototype, "startHeartbeatRun").mockResolvedValue({
+          id: "run-sat-created",
+          agentId: agent.id,
+          startedAt: "2026-01-01T00:00:00.000Z",
+          status: "running",
+        } as never);
+        vi.spyOn(AgentStore.prototype, "saveRun").mockResolvedValue(undefined as never);
 
         const store = createSaturatedStore({
           getFusionDir: vi.fn().mockReturnValue(fusionDir),
@@ -3875,23 +3907,17 @@ describe("Saturated-slot regression: heartbeat wake routes", () => {
           triggeringCommentType: "task",
         });
       } finally {
-        rmSync(tempDir, { recursive: true, force: true });
+        vi.restoreAllMocks();
       }
     });
 
     it("preserves validation 400 for invalid triggeringCommentIds when task-lane is saturated", async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), "kb-routes-sat-validation-"));
-      const fusionDir = join(tempDir, ".fusion");
-      mkdirSync(fusionDir, { recursive: true });
+      const fusionDir = "/fake/root/.fusion";
 
       try {
-        const { AgentStore } = await import("@fusion/core");
-        const agentStore = new AgentStore({ rootDir: fusionDir });
-        await agentStore.init();
-        const agent = await agentStore.createAgent({
-          name: "Validation Agent",
-          role: "executor",
-        });
+        // Validation rejects before any store/agent access, so no seeded
+        // agent is required — a fixed id suffices (PostgresCutover port).
+        const agent = { id: "agent-sat-validation-1" };
 
         const store = createSaturatedStore({
           getFusionDir: vi.fn().mockReturnValue(fusionDir),
@@ -3917,7 +3943,7 @@ describe("Saturated-slot regression: heartbeat wake routes", () => {
         expect(res.status).toBe(400);
         expect(res.body.error).toContain("triggeringCommentIds must be an array");
       } finally {
-        rmSync(tempDir, { recursive: true, force: true });
+        vi.restoreAllMocks();
       }
     }, 15_000);
   });
@@ -3990,6 +4016,203 @@ describe("DELETE /api/ai-sessions/cleanup", () => {
     expect(res.status).toBe(503);
     expect(res.body).toEqual({ error: "Session store not available" });
   });
+});
+
+// ── FN-7949: delete-mid-generation resurrection race ──────────────────────
+// Reproduces the exact reported bug: deleting a Planning Mode session while
+// its background generation is still in flight must not let a straggling
+// write resurrect it. Uses a REAL AiSessionStore (backed by a temp SQLite
+// db) wired the same way server.ts wires it — via setAiSessionStore() for
+// planning.ts's internal persistSession() calls AND via the routes.ts
+// aiSessionStore option for the DELETE endpoint — so the tombstone guard
+// added to AiSessionStore.upsert() is exercised end-to-end, not mocked out.
+describe("DELETE /api/ai-sessions/:id mid-generation (FN-7949)", () => {
+  let store: TaskStore;
+  let db: InstanceType<typeof Database>;
+  let realAiSessionStore: AiSessionStore;
+  let tmpRoot: string;
+
+  function buildApp() {
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(store, { aiSessionStore: realAiSessionStore as any }));
+    return app;
+  }
+
+  /**
+   * Deferred-prompt mock agent: the FIRST prompt() call (triggered by
+   * POST /api/planning/start) resolves immediately with a question, so the
+   * session reaches `awaiting_input` normally. The SECOND prompt() call
+   * (triggered by POST /api/planning/respond) does not resolve until the
+   * test explicitly calls `resolveSecondPrompt()` — modeling the abandoned
+   * `session.agent.session.prompt()` call that `runGenerationWithTimeout`'s
+   * `Promise.race` only stops *awaiting*, not actually cancels.
+   */
+  function setupDeferredRespondAgent() {
+    const messages: Array<{ role: string; content: string }> = [];
+    let callIndex = 0;
+    let resolveSecondPrompt: (() => void) | undefined;
+    const secondPromptStarted = new Promise<void>((resolveStarted) => {
+      const mockAgent = {
+        session: {
+          state: { messages },
+          prompt: vi.fn(async (msg: string) => {
+            messages.push({ role: "user", content: msg });
+            if (callIndex === 0) {
+              callIndex++;
+              messages.push({
+                role: "assistant",
+                content: JSON.stringify({
+                  type: "question",
+                  data: { id: "q-scope", type: "text", question: "What is the scope?" },
+                }),
+              });
+              return;
+            }
+            callIndex++;
+            await new Promise<void>((resolve) => {
+              resolveSecondPrompt = resolve;
+              resolveStarted();
+            });
+            messages.push({
+              role: "assistant",
+              content: JSON.stringify({
+                type: "complete",
+                data: { title: "Late-landing plan", description: "Should never be seen", suggestedSize: "S" },
+              }),
+            });
+          }),
+          dispose: vi.fn(),
+        },
+      };
+      __setCreateFnAgent(async () => mockAgent);
+    });
+
+    return {
+      secondPromptStarted,
+      resolveSecondPrompt: () => resolveSecondPrompt?.(),
+    };
+  }
+
+  beforeEach(() => {
+    store = createMockStore();
+    __resetPlanningState();
+    tmpRoot = mkdtempSync(join(tmpdir(), "kb-fn7949-ai-session-"));
+    db = new Database(join(tmpRoot, ".fusion"));
+    db.init();
+    realAiSessionStore = new AiSessionStore(db as any);
+    setAiSessionStore(realAiSessionStore);
+  });
+
+  afterEach(async () => {
+    __setCreateFnAgent(undefined as any);
+    __resetPlanningState();
+    realAiSessionStore.stopScheduledCleanup();
+    try {
+      db.close();
+    } catch {
+      // no-op
+    }
+    await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("does not resurrect a session deleted while a generation is still in flight", async () => {
+    const { secondPromptStarted, resolveSecondPrompt } = setupDeferredRespondAgent();
+
+    const startRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/planning/start",
+      JSON.stringify({ initialPlan: "Deleted mid-generation planning session" }),
+      { "Content-Type": "application/json" },
+    );
+    expect(startRes.status).toBe(201);
+    const sessionId = startRes.body.sessionId as string;
+    expect(realAiSessionStore.get(sessionId)).not.toBeNull();
+    expect(realAiSessionStore.get(sessionId)?.status).toBe("awaiting_input");
+
+    // Fire the respond call WITHOUT awaiting it — its underlying prompt()
+    // call is deferred and will not resolve until we explicitly release it
+    // below, simulating the straggling in-flight generation from FN-7949.
+    const respondPromise = REQUEST(
+      buildApp(),
+      "POST",
+      "/api/planning/respond",
+      JSON.stringify({ sessionId, responses: { "q-scope": "medium" } }),
+      { "Content-Type": "application/json" },
+    );
+
+    // Wait for the second prompt() call to actually start (i.e. respond's
+    // synchronous persistSession(session, "generating") has already run and
+    // execution is now parked awaiting the deferred prompt).
+    await secondPromptStarted;
+
+    // Delete the session while that generation is still in flight — the
+    // exact FN-7949 reproduction step.
+    const deleteRes = await REQUEST(buildApp(), "DELETE", `/api/ai-sessions/${sessionId}`);
+    expect(deleteRes.status).toBe(200);
+    expect(deleteRes.body).toEqual({ ok: true });
+    expect(realAiSessionStore.get(sessionId)).toBeNull();
+
+    const updatedEventIds: string[] = [];
+    realAiSessionStore.on("ai_session:updated", (summary) => updatedEventIds.push(summary.id));
+
+    // Let the abandoned prompt() call resolve — the straggling write lands
+    // after the session was already deleted.
+    resolveSecondPrompt();
+    await respondPromise.catch(() => {
+      // The request may resolve or reject depending on how far the aborted
+      // in-memory session state got; either is fine — what matters is the
+      // store-level assertion below.
+    });
+
+    // The deleted session must not have been resurrected, and no
+    // ai_session:updated event should have fired for it.
+    expect(realAiSessionStore.get(sessionId)).toBeNull();
+    expect(updatedEventIds).not.toContain(sessionId);
+  });
+
+  it("a normal delete with no in-flight generation continues to work exactly as before", async () => {
+    setupPlanningMockAgentForFn7949();
+
+    const startRes = await REQUEST(
+      buildApp(),
+      "POST",
+      "/api/planning/start",
+      JSON.stringify({ initialPlan: "Ordinary planning session, deleted cleanly" }),
+      { "Content-Type": "application/json" },
+    );
+    expect(startRes.status).toBe(201);
+    const sessionId = startRes.body.sessionId as string;
+    expect(realAiSessionStore.get(sessionId)).not.toBeNull();
+
+    const deleteRes = await REQUEST(buildApp(), "DELETE", `/api/ai-sessions/${sessionId}`);
+
+    expect(deleteRes.status).toBe(200);
+    expect(deleteRes.body).toEqual({ ok: true });
+    expect(realAiSessionStore.get(sessionId)).toBeNull();
+  });
+
+  function setupPlanningMockAgentForFn7949() {
+    const messages: Array<{ role: string; content: string }> = [];
+    const mockAgent = {
+      session: {
+        state: { messages },
+        prompt: vi.fn(async (msg: string) => {
+          messages.push({ role: "user", content: msg });
+          messages.push({
+            role: "assistant",
+            content: JSON.stringify({
+              type: "question",
+              data: { id: "q-scope", type: "text", question: "What is the scope?" },
+            }),
+          });
+        }),
+        dispose: vi.fn(),
+      },
+    };
+    __setCreateFnAgent(async () => mockAgent);
+  }
 });
 
 describe("POST /api/ai-sessions/:id/ping", () => {

@@ -44,11 +44,15 @@ const mockCentralListProjects = vi.fn().mockResolvedValue([]);
 const mockCentralInit = vi.fn().mockResolvedValue(undefined);
 const mockCentralClose = vi.fn().mockResolvedValue(undefined);
 const mockCentralReconcileProjectStatuses = vi.fn().mockResolvedValue(undefined);
-const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile } = vi.hoisted(() => ({
+const { mockPerformUpdateCheck, mockClearUpdateCheckCache, mockExecSync, mockExecFile, mockRunBackupCommand } = vi.hoisted(() => ({
   mockPerformUpdateCheck: vi.fn(),
   mockClearUpdateCheckCache: vi.fn(),
   mockExecSync: vi.fn(),
   mockExecFile: vi.fn(),
+  mockRunBackupCommand: vi.fn().mockResolvedValue({
+    success: true,
+    output: "Backup created: fusion-pg-2026-07-05.dump (1.2 KB).",
+  }),
 }));
 
 vi.mock("../update-check.js", async () => {
@@ -96,6 +100,14 @@ vi.mock("@fusion/core", async (importOriginal) => {
   const { createCoreMock } = await import("../test/mockCoreEngine.js");
   return createCoreMock(() => importOriginal<typeof import("@fusion/core")>(), {
     resolveGlobalDir: vi.fn().mockReturnValue("/tmp/fusion-test"),
+    /*
+    FNXC:DatabaseBackup 2026-07-05-16:30:
+    FN-7537 covers ROUTING parity (manual run intercepts the backup in-process
+    instead of shelling out), not the backup engine. Post-PG-cutover the real
+    runBackupCommand pg_dumps a live PostgreSQL cluster, which a unit test has
+    no business booting; stub it deterministically and assert it was invoked.
+    */
+    runBackupCommand: mockRunBackupCommand,
     isGhAvailable: vi.fn(),
     isGhAuthenticated: vi.fn(),
     isQmdAvailable: vi.fn().mockResolvedValue(false),
@@ -716,6 +728,84 @@ describe("Automation routes", () => {
       expect(automationStore.createSchedule).toHaveBeenCalledTimes(1);
     });
 
+    it("accepts and forwards valid step thinkingLevel for schedules", async () => {
+      const mockStore = createMockAutomationStore();
+      mockStore.createSchedule.mockResolvedValue({
+        ...FAKE_SCHEDULE,
+        command: "",
+        steps: [
+          {
+            id: "step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+            thinkingLevel: "high",
+          },
+        ],
+      });
+      const { app, automationStore } = buildApp(mockStore);
+      const res = await REQUEST(app, "POST", "/api/automations", JSON.stringify({
+        name: "Test",
+        command: "",
+        scheduleType: "hourly",
+        steps: [
+          {
+            id: "step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+            thinkingLevel: "high",
+          },
+        ],
+      }), { "Content-Type": "application/json" });
+      expect(res.status).toBe(201);
+      expect(automationStore.createSchedule).toHaveBeenCalledWith(expect.objectContaining({
+        steps: [expect.objectContaining({ thinkingLevel: "high" })],
+      }));
+      expect(res.body.steps[0].thinkingLevel).toBe("high");
+    });
+
+    it("accepts schedule steps without thinkingLevel", async () => {
+      const { app, automationStore } = buildApp();
+      const res = await REQUEST(app, "POST", "/api/automations", JSON.stringify({
+        name: "Test",
+        command: "",
+        scheduleType: "hourly",
+        steps: [
+          {
+            id: "step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+          },
+        ],
+      }), { "Content-Type": "application/json" });
+      expect(res.status).toBe(201);
+      expect(automationStore.createSchedule).toHaveBeenCalledWith(expect.objectContaining({
+        steps: [expect.not.objectContaining({ thinkingLevel: expect.anything() })],
+      }));
+    });
+
+    it("returns 400 for invalid schedule step thinkingLevel", async () => {
+      const { app } = buildApp();
+      const res = await REQUEST(app, "POST", "/api/automations", JSON.stringify({
+        name: "Test",
+        command: "",
+        scheduleType: "hourly",
+        steps: [
+          {
+            id: "step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+            thinkingLevel: "maximum",
+          },
+        ],
+      }), { "Content-Type": "application/json" });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("thinkingLevel must be one of off, minimal, low, medium, high, xhigh");
+    });
+
     it("returns 400 for missing name", async () => {
       const { app } = buildApp();
       const res = await REQUEST(app, "POST", "/api/automations", JSON.stringify({
@@ -900,6 +990,41 @@ describe("Automation routes", () => {
       }));
     });
 
+    it("forwards manual ai-prompt thinkingLevel into session creation and leaves omitted level unset", async () => {
+      vi.mocked(createFnAgent).mockClear();
+      const mockStore = createMockAutomationStore();
+      mockStore.getSchedule.mockResolvedValue({
+        ...FAKE_SCHEDULE,
+        command: "",
+        steps: [
+          {
+            id: "step-ai-high",
+            type: "ai-prompt",
+            name: "High thinking AI",
+            prompt: "Summarize deeply",
+            thinkingLevel: " high ",
+          },
+          {
+            id: "step-ai-default",
+            type: "ai-prompt",
+            name: "Default thinking AI",
+            prompt: "Summarize normally",
+          },
+        ],
+      });
+
+      const { app } = buildApp(mockStore);
+      const res = await REQUEST(app, "POST", "/api/automations/sched-001/run");
+
+      expect(res.status).toBe(200);
+      expect(vi.mocked(createFnAgent)).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        defaultThinkingLevel: "high",
+      }));
+      expect(vi.mocked(createFnAgent)).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        defaultThinkingLevel: undefined,
+      }));
+    });
+
     it("streams buffered live events for a completed manual AI prompt run", async () => {
       vi.mocked(createFnAgent).mockClear();
       const mockStore = createMockAutomationStore();
@@ -1005,6 +1130,7 @@ describe("Automation routes", () => {
       expect(vi.mocked(createFnAgent)).toHaveBeenCalledWith(expect.objectContaining({
         tools: "coding",
         toolsAllowlist: undefined,
+        defaultThinkingLevel: undefined,
       }));
     });
 
@@ -1021,6 +1147,7 @@ describe("Automation routes", () => {
             taskTitle: "Weekly report",
             taskDescription: "Create weekly maintenance report",
             taskColumn: "todo",
+            thinkingLevel: " high ",
           },
         ],
       });
@@ -1040,6 +1167,7 @@ describe("Automation routes", () => {
           title: "Weekly report",
           description: "Create weekly maintenance report",
           column: "todo",
+          thinkingLevel: "high",
         }),
       );
       expect(res.body.result.stepResults[0]).toEqual(
@@ -1049,6 +1177,35 @@ describe("Automation routes", () => {
           output: expect.stringContaining("Created task FN-9001"),
         }),
       );
+    });
+
+    it("leaves manual create-task thinkingLevel unset when the step omits it", async () => {
+      const mockStore = createMockAutomationStore();
+      mockStore.getSchedule.mockResolvedValue({
+        ...FAKE_SCHEDULE,
+        command: "",
+        steps: [
+          {
+            id: "step-task-default",
+            type: "create-task",
+            name: "Create default follow-up",
+            taskDescription: "Create default maintenance report",
+          },
+        ],
+      });
+      const { app, store } = buildApp(mockStore);
+      (store.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: "FN-9005",
+        title: "",
+        description: "Create default maintenance report",
+      });
+
+      const res = await REQUEST(app, "POST", "/api/automations/sched-001/run");
+
+      expect(res.status).toBe(200);
+      expect(store.createTask).toHaveBeenCalledWith(expect.objectContaining({
+        thinkingLevel: undefined,
+      }));
     });
 
     it("create-task automation step remains successful without explicit tracking issue creation", async () => {
@@ -1234,19 +1391,10 @@ describe("Automation routes", () => {
     without a global `fn`/`runfusion.ai` binary.
     */
     describe("manual backup run parity (FN-7537)", () => {
-      function writeTestDb(path: string): void {
-        try {
-          execFileSync("sqlite3", [path, "CREATE TABLE IF NOT EXISTS t(x); INSERT INTO t VALUES (1);"]);
-        } catch {
-          writeFileSync(path, "dummy database content");
-        }
-      }
-
       it("intercepts the in-process backup for a legacy single-command schedule and does not shell out", async () => {
         const tempDir = mkdtempSync(join(tmpdir(), "routes-automation-backup-"));
         const fusionDir = join(tempDir, ".fusion");
         mkdirSync(fusionDir, { recursive: true });
-        writeTestDb(join(fusionDir, "fusion.db"));
 
         try {
           const mockStore = createMockAutomationStore();
@@ -1265,6 +1413,7 @@ describe("Automation routes", () => {
           expect(res.status).toBe(200);
           expect(res.body.result.success).toBe(true);
           expect(res.body.result.output).toContain("Backup created");
+          expect(mockRunBackupCommand).toHaveBeenCalledWith(fusionDir, expect.anything());
           // A shelled-out command would have gone through node:child_process exec — assert it did not.
           expect(mockExecFile).not.toHaveBeenCalledWith(
             expect.anything(),
@@ -1281,7 +1430,6 @@ describe("Automation routes", () => {
         const tempDir = mkdtempSync(join(tmpdir(), "routes-automation-backup-step-"));
         const fusionDir = join(tempDir, ".fusion");
         mkdirSync(fusionDir, { recursive: true });
-        writeTestDb(join(fusionDir, "fusion.db"));
 
         try {
           const mockStore = createMockAutomationStore();
@@ -1317,7 +1465,6 @@ describe("Automation routes", () => {
         const tempDir = mkdtempSync(join(tmpdir(), "routes-automation-backup-live-"));
         const fusionDir = join(tempDir, ".fusion");
         mkdirSync(fusionDir, { recursive: true });
-        writeTestDb(join(fusionDir, "fusion.db"));
 
         try {
           const mockStore = createMockAutomationStore();
@@ -1851,6 +1998,80 @@ describe("Routine routes", () => {
         name: "Test",
         trigger: { type: "cron", cronExpression: "0 * * * *" },
       }));
+    });
+
+    it("accepts and forwards valid step thinkingLevel for routines", async () => {
+      const mockStore = createMockRoutineStore();
+      mockStore.createRoutine.mockResolvedValue({
+        ...FAKE_ROUTINE,
+        steps: [
+          {
+            id: "routine-step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+            thinkingLevel: "high",
+          },
+        ],
+      });
+      const { app, routineStore } = buildRoutineApp(mockStore);
+      const res = await REQUEST(app, "POST", "/api/routines", JSON.stringify({
+        name: "Test",
+        trigger: { type: "manual" },
+        steps: [
+          {
+            id: "routine-step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+            thinkingLevel: "high",
+          },
+        ],
+      }), { "Content-Type": "application/json" });
+      expect(res.status).toBe(201);
+      expect(routineStore.createRoutine).toHaveBeenCalledWith(expect.objectContaining({
+        steps: [expect.objectContaining({ thinkingLevel: "high" })],
+      }));
+      expect(res.body.steps[0].thinkingLevel).toBe("high");
+    });
+
+    it("accepts routine steps without thinkingLevel", async () => {
+      const { app, routineStore } = buildRoutineApp();
+      const res = await REQUEST(app, "POST", "/api/routines", JSON.stringify({
+        name: "Test",
+        trigger: { type: "manual" },
+        steps: [
+          {
+            id: "routine-step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+          },
+        ],
+      }), { "Content-Type": "application/json" });
+      expect(res.status).toBe(201);
+      expect(routineStore.createRoutine).toHaveBeenCalledWith(expect.objectContaining({
+        steps: [expect.not.objectContaining({ thinkingLevel: expect.anything() })],
+      }));
+    });
+
+    it("returns 400 for invalid routine step thinkingLevel", async () => {
+      const { app } = buildRoutineApp();
+      const res = await REQUEST(app, "POST", "/api/routines", JSON.stringify({
+        name: "Test",
+        trigger: { type: "manual" },
+        steps: [
+          {
+            id: "routine-step-ai",
+            type: "ai-prompt",
+            name: "AI",
+            prompt: "Summarize",
+            thinkingLevel: "maximum",
+          },
+        ],
+      }), { "Content-Type": "application/json" });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("thinkingLevel must be one of off, minimal, low, medium, high, xhigh");
     });
 
     it("creates a routine with webhook trigger (requires secret)", async () => {

@@ -19,6 +19,7 @@ import type {
   TaskPriority,
   TaskStore,
   NtfyNotificationEvent,
+  ThinkingLevel,
 } from "@fusion/core";
 import {
   DEFAULT_TASK_PRIORITY,
@@ -27,6 +28,7 @@ import {
   PLANNING_DEEPEN_PROCEED_OPTION_ID,
   PLANNING_DEEPEN_PROCEED_RESPONSE_KEY,
   TASK_PRIORITIES,
+  THINKING_LEVELS,
   resolvePrompt,
   summarizeTitle,
   type PromptOverrideMap,
@@ -62,8 +64,19 @@ type SkillPluginRunner = Parameters<typeof buildSessionSkillContextSync>[3];
 
 const PLANNING_BUILTIN_WEB_TOOLS = ["WebSearch", "WebFetch"] as const;
 type PlanningMcpServers = Awaited<ReturnType<typeof resolveMcpServersForStore>>["servers"];
+type PlanningSessionOptions = {
+  projectId?: string;
+  ntfyConfig?: PlanningNtfyConfig;
+  planningDepth?: PlanningDepth;
+  customQuestionCount?: number;
+  pluginRunner?: SkillPluginRunner;
+};
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let createFnAgent: any = engineCreateFnAgent;
+
+function isThinkingLevel(value: unknown): value is ThinkingLevel {
+  return THINKING_LEVELS.includes(value as ThinkingLevel);
+}
 
 async function resolvePlanningMcpServers(store: TaskStore): Promise<PlanningMcpServers> {
   const resolved = await resolveMcpServersForStore(store);
@@ -267,6 +280,9 @@ export const DRAFT_PLACEHOLDER_TITLE = "New planning session";
  * picked at create time, and so summarizeDraftTitle calls hit that same
  * model rather than silently falling back to project defaults.
  *
+ * FNXC:Planning 2026-07-12-00:00:
+ * Planning drafts/sessions persist a validated per-session reasoning effort in inputPayload so draft reopen and start-existing rebuilds preserve the selected thinking level without a SQLite schema change.
+ *
  * `summarizedFor` records the exact `initialPlan` string the current
  * persisted title was summarized from. The start-existing path uses it to
  * skip re-summarizing when blur/close already produced a title for the
@@ -276,6 +292,7 @@ export interface DraftInputPayload {
   initialPlan?: string;
   modelProvider?: string;
   modelId?: string;
+  thinkingLevel?: ThinkingLevel;
   summarizedFor?: string;
   pendingSummary?: PlanningSummary;
 }
@@ -359,6 +376,8 @@ interface Session {
   /** Model override the user picked at draft-create time. Persisted in inputPayload so reopen restores it. */
   draftModelProvider?: string;
   draftModelId?: string;
+  /** Per-session reasoning effort persisted with the draft/session and threaded into planning agents when set. */
+  draftThinkingLevel?: ThinkingLevel;
   /** Plan text the current title was summarized from; lets startExistingSession skip a redundant re-summarize when blur/close already covered the final text. */
   draftSummarizedFor?: string;
   ntfyConfig?: PlanningNtfyConfig;
@@ -414,6 +433,8 @@ interface ActivePlanningGeneration {
   abortController: AbortController;
   timer: NodeJS.Timeout;
   abortReason?: PlanningGenerationAbortReason;
+  abortTeardownFired: boolean;
+  abortTeardown: () => void;
   markProgress: (output: string) => void;
 }
 
@@ -717,6 +738,9 @@ function cleanupInMemorySession(sessionId: string): boolean {
   const activeGeneration = activeGenerations.get(sessionId);
   if (activeGeneration) {
     clearTimeout(activeGeneration.timer);
+    activeGeneration.abortReason = "user-stop";
+    activeGeneration.abortTeardown();
+    activeGeneration.abortController.abort();
     activeGenerations.delete(sessionId);
   }
 
@@ -752,6 +776,7 @@ function persistSession(session: Session, status: "generating" | "awaiting_input
       initialPlan: session.initialPlan,
       ...(session.draftModelProvider ? { modelProvider: session.draftModelProvider } : {}),
       ...(session.draftModelId ? { modelId: session.draftModelId } : {}),
+      ...(session.draftThinkingLevel ? { thinkingLevel: session.draftThinkingLevel } : {}),
       ...(session.draftSummarizedFor ? { summarizedFor: session.draftSummarizedFor } : {}),
       ...(session.pendingSummary ? { pendingSummary: session.pendingSummary } : {}),
     }),
@@ -766,7 +791,7 @@ function persistSession(session: Session, status: "generating" | "awaiting_input
     lockedByTab: null,
     lockedAt: null,
   };
-  _aiSessionStore.upsert(row);
+  _aiSessionStore.upsert(row).catch(() => { /* best-effort persistence */ });
 }
 
 /** Persist only thinking output (debounced). */
@@ -778,7 +803,7 @@ function persistThinking(sessionId: string, thinkingOutput: string): void {
 /** Remove session from persistence. */
 function unpersistSession(sessionId: string): void {
   if (!_aiSessionStore) return;
-  _aiSessionStore.delete(sessionId);
+  void _aiSessionStore.delete(sessionId);
 }
 
 /** Release in-memory planning runtime state while keeping persisted history. */
@@ -792,6 +817,8 @@ function buildSessionFromRow(row: AiSessionRow): Session {
     {},
     { throwOnError: true, fieldName: "inputPayload" },
   );
+
+  const thinkingLevel = isThinkingLevel(payload.thinkingLevel) ? payload.thinkingLevel : undefined;
 
   const createdAt = new Date(row.createdAt);
   const updatedAt = new Date(row.updatedAt);
@@ -815,6 +842,7 @@ function buildSessionFromRow(row: AiSessionRow): Session {
     projectId: row.projectId ?? undefined,
     draftModelProvider: payload.modelProvider,
     draftModelId: payload.modelId,
+    draftThinkingLevel: thinkingLevel,
     draftSummarizedFor: payload.summarizedFor,
     history: safeParseJson<PlanningHistoryEntry[]>(
       row.conversationHistory,
@@ -844,11 +872,11 @@ function buildSessionFromRow(row: AiSessionRow): Session {
   };
 }
 
-export function rehydrateFromStore(store: AiSessionStore): number {
+export async function rehydrateFromStore(store: AiSessionStore): Promise<number> {
   let rows: AiSessionRow[] = [];
 
   try {
-    rows = store.listRecoverable().filter((row) => row.type === "planning");
+    rows = (await store.listRecoverable()).filter((row) => row.type === "planning");
   } catch (error) {
     diagnostics.errorFromException("Failed to list recoverable sessions", error, { operation: "list-recoverable" });
     return 0;
@@ -1355,9 +1383,12 @@ export async function createDraftSession(
   _rootDir: string,
   modelProvider?: string,
   modelId?: string,
-  _promptOverrides?: PromptOverrideMap,
-  options?: { projectId?: string },
+  thinkingLevelOrPromptOverrides?: ThinkingLevel | PromptOverrideMap,
+  _promptOverridesOrOptions?: PromptOverrideMap | { projectId?: string },
+  optionsMaybe?: { projectId?: string },
 ): Promise<{ sessionId: string; title: string }> {
+  const thinkingLevel = isThinkingLevel(thinkingLevelOrPromptOverrides) ? thinkingLevelOrPromptOverrides : undefined;
+  const options = (isThinkingLevel(thinkingLevelOrPromptOverrides) ? optionsMaybe : _promptOverridesOrOptions) as { projectId?: string } | undefined;
   if (!checkRateLimit(ip)) {
     const resetTime = getRateLimitResetTime(ip);
     throw new RateLimitError(
@@ -1382,6 +1413,7 @@ export async function createDraftSession(
     projectId: options?.projectId,
     draftModelProvider: hasModelOverride ? modelProvider : undefined,
     draftModelId: hasModelOverride ? modelId : undefined,
+    draftThinkingLevel: thinkingLevel,
     history: [],
     thinkingOutput: "",
     lastGeneratedThinking: "",
@@ -1422,7 +1454,7 @@ export async function summarizeDraftTitle(
 ): Promise<string | null> {
   if (!_aiSessionStore) return null;
 
-  const row = _aiSessionStore.get(sessionId);
+  const row = await _aiSessionStore.get(sessionId);
   if (!row || row.type !== "planning" || row.status !== "draft") {
     return null;
   }
@@ -1452,12 +1484,12 @@ export async function summarizeDraftTitle(
 
   // Re-check status (not title) so a concurrent Start Planning or a later
   // edit-then-blur cycle doesn't overwrite a real generating/complete title.
-  const latest = _aiSessionStore.get(sessionId);
+  const latest = await _aiSessionStore.get(sessionId);
   if (!latest || latest.status !== "draft") {
     return latest?.title ?? null;
   }
 
-  _aiSessionStore.markDraftSummarized(sessionId, finalTitle, trimmed);
+  _aiSessionStore.markDraftSummarized(sessionId, finalTitle, trimmed).catch(() => { /* best-effort */ });
   const session = sessions.get(sessionId);
   if (session) {
     session.title = finalTitle;
@@ -1472,9 +1504,15 @@ export async function startExistingSession(
   store: TaskStore,
   modelProvider?: string,
   modelId?: string,
-  promptOverrides?: PromptOverrideMap,
-  pluginRunner?: SkillPluginRunner,
+  thinkingLevelOrPromptOverrides?: ThinkingLevel | PromptOverrideMap,
+  promptOverridesOrPluginRunner?: PromptOverrideMap | SkillPluginRunner,
+  pluginRunnerMaybe?: SkillPluginRunner,
 ): Promise<void> {
+  const thinkingLevel = isThinkingLevel(thinkingLevelOrPromptOverrides) ? thinkingLevelOrPromptOverrides : undefined;
+  const promptOverrides = isThinkingLevel(thinkingLevelOrPromptOverrides)
+    ? (promptOverridesOrPluginRunner as PromptOverrideMap | undefined)
+    : (thinkingLevelOrPromptOverrides as PromptOverrideMap | undefined);
+  const pluginRunner = (isThinkingLevel(thinkingLevelOrPromptOverrides) ? pluginRunnerMaybe : promptOverridesOrPluginRunner) as SkillPluginRunner | undefined;
   let session = sessions.get(sessionId);
 
   // Draft sessions aren't included in rehydrateFromStore (which only loads
@@ -1482,7 +1520,7 @@ export async function startExistingSession(
   // map entirely. Rebuild lazily from SQLite so persisted drafts can still be
   // started after a restart, and so updateDraft-only state survives.
   if (!session && _aiSessionStore) {
-    const row = _aiSessionStore.get(sessionId);
+    const row = await _aiSessionStore.get(sessionId);
     if (row && row.type === "planning") {
       try {
         session = buildSessionFromRow(row);
@@ -1509,10 +1547,11 @@ export async function startExistingSession(
   // summarized this exact text.
   let persistedProvider: string | undefined;
   let persistedModelId: string | undefined;
+  let persistedThinkingLevel: ThinkingLevel | undefined;
   let persistedSummarizedFor: string | undefined;
   let cameFromDraft = false;
   if (_aiSessionStore) {
-    const row = _aiSessionStore.get(sessionId);
+    const row = await _aiSessionStore.get(sessionId);
     if (row) {
       cameFromDraft = row.status === "draft";
       const payload = safeParseJson<DraftInputPayload>(row.inputPayload, {});
@@ -1521,6 +1560,7 @@ export async function startExistingSession(
       }
       persistedProvider = payload.modelProvider;
       persistedModelId = payload.modelId;
+      persistedThinkingLevel = isThinkingLevel(payload.thinkingLevel) ? payload.thinkingLevel : undefined;
       persistedSummarizedFor = payload.summarizedFor;
     }
   }
@@ -1554,10 +1594,11 @@ export async function startExistingSession(
     }
   }
 
+  session.draftThinkingLevel = thinkingLevel ?? persistedThinkingLevel;
   persistSession(session, "generating");
   planningStreamManager.registerInitialTurn(sessionId, () => {
     session.pluginRunner = pluginRunner;
-    initializeAgent(session, rootDir, store, modelProvider, modelId, promptOverrides, undefined, undefined, pluginRunner).catch((err) => {
+    initializeAgent(session, rootDir, store, modelProvider, modelId, session.draftThinkingLevel, promptOverrides, undefined, undefined, pluginRunner).catch((err) => {
       diagnostics.errorFromException("Failed to initialize agent for session", err, { sessionId, operation: "initialize-agent" });
       persistSession(session, "error", err.message || "Failed to initialize AI agent");
       planningStreamManager.broadcast(sessionId, {
@@ -1587,15 +1628,15 @@ export async function createSessionWithAgent(
   store: TaskStore,
   modelProvider?: string,
   modelId?: string,
-  promptOverrides?: PromptOverrideMap,
-  options?: {
-    projectId?: string;
-    ntfyConfig?: PlanningNtfyConfig;
-    planningDepth?: PlanningDepth;
-    customQuestionCount?: number;
-    pluginRunner?: SkillPluginRunner;
-  },
+  thinkingLevelOrPromptOverrides?: ThinkingLevel | PromptOverrideMap,
+  promptOverridesOrOptions?: PromptOverrideMap | PlanningSessionOptions,
+  optionsMaybe?: PlanningSessionOptions,
 ): Promise<string> {
+  const thinkingLevel = isThinkingLevel(thinkingLevelOrPromptOverrides) ? thinkingLevelOrPromptOverrides : undefined;
+  const promptOverrides = isThinkingLevel(thinkingLevelOrPromptOverrides)
+    ? (promptOverridesOrOptions as PromptOverrideMap | undefined)
+    : (thinkingLevelOrPromptOverrides as PromptOverrideMap | undefined);
+  const options = (isThinkingLevel(thinkingLevelOrPromptOverrides) ? optionsMaybe : promptOverridesOrOptions) as PlanningSessionOptions | undefined;
   // Check rate limit
   if (!checkRateLimit(ip)) {
     const resetTime = getRateLimitResetTime(ip);
@@ -1627,6 +1668,7 @@ export async function createSessionWithAgent(
     lastGeneratedThinking: "",
     createdAt: new Date(),
     updatedAt: new Date(),
+    draftThinkingLevel: thinkingLevel,
     pluginRunner: options?.pluginRunner,
   };
 
@@ -1640,6 +1682,7 @@ export async function createSessionWithAgent(
       store,
       modelProvider,
       modelId,
+      thinkingLevel,
       promptOverrides,
       options?.planningDepth,
       options?.customQuestionCount,
@@ -1666,6 +1709,7 @@ async function initializeAgent(
   store: TaskStore,
   modelProvider?: string,
   modelId?: string,
+  thinkingLevel?: ThinkingLevel,
   promptOverrides?: PromptOverrideMap,
   planningDepth?: PlanningDepth,
   customQuestionCount?: number,
@@ -1683,6 +1727,7 @@ async function initializeAgent(
         store,
         modelProvider,
         modelId,
+        thinkingLevel,
         promptOverrides,
         planningDepth,
         customQuestionCount,
@@ -1739,6 +1784,7 @@ async function createPlanningAgent(
   store: TaskStore,
   modelProvider?: string,
   modelId?: string,
+  thinkingLevel?: ThinkingLevel,
   promptOverrides?: PromptOverrideMap,
   planningDepth?: PlanningDepth,
   customQuestionCount?: number,
@@ -1780,6 +1826,7 @@ async function createPlanningAgent(
           defaultModelId: modelId,
         }
       : {}),
+    ...(thinkingLevel ? { defaultThinkingLevel: thinkingLevel } : {}),
     onThinking: (delta: string) => {
       markPlanningGenerationProgress(session.id, delta);
       session.thinkingOutput += delta;
@@ -1847,14 +1894,28 @@ async function ensureSessionAgent(
     );
   }
 
-  session.agent = await createPlanningAgent(session, effectiveRootDir, effectiveStore, undefined, undefined, promptOverrides, undefined, undefined, session.pluginRunner);
+  session.agent = await createPlanningAgent(session, effectiveRootDir, effectiveStore, undefined, undefined, session.draftThinkingLevel, promptOverrides, undefined, undefined, session.pluginRunner);
 
   if (historyForReplay.length === 0) {
     return;
   }
 
   const contextMessage = buildHistoryReplayPrompt(historyForReplay);
-  await session.agent.session.prompt(contextMessage);
+  await runGenerationWithTimeout(session, async (abortSignal) => {
+    /*
+    FNXC:AiSessionCancellation 2026-07-13-00:00:
+    Planning history replay is an agent prompt surface too. Forward the generation AbortSignal and rely on runGenerationWithTimeout to tear down the in-flight session because Promise.race alone cannot cancel prompt() work.
+    */
+    if (abortSignal.aborted) {
+      throw createAbortError();
+    }
+    await (session.agent!.session.prompt as (input: string, options?: { signal?: AbortSignal }) => Promise<void>)(contextMessage, {
+      signal: abortSignal,
+    });
+    if (abortSignal.aborted) {
+      throw createAbortError();
+    }
+  });
 }
 
 async function maybeNotifyPlanningAwaitingInput(session: Session, question: PlanningQuestion): Promise<void> {
@@ -1955,6 +2016,7 @@ async function runGenerationWithTimeout<T>(session: Session, operation: (abortSi
   if (existing) {
     clearTimeout(existing.timer);
     existing.abortReason = "displaced";
+    existing.abortTeardown();
     existing.abortController.abort();
   }
 
@@ -1975,8 +2037,8 @@ async function runGenerationWithTimeout<T>(session: Session, operation: (abortSi
         operation: "planning-generation-watchdog",
       });
       setSessionError(session, message);
-      disposeSessionAgentForRetry(session);
     }
+    generationRecord.abortTeardown();
     abortController.abort();
   };
 
@@ -1987,6 +2049,18 @@ async function runGenerationWithTimeout<T>(session: Session, operation: (abortSi
   const generationRecord: ActivePlanningGeneration = {
     abortController,
     timer: scheduleInactivityTimer(),
+    abortTeardownFired: false,
+    abortTeardown: () => {
+      if (generationRecord.abortTeardownFired) {
+        return;
+      }
+      generationRecord.abortTeardownFired = true;
+      /*
+      FNXC:AiSessionCancellation 2026-07-13-00:00:
+      Planning has a local generation runner instead of GenerationGuard. Abort teardown must run once for timeout, user-stop, displacement, stuck, and loop aborts so an abandoned prompt cannot continue after the Promise.race waiter rejects.
+      */
+      disposeSessionAgentForRetry(session);
+    },
     markProgress: (output: string) => {
       const signature = normalizeGenerationProgress(output);
       if (!signature) {
@@ -2097,11 +2171,19 @@ async function continueAgentConversation(session: Session, message: string): Pro
       // Clear thinking output for this turn
       session.thinkingOutput = "";
 
-      // Send message to agent using .prompt() - it will stream thinking via onThinking callback.
-      // Pass abort signal so timeout/user-stop can cancel the underlying prompt when supported.
+      /*
+      FNXC:AiSessionCancellation 2026-07-13-00:00:
+      Planning turns and parse-retry prompts must pass the active AbortSignal to prompt() and short-circuit after abort. The local generation runner also tears down the agent session because provider SDKs may ignore the signal.
+      */
+      if (abortSignal.aborted) {
+        throw createAbortError();
+      }
       await (session.agent.session.prompt as (input: string, options?: { signal?: AbortSignal }) => Promise<void>)(message, {
         signal: abortSignal,
       });
+      if (abortSignal.aborted) {
+        throw createAbortError();
+      }
 
     // Get the response text from the agent's state
     interface AgentMessage {
@@ -2167,12 +2249,18 @@ async function continueAgentConversation(session: Session, message: string): Pro
           );
           try {
             session.thinkingOutput = "";
+            if (abortSignal.aborted) {
+              throw createAbortError();
+            }
             await (session.agent.session.prompt as (input: string, options?: { signal?: AbortSignal }) => Promise<void>)(
               "Your previous response could not be parsed as JSON. " +
                 'Please respond with ONLY a valid JSON object: either {"type":"question","data":{...}} ' +
                 'or {"type":"complete","data":{...}}. No markdown, no explanation, just the JSON.',
               { signal: abortSignal },
             );
+            if (abortSignal.aborted) {
+              throw createAbortError();
+            }
             
             // Get the new response text
             const retryMessage = (session.agent.session.state.messages as AgentMessage[])
@@ -2196,6 +2284,9 @@ async function continueAgentConversation(session: Session, message: string): Pro
             responseText = retryText;
             markPlanningGenerationProgress(session.id, responseText);
           } catch (retryErr) {
+            if (retryErr instanceof Error && retryErr.name === "AbortError") {
+              throw retryErr;
+            }
             // Retry prompt itself failed — give up
             diagnostics.errorFromException(
               "Retry prompt failed for session",
@@ -2497,7 +2588,7 @@ export async function submitResponse(
   promptOverrides?: PromptOverrideMap,
   store?: TaskStore,
 ): Promise<PlanningResponse> {
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
   if (!session) {
     throw new SessionNotFoundError(`Planning session ${sessionId} not found or expired`);
   }
@@ -2593,7 +2684,7 @@ export async function retrySession(
   promptOverrides?: PromptOverrideMap,
   store?: TaskStore,
 ): Promise<void> {
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
   if (!session) {
     throw new SessionNotFoundError(`Planning session ${sessionId} not found or expired`);
   }
@@ -2601,7 +2692,7 @@ export async function retrySession(
   if (store && !session.store) session.store = store;
   if (rootDir && !session.rootDir) session.rootDir = rootDir;
 
-  const persisted = _aiSessionStore?.get(sessionId);
+  const persisted = _aiSessionStore ? await _aiSessionStore.get(sessionId) : null;
   if (persisted && persisted.type !== "planning") {
     throw new SessionNotFoundError(`Planning session ${sessionId} not found or expired`);
   }
@@ -2647,7 +2738,7 @@ export async function rewindSession(
   promptOverrides?: PromptOverrideMap,
   store?: TaskStore,
 ): Promise<PlanningRewindResult> {
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
   if (!session) {
     throw new SessionNotFoundError(`Planning session ${sessionId} not found or expired`);
   }
@@ -2696,19 +2787,10 @@ export function stopGeneration(sessionId: string): boolean {
   }
 
   activeGeneration.abortReason = "user-stop";
-  activeGeneration.abortController.abort();
   clearTimeout(activeGeneration.timer);
+  activeGeneration.abortTeardown();
+  activeGeneration.abortController.abort();
   activeGenerations.delete(sessionId);
-
-  if (session.agent) {
-    nonfatal(
-      () => session.agent?.session.dispose?.(),
-      diagnostics,
-      "Error disposing agent for stop-generation",
-      { sessionId, operation: "stop-generation-dispose" },
-    );
-    session.agent = undefined;
-  }
 
   setSessionError(session, PLANNING_USER_STOP_ERROR_MESSAGE);
   return true;
@@ -2889,7 +2971,7 @@ export async function cancelSession(sessionId: string): Promise<void> {
 /**
  * Get session details.
  */
-export function getSession(sessionId: string): Session | undefined {
+export async function getSession(sessionId: string): Promise<Session | undefined> {
   const inMemory = sessions.get(sessionId);
   if (inMemory) {
     return inMemory;
@@ -2899,7 +2981,7 @@ export function getSession(sessionId: string): Session | undefined {
     return undefined;
   }
 
-  const row = _aiSessionStore.get(sessionId);
+  const row = await _aiSessionStore.get(sessionId);
   if (!row || row.type !== "planning") {
     return undefined;
   }
@@ -3156,7 +3238,7 @@ export async function __runGenerationWithTimeoutForTests<T>(
   sessionId: string,
   operation: (abortSignal: AbortSignal) => Promise<T>,
 ): Promise<T> {
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
   if (!session) {
     throw new SessionNotFoundError(`Planning session ${sessionId} not found or expired`);
   }

@@ -580,7 +580,7 @@ describe("executeHeartbeat", () => {
       await (monitor as any).buildReportsHealthSection("agent-001", store);
 
       expect(heartbeatLog.log).toHaveBeenCalledWith(
-        expect.stringContaining("[reports-health] stale report agent-overdue intervalSource=persisted-agent"),
+        expect.stringContaining("[reports-health] stale report agent-overdue intervalSource=runtimeConfig"),
       );
       expect(heartbeatLog.log).toHaveBeenCalledWith(expect.stringContaining("staleThresholdMs="));
       expect(heartbeatLog.log).toHaveBeenCalledWith(expect.stringContaining("heartbeatAgeMs="));
@@ -884,10 +884,10 @@ describe("executeHeartbeat", () => {
 
       expect(result).toBeDefined();
       expect(result.status).toBe("completed");
-      // FNXC:HeartbeatTests 2026-07-12-FN7835: FN-7835 reclassified the error-state-not-recovery-eligible resultJson reason from "invalid_state" to "error-unrecoverable" (HEARTBEAT_ERROR_UNRECOVERABLE_PAUSE_REASON) so parked-unrecoverable agents are distinguishable from other invalid states. The paused-state case above still uses "invalid_state".
-      expect(result.resultJson).toEqual({ reason: "error-unrecoverable", recoveryEligible: false, state: "error" });
+      // FNXC:HeartbeatTests 2026-07-12-16:10: FN-7878 makes absent/generic durable-agent lastError recoverable, but this executor-harness agent is not recovery-eligible; it should remain a normal invalid-state exit instead of fabricating an unrecoverable park.
+      expect(result.resultJson).toEqual({ reason: "invalid_state", state: "error" });
       expect(mockedCreateFnAgent).not.toHaveBeenCalled();
-      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "active");
+      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
     });
 
     it("keeps terminated as a run status while pausing the agent", async () => {
@@ -920,9 +920,9 @@ describe("executeHeartbeat", () => {
         status: "completed",
       });
 
-      // FNXC:HeartbeatTests 2026-07-12-FN7835: FN-7835/FN-7859 park non-recoverable heartbeat failures as "paused" (pauseReason: error-unrecoverable) instead of bare "error". The subsequent successful run still clears the stale lastError and returns to active.
-      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "paused");
-      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "error");
+      // FNXC:HeartbeatTests 2026-07-12-16:10: FN-7878 changed generic heartbeat failures such as "Prompt failed" from immediate `error-unrecoverable` parking to bare `error` so the bounded retry budget can run. The subsequent successful run still clears the stale lastError and returns to active.
+      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "error");
+      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "paused");
       expect(store.updateAgent).toHaveBeenCalledWith("agent-001", expect.objectContaining({ lastError: "Prompt failed" }));
       expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "active");
       // FNXC:HeartbeatTests 2026-07-12-10:10: FN-7835's success path also resets error-recovery metadata alongside lastError, so use objectContaining to tolerate the extra metadata key.
@@ -3055,7 +3055,7 @@ describe("executeHeartbeat", () => {
       expect(callArgs.tools).toBe("coding");
       // fn_artifact_register/list/view, agent config/provisioning, goals/evaluations/identity,
       // task read discovery, workflow discovery/authoring, task promotion, bounded research, clarification, web fetch, memory, and fn_heartbeat_done.
-      expect(callArgs.customTools).toHaveLength(39);
+      expect(callArgs.customTools).toHaveLength(40);
       expect(callArgs.customTools![0]!.name).toBe("fn_task_create");
       expect(callArgs.customTools![1]!.name).toBe("fn_task_log");
       expect(callArgs.customTools![2]!.name).toBe("fn_task_document_write");
@@ -3078,24 +3078,25 @@ describe("executeHeartbeat", () => {
       expect(callArgs.customTools![19]!.name).toBe("fn_task_search");
       expect(callArgs.customTools![20]!.name).toBe("fn_workflow_list");
       expect(callArgs.customTools![21]!.name).toBe("fn_workflow_get");
-      expect(callArgs.customTools![22]!.name).toBe("fn_workflow_create");
-      expect(callArgs.customTools![23]!.name).toBe("fn_workflow_update");
-      expect(callArgs.customTools![24]!.name).toBe("fn_workflow_delete");
-      expect(callArgs.customTools![25]!.name).toBe("fn_workflow_settings");
-      expect(callArgs.customTools![26]!.name).toBe("fn_trait_list");
-      expect(callArgs.customTools![27]!.name).toBe("fn_ask_question");
-      expect(callArgs.customTools![28]!.name).toBe("fn_research_run");
-      expect(callArgs.customTools![29]!.name).toBe("fn_research_list");
-      expect(callArgs.customTools![30]!.name).toBe("fn_research_get");
-      expect(callArgs.customTools![31]!.name).toBe("fn_research_cancel");
-      expect(callArgs.customTools![32]!.name).toBe("fn_workflow_select");
-      expect(callArgs.customTools![33]!.name).toBe("fn_task_promote");
-      expect(callArgs.customTools![34]!.name).toBe("fn_web_fetch");
-      expect(callArgs.customTools![35]!.name).toBe("fn_memory_search");
-      expect(callArgs.customTools![36]!.name).toBe("fn_memory_get");
-      expect(callArgs.customTools![37]!.name).toBe("fn_memory_append");
+      expect(callArgs.customTools![22]!.name).toBe("fn_workflow_validate");
+      expect(callArgs.customTools![23]!.name).toBe("fn_workflow_create");
+      expect(callArgs.customTools![24]!.name).toBe("fn_workflow_update");
+      expect(callArgs.customTools![25]!.name).toBe("fn_workflow_delete");
+      expect(callArgs.customTools![26]!.name).toBe("fn_workflow_settings");
+      expect(callArgs.customTools![27]!.name).toBe("fn_trait_list");
+      expect(callArgs.customTools![28]!.name).toBe("fn_ask_question");
+      expect(callArgs.customTools![29]!.name).toBe("fn_research_run");
+      expect(callArgs.customTools![30]!.name).toBe("fn_research_list");
+      expect(callArgs.customTools![31]!.name).toBe("fn_research_get");
+      expect(callArgs.customTools![32]!.name).toBe("fn_research_cancel");
+      expect(callArgs.customTools![33]!.name).toBe("fn_workflow_select");
+      expect(callArgs.customTools![34]!.name).toBe("fn_task_promote");
+      expect(callArgs.customTools![35]!.name).toBe("fn_web_fetch");
+      expect(callArgs.customTools![36]!.name).toBe("fn_memory_search");
+      expect(callArgs.customTools![37]!.name).toBe("fn_memory_get");
+      expect(callArgs.customTools![38]!.name).toBe("fn_memory_append");
       // fn_heartbeat_done is last (terminal tool)
-      expect(callArgs.customTools![38]!.name).toBe("fn_heartbeat_done");
+      expect(callArgs.customTools![39]!.name).toBe("fn_heartbeat_done");
     });
 
     it("loads workspace memory into system prompt and identity snapshot when inline memory is empty", async () => {
@@ -3695,8 +3696,9 @@ describe("executeHeartbeat", () => {
       expect(result).toBeDefined();
       expect(result.status).toBe("failed");
       expect(result.stderrExcerpt).toContain("Model unavailable");
-      // FNXC:HeartbeatTests 2026-07-12-FN7835: FN-7835/FN-7859 park non-recoverable failures (e.g. "Model unavailable") as "paused" with pauseReason error-unrecoverable instead of bare "error".
-      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "paused");
+      // FNXC:HeartbeatTests 2026-07-12-16:10: FN-7878 treats generic session startup failures such as "Model unavailable" as recoverable unless an operator-actionable auth/model/billing signal is present.
+      expect(store.updateAgentState).toHaveBeenCalledWith("agent-001", "error");
+      expect(store.updateAgentState).not.toHaveBeenCalledWith("agent-001", "paused");
     });
 
     it("fails soft on timer heartbeat when model provider credentials are unavailable", async () => {

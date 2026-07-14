@@ -569,6 +569,8 @@ export function updateTask(
     planningModelProvider?: string | null;
     planningModelId?: string | null;
     thinkingLevel?: string | null;
+    validatorThinkingLevel?: string | null;
+    planningThinkingLevel?: string | null;
     plannerOversightLevel?: "off" | "observe" | "steer" | "autonomous" | null;
     reviewLevel?: number | null;
     executionMode?: "standard" | "fast" | null;
@@ -602,6 +604,7 @@ export function updateTask(
  * @param modelId - Executor model ID (optional, null to clear)
  * @param validatorModelProvider - Validator model provider (optional, null to clear)
  * @param validatorModelId - Validator model ID (optional, null to clear)
+ * @param thinkingLevel - Executor thinking level (optional, null to clear)
  * @returns Promise with updated tasks and count
  */
 export function batchUpdateTaskModels(
@@ -613,6 +616,7 @@ export function batchUpdateTaskModels(
   planningModelProvider?: string | null,
   planningModelId?: string | null,
   nodeId?: string | null,
+  thinkingLevel?: string | null,
   projectId?: string,
 ): Promise<{ updated: Task[]; count: number }> {
   return api<{ updated: Task[]; count: number }>(withProjectId("/tasks/batch-update-models", projectId), {
@@ -626,6 +630,7 @@ export function batchUpdateTaskModels(
       planningModelProvider,
       planningModelId,
       nodeId,
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     }),
   });
 }
@@ -3947,6 +3952,7 @@ export interface AgentOnboardingSummary {
 }
 
 export type OnboardingMode = "create" | "edit";
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface ExistingAgentOnboardingConfig {
   name?: string;
@@ -3958,7 +3964,7 @@ export interface ExistingAgentOnboardingConfig {
   reportsTo?: string;
   skills?: string[];
   model?: string;
-  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel?: ThinkingLevel;
   maxTurns?: number;
   runtimeHint?: string;
   heartbeatIntervalMs?: number;
@@ -3993,7 +3999,7 @@ export function startPlanning(
 export function createPlanningDraft(
   initialPlan: string,
   projectId?: string,
-  modelOverride?: { planningModelProvider?: string; planningModelId?: string },
+  modelOverride?: { planningModelProvider?: string; planningModelId?: string; thinkingLevel?: ThinkingLevel },
 ): Promise<{ sessionId: string; title: string }> {
   return api<{ sessionId: string; title: string }>(withProjectId("/planning/create-draft", projectId), {
     method: "POST",
@@ -4001,6 +4007,7 @@ export function createPlanningDraft(
       initialPlan,
       planningModelProvider: modelOverride?.planningModelProvider,
       planningModelId: modelOverride?.planningModelId,
+      thinkingLevel: modelOverride?.thinkingLevel,
     }),
   });
 }
@@ -4009,7 +4016,7 @@ export function createPlanningDraft(
 export function startPlanningStreaming(
   initialPlan: string,
   projectId?: string,
-  modelOverride?: { planningModelProvider?: string; planningModelId?: string },
+  modelOverride?: { planningModelProvider?: string; planningModelId?: string; thinkingLevel?: ThinkingLevel },
   planningOptions?: { planningDepth?: "small" | "medium" | "large"; customQuestionCount?: number },
   existingSessionId?: string,
 ): Promise<{ sessionId: string }> {
@@ -4019,6 +4026,7 @@ export function startPlanningStreaming(
       initialPlan,
       planningModelProvider: modelOverride?.planningModelProvider,
       planningModelId: modelOverride?.planningModelId,
+      thinkingLevel: modelOverride?.thinkingLevel,
       planningDepth: planningOptions?.planningDepth,
       customQuestionCount: planningOptions?.customQuestionCount,
       ...(existingSessionId ? { existingSessionId } : {}),
@@ -7665,6 +7673,40 @@ export async function fetchMeshState(): Promise<MeshClusterSnapshot> {
   return api<MeshClusterSnapshot>("/mesh/state");
 }
 
+/*
+ * FNXC:MeshSharedPg 2026-06-25-00:00:
+ * With the mesh on shared PostgreSQL, the dashboard needs to surface which
+ * engines are actively connected to the shared DB, their in-flight tasks, and
+ * heartbeat status. GET /api/mesh/engines joins the local engineManager with
+ * the central node registry and per-project health. The shape matches the
+ * MeshTopology `engines` prop (MeshEngineStatus) so the dashboard can render it
+ * without transformation.
+ */
+export interface MeshEnginesResponse {
+  collectedAt: string;
+  backend: string;
+  engines: MeshEngineStatusApi[];
+}
+
+/** Per-engine status entry returned by GET /api/mesh/engines. Mirrors MeshEngineStatus. */
+export interface MeshEngineStatusApi {
+  projectId: string;
+  projectName?: string;
+  projectPath?: string;
+  workingDirectory?: string;
+  runtimeStatus: string;
+  inFlightTasks: number;
+  activeAgents: number;
+  lastActivityAt?: string;
+  memoryBytes?: number;
+  nodeId?: string;
+}
+
+/** Fetch active engine connections reading from shared PG (GET /api/mesh/engines). */
+export async function fetchMeshEngines(): Promise<MeshEnginesResponse> {
+  return api<MeshEnginesResponse>("/mesh/engines");
+}
+
 /** Browse directory entries for the directory picker */
 export interface BrowseDirectoryResult {
   currentPath: string;
@@ -8725,7 +8767,7 @@ export type MissionInterviewResponse =
 export function startMissionInterview(
   missionTitle: string,
   projectId?: string,
-  modelOverride?: { modelProvider?: string; modelId?: string },
+  modelOverride?: { modelProvider?: string; modelId?: string; thinkingLevel?: ThinkingLevel },
 ): Promise<{ sessionId: string }> {
   return api<{ sessionId: string }>(withProjectId("/missions/interview/start", projectId), {
     method: "POST",
@@ -8733,6 +8775,7 @@ export function startMissionInterview(
       missionTitle,
       modelProvider: modelOverride?.modelProvider,
       modelId: modelOverride?.modelId,
+      thinkingLevel: modelOverride?.thinkingLevel,
     }),
   });
 }
@@ -9535,7 +9578,7 @@ export function pingSession(sessionId: string, projectId?: string): Promise<{ ok
 
 export function updatePlanningSessionDraft(
   sessionId: string,
-  draft: { initialPlan: string; modelProvider?: string; modelId?: string },
+  draft: { initialPlan: string; modelProvider?: string; modelId?: string; thinkingLevel?: ThinkingLevel },
   projectId?: string,
 ): Promise<{ ok: boolean }> {
   return api<{ ok: boolean }>(withProjectId(`/ai-sessions/${encodeURIComponent(sessionId)}/draft`, projectId), {
@@ -10296,10 +10339,17 @@ export function ensureTaskPlannerChatSession(
   );
 }
 
-/** Update a chat session (title, status) */
+/** Update a chat session (title, status, thinkingLevel, model, or agent target) */
 export function updateChatSession(
   id: string,
-  updates: { title?: string | null; status?: string },
+  updates: {
+    title?: string | null;
+    status?: string;
+    modelProvider?: string | null;
+    modelId?: string | null;
+    agentId?: string;
+    thinkingLevel?: string | null;
+  },
   projectId?: string,
 ): Promise<ChatSessionResponse> {
   return api<ChatSessionResponse>(withProjectId(`/chat/sessions/${encodeURIComponent(id)}`, projectId), {
@@ -10385,7 +10435,7 @@ export function fetchChatRoom(id: string, projectId?: string): Promise<ChatRoomR
 }
 
 export function createChatRoom(
-  input: { name: string; description?: string | null; createdBy?: string | null; memberAgentIds?: string[] },
+  input: { name: string; description?: string | null; createdBy?: string | null; memberAgentIds?: string[]; thinkingLevel?: string | null },
   projectId?: string,
 ): Promise<ChatRoomResponse> {
   const body = { ...input, ...(projectId ? { projectId } : {}) };
@@ -10397,7 +10447,7 @@ export function createChatRoom(
 
 export function updateChatRoom(
   id: string,
-  updates: { name?: string; description?: string | null; status?: "active" | "archived" },
+  updates: { name?: string; description?: string | null; status?: "active" | "archived"; thinkingLevel?: string | null },
   projectId?: string,
 ): Promise<{ room: ChatRoom }> {
   return api<{ room: ChatRoom }>(withProjectId(`/chat/rooms/${encodeURIComponent(id)}`, projectId), {
@@ -11159,10 +11209,12 @@ export function triggerInsightRun(
   projectId?: string,
   modelProvider?: string,
   modelId?: string,
+  thinkingLevel?: string,
 ): Promise<InsightRun> {
   const body: Record<string, unknown> = { trigger, inputMetadata };
   if (modelProvider) body.modelProvider = modelProvider;
   if (modelId) body.modelId = modelId;
+  if (thinkingLevel) body.thinkingLevel = thinkingLevel;
   return api<InsightRun>(withProjectId("/insights/run", projectId), {
     method: "POST",
     body: JSON.stringify(body),

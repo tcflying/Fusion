@@ -4,8 +4,8 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { ArrowUpDown, ArrowUp, ArrowDown, Link, Columns3, EyeOff, Eye, ChevronRight, Zap, Trash2, Pause, Play, Archive } from "lucide-react";
-import type { Task, TaskDetail, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, PrInfo } from "@fusion/core";
-import { COLUMNS, DEFAULT_COLUMN, getErrorMessage, isColumn } from "@fusion/core";
+import type { Task, TaskDetail, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, PrInfo, ThinkingLevel } from "@fusion/core";
+import { COLUMNS, DEFAULT_COLUMN, THINKING_LEVELS, getErrorMessage, isColumn } from "@fusion/core";
 import { resolveEffectiveAutoMerge } from "../../../core/src/task-merge";
 import { useColumnLabel } from "../i18n/labels";
 import { sortTasksForDisplayColumn } from "./taskSorting";
@@ -232,6 +232,8 @@ interface ListViewProps {
   onPopOut pops the split-pane task detail into a movable, resizable, non-blocking FloatingWindow managed at App level. Wired to the Maximize2 "Pop out" button in TaskDetailContent's header.
   */
   onPopOut?: (task: Task | TaskDetail) => void;
+  /** Mirrors the Board/right-dock "Open tasks as popups" routing for ordinary List row/card opens. */
+  openMobileTasksInPopup?: boolean;
   addToast: (message: string, type?: ToastType) => void;
   globalPaused?: boolean;
   onNewTask?: () => void;
@@ -320,6 +322,7 @@ export function ListView({
   onResetTask,
   onDuplicateTask,
   onPopOut,
+  openMobileTasksInPopup = false,
   onOpenDetail,
   addToast,
   globalPaused,
@@ -568,10 +571,20 @@ export function ListView({
     };
   }, [projectId, useSinglePaneList]);
 
+  // Bulk edit state and handlers (declared before clearSelection so every clear path resets pending lane edits)
+  const [executorModel, setExecutorModel] = useState<string>("__no_change__");
+  const [validatorModel, setValidatorModel] = useState<string>("__no_change__");
+  const [bulkThinkingLevel, setBulkThinkingLevel] = useState<string>("__no_change__");
+  const [nodeOverride, setNodeOverride] = useState<string>("__no_change__");
+
   const toggleBulkEdit = useCallback(() => {
     setBulkEditEnabled((prev) => {
       if (prev) {
         setSelectedTaskIds(new Set());
+        setExecutorModel("__no_change__");
+        setValidatorModel("__no_change__");
+        setBulkThinkingLevel("__no_change__");
+        setNodeOverride("__no_change__");
       }
       return !prev;
     });
@@ -593,6 +606,10 @@ export function ListView({
   // Clear selection
   const clearSelection = useCallback(() => {
     setSelectedTaskIds(new Set());
+    setExecutorModel("__no_change__");
+    setValidatorModel("__no_change__");
+    setBulkThinkingLevel("__no_change__");
+    setNodeOverride("__no_change__");
   }, []);
 
   // Toggle a column's visibility
@@ -664,6 +681,15 @@ export function ListView({
     if (!workflowMode) return undefined;
     return listColumns.map((column) => ({ id: column.id, label: column.name, flags: column.flags }));
   }, [listColumns, workflowMode]);
+
+  const getTaskPlanningWorkflowId = useCallback((task: Task): string | null => {
+    const taskWorkflowId = (task as Task & { workflowId?: string | null }).workflowId;
+    if (taskWorkflowId) return taskWorkflowId;
+    if (workflowMode && boardWorkflows) {
+      return boardWorkflows.taskWorkflowIds[task.id] ?? boardWorkflows.defaultWorkflowId ?? null;
+    }
+    return null;
+  }, [boardWorkflows, workflowMode]);
 
   const isArchivedColumn = useCallback((column: ColumnId): boolean => {
     return workflowMode ? Boolean(columnFlagsById.get(column)?.archived) : column === "archived";
@@ -932,9 +958,6 @@ export function ListView({
   }, [groupedTasks, isArchivedColumn, selectedTaskIds]);
 
   // Bulk edit state and handlers (must be after groupedTasks and clearSelection definition)
-  const [executorModel, setExecutorModel] = useState<string>("__no_change__");
-  const [validatorModel, setValidatorModel] = useState<string>("__no_change__");
-  const [nodeOverride, setNodeOverride] = useState<string>("__no_change__");
   const [availableNodes, setAvailableNodes] = useState<NodeInfo[]>([]);
   const [isLoadingNodes, setIsLoadingNodes] = useState(false);
   const selectedOverrideNode = useMemo(
@@ -1388,6 +1411,7 @@ export function ListView({
       validatorModelProvider?: string | null;
       validatorModelId?: string | null;
       nodeId?: string | null;
+      thinkingLevel?: ThinkingLevel | null;
     } = { taskIds };
 
     if (executorModel !== "__no_change__") {
@@ -1426,6 +1450,10 @@ export function ListView({
       }
     }
 
+    if (bulkThinkingLevel !== "__no_change__") {
+      payload.thinkingLevel = bulkThinkingLevel === "" ? null : bulkThinkingLevel as ThinkingLevel;
+    }
+
     // Check if any changes were made
     if (Object.keys(payload).length === 1) {
       addToast(t("listView.bulkNoChanges", "No changes to apply"), "info");
@@ -1443,6 +1471,7 @@ export function ListView({
         undefined,
         undefined,
         payload.nodeId,
+        payload.thinkingLevel,
         projectId,
       );
 
@@ -1456,13 +1485,14 @@ export function ListView({
       clearSelection();
       setExecutorModel("__no_change__");
       setValidatorModel("__no_change__");
+      setBulkThinkingLevel("__no_change__");
       setNodeOverride("__no_change__");
     } catch (err) {
       addToast(getErrorMessage(err) || t("listView.bulkUpdateFailed", "Failed to update models"), "error");
     } finally {
       setIsApplying(false);
     }
-  }, [selectedTaskIds, tasks, executorModel, validatorModel, nodeOverride, projectId, addToast, clearSelection, isArchivedColumn, onTasksUpdated]);
+  }, [selectedTaskIds, tasks, executorModel, validatorModel, bulkThinkingLevel, nodeOverride, projectId, addToast, clearSelection, isArchivedColumn, onTasksUpdated]);
 
   const closeContextMenu = useCallback(() => {
     setContextMenuState(null);
@@ -1693,6 +1723,10 @@ export function ListView({
       mergeStrategy,
       prAutomationLabel: getTaskPrAutomationLabel(t, task.status),
       onDelete: () => void handleListTaskDelete(task),
+      onPlan: onPlanningMode ? () => {
+        const seed = (task.description ?? "").trim() || task.title || task.id;
+        onPlanningMode(seed, getTaskPlanningWorkflowId(task));
+      } : undefined,
       onDuplicate: onDuplicateTask ? async () => {
         const shouldDuplicate = await confirm({
           title: t("taskDetail.duplicate.title", "Duplicate Task"),
@@ -1796,7 +1830,7 @@ export function ListView({
       actions.push({ id: model.reviewAction.id, label: model.reviewAction.label, disabled: model.reviewAction.disabled, onSelect: model.reviewAction.onSelect });
     }
     return actions.filter((action) => action.tone === "note" || action.disabled === true || Boolean(action.onSelect));
-  }, [addToast, autoMerge, columnFlagsById, confirm, getListColumnLabel, handleListContextCheckPrStatus, handleListContextEnableGithubTracking, handleListContextMove, handleListTaskArchive, handleListTaskDelete, handleListTaskRevert, isMobile, listContextMenuColumns, mergeStrategy, onDuplicateTask, onMergeTask, onOpenDetail, onPauseTask, onResetTask, onRetryTask, onUnpauseTask, onArchiveTask, onRevertTask, onTasksUpdated, projectId, t, useSinglePaneList]);
+  }, [addToast, autoMerge, columnFlagsById, confirm, getListColumnLabel, getTaskPlanningWorkflowId, handleListContextCheckPrStatus, handleListContextEnableGithubTracking, handleListContextMove, handleListTaskArchive, handleListTaskDelete, handleListTaskRevert, isMobile, listContextMenuColumns, mergeStrategy, onDuplicateTask, onMergeTask, onOpenDetail, onPlanningMode, onPauseTask, onResetTask, onRetryTask, onUnpauseTask, onArchiveTask, onRevertTask, onTasksUpdated, projectId, t, useSinglePaneList]);
 
   const contextMenuActions = useMemo(
     () => (contextMenuState ? buildListContextMenuActions(contextMenuState.task) : []),
@@ -1831,20 +1865,6 @@ export function ListView({
       openContextMenuAt(task, event.clientX, event.clientY);
     }, LIST_TOUCH_CONTEXT_MENU_DELAY_MS);
   }, [clearLongPressTimer, isMobile, openContextMenuAt]);
-
-  const handleListKeyDown = useCallback((event: React.KeyboardEvent, task: Task) => {
-    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
-    if (isListContextInteractiveTarget(event.target)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
-    suppressNextRowClickRef.current = true;
-    openContextMenuAt(
-      task,
-      rect.left + Math.min(rect.width - LIST_CONTEXT_MENU_VIEWPORT_MARGIN, LIST_KEYBOARD_CONTEXT_MENU_OFFSET),
-      rect.top + Math.min(rect.height - LIST_CONTEXT_MENU_VIEWPORT_MARGIN, LIST_KEYBOARD_CONTEXT_MENU_OFFSET),
-    );
-  }, [openContextMenuAt]);
 
   const handleListPointerMove = useCallback((event: React.PointerEvent) => {
     const start = longPressStartRef.current;
@@ -1918,6 +1938,14 @@ export function ListView({
         return;
       }
       closeContextMenu();
+      /*
+      FNXC:ListView 2026-07-13-00:00 (FN-7945):
+      When "Open tasks as popups" is on, ordinary List row/card and keyboard opens route to the shared movable/resizable popped-out FloatingWindow (`onPopOut` → `popOutTaskDetail`) for Board parity and navigate-while-open behavior. When off, preserve the existing docked split-pane on desktop and docked modal on mobile/tablet.
+      */
+      if (openMobileTasksInPopup && onPopOut) {
+        onPopOut(task);
+        return;
+      }
       if (useSinglePaneList) {
         onOpenDetail(task, { origin: "list-mobile" });
         return;
@@ -1926,8 +1954,29 @@ export function ListView({
       setSelectedTaskId(task.id);
       setSelectedTaskSnapshot(task);
     },
-    [closeContextMenu, onOpenDetail, useSinglePaneList]
+    [closeContextMenu, onOpenDetail, onPopOut, openMobileTasksInPopup, useSinglePaneList]
   );
+
+  const handleListKeyDown = useCallback((event: React.KeyboardEvent, task: Task) => {
+    if (event.key === "Enter" || event.key === " ") {
+      if (isListContextInteractiveTarget(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      handleRowClick(task);
+      return;
+    }
+    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    if (isListContextInteractiveTarget(event.target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    suppressNextRowClickRef.current = true;
+    openContextMenuAt(
+      task,
+      rect.left + Math.min(rect.width - LIST_CONTEXT_MENU_VIEWPORT_MARGIN, LIST_KEYBOARD_CONTEXT_MENU_OFFSET),
+      rect.top + Math.min(rect.height - LIST_CONTEXT_MENU_VIEWPORT_MARGIN, LIST_KEYBOARD_CONTEXT_MENU_OFFSET),
+    );
+  }, [handleRowClick, openContextMenuAt]);
 
   // Debounce detail fetches so rapid keyboard/mouse navigation through a
   // long task list doesn't issue a heavy /tasks/:id request (with log +
@@ -2345,7 +2394,7 @@ export function ListView({
       </div>
       {availableModels && availableModels.length > 0 ? (
         <div className="bulk-edit-toolbar">
-          <span className="bulk-edit-label">{t("listView.bulkEditModelsLabel", "Bulk Edit Models & Node:")}</span>
+          <span className="bulk-edit-label">{t("listView.bulkEditModelsLabel", "Bulk Edit Models, Thinking & Node:")}</span>
           <div className="bulk-edit-dropdown">
             <CustomModelDropdown
               models={availableModels}
@@ -2374,6 +2423,26 @@ export function ListView({
               onToggleModelFavorite={onToggleModelFavorite}
             />
           </div>
+          <div className="bulk-edit-dropdown">
+            {/*
+            FNXC:Settings-ThinkingLevel 2026-07-12-00:00:
+            List bulk edit needs a no-change sentinel plus a clear-to-default lane for task.thinkingLevel so operators can update reasoning effort independently from executor/reviewer model overrides.
+            */}
+            <select
+              className="select bulk-thinking-select"
+              value={bulkThinkingLevel}
+              onChange={(e) => setBulkThinkingLevel(e.target.value)}
+              aria-label={t("listView.thinkingLevel", "Thinking Level")}
+            >
+              <option value="__no_change__">{t("listView.noChange", "No change")}</option>
+              <option value="">{t("models.useDefault", "Use default")}</option>
+              {THINKING_LEVELS.map((level) => (
+                <option key={level} value={level}>
+                  {t(`models.options.${level}`, level === "xhigh" ? "Very High" : level.charAt(0).toUpperCase() + level.slice(1))}
+                </option>
+              ))}
+            </select>
+          </div>
           <div className="bulk-edit-dropdown bulk-edit-node-wrap">
             <select
               className="select bulk-node-select"
@@ -2395,7 +2464,7 @@ export function ListView({
           <button
             className="btn btn-primary btn-sm bulk-edit-apply-btn"
             onClick={handleApplyBulkUpdate}
-            disabled={isApplying || (executorModel === "__no_change__" && validatorModel === "__no_change__" && nodeOverride === "__no_change__")}
+            disabled={isApplying || (executorModel === "__no_change__" && validatorModel === "__no_change__" && bulkThinkingLevel === "__no_change__" && nodeOverride === "__no_change__")}
           >
             {isApplying ? t("listView.applying", "Applying...") : t("listView.apply", "Apply")}
           </button>

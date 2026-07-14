@@ -43,10 +43,13 @@ import {
   isEphemeralAgent,
   parseExplicitDuplicateMarker,
   isWorkflowColumnsEnabled,
+  resolveWorkflowIrForTask,
+  workflowHasColumn,
   TransitionRejectionError,
   getPlannerInterventionTimeline,
   isBuiltinWorkflowId,
   type NearDuplicateCandidate,
+  type ThinkingLevel,
 } from "@fusion/core";
 import { GitHubClient } from "../github.js";
 import { githubRateLimiter } from "../github-poll.js";
@@ -668,9 +671,9 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
     }
 
     const activePrEntity =
-      scopedStore.getActivePrEntityBySource?.("task", task.id) ??
+      (await scopedStore.getActivePrEntityBySource?.("task", task.id)) ??
       (task.branchContext?.groupId
-        ? scopedStore.getActivePrEntityBySource?.("branch-group", task.branchContext.groupId)
+        ? await scopedStore.getActivePrEntityBySource?.("branch-group", task.branchContext.groupId)
         : null);
     if (
       isBackwardMoveBlockedByOpenPr({
@@ -889,6 +892,14 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const offset = typeof req.query.offset === "string" ? Number.parseInt(req.query.offset, 10) : undefined;
       const q = typeof req.query.q === "string" ? req.query.q.trim() : undefined;
       const includeArchived = req.query.includeArchived === "1" || req.query.includeArchived === "true";
+      // FNXC:TaskStoreForensicRead 2026-06-26-15:30:
+      // VAL-CROSS-003 / VAL-DATA-006 — Forensic read surface. When
+      // includeDeleted=true is passed, soft-deleted tasks (deletedAt IS NOT
+      // NULL) are surfaced for admin/forensic consumers. Default (unset/false)
+      // preserves the live-reader invariant (VAL-DATA-005): tombstoned tasks
+      // never appear on the board. Only honored on the list path (no `q`),
+      // since search has its own deletedAt filter that is intentionally live-only.
+      const includeDeleted = req.query.includeDeleted === "1" || req.query.includeDeleted === "true";
       const columnParam = typeof req.query.column === "string" ? req.query.column.trim() : undefined;
       const column = columnParam ? (isColumn(columnParam) ? columnParam : undefined) : undefined;
 
@@ -909,7 +920,8 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         // Board-view list: omit the heavy agent log payload and exclude
         // archived tasks unless explicitly requested. Full task detail still loads via
         // GET /api/tasks/:id. Without this, every dashboard load shipped tens of MB of agent logs.
-        const listOptions = { limit, offset, slim: true, includeArchived, ...(column ? { column } : {}) };
+        // includeDeleted propagates to the store forensic read path (VAL-DATA-006).
+        const listOptions = { limit, offset, slim: true, includeArchived, ...(includeDeleted ? { includeDeleted } : {}), ...(column ? { column } : {}) };
         tasks = await scopedStore.listTasks(listOptions);
       }
 
@@ -1498,8 +1510,8 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
 
       const taskWithBranchContext = requestedBranchMode === "shared-group" && sharedFeatureBranch
         ? await (async () => {
-            const group = scopedStore.getBranchGroupByBranchName(sharedFeatureBranch)
-              ?? scopedStore.ensureBranchGroupForSource("new-task", sharedFeatureBranch, { branchName: sharedFeatureBranch });
+            const group = (await scopedStore.getBranchGroupByBranchName(sharedFeatureBranch))
+              ?? await scopedStore.ensureBranchGroupForSource("new-task", sharedFeatureBranch, { branchName: sharedFeatureBranch });
             await scopedStore.setTaskBranchGroup(taskWithAutoBranch.id, group.id);
             const taskSegment = ((taskWithAutoBranch.title ?? "").trim() || taskWithAutoBranch.description).slice(0, 60);
             const workingBranch = derivePerTaskBranch(sharedFeatureBranch, taskSegment);
@@ -1582,9 +1594,9 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const guardTask = await scopedStore.getTask(req.params.id);
       if (guardTask) {
         const activePrEntity =
-          scopedStore.getActivePrEntityBySource?.("task", guardTask.id) ??
+          (await scopedStore.getActivePrEntityBySource?.("task", guardTask.id)) ??
           (guardTask.branchContext?.groupId
-            ? scopedStore.getActivePrEntityBySource?.("branch-group", guardTask.branchContext.groupId)
+            ? await scopedStore.getActivePrEntityBySource?.("branch-group", guardTask.branchContext.groupId)
             : null);
         if (
           isBackwardMoveBlockedByOpenPr({
@@ -2288,12 +2300,25 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
     try {
       const { store: scopedStore, engine } = await getProjectContext(req);
       const task = await scopedStore.getTask(req.params.id);
-      const retrySpecification =
-        task.column === "triage" &&
-        (task.status === "failed" ||
-          task.status === "planning" ||
-          task.status === "needs-replan" ||
-          (task.stuckKillCount ?? 0) > 0);
+      const retrySpecificationStatus =
+        task.status === "failed" ||
+        task.status === "planning" ||
+        task.status === "needs-replan" ||
+        (task.stuckKillCount ?? 0) > 0;
+      let retrySpecification = task.column === "triage" && retrySpecificationStatus;
+      /*
+      FNXC:ManualRetry 2026-07-13-12:20:
+      Plan-in-place workflows (Coding (Ideas): no "triage" column) keep planning/replanning
+      cards in "todo", so the manual Retry button — which the cards already show for
+      needs-replan/planning/failed states — must offer the planning retry there too instead
+      of 400ing with "not in a retryable state". Gated on the task's OWN workflow declaring
+      no "triage" column, so default-workflow todo cards (where todo failures are execution
+      failures) keep the existing generic-retry semantics.
+      */
+      if (!retrySpecification && task.column === "todo" && retrySpecificationStatus) {
+        const workflowIr = await resolveWorkflowIrForTask(scopedStore, task.id);
+        retrySpecification = !workflowHasColumn(workflowIr, "triage");
+      }
       const isInReviewStatusNone =
         task.column === "in-review" && (task.status === null || task.status === undefined);
       const hasIncompleteSteps = task.steps.some(
@@ -2685,7 +2710,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   /**
    * POST /api/tasks/batch-update-models
    * Batch update AI model configuration for multiple tasks.
-   * Body: { taskIds: string[], modelProvider?: string | null, modelId?: string | null, validatorModelProvider?: string | null, validatorModelId?: string | null, planningModelProvider?: string | null, planningModelId?: string | null }
+   * Body: { taskIds: string[], modelProvider?: string | null, modelId?: string | null, validatorModelProvider?: string | null, validatorModelId?: string | null, planningModelProvider?: string | null, planningModelId?: string | null, thinkingLevel?: ThinkingLevel | null }
    * Returns: { updated: Task[], count: number }
    */
   router.post("/tasks/batch-update-models", async (req, res) => {
@@ -2700,6 +2725,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         planningModelProvider,
         planningModelId,
         nodeId,
+        thinkingLevel,
       } = req.body;
 
       // Validate taskIds
@@ -2713,17 +2739,21 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         throw badRequest("taskIds must contain non-empty strings");
       }
 
-      // Validate that at least one model field or node override is being updated
+      // Validate that at least one model field, thinking level, or node override is being updated
       const hasExecutorModel = modelProvider !== undefined || modelId !== undefined;
       const hasValidatorModel = validatorModelProvider !== undefined || validatorModelId !== undefined;
       const hasPlanningModel = planningModelProvider !== undefined || planningModelId !== undefined;
       const hasNodeId = nodeId !== undefined;
-      if (!hasExecutorModel && !hasValidatorModel && !hasPlanningModel && !hasNodeId) {
-        throw badRequest("At least one model field or nodeId must be provided");
+      const hasThinkingLevel = thinkingLevel !== undefined;
+      if (!hasExecutorModel && !hasValidatorModel && !hasPlanningModel && !hasNodeId && !hasThinkingLevel) {
+        throw badRequest("At least one model field, thinkingLevel, or nodeId must be provided");
       }
 
       if (nodeId !== undefined && nodeId !== null && typeof nodeId !== "string") {
         throw badRequest("nodeId must be a string, null, or undefined");
+      }
+      if (thinkingLevel !== undefined && thinkingLevel !== null && (typeof thinkingLevel !== "string" || !THINKING_LEVELS.includes(thinkingLevel as ThinkingLevel))) {
+        throw badRequest(`thinkingLevel must be one of ${THINKING_LEVELS.join(", ")}, null, or undefined`);
       }
 
       // Validate model field pairs (both provider and modelId must be provided together or neither)
@@ -2784,6 +2814,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
         planningModelProvider?: string | null;
         planningModelId?: string | null;
         nodeId?: string | null;
+        thinkingLevel?: ThinkingLevel | null;
       } = {};
       if (validatedExecutor.provider !== undefined) {
         updates.modelProvider = validatedExecutor.provider;
@@ -2805,6 +2836,13 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       }
       if (nodeId !== undefined) {
         updates.nodeId = nodeId;
+      }
+      /*
+      FNXC:Settings-ThinkingLevel 2026-07-12-00:00:
+      Bulk task model edits can now set or clear one executor-scoped thinkingLevel across the selected tasks, reusing the existing batch route instead of inventing a dashboard-only control that persists nowhere.
+      */
+      if (thinkingLevel !== undefined) {
+        updates.thinkingLevel = thinkingLevel as ThinkingLevel | null;
       }
 
       // Update all tasks in parallel
@@ -4249,7 +4287,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
   router.patch("/tasks/:id", async (req, res) => {
     try {
       const { store: scopedStore } = await getProjectContext(req);
-      const { title, description, prompt, priority, dependencies, enabledWorkflowSteps, modelProvider, modelId, validatorModelProvider, validatorModelId, planningModelProvider, planningModelId, thinkingLevel, assigneeUserId, reviewLevel, executionMode, sourceIssue, nodeId, branch, baseBranch, githubTracking, gitlabTracking, noCommitsExpected, autoMerge, overlapBlockedBy, status, dismissNearDuplicate } = req.body;
+      const { title, description, prompt, priority, dependencies, enabledWorkflowSteps, modelProvider, modelId, validatorModelProvider, validatorModelId, planningModelProvider, planningModelId, thinkingLevel, validatorThinkingLevel, planningThinkingLevel, assigneeUserId, reviewLevel, executionMode, sourceIssue, nodeId, branch, baseBranch, githubTracking, gitlabTracking, noCommitsExpected, autoMerge, overlapBlockedBy, status, dismissNearDuplicate } = req.body;
       const hasBodyField = (field: string) => Object.prototype.hasOwnProperty.call(req.body, field);
 
       // Validate model fields are strings or undefined/null
@@ -4270,11 +4308,16 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const validatedPlanningModelId = validateModelField(planningModelId, "planningModelId");
       const validatedAssigneeUserId = validateModelField(assigneeUserId, "assigneeUserId");
 
-      // Validate thinkingLevel if provided
+      // Validate thinking level fields if provided
       const validThinkingLevels = [...THINKING_LEVELS];
-      if (thinkingLevel !== undefined && thinkingLevel !== null && !validThinkingLevels.includes(thinkingLevel)) {
-        throw new Error(`thinkingLevel must be one of: ${validThinkingLevels.join(", ")}`);
-      }
+      const validateThinkingLevel = (value: unknown, name: string): void => {
+        if (value !== undefined && value !== null && !validThinkingLevels.includes(value as (typeof validThinkingLevels)[number])) {
+          throw new Error(`${name} must be one of: ${validThinkingLevels.join(", ")}`);
+        }
+      };
+      validateThinkingLevel(thinkingLevel, "thinkingLevel");
+      validateThinkingLevel(validatorThinkingLevel, "validatorThinkingLevel");
+      validateThinkingLevel(planningThinkingLevel, "planningThinkingLevel");
 
       // Validate reviewLevel if provided (must be integer 0-3)
       if (reviewLevel !== undefined && reviewLevel !== null) {
@@ -4557,6 +4600,8 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (hasBodyField("planningModelProvider")) updates.planningModelProvider = validatedPlanningModelProvider;
       if (hasBodyField("planningModelId")) updates.planningModelId = validatedPlanningModelId;
       if (hasBodyField("thinkingLevel")) updates.thinkingLevel = thinkingLevel === null ? null : thinkingLevel;
+      if (hasBodyField("validatorThinkingLevel")) updates.validatorThinkingLevel = validatorThinkingLevel === null ? null : validatorThinkingLevel;
+      if (hasBodyField("planningThinkingLevel")) updates.planningThinkingLevel = planningThinkingLevel === null ? null : planningThinkingLevel;
       if (hasBodyField("assigneeUserId")) updates.assigneeUserId = validatedAssigneeUserId;
       if (hasBodyField("reviewLevel")) updates.reviewLevel = reviewLevel;
       if (hasBodyField("executionMode")) updates.executionMode = executionMode === null ? null : executionMode;
@@ -4629,7 +4674,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (err instanceof ApiError) {
         throw err;
       }
-      const status = (err instanceof Error ? err.message : String(err)).includes("must be a string") || (err instanceof Error ? err.message : String(err)).includes("must be a non-empty string") || (err instanceof Error ? err.message : String(err)).includes("must be a string or null") || (err instanceof Error ? err.message : String(err)).includes("must be an array of strings") || (err instanceof Error ? err.message : String(err)).includes("must be a boolean") || (err instanceof Error ? err.message : String(err)).includes("thinkingLevel must be one of") || (err instanceof Error ? err.message : String(err)).includes("reviewLevel must be an integer") || (err instanceof Error ? err.message : String(err)).includes("executionMode must be one of") || (err instanceof Error ? err.message : String(err)).includes("priority must be one of") || (err instanceof Error ? err.message : String(err)).includes("sourceIssue") || (err instanceof Error ? err.message : String(err)).includes("gitlabTracking") || (err instanceof Error ? err.message : String(err)).includes("status may only be cleared") ? 400 : 500;
+      const status = (err instanceof Error ? err.message : String(err)).includes("must be a string") || (err instanceof Error ? err.message : String(err)).includes("must be a non-empty string") || (err instanceof Error ? err.message : String(err)).includes("must be a string or null") || (err instanceof Error ? err.message : String(err)).includes("must be an array of strings") || (err instanceof Error ? err.message : String(err)).includes("must be a boolean") || (err instanceof Error ? err.message : String(err)).includes("thinkingLevel must be one of") || (err instanceof Error ? err.message : String(err)).includes("validatorThinkingLevel must be one of") || (err instanceof Error ? err.message : String(err)).includes("planningThinkingLevel must be one of") || (err instanceof Error ? err.message : String(err)).includes("reviewLevel must be an integer") || (err instanceof Error ? err.message : String(err)).includes("executionMode must be one of") || (err instanceof Error ? err.message : String(err)).includes("priority must be one of") || (err instanceof Error ? err.message : String(err)).includes("sourceIssue") || (err instanceof Error ? err.message : String(err)).includes("gitlabTracking") || (err instanceof Error ? err.message : String(err)).includes("status may only be cleared") ? 400 : 500;
       throw new ApiError(status, err instanceof Error ? err.message : String(err));
     }
   });
@@ -4647,7 +4692,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
 
       const { store: scopedStore } = await getProjectContext(req);
       const { AgentStore } = await import("@fusion/core");
-      const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir() });
+      const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir(), asyncLayer: scopedStore.getAsyncLayer() ?? undefined });
       await agentStore.init();
 
       if (typeof agentId === "string") {
@@ -5128,6 +5173,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const agentStore = new AgentStore({
         rootDir: scopedStore.getFusionDir(),
         taskStore: scopedStore,
+        asyncLayer: scopedStore.getAsyncLayer() ?? undefined,
       });
       await agentStore.init();
 
@@ -5170,6 +5216,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const agentStore = new AgentStore({
         rootDir: scopedStore.getFusionDir(),
         taskStore: scopedStore,
+        asyncLayer: scopedStore.getAsyncLayer() ?? undefined,
       });
       await agentStore.init();
 
@@ -5197,6 +5244,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       const agentStore = new AgentStore({
         rootDir: scopedStore.getFusionDir(),
         taskStore: scopedStore,
+        asyncLayer: scopedStore.getAsyncLayer() ?? undefined,
       });
       await agentStore.init();
 

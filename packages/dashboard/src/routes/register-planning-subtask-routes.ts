@@ -2,9 +2,11 @@ import {
   DEFAULT_TASK_PRIORITY,
   resolvePlanningSettingsModel,
   TASK_PRIORITIES,
+  THINKING_LEVELS,
   type PlanningSummary,
   type TaskPriority,
   type TaskStore,
+  type ThinkingLevel,
 } from "@fusion/core";
 import { normalizePlanningSummaryPayload } from "../planning.js";
 import { ApiError, badRequest, conflict, notFound, rateLimited } from "../api-error.js";
@@ -18,7 +20,7 @@ type SkillPluginRunner = Parameters<typeof import("@fusion/engine").buildSession
 interface PlanningSubtaskRouteDeps {
   store: TaskStore;
   aiSessionStore?: AiSessionStore;
-  checkSessionLock: (sessionId: string, tabId: string | undefined, store: AiSessionStore | undefined) => { allowed: true } | { allowed: false; currentHolder: string | null | undefined };
+  checkSessionLock: (sessionId: string, tabId: string | undefined, store: AiSessionStore | undefined) => Promise<{ allowed: true } | { allowed: false; currentHolder: string | null | undefined }>;
   parseLastEventId: (req: import("express").Request) => number | undefined;
   replayBufferedSSE: (res: import("express").Response, bufferedEvents: SessionBufferedEvent[]) => boolean;
 }
@@ -96,7 +98,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
 
     try {
       const { subtaskStreamManager, getSubtaskSession } = await import("../subtask-breakdown.js");
-      const session = getSubtaskSession(sessionId);
+      const session = await getSubtaskSession(sessionId);
       if (!session) {
         writeSSEEvent(res, "error", JSON.stringify("Session not found or expired"));
         res.end();
@@ -220,7 +222,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
 
       const { store: scopedStore } = await getProjectContext(req);
       const { getSubtaskSession, cleanupSubtaskSession } = await import("../subtask-breakdown.js");
-      const session = getSubtaskSession(sessionId);
+      const session = await getSubtaskSession(sessionId);
       if (!session) {
         throw notFound(`Subtask session ${sessionId} not found or expired`);
       }
@@ -255,7 +257,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
             : "main";
         const settingsAutoMerge = typeof settings.autoMerge === "boolean" ? settings.autoMerge : false;
         const branchGroupStore = scopedStore as { ensureBranchGroupForSource?: TaskStore["ensureBranchGroupForSource"] };
-        const group = branchGroupStore.ensureBranchGroupForSource?.("planning", sessionId, {
+        const group = await branchGroupStore.ensureBranchGroupForSource?.("planning", sessionId, {
           branchName: resolvedBranch ?? resolvedBaseBranch ?? settingsDefaultBranch,
           autoMerge: session.autoMerge ?? settingsAutoMerge,
         });
@@ -413,7 +415,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       }
 
       const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -454,7 +456,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
         ? req.body.tabId.trim()
         : undefined;
-      const lockCheck = checkSessionLock(sessionId, tabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -543,9 +545,13 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
     }
   });
 
+  /**
+   * POST /api/planning/create-draft
+   * Body: { initialPlan: string, planningModelProvider?: string, planningModelId?: string, thinkingLevel?: ThinkingLevel }
+   */
   router.post("/planning/create-draft", async (req, res) => {
     try {
-      const { initialPlan, planningModelProvider, planningModelId } = req.body;
+      const { initialPlan, planningModelProvider, planningModelId, thinkingLevel } = req.body;
 
       if (!initialPlan || typeof initialPlan !== "string" || initialPlan.trim().length === 0) {
         throw badRequest("initialPlan is required and must be a string");
@@ -558,6 +564,11 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       if (planningModelId !== undefined && typeof planningModelId !== "string") {
         throw badRequest("planningModelId must be a string when provided");
       }
+
+      if (thinkingLevel !== undefined && !THINKING_LEVELS.includes(thinkingLevel as ThinkingLevel)) {
+        throw badRequest("thinkingLevel must be one of: " + THINKING_LEVELS.join(", "));
+      }
+      const validatedThinkingLevel = thinkingLevel as ThinkingLevel | undefined;
 
       const { store: scopedStore, projectId } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
@@ -574,15 +585,26 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         resolvedPlanningSettings.modelId;
 
       const { createDraftSession } = await import("../planning.js");
-      const draft = await createDraftSession(
-        ip,
-        initialPlan,
-        rootDir,
-        resolvedPlanningProvider,
-        resolvedPlanningModelId,
-        settings.promptOverrides,
-        { projectId },
-      );
+      const draft = validatedThinkingLevel
+        ? await createDraftSession(
+            ip,
+            initialPlan,
+            rootDir,
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+            validatedThinkingLevel,
+            settings.promptOverrides,
+            { projectId },
+          )
+        : await createDraftSession(
+            ip,
+            initialPlan,
+            rootDir,
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+            settings.promptOverrides,
+            { projectId },
+          );
       res.status(201).json(draft);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -598,7 +620,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
   /**
    * POST /api/planning/start-streaming
    * Start a new planning session with AI agent streaming.
-   * Body: { initialPlan: string }
+   * Body: { initialPlan: string, planningModelProvider?: string, planningModelId?: string, thinkingLevel?: ThinkingLevel }
    * Returns: { sessionId: string }
    *
    * After receiving sessionId, connect to GET /api/planning/:sessionId/stream
@@ -615,6 +637,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         planningDepth,
         customQuestionCount,
         existingSessionId,
+        thinkingLevel,
       } = req.body;
 
       if (!initialPlan || typeof initialPlan !== "string") {
@@ -649,6 +672,11 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         throw badRequest("existingSessionId must be a string when provided");
       }
 
+      if (thinkingLevel !== undefined && !THINKING_LEVELS.includes(thinkingLevel as ThinkingLevel)) {
+        throw badRequest("thinkingLevel must be one of: " + THINKING_LEVELS.join(", "));
+      }
+      const validatedThinkingLevel = thinkingLevel as ThinkingLevel | undefined;
+
       const { store: scopedStore, projectId } = await getProjectContext(req);
       const settings = await scopedStore.getSettings();
       const ip = req.ip || req.socket.remoteAddress || "unknown";
@@ -676,13 +704,14 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
         // would launch the session against stale text.
         if (aiSessionStore) {
           try {
-            aiSessionStore.updateDraft(existingSessionId, {
+            await aiSessionStore.updateDraft(existingSessionId, {
               initialPlan,
               // Persist the explicit body override (if both fields set) so a
               // later summarizeDraftTitle picks the same model the user just
               // chose; pass undefined to clear any half-set state otherwise.
               modelProvider: planningModelProvider && planningModelId ? planningModelProvider : undefined,
               modelId: planningModelProvider && planningModelId ? planningModelId : undefined,
+              thinkingLevel: validatedThinkingLevel,
             });
           } catch (error) {
             planningLogger.warn(
@@ -692,41 +721,67 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
           }
         }
         const { startExistingSession } = await import("../planning.js");
-        await startExistingSession(
-          existingSessionId,
-          rootDir,
-          scopedStore,
-          resolvedPlanningProvider,
-          resolvedPlanningModelId,
-          settings.promptOverrides,
-          ctx.options?.pluginRunner as SkillPluginRunner,
-        );
+        if (validatedThinkingLevel) {
+          await startExistingSession(
+            existingSessionId,
+            rootDir,
+            scopedStore,
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+            validatedThinkingLevel,
+            settings.promptOverrides,
+            ctx.options?.pluginRunner as SkillPluginRunner,
+          );
+        } else {
+          await startExistingSession(
+            existingSessionId,
+            rootDir,
+            scopedStore,
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+            settings.promptOverrides,
+            ctx.options?.pluginRunner as SkillPluginRunner,
+          );
+        }
         res.status(201).json({ sessionId: existingSessionId });
         return;
       }
 
       const { createSessionWithAgent, RateLimitError: _RateLimitError2 } = await import("../planning.js");
-      const sessionId = await createSessionWithAgent(
-        ip,
-        initialPlan,
-        rootDir,
-        scopedStore,
-        resolvedPlanningProvider,
-        resolvedPlanningModelId,
-        settings.promptOverrides,
-        {
-          projectId,
-          ntfyConfig: {
-            enabled: settings.ntfyEnabled ?? false,
-            topic: settings.ntfyTopic,
-            dashboardHost: settings.ntfyDashboardHost,
-            events: settings.ntfyEvents,
-          },
-          planningDepth,
-          customQuestionCount,
-          pluginRunner: ctx.options?.pluginRunner as SkillPluginRunner,
+      const planningOptions = {
+        projectId,
+        ntfyConfig: {
+          enabled: settings.ntfyEnabled ?? false,
+          topic: settings.ntfyTopic,
+          dashboardHost: settings.ntfyDashboardHost,
+          events: settings.ntfyEvents,
         },
-      );
+        planningDepth,
+        customQuestionCount,
+        pluginRunner: ctx.options?.pluginRunner as SkillPluginRunner,
+      };
+      const sessionId = validatedThinkingLevel
+        ? await createSessionWithAgent(
+            ip,
+            initialPlan,
+            rootDir,
+            scopedStore,
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+            validatedThinkingLevel,
+            settings.promptOverrides,
+            planningOptions,
+          )
+        : await createSessionWithAgent(
+            ip,
+            initialPlan,
+            rootDir,
+            scopedStore,
+            resolvedPlanningProvider,
+            resolvedPlanningModelId,
+            settings.promptOverrides,
+            planningOptions,
+          );
       res.status(201).json({ sessionId });
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -799,7 +854,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       }
 
       const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -845,7 +900,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
         ? req.body.tabId.trim()
         : undefined;
-      const lockCheck = checkSessionLock(sessionId, tabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -895,7 +950,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
         ? req.body.tabId.trim()
         : undefined;
-      const lockCheck = checkSessionLock(sessionId, tabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -933,7 +988,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
         ? req.body.tabId.trim()
         : undefined;
-      const lockCheck = checkSessionLock(sessionId, tabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -971,7 +1026,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       }
 
       const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
+      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
       if (!lockCheck.allowed) {
         res.status(409).json({
           error: "Session locked by another tab",
@@ -1072,7 +1127,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const { store: scopedStore } = await getProjectContext(req);
       const { getSession, getSummary, releaseSession } = await import("../planning.js");
 
-      const session = getSession(sessionId);
+      const session = await getSession(sessionId);
       let summary = summaryOverride ?? getSummary(sessionId);
       let initialPlan = session?.initialPlan;
 
@@ -1081,7 +1136,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
           throw notFound(`Planning session ${sessionId} not found or expired`);
         }
 
-        const persistedSession = aiSessionStore.get(sessionId);
+        const persistedSession = await aiSessionStore.get(sessionId);
         if (!persistedSession || persistedSession.type !== "planning") {
           throw notFound(`Planning session ${sessionId} not found or expired`);
         }
@@ -1211,7 +1266,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
 
       const { getSession, generateSubtasksFromPlanning } = await import("../planning.js");
 
-      const session = getSession(sessionId);
+      const session = await getSession(sessionId);
       if (!session) {
         throw notFound(`Planning session ${sessionId} not found or expired`);
       }
@@ -1280,7 +1335,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const { store: scopedStore } = await getProjectContext(req);
       const { getSession, cleanupSession, formatInterviewQA, mergePlanningSubtaskDrafts } = await import("../planning.js");
 
-      const session = getSession(planningSessionId);
+      const session = await getSession(planningSessionId);
       if (!session) {
         throw notFound(`Planning session ${planningSessionId} not found or expired`);
       }
@@ -1353,7 +1408,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
             : "main";
         const settingsAutoMerge = typeof settings.autoMerge === "boolean" ? settings.autoMerge : false;
         const branchGroupStore = scopedStore as { ensureBranchGroupForSource?: TaskStore["ensureBranchGroupForSource"] };
-        const group = branchGroupStore.ensureBranchGroupForSource?.("planning", planningSessionId, {
+        const group = await branchGroupStore.ensureBranchGroupForSource?.("planning", planningSessionId, {
           branchName: resolvedBranch ?? resolvedBaseBranch ?? settingsDefaultBranch,
           autoMerge: session.autoMerge ?? settingsAutoMerge,
         });
@@ -1480,7 +1535,7 @@ export function registerPlanningSubtaskRoutes(ctx: ApiRoutesContext, deps: Plann
       const { planningStreamManager, getSession } = await import("../planning.js");
 
       // Verify session exists
-      const session = getSession(sessionId);
+      const session = await getSession(sessionId);
       if (!session) {
         writeSSEEvent(res, "error", JSON.stringify({ message: "Session not found or expired" }));
         res.end();

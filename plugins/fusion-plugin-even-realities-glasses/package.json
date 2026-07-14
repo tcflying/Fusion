@@ -1,6 +1,6 @@
 {
   "name": "@fusion-plugin-examples/even-realities-glasses",
-  "version": "0.1.42",
+  "version": "0.1.44",
   "type": "module",
   "description": "Canonical Even Realities Fusion plugin with board/task cards, actions, notifications, and webhook transport",
   "keywords": [
@@ -27,7 +27,6 @@
   },
   "devDependencies": {
     "@types/node": "^25.5.2",
-    "better-sqlite3": "^12.4.1",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
   }

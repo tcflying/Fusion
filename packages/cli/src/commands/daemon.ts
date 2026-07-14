@@ -29,7 +29,7 @@ import {
   registerBuiltInZaiProvider,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
-import { createServer, GitHubClient, createSkillsAdapter, getProjectSettingsPath, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
+import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
   PeerExchangeService,
@@ -341,7 +341,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     // Some tests partially mock @fusion/dashboard and omit this export.
   }
 
+  const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
+  const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
+
   const engineManager = new ProjectEngineManager(sharedCentralCore, {
+    cliPackageVersion,
     getMergeStrategy,
     processPullRequestMerge: (s, wd, taskId, pool) =>
       processPullRequestMergeTask(s, wd, taskId, githubClient, getTaskMergeBlocker, pool),
@@ -547,7 +551,16 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     const schemaHooks = pluginLoader.getPluginSchemaInitHooks();
     if (schemaHooks.length > 0) {
       try {
-        await store.getDatabase().runPluginSchemaInits(schemaHooks);
+        /*
+         * FNXC:SqliteFinalRemoval 2026-06-25-16:25:
+         * Skip SQLite-specific plugin schema init in backend mode (PostgreSQL
+         * uses Drizzle migrations for schema management).
+         */
+        if (store.isBackendMode()) {
+          console.log("[plugins] Schema initialization skipped — backend mode (PostgreSQL Drizzle migrations)");
+        } else {
+          await store.getDatabase().runPluginSchemaInits(schemaHooks);
+        }
       } catch (err) {
         console.error(
           `[plugins] Schema initialization failed: ${err instanceof Error ? err.message : err}`,

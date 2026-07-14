@@ -15,7 +15,15 @@
  * - Unified session type for both milestone and slice interviews
  */
 
-import type { PlanningQuestion, Milestone, Slice, MissionStore, InterviewState, SlicePlanState, TaskStore } from "@fusion/core";
+import type { PlanningQuestion, Milestone, Slice, MissionStore, AsyncMissionStore, InterviewState, SlicePlanState, TaskStore } from "@fusion/core";
+
+/**
+ * FNXC:MissionStore 2026-06-27-16:10:
+ * getMissionStore() now returns MissionStore | AsyncMissionStore (PG backend mode).
+ * The target-interview helpers await every store call so milestone/slice planning
+ * works against both SQLite and PostgreSQL.
+ */
+type AnyMissionStore = MissionStore | AsyncMissionStore;
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { AiSessionStore, AiSessionRow } from "./ai-session-store.js";
@@ -30,7 +38,7 @@ import {
   resetDiagnosticsSink,
   nonfatal,
 } from "./ai-session-diagnostics.js";
-import { GenerationGuard, isAbortError } from "./ai-session-timeout.js";
+import { createAbortError, GenerationGuard, isAbortError } from "./ai-session-timeout.js";
 
 // Re-export JSON parsing utilities from mission-interview for external consumers
 export {
@@ -428,7 +436,7 @@ function persistSession(session: TargetInterviewSession, status: "generating" | 
     lockedByTab: null,
     lockedAt: null,
   };
-  _aiSessionStore.upsert(row);
+  _aiSessionStore.upsert(row).catch(() => { /* best-effort persistence */ });
 }
 
 function persistThinking(sessionId: string, thinkingOutput: string): void {
@@ -438,7 +446,7 @@ function persistThinking(sessionId: string, thinkingOutput: string): void {
 
 function unpersistSession(sessionId: string): void {
   if (!_aiSessionStore) return;
-  _aiSessionStore.delete(sessionId);
+  void _aiSessionStore.delete(sessionId);
 }
 
 function buildSessionFromRow(row: AiSessionRow): TargetInterviewSession {
@@ -494,11 +502,11 @@ function buildSessionFromRow(row: AiSessionRow): TargetInterviewSession {
   };
 }
 
-export function rehydrateFromStore(store: AiSessionStore): number {
+export async function rehydrateFromStore(store: AiSessionStore): Promise<number> {
   let rows: AiSessionRow[] = [];
 
   try {
-    rows = store.listRecoverable().filter(
+    rows = (await store.listRecoverable()).filter(
       (row) => row.type === "milestone_interview" || row.type === "slice_interview"
     );
   } catch (error) {
@@ -737,6 +745,36 @@ function disposeAgentForRetry(session: TargetInterviewSession): void {
   session.agent = undefined;
 }
 
+/*
+FNXC:AiSessionCancellation 2026-07-13-00:10:
+guard.run()'s onAbort teardown fires for EVERY abort cause, including "displaced" (a re-entrant
+generationGuard.run() call for the same session id triggers cancelInternal("displaced") on the
+prior entry before the new op runs). Retry flows call disposeAgentForRetry(session) themselves and
+then assign a brand-new session.agent BEFORE the retry's own generationGuard.run() call displaces
+the stale (already-forgotten) entry from session creation/history-replay. If the stale entry's
+onAbort teardown reads session.agent dynamically at teardown time (as disposeAgentForRetry does),
+it disposes the FRESH agent the retry just installed — not the stale one — and the retry's own
+operation then crashes on `session.agent!` being undefined. Capture the exact agent instance a
+generation started with and only tear down / clear that specific instance, so a later displacement
+can never dispose an agent installed by a newer call.
+*/
+function disposeAgentGeneration(session: TargetInterviewSession, agent: AgentResult | undefined): void {
+  if (!agent) {
+    return;
+  }
+
+  nonfatal(
+    () => agent.session.dispose?.(),
+    diagnostics,
+    "Error disposing agent for retry",
+    { sessionId: session.id, operation: "dispose-retry" }
+  );
+
+  if (session.agent === agent) {
+    session.agent = undefined;
+  }
+}
+
 // ── AI Agent Integration ───────────────────────────────────────────────────
 
 function getSystemPrompt(targetType: TargetType): string {
@@ -886,6 +924,7 @@ async function ensureInterviewAgent(
     return;
   }
 
+  const replayAgent = session.agent;
   await generationGuard.run(
     session.id,
     GENERATION_TIMEOUT_MS,
@@ -898,14 +937,28 @@ async function ensureInterviewAgent(
         session,
         "Generation stopped by user. You can retry or start a new session.",
       ),
+      onAbort: () => disposeAgentGeneration(session, replayAgent),
     },
-    () => session.agent!.session.prompt(
-      [
-        "Previous conversation summary:",
-        historySummary,
-        "Use this context when handling the next user response.",
-      ].join("\n\n"),
-    ),
+    async (abortSignal) => {
+      /*
+      FNXC:AiSessionCancellation 2026-07-13-00:00:
+      FN-7951 requires every milestone/slice interview prompt, including history replay, to receive the generation AbortSignal. Promise.race only stops the caller from awaiting; signal forwarding plus guard-level session teardown is the cancellation contract.
+      */
+      if (abortSignal.aborted) {
+        throw createAbortError();
+      }
+      await session.agent!.session.prompt(
+        [
+          "Previous conversation summary:",
+          historySummary,
+          "Use this context when handling the next user response.",
+        ].join("\n\n"),
+        { signal: abortSignal },
+      );
+      if (abortSignal.aborted) {
+        throw createAbortError();
+      }
+    },
   );
 }
 
@@ -951,6 +1004,7 @@ async function continueAgentConversation(session: TargetInterviewSession, messag
     throw new TargetInvalidSessionStateError("AI agent not initialized");
   }
 
+  const generationAgent = session.agent;
   try {
     await generationGuard.run(
       session.id,
@@ -964,12 +1018,23 @@ async function continueAgentConversation(session: TargetInterviewSession, messag
           session,
           "Generation stopped by user. You can retry or start a new session.",
         ),
+        onAbort: () => disposeAgentGeneration(session, generationAgent),
       },
-      async () => {
+      async (abortSignal) => {
         const agent = session.agent!;
         session.thinkingOutput = "";
 
-        await agent.session.prompt(message);
+        /*
+        FNXC:AiSessionCancellation 2026-07-13-00:00:
+        Milestone/slice interview turns and parse-retry prompts must pass the active AbortSignal to prompt() and short-circuit after abort. The GenerationGuard also tears down the agent session because provider SDKs may ignore the signal.
+        */
+        if (abortSignal.aborted) {
+          throw createAbortError();
+        }
+        await agent.session.prompt(message, { signal: abortSignal });
+        if (abortSignal.aborted) {
+          throw createAbortError();
+        }
 
         // Get the response text from the agent's state
         interface AgentMessage {
@@ -1010,12 +1075,19 @@ async function continueAgentConversation(session: TargetInterviewSession, messag
               );
               try {
                 session.thinkingOutput = "";
+                if (abortSignal.aborted) {
+                  throw createAbortError();
+                }
                 await agent.session.prompt(
                   "Your previous response could not be parsed as JSON. " +
                   'Please respond with ONLY a valid JSON object: either {"type":"question","data":{...}} ' +
                   'or {"type":"complete","data":{"title":"...","description":"...","planningNotes":"...","verification":"..."}}' +
-                  ". No markdown, no explanation, just the JSON."
+                  ". No markdown, no explanation, just the JSON.",
+                  { signal: abortSignal },
                 );
+                if (abortSignal.aborted) {
+                  throw createAbortError();
+                }
 
                 const retryMessage = (agent.session.state.messages as AgentMessage[])
                   .filter((m: AgentMessage) => m.role === "assistant")
@@ -1034,6 +1106,9 @@ async function continueAgentConversation(session: TargetInterviewSession, messag
                 }
                 responseText = retryText;
               } catch (retryErr) {
+                if (isAbortError(retryErr)) {
+                  throw retryErr;
+                }
                 diagnostics.errorFromException("Retry prompt failed for session", retryErr, { sessionId: session.id, operation: "retry-prompt" });
                 break;
               }
@@ -1153,9 +1228,17 @@ export async function submitTargetInterviewResponse(
   store?: TaskStore,
   pluginRunner?: SkillSelectionPluginRunner,
 ): Promise<TargetInterviewResponse> {
-  const session = getTargetInterviewSession(sessionId);
+  const session = await getTargetInterviewSession(sessionId);
   if (!session) {
     throw new TargetSessionNotFoundError(`Interview session ${sessionId} not found or expired`);
+  }
+
+  /*
+  FNXC:AiSessionCancellation 2026-07-13-00:10:
+  Reject an overlapping submit instead of letting generationGuard.run()'s displaced-abort teardown dispose the shared session.agent out from under this call (see TargetGenerationInProgressError doc).
+  */
+  if (generationGuard.has(sessionId)) {
+    throw new TargetGenerationInProgressError("Generation already in progress for this response");
   }
 
   if (!session.currentQuestion) {
@@ -1206,12 +1289,12 @@ export async function retryTargetInterviewSession(
   store?: TaskStore,
   pluginRunner?: SkillSelectionPluginRunner,
 ): Promise<void> {
-  const session = getTargetInterviewSession(sessionId);
+  const session = await getTargetInterviewSession(sessionId);
   if (!session) {
     throw new TargetSessionNotFoundError(`Interview session ${sessionId} not found or expired`);
   }
 
-  const persisted = _aiSessionStore?.get(sessionId);
+  const persisted = _aiSessionStore ? await _aiSessionStore.get(sessionId) : null;
   if (persisted) {
     const sessionType = getSessionType(session.targetType);
     if (persisted.type !== sessionType) {
@@ -1222,6 +1305,18 @@ export async function retryTargetInterviewSession(
   const inErrorState = persisted ? persisted.status === "error" : Boolean(session.error);
   if (!inErrorState) {
     throw new TargetInvalidSessionStateError(`Interview session ${sessionId} is not in an error state`);
+  }
+
+  /*
+  FNXC:AiSessionCancellation 2026-07-13-00:10:
+  A session can be observed in "error" (persisted status) while its original fire-and-forget
+  initializeAgent() first turn is still actually in flight (createTargetInterviewSession never
+  awaits it). Retrying while that generation is still registered would race two concurrent
+  continueAgentConversation calls over the single shared session.agent slot. Reject cleanly instead,
+  matching the mission-interview.ts retryMissionInterviewSession guard for the identical race.
+  */
+  if (generationGuard.has(sessionId)) {
+    throw new TargetGenerationInProgressError("Generation already in progress for this session");
   }
 
   disposeAgentForRetry(session);
@@ -1268,7 +1363,7 @@ export async function cancelTargetInterviewSession(sessionId: string): Promise<v
 /**
  * Get session by ID (in-memory or from SQLite).
  */
-export function getTargetInterviewSession(sessionId: string): TargetInterviewSession | undefined {
+export async function getTargetInterviewSession(sessionId: string): Promise<TargetInterviewSession | undefined> {
   const inMemory = sessions.get(sessionId);
   if (inMemory) {
     return inMemory;
@@ -1278,7 +1373,7 @@ export function getTargetInterviewSession(sessionId: string): TargetInterviewSes
     return undefined;
   }
 
-  const row = _aiSessionStore.get(sessionId);
+  const row = await _aiSessionStore.get(sessionId);
   if (!row || (row.type !== "milestone_interview" && row.type !== "slice_interview")) {
     return undefined;
   }
@@ -1296,8 +1391,8 @@ export function getTargetInterviewSession(sessionId: string): TargetInterviewSes
 /**
  * Get the summary from a completed session.
  */
-export function getTargetInterviewSummary(sessionId: string): TargetInterviewSummary | undefined {
-  return getTargetInterviewSession(sessionId)?.summary;
+export async function getTargetInterviewSummary(sessionId: string): Promise<TargetInterviewSummary | undefined> {
+  return (await getTargetInterviewSession(sessionId))?.summary;
 }
 
 /**
@@ -1313,11 +1408,11 @@ export function cleanupTargetInterviewSession(sessionId: string): void {
 /**
  * Apply the interview summary to the target (milestone or slice).
  */
-export function applyTargetInterview(
+export async function applyTargetInterview(
   sessionId: string,
-  missionStore: MissionStore
-): Milestone | Slice {
-  const session = getTargetInterviewSession(sessionId);
+  missionStore: AnyMissionStore
+): Promise<Milestone | Slice> {
+  const session = await getTargetInterviewSession(sessionId);
   if (!session) {
     throw new TargetSessionNotFoundError(`Interview session ${sessionId} not found or expired`);
   }
@@ -1330,24 +1425,24 @@ export function applyTargetInterview(
   let result: Milestone | Slice;
 
   if (session.targetType === "milestone") {
-    const milestone = missionStore.getMilestone(session.targetId);
+    const milestone = await missionStore.getMilestone(session.targetId);
     if (!milestone) {
       throw new TargetSessionNotFoundError(`Milestone ${session.targetId} not found`);
     }
 
-    result = missionStore.updateMilestone(session.targetId, {
+    result = await missionStore.updateMilestone(session.targetId, {
       description: summary.description,
       planningNotes: summary.planningNotes,
       verification: summary.verification,
       interviewState: "completed" as InterviewState,
     });
   } else {
-    const slice = missionStore.getSlice(session.targetId);
+    const slice = await missionStore.getSlice(session.targetId);
     if (!slice) {
       throw new TargetSessionNotFoundError(`Slice ${session.targetId} not found`);
     }
 
-    result = missionStore.updateSlice(session.targetId, {
+    result = await missionStore.updateSlice(session.targetId, {
       description: summary.description,
       planningNotes: summary.planningNotes,
       verification: summary.verification,
@@ -1364,46 +1459,46 @@ export function applyTargetInterview(
 /**
  * Skip the interview and apply mission-level context directly.
  */
-export function skipTargetInterview(
+export async function skipTargetInterview(
   targetType: TargetType,
   targetId: string,
-  missionStore: MissionStore
-): Milestone | Slice {
+  missionStore: AnyMissionStore
+): Promise<Milestone | Slice> {
   let result: Milestone | Slice;
 
   if (targetType === "milestone") {
-    const milestone = missionStore.getMilestone(targetId);
+    const milestone = await missionStore.getMilestone(targetId);
     if (!milestone) {
       throw new TargetSessionNotFoundError(`Milestone ${targetId} not found`);
     }
 
     // Get mission context for the skip message
-    const mission = missionStore.getMission(milestone.missionId);
+    const mission = await missionStore.getMission(milestone.missionId);
     const contextMessage = mission
       ? `Planned using mission-level context (no per-milestone interview). Mission: "${mission.title}". ${mission.description || ""}`
       : "Planned using mission-level context (no per-milestone interview)";
 
-    result = missionStore.updateMilestone(targetId, {
+    result = await missionStore.updateMilestone(targetId, {
       planningNotes: contextMessage,
       interviewState: "completed" as InterviewState,
     });
   } else {
-    const slice = missionStore.getSlice(targetId);
+    const slice = await missionStore.getSlice(targetId);
     if (!slice) {
       throw new TargetSessionNotFoundError(`Slice ${targetId} not found`);
     }
 
     // Get mission context for the skip message
-    const milestone = missionStore.getMilestone(slice.milestoneId);
+    const milestone = await missionStore.getMilestone(slice.milestoneId);
     const milestoneTitle = milestone?.title;
-    const mission = milestone ? missionStore.getMission(milestone.missionId) : undefined;
+    const mission = milestone ? await missionStore.getMission(milestone.missionId) : undefined;
     const contextMessage = mission
       ? `Planned using mission-level context (no per-slice interview). Mission: "${mission.title}". Milestone: "${milestoneTitle}". ${mission.description || ""}`
       : milestoneTitle
         ? `Planned using mission-level context (no per-slice interview). Milestone: "${milestoneTitle}".`
         : "Planned using mission-level context (no per-slice interview)";
 
-    result = missionStore.updateSlice(targetId, {
+    result = await missionStore.updateSlice(targetId, {
       planningNotes: contextMessage,
       planState: "planned" as SlicePlanState,
     });
@@ -1432,6 +1527,17 @@ export class TargetInvalidSessionStateError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "TargetInvalidSessionStateError";
+  }
+}
+
+/*
+FNXC:AiSessionCancellation 2026-07-13-00:10:
+FN-7951's onAbort teardown disposes the shared session.agent on every abort cause, including "displaced" (a re-entrant generationGuard.run() call for the same session id). The continued-conversation operation reads session.agent synchronously at the start of its op closure, so a second overlapping call for the same session would observe session.agent === undefined (cleared by the first call's displaced-abort teardown) and crash with a TypeError instead of a clean, recoverable error. Reject overlapping generations up front so the shared agent handle is never raced.
+*/
+export class TargetGenerationInProgressError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TargetGenerationInProgressError";
   }
 }
 

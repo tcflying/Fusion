@@ -62,6 +62,7 @@ export {
   askQuestionParams,
   workflowListParams,
   workflowGetParams,
+  workflowValidateParams,
   workflowSelectParams,
   workflowCreateParams,
   workflowUpdateParams,
@@ -69,7 +70,19 @@ export {
   workflowSettingsParams,
   traitListParams,
   executeApprovedAgentProvisioning,
+  createWorkflowValidateTool,
+  validateWorkflowIrDryRun,
+  type WorkflowValidateDryRunError,
 } from "./agent-tools.js";
+export {
+  POSTGRES_MIGRATION_HELP_URL,
+  POSTGRES_MIGRATION_NOTICE_KIND,
+  deliverPostgresMigrationNoticeIfNeeded,
+  isPostgresMigrationNoticeVersion,
+  type DeliverPostgresMigrationNoticeArgs,
+  type PostgresMigrationNoticeLog,
+  type PostgresMigrationNoticeResult,
+} from "./postgres-migration-notice.js";
 export { AgentSemaphore, PRIORITY_MERGE, PRIORITY_EXECUTE, PRIORITY_SPECIFY } from "./concurrency.js";
 export { TriageProcessor, type TriageProcessorOptions } from "./triage.js";
 export { TaskExecutor, type TaskExecutorOptions } from "./executor.js";
@@ -849,6 +862,7 @@ export {
   describeAgentModel,
   resolveExecutorThinkingLevel,
   resolveExecutorFallbackThinkingLevel,
+  resolvePlanningThinkingLevel,
   resolvePlanningFallbackThinkingLevel,
   resolveValidatorFallbackThinkingLevel,
   resolveTitleSummarizerFallbackThinkingLevel,
