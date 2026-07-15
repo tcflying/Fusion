@@ -82,6 +82,7 @@ import { registerSignalRoutes } from "./routes/register-signal-routes.js";
 import { registerMonitorRoutes } from "./routes/monitor-routes.js";
 import { registerAuthRoutes } from "./routes/register-auth-routes.js";
 import { registerRuntimeProviderRoutes } from "./routes/register-runtime-provider-routes.js";
+import { registerHappierDirectSessionRoutes } from "./routes/register-happier-direct-session-routes.js";
 import { registerFnBinaryRoutes } from "./routes/register-fn-binary-routes.js";
 import { registerUpdateCheckRoutes } from "./routes/register-update-check-routes.js";
 import { registerDiagnosticsRoutes } from "./routes/register-diagnostics-routes.js";
@@ -962,6 +963,7 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
     triggerCommentWakeForAssignedAgent: (...args) => triggerCommentWakeForAssignedAgent(...args),
     resolveSelfHealingManager: (...args) => resolveSelfHealingManager(...args),
   }));
+  registrarMounter.mount("registerHappierDirectSessionRoutes", () => registerHappierDirectSessionRoutes(routeContext));
   registrarMounter.mount("registerWorkflowRoutes", () => registerWorkflowRoutes(routeContext));
   registrarMounter.mount("registerPlanningSubtaskRoutes", () => registerPlanningSubtaskRoutes(routeContext, {
     store,
