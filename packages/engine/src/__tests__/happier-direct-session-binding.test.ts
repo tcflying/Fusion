@@ -83,6 +83,7 @@ function createHarness(backend: Backend) {
   const syncDb = {
     getProjectIdentity: () => ({ id: "project-sqlite" }),
     bumpLastModified: () => undefined,
+    transactionImmediate: <T>(operation: () => T): T => operation(),
     prepare: (sql: string) => ({
       get: (id: string) => rows.get(id),
       run: (...params: unknown[]) => {
@@ -125,9 +126,16 @@ function createHarness(backend: Backend) {
     }),
   };
 
+  const asyncLayer = {
+    db: asyncDb,
+    projectId: "project-pg",
+    transaction: <T>(operation: (tx: typeof asyncDb) => Promise<T>): Promise<T> => operation(asyncDb),
+    transactionImmediate: <T>(operation: (tx: typeof asyncDb) => Promise<T>): Promise<T> => operation(asyncDb),
+  };
+
   const store = {
     getFusionDir: () => "G:\\fusion-test-project\\.fusion",
-    getAsyncLayer: () => backend === "async" ? { db: asyncDb, projectId: "project-pg" } : null,
+    getAsyncLayer: () => backend === "async" ? asyncLayer : null,
     getDatabase: () => {
       if (backend === "async") throw new Error("SQLite path must not be touched");
       return syncDb;
@@ -157,6 +165,118 @@ function createHarness(backend: Backend) {
   };
 }
 
+function createConcurrentAsyncStores() {
+  const rows = new Map<string, StoredCliSession>();
+  let transactionTail = Promise.resolve();
+  let serializationFailurePending = true;
+  let waitingForClaimedSnapshot = 0;
+  let releaseClaimedSnapshots!: () => void;
+  const claimedSnapshotsReady = new Promise<void>((resolve) => {
+    releaseClaimedSnapshots = resolve;
+  });
+
+  function createAdapter() {
+    let claimAttempted = false;
+    let claimResultReadPending = false;
+    let insideSerializedTransaction = false;
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: async () => {
+            const snapshot = [...rows.values()].map((row) => ({ ...row }));
+            if (claimResultReadPending) {
+              claimResultReadPending = false;
+              return snapshot;
+            }
+            const posture = snapshot[0]?.autonomyPosture
+              ? JSON.parse(snapshot[0].autonomyPosture) as Record<string, unknown>
+              : null;
+            if (
+              !insideSerializedTransaction
+              && claimAttempted
+              && snapshot[0]?.nativeSessionId
+              && !posture?.happierDirectSession
+            ) {
+              waitingForClaimedSnapshot += 1;
+              if (waitingForClaimedSnapshot === 2) releaseClaimedSnapshots();
+              await claimedSnapshotsReady;
+            }
+            return snapshot;
+          },
+        }),
+      }),
+      insert: () => ({
+        values: (row: StoredCliSession) => ({
+          onConflictDoNothing: async () => {
+            if (!rows.has(row.id)) rows.set(row.id, { ...row });
+          },
+        }),
+      }),
+      update: () => ({
+        set: (updates: Partial<StoredCliSession>) => ({
+          where: () => ({
+            returning: async () => {
+              const row = [...rows.values()][0];
+              if (!row) return [];
+              if (updates.nativeSessionId !== undefined) {
+                claimAttempted = true;
+                claimResultReadPending = true;
+                if (row.nativeSessionId !== null) return [];
+              }
+              Object.assign(row, updates);
+              return [{ id: row.id }];
+            },
+          }),
+        }),
+      }),
+    };
+    return {
+      db,
+      async transactionImmediate<T>(operation: (tx: typeof db) => Promise<T>): Promise<T> {
+        const previous = transactionTail;
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        transactionTail = previous.then(() => gate);
+        await previous;
+        insideSerializedTransaction = true;
+        try {
+          if (serializationFailurePending) {
+            serializationFailurePending = false;
+            throw Object.assign(new Error("serialization failure"), { code: "40001" });
+          }
+          return await operation(db);
+        } finally {
+          insideSerializedTransaction = false;
+          release();
+        }
+      },
+    };
+  }
+
+  function createStore(adapter: ReturnType<typeof createAdapter>): TaskStore {
+    return {
+      getFusionDir: () => "G:\\fusion-test-project\\.fusion",
+      getAsyncLayer: () => ({
+        db: adapter.db,
+        projectId: "project-pg",
+        transaction: adapter.transactionImmediate,
+        transactionImmediate: adapter.transactionImmediate,
+      }),
+      getDatabase: () => {
+        throw new Error("SQLite path must not be touched");
+      },
+    } as unknown as TaskStore;
+  }
+
+  return {
+    rows,
+    storeA: createStore(createAdapter()),
+    storeB: createStore(createAdapter()),
+  };
+}
+
 async function createCanonicalSession(store: TaskStore, taskId: string) {
   const binding = await createTaskStoreNativeSessionBinding({
     runtimeHint: "happier",
@@ -175,6 +295,28 @@ it("keeps the existing deterministic Happier executor CLI session id", async () 
   const nativeBinding = await createCanonicalSession(harness.store, taskId);
 
   expect(nativeBinding.key.endsWith(`:${resolveTaskHappierCliSessionId({ taskId, purpose: "execute" })}`)).toBe(true);
+});
+
+it("serializes connected metadata across distinct stores sharing one database", async () => {
+  const taskId = "FN-HAPPIER-CROSS-STORE";
+  const harness = createConcurrentAsyncStores();
+  await createCanonicalSession(harness.storeA, taskId);
+  const row = harness.rows.get(resolveTaskHappierCliSessionId({ taskId, purpose: "execute" }));
+  if (!row) throw new Error("Expected canonical CLI session");
+  row.autonomyPosture = JSON.stringify({ unrelated: { keep: "yes" } });
+
+  const [first, second] = await Promise.all([
+    bindTaskHappierDirectSession({ store: harness.storeA, taskId, ensured: ensuredA }),
+    bindTaskHappierDirectSession({
+      store: harness.storeB,
+      taskId,
+      ensured: { ...ensuredA, remoteSessionId: "remote-from-second-store" },
+    }),
+  ]);
+
+  expect(second).toEqual(first);
+  await expect(readTaskHappierDirectSessionBinding({ store: harness.storeA, taskId })).resolves.toEqual(first);
+  expect(JSON.parse(row.autonomyPosture ?? "null")).toMatchObject({ unrelated: { keep: "yes" } });
 });
 
 describe.each<Backend>(["async", "sync"])("%s store", (backend) => {

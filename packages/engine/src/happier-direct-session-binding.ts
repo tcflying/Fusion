@@ -1,6 +1,7 @@
 import {
   AsyncCliSessionStore,
   CliSessionStore,
+  type AsyncDataLayer,
   type CliAutonomyPosture,
   type CliSession,
   type CliSessionUpdateInput,
@@ -76,41 +77,10 @@ type SessionStore = {
   ): CliSession | undefined | Promise<CliSession | undefined>;
 };
 
-const serializedMutations = new WeakMap<object, Map<string, Promise<void>>>();
-
 function resolveSessionStore(store: Store): SessionStore {
   const asyncLayer = store.getAsyncLayer();
   if (asyncLayer) return new AsyncCliSessionStore(asyncLayer);
   return new CliSessionStore(store.getFusionDir(), store.getDatabase());
-}
-
-async function runSerialized<T>(
-  store: Store,
-  cliSessionId: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const owner = store as object;
-  let queue = serializedMutations.get(owner);
-  if (!queue) {
-    queue = new Map();
-    serializedMutations.set(owner, queue);
-  }
-
-  const previous = queue.get(cliSessionId) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const tail = previous.then(() => gate);
-  queue.set(cliSessionId, tail);
-
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-    if (queue.get(cliSessionId) === tail) queue.delete(cliSessionId);
-  }
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -174,6 +144,204 @@ function bindingFromSession(input: {
   return persisted;
 }
 
+const SERIALIZABLE_TRANSACTION_ATTEMPTS = 3;
+
+function isSerializationFailure(error: unknown): boolean {
+  let candidate = error;
+  for (let depth = 0; depth < 3; depth += 1) {
+    if (!candidate || typeof candidate !== "object") return false;
+    if ((candidate as { code?: unknown }).code === "40001") return true;
+    candidate = (candidate as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+async function withSerializableRetry<T>(operation: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; attempt <= SERIALIZABLE_TRANSACTION_ATTEMPTS; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isSerializationFailure(error) || attempt === SERIALIZABLE_TRANSACTION_ATTEMPTS) {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Unreachable serializable transaction retry state");
+}
+
+function existingBindingForEnsure(input: {
+  taskId: string;
+  cliSessionId: string;
+  session: CliSession | undefined;
+  ensuredNativeSessionId: string;
+}): TaskHappierDirectSessionBinding | null {
+  const existing = bindingFromSession(input);
+  if (existing && existing.nativeSessionId !== input.ensuredNativeSessionId) {
+    throw new TaskHappierDirectSessionConflictError(
+      input.taskId,
+      input.cliSessionId,
+      existing.nativeSessionId,
+      input.ensuredNativeSessionId,
+    );
+  }
+  return existing;
+}
+
+function createConnectedBinding(input: {
+  cliSessionId: string;
+  nativeSessionId: string;
+  ensured: HappierDirectSessionEnsureMetadata;
+}): TaskHappierDirectSessionBinding {
+  return {
+    cliSessionId: input.cliSessionId,
+    nativeSessionId: input.nativeSessionId,
+    providerId: input.ensured.providerId,
+    remoteSessionId: input.ensured.remoteSessionId,
+    machineId: input.ensured.machineId,
+    serverId: input.ensured.serverId,
+    linkedAt: new Date().toISOString(),
+  };
+}
+
+function assertClaimedNativeSession(input: {
+  taskId: string;
+  cliSessionId: string;
+  claimedNativeSessionId: string;
+  ensuredNativeSessionId: string;
+}): void {
+  if (input.claimedNativeSessionId === input.ensuredNativeSessionId) return;
+  throw new TaskHappierDirectSessionConflictError(
+    input.taskId,
+    input.cliSessionId,
+    input.claimedNativeSessionId,
+    input.ensuredNativeSessionId,
+  );
+}
+
+async function bindAsyncTransaction(input: {
+  sessionStore: AsyncCliSessionStore;
+  taskId: string;
+  cliSessionId: string;
+  ensured: HappierDirectSessionEnsureMetadata;
+}): Promise<TaskHappierDirectSessionBinding> {
+  const currentSession = await input.sessionStore.getSession(input.cliSessionId);
+  if (!currentSession) throw new Error(`CLI session not found: ${input.cliSessionId}`);
+  const currentBinding = existingBindingForEnsure({
+    ...input,
+    session: currentSession,
+    ensuredNativeSessionId: input.ensured.sessionId,
+  });
+  if (currentBinding) return currentBinding;
+
+  const claim = await input.sessionStore.claimNativeSessionId(
+    input.cliSessionId,
+    input.ensured.sessionId,
+  );
+  if (!claim) throw new Error(`CLI session not found during native-session claim: ${input.cliSessionId}`);
+  assertClaimedNativeSession({
+    ...input,
+    claimedNativeSessionId: claim.nativeSessionId,
+    ensuredNativeSessionId: input.ensured.sessionId,
+  });
+
+  const latestSession = await input.sessionStore.getSession(input.cliSessionId);
+  if (!latestSession) throw new Error(`CLI session not found after native-session claim: ${input.cliSessionId}`);
+  const existingAfterClaim = existingBindingForEnsure({
+    ...input,
+    session: latestSession,
+    ensuredNativeSessionId: input.ensured.sessionId,
+  });
+  if (existingAfterClaim) return existingAfterClaim;
+
+  const binding = createConnectedBinding({
+    cliSessionId: input.cliSessionId,
+    nativeSessionId: claim.nativeSessionId,
+    ensured: input.ensured,
+  });
+  const autonomyPosture: CliAutonomyPosture = {
+    ...(latestSession.autonomyPosture ?? {}),
+    happierDirectSession: binding,
+  };
+  const updated = await input.sessionStore.updateSession(input.cliSessionId, { autonomyPosture });
+  if (!updated) throw new Error(`CLI session not found while linking Happier metadata: ${input.cliSessionId}`);
+  return binding;
+}
+
+function bindSyncTransaction(input: {
+  sessionStore: CliSessionStore;
+  taskId: string;
+  cliSessionId: string;
+  ensured: HappierDirectSessionEnsureMetadata;
+}): TaskHappierDirectSessionBinding {
+  const currentSession = input.sessionStore.getSession(input.cliSessionId);
+  if (!currentSession) throw new Error(`CLI session not found: ${input.cliSessionId}`);
+  const currentBinding = existingBindingForEnsure({
+    ...input,
+    session: currentSession,
+    ensuredNativeSessionId: input.ensured.sessionId,
+  });
+  if (currentBinding) return currentBinding;
+
+  const claim = input.sessionStore.claimNativeSessionId(
+    input.cliSessionId,
+    input.ensured.sessionId,
+  );
+  if (!claim) throw new Error(`CLI session not found during native-session claim: ${input.cliSessionId}`);
+  assertClaimedNativeSession({
+    ...input,
+    claimedNativeSessionId: claim.nativeSessionId,
+    ensuredNativeSessionId: input.ensured.sessionId,
+  });
+
+  const latestSession = input.sessionStore.getSession(input.cliSessionId);
+  if (!latestSession) throw new Error(`CLI session not found after native-session claim: ${input.cliSessionId}`);
+  const existingAfterClaim = existingBindingForEnsure({
+    ...input,
+    session: latestSession,
+    ensuredNativeSessionId: input.ensured.sessionId,
+  });
+  if (existingAfterClaim) return existingAfterClaim;
+
+  const binding = createConnectedBinding({
+    cliSessionId: input.cliSessionId,
+    nativeSessionId: claim.nativeSessionId,
+    ensured: input.ensured,
+  });
+  const autonomyPosture: CliAutonomyPosture = {
+    ...(latestSession.autonomyPosture ?? {}),
+    happierDirectSession: binding,
+  };
+  const updated = input.sessionStore.updateSession(input.cliSessionId, { autonomyPosture });
+  if (!updated) throw new Error(`CLI session not found while linking Happier metadata: ${input.cliSessionId}`);
+  return binding;
+}
+
+async function bindWithDatabaseSerialization(input: {
+  store: Store;
+  taskId: string;
+  cliSessionId: string;
+  ensured: HappierDirectSessionEnsureMetadata;
+}): Promise<TaskHappierDirectSessionBinding> {
+  const asyncLayer = input.store.getAsyncLayer();
+  if (asyncLayer) {
+    return withSerializableRetry(() => asyncLayer.transactionImmediate(
+      async (transaction) => bindAsyncTransaction({
+        ...input,
+        sessionStore: new AsyncCliSessionStore({
+          db: transaction as unknown as AsyncDataLayer["db"],
+        }),
+      }),
+      { isolationLevel: "serializable" },
+    ));
+  }
+
+  const database = input.store.getDatabase();
+  return database.transactionImmediate(() => bindSyncTransaction({
+    ...input,
+    sessionStore: new CliSessionStore(input.store.getFusionDir(), database),
+  }));
+}
+
 export async function readTaskHappierDirectSessionBinding(input: {
   store: Store;
   taskId: string;
@@ -197,70 +365,20 @@ export async function bindTaskHappierDirectSession(input: {
     purpose: "execute",
   });
 
-  return runSerialized(input.store, cliSessionId, async () => {
-    const sessionStore = resolveSessionStore(input.store);
-    const currentSession = await sessionStore.getSession(cliSessionId);
-    const currentBinding = bindingFromSession({
-      taskId: input.taskId,
-      cliSessionId,
-      session: currentSession,
-    });
-    if (currentBinding) {
-      if (currentBinding.nativeSessionId !== input.ensured.sessionId) {
-        throw new TaskHappierDirectSessionConflictError(
-          input.taskId,
-          cliSessionId,
-          currentBinding.nativeSessionId,
-          input.ensured.sessionId,
-        );
-      }
-      return currentBinding;
-    }
+  const nativeBinding = await createTaskStoreNativeSessionBinding({
+    runtimeHint: "happier",
+    taskStore: input.store,
+    sessionKey: `executor:${input.taskId}:primary`,
+    taskId: input.taskId,
+    purpose: "execute",
+    worktreePath: input.worktreePath,
+  });
+  if (!nativeBinding) throw new Error("Happier native-session binding was not created");
 
-    const nativeBinding = await createTaskStoreNativeSessionBinding({
-      runtimeHint: "happier",
-      taskStore: input.store,
-      sessionKey: `executor:${input.taskId}:primary`,
-      taskId: input.taskId,
-      purpose: "execute",
-      worktreePath: input.worktreePath,
-    });
-    if (!nativeBinding) throw new Error("Happier native-session binding was not created");
-
-    const claim = await nativeBinding.claimNativeSessionId(input.ensured.sessionId);
-    if (claim.nativeSessionId !== input.ensured.sessionId) {
-      throw new TaskHappierDirectSessionConflictError(
-        input.taskId,
-        cliSessionId,
-        claim.nativeSessionId,
-        input.ensured.sessionId,
-      );
-    }
-
-    const claimedSession = await sessionStore.getSession(cliSessionId);
-    if (!claimedSession) throw new Error(`CLI session not found after native-session claim: ${cliSessionId}`);
-    const existingAfterClaim = bindingFromSession({
-      taskId: input.taskId,
-      cliSessionId,
-      session: claimedSession,
-    });
-    if (existingAfterClaim) return existingAfterClaim;
-
-    const binding: TaskHappierDirectSessionBinding = {
-      cliSessionId,
-      nativeSessionId: claim.nativeSessionId,
-      providerId: input.ensured.providerId,
-      remoteSessionId: input.ensured.remoteSessionId,
-      machineId: input.ensured.machineId,
-      serverId: input.ensured.serverId,
-      linkedAt: new Date().toISOString(),
-    };
-    const autonomyPosture: CliAutonomyPosture = {
-      ...(claimedSession.autonomyPosture ?? {}),
-      happierDirectSession: binding,
-    };
-    const updated = await sessionStore.updateSession(cliSessionId, { autonomyPosture });
-    if (!updated) throw new Error(`CLI session not found while linking Happier metadata: ${cliSessionId}`);
-    return binding;
+  return bindWithDatabaseSerialization({
+    store: input.store,
+    taskId: input.taskId,
+    cliSessionId,
+    ensured: input.ensured,
   });
 }
