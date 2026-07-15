@@ -67,6 +67,41 @@ export interface AgentRuntimeNativeSessionBinding {
   persistNativeSessionId(nativeSessionId: string): Promise<void> | void;
 }
 
+function resolveHappierCliSessionId(input: {
+  sessionKey: string;
+  purpose: CliSessionPurpose;
+}): string {
+  return `cli-happier-${input.purpose}-${createHash("sha256").update(input.sessionKey).digest("hex").slice(0, 24)}`;
+}
+
+export function resolveTaskHappierCliSessionId(input: {
+  taskId: string;
+  purpose: "execute";
+}): string {
+  return resolveHappierCliSessionId({
+    sessionKey: `executor:${input.taskId}:primary`,
+    purpose: input.purpose,
+  });
+}
+
+function resolveHappierCliSessionId(input: {
+  sessionKey: string;
+  purpose: CliSessionPurpose;
+}): string {
+  const digest = createHash("sha256").update(input.sessionKey).digest("hex").slice(0, 24);
+  return `cli-happier-${input.purpose}-${digest}`;
+}
+
+export function resolveTaskHappierCliSessionId(input: {
+  taskId: string;
+  purpose: "execute";
+}): string {
+  return resolveHappierCliSessionId({
+    sessionKey: `executor:${input.taskId}:primary`,
+    purpose: input.purpose,
+  });
+}
+
 /**
  * FNXC:HappierRuntime 2026-07-13-19:42:
  * Bridge the canonical CliSessionStore record into the AgentRuntime creation
@@ -125,8 +160,10 @@ export async function createTaskStoreNativeSessionBinding(options: {
   const layer = options.taskStore.getAsyncLayer();
   if (!layer) throw new Error("Happier runtime requires the TaskStore PostgreSQL AsyncDataLayer");
   const store = await CliSessionStore.create(layer, layer.projectId || options.taskStore.getFusionDir());
-  const digest = createHash("sha256").update(options.sessionKey).digest("hex").slice(0, 24);
-  const sessionId = `cli-happier-${options.purpose}-${digest}`;
+  const sessionId = resolveHappierCliSessionId({
+    sessionKey: options.sessionKey,
+    purpose: options.purpose,
+  });
   const projectId = layer.projectId || options.taskStore.getFusionDir();
   const existing = store.getSession(sessionId);
   if (!existing) {

@@ -927,8 +927,18 @@ export {
   type AgentRuntimeOptions,
   type AgentRuntimeNativeSessionBinding,
   createCliSessionNativeSessionBinding,
+  resolveTaskHappierCliSessionId,
   type AgentSessionResult,
 } from "./agent-runtime.js";
+export {
+  bindTaskHappierDirectSession,
+  readTaskHappierDirectSessionBinding,
+  TaskHappierDirectSessionConflictError,
+  TaskHappierDirectSessionIntegrityError,
+  type HappierDirectSessionEnsureMetadata,
+  type HappierDirectSessionProviderId,
+  type TaskHappierDirectSessionBinding,
+} from "./happier-direct-session-binding.js";
 export { askAcpOnce, type AskAcpOnceOptions, type AskAcpOnceResult } from "./cli-agent-ask.js";
 export {
   resolveRuntime,
