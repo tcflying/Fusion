@@ -181,6 +181,42 @@ describe("HappierRuntimeAdapter", () => {
     );
   });
 
+  /*
+  FNXC:HappierRuntime 2026-07-15-20:59:
+  A task-bound Direct Session is prebound before execution starts. The first
+  later user-authorized prompt and session stop must reuse that persisted ID;
+  runtime startup must not create, claim, persist, archive, or substitute one.
+  */
+  it("reuses one prebound direct session for refresh, first prompt, and stop without persisting an alternate id", async () => {
+    const ensuredSessionId = "hp_prebound_direct_session";
+    const native = nativeBinding(ensuredSessionId, "task-bound-direct-session");
+    const runtime = new HappierRuntimeAdapter({ backend: "codex" });
+    const result = await runtime.createSession(makeOptions(native.binding));
+
+    await runtime.promptWithFallback(result.session, "first user-authorized prompt");
+    result.session.dispose();
+
+    expect(native.refreshNativeSessionId).toHaveBeenCalledOnce();
+    expect(native.refreshNativeSessionId.mock.invocationCallOrder[0]).toBeLessThan(
+      cli.getHappierSessionStatus.mock.invocationCallOrder[0],
+    );
+    expect(cli.getHappierSessionStatus).toHaveBeenCalledWith(ensuredSessionId, expect.anything());
+    expect(cli.sendHappierMessage).toHaveBeenCalledOnce();
+    expect(cli.sendHappierMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: ensuredSessionId,
+        message: "first user-authorized prompt",
+      }),
+      expect.anything(),
+    );
+    expect(result.session.sessionId).toBe(ensuredSessionId);
+    expect(native.binding.nativeSessionId).toBe(ensuredSessionId);
+    expect(cli.createHappierSession).not.toHaveBeenCalled();
+    expect(native.claimNativeSessionId).not.toHaveBeenCalled();
+    expect(native.persistNativeSessionId).not.toHaveBeenCalled();
+    expect(cli.archiveHappierSession).not.toHaveBeenCalled();
+  });
+
   it("reuses and reconciles the id persisted by a previous runtime instance", async () => {
     const firstBinding = nativeBinding(null, "restart-binding");
     const firstRuntime = new HappierRuntimeAdapter({ backend: "codex" });
