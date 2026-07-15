@@ -158,6 +158,7 @@ describe("HappierRuntimeAdapter", () => {
       2,
       expect.objectContaining({ sessionId: "hp_session_1", message: "second prompt" }),
       expect.anything(),
+      expect.any(AbortSignal),
     );
     expect(result.session.sessionId).toBe("hp_session_1");
   });
@@ -171,10 +172,15 @@ describe("HappierRuntimeAdapter", () => {
 
     expect(cli.createHappierSession).not.toHaveBeenCalled();
     expect(native.claimNativeSessionId).not.toHaveBeenCalled();
-    expect(cli.getHappierSessionStatus).toHaveBeenCalledWith("hp_session_1", expect.anything());
+    expect(cli.getHappierSessionStatus).toHaveBeenCalledWith(
+      "hp_session_1",
+      expect.anything(),
+      expect.any(AbortSignal),
+    );
     expect(cli.sendHappierMessage).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: "hp_session_1", message: "after restart" }),
       expect.anything(),
+      expect.any(AbortSignal),
     );
     expect(cli.getHappierSessionStatus.mock.invocationCallOrder[0]).toBeLessThan(
       cli.sendHappierMessage.mock.invocationCallOrder[0],
@@ -182,35 +188,74 @@ describe("HappierRuntimeAdapter", () => {
   });
 
   /*
-  FNXC:HappierRuntime 2026-07-15-20:59:
-  A task-bound Direct Session is prebound before execution starts. The first
-  later user-authorized prompt and session stop must reuse that persisted ID;
-  runtime startup must not create, claim, persist, archive, or substitute one.
+  FNXC:HappierRuntime 2026-07-15-21:14:
+  A task-bound Direct Session is prebound before execution starts. Executor
+  cancellation calls abort then dispose, so the adapter must abort the official
+  CLI operation carrying that persisted ID without creating or substituting one.
   */
-  it("reuses one prebound direct session for refresh, first prompt, and stop without persisting an alternate id", async () => {
+  it("cancels the first prebound prompt through the same native id without persisting an alternate id", async () => {
     const ensuredSessionId = "hp_prebound_direct_session";
     const native = nativeBinding(ensuredSessionId, "task-bound-direct-session");
+    const lifecycle: string[] = [];
+    let cancelledSessionId: string | undefined;
+    native.refreshNativeSessionId.mockImplementationOnce(async () => {
+      lifecycle.push(`refresh:${ensuredSessionId}`);
+      return ensuredSessionId;
+    });
+    cli.getHappierSessionStatus.mockImplementationOnce(async (sessionId: string) => {
+      lifecycle.push(`status:${sessionId}`);
+      return resumableStatus(sessionId);
+    });
+    cli.sendHappierMessage.mockImplementationOnce((
+      { sessionId }: { sessionId: string },
+      _settings: unknown,
+      signal?: AbortSignal,
+    ) => new Promise<never>((_resolve, reject) => {
+      lifecycle.push(`send:${sessionId}`);
+      signal?.addEventListener("abort", () => {
+        cancelledSessionId = sessionId;
+        lifecycle.push(`cancel:${sessionId}`);
+        reject(new HappierCliError("timeout", "Happier CLI invocation aborted"));
+      }, { once: true });
+    }));
     const runtime = new HappierRuntimeAdapter({ backend: "codex" });
     const result = await runtime.createSession(makeOptions(native.binding));
+    const sessionWithAbort = result.session as typeof result.session & { abort?: () => Promise<void> };
 
-    await runtime.promptWithFallback(result.session, "first user-authorized prompt");
+    const prompt = runtime.promptWithFallback(result.session, "first user-authorized prompt");
+    await vi.waitFor(() => expect(cli.sendHappierMessage).toHaveBeenCalledOnce());
+
+    expect(sessionWithAbort.abort).toBeTypeOf("function");
+    await sessionWithAbort.abort!();
     result.session.dispose();
+    await expect(prompt).rejects.toMatchObject({
+      code: "timeout",
+      message: "Happier CLI invocation aborted",
+    });
 
-    expect(native.refreshNativeSessionId).toHaveBeenCalledOnce();
-    expect(native.refreshNativeSessionId.mock.invocationCallOrder[0]).toBeLessThan(
-      cli.getHappierSessionStatus.mock.invocationCallOrder[0],
-    );
-    expect(cli.getHappierSessionStatus).toHaveBeenCalledWith(ensuredSessionId, expect.anything());
-    expect(cli.sendHappierMessage).toHaveBeenCalledOnce();
+    expect(lifecycle).toEqual([
+      `refresh:${ensuredSessionId}`,
+      `status:${ensuredSessionId}`,
+      `send:${ensuredSessionId}`,
+      `cancel:${ensuredSessionId}`,
+    ]);
+    expect(cancelledSessionId).toBe(ensuredSessionId);
     expect(cli.sendHappierMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionId: ensuredSessionId,
         message: "first user-authorized prompt",
       }),
       expect.anything(),
+      expect.any(AbortSignal),
     );
-    expect(result.session.sessionId).toBe(ensuredSessionId);
-    expect(native.binding.nativeSessionId).toBe(ensuredSessionId);
+    expect(cli.getHappierSessionHistory).toHaveBeenCalledTimes(1);
+    const observedNativeIds = [
+      ...cli.getHappierSessionStatus.mock.calls.map((call) => call[0]),
+      ...cli.getHappierSessionHistory.mock.calls.map((call) => call[0]),
+      ...cli.sendHappierMessage.mock.calls.map((call) => call[0].sessionId),
+      cancelledSessionId,
+    ];
+    expect(new Set(observedNativeIds)).toEqual(new Set([ensuredSessionId]));
     expect(cli.createHappierSession).not.toHaveBeenCalled();
     expect(native.claimNativeSessionId).not.toHaveBeenCalled();
     expect(native.persistNativeSessionId).not.toHaveBeenCalled();
@@ -346,6 +391,7 @@ describe("HappierRuntimeAdapter", () => {
     expect(cli.sendHappierMessage).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: "hp_winner", message: "use winner" }),
       expect.anything(),
+      expect.any(AbortSignal),
     );
   });
 

@@ -282,6 +282,28 @@ function asHappierSession(session: AgentSession): HappierAgentSession {
   return session as HappierAgentSession;
 }
 
+/*
+FNXC:HappierRuntime 2026-07-15-21:14:
+Executor cancellation awaits session.abort() before dispose(). Track the one
+active official CLI operation so both surfaces terminate that operation through
+its AbortSignal while preserving the canonical Happier native session ID.
+*/
+type ManagedHappierSession = HappierAgentSession & {
+  needsPersistence: boolean;
+  activePrompt?: Promise<void>;
+  activePromptController?: AbortController;
+  stopped: boolean;
+  abort(): Promise<void>;
+};
+
+function happierPromptAbortError(): HappierCliError {
+  return new HappierCliError("timeout", "Happier CLI invocation aborted");
+}
+
+function throwIfPromptAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw happierPromptAbortError();
+}
+
 export class HappierRuntimeAdapter implements AgentRuntime {
   readonly id = "happier";
   readonly name = "Happier Runtime";
@@ -309,7 +331,8 @@ export class HappierRuntimeAdapter implements AgentRuntime {
       );
     }
     const sessionId = nonEmptyString(options.nativeSession.nativeSessionId) ?? "";
-    const session = {
+    let session!: ManagedHappierSession;
+    session = {
       model: undefined,
       cwd: options.cwd,
       systemPrompt: options.systemPrompt,
@@ -331,20 +354,32 @@ export class HappierRuntimeAdapter implements AgentRuntime {
       nativeSession: options.nativeSession,
       needsReconciliation: Boolean(sessionId),
       needsPersistence: false,
-      dispose: () => undefined,
-    } as unknown as HappierAgentSession & { needsPersistence: boolean };
+      stopped: false,
+      abort: async () => {
+        session.stopped = true;
+        session.activePromptController?.abort();
+        await session.activePrompt?.catch(() => undefined);
+      },
+      dispose: () => {
+        session.stopped = true;
+        session.activePromptController?.abort();
+      },
+    } as unknown as ManagedHappierSession;
     return { session, sessionFile: undefined };
   }
 
   promptWithFallback(session: AgentSession, prompt: string, _options?: unknown): Promise<void> {
     if (!prompt.trim()) return Promise.reject(new HappierCliError("session", "Happier message is required"));
-    const happierSession = asHappierSession(session) as HappierAgentSession & { needsPersistence: boolean };
+    const happierSession = asHappierSession(session) as ManagedHappierSession;
+    if (happierSession.stopped) return Promise.reject(happierPromptAbortError());
     const queueKey = happierSession.nativeSession.key;
     const prior = bindingQueues.get(queueKey) ?? Promise.resolve();
     const current = prior.catch(() => undefined).then(() => this.runPrompt(happierSession, prompt));
+    happierSession.activePrompt = current;
     const tail = current.then(() => undefined, () => undefined);
     bindingQueues.set(queueKey, tail);
     return current.finally(() => {
+      if (happierSession.activePrompt === current) happierSession.activePrompt = undefined;
       if (bindingQueues.get(queueKey) === tail) bindingQueues.delete(queueKey);
     });
   }
@@ -354,23 +389,29 @@ export class HappierRuntimeAdapter implements AgentRuntime {
   }
 
   private async runPrompt(
-    session: HappierAgentSession & { needsPersistence: boolean },
+    session: ManagedHappierSession,
     prompt: string,
   ): Promise<void> {
+    if (session.stopped) throw happierPromptAbortError();
+    const promptController = new AbortController();
+    session.activePromptController = promptController;
+    const { signal } = promptController;
     let localUserMessageAdded = false;
     try {
       await this.ensureNativeSession(session);
+      throwIfPromptAborted(signal);
 
       if (session.needsReconciliation) {
-        await this.reconcilePersistedSession(session);
+        await this.reconcilePersistedSession(session, signal);
         session.needsReconciliation = false;
       }
 
       let watermark: HistoryWatermark;
       try {
-        const before = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
+        const before = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings, signal);
         watermark = captureHistoryWatermark(before);
       } catch (error) {
+        if (signal.aborted) throw error;
         session.state.status = "blocked";
         throw new HappierRecoveryError(
           "history-reconciliation-failed",
@@ -389,9 +430,10 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         await sendHappierMessage(
           { sessionId: session.sessionId, message: prompt, localId, timeoutSeconds: this.timeoutSeconds },
           this.settings,
+          signal,
         );
-        const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
-        const status = await getHappierSessionStatus(session.sessionId, this.settings);
+        const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings, signal);
+        const status = await getHappierSessionStatus(session.sessionId, this.settings, signal);
         let correlated: ReturnType<typeof correlatePromptOutput>;
         try {
           correlated = correlatePromptOutput(watermark, history, localId);
@@ -411,6 +453,7 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         this.recordAssistantOutput(session, correlated.assistant);
         session.state.status = statusToRuntimeState(status) ?? "ready";
       } catch (error) {
+        if (signal.aborted) throw error;
         if (error instanceof HappierCliError && error.code === "protocol") {
           session.state.status = "blocked";
           throw new HappierRecoveryError(
@@ -421,7 +464,7 @@ export class HappierRuntimeAdapter implements AgentRuntime {
           );
         }
         if (!isAmbiguousSendError(error)) throw error;
-        const reconciled = await this.reconcileAmbiguousSend(session, watermark, localId, error);
+        const reconciled = await this.reconcileAmbiguousSend(session, watermark, localId, error, signal);
         assertNoProviderProcessFailure(reconciled.added, session.sessionId);
         this.recordAssistantOutput(session, reconciled.added);
         session.state.status = statusToRuntimeState(reconciled.status) ?? "ready";
@@ -440,6 +483,8 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         session.state.status = "failed";
       }
       throw error;
+    } finally {
+      if (session.activePromptController === promptController) session.activePromptController = undefined;
     }
   }
 
@@ -511,10 +556,10 @@ export class HappierRuntimeAdapter implements AgentRuntime {
     session.needsPersistence = false;
   }
 
-  private async reconcilePersistedSession(session: HappierAgentSession): Promise<void> {
+  private async reconcilePersistedSession(session: HappierAgentSession, signal: AbortSignal): Promise<void> {
     session.state.status = "recovering";
     try {
-      const status = await getHappierSessionStatus(session.sessionId, this.settings);
+      const status = await getHappierSessionStatus(session.sessionId, this.settings, signal);
       if (!statusProvesResumable(status)) {
         session.state.status = "blocked";
         throw new HappierRecoveryError(
@@ -524,6 +569,7 @@ export class HappierRuntimeAdapter implements AgentRuntime {
         );
       }
     } catch (error) {
+      if (signal.aborted) throw error;
       if (error instanceof HappierRecoveryError) throw error;
       const code = error instanceof HappierCliError && error.code === "session" ? "session-missing" : "status-check-failed";
       session.state.status = code === "session-missing" ? "blocked" : "recovering";
@@ -541,10 +587,11 @@ export class HappierRuntimeAdapter implements AgentRuntime {
     watermark: HistoryWatermark,
     localId: string,
     originalError: unknown,
+    signal: AbortSignal,
   ): Promise<HistoryReconciliation> {
     try {
-      const status = await getHappierSessionStatus(session.sessionId, this.settings);
-      const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings);
+      const status = await getHappierSessionStatus(session.sessionId, this.settings, signal);
+      const history = await getHappierSessionHistory(session.sessionId, HISTORY_LIMIT, this.settings, signal);
       const correlated = correlatePromptOutput(watermark, history, localId);
       return { status, history, added: correlated.assistant };
     } catch (error) {
