@@ -121,6 +121,16 @@ export interface HappierRawHistoryRow {
 }
 export type HappierSessionHistoryResult = HappierJsonRecord & { sessionId: string; format: string; messages: HappierRawHistoryRow[] };
 
+export type HappierDirectSessionEnsureResult = {
+  providerId: "codex" | "claude" | "opencode";
+  remoteSessionId: string;
+  machineId: string;
+  serverId: string;
+  sessionId: string;
+  created: boolean;
+  openUrl: string;
+};
+
 export type HappierRuntimeState =
   | "starting"
   | "ready"

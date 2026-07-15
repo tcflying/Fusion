@@ -6,6 +6,7 @@ import {
   type HappierBackend,
   type HappierCliInvocation,
   type HappierCliSettings,
+  type HappierDirectSessionEnsureResult,
   type HappierErrorCode,
   type HappierFailureEnvelope,
   type HappierJsonEnvelope,
@@ -460,6 +461,48 @@ export async function invokeHappierJsonForKind<T extends HappierJsonRecord>(
     }
   }
   throw new HappierCliError("process", "Happier CLI startup retry exhausted");
+}
+
+export function buildHappierSessionOpenUrl(webappUrl: string, serverId: string, sessionId: string): string {
+  return `${webappUrl.replace(/\/+$/u, "")}/session/${encodeURIComponent(serverId)}/${encodeURIComponent(sessionId)}`;
+}
+
+function directSessionString(data: HappierJsonRecord, field: string): string {
+  const value = nonEmptyString(data[field]);
+  if (!value) throw new HappierCliError("session", `Happier direct session ensure returned an empty ${field}`);
+  return value;
+}
+
+export async function ensureHappierDirectSession(input: {
+  uri: string;
+  machineId?: string;
+  settings: HappierCliSettings;
+}): Promise<HappierDirectSessionEnsureResult> {
+  const args = ["direct-session", "ensure", "--uri", input.uri];
+  if (input.machineId !== undefined) args.push("--machine-id", input.machineId);
+  args.push("--json");
+
+  const data = ensureRecord(
+    await invokeHappierJsonForKind(args, "direct_session_ensure", input.settings),
+    "direct session ensure",
+  );
+  const providerId = directSessionString(data, "providerId");
+  if (!HAPPIER_BACKENDS.includes(providerId as HappierBackend)) {
+    throw new HappierCliError("backend", `Unsupported Happier backend: ${providerId}`);
+  }
+  if (typeof data.created !== "boolean") {
+    throw new HappierCliError("session", "Happier direct session ensure returned an invalid created flag");
+  }
+
+  return {
+    providerId: providerId as HappierBackend,
+    remoteSessionId: directSessionString(data, "remoteSessionId"),
+    machineId: directSessionString(data, "machineId"),
+    serverId: directSessionString(data, "serverId"),
+    sessionId: directSessionString(data, "sessionId"),
+    created: data.created,
+    openUrl: directSessionString(data, "openUrl"),
+  };
 }
 
 export async function createHappierSession(

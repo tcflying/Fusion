@@ -11,8 +11,10 @@ vi.mock("node:child_process", async (importOriginal) => ({
 
 import {
   archiveHappierSession,
+  buildHappierSessionOpenUrl,
   buildHappierInvocation,
   createHappierSession,
+  ensureHappierDirectSession,
   getHappierSessionHistory,
   getHappierSessionStatus,
   invokeHappierJson,
@@ -32,6 +34,8 @@ const HISTORY_SUCCESS =
   '{"v":1,"ok":true,"kind":"session_history","data":{"sessionId":"sess_integration_history_123","format":"raw","messages":[{"id":"message-1","localId":"local-1","createdAt":1,"role":"user","raw":{"content":{"type":"text","text":"hello"}}}]}}';
 const AUTH_FAILURE =
   '{"v":1,"ok":false,"kind":"session_send","error":{"code":"not_authenticated","message":"accessToken=do-not-leak"}}';
+const DIRECT_SESSION_SUCCESS =
+  '{"v":1,"ok":true,"kind":"direct_session_ensure","data":{"providerId":"codex","remoteSessionId":"remote-1","machineId":"machine-1","serverId":"server-1","sessionId":"session-1","created":true,"openUrl":"https://app.happier.dev/session/session-1"}}';
 
 function settings(overrides: Partial<HappierCliSettings> = {}): HappierCliSettings {
   return {
@@ -311,6 +315,121 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
+  it("ensures a direct session with exact shell-free argv and stack settings", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const uri = "happier://direct/session?provider=codex&name=$(whoami)";
+    const machineId = "machine id; echo pwned";
+    const promise = ensureHappierDirectSession({
+      uri,
+      machineId,
+      settings: settings({
+        executable: "C:\\Program Files\\Happier\\happier.exe",
+        serverUrl: "https://server.example/path with spaces",
+        profile: "profile & safe",
+        homeDir: "C:\\Happier Home\\stack;safe",
+      }),
+    });
+    fake.stdout(DIRECT_SESSION_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).resolves.toEqual({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      machineId: "machine-1",
+      serverId: "server-1",
+      sessionId: "session-1",
+      created: true,
+      openUrl: "https://app.happier.dev/session/session-1",
+    });
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "C:\\Program Files\\Happier\\happier.exe",
+      [
+        "--server-url",
+        "https://server.example/path with spaces",
+        "--profile",
+        "profile & safe",
+        "direct-session",
+        "ensure",
+        "--uri",
+        uri,
+        "--machine-id",
+        machineId,
+        "--json",
+      ],
+      expect.objectContaining({
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: expect.objectContaining({ HAPPIER_HOME_DIR: "C:\\Happier Home\\stack;safe" }),
+      }),
+    );
+  });
+
+  it("omits machine-id when ensuring a direct session without one", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = ensureHappierDirectSession({ uri: "happier://direct/codex/remote-1", settings: settings() });
+    fake.stdout(DIRECT_SESSION_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).resolves.toMatchObject({ sessionId: "session-1" });
+    expect(mockSpawn.mock.calls[0]?.[1]).toEqual([
+      "direct-session",
+      "ensure",
+      "--uri",
+      "happier://direct/codex/remote-1",
+      "--json",
+    ]);
+  });
+
+  it.each([
+    ["malformed envelope", "not-json", 0, "invalid-json"],
+    [
+      "wrong envelope kind",
+      '{"v":1,"ok":true,"kind":"session_create","data":{"providerId":"codex","remoteSessionId":"remote-1","machineId":"machine-1","serverId":"server-1","sessionId":"session-1","created":true,"openUrl":"https://app/session-1"}}',
+      0,
+      "invalid-json",
+    ],
+    ["non-zero exit", "not-json", 17, "process"],
+  ])("preserves typed errors for %s", async (_name, stdout, exitCode, expectedCode) => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = ensureHappierDirectSession({ uri: "happier://direct/codex/remote-1", settings: settings() });
+    fake.stdout(stdout);
+    fake.close(exitCode);
+
+    await expect(promise).rejects.toMatchObject({ code: expectedCode });
+  });
+
+  it.each(["providerId", "remoteSessionId", "sessionId"] as const)(
+    "rejects a successful direct-session envelope with empty %s",
+    async (field) => {
+      const fake = fakeChild();
+      mockSpawn.mockReturnValue(fake.child);
+      const data = {
+        providerId: "codex",
+        remoteSessionId: "remote-1",
+        machineId: "machine-1",
+        serverId: "server-1",
+        sessionId: "session-1",
+        created: true,
+        openUrl: "https://app/session-1",
+        [field]: "   ",
+      };
+      const promise = ensureHappierDirectSession({ uri: "happier://direct/codex/remote-1", settings: settings() });
+      fake.stdout(JSON.stringify({ v: 1, ok: true, kind: "direct_session_ensure", data }));
+      fake.close(0);
+
+      await expect(promise).rejects.toMatchObject({ code: "session" });
+    },
+  );
+
+  it("normalizes the webapp trailing slash and encodes session-open ids", () => {
+    expect(buildHappierSessionOpenUrl("https://app.happier.dev/", "server/id", "session id?#")).toBe(
+      "https://app.happier.dev/session/server%2Fid/session%20id%3F%23",
+    );
+  });
+
   it("retries a bounded synchronous Windows spawn file lock", async () => {
     const recovered = fakeChild();
     mockSpawn
@@ -424,6 +543,7 @@ describe("package entrypoint", () => {
   it("exports the Task 1 contract from src/index.ts", async () => {
     const entry = await import("../index.js");
     expect(entry.createHappierSession).toBeTypeOf("function");
+    expect(entry.ensureHappierDirectSession).toBeTypeOf("function");
     expect(entry.invokeHappierJson).toBeTypeOf("function");
-  });
+  }, 15_000);
 });

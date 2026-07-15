@@ -55,6 +55,8 @@ const plugin: FusionPlugin = definePlugin({
 
 export default plugin;
 
+export { ensureHappierDirectSession } from "./cli-spawn.js";
+export type { HappierDirectSessionEnsureResult } from "./types.js";
 export * from "./cli-spawn.js";
 export * from "./operations.js";
 export * from "./probe.js";
