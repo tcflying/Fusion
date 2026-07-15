@@ -3689,3 +3689,189 @@ Mobile Task Detail needs a shorter embedded terminal than the desktop/tablet she
     min-height: min(50dvh, calc(var(--space-2xl) * 11));
   }
 }
+
+/*
+FNXC:HappierDirectSession 2026-07-15-21:02:
+The task-bound Happier card shares Task Detail tokens, keeps every flex child shrinkable, and wraps full identifiers. Mobile stacks URI, machine, and action controls so the card never introduces horizontal modal scrolling.
+*/
+.happier-direct-session-card {
+  max-width: 100%;
+  min-width: 0;
+  margin: var(--space-sm) 0;
+  padding: var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-secondary);
+  overflow-x: hidden;
+}
+
+.happier-direct-session-card__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+  min-width: 0;
+}
+
+.happier-direct-session-card__header > div {
+  min-width: 0;
+}
+
+.happier-direct-session-card__header h3,
+.happier-direct-session-card__header p {
+  margin: 0;
+}
+
+.happier-direct-session-card__header p {
+  margin-top: var(--space-xs);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.happier-direct-session-card__status {
+  flex: 0 0 auto;
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.happier-direct-session-card__status--connected {
+  color: var(--color-success);
+}
+
+.happier-direct-session-card__form-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-sm);
+  min-width: 0;
+  margin-top: var(--space-md);
+}
+
+.happier-direct-session-card__uri-field,
+.happier-direct-session-card__machine-field,
+.happier-direct-session-card__machine-details,
+.happier-direct-session-card__machine-details label {
+  min-width: 0;
+}
+
+.happier-direct-session-card__uri-field {
+  flex: 1 1 auto;
+}
+
+.happier-direct-session-card__machine-field,
+.happier-direct-session-card__machine-details {
+  flex: 0 1 16rem;
+}
+
+.happier-direct-session-card__uri-field,
+.happier-direct-session-card__machine-field,
+.happier-direct-session-card__machine-details label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.happier-direct-session-card__machine-details summary {
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.happier-direct-session-card__machine-details label {
+  margin-top: var(--space-xs);
+}
+
+.happier-direct-session-card__form-row input,
+.happier-direct-session-card__form-row select {
+  width: 100%;
+  min-width: 0;
+}
+
+.happier-direct-session-card__ids {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+  margin: var(--space-md) 0 0;
+}
+
+.happier-direct-session-card__id-row {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.3fr) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-sm);
+  min-width: 0;
+}
+
+.happier-direct-session-card__id-row dt {
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.happier-direct-session-card__id-row dd {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-xs);
+  min-width: 0;
+  margin: 0;
+}
+
+.happier-direct-session-card__id-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.happier-direct-session-card__actions,
+.happier-direct-session-card__error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  min-width: 0;
+  margin-top: var(--space-md);
+}
+
+.happier-direct-session-card__error {
+  justify-content: space-between;
+  color: var(--color-error);
+}
+
+.happier-direct-session-card__error > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 768px) {
+  .happier-direct-session-card__header,
+  .happier-direct-session-card__error {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .happier-direct-session-card__actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .happier-direct-session-card__form-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .happier-direct-session-card__status {
+    align-self: flex-start;
+  }
+
+  .happier-direct-session-card__machine-field,
+  .happier-direct-session-card__machine-details {
+    flex-basis: auto;
+  }
+
+  .happier-direct-session-card__id-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

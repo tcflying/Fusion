@@ -45,6 +45,7 @@ import { TaskPlannerChatTab } from "./TaskPlannerChatTab";
 import { TaskReviewTab } from "./TaskReviewTab";
 import { TaskChangesTab } from "./TaskChangesTab";
 import { TaskSummaryTab } from "./TaskSummaryTab";
+import { HappierDirectSessionCard } from "./HappierDirectSessionCard";
 import { TaskCostTab } from "./TaskCostTab";
 import { WorkspaceWorktreesSummary, isWorkspaceTask } from "./WorkspaceWorktreesSummary";
 import { TaskForm, type PendingImage } from "./TaskForm";
@@ -4878,6 +4879,15 @@ export function TaskDetailContent({
           )}
           {!isEditing && (
             <>
+          {/*
+            FNXC:HappierDirectSession 2026-07-15-21:02:
+            Keep the task-scoped Happier binding in the always-visible detail summary area rather than gating it on a live CLI terminal. The card reports paused bindings as not running and deliberately has no Start action.
+          */}
+          <HappierDirectSessionCard
+            taskId={task.id}
+            projectId={projectId}
+            taskPaused={Boolean(task.paused || task.userPaused || task.status === "paused")}
+          />
           <div className="detail-tabs">
             {/*
               FNXC:TaskDetailActivityFirst 2026-06-30-23:59:
