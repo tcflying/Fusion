@@ -20,8 +20,8 @@
 
 ## 3. Session Connector and Happier adapter
 
-- [ ] 3.1 Add RED contract tests for connector capability states, exact ensure/create, status, history cursors, events, send acknowledgements, interrupt/resume, host affinity, health, and deep links.
-- [ ] 3.2 Introduce the provider-neutral Session Connector registry in the natural plugin/runtime owner without provider-name branching in Room orchestration.
+- [x] 3.1 Add RED contract tests for connector capability states, exact ensure/create, status, history cursors, events, send acknowledgements, interrupt/resume, host affinity, health, and deep links.
+- [x] 3.2 Introduce the provider-neutral Session Connector registry in the natural plugin/runtime owner without provider-name branching in Room orchestration.
 - [ ] 3.3 Adapt the existing Happier runtime plugin's reviewed CLI runner and Direct Session wrapper to implement connector ensure/status/history/send while preserving its current AgentRuntime API.
 - [ ] 3.4 Add logical/local message IDs to connector sends and persist native acknowledgements/cursors without logging message content or credentials in run audit.
 - [ ] 3.5 Implement event-first transcript/status ingestion using certified Happier event surfaces, with bounded history polling for startup, reconnect, gap repair, and degraded mode.

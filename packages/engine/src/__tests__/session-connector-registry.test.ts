@@ -1,0 +1,399 @@
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  SESSION_CONNECTOR_CAPABILITIES,
+  type SessionConnectorCapabilitiesV1,
+  type SessionConnectorCapabilityName,
+  type SessionConnectorCapabilityState,
+  type SessionConnectorControlResultV1,
+  type SessionConnectorDeepLinksV1,
+  type SessionConnectorEventV1,
+  type SessionConnectorHealthV1,
+  type SessionConnectorHistoryPageV1,
+  type SessionConnectorIdentityV1,
+  type SessionConnectorResultV1,
+  type SessionConnectorSendReceiptV1,
+  type SessionConnectorStatusV1,
+  type SessionConnectorV1,
+} from "@fusion/core";
+import { SessionConnectorRegistry } from "../session-connector-registry.js";
+
+const NOW = "2026-07-17T10:00:00.000Z";
+const IDENTITY = {
+  connectorId: "happier",
+  providerId: "codex",
+  nativeSessionId: "codex-thread-1",
+  happierSessionId: "happier-session-1",
+  serverProfileId: "happier-server-1",
+  machineId: "happier-machine-1",
+  hostId: "windows-host-1",
+} satisfies SessionConnectorIdentityV1;
+
+function ok<T>(value: T): SessionConnectorResultV1<T> {
+  return { ok: true, value };
+}
+
+function capabilityMatrix(
+  overrides: Partial<Record<SessionConnectorCapabilityName, SessionConnectorCapabilityState>> = {},
+): SessionConnectorCapabilitiesV1 {
+  const capabilities = Object.fromEntries(
+    SESSION_CONNECTOR_CAPABILITIES.map((name) => {
+      const state = overrides[name] ?? "verified";
+      return [name, {
+        state,
+        evidenceRef: state === "verified" ? `evidence://happier/${name}` : null,
+        reason: state === "verified" ? undefined : `${name} is ${state}`,
+        lastVerifiedAt: NOW,
+      }];
+    }),
+  ) as unknown as SessionConnectorCapabilitiesV1["capabilities"];
+  return {
+    contractVersion: 1,
+    connectorId: "happier",
+    connectorVersion: "0.2.73",
+    sourceRevision: "happier-source-revision",
+    verifiedAt: NOW,
+    capabilities,
+  };
+}
+
+async function* eventStream(): AsyncIterable<SessionConnectorEventV1> {
+  yield {
+    connectorEventId: "connector-event-8",
+    identity: IDENTITY,
+    eventType: "message",
+    cursor: "8",
+    occurredAt: NOW,
+    payload: { nativeMessageId: "native-message-8" },
+  };
+  yield {
+    connectorEventId: "connector-event-9",
+    identity: IDENTITY,
+    eventType: "status",
+    cursor: "9",
+    occurredAt: NOW,
+    payload: { state: "idle" },
+  };
+}
+
+function makeConnector(input: {
+  readonly capabilities?: () => SessionConnectorCapabilitiesV1;
+} = {}): SessionConnectorV1 {
+  return {
+    contractVersion: 1,
+    id: "happier",
+    version: "0.2.73",
+    getCapabilities: vi.fn(async () => (
+      input.capabilities?.() ?? capabilityMatrix()
+    )),
+    ensureExisting: vi.fn(async () => ok({
+      identity: IDENTITY,
+      createdLink: true,
+      providerTurnStarted: false,
+      attachedAt: NOW,
+      capabilities: capabilityMatrix(),
+    })),
+    create: vi.fn(async () => ok({
+      ...IDENTITY,
+      providerId: "opencode",
+      nativeSessionId: "opencode-session-created",
+      happierSessionId: "happier-session-created",
+    })),
+    getStatus: vi.fn(async () => ok<SessionConnectorStatusV1>({
+      identity: IDENTITY,
+      state: "idle",
+      lastActivityAt: NOW,
+      connectorCursor: "7",
+      nativeWriterDetected: false,
+    })),
+    readHistory: vi.fn(async () => ok<SessionConnectorHistoryPageV1>({
+      items: [{
+        nativeMessageId: "native-message-8",
+        logicalMessageId: "room-message-8",
+        role: "assistant",
+        contentHash: "sha256:history-message-8",
+        occurredAt: NOW,
+        cursor: "8",
+      }],
+      nextCursor: "8",
+      completeThroughCursor: "8",
+    })),
+    subscribeEvents: vi.fn(async () => ok(eventStream())),
+    send: vi.fn(async () => ok<SessionConnectorSendReceiptV1>({
+      outcome: "confirmed",
+      connectorAcknowledgementId: "happier-ack-10",
+      nativeMessageId: "native-message-10",
+      cursor: "10",
+      acceptedAt: NOW,
+    })),
+    interrupt: vi.fn(async () => ok<SessionConnectorControlResultV1>({
+      state: "completed",
+      connectorAcknowledgementId: "interrupt-ack-1",
+    })),
+    resume: vi.fn(async () => ok<SessionConnectorControlResultV1>({
+      state: "completed",
+      connectorAcknowledgementId: "resume-ack-1",
+    })),
+    takeover: vi.fn(async () => ok<SessionConnectorControlResultV1>({
+      state: "accepted",
+      connectorAcknowledgementId: "takeover-ack-1",
+    })),
+    getHealth: vi.fn(async () => ({
+      connectorId: "happier",
+      hostId: IDENTITY.hostId,
+      state: "healthy",
+      checkedAt: NOW,
+      safeReason: null,
+      retryAfterMs: null,
+    } satisfies SessionConnectorHealthV1)),
+    getDeepLinks: vi.fn(async () => ok<SessionConnectorDeepLinksV1>({
+      happierUrl: "http://127.0.0.1:18287/session/happier-session-1",
+      nativeSessionUrl: "codex://threads/codex-thread-1",
+    })),
+  };
+}
+
+async function requireVerified(
+  registry: SessionConnectorRegistry,
+  capability: SessionConnectorCapabilityName,
+): Promise<SessionConnectorV1> {
+  return registry.requireVerified({
+    connectorId: "happier",
+    capability,
+    identity: IDENTITY,
+    requiredHostId: IDENTITY.hostId,
+  });
+}
+
+describe("provider-neutral Session Connector registry contract", () => {
+  it("registers by connector identity and rejects duplicate or unknown connectors", () => {
+    const registry = new SessionConnectorRegistry();
+    const connector = makeConnector();
+    registry.register(connector);
+
+    expect(registry.get("happier")).toBe(connector);
+    expect(registry.all()).toEqual([connector]);
+    expect(() => registry.register(makeConnector())).toThrow(expect.objectContaining({
+      code: "SESSION_CONNECTOR_DUPLICATE",
+      connectorId: "happier",
+    }));
+    expect(() => registry.get("missing")).toThrow(expect.objectContaining({
+      code: "SESSION_CONNECTOR_UNKNOWN",
+      connectorId: "missing",
+    }));
+  });
+
+  it("fails closed for degraded, unavailable, or unverified operations and enforces host affinity", async () => {
+    let overrides: Partial<Record<SessionConnectorCapabilityName, SessionConnectorCapabilityState>> = {};
+    const connector = makeConnector({ capabilities: () => capabilityMatrix(overrides) });
+    const registry = new SessionConnectorRegistry();
+    registry.register(connector);
+
+    await expect(requireVerified(registry, "send")).resolves.toBe(connector);
+    for (const state of ["degraded", "unavailable", "unverified"] as const) {
+      overrides = { send: state };
+      await expect(requireVerified(registry, "send")).rejects.toMatchObject({
+        code: "SESSION_CONNECTOR_CAPABILITY_NOT_VERIFIED",
+        connectorId: "happier",
+        capability: "send",
+        state,
+      });
+    }
+
+    overrides = {};
+    await expect(registry.requireVerified({
+      connectorId: "happier",
+      capability: "history",
+      identity: IDENTITY,
+      requiredHostId: "another-windows-host",
+    })).rejects.toMatchObject({
+      code: "SESSION_CONNECTOR_HOST_AFFINITY",
+      connectorId: "happier",
+      expectedHostId: "another-windows-host",
+      actualHostId: IDENTITY.hostId,
+    });
+    await expect(registry.requireVerified({
+      connectorId: "happier",
+      capability: "status",
+      identity: { ...IDENTITY, connectorId: "different-connector" },
+      requiredHostId: IDENTITY.hostId,
+    })).rejects.toMatchObject({
+      code: "SESSION_CONNECTOR_IDENTITY_CONFLICT",
+    });
+  });
+
+  it("rejects malformed dynamic connector and capability registrations with typed contract errors", async () => {
+    const registry = new SessionConnectorRegistry();
+    expect(() => registry.register({
+      ...makeConnector(),
+      send: undefined,
+    } as unknown as SessionConnectorV1)).toThrow(expect.objectContaining({
+      code: "SESSION_CONNECTOR_CONTRACT_CONFLICT",
+      connectorId: "happier",
+    }));
+
+    const connector = makeConnector({
+      capabilities: () => ({
+        ...capabilityMatrix(),
+        connectorId: "another-connector",
+      }),
+    });
+    registry.register(connector);
+    await expect(requireVerified(registry, "status")).rejects.toMatchObject({
+      code: "SESSION_CONNECTOR_CONTRACT_CONFLICT",
+      connectorId: "happier",
+    });
+  });
+
+  it("preserves exact existing-session ensure and explicit new-session creation requests", async () => {
+    const connector = makeConnector();
+    const registry = new SessionConnectorRegistry();
+    registry.register(connector);
+    const ensureRequest = {
+      contractVersion: 1 as const,
+      canonicalSessionUri: "codex://threads/codex-thread-1",
+      requiredHostId: IDENTITY.hostId,
+      requiredMachineId: IDENTITY.machineId!,
+      idempotencyKey: "ensure:codex-thread-1",
+    };
+    const ensured = await (await requireVerified(registry, "ensureExisting"))
+      .ensureExisting(ensureRequest);
+    expect(connector.ensureExisting).toHaveBeenCalledWith(ensureRequest);
+    expect(ensured).toMatchObject({
+      ok: true,
+      value: {
+        identity: IDENTITY,
+        createdLink: true,
+        providerTurnStarted: false,
+      },
+    });
+
+    const createRequest = {
+      contractVersion: 1 as const,
+      providerId: "opencode",
+      modelId: "provider-default",
+      accountId: "account-profile-1",
+      hostId: IDENTITY.hostId,
+      workingDirectory: "G:\\codex-project\\new-room-worker",
+      idempotencyKey: "create:room-1:seat-2",
+    };
+    const created = await (await requireVerified(registry, "create")).create(createRequest);
+    expect(connector.create).toHaveBeenCalledWith(createRequest);
+    expect(created).toMatchObject({
+      ok: true,
+      value: {
+        providerId: "opencode",
+        nativeSessionId: "opencode-session-created",
+        hostId: IDENTITY.hostId,
+      },
+    });
+  });
+
+  it("routes status, bounded history cursors, and ordered events without provider branching", async () => {
+    const connector = makeConnector();
+    const registry = new SessionConnectorRegistry();
+    registry.register(connector);
+
+    const status = await (await requireVerified(registry, "status")).getStatus(IDENTITY);
+    expect(connector.getStatus).toHaveBeenCalledWith(IDENTITY);
+    expect(status).toMatchObject({ ok: true, value: { connectorCursor: "7", state: "idle" } });
+
+    const historyRequest = {
+      contractVersion: 1 as const,
+      identity: IDENTITY,
+      afterCursor: "7",
+      limit: 50,
+    };
+    const history = await (await requireVerified(registry, "history")).readHistory(historyRequest);
+    expect(connector.readHistory).toHaveBeenCalledWith(historyRequest);
+    expect(history).toMatchObject({
+      ok: true,
+      value: {
+        nextCursor: "8",
+        completeThroughCursor: "8",
+        items: [{ cursor: "8", logicalMessageId: "room-message-8" }],
+      },
+    });
+
+    const subscription = await (await requireVerified(registry, "events"))
+      .subscribeEvents(IDENTITY);
+    expect(connector.subscribeEvents).toHaveBeenCalledWith(IDENTITY);
+    if (!subscription.ok) throw new Error(subscription.error.message);
+    const events: SessionConnectorEventV1[] = [];
+    for await (const event of subscription.value) events.push(event);
+    expect(events.map((event) => [event.cursor, event.eventType])).toEqual([
+      ["8", "message"],
+      ["9", "status"],
+    ]);
+  });
+
+  it("carries stable logical/local send identity and returns native acknowledgement evidence", async () => {
+    const connector = makeConnector();
+    const registry = new SessionConnectorRegistry();
+    registry.register(connector);
+    const sendRequest = {
+      contractVersion: 1 as const,
+      bindingId: "binding-1",
+      identity: IDENTITY,
+      logicalMessageId: "room-message-10",
+      idempotencyKey: "room-message-10:binding-1",
+      content: "Continue the exact native Session.",
+      contentHash: "sha256:room-message-10",
+    };
+
+    const receipt = await (await requireVerified(registry, "send")).send(sendRequest);
+    expect(connector.send).toHaveBeenCalledWith(sendRequest);
+    expect(receipt).toEqual(ok({
+      outcome: "confirmed",
+      connectorAcknowledgementId: "happier-ack-10",
+      nativeMessageId: "native-message-10",
+      cursor: "10",
+      acceptedAt: NOW,
+    }));
+  });
+
+  it("routes certified interrupt, resume, and takeover controls with exact identity", async () => {
+    const connector = makeConnector();
+    const registry = new SessionConnectorRegistry();
+    registry.register(connector);
+    const controlRequest = {
+      contractVersion: 1 as const,
+      identity: IDENTITY,
+      idempotencyKey: "control:binding-1:turn-1",
+      reason: "Operator requested a safe turn boundary",
+    };
+
+    expect(await (await requireVerified(registry, "interrupt")).interrupt(controlRequest))
+      .toMatchObject({ ok: true, value: { connectorAcknowledgementId: "interrupt-ack-1" } });
+    expect(await (await requireVerified(registry, "resume")).resume(controlRequest))
+      .toMatchObject({ ok: true, value: { connectorAcknowledgementId: "resume-ack-1" } });
+    expect(await (await requireVerified(registry, "takeover")).takeover(controlRequest))
+      .toMatchObject({ ok: true, value: { connectorAcknowledgementId: "takeover-ack-1" } });
+    expect(connector.interrupt).toHaveBeenCalledWith(controlRequest);
+    expect(connector.resume).toHaveBeenCalledWith(controlRequest);
+    expect(connector.takeover).toHaveBeenCalledWith(controlRequest);
+  });
+
+  it("returns host-scoped health and rebuildable Happier/native deep links", async () => {
+    const connector = makeConnector();
+    const registry = new SessionConnectorRegistry();
+    registry.register(connector);
+
+    const health = await (await requireVerified(registry, "health")).getHealth(IDENTITY.hostId);
+    expect(health).toEqual({
+      connectorId: "happier",
+      hostId: IDENTITY.hostId,
+      state: "healthy",
+      checkedAt: NOW,
+      safeReason: null,
+      retryAfterMs: null,
+    });
+    const links = await (await requireVerified(registry, "deepLinks")).getDeepLinks(IDENTITY);
+    expect(links).toEqual(ok({
+      happierUrl: "http://127.0.0.1:18287/session/happier-session-1",
+      nativeSessionUrl: "codex://threads/codex-thread-1",
+    }));
+    expect(connector.getHealth).toHaveBeenCalledWith(IDENTITY.hostId);
+    expect(connector.getDeepLinks).toHaveBeenCalledWith(IDENTITY);
+  });
+});

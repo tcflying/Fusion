@@ -1,4 +1,5 @@
 export { AgentLogger, type AgentLoggerOptions, summarizeToolArgs } from "./agent-logger.js";
+export * from "./session-connector-registry.js";
 export { reloadExemptTools, addToExemptTools, getExemptToolNames } from "./agent-action-gate.js";
 export type { AgentActionGateContext } from "./agent-action-gate.js";
 export { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
