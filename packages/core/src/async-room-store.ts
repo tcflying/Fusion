@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { and, asc, eq, inArray } from "drizzle-orm";
 
 import {
@@ -17,6 +17,7 @@ import type {
   RoomOutboxRecordV1,
 } from "./room-contracts/storage.js";
 import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
+import { compareRoomText, hashRoomValue } from "./room-integrity.js";
 import {
   operationalRooms,
   roomBindings,
@@ -206,9 +207,15 @@ export class AsyncRoomStore {
         updatedAt: aggregate.room.updatedAt,
       });
       const event = await insertRoomEvent(tx, aggregate, "room_created", context, {
+        projectionVersion: 1,
+        objective: aggregate.room.objective,
         lifecycleState: aggregate.room.state,
         protocolId: aggregate.room.protocolId,
         protocolVersion: aggregate.room.protocolVersion,
+        membershipVersion: aggregate.membershipVersion,
+        activeTurnId: aggregate.activeTurnId,
+        createdAt: aggregate.room.createdAt,
+        updatedAt: aggregate.room.updatedAt,
       });
       return { aggregate, event };
     });
@@ -222,7 +229,7 @@ export class AsyncRoomStore {
     context: RoomCommandContext,
   ): Promise<RoomAggregateV1> {
     const committed = await this.layer.transactionImmediate(async (tx) => {
-      const current = await loadRoomAggregate(tx, this.projectId, roomId);
+      const current = await loadRoomAggregateProjection(tx, this.projectId, roomId);
       if (!current) {
         throw new RoomDomainError("room_state_conflict", `Operational Room ${roomId} does not exist`);
       }
@@ -250,8 +257,10 @@ export class AsyncRoomStore {
         );
       }
       const event = await insertRoomEvent(tx, next, "room_lifecycle_transitioned", context, {
+        projectionVersion: 1,
         from: current.room.state,
         to: next.room.state,
+        updatedAt: next.room.updatedAt,
       });
       return { aggregate: next, event };
     });
@@ -260,22 +269,11 @@ export class AsyncRoomStore {
   }
 
   async getRoom(roomId: string): Promise<RoomAggregateV1 | undefined> {
-    return loadRoomAggregate(this.layer.db, this.projectId, roomId);
+    return loadRoomAggregateProjection(this.layer.db, this.projectId, roomId);
   }
 
   async listEvents(roomId: string, afterCursor?: string): Promise<RoomEventRecordV1[]> {
-    const cursor = afterCursor === undefined ? undefined : Number(afterCursor);
-    if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
-      throw new Error(`Invalid Room event cursor: ${afterCursor}`);
-    }
-    const rows = await this.layer.db
-      .select()
-      .from(roomEvents)
-      .where(and(eq(roomEvents.projectId, this.projectId), eq(roomEvents.roomId, roomId)))
-      .orderBy(asc(roomEvents.cursor));
-    return rows
-      .filter((row) => cursor === undefined || Number(row.cursor) > cursor)
-      .map(rowToRoomEvent);
+    return loadRoomEvents(this.layer.db, this.projectId, roomId, afterCursor);
   }
 
   /**
@@ -292,8 +290,8 @@ export class AsyncRoomStore {
     input: EnqueueRoomMessageInput,
     context: RoomCommandContext,
   ): Promise<EnqueueRoomMessageResult> {
-    const contentHash = hashValue(input.message.content);
-    const commandHash = hashValue({
+    const contentHash = hashRoomValue(input.message.content);
+    const commandHash = hashRoomValue({
       roomId: input.roomId,
       message: {
         id: input.message.id,
@@ -301,7 +299,7 @@ export class AsyncRoomStore {
         nodeId: input.message.nodeId,
         originType: input.message.originType,
         originId: input.message.originId,
-        targetSeatIds: [...input.message.targetSeatIds].sort(compareText),
+        targetSeatIds: [...input.message.targetSeatIds].sort(compareRoomText),
         intent: input.message.intent,
         contentHash,
         authorityEnvelope: input.message.authorityEnvelope,
@@ -309,11 +307,11 @@ export class AsyncRoomStore {
       },
       deliveries: [...input.deliveries]
         .map((delivery) => ({ id: delivery.id, bindingId: delivery.bindingId }))
-        .sort((left, right) => compareText(left.id, right.id) || compareText(left.bindingId, right.bindingId)),
+        .sort((left, right) => compareRoomText(left.id, right.id) || compareRoomText(left.bindingId, right.bindingId)),
     });
 
     const committed = await this.layer.transactionImmediate(async (tx) => {
-      const current = await loadRoomAggregate(tx, this.projectId, input.roomId);
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
       if (!current) {
         throw new RoomDomainError(
           "room_state_conflict",
@@ -447,8 +445,10 @@ export class AsyncRoomStore {
       await tx.insert(roomOutbox).values(outboxValues);
 
       const event = await insertRoomEvent(tx, next, "room_message_queued", context, {
+        projectionVersion: 1,
         messageId: input.message.id,
         outboxIds: input.deliveries.map((delivery) => delivery.id),
+        updatedAt: next.room.updatedAt,
       });
       const linked = await tx
         .update(roomIdempotencyKeys)
@@ -932,48 +932,17 @@ function deliveryStateForOutcome(
   }
 }
 
-function hashValue(value: unknown): string {
-  return `sha256:${createHash("sha256").update(stableSerialize(value), "utf8").digest("hex")}`;
-}
-
-function stableSerialize(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(",")}]`;
-  switch (typeof value) {
-    case "string":
-    case "boolean":
-      return JSON.stringify(value);
-    case "number":
-      if (!Number.isFinite(value)) throw new Error("Cannot hash a non-finite number");
-      return JSON.stringify(value);
-    case "object": {
-      const entries = Object.entries(value as Record<string, unknown>)
-        .filter(([, entry]) => entry !== undefined)
-        .sort(([left], [right]) => compareText(left, right));
-      return `{${entries
-        .map(([key, entry]) => `${JSON.stringify(key)}:${stableSerialize(entry)}`)
-        .join(",")}}`;
-    }
-    default:
-      throw new Error(`Cannot hash unsupported value type ${typeof value}`);
-  }
-}
-
 function asRecord(value: unknown): Readonly<Record<string, unknown>> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Readonly<Record<string, unknown>>
     : {};
 }
 
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function loadRoomAggregate(
+export async function loadRoomAggregateProjection(
   handle: QueryHandle,
   projectId: string,
   roomId: string,
@@ -1070,6 +1039,26 @@ async function loadRoomAggregate(
     })),
     pendingMembershipChanges: membershipRows.map(rowToPendingMembershipChange),
   };
+}
+
+export async function loadRoomEvents(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  afterCursor?: string,
+): Promise<RoomEventRecordV1[]> {
+  const cursor = afterCursor === undefined ? undefined : Number(afterCursor);
+  if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
+    throw new Error(`Invalid Room event cursor: ${afterCursor}`);
+  }
+  const rows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.roomId, roomId)))
+    .orderBy(asc(roomEvents.cursor));
+  return rows
+    .filter((row) => cursor === undefined || Number(row.cursor) > cursor)
+    .map(rowToRoomEvent);
 }
 
 async function insertRoomEvent(
