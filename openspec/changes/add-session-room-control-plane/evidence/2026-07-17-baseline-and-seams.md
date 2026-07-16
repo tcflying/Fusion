@@ -123,3 +123,41 @@ The pinned one-to-one bridge and Happier exact-link command are healthy on their
 - Compatibility reruns after the contract exports passed the legacy binding file 15/15, Direct Session card file 22/22, and Happier runtime plugin entry file 4/4.
 - Scoped ESLint reported zero errors. Five test files were explicitly ignored by the repository lint policy and reported as warnings, so this is not presented as proof that those ignored tests were linted; they are instead covered by the passing Vitest runs above.
 - Worktree-local CodeGraph sync added/updated the contract surfaces and finished `up to date` at 4,339 files, 64,133 nodes, and 259,088 edges.
+
+## Task 2.1 Room-domain RED evidence
+
+- Added five behavior tests covering project-scoped draft creation, optimistic aggregate versions, invalid lifecycle transitions, terminal-outcome immutability with archive-only closure, arbitrary stable participant seats, duplicate-seat rejection, immutable binding generations, and deferred replacement at a settled turn boundary.
+- RED is real: the focused Vitest run failed before collection because `../room-domain.js` does not yet exist. No placeholder implementation, skip, mock, or weakened assertion was added.
+
+## Task 2.2 canonical PostgreSQL schema and migration evidence
+
+- Added 24 operational Room tables to Fusion's existing `project` PostgreSQL schema and Drizzle namespace: aggregate, seats, binding lineage, turns, deferred membership, immutable events, task DAG, messages, durable outbox/attempts/inbox, idempotency keys, fenced leases, checkpoints, artifacts/evidence/candidates/reviews/dissent/gates/promotions/confidence, and alerts. No SQLite fallback, plugin-owned database, or third persistence path was introduced.
+- Preserved the immutable `0000` baseline and added ordered `0001_session_rooms.sql`. The schema applier now serializes migrators with a PostgreSQL advisory transaction lock and records each version atomically; new and existing databases use the same ledger.
+- Fixed a packaging edge: operational scripts now refresh all migration assets instead of treating the presence of `0000_initial.sql` as proof that later migrations were staged. The CLI build already refreshes the complete migration directory and its documentation now states that explicitly.
+- Static schema/migration tests passed 2/2 and `@fusion/core` typecheck exited `0`.
+- Real native-Windows embedded PostgreSQL tests passed 2/2: a fresh database applied `[0000, 0001]`, an existing ledger containing only `0000` applied only `[0001]`, a second apply was a no-op, all 24 tables existed, duplicate `(room_id, aggregate_version)` events were rejected, and a child row carrying the wrong `project_id` was rejected by the composite foreign key.
+
+## Task 2.3 Room-domain GREEN evidence
+
+- Implemented immutable optimistic-versioned Room aggregate helpers for creation, lifecycle transitions, stable seat provisioning, exact binding attachment, turn begin/settle, deferred binding replacement, and boundary activation.
+- Terminal outcomes can only move to `archived`; they cannot reopen or change outcome. Active turns fence direct membership changes, and replacement activation requires the referenced turn to be visibly `completed`, `cancelled`, or `uncertain`.
+- Replacement creates the next binding generation, marks the former binding `replaced`, preserves both native identities, and updates the stable seat without mutating the input aggregate.
+- The original RED suite now passes 5/5; `@fusion/core` typecheck, scoped production ESLint, and `git diff --check` all exit `0`.
+
+## Task 2.4 transactional AsyncRoomStore evidence
+
+- Added a project-bound `AsyncRoomStore` on the canonical `AsyncDataLayer`, with create/get/lifecycle/list-events operations, optimistic conditional updates, immutable event append, durable identity cursor, and project scoping.
+- Projection and event writes share one `transactionImmediate`. A forced duplicate event ID rejected the command and the Room projection remained at its prior state/version, proving rollback rather than partial success.
+- Two concurrent lifecycle commands with the same expected aggregate version produced exactly one success, one rejection, and one version-1 event; no last-writer-wins overwrite occurred.
+- Committed-event listeners are queued only after the transaction returns. Listener work and diagnostics failures are isolated from command success so slow UI/notification consumers cannot hold the Room worker or turn a committed command into a blind retry.
+- Real native-Windows embedded PostgreSQL store test passed 1/1. The focused pure suite passed 5 files and 16/16 tests; core typecheck, production ESLint, and diff check all exited `0`.
+
+## Task 2.5 idempotent delivery persistence evidence
+
+- The first focused RED run retained the expected failure: the real PostgreSQL test reached the new concurrent scenario and failed because `AsyncRoomStore.enqueueMessage` did not exist. This was an absent production capability, not a mock or environment failure.
+- `enqueueMessage` now reserves the Room-scoped idempotency key, conditionally advances the aggregate version, stores message content/hash and exact seat targets, creates one outbox row per active binding, appends the causal event, and links the result event to the reservation in one transaction. The event payload stores IDs rather than message content.
+- Two real concurrent commands using the same idempotency key and canonical command hash produce one committed message, one event, one outbox row, and one idempotency row. One caller receives the original result and the other receives a replay of that same event. Reusing the key for different content fails as an idempotency conflict.
+- Delivery attempts use conditional `pending -> dispatching` claims and immutable attempt numbers. A timeout classified as `delivery_uncertain` clears automatic retry scheduling; a later dispatch attempt is rejected until native-session reconciliation resolves whether the external side effect happened.
+- Inbox receipts deduplicate by binding plus native cursor. An identical replay returns the first receipt; the same cursor with a different payload hash fails closed.
+- The final native-Windows embedded PostgreSQL store run passed 2/2. The latest schema/upgrade run passed 2/2, including fresh, incremental, and idempotent migration paths. The focused pure suite passed 5 files and 16/16 tests; core typecheck, production ESLint, and `git diff --check` all exited `0`.
+- An additional probe of the older `schema-applier.test.ts` plus `sqlite-migrator.test.ts` surface reported 34/34 setup failures before product assertions because both harnesses shell out to `psql`, which is not installed or on `PATH` on this Windows host. The bundled `embedded-postgres` package does not provide `psql.exe`. These are retained as infrastructure blockers, not counted as passing tests and not treated as Room regressions; the new embedded-process tests exercise the changed ordered applier directly without Docker, WSL, or the missing client binary.

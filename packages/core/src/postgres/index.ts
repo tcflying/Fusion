@@ -73,15 +73,16 @@ export {
 /**
  * FNXC:PostgresSchema 2026-06-24-03:50:
  * Drizzle schema-as-code for the three application databases (project/central/
- * archive) and plugin-owned tables. The fresh migration baseline
- * (migrations/0000_initial.sql) materializes these definitions; the schema
- * applier applies the baseline + plugin hooks to a connection.
+ * archive) and plugin-owned tables. Ordered SQL migrations materialize these
+ * definitions; the schema applier applies pending migrations + plugin hooks.
  */
 export * as schema from "./schema/index.js";
 export {
   applySchemaBaseline,
   getAppliedMigrations,
   readBaselineMigrationSql,
+  readSchemaMigrationSql,
+  SCHEMA_MIGRATIONS,
   SCHEMA_BASELINE_VERSION,
   // FNXC:StaleBinaryGuard 2026-07-19-03:10 (U9b / R10): old-binary write refusal.
   StaleBinarySchemaError,
@@ -89,7 +90,9 @@ export {
   WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_VERSION,
   PROJECT_OWNERSHIP_SCHEMA_VERSION,
   SESSION_ADVISOR_ENABLED_SCHEMA_VERSION,
+  SCHEMA_ROOM_VERSION,
   MIGRATION_BOOKKEEPING_TABLE,
+  type SchemaMigrationVersion,
 } from "./schema-applier.js";
 export {
   roadmapPluginSchemaInit,

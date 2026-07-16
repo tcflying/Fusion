@@ -443,8 +443,10 @@ const cliBuildConfig = {
     // FNXC:RuntimeStartupWiring 2026-06-24-11:15:
     // FNXC:AutomationIsolation 2026-07-13-22:37: Stage the complete versioned PostgreSQL migration directory (including automation project isolation) into dist/migrations so existing installations upgrade before project cron runners start.
     // Stage the PostgreSQL schema migrations into dist/migrations so the schema applier can read them at runtime after
+    // Stage all ordered PostgreSQL migrations (0000, 0001, ... + meta) into
+    // dist/migrations so the schema applier can read it at runtime after
     // @fusion/core is bundled into dist/bin.js. Without this, the PG boot
-    // path fails with ENOENT for dist/migrations/0000_initial.sql.
+    // path fails with ENOENT for a registered migration file.
     if (existsSync(pgMigrationsSrc)) {
       if (existsSync(pgMigrationsDest)) {
         rmSync(pgMigrationsDest, { recursive: true, force: true });

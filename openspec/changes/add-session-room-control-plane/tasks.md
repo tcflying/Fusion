@@ -8,11 +8,11 @@
 
 ## 2. Room domain and PostgreSQL persistence
 
-- [ ] 2.1 Add RED tests for Room lifecycle states, aggregate versions, participant-seat identity, binding generations, turn-boundary mutations, terminal-state immutability, and invalid transition rejection.
-- [ ] 2.2 Add canonical async/PostgreSQL schema and migrations for operational Rooms, seats, bindings, turns, events, task nodes/edges, messages, outbox delivery, leases, checkpoints, artifacts/candidates/reviews, confidence snapshots, and alerts without introducing a third persistence path.
-- [ ] 2.3 Implement typed Room domain records and transition helpers in focused `@fusion/core` modules, including FNXC requirement comments on the user-facing invariants.
-- [ ] 2.4 Implement `AsyncRoomStore` transactional commands that validate expected aggregate version, append immutable events, update projections, and emit post-commit notifications.
-- [ ] 2.5 Implement idempotency-key storage, transactional outbox/inbox state, delivery attempts, uncertainty states, and duplicate-command handling with concurrent PostgreSQL tests.
+- [x] 2.1 Add RED tests for Room lifecycle states, aggregate versions, participant-seat identity, binding generations, turn-boundary mutations, terminal-state immutability, and invalid transition rejection.
+- [x] 2.2 Add canonical async/PostgreSQL schema and migrations for operational Rooms, seats, bindings, turns, events, task nodes/edges, messages, outbox delivery, leases, checkpoints, artifacts/candidates/reviews, confidence snapshots, and alerts without introducing a third persistence path.
+- [x] 2.3 Implement typed Room domain records and transition helpers in focused `@fusion/core` modules, including FNXC requirement comments on the user-facing invariants.
+- [x] 2.4 Implement `AsyncRoomStore` transactional commands that validate expected aggregate version, append immutable events, update projections, and emit post-commit notifications.
+- [x] 2.5 Implement idempotency-key storage, transactional outbox/inbox state, delivery attempts, uncertainty states, and duplicate-command handling with concurrent PostgreSQL tests.
 - [ ] 2.6 Implement fenced Room, sender, and workspace lease persistence with epoch-based stale-writer rejection and real concurrent-store tests.
 - [ ] 2.7 Implement turn checkpoints and projection rebuild/replay tests from append-only Room events.
 - [ ] 2.8 Implement one-way import of an existing task-bound Happier Session as a one-seat Room and prove import failure leaves the legacy binding untouched.

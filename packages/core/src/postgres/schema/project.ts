@@ -6,8 +6,8 @@
  * packages/core/src/db.ts (SCHEMA_SQL + MIGRATION_ONLY_TABLE_SCHEMAS). Every
  * table, column, CHECK constraint, foreign key with cascade rule, and unique
  * index is preserved one-for-one. This file is the schema-as-code source of
- * truth for the project database; the fresh migration SQL in
- * postgres/migrations/0000_initial.sql materializes it.
+ * truth for the project database; ordered SQL files under
+ * postgres/migrations materialize and upgrade it.
  *
  * SQLite type mapping (binding):
  *   - INTEGER PRIMARY KEY AUTOINCREMENT → integer().generatedAlwaysAsIdentity()
@@ -41,6 +41,9 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { PROJECT_SCHEMA, bytea, tsvector } from "./_shared.js";
+import { ROOM_PROJECT_TABLE_NAMES } from "./room.js";
+
+export * from "./room.js";
 
 /**
  * FNXC:PostgresSchema 2026-06-24-02:25:
@@ -2214,5 +2217,5 @@ export const projectTableNames = [
   "mission_fix_feature_lineage", "verification_cache", "import_translation_cache",
   "approval_requests",
   "approval_request_audit_events", "chat_rooms", "chat_room_members",
-  "chat_room_messages", "chat_token_usage",
+  "chat_room_messages", "chat_token_usage", ...ROOM_PROJECT_TABLE_NAMES,
 ] as const;

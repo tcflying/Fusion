@@ -6,9 +6,8 @@
  * plugin-owned tables. This is the single import surface for the data-layer
  * features (U4+) that need Drizzle table references for type-safe queries.
  *
- * The fresh migration baseline (postgres/migrations/0000_initial.sql) is the
- * materialized snapshot of these definitions; applying it to an empty database
- * yields the schema these Drizzle objects describe (VAL-SCHEMA-001).
+ * Ordered SQL migrations under postgres/migrations materialize these
+ * definitions for fresh and existing databases (VAL-SCHEMA-001).
  */
 
 export {
@@ -20,11 +19,13 @@ export {
 } from "./_shared.js";
 
 export * as project from "./project.js";
+export * as room from "./room.js";
 export * as central from "./central.js";
 export * as archive from "./archive.js";
 export * as plugin from "./plugin.js";
 
 export { projectTableNames } from "./project.js";
+export { ROOM_PROJECT_TABLE_NAMES } from "./room.js";
 export { centralTableNames } from "./central.js";
 export { archiveTableNames } from "./archive.js";
 export { roadmapPluginTableNames, cePluginTableNames, evenRealitiesPluginTableNames, reportsPluginTableNames, cliPressPluginTableNames } from "./plugin.js";

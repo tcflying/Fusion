@@ -41,7 +41,7 @@ FNXC:MigrationStatusRuntimeRead 2026-07-20:
 SCHEMA_BASELINE_VERSION advances to 0030 for project-scoped runtime reads of
 the SQLite cutover ledger.
 */
-export const SCHEMA_BASELINE_VERSION = "0030";
+export const SCHEMA_BASELINE_VERSION = "0031";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -132,6 +132,8 @@ export const BIGINT_COUNTERS_VERSION = "0026";
 export const PLANNING_ACTIVE_TIMING_VERSION = "0029";
 /** Dashboard health needs project-scoped, read-only runtime access to the SQLite cutover ledger. */
 export const SQLITE_MIGRATION_RUNTIME_READ_VERSION = "0030";
+/** FNXC:SessionRoomPostgres 2026-07-21: durable Session Room operational tables. */
+export const SESSION_ROOM_SCHEMA_VERSION = "0031";
 
 /**
  * Thrown when the database was migrated by a NEWER Fusion binary than the one now
@@ -324,6 +326,7 @@ const WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_MIGRATION_PATH = join(
 const PLANNING_ACTIVE_TIMING_MIGRATION_PATH = join(MIGRATIONS_DIR, "0029_planning_active_timing.sql");
 const TASK_DECLARED_SYMBOLS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0028_task_declared_symbols.sql");
 const SQLITE_MIGRATION_RUNTIME_READ_PATH = join(MIGRATIONS_DIR, "0030_sqlite_migration_runtime_read.sql");
+const SESSION_ROOM_MIGRATION_PATH = join(MIGRATIONS_DIR, "0001_session_rooms.sql");
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -422,6 +425,7 @@ export async function applySchemaBaseline(
     const workflowIrPinAndLegacyAdoptionAlreadyApplied = applied.includes(WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_VERSION);
     const planningActiveTimingAlreadyApplied = applied.includes(PLANNING_ACTIVE_TIMING_VERSION);
     const sqliteMigrationRuntimeReadAlreadyApplied = applied.includes(SQLITE_MIGRATION_RUNTIME_READ_VERSION);
+    const sessionRoomAlreadyApplied = applied.includes(SESSION_ROOM_SCHEMA_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -868,6 +872,13 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(SQLITE_MIGRATION_RUNTIME_READ_PATH, "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SQLITE_MIGRATION_RUNTIME_READ_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+
+    if (!sessionRoomAlreadyApplied) {
+      const migrationSql = await readFile(SESSION_ROOM_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SESSION_ROOM_SCHEMA_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
 
