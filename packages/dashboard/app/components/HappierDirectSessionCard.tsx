@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import {
   connectHappierDirectSession,
   fetchHappierDirectSession,
@@ -19,6 +19,11 @@ interface MachineCandidate {
 }
 
 type RetryMode = "load" | "connect";
+
+interface CopyFallback {
+  label: string;
+  value: string;
+}
 
 function machineCandidatesFromError(error: HappierDirectSessionApiError): MachineCandidate[] {
   const rawCandidates = error.details?.candidates;
@@ -74,6 +79,9 @@ FNXC:HappierDirectSession 2026-07-15-21:02:
 The task-detail card is present before any Fusion process exists. Connecting only binds the inspected Happier native URI; it never starts or resumes the task, and a paused task remains explicitly "Bound, not running".
 
 One in-flight Connect owns the card until completion. Stable daemon/auth/candidate error codes stay visible and retryable, ambiguity promotes machine selection, a partial bridge-assignment failure refreshes the already-bound truth, and a blocked popup leaves the successful binding intact with a normal link fallback.
+
+FNXC:HappierDirectSession 2026-07-16-11:29:
+Task and project identity changes invalidate every prior GET, POST, and partial-binding refresh before resetting URI, machine, pending, error, popup, and copy state. Clipboard support is optional; unavailable or throwing implementations expose the full value in an accessible manual-copy fallback.
 */
 export function HappierDirectSessionCard({
   taskId,
@@ -90,34 +98,47 @@ export function HappierDirectSessionCard({
   const [retryMode, setRetryMode] = useState<RetryMode>("load");
   const [popupBlocked, setPopupBlocked] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
+  const [copyFallback, setCopyFallback] = useState<CopyFallback | null>(null);
   const pendingRef = useRef(false);
+  const identityVersionRef = useRef(0);
 
   const applyResponse = useCallback((response: HappierDirectSessionResponse) => {
     setBinding(response.connected ? response : null);
   }, []);
 
-  const load = useCallback(async (cancelled?: () => boolean) => {
+  const load = useCallback(async (identityVersion = identityVersionRef.current) => {
+    if (identityVersionRef.current !== identityVersion) return;
     setLoading(true);
     setError(null);
     try {
       const response = await fetchHappierDirectSession(taskId, projectId);
-      if (cancelled?.()) return;
+      if (identityVersionRef.current !== identityVersion) return;
       applyResponse(response);
     } catch (loadError) {
-      if (cancelled?.()) return;
+      if (identityVersionRef.current !== identityVersion) return;
       setError(errorFromUnknown(loadError));
       setRetryMode("load");
     } finally {
-      if (!cancelled?.()) setLoading(false);
+      if (identityVersionRef.current === identityVersion) setLoading(false);
     }
   }, [applyResponse, projectId, taskId]);
 
-  useEffect(() => {
-    let cancelled = false;
+  useLayoutEffect(() => {
+    const identityVersion = identityVersionRef.current + 1;
+    identityVersionRef.current = identityVersion;
+    pendingRef.current = false;
     setBinding(null);
+    setLoading(true);
+    setPending(false);
+    setUri("");
+    setMachineId("");
+    setMachineCandidates([]);
+    setError(null);
+    setRetryMode("load");
     setPopupBlocked(false);
-    void load(() => cancelled);
-    return () => { cancelled = true; };
+    setCopyStatus("");
+    setCopyFallback(null);
+    void load(identityVersion);
   }, [load]);
 
   const openInHappier = useCallback((openUrl: string) => {
@@ -132,6 +153,7 @@ export function HappierDirectSessionCard({
 
   const connect = useCallback(async () => {
     if (pendingRef.current || uri.trim().length === 0) return;
+    const identityVersion = identityVersionRef.current;
     pendingRef.current = true;
     setPending(true);
     setError(null);
@@ -141,9 +163,11 @@ export function HappierDirectSessionCard({
         uri,
         ...(machineId.length > 0 ? { machineId } : {}),
       });
+      if (identityVersionRef.current !== identityVersion) return;
       applyResponse(response);
       if (response.connected) openInHappier(response.openUrl);
     } catch (connectError) {
+      if (identityVersionRef.current !== identityVersion) return;
       const codedError = errorFromUnknown(connectError);
       setError(codedError);
       setRetryMode("connect");
@@ -154,12 +178,19 @@ export function HappierDirectSessionCard({
       }
       if (codedError.details?.sessionBound === true) {
         try {
-          applyResponse(await fetchHappierDirectSession(taskId, projectId));
-        } catch {}
+          const refreshed = await fetchHappierDirectSession(taskId, projectId);
+          if (identityVersionRef.current !== identityVersion) return;
+          applyResponse(refreshed);
+        } catch {
+          if (identityVersionRef.current !== identityVersion) return;
+          setError(codedError);
+        }
       }
     } finally {
-      pendingRef.current = false;
-      setPending(false);
+      if (identityVersionRef.current === identityVersion) {
+        pendingRef.current = false;
+        setPending(false);
+      }
     }
   }, [applyResponse, machineId, openInHappier, projectId, taskId, uri]);
 
@@ -172,10 +203,29 @@ export function HappierDirectSessionCard({
   }, [connect, load, retryMode]);
 
   const copyValue = useCallback((value: string, label: string) => {
-    void navigator.clipboard.writeText(value).then(
-      () => setCopyStatus(`${label} copied.`),
-      () => setCopyStatus(`${label} could not be copied.`),
-    );
+    const identityVersion = identityVersionRef.current;
+    const copyFailed = () => {
+      if (identityVersionRef.current !== identityVersion) return;
+      setCopyStatus(`${label} could not be copied. Copy the full value manually.`);
+      setCopyFallback({ label, value });
+    };
+    const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+    if (typeof clipboard?.writeText !== "function") {
+      copyFailed();
+      return;
+    }
+    try {
+      void Promise.resolve(clipboard.writeText(value)).then(
+        () => {
+          if (identityVersionRef.current !== identityVersion) return;
+          setCopyStatus(`${label} copied.`);
+          setCopyFallback(null);
+        },
+        copyFailed,
+      );
+    } catch {
+      copyFailed();
+    }
   }, []);
 
   return (
@@ -279,6 +329,12 @@ export function HappierDirectSessionCard({
           <button type="button" className="btn btn-secondary btn-sm" disabled={pending || loading} onClick={retry}>
             Retry
           </button>
+        </div>
+      ) : null}
+      {copyFallback ? (
+        <div className="happier-direct-session-card__copy-fallback" role="alert">
+          <span>{copyFallback.label} could not be copied. Copy the full value manually:</span>
+          <code tabIndex={0}>{copyFallback.value}</code>
         </div>
       ) : null}
       <span className="sr-only" aria-live="polite">{copyStatus}</span>

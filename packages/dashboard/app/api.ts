@@ -30,9 +30,16 @@ export interface HappierDirectSessionConnected {
   openUrl: string;
 }
 
-export type HappierDirectSessionResponse =
+export type HappierDirectSessionGetResponse =
   | HappierDirectSessionDisconnected
   | HappierDirectSessionConnected;
+
+export type HappierDirectSessionResponse = HappierDirectSessionGetResponse;
+
+export interface HappierDirectSessionPostResponse extends HappierDirectSessionConnected {
+  created: boolean;
+  agentId: string;
+}
 
 export interface ConnectHappierDirectSessionInput {
   uri: string;
@@ -60,11 +67,11 @@ function happierDirectSessionUrl(taskId: string, projectId?: string): string {
   return `/api/tasks/${encodeURIComponent(taskId)}/happier-direct-session${query}`;
 }
 
-async function happierDirectSessionRequest(
+async function happierDirectSessionRequest<TResponse>(
   taskId: string,
   projectId: string | undefined,
   init: RequestInit,
-): Promise<HappierDirectSessionResponse> {
+): Promise<TResponse> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   const token = getAuthToken();
@@ -78,7 +85,7 @@ async function happierDirectSessionRequest(
     error?: unknown;
     code?: unknown;
     details?: unknown;
-  } | HappierDirectSessionResponse | null;
+  } | TResponse | null;
 
   if (!response.ok) {
     const errorPayload = payload && typeof payload === "object" ? payload as {
@@ -100,7 +107,7 @@ async function happierDirectSessionRequest(
     throw new HappierDirectSessionApiError(message, response.status, code, details);
   }
 
-  return payload as HappierDirectSessionResponse;
+  return payload as TResponse;
 }
 
 /*
@@ -110,16 +117,16 @@ Task Detail reads and binds Happier sessions through task-scoped GET/POST calls.
 export function fetchHappierDirectSession(
   taskId: string,
   projectId?: string,
-): Promise<HappierDirectSessionResponse> {
-  return happierDirectSessionRequest(taskId, projectId, { method: "GET" });
+): Promise<HappierDirectSessionGetResponse> {
+  return happierDirectSessionRequest<HappierDirectSessionGetResponse>(taskId, projectId, { method: "GET" });
 }
 
 export function connectHappierDirectSession(
   taskId: string,
   projectId: string | undefined,
   input: ConnectHappierDirectSessionInput,
-): Promise<HappierDirectSessionResponse> {
-  return happierDirectSessionRequest(taskId, undefined, {
+): Promise<HappierDirectSessionPostResponse> {
+  return happierDirectSessionRequest<HappierDirectSessionPostResponse>(taskId, undefined, {
     method: "POST",
     body: JSON.stringify({ projectId, ...input }),
   });

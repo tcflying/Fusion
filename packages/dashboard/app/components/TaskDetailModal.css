@@ -3845,6 +3845,20 @@ The task-bound Happier card shares Task Detail tokens, keeps every flex child sh
   overflow-wrap: anywhere;
 }
 
+.happier-direct-session-card__copy-fallback {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  min-width: 0;
+  margin-top: var(--space-sm);
+  color: var(--color-error);
+}
+
+.happier-direct-session-card__copy-fallback code {
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 @media (max-width: 768px) {
   .happier-direct-session-card__header,
   .happier-direct-session-card__error {

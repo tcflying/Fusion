@@ -24,6 +24,21 @@ const connected: HappierDirectSessionConnected = {
   linkedAt: "2026-07-15T00:00:00.000Z",
   openUrl: "https://app.happier.dev/session/server-1/session-1",
 };
+const postConnected = {
+  ...connected,
+  created: true,
+  agentId: "agent-happier-500",
+};
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -56,11 +71,11 @@ describe("Happier direct-session API", () => {
   });
 
   it("POSTs the exact URI and optional machine ID without normalizing either value", async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(connected));
+    fetchMock.mockResolvedValueOnce(jsonResponse(postConnected));
     const uri = "happier://direct/session?provider=codex&name=$(whoami)  ";
     const machineId = "machine id; echo untouched";
 
-    await connectHappierDirectSession("FN-500", "project-500", { uri, machineId });
+    const response = await connectHappierDirectSession("FN-500", "project-500", { uri, machineId });
 
     const [, request] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
@@ -68,6 +83,8 @@ describe("Happier direct-session API", () => {
     );
     expect(request).toMatchObject({ method: "POST" });
     expect(JSON.parse(String(request.body))).toEqual({ projectId: "project-500", uri, machineId });
+    expect(response.created).toBe(true);
+    expect(response.agentId).toBe("agent-happier-500");
   });
 
   it("throws a coded error with server details intact", async () => {
@@ -157,6 +174,86 @@ describe("HappierDirectSessionCard", () => {
     expect(screen.getByText(connected.machineId)).toBeInTheDocument();
     expect(screen.getByText(connected.serverId)).toBeInTheDocument();
     expect(openMock).toHaveBeenCalledWith(connected.openUrl, "_blank", "noopener,noreferrer");
+  });
+
+  it("resets identity-bound form and candidate state when the selected task changes", async () => {
+    const user = userEvent.setup();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(disconnected))
+      .mockResolvedValueOnce(jsonResponse({
+        error: "Choose a machine",
+        details: {
+          code: "candidate_ambiguous",
+          candidates: [{ machineId: "machine-a", label: "Workstation A" }],
+        },
+      }, 409))
+      .mockResolvedValueOnce(jsonResponse({ connected: false, taskId: "FN-501" }));
+    const view = render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await user.type(screen.getByLabelText("Native Session URI"), "happier://direct/codex/remote-a");
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+    await user.selectOptions(await screen.findByLabelText("Machine ID"), "machine-a");
+
+    view.rerender(<HappierDirectSessionCard taskId="FN-501" projectId="project-501" taskPaused />);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByLabelText("Native Session URI")).toHaveValue("");
+    expect(screen.getByText("Machine ID (optional)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Machine ID")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
+  });
+
+  it("ignores a stale POST result and releases pending state after a deterministic task rerender race", async () => {
+    const user = userEvent.setup();
+    const stalePost = deferred<Response>();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(disconnected))
+      .mockImplementationOnce(() => stalePost.promise)
+      .mockResolvedValueOnce(jsonResponse({ connected: false, taskId: "FN-501" }));
+    const view = render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await user.type(screen.getByLabelText("Native Session URI"), "happier://direct/codex/remote-a");
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+    expect(screen.getByRole("button", { name: "Connecting…" })).toBeDisabled();
+
+    view.rerender(<HappierDirectSessionCard taskId="FN-501" projectId="project-501" taskPaused />);
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByLabelText("Native Session URI")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Connect" })).toBeDisabled();
+    await act(async () => { stalePost.resolve(jsonResponse(postConnected)); });
+    expect(screen.queryByText(connected.nativeSessionId)).not.toBeInTheDocument();
+    expect(openMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores a stale partial-binding refresh that resolves after the task changes", async () => {
+    const user = userEvent.setup();
+    const staleRefresh = deferred<Response>();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(disconnected))
+      .mockResolvedValueOnce(jsonResponse({
+        error: "Session bound, but bridge assignment failed",
+        details: {
+          code: "HAPPIER_SESSION_BOUND_ASSIGNMENT_FAILED",
+          sessionBound: true,
+          nativeSessionId: connected.nativeSessionId,
+        },
+      }, 500))
+      .mockImplementationOnce(() => staleRefresh.promise)
+      .mockResolvedValueOnce(jsonResponse({ connected: false, taskId: "FN-501" }));
+    const view = render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await user.type(screen.getByLabelText("Native Session URI"), "happier://direct/codex/remote-a");
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+    view.rerender(<HappierDirectSessionCard taskId="FN-501" projectId="project-501" taskPaused />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    await act(async () => { staleRefresh.resolve(jsonResponse(connected)); });
+
+    expect(screen.queryByText(connected.nativeSessionId)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("Not connected")).toBeInTheDocument();
   });
 
   it("keeps the connected state and exposes a fallback link when the popup is blocked", async () => {
@@ -281,6 +378,35 @@ describe("HappierDirectSessionCard", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("keeps the original partial-binding error when the binding refresh also fails", async () => {
+    const user = userEvent.setup();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(disconnected))
+      .mockResolvedValueOnce(jsonResponse({
+        error: "Session bound, but bridge assignment failed",
+        details: {
+          code: "HAPPIER_SESSION_BOUND_ASSIGNMENT_FAILED",
+          sessionBound: true,
+          nativeSessionId: connected.nativeSessionId,
+        },
+      }, 500))
+      .mockResolvedValueOnce(jsonResponse({
+        error: "Refresh temporarily unavailable",
+        details: { code: "HAPPIER_DAEMON_UNAVAILABLE" },
+      }, 503));
+    render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await user.type(screen.getByLabelText("Native Session URI"), "happier://direct/codex/remote-1");
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(screen.getByText("Not connected")).toBeInTheDocument();
+    expect(screen.queryByText(connected.nativeSessionId)).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("HAPPIER_SESSION_BOUND_ASSIGNMENT_FAILED");
+    expect(screen.getByRole("alert")).toHaveTextContent("Session bound, but bridge assignment failed");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
   it("wraps long IDs and gives each full value an accessible copy action", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(connected));
     render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
@@ -297,11 +423,45 @@ describe("HappierDirectSessionCard", () => {
     }
   });
 
-  it("stacks controls at narrow widths without horizontal overflow", () => {
+  it("offers an accessible manual-copy fallback when the Clipboard API is unavailable", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    fetchMock.mockResolvedValueOnce(jsonResponse(connected));
+    render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+    await screen.findByText(connected.nativeSessionId);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy native session ID" }));
+
+    const fallback = await screen.findByRole("alert");
+    expect(fallback).toHaveTextContent("Native session ID could not be copied");
+    expect(fallback).toHaveTextContent(connected.nativeSessionId);
+  });
+
+  it("keeps controls shrinkable inside a narrow host and declares stacked mobile actions", () => {
     const css = readFileSync(resolve(__dirname, "../TaskDetailModal.css"), "utf8");
+    const style = document.createElement("style");
+    style.textContent = css;
+    document.head.appendChild(style);
+    fetchMock.mockResolvedValueOnce(jsonResponse(disconnected));
+    const { container } = render(
+      <div style={{ width: 320, maxWidth: 320, overflowX: "auto" }}>
+        <HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />
+      </div>,
+    );
+    const card = container.querySelector(".happier-direct-session-card") as HTMLElement;
+    const formRow = container.querySelector(".happier-direct-session-card__form-row") as HTMLElement;
+    const uriInput = screen.getByLabelText("Native Session URI");
+
+    expect(window.getComputedStyle(card).maxWidth).toBe("100%");
+    expect(window.getComputedStyle(card).overflowX).toBe("hidden");
+    expect(window.getComputedStyle(formRow).minWidth).toBe("0px");
+    expect(window.getComputedStyle(uriInput).minWidth).toBe("0px");
     expect(css).toMatch(/\.happier-direct-session-card__form-row\s*\{[^}]*min-width:\s*0/s);
     expect(css).toMatch(/\.happier-direct-session-card__id-value\s*\{[^}]*overflow-wrap:\s*anywhere/s);
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*\.happier-direct-session-card__actions\s*\{[^}]*flex-direction:\s*column/s);
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*\.happier-direct-session-card__form-row\s*\{[^}]*flex-direction:\s*column/s);
+    style.remove();
   });
 });
