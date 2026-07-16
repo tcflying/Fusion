@@ -10,7 +10,9 @@ import {
   applySchemaBaseline,
   getAppliedMigrations,
   MIGRATION_BOOKKEEPING_TABLE,
+  readSchemaMigrationSql,
   SCHEMA_BASELINE_VERSION,
+  SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -59,11 +61,16 @@ describe("Session Room PostgreSQL migration", () => {
     const context = await startEmbeddedDatabase();
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
-    expect(result.appliedVersions).toEqual([SCHEMA_BASELINE_VERSION, SCHEMA_ROOM_VERSION]);
+    expect(result.appliedVersions).toEqual([
+      SCHEMA_BASELINE_VERSION,
+      SCHEMA_ROOM_VERSION,
+      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+    ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
       SCHEMA_BASELINE_VERSION,
       SCHEMA_ROOM_VERSION,
+      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -112,6 +119,66 @@ describe("Session Room PostgreSQL migration", () => {
         )
       `),
     ).rejects.toThrow();
+
+    await context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-2', 'project-1', 'objective 2', 'implementation', 1,
+        'draft', '2026-07-17T00:00:00.000Z', '2026-07-17T00:00:00.000Z'
+      );
+      INSERT INTO project.room_seats (
+        id, project_id, room_id, role, state, created_at, updated_at
+      ) VALUES
+        ('seat-owner-1', 'project-1', 'room-1', 'producer', 'ready', '2026-07-17T00:00:00.000Z', '2026-07-17T00:00:00.000Z'),
+        ('seat-owner-2', 'project-1', 'room-2', 'producer', 'ready', '2026-07-17T00:00:00.000Z', '2026-07-17T00:00:00.000Z');
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, happier_session_id, host_id,
+        state, attached_at
+      ) VALUES (
+        'binding-owner-1', 'project-1', 'room-1', 'seat-owner-1', 1, 'happier',
+        'codex', 'native-owner-1', 'happier-owner-1', 'host-1',
+        'attached', '2026-07-17T00:00:00.000Z'
+      );
+    `));
+    await expect(context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, happier_session_id, host_id,
+        state, attached_at
+      ) VALUES (
+        'binding-native-duplicate', 'project-1', 'room-2', 'seat-owner-2', 1, 'happier',
+        'codex', 'native-owner-1', 'happier-owner-2', 'host-2',
+        'attached', '2026-07-17T00:00:00.000Z'
+      )
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, happier_session_id, host_id,
+        state, attached_at
+      ) VALUES (
+        'binding-happier-duplicate', 'project-1', 'room-2', 'seat-owner-2', 1, 'happier',
+        'codex', 'native-owner-2', 'happier-owner-1', 'host-2',
+        'attached', '2026-07-17T00:00:00.000Z'
+      )
+    `))).rejects.toThrow();
+    await context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_bindings
+      SET state = 'detached', detached_at = '2026-07-17T00:01:00.000Z'
+      WHERE id = 'binding-owner-1';
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, happier_session_id, host_id,
+        state, attached_at
+      ) VALUES (
+        'binding-owner-2', 'project-1', 'room-2', 'seat-owner-2', 1, 'happier',
+        'codex', 'native-owner-1', 'happier-owner-1', 'host-2',
+        'attached', '2026-07-17T00:02:00.000Z'
+      );
+    `));
     await expect(
       context.connections!.migration.execute(sql`
         INSERT INTO project.room_seats (
@@ -145,7 +212,10 @@ describe("Session Room PostgreSQL migration", () => {
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_VERSION]);
+    expect(result.appliedVersions).toEqual([
+      SCHEMA_ROOM_VERSION,
+      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+    ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
       SELECT table_name
@@ -153,5 +223,37 @@ describe("Session Room PostgreSQL migration", () => {
       WHERE table_schema = 'project' AND table_name = 'operational_rooms'
     `)) as unknown as Array<{ table_name: string }>;
     expect(rooms).toEqual([{ table_name: "operational_rooms" }]);
+  });
+
+  it("upgrades an existing 0001 Room schema with ownership indexes only", async () => {
+    const context = await startEmbeddedDatabase();
+    const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
+    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
+    await context.connections!.migration.execute(sql.raw(roomSql));
+    await context.connections!.migration.execute(sql.raw(`
+      CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
+        version text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
+      VALUES ('${SCHEMA_BASELINE_VERSION}'), ('${SCHEMA_ROOM_VERSION}');
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION]);
+    const indexes = (await context.connections!.migration.execute(sql`
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'project'
+        AND indexname IN (
+          'idx_room_bindings_active_native_session',
+          'idx_room_bindings_active_happier_session'
+        )
+      ORDER BY indexname
+    `)) as unknown as Array<{ indexname: string }>;
+    expect(indexes.map((row) => row.indexname)).toEqual([
+      "idx_room_bindings_active_happier_session",
+      "idx_room_bindings_active_native_session",
+    ]);
   });
 });

@@ -101,6 +101,12 @@ export const roomBindings = roomSchema.table("room_bindings", {
   unique("room_bindings_seat_generation_unique").on(t.seatId, t.generation),
   index("idx_room_bindings_native_session").on(t.providerId, t.nativeSessionId),
   index("idx_room_bindings_room_state").on(t.projectId, t.roomId, t.state),
+  uniqueIndex("idx_room_bindings_active_native_session")
+    .on(t.projectId, t.providerId, t.nativeSessionId)
+    .where(sql`${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain')`),
+  uniqueIndex("idx_room_bindings_active_happier_session")
+    .on(t.projectId, t.connectorId, t.happierSessionId)
+    .where(sql`${t.happierSessionId} IS NOT NULL AND ${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain')`),
   check("room_bindings_generation_check", sql`${t.generation} > 0`),
   check("room_bindings_state_check", sql`${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain','detached','replaced','failed')`),
 ]);

@@ -41,7 +41,7 @@ FNXC:MigrationStatusRuntimeRead 2026-07-20:
 SCHEMA_BASELINE_VERSION advances to 0030 for project-scoped runtime reads of
 the SQLite cutover ledger.
 */
-export const SCHEMA_BASELINE_VERSION = "0031";
+export const SCHEMA_BASELINE_VERSION = "0032";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -134,6 +134,17 @@ export const PLANNING_ACTIVE_TIMING_VERSION = "0029";
 export const SQLITE_MIGRATION_RUNTIME_READ_VERSION = "0030";
 /** FNXC:SessionRoomPostgres 2026-07-21: durable Session Room operational tables. */
 export const SESSION_ROOM_SCHEMA_VERSION = "0031";
+export const SCHEMA_ROOM_VERSION = SESSION_ROOM_SCHEMA_VERSION;
+/** FNXC:SessionRoomPostgres 2026-07-21: active native/Happier ownership indexes. */
+export const SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION = "0032";
+
+export const SCHEMA_MIGRATIONS = [
+  { version: "0000", filename: "0000_initial.sql" },
+  { version: SCHEMA_ROOM_VERSION, filename: "0001_session_rooms.sql" },
+  { version: SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION, filename: "0002_room_binding_ownership.sql" },
+] as const;
+
+export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];
 
 /**
  * Thrown when the database was migrated by a NEWER Fusion binary than the one now
@@ -327,6 +338,7 @@ const PLANNING_ACTIVE_TIMING_MIGRATION_PATH = join(MIGRATIONS_DIR, "0029_plannin
 const TASK_DECLARED_SYMBOLS_MIGRATION_PATH = join(MIGRATIONS_DIR, "0028_task_declared_symbols.sql");
 const SQLITE_MIGRATION_RUNTIME_READ_PATH = join(MIGRATIONS_DIR, "0030_sqlite_migration_runtime_read.sql");
 const SESSION_ROOM_MIGRATION_PATH = join(MIGRATIONS_DIR, "0001_session_rooms.sql");
+const SESSION_ROOM_BINDING_OWNERSHIP_MIGRATION_PATH = join(MIGRATIONS_DIR, "0002_room_binding_ownership.sql");
 
 /**
  * Ensure the migration bookkeeping table exists. Lives in the public schema so
@@ -345,6 +357,13 @@ async function ensureBookkeepingTable(db: PostgresJsDatabase<Record<string, neve
 /** Read the baseline migration SQL from disk. Exported for tests. */
 export async function readBaselineMigrationSql(): Promise<string> {
   return readFile(BASELINE_MIGRATION_PATH, "utf8");
+}
+
+/** Read a Room migration through the stable migration registry used by tests and plugins. */
+export async function readSchemaMigrationSql(version: SchemaMigrationVersion): Promise<string> {
+  const migration = SCHEMA_MIGRATIONS.find((candidate) => candidate.version === version);
+  if (!migration) throw new Error(`Unknown Fusion schema migration version: ${version}`);
+  return readFile(join(MIGRATIONS_DIR, migration.filename), "utf8");
 }
 
 /** Return the set of already-applied migration versions, or empty if none. */
@@ -372,7 +391,12 @@ export async function getAppliedMigrations(
 export async function applySchemaBaseline(
   db: PostgresJsDatabase<Record<string, never>>,
   options: { pluginHooks?: readonly PluginSchemaInitHook[] } = {},
-): Promise<{ applied: boolean; pluginHooksRun: number }> {
+): Promise<{
+  applied: boolean;
+  baselineApplied: boolean;
+  appliedVersions: readonly string[];
+  pluginHooksRun: number;
+}> {
   /*
    * FNXC:PostgresSchema 2026-07-14-00:05:
    * Schema versions are a cluster-wide invariant. Serialize version discovery,
@@ -426,6 +450,7 @@ export async function applySchemaBaseline(
     const planningActiveTimingAlreadyApplied = applied.includes(PLANNING_ACTIVE_TIMING_VERSION);
     const sqliteMigrationRuntimeReadAlreadyApplied = applied.includes(SQLITE_MIGRATION_RUNTIME_READ_VERSION);
     const sessionRoomAlreadyApplied = applied.includes(SESSION_ROOM_SCHEMA_VERSION);
+    const sessionRoomBindingOwnershipAlreadyApplied = applied.includes(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -882,6 +907,20 @@ export async function applySchemaBaseline(
       schemaChanged = true;
     }
 
-    return { applied: schemaChanged, pluginHooksRun: pluginHooks.length };
+    if (!sessionRoomBindingOwnershipAlreadyApplied) {
+      const migrationSql = await readFile(SESSION_ROOM_BINDING_OWNERSHIP_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+
+    const latestApplied = await getAppliedMigrations(tx);
+    const appliedVersions = latestApplied.filter((version) => !applied.includes(version));
+    return {
+      applied: schemaChanged,
+      baselineApplied: appliedVersions.includes(INITIAL_SCHEMA_VERSION),
+      appliedVersions,
+      pluginHooksRun: pluginHooks.length,
+    };
   });
 }

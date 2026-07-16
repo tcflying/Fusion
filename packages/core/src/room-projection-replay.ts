@@ -9,6 +9,7 @@ import {
   type RoomEventRecordV1,
   type RoomLifecycleState,
 } from "./room-contracts/storage.js";
+import { hashRoomValue } from "./room-integrity.js";
 
 export type RoomProjectionReplayErrorCode =
   | "empty_event_stream"
@@ -148,6 +149,40 @@ function parseRoomAggregateProjectionUnsafe(value: unknown): RoomAggregateV1 {
 
 function aggregateFromCreatedEvent(event: RoomEventRecordV1): RoomAggregateV1 {
   const payload = requireEventPayload(event);
+  if (payload.initialProjection !== undefined) {
+    const expectedHash = requireString(
+      payload.initialProjectionHash,
+      `room_created ${event.id} initialProjectionHash`,
+    );
+    const actualHash = hashRoomValue(payload.initialProjection);
+    if (actualHash !== expectedHash) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `room_created ${event.id} initial projection hash does not match its payload`,
+      );
+    }
+    let aggregate: RoomAggregateV1;
+    try {
+      aggregate = parseRoomAggregateProjection(payload.initialProjection);
+    } catch (error) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `room_created ${event.id} initial projection is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (
+      aggregate.room.id !== event.roomId
+      || aggregate.room.projectId !== event.projectId
+      || aggregate.room.aggregateVersion !== event.aggregateVersion
+      || aggregate.room.aggregateVersion !== 0
+    ) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `room_created ${event.id} initial projection identity/version does not match its event`,
+      );
+    }
+    return aggregate;
+  }
   const lifecycleState = requireLifecycleState(
     payload.lifecycleState,
     `room_created ${event.id} lifecycleState`,

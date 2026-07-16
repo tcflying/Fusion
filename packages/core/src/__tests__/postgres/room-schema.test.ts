@@ -90,13 +90,16 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001"]);
-    const sql = await readSchemaMigrationSql("0001");
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002"]);
+    const roomSql = await readSchemaMigrationSql("0001");
+    const ownershipSql = await readSchemaMigrationSql("0002");
 
     for (const tableName of ROOM_PROJECT_TABLE_NAMES) {
-      expect(sql).toContain(`project.${tableName}`);
+      expect(roomSql).toContain(`project.${tableName}`);
     }
-    expect(sql).toContain("UNIQUE (room_id, aggregate_version)");
-    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS idx_room_outbox_logical_message");
+    expect(roomSql).toContain("UNIQUE (room_id, aggregate_version)");
+    expect(roomSql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS idx_room_outbox_logical_message");
+    expect(ownershipSql).toContain("idx_room_bindings_active_native_session");
+    expect(ownershipSql).toContain("idx_room_bindings_active_happier_session");
   });
 });

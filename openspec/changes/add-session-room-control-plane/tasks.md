@@ -15,7 +15,7 @@
 - [x] 2.5 Implement idempotency-key storage, transactional outbox/inbox state, delivery attempts, uncertainty states, and duplicate-command handling with concurrent PostgreSQL tests.
 - [x] 2.6 Implement fenced Room, sender, and workspace lease persistence with epoch-based stale-writer rejection and real concurrent-store tests.
 - [x] 2.7 Implement turn checkpoints and projection rebuild/replay tests from append-only Room events.
-- [ ] 2.8 Implement one-way import of an existing task-bound Happier Session as a one-seat Room and prove import failure leaves the legacy binding untouched.
+- [x] 2.8 Implement one-way import of an existing task-bound Happier Session as a one-seat Room and prove import failure leaves the legacy binding untouched.
 - [ ] 2.9 Export Room stores/types through canonical core entrypoints and run scoped core typecheck, lint, migration, and PostgreSQL tests.
 
 ## 3. Session Connector and Happier adapter
