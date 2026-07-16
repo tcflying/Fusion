@@ -254,30 +254,31 @@ export class AsyncRoomCheckpointStore {
               `Checkpoint ${checkpointRow.id} hash does not match its persisted projection`,
             );
           }
-          checkpoint = rowToStoredCheckpoint(checkpointRow);
-          const base = parseRoomAggregateProjection(checkpoint.projection);
+          const storedCheckpoint = rowToStoredCheckpoint(checkpointRow);
+          checkpoint = storedCheckpoint;
+          const base = parseRoomAggregateProjection(storedCheckpoint.projection);
           if (
             base.room.id !== roomId
             || base.room.projectId !== this.projectId
-            || base.room.aggregateVersion !== checkpoint.aggregateVersion
+            || base.room.aggregateVersion !== storedCheckpoint.aggregateVersion
           ) {
             throw new RoomCheckpointStoreError(
               "checkpoint_identity_conflict",
-              `Checkpoint ${checkpoint.id} projection identity or version does not match its record`,
+              `Checkpoint ${storedCheckpoint.id} projection identity or version does not match its record`,
             );
           }
           const anchor = events.find(
-            (event) => event.id === checkpoint.eventId
-              && event.cursor === checkpoint.eventCursor
-              && event.aggregateVersion === checkpoint.aggregateVersion,
+            (event) => event.id === storedCheckpoint.eventId
+              && event.cursor === storedCheckpoint.eventCursor
+              && event.aggregateVersion === storedCheckpoint.aggregateVersion,
           );
           if (!anchor) {
             throw new RoomCheckpointStoreError(
               "checkpoint_anchor_conflict",
-              `Checkpoint ${checkpoint.id} event anchor is missing from the immutable Room stream`,
+              `Checkpoint ${storedCheckpoint.id} event anchor is missing from the immutable Room stream`,
             );
           }
-          const anchorCursor = BigInt(checkpoint.eventCursor);
+          const anchorCursor = BigInt(storedCheckpoint.eventCursor);
           replayedEvents = events.filter((event) => BigInt(event.cursor) > anchorCursor);
           aggregate = applyRoomProjectionEvents(base, replayedEvents);
         } else {
