@@ -226,6 +226,61 @@ describe("HappierDirectSessionCard", () => {
     expect(openMock).not.toHaveBeenCalled();
   });
 
+  it("invalidates a pending successful POST when the card unmounts", async () => {
+    const user = userEvent.setup();
+    const stalePost = deferred<Response>();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(disconnected))
+      .mockImplementationOnce(() => stalePost.promise);
+    openMock.mockReturnValue({ closed: false });
+    const view = render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+
+    try {
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await user.type(screen.getByLabelText("Native Session URI"), "happier://direct/codex/remote-a");
+      await user.click(screen.getByRole("button", { name: "Connect" }));
+      view.unmount();
+
+      await act(async () => { stalePost.resolve(jsonResponse(postConnected)); });
+
+      expect(openMock).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(consoleError.mock.calls.some(([message]) => (
+        /state update.*unmounted component/i.test(String(message))
+      ))).toBe(false);
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  it("does not start a partial-binding refresh after the card unmounts", async () => {
+    const user = userEvent.setup();
+    const stalePost = deferred<Response>();
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(disconnected))
+      .mockImplementationOnce(() => stalePost.promise);
+    const view = render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await user.type(screen.getByLabelText("Native Session URI"), "happier://direct/codex/remote-a");
+    await user.click(screen.getByRole("button", { name: "Connect" }));
+    view.unmount();
+
+    await act(async () => {
+      stalePost.resolve(jsonResponse({
+        error: "Session bound, but bridge assignment failed",
+        details: {
+          code: "HAPPIER_SESSION_BOUND_ASSIGNMENT_FAILED",
+          sessionBound: true,
+          nativeSessionId: connected.nativeSessionId,
+        },
+      }, 500));
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(openMock).not.toHaveBeenCalled();
+  });
+
   it("ignores a stale partial-binding refresh that resolves after the task changes", async () => {
     const user = userEvent.setup();
     const staleRefresh = deferred<Response>();

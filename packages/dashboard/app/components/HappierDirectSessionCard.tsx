@@ -82,6 +82,9 @@ One in-flight Connect owns the card until completion. Stable daemon/auth/candida
 
 FNXC:HappierDirectSession 2026-07-16-11:29:
 Task and project identity changes invalidate every prior GET, POST, and partial-binding refresh before resetting URI, machine, pending, error, popup, and copy state. Clipboard support is optional; unavailable or throwing implementations expose the full value in an accessible manual-copy fallback.
+
+FNXC:HappierDirectSession 2026-07-16-11:56:
+The identity-owning layout effect cleanup invalidates pending work on both identity replacement and unmount before any POST or partial-refresh continuation can update state or open external UI.
 */
 export function HappierDirectSessionCard({
   taskId,
@@ -139,6 +142,10 @@ export function HappierDirectSessionCard({
     setCopyStatus("");
     setCopyFallback(null);
     void load(identityVersion);
+    return () => {
+      identityVersionRef.current += 1;
+      pendingRef.current = false;
+    };
   }, [load]);
 
   const openInHappier = useCallback((openUrl: string) => {
