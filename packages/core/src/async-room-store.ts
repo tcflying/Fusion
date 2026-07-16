@@ -143,8 +143,10 @@ export type LegacyHappierBindingProviderId = "codex" | "claude" | "opencode";
 export interface LegacyHappierBindingSourceV1 {
   readonly taskId: string;
   readonly cliSessionId: string;
+  /** Legacy field: stores the Happier linked Session id, not the provider id. */
   readonly nativeSessionId: string;
   readonly providerId: LegacyHappierBindingProviderId;
+  /** Official Happier remoteSessionId: the provider-native Session id. */
   readonly remoteSessionId: string;
   readonly machineId: string;
   readonly serverId: string;
@@ -276,6 +278,13 @@ export class AsyncRoomStore {
     context: RoomCommandContext,
   ): Promise<RoomAggregateV1> {
     assertLegacyImportInput(input);
+    // FNXC:LegacyHappierIdentity 2026-07-17-05:03:
+    // The old task bridge persisted Happier's `sessionId` in its misleading
+    // `nativeSessionId` field and the actual provider id in `remoteSessionId`.
+    // Normalize only at the Room boundary; never rewrite the legacy row that
+    // the existing AgentRuntime still uses to address Happier CLI operations.
+    const providerNativeSessionId = input.source.remoteSessionId;
+    const happierSessionId = input.source.nativeSessionId;
     const base = createRoomAggregate({
       id: input.room.id,
       projectId: this.projectId,
@@ -307,8 +316,8 @@ export class AsyncRoomStore {
         generation: 1,
         connectorId: "happier",
         providerId: input.source.providerId,
-        nativeSessionId: input.source.nativeSessionId,
-        happierSessionId: input.source.remoteSessionId,
+        nativeSessionId: providerNativeSessionId,
+        happierSessionId,
         serverProfileId: input.source.serverId,
         hostId: input.source.machineId,
         state: "attached",
@@ -324,7 +333,7 @@ export class AsyncRoomStore {
         tx,
         this.projectId,
         input.source.providerId,
-        input.source.nativeSessionId,
+        providerNativeSessionId,
       );
       await verifyLegacyHappierBindingSource(tx, this.projectId, input.source);
 
@@ -334,7 +343,7 @@ export class AsyncRoomStore {
         .where(and(
           eq(roomBindings.projectId, this.projectId),
           eq(roomBindings.providerId, input.source.providerId),
-          eq(roomBindings.nativeSessionId, input.source.nativeSessionId),
+          eq(roomBindings.nativeSessionId, providerNativeSessionId),
           inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
         ))
         .limit(1);
@@ -352,7 +361,7 @@ export class AsyncRoomStore {
         .where(and(
           eq(roomBindings.projectId, this.projectId),
           eq(roomBindings.connectorId, "happier"),
-          eq(roomBindings.happierSessionId, input.source.remoteSessionId),
+          eq(roomBindings.happierSessionId, happierSessionId),
           inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
         ))
         .limit(1);
@@ -360,7 +369,7 @@ export class AsyncRoomStore {
       if (activeHappierOwner) {
         throw new RoomStoreError(
           "legacy_binding_integrity_conflict",
-          `Happier Session ${input.source.remoteSessionId} already belongs to Room ${activeHappierOwner.roomId} as binding ${activeHappierOwner.bindingId}`,
+          `Happier Session ${happierSessionId} already belongs to Room ${activeHappierOwner.roomId} as binding ${activeHappierOwner.bindingId}`,
         );
       }
 
@@ -415,8 +424,8 @@ export class AsyncRoomStore {
         generation: 1,
         connectorId: "happier",
         providerId: input.source.providerId,
-        nativeSessionId: input.source.nativeSessionId,
-        happierSessionId: input.source.remoteSessionId,
+        nativeSessionId: providerNativeSessionId,
+        happierSessionId,
         serverProfileId: input.source.serverId,
         hostId: input.source.machineId,
         state: "attached",

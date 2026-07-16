@@ -62,9 +62,12 @@ async function createLegacyBinding(
   const cliSessionId = `cli-task-legacy-${suffix}`;
   const binding = {
     cliSessionId,
-    nativeSessionId: `codex-thread-legacy-${suffix}`,
+    // Legacy bridge naming is inverted relative to the Room contract:
+    // nativeSessionId stores Happier's linked Session id, while
+    // remoteSessionId is the provider-native Codex/Claude/OpenCode id.
+    nativeSessionId: `happier-session-legacy-${suffix}`,
     providerId: "codex" as const,
-    remoteSessionId: `happier-session-legacy-${suffix}`,
+    remoteSessionId: `codex-thread-legacy-${suffix}`,
     machineId: `windows-host-${suffix}`,
     serverId: `happier-server-${suffix}`,
     linkedAt: "2026-07-17T09:00:00.000Z",
@@ -146,8 +149,8 @@ describe("one-way legacy Happier Session import", () => {
       seats: [{ id: "seat-import-success", activeBindingId: "binding-import-success" }],
       bindings: [{
         id: "binding-import-success",
-        nativeSessionId: legacy.source.nativeSessionId,
-        happierSessionId: legacy.source.remoteSessionId,
+        nativeSessionId: legacy.source.remoteSessionId,
+        happierSessionId: legacy.source.nativeSessionId,
         serverProfileId: legacy.source.serverId,
         hostId: legacy.source.machineId,
         generation: 1,
