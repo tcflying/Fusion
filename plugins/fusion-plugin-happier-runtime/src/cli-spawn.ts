@@ -414,10 +414,19 @@ function ensureRecord(value: unknown, operation: string): HappierJsonRecord {
   return value;
 }
 
+/** FNXC:HappierRuntime 2026-07-16-11:17: Session identifiers reject C0 controls and DEL without regex lint suppression. */
+function hasForbiddenControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || codeUnit === 0x7f) return true;
+  }
+  return false;
+}
+
 function trimSessionId(value: unknown): string {
   if (typeof value !== "string") throw new HappierCliError("session", "Happier session id must be a string");
   const trimmed = value.trim();
-  if (!trimmed || /[\u0000-\u001f\u007f]/.test(trimmed) || trimmed.length > 512) {
+  if (!trimmed || hasForbiddenControlCharacter(trimmed) || trimmed.length > 512) {
     throw new HappierCliError("session", "Happier session id is invalid");
   }
   return trimmed;

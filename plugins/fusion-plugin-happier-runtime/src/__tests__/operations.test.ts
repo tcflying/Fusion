@@ -105,6 +105,19 @@ describe("Happier multi-agent operations", () => {
     expect(invokeHappierJsonForKind).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["U+0000", "\u0000"],
+    ["U+001F", "\u001f"],
+    ["U+007F", "\u007f"],
+  ])("rejects %s in operation identifiers before invoking the CLI", async (_label, controlCharacter) => {
+    await expect(startHappierPlan({
+      sessionId: `sess-${controlCharacter}-1`,
+      backends: ["claude"],
+      instructions: "Plan.",
+    })).rejects.toMatchObject({ code: "protocol" });
+    expect(invokeHappierJsonForKind).not.toHaveBeenCalled();
+  });
+
   it("rejects missing, duplicate, or malformed participant results", async () => {
     invokeHappierJsonForKind
       .mockResolvedValueOnce({ sessionId: "sess-1", results: [] })

@@ -315,6 +315,17 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
+  it.each([
+    ["U+0000", "\u0000"],
+    ["U+001F", "\u001f"],
+    ["U+007F", "\u007f"],
+  ])("rejects %s in session ids before spawning the CLI", async (_label, controlCharacter) => {
+    await expect(archiveHappierSession(`sess-${controlCharacter}-1`, settings())).rejects.toMatchObject({
+      code: "session",
+    });
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
   it("ensures a direct session with exact shell-free argv and stack settings", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
