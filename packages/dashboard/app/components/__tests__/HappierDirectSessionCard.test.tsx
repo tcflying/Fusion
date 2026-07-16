@@ -1,5 +1,9 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import {
+  isSessionRoomControlPlaneEnabled,
+  SESSION_ROOM_CONTROL_PLANE_FLAG,
+} from "@fusion/core";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -123,6 +127,21 @@ describe("HappierDirectSessionCard", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("keeps the legacy task-detail connection card while the Room gate is off", async () => {
+    expect(
+      isSessionRoomControlPlaneEnabled({
+        experimentalFeatures: { [SESSION_ROOM_CONTROL_PLANE_FLAG]: false },
+      }),
+    ).toBe(false);
+    fetchMock.mockResolvedValueOnce(jsonResponse(disconnected));
+
+    render(<HappierDirectSessionCard taskId="FN-500" projectId="project-500" taskPaused />);
+
+    expect(screen.getByRole("heading", { name: "Happier Direct Session" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect" })).toBeInTheDocument();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
   });
 
   it("is visible before a live process exists and loads the binding on detail open", async () => {

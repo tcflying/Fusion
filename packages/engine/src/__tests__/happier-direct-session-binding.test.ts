@@ -1,4 +1,8 @@
-import type { TaskStore } from "@fusion/core";
+import {
+  isSessionRoomControlPlaneEnabled,
+  SESSION_ROOM_CONTROL_PLANE_FLAG,
+  type TaskStore,
+} from "@fusion/core";
 import { describe, expect, it } from "vitest";
 import { createTaskStoreNativeSessionBinding } from "../agent-runtime.js";
 import {
@@ -291,6 +295,19 @@ async function createCanonicalSession(store: TaskStore, taskId: string) {
 
 it("keeps the existing deterministic Happier executor CLI session id", async () => {
   const taskId = "FN-HAPPIER-BIND-ID";
+  const harness = createHarness("async");
+  const nativeBinding = await createCanonicalSession(harness.store, taskId);
+
+  expect(nativeBinding.key.endsWith(`:${resolveTaskHappierCliSessionId({ taskId, purpose: "execute" })}`)).toBe(true);
+});
+
+it("keeps the legacy executor primary binding available while the Room gate is off", async () => {
+  const settings = {
+    experimentalFeatures: { [SESSION_ROOM_CONTROL_PLANE_FLAG]: false },
+  };
+  expect(isSessionRoomControlPlaneEnabled(settings)).toBe(false);
+
+  const taskId = "FN-HAPPIER-ROOM-GATE-OFF";
   const harness = createHarness("async");
   const nativeBinding = await createCanonicalSession(harness.store, taskId);
 

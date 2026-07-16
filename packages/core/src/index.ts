@@ -2089,6 +2089,11 @@ export {
   type ResolvedMobileNavPrimaryItems,
 } from "./mobile-nav-primary-items.js";
 export {
+  isSessionRoomControlPlaneEnabled,
+  SESSION_ROOM_CONTROL_PLANE_FLAG,
+} from "./room-feature-gate.js";
+export * from "./room-contracts/index.js";
+export {
   POST_MERGE_VERIFICATION_GROUP_ID,
   postMergeOptionalGroupNode,
   postMergeVerificationOptionalGroupNode,

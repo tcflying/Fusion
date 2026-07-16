@@ -1,10 +1,10 @@
 ## 1. Baseline, provenance, and implementation seams
 
-- [ ] 1.1 Record and verify the exact Fusion bridge and Happier Direct Session base SHAs, worktree status, licenses, public CLI/help surfaces, and existing real E2E evidence without modifying either preserved baseline worktree.
-- [ ] 1.2 Inventory existing tests and owners for native-session binding, async CLI sessions, Chat Rooms, MessageStore, TaskStore dependencies, scheduler leases, evaluations, dashboard events, and plugin views; classify each baseline as reusable, partial, rejected, or missing.
-- [ ] 1.3 Run the narrow current bridge/Direct Session test and typecheck lanes and retain exact baseline failures separately from new regressions.
-- [ ] 1.4 Add a fail-closed Room feature gate and compatibility tests proving legacy `executor:<taskId>:primary` binding, task detail card, and Happier runtime plugin behavior remain unchanged while the gate is off.
-- [ ] 1.5 Define versioned package/API contracts for Room storage, Session Connector, controller commands/events, protocol definitions, evidence, and UI DTOs before parallel implementation begins.
+- [x] 1.1 Record and verify the exact Fusion bridge and Happier Direct Session base SHAs, worktree status, licenses, public CLI/help surfaces, and existing real E2E evidence without modifying either preserved baseline worktree.
+- [x] 1.2 Inventory existing tests and owners for native-session binding, async CLI sessions, Chat Rooms, MessageStore, TaskStore dependencies, scheduler leases, evaluations, dashboard events, and plugin views; classify each baseline as reusable, partial, rejected, or missing.
+- [x] 1.3 Run the narrow current bridge/Direct Session test and typecheck lanes and retain exact baseline failures separately from new regressions.
+- [x] 1.4 Add a fail-closed Room feature gate and compatibility tests proving legacy `executor:<taskId>:primary` binding, task detail card, and Happier runtime plugin behavior remain unchanged while the gate is off.
+- [x] 1.5 Define versioned package/API contracts for Room storage, Session Connector, controller commands/events, protocol definitions, evidence, and UI DTOs before parallel implementation begins.
 
 ## 2. Room domain and PostgreSQL persistence
 

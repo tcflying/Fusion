@@ -35,6 +35,18 @@ describe("Happier runtime plugin registration", () => {
     expect(JSON.stringify(runtime)).not.toContain("do-not-forward");
   });
 
+  it("keeps the legacy AgentRuntime available while the Room gate is off", async () => {
+    const runtime = await happierRuntimeFactory({
+      settings: {
+        backend: "codex",
+        experimentalFeatures: { sessionRoomControlPlane: false },
+      },
+    } as never);
+
+    expect(plugin.runtime?.metadata).toEqual(happierRuntimeMetadata);
+    expect(runtime).toMatchObject({ id: HAPPIER_RUNTIME_ID, name: "Happier Runtime" });
+  });
+
   it("emits a non-sensitive loaded event and never logs settings secrets", () => {
     const info = vi.fn();
     const emitEvent = vi.fn();
