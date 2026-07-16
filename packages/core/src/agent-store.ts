@@ -770,6 +770,31 @@ export class AgentStore extends EventEmitter {
     return existing !== null;
   }
 
+  private async createDurableNamedAgentUnderLock(
+    input: AgentCreateInput,
+    normalizedName: string,
+    metadata: Record<string, unknown>,
+    runtimeConfig: Record<string, unknown> | undefined,
+  ): Promise<Agent> {
+    if (!this.backendMode) {
+      throw new Error("Locked durable agent creation requires the PostgreSQL AsyncDataLayer");
+    }
+
+    const lockKey = `fusion:agent-name:${normalizedName}`;
+    return this.asyncLayer!.transactionImmediate(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      const candidates = await findAgentRowsByNameAsync(tx, normalizedName);
+      const existing = candidates.find((candidate) => !isEphemeralAgent(candidate));
+      if (existing) {
+        throw new Error(`Agent with name "${normalizedName}" already exists (agentId: ${existing.id})`);
+      }
+
+      const created = buildAgentCreationRecord(input, normalizedName, metadata, runtimeConfig);
+      await writeAgentAsync(tx, created);
+      return created;
+    });
+  }
+
   /**
    * Create a new agent with a default state based on ephemeral classification.
    *
@@ -801,6 +826,19 @@ export class AgentStore extends EventEmitter {
     const metadata = input.metadata ?? {};
     const ephemeral = isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo });
 
+    const runtimeConfig = resolveCreationRuntimeConfig(input.runtimeConfig, metadata);
+
+    if (!ephemeral && this.backendMode) {
+      const agent = await this.createDurableNamedAgentUnderLock(
+        input,
+        normalizedName,
+        metadata,
+        runtimeConfig,
+      );
+      this.emit("agent:created", agent);
+      return agent;
+    }
+
     if (!ephemeral) {
       const existing = await this.findAgentByName(normalizedName);
       if (existing) {
@@ -808,7 +846,6 @@ export class AgentStore extends EventEmitter {
       }
     }
 
-    const runtimeConfig = resolveCreationRuntimeConfig(input.runtimeConfig, metadata);
     const agent = buildAgentCreationRecord(input, normalizedName, metadata, runtimeConfig);
 
     await this.writeAgent(agent);
@@ -844,24 +881,12 @@ export class AgentStore extends EventEmitter {
       throw new Error("Exact named agent creation requires the PostgreSQL AsyncDataLayer");
     }
 
-    const lockKey = `fusion:agent-name:${normalizedName}`;
-    const agent = await this.asyncLayer!.transactionImmediate(async (tx) => {
-      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
-      const candidates = await findAgentRowsByNameAsync(tx, normalizedName);
-      const existing = candidates.find((candidate) => !isEphemeralAgent(candidate));
-      if (existing) {
-        throw new Error(`Agent with name "${normalizedName}" already exists (agentId: ${existing.id})`);
-      }
-
-      const created = buildAgentCreationRecord(
-        input,
-        normalizedName,
-        metadata,
-        { ...input.runtimeConfig },
-      );
-      await writeAgentAsync(tx, created);
-      return created;
-    });
+    const agent = await this.createDurableNamedAgentUnderLock(
+      input,
+      normalizedName,
+      metadata,
+      { ...input.runtimeConfig },
+    );
 
     this.emit("agent:created", agent);
     return agent;

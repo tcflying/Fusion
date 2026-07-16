@@ -51,4 +51,31 @@ describe("AgentStore exact runtime-config creation", () => {
     });
     expect(Object.keys(matching[0]?.runtimeConfig ?? {}).sort()).toEqual(Object.keys(runtimeConfig).sort());
   });
+
+  it("serializes ordinary and exact durable creation under the same name", async () => {
+    const name = "Mixed Named Agent";
+    const results = await Promise.allSettled([
+      store.createAgent({
+        name,
+        role: "executor",
+        runtimeConfig: { runtimeHint: "ordinary" },
+      }),
+      store.createAgentWithExactRuntimeConfig({
+        name,
+        role: "executor",
+        runtimeConfig: {
+          runtimeHint: "happier",
+          assignmentPolicy: "explicit-only",
+          allowParallelExecution: true,
+          autoClaimRelevantTasks: false,
+        },
+      }),
+    ]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const matching = (await store.listAgents({ includeEphemeral: false }))
+      .filter((agent) => agent.name === name);
+    expect(matching).toHaveLength(1);
+  });
 });

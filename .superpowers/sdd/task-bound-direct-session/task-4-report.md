@@ -120,3 +120,23 @@ The correction owns these additional files:
 - `packages/core/src/__tests__/postgres/agent-store-exact-create.pg.test.ts`
 
 No temporary test runner is included in the commit. The removed SQLite runtime was not reintroduced.
+
+## Independent review correction 2 (2026-07-16)
+
+The correction commit's independent reviewer found one remaining Important race: PostgreSQL `createAgent` still performed its durable-name check outside the advisory-lock transaction, so an ordinary durable create could overlap `createAgentWithExactRuntimeConfig` and persist two agents with the same name.
+
+### Cross-path RED
+
+A new real PostgreSQL test launched ordinary and exact durable creation concurrently under one name. Before the fix, both calls fulfilled and the test failed at the one-winner assertion: 1 failed / 1 passed in the focused file.
+
+### Cross-path GREEN
+
+All PostgreSQL durable named creation now uses one shared helper that acquires the same transaction-scoped advisory lock, rechecks the name inside the transaction, writes the final record, and emits the creation event only after commit. Ephemeral creation and the non-PostgreSQL fallback retain their existing behavior.
+
+- exact/exact and ordinary/exact concurrency: 2/2 passed on a fresh Fusion embedded PostgreSQL instance;
+- existing AgentStore routing-policy suite: 14/14 passed on the same real PostgreSQL instance;
+- Happier route plus adjacent workflow suites: 32/32 passed on the same real PostgreSQL instance;
+- `@fusion/core` typecheck: passed;
+- scoped ESLint: no errors.
+
+The temporary embedded-PostgreSQL runner was removed before staging.
