@@ -84,3 +84,39 @@ Result before report creation: exit 0. Re-run after the final report/diff audit 
 
 - Concurrent Task 5 work appeared during Task 4 in dashboard app files, and `.superpowers/sdd/progress.md` remains dirty. Those files are not owned by Task 4 and must not be staged or altered.
 - No Task 4 product blocker is known.
+
+## Independent review correction (2026-07-16)
+
+The first independent review rejected the initial implementation for five substantive reasons:
+
+- a same-name durable agent with the wrong role could fall through to a partial `500` instead of returning a deterministic `409` conflict;
+- agent creation followed by runtime-config replacement was not atomic and could expose intermediate defaults;
+- route tests used fake task/agent stores instead of the repository's real PostgreSQL stores;
+- the remote-session idempotency assertion was not stateful enough to prove that only one Happier session was created;
+- plugin lookup mapped every storage exception to `HAPPIER_PLUGIN_NOT_CONFIGURED`, hiding non-`ENOENT` failures.
+
+The correction adds an exact-runtime-config AgentStore creation path guarded by a PostgreSQL transaction and transaction-scoped advisory lock, checks both bridge role and runtime compatibility, re-reads after creation races, and maps only storage `ENOENT` to the not-configured response. The route suite now uses the shared real PostgreSQL TaskStore and AgentStore harness; only the external Happier CLI boundary remains a stateful fake that counts concrete remote sessions.
+
+### Correction RED
+
+Before the route correction, the real PostgreSQL route suite collected 24 tests and produced 5 expected failures / 19 passes:
+
+- wrong-role bridge agent: expected `409`, received `500`;
+- four non-`ENOENT` plugin-store failures: expected `500`, received `409`.
+
+### Correction GREEN
+
+- real PostgreSQL route suite: 24/24 passed;
+- route suite plus two adjacent workflow suites: 32/32 passed;
+- concurrent exact AgentStore creation test on the shared PostgreSQL harness: 1/1 passed, with one durable winner and the exact four-key runtime config persisted;
+- `@fusion/core` typecheck: passed;
+- `@fusion/dashboard` typecheck: passed;
+- scoped ESLint for the AgentStore and route source: passed;
+- `git diff --check`: passed.
+
+The correction owns these additional files:
+
+- `packages/core/src/agent-store.ts`
+- `packages/core/src/__tests__/postgres/agent-store-exact-create.pg.test.ts`
+
+No temporary test runner is included in the commit. The removed SQLite runtime was not reintroduced.

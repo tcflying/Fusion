@@ -1,10 +1,11 @@
 // @vitest-environment node
 
+import { join } from "node:path";
 import express from "express";
 import {
-  CliSessionStore,
+  AgentStore,
+  AsyncCliSessionStore,
   HAPPIER_RUNTIME_PLUGIN_ID,
-  type Agent,
   type Task,
   type TaskStore,
 } from "@fusion/core";
@@ -16,7 +17,11 @@ import {
   HappierCliError,
   type HappierDirectSessionEnsureResult,
 } from "@fusion-plugin-examples/happier-runtime";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import {
+  createSharedPgTaskStoreTestHarness,
+  pgDescribe,
+} from "../../../../core/src/__test-utils__/pg-test-harness.js";
 import { ApiError } from "../../api-error.js";
 import { request } from "../../test-request.js";
 import type { ApiRoutesContext } from "../types.js";
@@ -28,8 +33,8 @@ import {
 } from "../register-happier-direct-session-routes.js";
 
 /*
-FNXC:HappierTaskBinding 2026-07-15-21:00:
-Task-scoped Happier connection routes must bind only paused non-terminal tasks, rebuild Web URLs from current persisted plugin settings, preserve typed failures, and assign exactly one compatible project-local bridge agent without starting work.
+FNXC:HappierTaskBinding 2026-07-16-12:10:
+Task-scoped Happier route tests use Fusion's current real PostgreSQL-backed TaskStore and AgentStore because the SQLite runtime was removed. Only the official CLI boundary is simulated, and that simulation must retain remote-session state across POSTs.
 */
 
 const PROJECT_ID = "project-happier-route";
@@ -47,186 +52,85 @@ const DEFAULT_SETTINGS = {
   maxOutputBytes: 65_536,
 };
 
-const ENSURED_A: HappierDirectSessionEnsureResult = {
-  providerId: "codex",
-  remoteSessionId: "thread-a",
-  machineId: "machine-a",
-  serverId: "server/a",
-  sessionId: "happier session a",
-  created: true,
-  openUrl: "https://cli-returned.invalid/must-not-be-persisted",
-};
-
 type TestResponseBody = Record<string, any>;
 
-interface StoredCliSession {
-  id: string;
-  taskId: string | null;
-  chatSessionId: string | null;
-  purpose: string;
-  projectId: string;
-  adapterId: string;
-  agentState: string;
-  terminationReason: string | null;
-  nativeSessionId: string | null;
-  resumeAttempts: number;
-  autonomyPosture: string | null;
-  worktreePath: string | null;
-  createdAt: string;
-  updatedAt: string;
+function createStatefulOfficialEnsure() {
+  const sessions = new Map<string, Omit<HappierDirectSessionEnsureResult, "created">>();
+  const ensure = vi.fn(async (input: { uri: string; machineId?: string }) => {
+    const key = `${input.uri}\u0000${input.machineId ?? ""}`;
+    const existing = sessions.get(key);
+    if (existing) return { ...existing, created: false };
+    const created = {
+      providerId: "codex",
+      remoteSessionId: `thread-${sessions.size + 1}`,
+      machineId: input.machineId ?? "machine-a",
+      serverId: "server/a",
+      sessionId: `happier-session-${sessions.size + 1}`,
+      openUrl: "https://cli-returned.invalid/must-not-be-persisted",
+    };
+    sessions.set(key, created);
+    return { ...created, created: true };
+  });
+  return { ensure, sessions };
 }
 
-function createInMemoryTaskStore() {
-  const tasks = new Map<string, Task & { prompt?: string }>();
-  const cliSessions = new Map<string, StoredCliSession>();
-  let pluginSettings: Record<string, unknown> = { ...DEFAULT_SETTINGS };
-  const database = {
-    getProjectIdentity: () => ({ id: PROJECT_ID }),
-    bumpLastModified: () => undefined,
-    transactionImmediate: <T>(operation: () => T): T => operation(),
-    prepare: (sql: string) => ({
-      get: (id: string) => cliSessions.get(id),
-      run: (...params: unknown[]) => {
-        if (/^\s*INSERT/iu.test(sql)) {
-          const columns = /\(([^)]+)\)\s*VALUES/iu.exec(sql)?.[1]
-            ?.split(",")
-            .map((column) => column.trim());
-          if (!columns) throw new Error(`Unsupported insert: ${sql}`);
-          const row = Object.fromEntries(columns.map((column, index) => [column, params[index]])) as unknown as StoredCliSession;
-          if (!cliSessions.has(row.id)) cliSessions.set(row.id, row);
-          return { changes: 1 };
-        }
-        if (/^\s*UPDATE/iu.test(sql)) {
-          const id = String(params.at(-1));
-          const row = cliSessions.get(id);
-          if (!row) return { changes: 0 };
-          const assignments = /SET\s+(.+)\s+WHERE/isu.exec(sql)?.[1]
-            ?.split(",")
-            .map((assignment) => assignment.trim().split("=")[0].trim());
-          if (!assignments) throw new Error(`Unsupported update: ${sql}`);
-          if (/nativeSessionId IS NULL/iu.test(sql) && row.nativeSessionId !== null) return { changes: 0 };
-          assignments.forEach((column, index) => {
-            (row as unknown as Record<string, unknown>)[column] = params[index];
-          });
-          return { changes: 1 };
-        }
-        throw new Error(`Unsupported SQL: ${sql}`);
-      },
-    }),
-  };
-  const pluginStore = {
-    getPlugin: vi.fn(async (id: string) => {
-      if (id !== HAPPIER_RUNTIME_PLUGIN_ID) throw Object.assign(new Error("Plugin not found"), { code: "ENOENT" });
-      return { id, settings: { ...pluginSettings } };
-    }),
-    updatePluginSettings: vi.fn(async (_id: string, patch: Record<string, unknown>) => {
-      pluginSettings = { ...pluginSettings, ...patch };
-      return { id: HAPPIER_RUNTIME_PLUGIN_ID, settings: { ...pluginSettings } };
-    }),
-  };
-  const store = {
-    getFusionDir: () => "G:\\in-memory-project\\.fusion",
-    getRootDir: () => "G:\\in-memory-project",
-    getAsyncLayer: () => null,
-    getDatabase: () => database,
-    getPluginStore: () => pluginStore,
-    getTask: vi.fn(async (id: string) => {
-      const task = tasks.get(id);
-      if (!task) throw new Error(`Task ${id} not found`);
-      return { ...task };
-    }),
-    updateTask: vi.fn(async (id: string, patch: Partial<Task>) => {
-      const task = tasks.get(id);
-      if (!task) throw new Error(`Task ${id} not found`);
-      const updated = { ...task, ...patch, updatedAt: new Date().toISOString() };
-      tasks.set(id, updated);
-      return { ...updated };
-    }),
-  } as unknown as TaskStore;
-  return { store, tasks, cliSessions, pluginStore };
-}
-
-function createInMemoryAgentStore() {
-  const agents = new Map<string, Agent>();
-  let sequence = 0;
-  return {
-    agents,
-    findAgentByName: vi.fn(async (name: string) =>
-      [...agents.values()].find((agent) => agent.name === name) ?? null),
-    createAgent: vi.fn(async (input: { name: string; role: string; runtimeConfig?: Record<string, unknown> }) => {
-      sequence += 1;
-      const now = new Date().toISOString();
-      const agent = {
-        id: `agent-${sequence}`,
-        name: input.name,
-        role: input.role,
-        state: "active",
-        createdAt: now,
-        updatedAt: now,
-        runtimeConfig: {
-          ...(input.runtimeConfig ?? {}),
-          enabled: true,
-          heartbeatIntervalMs: 3_600_000,
-        },
-        metadata: {},
-      } as Agent;
-      agents.set(agent.id, agent);
-      return agent;
-    }),
-    updateAgent: vi.fn(async (id: string, patch: Partial<Agent>) => {
-      const current = agents.get(id);
-      if (!current) throw new Error(`Agent ${id} not found`);
-      const updated = { ...current, ...patch, updatedAt: new Date().toISOString() } as Agent;
-      agents.set(id, updated);
-      return updated;
-    }),
-    assignTask: vi.fn(async (id: string, taskId: string) => {
-      const current = agents.get(id);
-      if (!current) throw new Error(`Agent ${id} not found`);
-      const updated = { ...current, taskId, updatedAt: new Date().toISOString() } as Agent;
-      agents.set(id, updated);
-      return updated;
-    }),
-    listAgents: vi.fn(async () => [...agents.values()]),
-    getAgent: vi.fn(async (id: string) => agents.get(id) ?? null),
-  };
-}
+const describe = pgDescribe;
 
 describe("Happier direct-session task routes", () => {
+  const h = createSharedPgTaskStoreTestHarness({ prefix: "happier_route" });
   let store: TaskStore;
-  let tasks: Map<string, Task & { prompt?: string }>;
-  let pluginStore: ReturnType<typeof createInMemoryTaskStore>["pluginStore"];
-  let agentStore: ReturnType<typeof createInMemoryAgentStore>;
-  let ensureHappierDirectSession: ReturnType<typeof vi.fn>;
+  let agentStore: AgentStore;
+  let ensureHarness: ReturnType<typeof createStatefulOfficialEnsure>;
   let taskSequence = 0;
 
+  beforeAll(h.beforeAll);
+  afterAll(h.afterAll);
+  afterEach(h.afterEach);
+
   beforeEach(async () => {
-    const taskHarness = createInMemoryTaskStore();
-    store = taskHarness.store;
-    tasks = taskHarness.tasks;
-    pluginStore = taskHarness.pluginStore;
-    agentStore = createInMemoryAgentStore();
-    ensureHappierDirectSession = vi.fn().mockResolvedValue(ENSURED_A);
+    await h.beforeEach();
+    store = h.store();
+    agentStore = new AgentStore({
+      rootDir: store.getFusionDir(),
+      taskStore: store,
+      asyncLayer: h.layer(),
+    });
+    await agentStore.init();
+    ensureHarness = createStatefulOfficialEnsure();
+    await store.getPluginStore().registerPlugin({
+      manifest: {
+        id: HAPPIER_RUNTIME_PLUGIN_ID,
+        name: "Happier Runtime",
+        version: "0.0.0",
+      },
+      path: join(h.rootDir(), "plugins", "happier-runtime"),
+      settings: DEFAULT_SETTINGS,
+    });
   });
 
-  async function createTask(input: { column?: string; paused?: boolean } = {}): Promise<Task> {
+  async function createTask(input: { column?: Task["column"]; paused?: boolean } = {}): Promise<Task> {
     taskSequence += 1;
-    const now = new Date().toISOString();
-    const task = {
-      id: `FN-HAPPIER-${taskSequence}`,
-      description: `Happier route task ${taskSequence}`,
-      column: input.column ?? "todo",
-      dependencies: [],
-      steps: [],
-      currentStep: 0,
-      log: [],
-      createdAt: now,
-      updatedAt: now,
-      prompt: `# ${taskSequence}\nHappier route prompt`,
-      ...(input.paused === false ? {} : { paused: true, userPaused: true }),
-    } as Task & { prompt?: string };
-    tasks.set(task.id, task);
-    return task;
+    const created = await store.createTask({ description: `Happier route task ${taskSequence}` });
+    const targetColumn = input.column ?? "todo";
+    if (targetColumn === "archived") {
+      await store.moveTask(created.id, "archived");
+    } else if (targetColumn !== "triage") {
+      await store.moveTask(created.id, "todo");
+      if (targetColumn === "in-progress" || targetColumn === "in-review" || targetColumn === "done") {
+        await store.moveTask(created.id, "in-progress");
+      }
+      if (targetColumn === "in-review" || targetColumn === "done") {
+        await store.moveTask(created.id, "in-review");
+      }
+      if (targetColumn === "done") {
+        await store.moveTask(created.id, "done");
+      }
+    }
+    return store.updateTask(created.id, {
+      paused: input.paused === false ? false : true,
+      userPaused: input.paused === false ? false : true,
+      worktree: `G:\\worktrees\\${created.id}`,
+    });
   }
 
   function createApp(overrides: Partial<HappierDirectSessionRouteDependencies> = {}) {
@@ -252,7 +156,7 @@ describe("Happier direct-session task routes", () => {
     } as unknown as ApiRoutesContext;
 
     registerHappierDirectSessionRoutes(context, {
-      ensureHappierDirectSession,
+      ensureHappierDirectSession: ensureHarness.ensure as never,
       createAgentStore: vi.fn(async () => agentStore),
       ...overrides,
     });
@@ -283,7 +187,7 @@ describe("Happier direct-session task routes", () => {
   it("GET returns 404 for unknown/deleted tasks and disconnected for an unbound live task", async () => {
     const live = await createTask();
     const deleted = await createTask();
-    tasks.delete(deleted.id);
+    await store.deleteTask(deleted.id);
     const { app, getProjectContext } = createApp();
 
     const unknownResponse = await request(app, "GET", `/api/tasks/FN-UNKNOWN/happier-direct-session?projectId=${PROJECT_ID}`);
@@ -302,16 +206,13 @@ describe("Happier direct-session task routes", () => {
   it("GET rebuilds a fresh openUrl from changed persisted webappUrl without storing either URL", async () => {
     const task = await createTask();
     const { app } = createApp();
-    const connected = await post(app, task.id);
-    expect(connected.status).toBe(200);
+    expect((await post(app, task.id)).status).toBe(200);
 
-    const cliSessionId = resolveTaskHappierCliSessionId({ taskId: task.id, purpose: "execute" });
-    const cliStore = new CliSessionStore(store.getFusionDir(), store.getDatabase());
-    const persisted = cliStore.getSession(cliSessionId);
-    expect(persisted?.autonomyPosture?.happierDirectSession).not.toHaveProperty("openUrl");
-    expect(JSON.stringify(persisted?.autonomyPosture)).not.toContain("cli-returned.invalid");
+    const persisted = await readTaskHappierDirectSessionBinding({ store, taskId: task.id });
+    expect(persisted).not.toHaveProperty("openUrl");
+    expect(JSON.stringify(persisted)).not.toContain("cli-returned.invalid");
 
-    await pluginStore.updatePluginSettings(HAPPIER_RUNTIME_PLUGIN_ID, {
+    await store.getPluginStore().updatePluginSettings(HAPPIER_RUNTIME_PLUGIN_ID, {
       webappUrl: "https://new.happier.example/root/",
     });
     const response = await request(app, "GET", `/api/tasks/${task.id}/happier-direct-session?projectId=${PROJECT_ID}`);
@@ -320,13 +221,13 @@ describe("Happier direct-session task routes", () => {
     expect(response.body).toMatchObject({
       connected: true,
       taskId: task.id,
-      cliSessionId,
-      nativeSessionId: ENSURED_A.sessionId,
-      providerId: ENSURED_A.providerId,
-      remoteSessionId: ENSURED_A.remoteSessionId,
-      machineId: ENSURED_A.machineId,
-      serverId: ENSURED_A.serverId,
-      openUrl: "https://new.happier.example/root/session/server%2Fa/happier%20session%20a",
+      cliSessionId: resolveTaskHappierCliSessionId({ taskId: task.id, purpose: "execute" }),
+      nativeSessionId: "happier-session-1",
+      providerId: "codex",
+      remoteSessionId: "thread-1",
+      machineId: "machine-a",
+      serverId: "server/a",
+      openUrl: "https://new.happier.example/root/session/server%2Fa/happier-session-1",
     });
   });
 
@@ -334,12 +235,11 @@ describe("Happier direct-session task routes", () => {
     const task = await createTask();
     const { app } = createApp();
     expect((await post(app, task.id)).status).toBe(200);
-
     const cliSessionId = resolveTaskHappierCliSessionId({ taskId: task.id, purpose: "execute" });
-    const cliStore = new CliSessionStore(store.getFusionDir(), store.getDatabase());
-    const session = cliStore.getSession(cliSessionId);
+    const cliStore = new AsyncCliSessionStore(h.layer());
+    const session = await cliStore.getSession(cliSessionId);
     expect(session).toBeDefined();
-    cliStore.updateSession(cliSessionId, {
+    await cliStore.updateSession(cliSessionId, {
       autonomyPosture: {
         ...(session?.autonomyPosture ?? {}),
         happierDirectSession: { providerId: "codex" },
@@ -355,32 +255,32 @@ describe("Happier direct-session task routes", () => {
   });
 
   it.each([
-    { label: "done", column: "done", paused: true, expectedStatus: 409 },
-    { label: "archived", column: "archived", paused: true, expectedStatus: 409 },
-    { label: "in-progress", column: "in-progress", paused: true, expectedStatus: 409 },
-    { label: "in-review", column: "in-review", paused: true, expectedStatus: 409 },
-    { label: "unpaused", column: "todo", paused: false, expectedStatus: 409 },
-  ])("POST rejects $label tasks before calling Happier", async ({ column, paused, expectedStatus }) => {
+    { label: "done", column: "done" as const, paused: true },
+    { label: "archived", column: "archived" as const, paused: true },
+    { label: "in-progress", column: "in-progress" as const, paused: true },
+    { label: "in-review", column: "in-review" as const, paused: true },
+    { label: "unpaused", column: "todo" as const, paused: false },
+  ])("POST rejects $label tasks before calling Happier", async ({ column, paused }) => {
     const task = await createTask({ column, paused });
     const { app } = createApp();
     const response = await post(app, task.id);
-    expect(response.status).toBe(expectedStatus);
+    expect(response.status).toBe(409);
     expect((response.body as TestResponseBody).details.code).toBe("HAPPIER_TASK_NOT_CONNECTABLE");
-    expect(ensureHappierDirectSession).not.toHaveBeenCalled();
+    expect(ensureHarness.ensure).not.toHaveBeenCalled();
   });
 
   it("POST rejects a deleted task before calling Happier", async () => {
     const task = await createTask();
-    tasks.delete(task.id);
+    await store.deleteTask(task.id);
     const { app } = createApp();
-    const response = await post(app, task.id);
-    expect(response.status).toBe(404);
-    expect(ensureHappierDirectSession).not.toHaveBeenCalled();
+    expect((await post(app, task.id)).status).toBe(404);
+    expect(ensureHarness.ensure).not.toHaveBeenCalled();
   });
 
-  it("POST uses persisted settings once, binds idempotently, reuses one exact bridge agent, and does not start work", async () => {
+  it("POST persists one stateful remote session, one exact-role bridge, and one assignment across retries", async () => {
     const task = await createTask();
     const before = await store.getTask(task.id);
+    const promptBefore = await store.readPromptForArchive(task.id);
     const { app, engineCalls } = createApp();
 
     const first = await post(app, task.id, { machineId: "machine-a" });
@@ -388,24 +288,31 @@ describe("Happier direct-session task routes", () => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    expect(second.body).toMatchObject(first.body as TestResponseBody);
-    expect(ensureHappierDirectSession).toHaveBeenCalledTimes(2);
-    expect(ensureHappierDirectSession).toHaveBeenNthCalledWith(1, {
+    expect(first.body).toMatchObject({ created: true, nativeSessionId: "happier-session-1" });
+    expect(second.body).toMatchObject({ created: false, nativeSessionId: "happier-session-1" });
+    expect(ensureHarness.ensure).toHaveBeenCalledTimes(2);
+    expect(ensureHarness.sessions).toHaveLength(1);
+    expect(ensureHarness.ensure).toHaveBeenNthCalledWith(1, {
       uri: "codex://threads/thread-a",
       machineId: "machine-a",
       settings: DEFAULT_SETTINGS,
     });
-    expect(ensureHappierDirectSession).toHaveBeenNthCalledWith(2, {
+    expect(ensureHarness.ensure).toHaveBeenNthCalledWith(2, {
       uri: "codex://threads/thread-a",
       machineId: "machine-a",
       settings: DEFAULT_SETTINGS,
     });
 
-    const agents = await agentStore.listAgents({ includeEphemeral: false });
-    const bridgeAgents = agents.filter((agent) => agent.name === HAPPIER_BRIDGE_AGENT_NAME);
+    const bridgeAgents = (await agentStore.listAgents({ includeEphemeral: false }))
+      .filter((agent) => agent.name === HAPPIER_BRIDGE_AGENT_NAME);
     expect(bridgeAgents).toHaveLength(1);
-    expect(bridgeAgents[0]?.runtimeConfig).toEqual(HAPPIER_BRIDGE_RUNTIME_CONFIG);
-    expect(bridgeAgents[0]?.taskId).toBe(task.id);
+    expect(bridgeAgents[0]).toMatchObject({
+      role: "executor",
+      runtimeConfig: HAPPIER_BRIDGE_RUNTIME_CONFIG,
+      taskId: task.id,
+    });
+    const binding = await readTaskHappierDirectSessionBinding({ store, taskId: task.id });
+    expect(binding?.nativeSessionId).toBe("happier-session-1");
 
     const after = await store.getTask(task.id);
     expect(after.assignedAgentId).toBe(bridgeAgents[0]?.id);
@@ -414,21 +321,63 @@ describe("Happier direct-session task routes", () => {
     expect(after.paused).toBe(before.paused);
     expect(after.userPaused).toBe(before.userPaused);
     expect(after.worktree).toBe(before.worktree);
-    expect(after.prompt).toBe(before.prompt);
+    expect(await store.readPromptForArchive(task.id)).toBe(promptBefore);
     for (const call of Object.values(engineCalls)) expect(call).not.toHaveBeenCalled();
+  });
+
+  it("POST returns 409 before assignment for an exact-config same-name agent with the wrong role", async () => {
+    const task = await createTask();
+    const existing = await agentStore.createAgent({
+      name: HAPPIER_BRIDGE_AGENT_NAME,
+      role: "reviewer",
+      runtimeConfig: { ...HAPPIER_BRIDGE_RUNTIME_CONFIG },
+    });
+    await agentStore.updateAgent(existing.id, { runtimeConfig: { ...HAPPIER_BRIDGE_RUNTIME_CONFIG } });
+    const assignSpy = vi.spyOn(agentStore, "assignTask");
+    const { app } = createApp();
+
+    const response = await post(app, task.id);
+    expect(response.status).toBe(409);
+    expect((response.body as TestResponseBody).details).toMatchObject({
+      code: "HAPPIER_BRIDGE_AGENT_CONFLICT",
+      agentId: existing.id,
+      sessionBound: true,
+      nativeSessionId: "happier-session-1",
+    });
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect((await agentStore.getAgent(existing.id))?.role).toBe("reviewer");
+    expect((await store.getTask(task.id)).assignedAgentId).toBeUndefined();
+  });
+
+  it("POST conflicts with an incompatible same-name runtime without rewriting it or assigning", async () => {
+    const task = await createTask();
+    const existing = await agentStore.createAgent({
+      name: HAPPIER_BRIDGE_AGENT_NAME,
+      role: "executor",
+      runtimeConfig: { runtimeHint: "other" },
+    });
+    const beforeRuntime = existing.runtimeConfig;
+    const assignSpy = vi.spyOn(agentStore, "assignTask");
+    const { app } = createApp();
+
+    const response = await post(app, task.id);
+    expect(response.status).toBe(409);
+    expect((response.body as TestResponseBody).details.code).toBe("HAPPIER_BRIDGE_AGENT_CONFLICT");
+    expect(assignSpy).not.toHaveBeenCalled();
+    expect((await agentStore.getAgent(existing.id))?.runtimeConfig).toEqual(beforeRuntime);
+    expect((await store.getTask(task.id)).assignedAgentId).toBeUndefined();
   });
 
   it("POST returns 409 for a different native session without replacing the first binding", async () => {
     const task = await createTask();
     const { app } = createApp();
     expect((await post(app, task.id)).status).toBe(200);
-    ensureHappierDirectSession.mockResolvedValueOnce({ ...ENSURED_A, sessionId: "happier-session-b" });
 
-    const response = await post(app, task.id);
+    const response = await post(app, task.id, { uri: "codex://threads/thread-b" });
     expect(response.status).toBe(409);
     expect((response.body as TestResponseBody).details.code).toBe("HAPPIER_DIRECT_SESSION_CONFLICT");
     await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toMatchObject({
-      nativeSessionId: ENSURED_A.sessionId,
+      nativeSessionId: "happier-session-1",
     });
   });
 
@@ -440,7 +389,7 @@ describe("Happier direct-session task routes", () => {
     ["machine_mismatch", 409],
   ] as const)("POST preserves CLI code %s and leaves no binding or assignment", async (officialCode, expectedStatus) => {
     const task = await createTask();
-    ensureHappierDirectSession.mockRejectedValueOnce(
+    ensureHarness.ensure.mockRejectedValueOnce(
       new HappierCliError("process", `failure: ${officialCode}`, undefined, officialCode),
     );
     const { app } = createApp();
@@ -453,31 +402,34 @@ describe("Happier direct-session task routes", () => {
     await expect(agentStore.findAgentByName(HAPPIER_BRIDGE_AGENT_NAME)).resolves.toBeNull();
   });
 
-  it("POST conflicts with an incompatible same-name agent without rewriting it and preserves the successful binding", async () => {
+  it("POST maps only an explicit plugin ENOENT to HAPPIER_PLUGIN_NOT_CONFIGURED", async () => {
     const task = await createTask();
-    const existing = await agentStore.createAgent({
-      name: HAPPIER_BRIDGE_AGENT_NAME,
-      role: "executor",
-      runtimeConfig: { runtimeHint: "other" },
-    });
-    const beforeRuntime = existing.runtimeConfig;
+    await store.getPluginStore().unregisterPlugin(HAPPIER_RUNTIME_PLUGIN_ID);
     const { app } = createApp();
 
     const response = await post(app, task.id);
     expect(response.status).toBe(409);
-    expect((response.body as TestResponseBody).details).toMatchObject({
-      code: "HAPPIER_BRIDGE_AGENT_CONFLICT",
-      sessionBound: true,
-      nativeSessionId: ENSURED_A.sessionId,
-    });
-    expect((await agentStore.getAgent(existing.id))?.runtimeConfig).toEqual(beforeRuntime);
-    await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toMatchObject({
-      nativeSessionId: ENSURED_A.sessionId,
-    });
-    expect((await store.getTask(task.id)).assignedAgentId).toBeUndefined();
+    expect((response.body as TestResponseBody).details.code).toBe("HAPPIER_PLUGIN_NOT_CONFIGURED");
+    expect(ensureHarness.ensure).not.toHaveBeenCalled();
   });
 
-  it("POST returns a typed partial error when assignment fails after binding and retry does not create a second session", async () => {
+  it.each([
+    Object.assign(new Error("backend unavailable"), { code: "ECONNREFUSED" }),
+    Object.assign(new Error("database read failed"), { code: "DB_READ_FAILED" }),
+    Object.assign(new Error("permission denied"), { code: "EACCES" }),
+    Object.assign(new Error("corrupt plugin row"), { code: "DATA_CORRUPT" }),
+  ])("POST propagates non-ENOENT plugin-store failures as 500", async (pluginError) => {
+    const task = await createTask();
+    vi.spyOn(store.getPluginStore(), "getPlugin").mockRejectedValueOnce(pluginError);
+    const { app } = createApp();
+
+    const response = await post(app, task.id);
+    expect(response.status).toBe(500);
+    expect((response.body as TestResponseBody).error).toBe(pluginError.message);
+    expect(ensureHarness.ensure).not.toHaveBeenCalled();
+  });
+
+  it("POST returns a typed partial error when assignment fails after binding and retry reuses the remote session", async () => {
     const task = await createTask();
     const assignTaskToBridge = vi.fn()
       .mockRejectedValueOnce(new Error("assignment unavailable"))
@@ -489,16 +441,17 @@ describe("Happier direct-session task routes", () => {
     expect((first.body as TestResponseBody).details).toMatchObject({
       code: "HAPPIER_SESSION_BOUND_ASSIGNMENT_FAILED",
       sessionBound: true,
-      nativeSessionId: ENSURED_A.sessionId,
+      nativeSessionId: "happier-session-1",
     });
     await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toMatchObject({
-      nativeSessionId: ENSURED_A.sessionId,
+      nativeSessionId: "happier-session-1",
     });
 
     const second = await post(app, task.id);
     expect(second.status).toBe(200);
+    expect(second.body).toMatchObject({ created: false, nativeSessionId: "happier-session-1" });
     expect(assignTaskToBridge).toHaveBeenCalledTimes(2);
-    expect(ensureHappierDirectSession).toHaveBeenCalledTimes(2);
-    expect((second.body as TestResponseBody).nativeSessionId).toBe(ENSURED_A.sessionId);
+    expect(ensureHarness.ensure).toHaveBeenCalledTimes(2);
+    expect(ensureHarness.sessions).toHaveLength(1);
   });
 });

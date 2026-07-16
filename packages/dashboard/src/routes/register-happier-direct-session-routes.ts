@@ -33,7 +33,10 @@ export const HAPPIER_BRIDGE_RUNTIME_CONFIG = Object.freeze({
 });
 
 type BridgeAssignmentResult = { agentId: string };
-type BridgeAgentStore = Pick<AgentStore, "findAgentByName" | "createAgent" | "updateAgent" | "assignTask">;
+type BridgeAgentStore = Pick<
+  AgentStore,
+  "findAgentByName" | "createAgentWithExactRuntimeConfig" | "assignTask"
+>;
 
 export interface HappierDirectSessionRouteDependencies {
   ensureHappierDirectSession?: typeof ensureHappierDirectSession;
@@ -46,7 +49,7 @@ export interface HappierDirectSessionRouteDependencies {
 
 class HappierBridgeAgentConflictError extends Error {
   constructor(readonly agent: Agent) {
-    super(`Agent "${HAPPIER_BRIDGE_AGENT_NAME}" has incompatible runtime configuration`);
+    super(`Agent "${HAPPIER_BRIDGE_AGENT_NAME}" has an incompatible role or runtime configuration`);
     this.name = "HappierBridgeAgentConflictError";
   }
 }
@@ -72,18 +75,21 @@ function isExactBridgeRuntimeConfig(value: unknown): boolean {
     && keys.every((key, index) => key === expectedKeys[index] && value[key] === expected[key]);
 }
 
+function isCompatibleBridgeAgent(agent: Agent): boolean {
+  return agent.role === "executor" && isExactBridgeRuntimeConfig(agent.runtimeConfig);
+}
+
 async function createOrFindBridgeAgent(agentStore: BridgeAgentStore): Promise<Agent> {
   const existing = await agentStore.findAgentByName(HAPPIER_BRIDGE_AGENT_NAME);
   if (existing) {
-    if (!isExactBridgeRuntimeConfig(existing.runtimeConfig)) {
+    if (!isCompatibleBridgeAgent(existing)) {
       throw new HappierBridgeAgentConflictError(existing);
     }
     return existing;
   }
 
-  let created: Agent;
   try {
-    created = await agentStore.createAgent({
+    return await agentStore.createAgentWithExactRuntimeConfig({
       name: HAPPIER_BRIDGE_AGENT_NAME,
       role: "executor",
       runtimeConfig: { ...HAPPIER_BRIDGE_RUNTIME_CONFIG },
@@ -91,18 +97,11 @@ async function createOrFindBridgeAgent(agentStore: BridgeAgentStore): Promise<Ag
   } catch (error) {
     const raced = await agentStore.findAgentByName(HAPPIER_BRIDGE_AGENT_NAME);
     if (!raced) throw error;
-    if (!isExactBridgeRuntimeConfig(raced.runtimeConfig)) {
+    if (!isCompatibleBridgeAgent(raced)) {
       throw new HappierBridgeAgentConflictError(raced);
     }
     return raced;
   }
-
-  // AgentStore supplies defaults for ordinary durable agents. This bridge has
-  // an intentionally exact runtime contract, so replace those defaults through
-  // the public update API immediately after durable identity creation.
-  return agentStore.updateAgent(created.id, {
-    runtimeConfig: { ...HAPPIER_BRIDGE_RUNTIME_CONFIG },
-  });
 }
 
 async function createProjectAgentStore(store: TaskStore): Promise<BridgeAgentStore> {
@@ -158,7 +157,8 @@ async function resolveHappierSettings(store: TaskStore): Promise<HappierCliSetti
   let plugin;
   try {
     plugin = await store.getPluginStore().getPlugin(HAPPIER_RUNTIME_PLUGIN_ID);
-  } catch {
+  } catch (error) {
+    if (!isRecord(error) || error.code !== "ENOENT") throw error;
     throw new ApiError(409, "Happier runtime plugin is not installed for this project", {
       code: "HAPPIER_PLUGIN_NOT_CONFIGURED",
     });

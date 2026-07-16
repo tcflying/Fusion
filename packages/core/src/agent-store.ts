@@ -13,6 +13,7 @@ import { constants as fsConstants, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { sql } from "drizzle-orm";
 import type {
   Agent,
   AgentState,
@@ -162,6 +163,10 @@ export interface AgentStoreOptions {
   asyncLayer?: AsyncDataLayer;
 }
 
+export interface ExactRuntimeConfigAgentCreateInput extends AgentCreateInput {
+  runtimeConfig: Record<string, unknown>;
+}
+
 /** Agent data as stored in SQLite JSON columns */
 interface AgentData {
   id: string;
@@ -267,6 +272,46 @@ function resolveCreationRuntimeConfig(
     rc.heartbeatIntervalMs = DEFAULT_AGENT_HEARTBEAT_INTERVAL_MS;
   }
   return rc;
+}
+
+function buildAgentCreationRecord(
+  input: AgentCreateInput,
+  normalizedName: string,
+  metadata: Record<string, unknown>,
+  runtimeConfig: Record<string, unknown> | undefined,
+): Agent {
+  const ephemeral = isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo });
+  const now = new Date().toISOString();
+  const agentId = `agent-${randomUUID().slice(0, 8)}`;
+  const resolvedHeartbeatProcedurePath = input.heartbeatProcedurePath
+    ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId, input.name));
+  const normalizedPermissionPolicy = input.permissionPolicy
+    ? normalizeAgentPermissionPolicy(input.permissionPolicy)
+    : undefined;
+  const permissions = normalizeStoredPermissions(input.permissions);
+
+  return {
+    id: agentId,
+    name: normalizedName,
+    role: input.role,
+    state: ephemeral ? "idle" : "active",
+    createdAt: now,
+    updatedAt: now,
+    metadata,
+    ...(input.title && { title: input.title }),
+    ...(input.icon && { icon: input.icon }),
+    ...(input.imageUrl && { imageUrl: input.imageUrl }),
+    ...(input.reportsTo && { reportsTo: input.reportsTo }),
+    ...(runtimeConfig && { runtimeConfig }),
+    ...(permissions && { permissions }),
+    ...(normalizedPermissionPolicy && { permissionPolicy: normalizedPermissionPolicy }),
+    ...(input.instructionsPath && { instructionsPath: input.instructionsPath }),
+    ...(input.instructionsText && { instructionsText: input.instructionsText }),
+    ...(input.soul && { soul: input.soul }),
+    ...(input.memory && { memory: input.memory }),
+    ...(input.bundleConfig && { bundleConfig: input.bundleConfig }),
+    ...(resolvedHeartbeatProcedurePath && { heartbeatProcedurePath: resolvedHeartbeatProcedurePath }),
+  };
 }
 
 /**
@@ -763,57 +808,62 @@ export class AgentStore extends EventEmitter {
       }
     }
 
-    const now = new Date().toISOString();
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
-
     const runtimeConfig = resolveCreationRuntimeConfig(input.runtimeConfig, metadata);
-
-    // Default heartbeatProcedurePath for new non-ephemeral agents so operators
-    // get an editable HEARTBEAT.md file from day one. Each agent gets its
-    // own per-agent file (under `.fusion/agents/<id>/HEARTBEAT.md`) so
-    // tweaks to one agent's procedure do not bleed into the rest of the
-    // team. Ephemeral task workers skip this — they're short-lived and
-    // don't need persistent procedure files.
-    const resolvedHeartbeatProcedurePath = input.heartbeatProcedurePath
-      ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId, input.name));
-
-    /*
-    FNXC:AgentPermissions 2026-07-02-00:00:
-    FN-7413 makes permission configuration lifetime-agnostic: durable identity agents and ephemeral task-worker agents may both store explicit capability grants and runtime permission policies. Missing policies stay absent for every lifetime so legacy rows and newly created agents inherit the project default at runtime instead of being materialized as explicit unrestricted overrides.
-    */
-    const normalizedPermissionPolicy = input.permissionPolicy
-      ? normalizeAgentPermissionPolicy(input.permissionPolicy)
-      : undefined;
-
-    const agent: Agent = {
-      id: agentId,
-      name: normalizedName,
-      role: input.role,
-      // Non-ephemeral agents start active so they immediately participate in
-      // heartbeat scheduling; ephemeral/task-worker agents start idle and are
-      // activated by the engine when work is assigned.
-      state: ephemeral ? "idle" : "active",
-      createdAt: now,
-      updatedAt: now,
-      metadata,
-      ...(input.title && { title: input.title }),
-      ...(input.icon && { icon: input.icon }),
-      ...(input.imageUrl && { imageUrl: input.imageUrl }),
-      ...(input.reportsTo && { reportsTo: input.reportsTo }),
-      ...(runtimeConfig && { runtimeConfig }),
-      ...(normalizeStoredPermissions(input.permissions) && { permissions: normalizeStoredPermissions(input.permissions) }),
-      ...(normalizedPermissionPolicy && { permissionPolicy: normalizedPermissionPolicy }),
-      ...(input.instructionsPath && { instructionsPath: input.instructionsPath }),
-      ...(input.instructionsText && { instructionsText: input.instructionsText }),
-      ...(input.soul && { soul: input.soul }),
-      ...(input.memory && { memory: input.memory }),
-      ...(input.bundleConfig && { bundleConfig: input.bundleConfig }),
-      ...(resolvedHeartbeatProcedurePath && { heartbeatProcedurePath: resolvedHeartbeatProcedurePath }),
-    };
+    const agent = buildAgentCreationRecord(input, normalizedName, metadata, runtimeConfig);
 
     await this.writeAgent(agent);
     this.emit("agent:created", agent);
 
+    return agent;
+  }
+
+  /**
+   * Create one durable named agent while preserving the caller's runtimeConfig
+   * byte-for-byte at the persistence boundary.
+   *
+   * FNXC:HappierTaskBinding 2026-07-16-13:10:
+   * Bridge agents must never become visible with AgentStore heartbeat or auto-claim defaults before a follow-up update. Serialize exact named creation with a PostgreSQL transaction-scoped advisory lock, check durable-name uniqueness and insert the final row in that same transaction, then emit creation only after commit.
+   */
+  async createAgentWithExactRuntimeConfig(input: ExactRuntimeConfigAgentCreateInput): Promise<Agent> {
+    if (!input.name?.trim()) {
+      throw new Error("Agent name is required");
+    }
+    if (!input.role) {
+      throw new Error("Agent role is required");
+    }
+    if (!input.runtimeConfig || typeof input.runtimeConfig !== "object" || Array.isArray(input.runtimeConfig)) {
+      throw new Error("Exact runtimeConfig is required");
+    }
+
+    const normalizedName = input.name.trim();
+    const metadata = input.metadata ?? {};
+    if (isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo })) {
+      throw new Error("Exact named creation is only supported for durable agents");
+    }
+    if (!this.backendMode) {
+      throw new Error("Exact named agent creation requires the PostgreSQL AsyncDataLayer");
+    }
+
+    const lockKey = `fusion:agent-name:${normalizedName}`;
+    const agent = await this.asyncLayer!.transactionImmediate(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      const candidates = await findAgentRowsByNameAsync(tx, normalizedName);
+      const existing = candidates.find((candidate) => !isEphemeralAgent(candidate));
+      if (existing) {
+        throw new Error(`Agent with name "${normalizedName}" already exists (agentId: ${existing.id})`);
+      }
+
+      const created = buildAgentCreationRecord(
+        input,
+        normalizedName,
+        metadata,
+        { ...input.runtimeConfig },
+      );
+      await writeAgentAsync(tx, created);
+      return created;
+    });
+
+    this.emit("agent:created", agent);
     return agent;
   }
 
