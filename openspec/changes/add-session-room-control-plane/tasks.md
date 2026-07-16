@@ -13,7 +13,7 @@
 - [x] 2.3 Implement typed Room domain records and transition helpers in focused `@fusion/core` modules, including FNXC requirement comments on the user-facing invariants.
 - [x] 2.4 Implement `AsyncRoomStore` transactional commands that validate expected aggregate version, append immutable events, update projections, and emit post-commit notifications.
 - [x] 2.5 Implement idempotency-key storage, transactional outbox/inbox state, delivery attempts, uncertainty states, and duplicate-command handling with concurrent PostgreSQL tests.
-- [ ] 2.6 Implement fenced Room, sender, and workspace lease persistence with epoch-based stale-writer rejection and real concurrent-store tests.
+- [x] 2.6 Implement fenced Room, sender, and workspace lease persistence with epoch-based stale-writer rejection and real concurrent-store tests.
 - [ ] 2.7 Implement turn checkpoints and projection rebuild/replay tests from append-only Room events.
 - [ ] 2.8 Implement one-way import of an existing task-bound Happier Session as a one-seat Room and prove import failure leaves the legacy binding untouched.
 - [ ] 2.9 Export Room stores/types through canonical core entrypoints and run scoped core typecheck, lint, migration, and PostgreSQL tests.
