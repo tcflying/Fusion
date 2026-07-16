@@ -16,8 +16,16 @@ import type {
   RoomMessageRecordV1,
   RoomOutboxRecordV1,
 } from "./room-contracts/storage.js";
-import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
-import { compareRoomText, hashRoomValue } from "./room-integrity.js";
+import {
+  recordRunAuditEventWithinTransaction,
+  type AsyncDataLayer,
+  type DbTransaction,
+} from "./postgres/data-layer.js";
+import {
+  buildRoomConnectorLocalMessageId,
+  compareRoomText,
+  hashRoomValue,
+} from "./room-integrity.js";
 import { cliSessions } from "./postgres/schema/project.js";
 import {
   operationalRooms,
@@ -120,10 +128,16 @@ export interface CompleteRoomDeliveryAttemptInput {
   readonly attemptId: string;
   readonly outcome: "confirmed" | "delivery_uncertain" | "retryable_failure" | "rejected";
   readonly connectorAcknowledgementId: string | null;
+  readonly nativeMessageId: string | null;
   readonly nativeCursor: string | null;
   readonly errorCode: string | null;
   readonly nextAttemptAt: string | null;
   readonly now: string;
+  readonly audit: {
+    readonly runId: string;
+    readonly agentId: string;
+    readonly taskId?: string;
+  };
 }
 
 export interface RecordRoomInboxReceiptInput {
@@ -661,24 +675,33 @@ export class AsyncRoomStore {
         createdAt: input.message.createdAt,
       });
 
-      const outboxValues = input.deliveries.map((delivery) => ({
-        id: delivery.id,
-        projectId: this.projectId,
-        roomId: input.roomId,
-        messageId: input.message.id,
-        bindingId: delivery.bindingId,
-        logicalMessageId: input.message.id,
-        idempotencyKey: `${input.idempotencyKey}:${delivery.bindingId}`,
-        payloadHash: contentHash,
-        deliveryState: "pending",
-        nativeAcknowledgement: null,
-        nativeCursor: null,
-        attemptCount: 0,
-        lastErrorCode: null,
-        nextAttemptAt: null,
-        createdAt: input.message.createdAt,
-        updatedAt: input.message.createdAt,
-      }));
+      const outboxValues = input.deliveries.map((delivery) => {
+        const idempotencyKey = `${input.idempotencyKey}:${delivery.bindingId}`;
+        return {
+          id: delivery.id,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          messageId: input.message.id,
+          bindingId: delivery.bindingId,
+          logicalMessageId: input.message.id,
+          localMessageId: buildRoomConnectorLocalMessageId({
+            logicalMessageId: input.message.id,
+            bindingId: delivery.bindingId,
+            idempotencyKey,
+            payloadHash: contentHash,
+          }),
+          idempotencyKey,
+          payloadHash: contentHash,
+          deliveryState: "pending",
+          nativeAcknowledgement: null,
+          nativeCursor: null,
+          attemptCount: 0,
+          lastErrorCode: null,
+          nextAttemptAt: null,
+          createdAt: input.message.createdAt,
+          updatedAt: input.message.createdAt,
+        };
+      });
       await tx.insert(roomOutbox).values(outboxValues);
 
       const event = await insertRoomEvent(tx, next, "room_message_queued", context, {
@@ -835,15 +858,36 @@ export class AsyncRoomStore {
           `Delivery outcome ${input.outcome} cannot schedule a retry`,
         );
       }
+      if (!input.audit.runId.trim() || !input.audit.agentId.trim()) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Delivery completion for ${input.outboxId} requires run and agent audit identity`,
+        );
+      }
+      if (
+        input.outcome === "confirmed"
+        && !input.connectorAcknowledgementId
+        && !input.nativeMessageId
+        && !input.nativeCursor
+      ) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Confirmed delivery for ${input.outboxId} requires connector or native acknowledgement evidence`,
+        );
+      }
 
       const nextState = deliveryStateForOutcome(input.outcome);
+      const nativeAcknowledgement = input.connectorAcknowledgementId || input.nativeMessageId
+        ? {
+            connectorAcknowledgementId: input.connectorAcknowledgementId,
+            nativeMessageId: input.nativeMessageId,
+          }
+        : null;
       const updated = await tx
         .update(roomOutbox)
         .set({
           deliveryState: nextState,
-          nativeAcknowledgement: input.connectorAcknowledgementId
-            ? { id: input.connectorAcknowledgementId }
-            : null,
+          nativeAcknowledgement,
           nativeCursor: input.nativeCursor,
           lastErrorCode: input.errorCode,
           nextAttemptAt: input.outcome === "retryable_failure" ? input.nextAttemptAt : null,
@@ -886,6 +930,33 @@ export class AsyncRoomStore {
           `Failed to complete delivery attempt ${input.attemptId}`,
         );
       }
+      // FNXC:RoomConnectorAuditPrivacy 2026-07-17-05:31:
+      // Run audit carries only durable identities, hashes, outcome, and cursor.
+      // Message plaintext, authority envelopes, connector settings, and official
+      // credential material are intentionally unavailable to this payload.
+      await recordRunAuditEventWithinTransaction(tx, {
+        timestamp: input.now,
+        taskId: input.audit.taskId,
+        agentId: input.audit.agentId,
+        runId: input.audit.runId,
+        domain: "database",
+        mutationType: "room:connector-delivery",
+        target: input.outboxId,
+        metadata: {
+          roomId: current.roomId,
+          bindingId: current.bindingId,
+          messageId: current.messageId,
+          logicalMessageId: current.logicalMessageId,
+          localMessageId: current.localMessageId,
+          payloadHash: current.payloadHash,
+          attempt: current.attemptCount,
+          outcome: input.outcome,
+          connectorAcknowledgementId: input.connectorAcknowledgementId,
+          nativeMessageId: input.nativeMessageId,
+          nativeCursor: input.nativeCursor,
+          errorCode: input.errorCode,
+        },
+      });
       return rowToOutboxRecord(updatedRow);
     });
   }
@@ -1129,13 +1200,21 @@ function rowToOutboxRecord(row: typeof roomOutbox.$inferSelect): RoomOutboxRecor
     id: row.id,
     roomId: row.roomId,
     logicalMessageId: row.logicalMessageId,
+    localMessageId: row.localMessageId,
     bindingId: row.bindingId,
     idempotencyKey: row.idempotencyKey,
     payloadHash: row.payloadHash,
     state: row.deliveryState as RoomOutboxRecordV1["state"],
     attemptCount: row.attemptCount,
-    connectorAcknowledgementId:
-      typeof acknowledgement.id === "string" ? acknowledgement.id : null,
+    connectorAcknowledgementId: typeof acknowledgement.connectorAcknowledgementId === "string"
+      ? acknowledgement.connectorAcknowledgementId
+      : typeof acknowledgement.id === "string"
+        ? acknowledgement.id
+        : null,
+    nativeMessageId: typeof acknowledgement.nativeMessageId === "string"
+      ? acknowledgement.nativeMessageId
+      : null,
+    nativeCursor: row.nativeCursor,
     lastErrorCode: row.lastErrorCode,
     nextAttemptAt: row.nextAttemptAt,
     updatedAt: row.updatedAt,

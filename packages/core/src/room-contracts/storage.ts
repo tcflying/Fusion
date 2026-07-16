@@ -182,12 +182,15 @@ export interface RoomOutboxRecordV1 {
   readonly id: string;
   readonly roomId: RoomId;
   readonly logicalMessageId: RoomMessageId;
+  readonly localMessageId: string;
   readonly bindingId: RoomBindingId;
   readonly idempotencyKey: string;
   readonly payloadHash: ContentHash;
   readonly state: RoomDeliveryState;
   readonly attemptCount: number;
   readonly connectorAcknowledgementId: string | null;
+  readonly nativeMessageId: string | null;
+  readonly nativeCursor: EventCursor | null;
   readonly lastErrorCode: string | null;
   readonly nextAttemptAt: IsoTimestamp | null;
   readonly updatedAt: IsoTimestamp;

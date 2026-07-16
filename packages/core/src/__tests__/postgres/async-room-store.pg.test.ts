@@ -8,6 +8,7 @@ import { createConnectionSetFromUrl, type PostgresConnections } from "../../post
 import { createAsyncDataLayer } from "../../postgres/data-layer.js";
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
+import { runAuditEvents } from "../../postgres/schema/project.js";
 import {
   roomBindings,
   roomIdempotencyKeys,
@@ -267,6 +268,7 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     expect([first.replayed, second.replayed].sort()).toEqual([false, true]);
     expect(first.event.id).toBe(second.event.id);
     expect(first.message.contentHash).toMatch(/^sha256:/);
+    expect(first.deliveries[0]?.localMessageId).toMatch(/^fusion-room-[a-f0-9]{64}$/u);
     expect((await layer.db.select().from(roomMessages))).toHaveLength(1);
     expect((await layer.db.select().from(roomOutbox))).toHaveLength(1);
     expect((await layer.db.select().from(roomIdempotencyKeys))).toHaveLength(1);
@@ -300,10 +302,12 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       attemptId: "attempt-1",
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
+      nativeMessageId: null,
       nativeCursor: null,
       errorCode: "ack_timeout",
       nextAttemptAt: null,
       now: "2026-07-17T03:04:00.000Z",
+      audit: { runId: "room-run-uncertain", agentId: "room-worker-1" },
     });
     expect(uncertain).toMatchObject({
       state: "delivery_uncertain",
@@ -318,6 +322,81 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
         now: "2026-07-17T03:05:00.000Z",
       }),
     ).rejects.toThrow(/uncertain/i);
+
+    const protectedContent = "Bearer room-audit-secret must cross only the connector boundary.";
+    const protectedCredentialReference = "credential://room-provider-secret";
+    const confirmedQueued = await store.enqueueMessage({
+      ...input,
+      expectedAggregateVersion: 1,
+      idempotencyKey: "operator-device-1:message-2",
+      message: {
+        ...input.message,
+        id: "message-2",
+        content: protectedContent,
+        authorityEnvelope: {
+          allowedActions: ["session:send"],
+          credentialReference: protectedCredentialReference,
+        },
+        createdAt: "2026-07-17T03:05:30.000Z",
+      },
+      deliveries: [{ id: "outbox-2", bindingId: "binding-delivery-1" }],
+    }, {
+      eventId: "event-message-confirmed",
+      actorType: "human",
+      actorId: "operator-1",
+      correlationId: "correlation-message-confirmed",
+      causationId: "event-message-contender-1",
+      occurredAt: "2026-07-17T03:05:30.000Z",
+    });
+    expect(confirmedQueued.deliveries[0]).toMatchObject({
+      logicalMessageId: "message-2",
+      localMessageId: expect.stringMatching(/^fusion-room-[a-f0-9]{64}$/u),
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-2",
+      attemptId: "attempt-confirmed-1",
+      now: "2026-07-17T03:05:40.000Z",
+    });
+    const confirmed = await store.completeDeliveryAttempt({
+      outboxId: "outbox-2",
+      attemptId: "attempt-confirmed-1",
+      outcome: "confirmed",
+      connectorAcknowledgementId: "happier-local-ack-2",
+      nativeMessageId: "native-message-confirmed-2",
+      nativeCursor: "native-cursor-confirmed-2",
+      errorCode: null,
+      nextAttemptAt: null,
+      now: "2026-07-17T03:05:50.000Z",
+      audit: { runId: "room-run-confirmed", agentId: "room-worker-1", taskId: "task-room-dispatch" },
+    });
+    expect(confirmed).toMatchObject({
+      logicalMessageId: "message-2",
+      localMessageId: confirmedQueued.deliveries[0]?.localMessageId,
+      state: "confirmed",
+      connectorAcknowledgementId: "happier-local-ack-2",
+      nativeMessageId: "native-message-confirmed-2",
+      nativeCursor: "native-cursor-confirmed-2",
+    });
+    const auditRows = await layer.db.select().from(runAuditEvents);
+    const confirmedAudit = auditRows.find((row) => row.runId === "room-run-confirmed");
+    expect(confirmedAudit).toMatchObject({
+      taskId: "task-room-dispatch",
+      agentId: "room-worker-1",
+      domain: "database",
+      mutationType: "room:connector-delivery",
+      target: "outbox-2",
+      metadata: expect.objectContaining({
+        roomId: created.room.id,
+        bindingId: "binding-delivery-1",
+        logicalMessageId: "message-2",
+        localMessageId: confirmedQueued.deliveries[0]?.localMessageId,
+        connectorAcknowledgementId: "happier-local-ack-2",
+        nativeMessageId: "native-message-confirmed-2",
+        nativeCursor: "native-cursor-confirmed-2",
+      }),
+    });
+    expect(JSON.stringify(confirmedAudit)).not.toContain(protectedContent);
+    expect(JSON.stringify(confirmedAudit)).not.toContain(protectedCredentialReference);
 
     const inboxInput = {
       id: "inbox-1",

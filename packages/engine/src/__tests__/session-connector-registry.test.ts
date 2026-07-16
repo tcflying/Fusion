@@ -336,6 +336,7 @@ describe("provider-neutral Session Connector registry contract", () => {
       bindingId: "binding-1",
       identity: IDENTITY,
       logicalMessageId: "room-message-10",
+      localMessageId: "fusion-room-local-10",
       idempotencyKey: "room-message-10:binding-1",
       content: "Continue the exact native Session.",
       contentHash: "sha256:room-message-10",

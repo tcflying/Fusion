@@ -250,15 +250,6 @@ function mapHistoryRow(row: HappierRawHistoryRow): SessionConnectorHistoryItemV1
   };
 }
 
-function stableLocalMessageId(input: SessionConnectorSendRequestV1): string {
-  const digest = hashRoomValue({
-    logicalMessageId: input.logicalMessageId,
-    idempotencyKey: input.idempotencyKey,
-    contentHash: input.contentHash,
-  }).slice("sha256:".length);
-  return `fusion-room-${digest}`;
-}
-
 function unavailableResult<T>(operation: string): SessionConnectorResultV1<T> {
   return failure(
     "unavailable",
@@ -487,13 +478,16 @@ export class HappierSessionConnector implements SessionConnectorV1 {
       input.contractVersion !== 1
       || !input.bindingId.trim()
       || !input.logicalMessageId.trim()
+      || !input.localMessageId.trim()
+      || input.localMessageId.length > 128
+      || !/^[A-Za-z0-9._:-]+$/u.test(input.localMessageId)
       || !input.idempotencyKey.trim()
       || !input.content.trim()
       || input.contentHash !== hashRoomValue(input.content)
     ) {
       return failure("invalid_request", "Happier send requires valid identity, idempotency, content, and content hash", false);
     }
-    const localId = stableLocalMessageId(input);
+    const localId = input.localMessageId;
     try {
       const result = await this.dependencies.sendMessage({
         sessionId: target.value,

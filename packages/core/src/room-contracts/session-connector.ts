@@ -166,6 +166,7 @@ export interface SessionConnectorSendRequestV1 {
   readonly bindingId: RoomBindingId;
   readonly identity: SessionConnectorIdentityV1;
   readonly logicalMessageId: RoomMessageId;
+  readonly localMessageId: string;
   readonly idempotencyKey: string;
   readonly content: string;
   readonly contentHash: ContentHash;

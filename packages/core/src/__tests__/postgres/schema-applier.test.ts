@@ -38,6 +38,9 @@ import {
   cePluginSchemaInit,
   cliPressPluginSchemaInit,
   reportsPluginSchemaInit,
+  SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+  SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
+  SCHEMA_ROOM_VERSION,
   roadmapPluginSchemaInit,
 } from "../../postgres/index.js";
 import {
@@ -662,6 +665,9 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
       SELECT version FROM public.fusion_schema_migrations
     `)) as unknown as Array<{ version: string }>;
     expect(rows.map((r) => r.version)).toContain(SCHEMA_BASELINE_VERSION);
+    expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_VERSION);
+    expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
+    expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
   });
 
   it("is idempotent: re-applying is a no-op", async () => {

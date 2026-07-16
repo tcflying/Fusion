@@ -253,6 +253,7 @@ export const roomOutbox = roomSchema.table("room_outbox", {
   messageId: text("message_id").notNull(),
   bindingId: text("binding_id").notNull(),
   logicalMessageId: text("logical_message_id").notNull(),
+  localMessageId: text("local_message_id").notNull(),
   idempotencyKey: text("idempotency_key").notNull(),
   payloadHash: text("payload_hash").notNull(),
   deliveryState: text("delivery_state").notNull(),
@@ -272,6 +273,7 @@ export const roomOutbox = roomSchema.table("room_outbox", {
   foreignKey({ columns: [t.messageId], foreignColumns: [roomMessages.id], name: "room_outbox_message_fkey" }).onDelete("cascade"),
   foreignKey({ columns: [t.bindingId], foreignColumns: [roomBindings.id], name: "room_outbox_binding_fkey" }).onDelete("cascade"),
   uniqueIndex("idx_room_outbox_logical_message").on(t.bindingId, t.logicalMessageId),
+  uniqueIndex("idx_room_outbox_local_message").on(t.bindingId, t.localMessageId),
   index("idx_room_outbox_dispatch").on(t.projectId, t.deliveryState, t.nextAttemptAt),
   check("room_outbox_delivery_state_check", sql`${t.deliveryState} IN ('pending','dispatching','confirmed','delivery_uncertain','rejected','cancelled')`),
 ]);

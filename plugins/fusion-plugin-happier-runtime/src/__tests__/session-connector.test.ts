@@ -1,4 +1,5 @@
 import {
+  buildRoomConnectorLocalMessageId,
   hashRoomValue,
   type SessionConnectorIdentityV1,
   type SessionConnectorSendRequestV1,
@@ -85,14 +86,21 @@ function setup(overrides: Partial<HappierSessionConnectorDependencies> = {}) {
 
 function sendRequest(): SessionConnectorSendRequestV1 {
   const content = "Continue the exact native Session";
+  const contentHash = hashRoomValue(content);
   return {
     contractVersion: 1,
     bindingId: "binding-1",
     identity: IDENTITY,
     logicalMessageId: "room-message-1",
     idempotencyKey: "dispatch-1",
+    localMessageId: buildRoomConnectorLocalMessageId({
+      logicalMessageId: "room-message-1",
+      bindingId: "binding-1",
+      idempotencyKey: "dispatch-1",
+      payloadHash: contentHash,
+    }),
     content,
-    contentHash: hashRoomValue(content),
+    contentHash,
   };
 }
 
@@ -198,7 +206,7 @@ describe("HappierSessionConnector", () => {
     );
   });
 
-  it("uses a deterministic safe local id and returns the official send acknowledgement", async () => {
+  it("uses the persisted local id and returns the official send acknowledgement", async () => {
     const { connector, dependencies } = setup();
     const request = sendRequest();
 
@@ -215,7 +223,7 @@ describe("HappierSessionConnector", () => {
       },
     });
     const localId = (dependencies.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0]?.[0].localId;
-    expect(localId).toMatch(/^fusion-room-[a-f0-9]{64}$/u);
+    expect(localId).toBe(request.localMessageId);
     expect((dependencies.sendMessage as ReturnType<typeof vi.fn>).mock.calls[1]?.[0].localId).toBe(localId);
     expect(first.ok && first.value.connectorAcknowledgementId).toBe(localId);
     expect(dependencies.sendMessage).toHaveBeenCalledWith(

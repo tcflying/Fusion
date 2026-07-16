@@ -13,6 +13,7 @@ import {
   readSchemaMigrationSql,
   SCHEMA_BASELINE_VERSION,
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+  SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -65,12 +66,14 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_BASELINE_VERSION,
       SCHEMA_ROOM_VERSION,
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
       SCHEMA_BASELINE_VERSION,
       SCHEMA_ROOM_VERSION,
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -215,6 +218,7 @@ describe("Session Room PostgreSQL migration", () => {
     expect(result.appliedVersions).toEqual([
       SCHEMA_ROOM_VERSION,
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -225,7 +229,7 @@ describe("Session Room PostgreSQL migration", () => {
     expect(rooms).toEqual([{ table_name: "operational_rooms" }]);
   });
 
-  it("upgrades an existing 0001 Room schema with ownership indexes only", async () => {
+  it("upgrades an existing 0001 Room schema through ownership and outbox identity", async () => {
     const context = await startEmbeddedDatabase();
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
@@ -240,7 +244,10 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION]);
+    expect(result.appliedVersions).toEqual([
+      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
+    ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
       FROM pg_indexes
@@ -255,5 +262,42 @@ describe("Session Room PostgreSQL migration", () => {
       "idx_room_bindings_active_happier_session",
       "idx_room_bindings_active_native_session",
     ]);
+    const outboxColumns = (await context.connections!.migration.execute(sql`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'room_outbox'
+        AND column_name = 'local_message_id'
+    `)) as unknown as Array<{ column_name: string; is_nullable: string }>;
+    expect(outboxColumns).toEqual([{ column_name: "local_message_id", is_nullable: "NO" }]);
+  });
+
+  it("upgrades an existing 0002 schema with the outbox identity migration only", async () => {
+    const context = await startEmbeddedDatabase();
+    const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
+    const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
+    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
+    await context.connections!.migration.execute(sql.raw(roomSql));
+    await context.connections!.migration.execute(sql.raw(ownershipSql));
+    await context.connections!.migration.execute(sql.raw(`
+      CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
+        version text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
+      VALUES
+        ('${SCHEMA_BASELINE_VERSION}'),
+        ('${SCHEMA_ROOM_VERSION}'),
+        ('${SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION}');
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION]);
+    const indexes = (await context.connections!.migration.execute(sql`
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'project' AND indexname = 'idx_room_outbox_local_message'
+    `)) as unknown as Array<{ indexname: string }>;
+    expect(indexes).toEqual([{ indexname: "idx_room_outbox_local_message" }]);
   });
 });

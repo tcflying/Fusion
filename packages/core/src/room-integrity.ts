@@ -7,6 +7,35 @@ export function hashRoomValue(value: unknown): string {
     .digest("hex")}`;
 }
 
+export interface BuildRoomConnectorLocalMessageIdInput {
+  readonly logicalMessageId: string;
+  readonly bindingId: string;
+  readonly idempotencyKey: string;
+  readonly payloadHash: string;
+}
+
+/**
+ * Stable provider-safe local id persisted before an external send begins.
+ * The plaintext payload is deliberately excluded; only its canonical hash is
+ * bound into the id so retries reproduce the same connector idempotency key.
+ */
+export function buildRoomConnectorLocalMessageId(
+  input: BuildRoomConnectorLocalMessageIdInput,
+): string {
+  for (const [label, value] of Object.entries(input)) {
+    if (typeof value !== "string" || value.trim().length === 0) {
+      throw new Error(`Room connector local message id requires ${label}`);
+    }
+  }
+  const digest = hashRoomValue({
+    logicalMessageId: input.logicalMessageId,
+    bindingId: input.bindingId,
+    idempotencyKey: input.idempotencyKey,
+    payloadHash: input.payloadHash,
+  }).slice("sha256:".length);
+  return `fusion-room-${digest}`;
+}
+
 /**
  * Deterministic JSON-compatible encoding. Object key order and process locale
  * cannot change a persisted Room hash; unsupported values fail closed.
