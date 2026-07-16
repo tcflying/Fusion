@@ -56,6 +56,7 @@ describe("PluginRunner", () => {
     getPluginUiSlots: ReturnType<typeof vi.fn>;
     getPluginUiContributions: ReturnType<typeof vi.fn>;
     getPluginRuntimes: ReturnType<typeof vi.fn>;
+    getPluginSessionConnectors: ReturnType<typeof vi.fn>;
     getCliProviderContributions: ReturnType<typeof vi.fn>;
     getPluginSkills: ReturnType<typeof vi.fn>;
     getPluginWorkflowSteps: ReturnType<typeof vi.fn>;
@@ -122,6 +123,7 @@ describe("PluginRunner", () => {
       getPluginUiSlots: vi.fn().mockReturnValue([]),
       getPluginUiContributions: vi.fn().mockReturnValue([]),
       getPluginRuntimes: vi.fn().mockReturnValue([]),
+      getPluginSessionConnectors: vi.fn().mockReturnValue([]),
       getCliProviderContributions: vi.fn().mockReturnValue([]),
       getPluginSkills: vi.fn().mockReturnValue([]),
       getPluginWorkflowSteps: vi.fn().mockReturnValue([]),
@@ -850,6 +852,24 @@ describe("PluginRunner", () => {
       // Next call should rebuild cache
       pluginRunner.getPluginRuntimes();
       expect(mockPluginLoader.getPluginRuntimes).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("Session Connector contributions", () => {
+    it("discovers a connector by generic connector id", async () => {
+      const registration = {
+        pluginId: "session-plugin",
+        sessionConnector: {
+          metadata: { connectorId: "connector-one", name: "Connector One", version: "1.0.0" },
+          factory: vi.fn(),
+        },
+      };
+      mockPluginLoader.getPluginSessionConnectors.mockReturnValue([registration]);
+      await pluginRunner.init();
+
+      expect(pluginRunner.getPluginSessionConnectors()).toEqual([registration]);
+      expect(pluginRunner.getSessionConnectorById("connector-one")).toBe(registration);
+      expect(pluginRunner.getSessionConnectorById("missing")).toBeUndefined();
     });
   });
 

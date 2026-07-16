@@ -12,6 +12,7 @@
  */
 
 import type { Database } from "./db.js";
+import type { SessionConnectorV1 } from "./room-contracts/session-connector.js";
 import type { TaskStore } from "./store.js";
 import type { PlanningQuestion, Task, WorkflowStepMode, WorkflowStepToolMode } from "./types.js";
 import type {
@@ -54,6 +55,8 @@ export interface PluginManifest {
   settingsSchema?: Record<string, PluginSettingSchema>;
   /** Optional agent runtime metadata for discovery (runtime factory is in FusionPlugin.runtime) */
   runtime?: PluginRuntimeManifestMetadata;
+  /** Optional provider-neutral Session Connector metadata for discovery. */
+  sessionConnector?: PluginSessionConnectorManifestMetadata;
   /** Optional skill metadata used for discovery UIs. */
   skills?: Array<{ skillId: string; name: string }>;
   /** Optional workflow step metadata used for discovery UIs. */
@@ -631,6 +634,29 @@ export interface PluginRuntimeRegistration {
   factory: PluginRuntimeFactory;
 }
 
+/** Discovery metadata for a plugin-provided Session Connector. */
+export interface PluginSessionConnectorManifestMetadata {
+  /** Stable connector id used by Room bindings and the connector registry. */
+  connectorId: string;
+  /** Human-readable connector name. */
+  name: string;
+  /** Short description of the owned connection surface. */
+  description?: string;
+  /** Semantic version of the connector implementation. */
+  version?: string;
+}
+
+/** Factory for a project/runtime-scoped Session Connector instance. */
+export type PluginSessionConnectorFactory = (
+  ctx: PluginContext,
+) => Promise<SessionConnectorV1> | SessionConnectorV1;
+
+/** Plugin contribution pairing connector discovery metadata and its factory. */
+export interface PluginSessionConnectorRegistration {
+  metadata: PluginSessionConnectorManifestMetadata;
+  factory: PluginSessionConnectorFactory;
+}
+
 export type CliProviderType = "cli" | "oauth" | "api_key" | "custom";
 
 export interface CliProviderActionMetadata {
@@ -1159,6 +1185,8 @@ export interface FusionPlugin {
   dashboardViews?: PluginDashboardViewDefinition[];
   /** Agent runtime registration for providing custom runtime implementations */
   runtime?: PluginRuntimeRegistration;
+  /** Provider-neutral native Session Connector registration. */
+  sessionConnector?: PluginSessionConnectorRegistration;
   /** CLI-backed provider metadata and integration hooks. */
   cliProviders?: CliProviderContribution[];
   /** Plugin-contributed skills surfaced by the skill resolver. */

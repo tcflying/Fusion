@@ -17,6 +17,7 @@ import type {
   PluginUiSlotDefinition,
   PluginUiContributionDefinition,
   PluginRuntimeRegistration,
+  PluginSessionConnectorRegistration,
   CliProviderContribution,
   PluginContext,
   PluginSkillContribution,
@@ -377,6 +378,24 @@ export class PluginRunner {
       };
     }
     return this.cachedRuntimes.runtimes;
+  }
+
+  /** Discover Session Connectors through the generic plugin contribution seam. */
+  getPluginSessionConnectors(): Array<{
+    pluginId: string;
+    sessionConnector: PluginSessionConnectorRegistration;
+  }> {
+    return this.options.pluginLoader.getPluginSessionConnectors();
+  }
+
+  /** Resolve one connector registration without provider-specific branching. */
+  getSessionConnectorById(connectorId: string): {
+    pluginId: string;
+    sessionConnector: PluginSessionConnectorRegistration;
+  } | undefined {
+    return this.getPluginSessionConnectors().find(
+      (registration) => registration.sessionConnector.metadata.connectorId === connectorId,
+    );
   }
 
   getCliProviderContributions(): Array<{ pluginId: string; contribution: CliProviderContribution }> {

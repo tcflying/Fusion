@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import plugin, {
   HAPPIER_RUNTIME_ID,
+  happierSessionConnectorFactory,
+  happierSessionConnectorMetadata,
   happierRuntimeFactory,
   happierRuntimeMetadata,
 } from "../index.js";
@@ -13,6 +15,7 @@ describe("Happier runtime plugin registration", () => {
     const manifestJson = JSON.parse(readFileSync(new URL("../../manifest.json", import.meta.url), "utf8")) as {
       version: string;
       runtime?: { version?: string };
+      sessionConnector?: { version?: string };
     };
 
     expect(source).toMatch(/import\s*\{\s*definePlugin\s*\}\s*from\s*["']@fusion\/plugin-sdk["']/);
@@ -20,6 +23,7 @@ describe("Happier runtime plugin registration", () => {
     expect(happierRuntimeMetadata.version).toBe(packageJson.version);
     expect(manifestJson.version).toBe(packageJson.version);
     expect(manifestJson.runtime?.version).toBe(packageJson.version);
+    expect(manifestJson.sessionConnector?.version).toBe(packageJson.version);
   });
 
   it("registers metadata and creates the runtime without provider credentials", async () => {
@@ -45,6 +49,26 @@ describe("Happier runtime plugin registration", () => {
 
     expect(plugin.runtime?.metadata).toEqual(happierRuntimeMetadata);
     expect(runtime).toMatchObject({ id: HAPPIER_RUNTIME_ID, name: "Happier Runtime" });
+  });
+
+  it("registers a separate Session Connector without replacing AgentRuntime", async () => {
+    expect(plugin.runtime?.metadata).toEqual(happierRuntimeMetadata);
+    expect(plugin.sessionConnector?.metadata).toEqual(happierSessionConnectorMetadata);
+
+    const connector = await happierSessionConnectorFactory({
+      settings: {
+        executable: "happier",
+        backend: "codex",
+        providerApiKey: "must-not-be-exposed",
+      },
+    } as never);
+
+    expect(connector).toMatchObject({ contractVersion: 1, id: "happier" });
+    expect(JSON.stringify(connector)).not.toContain("must-not-be-exposed");
+    expect(await happierRuntimeFactory({ settings: {} } as never)).toMatchObject({
+      id: HAPPIER_RUNTIME_ID,
+      name: "Happier Runtime",
+    });
   });
 
   it("emits a non-sensitive loaded event and never logs settings secrets", () => {

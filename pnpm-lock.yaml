@@ -1081,6 +1081,9 @@ importers:
 
   plugins/fusion-plugin-happier-runtime:
     dependencies:
+      '@fusion/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@fusion/engine':
         specifier: workspace:*
         version: link:../../packages/engine

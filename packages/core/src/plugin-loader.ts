@@ -27,6 +27,7 @@ import type {
   PluginUiContributionDefinition,
   PluginDashboardViewDefinition,
   PluginRuntimeRegistration,
+  PluginSessionConnectorRegistration,
   CliProviderContribution,
   PluginInstallation,
   PluginManifest,
@@ -1329,6 +1330,23 @@ export class PluginLoader extends EventEmitter<{
       }
     }
     return runtimes;
+  }
+
+  /** Get provider-neutral Session Connector registrations from loaded plugins. */
+  getPluginSessionConnectors(): Array<{
+    pluginId: string;
+    sessionConnector: PluginSessionConnectorRegistration;
+  }> {
+    const connectors: Array<{
+      pluginId: string;
+      sessionConnector: PluginSessionConnectorRegistration;
+    }> = [];
+    for (const [pluginId, plugin] of this.plugins) {
+      if (plugin.sessionConnector) {
+        connectors.push({ pluginId, sessionConnector: plugin.sessionConnector });
+      }
+    }
+    return connectors;
   }
 
   /**

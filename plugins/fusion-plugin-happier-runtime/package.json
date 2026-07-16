@@ -25,6 +25,7 @@
     "test": "vitest run src --silent=passed-only --reporter=dot"
   },
   "dependencies": {
+    "@fusion/core": "workspace:*",
     "@fusion/engine": "workspace:*",
     "@fusion/plugin-sdk": "workspace:*"
   },

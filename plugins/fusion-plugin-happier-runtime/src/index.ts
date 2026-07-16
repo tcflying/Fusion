@@ -5,16 +5,25 @@
  */
 
 import { HappierRuntimeAdapter } from "./runtime-adapter.js";
+import { resolveHappierCliSettings } from "./cli-spawn.js";
+import {
+  HAPPIER_SESSION_CONNECTOR_ID,
+  HAPPIER_SESSION_CONNECTOR_VERSION,
+  HappierSessionConnector,
+} from "./session-connector.js";
 import { definePlugin } from "@fusion/plugin-sdk";
 import type {
   FusionPlugin,
   PluginContext,
   PluginRuntimeFactory,
   PluginRuntimeManifestMetadata,
+  PluginSessionConnectorFactory,
+  PluginSessionConnectorManifestMetadata,
 } from "@fusion/plugin-sdk";
+import type { HappierBackend } from "./types.js";
 
-export const HAPPIER_RUNTIME_ID = "happier";
-export const HAPPIER_RUNTIME_VERSION = "0.2.73";
+export const HAPPIER_RUNTIME_ID = HAPPIER_SESSION_CONNECTOR_ID;
+export const HAPPIER_RUNTIME_VERSION = HAPPIER_SESSION_CONNECTOR_VERSION;
 
 export const happierRuntimeMetadata: PluginRuntimeManifestMetadata = {
   runtimeId: HAPPIER_RUNTIME_ID,
@@ -26,6 +35,27 @@ export const happierRuntimeMetadata: PluginRuntimeManifestMetadata = {
 export const happierRuntimeFactory: PluginRuntimeFactory = async (ctx) =>
   new HappierRuntimeAdapter(ctx.settings as Record<string, unknown>);
 
+export const happierSessionConnectorMetadata: PluginSessionConnectorManifestMetadata = {
+  connectorId: HAPPIER_SESSION_CONNECTOR_ID,
+  name: "Happier Session Connector",
+  description: "Connects exact native Sessions through the official Happier JSON CLI",
+  version: HAPPIER_SESSION_CONNECTOR_VERSION,
+};
+
+function connectorSettings(ctx: PluginContext) {
+  const settings = ctx.settings as Record<string, unknown>;
+  const backend = settings.backend === "codex" || settings.backend === "claude" || settings.backend === "opencode"
+    ? settings.backend as HappierBackend
+    : undefined;
+  return {
+    ...resolveHappierCliSettings(settings),
+    ...(backend ? { backend } : {}),
+  };
+}
+
+export const happierSessionConnectorFactory: PluginSessionConnectorFactory = async (ctx) =>
+  new HappierSessionConnector({ settings: connectorSettings(ctx) });
+
 const plugin: FusionPlugin = definePlugin({
   manifest: {
     id: "fusion-plugin-happier-runtime",
@@ -35,6 +65,7 @@ const plugin: FusionPlugin = definePlugin({
     author: "Fusion Team",
     homepage: "https://github.com/Runfusion/Fusion",
     runtime: happierRuntimeMetadata,
+    sessionConnector: happierSessionConnectorMetadata,
   },
   state: "installed",
   hooks: {
@@ -51,6 +82,10 @@ const plugin: FusionPlugin = definePlugin({
     metadata: happierRuntimeMetadata,
     factory: happierRuntimeFactory,
   },
+  sessionConnector: {
+    metadata: happierSessionConnectorMetadata,
+    factory: happierSessionConnectorFactory,
+  },
 });
 
 export default plugin;
@@ -62,3 +97,4 @@ export * from "./operations.js";
 export * from "./probe.js";
 export * from "./types.js";
 export { HappierRecoveryError, HappierRuntimeAdapter } from "./runtime-adapter.js";
+export * from "./session-connector.js";
