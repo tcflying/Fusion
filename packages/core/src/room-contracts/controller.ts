@@ -45,9 +45,16 @@ export const ROOM_CONTROLLER_EVENT_TYPES = [
 export type RoomControllerCommandType = (typeof ROOM_CONTROLLER_COMMAND_TYPES)[number];
 export type RoomControllerEventType = (typeof ROOM_CONTROLLER_EVENT_TYPES)[number];
 export type RoomMessageIntent = "instruction" | "proposal" | "question" | "critique" | "challenge" | "verdict" | "handoff" | "help_request";
+export const ROOM_AUTHORITY_ACTOR_TYPES = ["human", "controller", "seat", "system", "evolution"] as const;
+export const ROOM_AUTHORITY_CLAIM_VERSION = "room-authority/v1" as const;
+export const ROOM_AUTHORITY_PROOF_ALGORITHMS = ["Ed25519"] as const;
+
+export type RoomAuthorityActorTypeV1 = (typeof ROOM_AUTHORITY_ACTOR_TYPES)[number];
+export type RoomAuthorityClaimVersionV1 = typeof ROOM_AUTHORITY_CLAIM_VERSION;
+export type RoomAuthorityProofAlgorithmV1 = (typeof ROOM_AUTHORITY_PROOF_ALGORITHMS)[number];
 
 export interface RoomAuthorityEnvelopeV1 {
-  readonly actorType: "human" | "controller" | "seat" | "system" | "evolution";
+  readonly actorType: RoomAuthorityActorTypeV1;
   readonly actorId: string;
   readonly deviceId: string | null;
   readonly role: string;
@@ -64,6 +71,65 @@ export type RoomMessageTargetV1 =
   | { readonly kind: "all" }
   | { readonly kind: "group"; readonly groupId: string }
   | { readonly kind: "seats"; readonly seatIds: readonly RoomSeatId[] };
+
+/*
+FNXC:SessionRoomAuthority 2026-07-17-22:40:
+Task 9.1 adds a signed backend-issued authority layer that is evaluated
+separately from peer content. Claims bind the exact Room/project/turn/node,
+target selector, expected versions, intent, and content hash so text can
+propose work but cannot mint tools, workspace, credential, network, or
+publication authority on its own.
+*/
+export interface RoomAuthorityClaimsV1 {
+  readonly version: RoomAuthorityClaimVersionV1;
+  readonly issuer: string;
+  readonly actorType: RoomAuthorityActorTypeV1;
+  readonly actorId: string;
+  readonly issuedAt: IsoTimestamp;
+  readonly expiresAt: IsoTimestamp;
+  readonly nonce: string;
+  readonly commandId: string;
+  readonly projectId: ProjectId;
+  readonly roomId: RoomId;
+  readonly turnId: RoomTurnId | null;
+  readonly nodeId: RoomTaskNodeId | null;
+  readonly target: RoomMessageTargetV1;
+  readonly expectedAggregateVersion: number;
+  readonly expectedMembershipVersion: number;
+  readonly intent: RoomMessageIntent;
+  readonly contentHash: ContentHash;
+  readonly scopes: readonly string[];
+}
+
+export interface RoomAuthorityProofV1 {
+  readonly algorithm: RoomAuthorityProofAlgorithmV1;
+  readonly keyId: string;
+  readonly signature: string;
+}
+
+export interface SignedRoomAuthorityEnvelopeV1 {
+  readonly version: RoomAuthorityClaimVersionV1;
+  readonly issuer: string;
+  readonly issuedAt: IsoTimestamp;
+  readonly expiresAt: IsoTimestamp;
+  readonly claims: RoomAuthorityClaimsV1;
+  readonly proof: RoomAuthorityProofV1;
+}
+
+export interface RoomAuthorityVerificationContextV1 {
+  readonly commandId: string;
+  readonly projectId: ProjectId;
+  readonly roomId: RoomId;
+  readonly turnId: RoomTurnId | null;
+  readonly nodeId: RoomTaskNodeId | null;
+  readonly target: RoomMessageTargetV1;
+  readonly expectedAggregateVersion: number;
+  readonly expectedMembershipVersion: number;
+  readonly intent: RoomMessageIntent;
+  readonly contentHash: ContentHash;
+  readonly content?: string;
+  readonly requiredScopes: readonly string[];
+}
 
 export interface CreateRoomCommandV1 {
   readonly type: "create_room";

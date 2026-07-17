@@ -2100,6 +2100,7 @@ export * from "./room-protocol-schema.js";
 export * from "./room-protocol-definitions.js";
 export * from "./room-domain.js";
 export * from "./room-integrity.js";
+export * from "./room-authority.js";
 export * from "./room-projection-replay.js";
 export * from "./external-component-provenance.js";
 export * from "./session-room-external-components.js";
