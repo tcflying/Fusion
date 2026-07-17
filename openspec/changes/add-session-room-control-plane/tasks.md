@@ -43,9 +43,9 @@
 
 ## 5. Dynamic DAG and protocol execution
 
-- [ ] 5.1 Add RED tests for typed task nodes/edges, dependency readiness, critical paths, accepted-node freeze, and evidence-driven reopen rules.
+- [x] 5.1 Add RED tests for typed task nodes/edges, dependency readiness, critical paths, accepted-node freeze, and evidence-driven reopen rules.
 - [ ] 5.2 Implement dynamic hierarchical DAG commands and projections, including add/split/merge/cancel/reopen with causal evidence.
-- [ ] 5.3 Define and validate versioned declarative protocol schemas for phases, roles, channels, context packs, transitions, gates, timeouts, recovery, and exit conditions.
+- [x] 5.3 Define and validate versioned declarative protocol schemas for phases, roles, channels, context packs, transitions, gates, timeouts, recovery, and exit conditions.
 - [ ] 5.4 Implement initial analysis, implementation, diagnosis, creative-review, and bounded-discussion protocol definitions with migration/version tests.
 - [ ] 5.5 Implement capability-aware role assignment, user locks/forbids, phase changes, and producer/verifier separation.
 - [ ] 5.6 Implement structured proposal/question/critique/challenge/verdict/handoff/help-request routing and semantic loop breaking.

@@ -2096,6 +2096,7 @@ export {
   SESSION_ROOM_CONTROL_PLANE_FLAG,
 } from "./room-feature-gate.js";
 export * from "./room-contracts/index.js";
+export * from "./room-protocol-schema.js";
 export * from "./room-domain.js";
 export * from "./room-integrity.js";
 export * from "./room-projection-replay.js";
