@@ -2,12 +2,15 @@ import {
   RoomDomainError,
   createRoomAggregate,
   transitionRoomLifecycle,
+  type PendingRoomMembershipChangeV1,
   type RoomAggregateV1,
 } from "./room-domain.js";
 import {
   ROOM_LIFECYCLE_STATES,
+  type RoomBindingRecordV1,
   type RoomEventRecordV1,
   type RoomLifecycleState,
+  type RoomSeatRecordV1,
 } from "./room-contracts/storage.js";
 import { hashRoomValue } from "./room-integrity.js";
 
@@ -272,53 +275,9 @@ function applyOneEvent(
       };
     }
     case "membership_change_requested":
-    case "membership_change_activated": {
-      const projectionHash = requireString(payload.projectionHash, `${event.id} projectionHash`);
-      if (hashRoomValue(payload.projection) !== projectionHash) {
-        throw new RoomProjectionReplayError(
-          "invalid_event_payload",
-          `Room membership event ${event.id} projection hash does not match its payload`,
-        );
-      }
-      let projection: RoomAggregateV1;
-      try {
-        projection = parseRoomAggregateProjection(payload.projection);
-      } catch (error) {
-        throw new RoomProjectionReplayError(
-          "invalid_event_payload",
-          `Room membership event ${event.id} projection is invalid: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      if (
-        projection.room.id !== aggregate.room.id
-        || projection.room.projectId !== aggregate.room.projectId
-        || projection.room.aggregateVersion !== event.aggregateVersion
-      ) {
-        throw new RoomProjectionReplayError(
-          "invalid_event_payload",
-          `Room membership event ${event.id} projection identity/version does not match its event`,
-        );
-      }
-      if (
-        event.eventType === "membership_change_requested"
-        && projection.membershipVersion !== aggregate.membershipVersion
-      ) {
-        throw new RoomProjectionReplayError(
-          "invalid_event_payload",
-          `Membership request ${event.id} changed the active membership snapshot`,
-        );
-      }
-      if (
-        event.eventType === "membership_change_activated"
-        && projection.membershipVersion !== aggregate.membershipVersion + 1
-      ) {
-        throw new RoomProjectionReplayError(
-          "invalid_event_payload",
-          `Membership activation ${event.id} must advance membership version exactly once`,
-        );
-      }
-      return projection;
-    }
+      return validateMembershipChangeRequested(aggregate, event, payload);
+    case "membership_change_activated":
+      return validateMembershipChangeActivated(aggregate, event, payload);
     default:
       throw new RoomProjectionReplayError(
         "unsupported_event",
@@ -326,6 +285,896 @@ function applyOneEvent(
         { eventId: event.id, eventType: event.eventType },
       );
   }
+}
+
+function validateMembershipChangeRequested(
+  aggregate: RoomAggregateV1,
+  event: RoomEventRecordV1,
+  payload: Readonly<Record<string, unknown>>,
+): RoomAggregateV1 {
+  assertExactKeys(payload, [
+    "projectionVersion",
+    "changeId",
+    "changeKind",
+    "effectiveAfterTurnId",
+    "projection",
+    "projectionHash",
+    "updatedAt",
+  ], `${event.id} payload`);
+  const projectionHash = requireString(payload.projectionHash, `${event.id} projectionHash`);
+  if (hashRoomValue(payload.projection) !== projectionHash) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership event ${event.id} projection hash does not match its payload`,
+    );
+  }
+  if (aggregate.activeTurnId === null) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${event.id} requires an active turn boundary`,
+    );
+  }
+  const changeId = requireTrimmedString(payload.changeId, `${event.id} changeId`);
+  const changeKind = requireMembershipChangeKind(payload.changeKind, `${event.id} changeKind`);
+  const effectiveAfterTurnId = requireTrimmedString(
+    payload.effectiveAfterTurnId,
+    `${event.id} effectiveAfterTurnId`,
+  );
+  if (effectiveAfterTurnId !== aggregate.activeTurnId) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${event.id} must target active turn ${aggregate.activeTurnId}`,
+    );
+  }
+  const updatedAt = requireIsoTimestamp(payload.updatedAt, `${event.id} updatedAt`);
+  const projection = requireEventRecord(payload.projection, `${event.id} projection`);
+  assertExactKeys(projection, [
+    "room",
+    "membershipVersion",
+    "activeTurnId",
+    "seats",
+    "bindings",
+    "turns",
+    "pendingMembershipChanges",
+  ], `${event.id} projection`);
+
+  const existingPending = validatePendingMembershipChangeSet(
+    aggregate.pendingMembershipChanges,
+    `${event.id} existing pending changes`,
+  );
+  if (existingPending.some((change) => change.id === changeId)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${event.id} duplicates changeId ${changeId}`,
+    );
+  }
+  const projectedPending = requireEventArray(
+    projection.pendingMembershipChanges,
+    `${event.id} projection.pendingMembershipChanges`,
+  );
+  if (projectedPending.length !== existingPending.length + 1) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${event.id} must add exactly one pending membership change`,
+    );
+  }
+  const pending = parseStrictPendingMembershipChange(
+    projectedPending.at(-1),
+    `${event.id} pending membership change`,
+  );
+  assertPendingMembershipChangeMatchesRequest(
+    aggregate,
+    pending,
+    event.id,
+    changeId,
+    changeKind,
+    effectiveAfterTurnId,
+    updatedAt,
+  );
+
+  const expected: RoomAggregateV1 = {
+    room: {
+      ...aggregate.room,
+      aggregateVersion: event.aggregateVersion,
+      updatedAt,
+    },
+    membershipVersion: aggregate.membershipVersion,
+    activeTurnId: aggregate.activeTurnId,
+    seats: aggregate.seats,
+    bindings: aggregate.bindings,
+    turns: aggregate.turns,
+    pendingMembershipChanges: [...existingPending, pending],
+  };
+  if (hashRoomValue(payload.projection) !== hashRoomValue(expected)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${event.id} projection is not the exact allowed request delta`,
+    );
+  }
+  return expected;
+}
+
+function validateMembershipChangeActivated(
+  aggregate: RoomAggregateV1,
+  event: RoomEventRecordV1,
+  payload: Readonly<Record<string, unknown>>,
+): RoomAggregateV1 {
+  assertExactKeys(payload, [
+    "projectionVersion",
+    "turnId",
+    "changeIds",
+    "membershipVersion",
+    "projection",
+    "projectionHash",
+    "updatedAt",
+  ], `${event.id} payload`);
+  const projectionHash = requireString(payload.projectionHash, `${event.id} projectionHash`);
+  if (hashRoomValue(payload.projection) !== projectionHash) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership event ${event.id} projection hash does not match its payload`,
+    );
+  }
+  const turnId = requireTrimmedString(payload.turnId, `${event.id} turnId`);
+  const changeIds = requireUniqueStringArray(payload.changeIds, `${event.id} changeIds`);
+  const updatedAt = requireIsoTimestamp(payload.updatedAt, `${event.id} updatedAt`);
+  const declaredMembershipVersion = requireNonNegativeInteger(
+    payload.membershipVersion,
+    `${event.id} membershipVersion`,
+  );
+  if (declaredMembershipVersion !== aggregate.membershipVersion + 1) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} declared an invalid membership version`,
+    );
+  }
+
+  const projection = requireEventRecord(payload.projection, `${event.id} projection`);
+  assertExactKeys(projection, [
+    "room",
+    "membershipVersion",
+    "activeTurnId",
+    "seats",
+    "bindings",
+    "turns",
+    "pendingMembershipChanges",
+  ], `${event.id} projection`);
+  const validatedPending = validatePendingMembershipChangeSet(
+    aggregate.pendingMembershipChanges,
+    `${event.id} pending changes`,
+  );
+  const replayBase: RoomAggregateV1 = {
+    ...aggregate,
+    pendingMembershipChanges: validatedPending,
+  };
+  const applicableChanges = validatedPending
+    .filter((change) => change.effectiveAfterTurnId === turnId)
+    .slice()
+    .sort((left, right) => comparePendingMembershipChanges(left, right));
+  if (applicableChanges.length === 0) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} has no pending changes for turn ${turnId}`,
+    );
+  }
+  const applicableIds = applicableChanges.map((change) => change.id);
+  if (
+    changeIds.length !== applicableIds.length
+    || changeIds.some((changeId, index) => changeId !== applicableIds[index])
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} does not match the pending change set for turn ${turnId}`,
+    );
+  }
+
+  const boundaryBase = deriveMembershipActivationBoundary(
+    replayBase,
+    projection,
+    event.id,
+    turnId,
+    updatedAt,
+  );
+  const expected = applyMembershipChangesForReplay(boundaryBase, applicableChanges, updatedAt);
+  if (
+    expected.room.aggregateVersion !== event.aggregateVersion
+    || expected.membershipVersion !== declaredMembershipVersion
+    || hashRoomValue(payload.projection) !== hashRoomValue(expected)
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} projection is not the exact allowed boundary delta`,
+    );
+  }
+  return expected;
+}
+
+/*
+FNXC:SessionRoomMembershipReplay 2026-07-18-01:56:
+A membership request is replayable only as one exact pending delta against the
+current active turn. Activation may carry the missing durable boundary evidence,
+but only for that same turn: active becomes null and the one running or waiting
+turn becomes completed, cancelled, or uncertain. All other Room, turn, seat,
+binding, and pending state is derived and compared fail closed.
+*/
+function deriveMembershipActivationBoundary(
+  aggregate: RoomAggregateV1,
+  projection: Readonly<Record<string, unknown>>,
+  eventId: string,
+  turnId: string,
+  updatedAt: string,
+): RoomAggregateV1 {
+  const boundaryTurn = aggregate.turns.find((turn) => turn.id === turnId);
+  if (!boundaryTurn) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${eventId} targets missing turn ${turnId}`,
+    );
+  }
+  if (projection.activeTurnId !== null) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${eventId} must clear activeTurnId at the boundary`,
+    );
+  }
+
+  if (aggregate.activeTurnId === null) {
+    if (
+      !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)
+      || boundaryTurn.endedAt === null
+    ) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership activation ${eventId} lacks a settled checkpoint boundary for turn ${turnId}`,
+      );
+    }
+    return aggregate;
+  }
+  if (aggregate.activeTurnId !== turnId) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${eventId} cannot settle unrelated active turn ${aggregate.activeTurnId}`,
+    );
+  }
+  if (!["running", "waiting"].includes(boundaryTurn.state) || boundaryTurn.endedAt !== null) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${eventId} has invalid pre-boundary state for turn ${turnId}`,
+    );
+  }
+
+  const projectedTurns = requireEventArray(projection.turns, `${eventId} projection.turns`);
+  const projectedMatches = projectedTurns
+    .map((candidate) => requireEventRecord(candidate, `${eventId} projected turn`))
+    .filter((candidate) => candidate.id === turnId);
+  if (projectedMatches.length !== 1) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${eventId} requires exactly one projected boundary turn ${turnId}`,
+    );
+  }
+  const projectedBoundaryTurn = projectedMatches[0]!;
+  const outcome = requireSettledTurnState(
+    projectedBoundaryTurn.state,
+    `${eventId} projected boundary turn state`,
+  );
+  const endedAt = requireIsoTimestamp(
+    projectedBoundaryTurn.endedAt,
+    `${eventId} projected boundary turn endedAt`,
+  );
+  if (
+    Date.parse(endedAt) < Date.parse(boundaryTurn.startedAt ?? aggregate.room.createdAt)
+    || Date.parse(endedAt) > Date.parse(updatedAt)
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${eventId} has impossible boundary time for turn ${turnId}`,
+    );
+  }
+  return {
+    ...aggregate,
+    activeTurnId: null,
+    turns: aggregate.turns.map((turn) => turn.id === turnId
+      ? { ...turn, state: outcome, endedAt }
+      : turn),
+  };
+}
+
+function assertPendingMembershipChangeMatchesRequest(
+  aggregate: RoomAggregateV1,
+  pending: PendingRoomMembershipChangeV1,
+  eventId: string,
+  changeId: string,
+  changeKind: PendingRoomMembershipChangeV1["kind"],
+  effectiveAfterTurnId: string,
+  updatedAt: string,
+): void {
+  if (
+    pending.id !== changeId
+    || pending.kind !== changeKind
+    || pending.roomId !== aggregate.room.id
+    || pending.effectiveAfterTurnId !== effectiveAfterTurnId
+    || pending.state !== "waiting_turn_boundary"
+    || pending.requestedAt !== updatedAt
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${eventId} pending change does not match the event payload`,
+    );
+  }
+  if (changeKind === "add") {
+    if (
+      !pending.seat
+      || !pending.binding
+      || pending.seat.id !== pending.seatId
+      || aggregate.seats.some((seat) => seat.id === pending.seatId)
+      || aggregate.bindings.some((binding) => binding.id === pending.binding!.id)
+    ) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership request ${eventId} has an invalid add delta`,
+      );
+    }
+    return;
+  }
+
+  const seat = aggregate.seats.find((candidate) => candidate.id === pending.seatId);
+  if (!seat || seat.state === "removed") {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${eventId} targets missing seat ${pending.seatId}`,
+    );
+  }
+  if (
+    changeKind !== "change_role"
+    && (!seat.activeBindingId || !aggregate.bindings.some((binding) => binding.id === seat.activeBindingId))
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership request ${eventId} requires an active binding for seat ${pending.seatId}`,
+    );
+  }
+}
+
+function validatePendingMembershipChangeSet(
+  values: readonly unknown[],
+  label: string,
+): readonly PendingRoomMembershipChangeV1[] {
+  const parsed = values.map((value, index) =>
+    parseStrictPendingMembershipChange(value, `${label}[${index}]`));
+  const ids = new Set<string>();
+  for (const change of parsed) {
+    if (ids.has(change.id)) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `${label} contains duplicate changeId ${change.id}`,
+      );
+    }
+    ids.add(change.id);
+  }
+  return parsed;
+}
+
+function parseStrictPendingMembershipChange(
+  value: unknown,
+  label: string,
+): PendingRoomMembershipChangeV1 {
+  const pending = requireEventRecord(value, label);
+  const kind = requireMembershipChangeKind(pending.kind, `${label}.kind`);
+  const commonKeys = [
+    "id",
+    "roomId",
+    "seatId",
+    "kind",
+    "reason",
+    "effectiveAfterTurnId",
+    "requestedAt",
+    "state",
+  ];
+  const extraKeys = kind === "add"
+    ? ["seat", "binding"]
+    : kind === "replace"
+      ? ["replacement"]
+      : kind === "change_role"
+        ? ["role"]
+        : [];
+  assertExactKeys(pending, [...commonKeys, ...extraKeys], label);
+  if (pending.state !== "waiting_turn_boundary") {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label}.state must be waiting_turn_boundary`,
+    );
+  }
+  const common = {
+    id: requireTrimmedString(pending.id, `${label}.id`),
+    roomId: requireTrimmedString(pending.roomId, `${label}.roomId`),
+    seatId: requireTrimmedString(pending.seatId, `${label}.seatId`),
+    kind,
+    reason: requireTrimmedString(pending.reason, `${label}.reason`),
+    effectiveAfterTurnId: requireNullableTrimmedString(
+      pending.effectiveAfterTurnId,
+      `${label}.effectiveAfterTurnId`,
+    ),
+    requestedAt: requireIsoTimestamp(pending.requestedAt, `${label}.requestedAt`),
+    state: "waiting_turn_boundary" as const,
+  };
+  switch (kind) {
+    case "add":
+      return {
+        ...common,
+        kind,
+        seat: parseStrictPendingSeat(pending.seat, `${label}.seat`),
+        binding: parseStrictMembershipBinding(pending.binding, `${label}.binding`),
+      };
+    case "replace":
+      return {
+        ...common,
+        kind,
+        replacement: parseStrictMembershipBinding(
+          pending.replacement,
+          `${label}.replacement`,
+        ),
+      };
+    case "change_role":
+      return {
+        ...common,
+        kind,
+        role: requireTrimmedString(pending.role, `${label}.role`),
+      };
+    case "pause":
+    case "remove":
+      return { ...common, kind };
+  }
+}
+
+function parseStrictPendingSeat(
+  value: unknown,
+  label: string,
+): NonNullable<PendingRoomMembershipChangeV1["seat"]> {
+  const seat = requireEventRecord(value, label);
+  assertExactKeys(seat, ["id", "role", "permissionScope"], label);
+  return {
+    id: requireTrimmedString(seat.id, `${label}.id`),
+    role: requireTrimmedString(seat.role, `${label}.role`),
+    permissionScope: requireUniqueStringArray(seat.permissionScope, `${label}.permissionScope`),
+  };
+}
+
+function parseStrictMembershipBinding(
+  value: unknown,
+  label: string,
+): NonNullable<PendingRoomMembershipChangeV1["binding"]> {
+  const binding = requireEventRecord(value, label);
+  assertExactKeys(binding, [
+    "id",
+    "connectorId",
+    "providerId",
+    "nativeSessionId",
+    "happierSessionId",
+    "serverProfileId",
+    "machineId",
+    "hostId",
+  ], label);
+  return {
+    id: requireTrimmedString(binding.id, `${label}.id`),
+    connectorId: requireTrimmedString(binding.connectorId, `${label}.connectorId`),
+    providerId: requireTrimmedString(binding.providerId, `${label}.providerId`),
+    nativeSessionId: requireTrimmedString(binding.nativeSessionId, `${label}.nativeSessionId`),
+    happierSessionId: requireNullableTrimmedString(
+      binding.happierSessionId,
+      `${label}.happierSessionId`,
+    ),
+    serverProfileId: requireNullableTrimmedString(
+      binding.serverProfileId,
+      `${label}.serverProfileId`,
+    ),
+    machineId: requireNullableTrimmedString(binding.machineId, `${label}.machineId`),
+    hostId: requireTrimmedString(binding.hostId, `${label}.hostId`),
+  };
+}
+
+function applyMembershipChangesForReplay(
+  aggregate: RoomAggregateV1,
+  changes: readonly PendingRoomMembershipChangeV1[],
+  now: string,
+): RoomAggregateV1 {
+  let next = aggregate;
+  for (const change of changes) {
+    next = applyMembershipChangeForReplay(next, change, now);
+  }
+  const appliedIds = new Set(changes.map((change) => change.id));
+  return {
+    ...next,
+    room: {
+      ...next.room,
+      aggregateVersion: aggregate.room.aggregateVersion + 1,
+      updatedAt: now,
+    },
+    membershipVersion: aggregate.membershipVersion + 1,
+    pendingMembershipChanges: aggregate.pendingMembershipChanges.filter(
+      (change) => !appliedIds.has(change.id),
+    ),
+  };
+}
+
+function applyMembershipChangeForReplay(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  switch (change.kind) {
+    case "add":
+      return applyAddMembershipChangeForReplay(aggregate, change, now);
+    case "pause":
+      return applyPauseMembershipChangeForReplay(aggregate, change, now);
+    case "remove":
+      return applyRemoveMembershipChangeForReplay(aggregate, change, now);
+    case "change_role":
+      return applyRoleMembershipChangeForReplay(aggregate, change, now);
+    case "replace":
+      return applyReplaceMembershipChangeForReplay(aggregate, change, now);
+    default:
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership activation ${change.id} has unsupported kind ${change.kind}`,
+      );
+  }
+}
+
+function applyAddMembershipChangeForReplay(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  const seat = change.seat;
+  const binding = change.binding;
+  if (!seat || !binding) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} is missing add payload`,
+    );
+  }
+  const seatId = requireString(seat.id, `${change.id} seat.id`);
+  if (aggregate.seats.some((candidate) => candidate.id === seatId)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} duplicates seat ${seatId}`,
+    );
+  }
+  const bindingId = requireString(binding.id, `${change.id} binding.id`);
+  if (aggregate.bindings.some((candidate) => candidate.id === bindingId)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} duplicates binding ${bindingId}`,
+    );
+  }
+  const nextSeat: RoomSeatRecordV1 = {
+    contractVersion: 1,
+    id: seatId,
+    roomId: aggregate.room.id,
+    role: requireString(seat.role, `${change.id} seat.role`),
+    state: "active",
+    permissionScope: [...requireStringArray(seat.permissionScope, `${change.id} seat.permissionScope`)],
+    activeBindingId: bindingId,
+    roleVersion: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+  return {
+    ...aggregate,
+    seats: [...aggregate.seats, nextSeat],
+    bindings: [
+      ...aggregate.bindings,
+      createReplayBindingRecord(aggregate.room.id, seatId, 1, change.binding, now),
+    ],
+  };
+}
+
+function applyPauseMembershipChangeForReplay(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  const seat = requireReplaySeat(aggregate, change);
+  const oldBinding = requireReplayActiveBinding(aggregate, seat, change);
+  const nextSeats: RoomSeatRecordV1[] = aggregate.seats.map((candidate): RoomSeatRecordV1 =>
+    candidate.id === seat.id
+      ? { ...candidate, state: "paused" as const, updatedAt: now }
+      : candidate,
+  );
+  const nextBindings: RoomBindingRecordV1[] = aggregate.bindings.map((binding): RoomBindingRecordV1 =>
+    binding.id === oldBinding.id
+      ? { ...binding, state: "paused" as const }
+      : binding,
+  );
+  return {
+    ...aggregate,
+    seats: nextSeats,
+    bindings: nextBindings,
+  };
+}
+
+function applyRemoveMembershipChangeForReplay(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  const seat = requireReplaySeat(aggregate, change);
+  const oldBinding = requireReplayActiveBinding(aggregate, seat, change);
+  const nextSeats: RoomSeatRecordV1[] = aggregate.seats.map((candidate): RoomSeatRecordV1 =>
+    candidate.id === seat.id
+      ? { ...candidate, state: "removed" as const, activeBindingId: null, updatedAt: now }
+      : candidate,
+  );
+  const nextBindings: RoomBindingRecordV1[] = aggregate.bindings.map((binding): RoomBindingRecordV1 =>
+    binding.id === oldBinding.id
+      ? { ...binding, state: "detached" as const, detachedAt: now }
+      : binding,
+  );
+  return {
+    ...aggregate,
+    seats: nextSeats,
+    bindings: nextBindings,
+  };
+}
+
+function applyRoleMembershipChangeForReplay(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  const seat = requireReplaySeat(aggregate, change);
+  const role = change.role;
+  if (!role) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} is missing role payload`,
+    );
+  }
+  const nextSeats: RoomSeatRecordV1[] = aggregate.seats.map((candidate): RoomSeatRecordV1 =>
+    candidate.id === seat.id
+      ? { ...candidate, role, roleVersion: candidate.roleVersion + 1, updatedAt: now }
+      : candidate,
+  );
+  return {
+    ...aggregate,
+    seats: nextSeats,
+  };
+}
+
+function applyReplaceMembershipChangeForReplay(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  const seat = requireReplaySeat(aggregate, change);
+  const oldBinding = requireReplayActiveBinding(aggregate, seat, change);
+  if (!change.replacement) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} is missing replacement payload`,
+    );
+  }
+  const generation = nextReplayBindingGeneration(aggregate, seat.id);
+  const replacement = createReplayBindingRecord(aggregate.room.id, seat.id, generation, change.replacement, now);
+  const nextSeats: RoomSeatRecordV1[] = aggregate.seats.map((candidate): RoomSeatRecordV1 =>
+    candidate.id === seat.id
+      ? { ...candidate, state: "active" as const, activeBindingId: replacement.id, updatedAt: now }
+      : candidate,
+  );
+  const nextBindings: RoomBindingRecordV1[] = [
+    ...aggregate.bindings.map((binding): RoomBindingRecordV1 =>
+      binding.id === oldBinding.id
+        ? { ...binding, state: "replaced" as const, detachedAt: now, replacedByBindingId: replacement.id }
+        : binding,
+    ),
+    replacement,
+  ];
+  return {
+    ...aggregate,
+    seats: nextSeats,
+    bindings: nextBindings,
+  };
+}
+
+function createReplayBindingRecord(
+  roomId: string,
+  seatId: string,
+  generation: number,
+  binding: NonNullable<PendingRoomMembershipChangeV1["binding"]>,
+  now: string,
+): RoomAggregateV1["bindings"][number] {
+  return {
+    contractVersion: 1,
+    id: requireString(binding.id, `${binding.id ?? "unknown"} id`),
+    roomId,
+    seatId,
+    generation,
+    connectorId: requireString(binding.connectorId, `${binding.id} connectorId`),
+    providerId: requireString(binding.providerId, `${binding.id} providerId`),
+    nativeSessionId: requireString(binding.nativeSessionId, `${binding.id} nativeSessionId`),
+    happierSessionId: binding.happierSessionId,
+    serverProfileId: binding.serverProfileId,
+    machineId: binding.machineId,
+    hostId: requireString(binding.hostId, `${binding.id} hostId`),
+    state: "attached",
+    attachedAt: now,
+    detachedAt: null,
+    replacedByBindingId: null,
+  };
+}
+
+function requireReplaySeat(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+): RoomAggregateV1["seats"][number] {
+  const seat = aggregate.seats.find((candidate) => candidate.id === change.seatId);
+  if (!seat) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} targets missing seat ${change.seatId}`,
+    );
+  }
+  return seat;
+}
+
+function requireReplayActiveBinding(
+  aggregate: RoomAggregateV1,
+  seat: RoomAggregateV1["seats"][number],
+  change: PendingRoomMembershipChangeV1,
+): RoomAggregateV1["bindings"][number] {
+  if (!seat.activeBindingId) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} requires an active binding for seat ${seat.id}`,
+    );
+  }
+  const binding = aggregate.bindings.find((candidate) => candidate.id === seat.activeBindingId);
+  if (!binding) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${change.id} lost binding ${seat.activeBindingId}`,
+    );
+  }
+  return binding;
+}
+
+function nextReplayBindingGeneration(aggregate: RoomAggregateV1, seatId: string): number {
+  return aggregate.bindings.reduce(
+    (highest, binding) => (binding.seatId === seatId ? Math.max(highest, binding.generation) : highest),
+    0,
+  ) + 1;
+}
+
+function comparePendingMembershipChanges(
+  left: PendingRoomMembershipChangeV1,
+  right: PendingRoomMembershipChangeV1,
+): number {
+  if (left.requestedAt !== right.requestedAt) {
+    return left.requestedAt < right.requestedAt ? -1 : 1;
+  }
+  if (left.id === right.id) return 0;
+  return left.id < right.id ? -1 : 1;
+}
+
+function requireMembershipChangeKind(
+  value: unknown,
+  label: string,
+): PendingRoomMembershipChangeV1["kind"] {
+  if (
+    value !== "add"
+    && value !== "remove"
+    && value !== "pause"
+    && value !== "replace"
+    && value !== "change_role"
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be a supported membership change kind`,
+    );
+  }
+  return value;
+}
+
+function assertExactKeys(
+  value: Readonly<Record<string, unknown>>,
+  allowedKeys: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const expected = [...allowedKeys].sort();
+  if (
+    actual.length !== expected.length
+    || actual.some((key, index) => key !== expected[index])
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must contain exactly [${expected.join(", ")}]; received [${actual.join(", ")}]`,
+    );
+  }
+}
+
+function requireEventRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be an object`,
+    );
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireEventArray(value: unknown, label: string): readonly unknown[] {
+  if (!Array.isArray(value)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be an array`,
+    );
+  }
+  return value;
+}
+
+function requireTrimmedString(value: unknown, label: string): string {
+  const result = requireString(value, label);
+  if (result.trim() !== result || result.length === 0) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be a trimmed non-empty string`,
+    );
+  }
+  return result;
+}
+
+function requireNullableTrimmedString(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  return requireTrimmedString(value, label);
+}
+
+function requireIsoTimestamp(value: unknown, label: string): string {
+  const result = requireTrimmedString(value, label);
+  if (!Number.isFinite(Date.parse(result))) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be a valid timestamp`,
+    );
+  }
+  return result;
+}
+
+function requireUniqueStringArray(value: unknown, label: string): readonly string[] {
+  const values = requireEventArray(value, label).map((candidate, index) =>
+    requireTrimmedString(candidate, `${label}[${index}]`));
+  if (new Set(values).size !== values.length) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must contain unique strings`,
+    );
+  }
+  return values;
+}
+
+function requireSettledTurnState(
+  value: unknown,
+  label: string,
+): Extract<RoomAggregateV1["turns"][number]["state"], "completed" | "cancelled" | "uncertain"> {
+  if (value !== "completed" && value !== "cancelled" && value !== "uncertain") {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be completed, cancelled, or uncertain`,
+    );
+  }
+  return value;
+}
+
+function requireStringArray(value: unknown, label: string): readonly string[] {
+  const array = requireArray(value, label);
+  if (array.some((candidate) => typeof candidate !== "string" || candidate.length === 0)) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `${label} must be an array of non-empty strings`,
+    );
+  }
+  return array as readonly string[];
 }
 
 function assertEventOrder(events: readonly RoomEventRecordV1[]): void {
