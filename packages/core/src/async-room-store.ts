@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import {
   RoomDomainError,
@@ -12,6 +12,13 @@ import {
   type TransitionRoomLifecycleInput,
 } from "./room-domain.js";
 import type {
+  RoomConnectorIngestionMode,
+  RoomConnectorIngestionStateV1,
+  RoomConnectorMessageRole,
+  RoomConnectorStatus,
+  RoomConnectorTranscriptBatchResultV1,
+  RoomConnectorTranscriptItemV1,
+  RoomConnectorTranscriptSource,
   RoomEventRecordV1,
   RoomMessageRecordV1,
   RoomOutboxRecordV1,
@@ -29,6 +36,7 @@ import {
 import { cliSessions } from "./postgres/schema/project.js";
 import {
   operationalRooms,
+  roomBindingIngestionState,
   roomBindings,
   roomEvents,
   roomIdempotencyKeys,
@@ -66,6 +74,7 @@ export interface AsyncRoomStoreOptions {
 export type RoomStoreErrorCode =
   | "idempotency_conflict"
   | "idempotency_result_missing"
+  | "connector_batch_invalid"
   | "delivery_target_conflict"
   | "delivery_state_conflict"
   | "delivery_attempt_conflict"
@@ -145,12 +154,55 @@ export interface RecordRoomInboxReceiptInput {
   readonly roomId: string;
   readonly bindingId: string;
   readonly nativeMessageId: string | null;
+  readonly logicalMessageId?: string | null;
   readonly nativeCursor: string;
   readonly payloadHash: string;
+  readonly role?: RoomConnectorMessageRole;
+  readonly occurredAt?: string;
+  readonly source?: RoomConnectorTranscriptSource;
   readonly receivedAt: string;
 }
 
-export type RoomInboxReceiptV1 = RecordRoomInboxReceiptInput;
+export interface RoomInboxReceiptV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly bindingId: string;
+  readonly nativeMessageId: string | null;
+  readonly logicalMessageId: string | null;
+  readonly nativeCursor: string;
+  readonly payloadHash: string;
+  readonly role: RoomConnectorMessageRole;
+  readonly occurredAt: string;
+  readonly source: RoomConnectorTranscriptSource;
+  readonly receivedAt: string;
+}
+
+export interface GetRoomConnectorIngestionStateInput {
+  readonly roomId: string;
+  readonly bindingId: string;
+}
+
+export interface RecordRoomConnectorTranscriptBatchInput extends GetRoomConnectorIngestionStateInput {
+  readonly source: RoomConnectorTranscriptSource;
+  readonly fromCursor: string | null;
+  readonly nextCursor: string | null;
+  readonly truncated: boolean;
+  readonly modeAfterCommit: RoomConnectorIngestionMode;
+  readonly receivedAt: string;
+  readonly items: readonly RoomConnectorTranscriptItemV1[];
+}
+
+export interface RecordRoomConnectorStatusInput extends GetRoomConnectorIngestionStateInput {
+  readonly state: RoomConnectorStatus;
+  readonly statusCursor: string | null;
+  readonly nativeWriterDetected: boolean;
+  readonly occurredAt: string;
+}
+
+export interface RecordRoomConnectorIngestionModeInput extends GetRoomConnectorIngestionStateInput {
+  readonly mode: RoomConnectorIngestionMode;
+  readonly occurredAt: string;
+}
 
 export type LegacyHappierBindingProviderId = "codex" | "claude" | "opencode";
 
@@ -961,70 +1013,262 @@ export class AsyncRoomStore {
     });
   }
 
+  async getConnectorIngestionState(
+    input: GetRoomConnectorIngestionStateInput,
+  ): Promise<RoomConnectorIngestionStateV1> {
+    await requireRoomBinding(this.layer.db, this.projectId, input.roomId, input.bindingId);
+    return loadRoomConnectorIngestionState(
+      this.layer.db,
+      this.projectId,
+      input.roomId,
+      input.bindingId,
+    );
+  }
+
+  /**
+   * Commit one contiguous connector transcript batch and its durable cursor.
+   * A cursor discontinuity or truncation records repair evidence but commits no
+   * messages and advances no cursor, so a crash can only replay known input.
+   *
+   * FNXC:RoomConnectorEventIngestion 2026-07-17-07:02:
+   * Connector event delivery is at-least-once. The database therefore owns the
+   * per-binding cursor, native-id/hash fallback dedupe, and gap state in one
+   * advisory-locked transaction rather than trusting a process-local offset.
+   */
+  async recordConnectorTranscriptBatch(
+    input: RecordRoomConnectorTranscriptBatchInput,
+  ): Promise<RoomConnectorTranscriptBatchResultV1> {
+    validateConnectorTranscriptBatchInput(input);
+
+    return this.layer.transactionImmediate(async (tx) => {
+      await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
+      await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
+      const current = await loadRoomConnectorIngestionState(
+        tx,
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+      );
+      const unresolvedGap = current.gapDetectedAt !== null
+        || current.gapExpectedCursor !== null
+        || current.gapObservedCursor !== null;
+      if (
+        !input.truncated
+        && current.transcriptCursor === input.nextCursor
+        && input.items.length > 0
+        && !unresolvedGap
+      ) {
+        const replay = await classifyCompleteConnectorBatchReplay(tx, this.projectId, input);
+        if (replay) {
+          return {
+            state: current,
+            insertedCount: 0,
+            duplicateCount: input.items.length,
+            duplicateNativeMessageIdCount: replay.duplicateNativeMessageIdCount,
+            duplicatePayloadHashCount: replay.duplicatePayloadHashCount,
+            gapDetected: false,
+          };
+        }
+        if (current.transcriptCursor === input.fromCursor) {
+          throw new RoomStoreError(
+            "connector_batch_invalid",
+            "A connector transcript batch cannot insert new messages without advancing its cursor",
+          );
+        }
+      }
+      if (unresolvedGap && input.source === "event") {
+        const mode = current.mode === "stopped"
+          ? "stopped"
+          : current.mode === "degraded"
+            ? "degraded"
+            : "reconciling";
+        const updatedAt = latestTimestamp(current.updatedAt, input.receivedAt);
+        const state: RoomConnectorIngestionStateV1 = {
+          ...current,
+          mode,
+          lastModeAt: mode === current.mode
+            ? current.lastModeAt
+            : latestTimestamp(current.lastModeAt, input.receivedAt),
+          updatedAt,
+        };
+        if (state !== current) {
+          await persistRoomConnectorIngestionState(tx, this.projectId, state, updatedAt);
+        }
+        return {
+          state,
+          insertedCount: 0,
+          duplicateCount: 0,
+          duplicateNativeMessageIdCount: 0,
+          duplicatePayloadHashCount: 0,
+          gapDetected: true,
+        };
+      }
+      const gapDetected = current.transcriptCursor !== input.fromCursor;
+      if (gapDetected) {
+        const updatedAt = latestTimestamp(current.updatedAt, input.receivedAt);
+        const modeChanges = current.mode !== "stopped";
+        const state: RoomConnectorIngestionStateV1 = {
+          ...current,
+          mode: current.mode === "stopped"
+            ? "stopped"
+            : input.modeAfterCommit === "degraded"
+              ? "degraded"
+              : "reconciling",
+          gapExpectedCursor: current.transcriptCursor,
+          gapObservedCursor: input.fromCursor,
+          gapDetectedAt: input.receivedAt,
+          lastModeAt: modeChanges
+            ? latestTimestamp(current.lastModeAt, input.receivedAt)
+            : current.lastModeAt,
+          updatedAt,
+        };
+        await persistRoomConnectorIngestionState(tx, this.projectId, state, updatedAt);
+        return {
+          state,
+          insertedCount: 0,
+          duplicateCount: 0,
+          duplicateNativeMessageIdCount: 0,
+          duplicatePayloadHashCount: 0,
+          gapDetected: true,
+        };
+      }
+
+      let insertedCount = 0;
+      let duplicateCount = 0;
+      let duplicateNativeMessageIdCount = 0;
+      let duplicatePayloadHashCount = 0;
+      for (const item of input.items) {
+        const receipt = connectorTranscriptItemToReceipt(input, item);
+        const result = await insertRoomInboxReceipt(tx, this.projectId, receipt);
+        if (result.inserted) insertedCount += 1;
+        else {
+          duplicateCount += 1;
+          if (item.nativeMessageId) duplicateNativeMessageIdCount += 1;
+          else duplicatePayloadHashCount += 1;
+        }
+      }
+
+      const lastItem = input.items.length > 0 ? input.items[input.items.length - 1] : undefined;
+      const updatedAt = latestTimestamp(current.updatedAt, input.receivedAt);
+      const state: RoomConnectorIngestionStateV1 = {
+        ...current,
+        mode: current.mode === "stopped" ? "stopped" : input.modeAfterCommit,
+        transcriptCursor: input.nextCursor,
+        lastNativeMessageId: lastItem?.nativeMessageId ?? current.lastNativeMessageId,
+        lastPayloadHash: lastItem?.payloadHash ?? current.lastPayloadHash,
+        gapExpectedCursor: null,
+        gapObservedCursor: null,
+        gapDetectedAt: null,
+        lastTranscriptAt: latestTimestamp(current.lastTranscriptAt, input.receivedAt),
+        lastModeAt: current.mode === "stopped"
+          ? current.lastModeAt
+          : latestTimestamp(current.lastModeAt, input.receivedAt),
+        updatedAt,
+      };
+      await persistRoomConnectorIngestionState(tx, this.projectId, state, updatedAt);
+      return {
+        state,
+        insertedCount,
+        duplicateCount,
+        duplicateNativeMessageIdCount,
+        duplicatePayloadHashCount,
+        gapDetected: false,
+      };
+    });
+  }
+
+  async recordConnectorStatus(
+    input: RecordRoomConnectorStatusInput,
+  ): Promise<RoomConnectorIngestionStateV1> {
+    return this.layer.transactionImmediate(async (tx) => {
+      await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
+      await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
+      const current = await loadRoomConnectorIngestionState(
+        tx,
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+      );
+      if (isEarlierTimestamp(input.occurredAt, current.lastStatusAt)) return current;
+      if (current.lastStatusAt === input.occurredAt) {
+        if (
+          current.statusCursor !== input.statusCursor
+          || current.connectorStatus !== input.state
+          || current.nativeWriterDetected !== input.nativeWriterDetected
+        ) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Connector status timestamp ${input.occurredAt} was replayed with different state`,
+          );
+        }
+        return current;
+      }
+      if (input.statusCursor !== null && current.statusCursor === input.statusCursor) {
+        if (
+          current.connectorStatus !== input.state
+          || current.nativeWriterDetected !== input.nativeWriterDetected
+        ) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Connector status cursor ${input.statusCursor} was replayed with different state`,
+          );
+        }
+        return current;
+      }
+      const updatedAt = latestTimestamp(current.updatedAt, input.occurredAt);
+      const state: RoomConnectorIngestionStateV1 = {
+        ...current,
+        statusCursor: input.statusCursor,
+        connectorStatus: input.state,
+        nativeWriterDetected: input.nativeWriterDetected,
+        lastStatusAt: input.occurredAt,
+        updatedAt,
+      };
+      await persistRoomConnectorIngestionState(tx, this.projectId, state, updatedAt);
+      return state;
+    });
+  }
+
+  async recordConnectorIngestionMode(
+    input: RecordRoomConnectorIngestionModeInput,
+  ): Promise<RoomConnectorIngestionStateV1> {
+    return this.layer.transactionImmediate(async (tx) => {
+      await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
+      await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
+      const current = await loadRoomConnectorIngestionState(
+        tx,
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+      );
+      if (isEarlierTimestamp(input.occurredAt, current.lastModeAt)) return current;
+      if (current.lastModeAt === input.occurredAt) {
+        if (current.mode !== input.mode) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Connector ingestion timestamp ${input.occurredAt} was replayed with a different mode`,
+          );
+        }
+        return current;
+      }
+      const state: RoomConnectorIngestionStateV1 = {
+        ...current,
+        mode: input.mode,
+        lastModeAt: input.occurredAt,
+        updatedAt: latestTimestamp(current.updatedAt, input.occurredAt),
+      };
+      await persistRoomConnectorIngestionState(tx, this.projectId, state, state.updatedAt!);
+      return state;
+    });
+  }
+
   async recordInboxReceipt(
     input: RecordRoomInboxReceiptInput,
   ): Promise<RoomInboxReceiptV1> {
     return this.layer.transactionImmediate(async (tx) => {
-      const bindingRows = await tx
-        .select({ id: roomBindings.id })
-        .from(roomBindings)
-        .where(
-          and(
-            eq(roomBindings.projectId, this.projectId),
-            eq(roomBindings.roomId, input.roomId),
-            eq(roomBindings.id, input.bindingId),
-          ),
-        )
-        .limit(1);
-      if (bindingRows.length !== 1) {
-        throw new RoomStoreError(
-          "delivery_target_conflict",
-          `Binding ${input.bindingId} does not belong to Room ${input.roomId}`,
-        );
-      }
-
-      const inserted = await tx
-        .insert(roomInboxReceipts)
-        .values({
-          id: input.id,
-          projectId: this.projectId,
-          roomId: input.roomId,
-          bindingId: input.bindingId,
-          nativeMessageId: input.nativeMessageId,
-          nativeCursor: input.nativeCursor,
-          payloadHash: input.payloadHash,
-          receivedAt: input.receivedAt,
-        })
-        .onConflictDoNothing()
-        .returning();
-      if (inserted[0]) return rowToInboxReceipt(inserted[0]);
-
-      const existingRows = await tx
-        .select()
-        .from(roomInboxReceipts)
-        .where(
-          and(
-            eq(roomInboxReceipts.projectId, this.projectId),
-            eq(roomInboxReceipts.roomId, input.roomId),
-            eq(roomInboxReceipts.bindingId, input.bindingId),
-            eq(roomInboxReceipts.nativeCursor, input.nativeCursor),
-          ),
-        )
-        .limit(1);
-      const existing = existingRows[0];
-      if (!existing) {
-        throw new RoomStoreError(
-          "delivery_state_conflict",
-          `Inbox receipt ${input.id} conflicted outside its native cursor`,
-        );
-      }
-      if (existing.payloadHash !== input.payloadHash) {
-        throw new RoomStoreError(
-          "inbox_payload_conflict",
-          `Inbox native cursor ${input.nativeCursor} was replayed with a different payload hash`,
-        );
-      }
-      return rowToInboxReceipt(existing);
+      await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
+      await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
+      return (await insertRoomInboxReceipt(tx, this.projectId, normalizeInboxReceipt(input))).receipt;
     });
   }
 
@@ -1227,10 +1471,486 @@ function rowToInboxReceipt(row: typeof roomInboxReceipts.$inferSelect): RoomInbo
     roomId: row.roomId,
     bindingId: row.bindingId,
     nativeMessageId: row.nativeMessageId,
+    logicalMessageId: row.logicalMessageId,
     nativeCursor: row.nativeCursor,
     payloadHash: row.payloadHash,
+    role: row.role as RoomConnectorMessageRole,
+    occurredAt: row.occurredAt,
+    source: row.source as RoomConnectorTranscriptSource,
     receivedAt: row.receivedAt,
   };
+}
+
+interface NormalizedRoomInboxReceiptInput extends RoomInboxReceiptV1 {
+  readonly dedupeKey: string;
+}
+
+function normalizeInboxReceipt(input: RecordRoomInboxReceiptInput): NormalizedRoomInboxReceiptInput {
+  const normalized = {
+    id: input.id,
+    roomId: input.roomId,
+    bindingId: input.bindingId,
+    nativeMessageId: input.nativeMessageId,
+    logicalMessageId: input.logicalMessageId ?? null,
+    nativeCursor: input.nativeCursor,
+    payloadHash: input.payloadHash,
+    role: input.role ?? "unknown",
+    occurredAt: input.occurredAt ?? input.receivedAt,
+    source: input.source ?? "history",
+    receivedAt: input.receivedAt,
+  } satisfies RoomInboxReceiptV1;
+  return { ...normalized, dedupeKey: buildInboxDedupeKey(normalized) };
+}
+
+function connectorTranscriptItemToReceipt(
+  input: RecordRoomConnectorTranscriptBatchInput,
+  item: RoomConnectorTranscriptItemV1,
+): NormalizedRoomInboxReceiptInput {
+  const dedupeKey = buildInboxDedupeKey(item);
+  return {
+    id: `room-inbox-${hashRoomValue({ bindingId: input.bindingId, dedupeKey })}`,
+    roomId: input.roomId,
+    bindingId: input.bindingId,
+    nativeMessageId: item.nativeMessageId,
+    logicalMessageId: item.logicalMessageId,
+    nativeCursor: item.nativeCursor,
+    payloadHash: item.payloadHash,
+    dedupeKey,
+    role: item.role,
+    occurredAt: item.occurredAt,
+    source: input.source,
+    receivedAt: input.receivedAt,
+  };
+}
+
+function buildInboxDedupeKey(
+  item: Pick<RoomInboxReceiptV1, "nativeMessageId" | "payloadHash" | "role" | "occurredAt">,
+): string {
+  if (item.nativeMessageId) {
+    return `native:${item.nativeMessageId}`;
+  }
+  return `fallback:${item.payloadHash}:${item.role}:${item.occurredAt}`;
+}
+
+async function insertRoomInboxReceipt(
+  tx: DbTransaction,
+  projectId: string,
+  input: NormalizedRoomInboxReceiptInput,
+): Promise<{ readonly receipt: RoomInboxReceiptV1; readonly inserted: boolean }> {
+  const existing = await findMatchingInboxReceipt(tx, projectId, input);
+  if (existing) {
+    return {
+      receipt: rowToInboxReceipt(
+        await reconcileExistingInboxReceipt(tx, existing.row, input, existing.matchedBy),
+      ),
+      inserted: false,
+    };
+  }
+
+  const inserted = await tx
+    .insert(roomInboxReceipts)
+    .values({
+      id: input.id,
+      projectId,
+      roomId: input.roomId,
+      bindingId: input.bindingId,
+      nativeMessageId: input.nativeMessageId,
+      logicalMessageId: input.logicalMessageId,
+      nativeCursor: input.nativeCursor,
+      payloadHash: input.payloadHash,
+      dedupeKey: input.dedupeKey,
+      role: input.role,
+      occurredAt: input.occurredAt,
+      source: input.source,
+      legacyPlaceholder: false,
+      receivedAt: input.receivedAt,
+    })
+    .onConflictDoNothing()
+    .returning();
+  if (inserted[0]) return { receipt: rowToInboxReceipt(inserted[0]), inserted: true };
+
+  const conflicted = await findMatchingInboxReceipt(tx, projectId, input);
+  if (conflicted) {
+    return {
+      receipt: rowToInboxReceipt(
+        await reconcileExistingInboxReceipt(tx, conflicted.row, input, conflicted.matchedBy),
+      ),
+      inserted: false,
+    };
+  }
+
+  throw new RoomStoreError(
+    "delivery_state_conflict",
+    `Inbox receipt ${input.id} conflicted outside its native cursor and dedupe identity`,
+  );
+}
+
+type InboxReceiptMatchKind = "dedupe" | "cursor" | "logical" | "legacy";
+
+async function findMatchingInboxReceipt(
+  tx: DbTransaction,
+  projectId: string,
+  input: NormalizedRoomInboxReceiptInput,
+): Promise<{
+  readonly row: typeof roomInboxReceipts.$inferSelect;
+  readonly matchedBy: InboxReceiptMatchKind;
+} | null> {
+  const scope = [
+    eq(roomInboxReceipts.projectId, projectId),
+    eq(roomInboxReceipts.roomId, input.roomId),
+    eq(roomInboxReceipts.bindingId, input.bindingId),
+  ] as const;
+  const dedupeRows = await tx.select().from(roomInboxReceipts)
+    .where(and(...scope, eq(roomInboxReceipts.dedupeKey, input.dedupeKey)))
+    .limit(1);
+  if (dedupeRows[0]) return { row: dedupeRows[0], matchedBy: "dedupe" };
+
+  const cursorRows = await tx.select().from(roomInboxReceipts)
+    .where(and(...scope, eq(roomInboxReceipts.nativeCursor, input.nativeCursor)))
+    .limit(1);
+  if (cursorRows[0]) return { row: cursorRows[0], matchedBy: "cursor" };
+
+  if (input.logicalMessageId !== null) {
+    const logicalRows = await tx.select().from(roomInboxReceipts)
+      .where(and(...scope, eq(roomInboxReceipts.logicalMessageId, input.logicalMessageId)))
+      .limit(1);
+    if (logicalRows[0]) return { row: logicalRows[0], matchedBy: "logical" };
+  }
+
+  const nativeIdentity = input.nativeMessageId === null
+    ? isNull(roomInboxReceipts.nativeMessageId)
+    : or(
+      isNull(roomInboxReceipts.nativeMessageId),
+      eq(roomInboxReceipts.nativeMessageId, input.nativeMessageId),
+    );
+  const logicalIdentity = input.logicalMessageId === null
+    ? isNull(roomInboxReceipts.logicalMessageId)
+    : or(
+      isNull(roomInboxReceipts.logicalMessageId),
+      eq(roomInboxReceipts.logicalMessageId, input.logicalMessageId),
+    );
+  const legacyRows = await tx.select().from(roomInboxReceipts)
+    .where(and(
+      ...scope,
+      eq(roomInboxReceipts.legacyPlaceholder, true),
+      eq(roomInboxReceipts.payloadHash, input.payloadHash),
+      nativeIdentity,
+      logicalIdentity,
+    ))
+    .limit(2);
+  if (legacyRows.length > 1) {
+    throw new RoomStoreError(
+      "inbox_payload_conflict",
+      "Legacy inbox replay matched more than one placeholder receipt",
+    );
+  }
+  return legacyRows[0] ? { row: legacyRows[0], matchedBy: "legacy" } : null;
+}
+
+async function reconcileExistingInboxReceipt(
+  tx: DbTransaction,
+  existing: typeof roomInboxReceipts.$inferSelect,
+  input: NormalizedRoomInboxReceiptInput,
+  matchedBy: InboxReceiptMatchKind,
+): Promise<typeof roomInboxReceipts.$inferSelect> {
+  if (existing.payloadHash !== input.payloadHash) {
+    throw new RoomStoreError(
+      "inbox_payload_conflict",
+      `Inbox connector message was replayed with a different payload hash`,
+    );
+  }
+  if (
+    existing.nativeMessageId !== null
+    && input.nativeMessageId !== null
+    && existing.nativeMessageId !== input.nativeMessageId
+  ) {
+    throw new RoomStoreError(
+      "inbox_payload_conflict",
+      `Inbox connector message was replayed with a different native message identity`,
+    );
+  }
+  if (
+    existing.logicalMessageId !== null
+    && input.logicalMessageId !== null
+    && existing.logicalMessageId !== input.logicalMessageId
+  ) {
+    throw new RoomStoreError(
+      "inbox_payload_conflict",
+      `Inbox connector message was replayed with a different logical message identity`,
+    );
+  }
+
+  if (existing.legacyPlaceholder) {
+    const updatedRows = await tx
+      .update(roomInboxReceipts)
+      .set({
+        nativeMessageId: input.nativeMessageId ?? existing.nativeMessageId,
+        logicalMessageId: input.logicalMessageId ?? existing.logicalMessageId,
+        dedupeKey: input.dedupeKey,
+        role: input.role,
+        occurredAt: input.occurredAt,
+        source: input.source,
+        legacyPlaceholder: false,
+      })
+      .where(eq(roomInboxReceipts.id, existing.id))
+      .returning();
+    const updated = updatedRows[0];
+    if (!updated) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Legacy inbox receipt ${existing.id} disappeared during reconciliation`,
+      );
+    }
+    return updated;
+  }
+
+  if (matchedBy === "cursor" && existing.dedupeKey !== input.dedupeKey) {
+    throw new RoomStoreError(
+      "inbox_payload_conflict",
+      `Inbox native cursor ${input.nativeCursor} was reused for a different connector message identity`,
+    );
+  }
+  if (existing.role !== input.role || existing.occurredAt !== input.occurredAt) {
+    throw new RoomStoreError(
+      "inbox_payload_conflict",
+      `Inbox connector message was replayed with different immutable message facts`,
+    );
+  }
+  if (existing.logicalMessageId === null && input.logicalMessageId !== null) {
+    const updatedRows = await tx
+      .update(roomInboxReceipts)
+      .set({ logicalMessageId: input.logicalMessageId })
+      .where(eq(roomInboxReceipts.id, existing.id))
+      .returning();
+    return updatedRows[0] ?? existing;
+  }
+  return existing;
+}
+
+function validateConnectorTranscriptBatchInput(input: RecordRoomConnectorTranscriptBatchInput): void {
+  const invalid = (message: string): never => {
+    throw new RoomStoreError("connector_batch_invalid", message);
+  };
+  if (!isNonEmptyString(input.roomId) || !isNonEmptyString(input.bindingId)) {
+    invalid("Connector transcript batch requires non-empty Room and binding ids");
+  }
+  if (!isNonEmptyString(input.receivedAt)) {
+    invalid("Connector transcript batch requires a receivedAt timestamp");
+  }
+  if (!isNullableNonEmptyString(input.fromCursor) || !isNullableNonEmptyString(input.nextCursor)) {
+    invalid("Connector transcript cursors must be null or non-empty strings");
+  }
+  if (input.items.length > 250) {
+    invalid("Connector transcript batches are limited to 250 items");
+  }
+  for (const item of input.items) {
+    if (
+      !isNonEmptyString(item.nativeCursor)
+      || !isNonEmptyString(item.payloadHash)
+      || !isNonEmptyString(item.occurredAt)
+      || !isNullableNonEmptyString(item.nativeMessageId)
+      || !isNullableNonEmptyString(item.logicalMessageId)
+    ) {
+      invalid("Connector transcript items require valid cursors, hashes, identities, and timestamps");
+    }
+  }
+  if (input.items.length === 0 && input.nextCursor !== input.fromCursor) {
+    invalid("An empty connector transcript batch cannot advance the durable cursor");
+  }
+  if (
+    input.items.length > 0
+    && input.nextCursor !== input.fromCursor
+    && input.items[input.items.length - 1]?.nativeCursor !== input.nextCursor
+  ) {
+    invalid("A connector transcript batch that advances must end at its next cursor");
+  }
+}
+
+async function classifyCompleteConnectorBatchReplay(
+  tx: DbTransaction,
+  projectId: string,
+  input: RecordRoomConnectorTranscriptBatchInput,
+): Promise<{
+  readonly duplicateNativeMessageIdCount: number;
+  readonly duplicatePayloadHashCount: number;
+} | null> {
+  let duplicateNativeMessageIdCount = 0;
+  let duplicatePayloadHashCount = 0;
+  for (const item of input.items) {
+    const receipt = connectorTranscriptItemToReceipt(input, item);
+    const existing = await findMatchingInboxReceipt(tx, projectId, receipt);
+    if (!existing) return null;
+    await reconcileExistingInboxReceipt(tx, existing.row, receipt, existing.matchedBy);
+    if (item.nativeMessageId) duplicateNativeMessageIdCount += 1;
+    else duplicatePayloadHashCount += 1;
+  }
+  return { duplicateNativeMessageIdCount, duplicatePayloadHashCount };
+}
+
+function isNullableNonEmptyString(value: string | null): boolean {
+  return value === null || isNonEmptyString(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isEarlierTimestamp(candidate: string, current: string | null): boolean {
+  return current !== null && compareTimestamp(candidate, current) < 0;
+}
+
+function latestTimestamp(current: string | null, candidate: string): string {
+  return current === null || compareTimestamp(candidate, current) > 0 ? candidate : current;
+}
+
+function compareTimestamp(left: string, right: string): number {
+  const leftMs = Date.parse(left);
+  const rightMs = Date.parse(right);
+  if (Number.isFinite(leftMs) && Number.isFinite(rightMs)) return leftMs - rightMs;
+  return left.localeCompare(right);
+}
+
+async function requireRoomBinding(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  bindingId: string,
+): Promise<void> {
+  const bindingRows = await handle
+    .select({ id: roomBindings.id })
+    .from(roomBindings)
+    .where(
+      and(
+        eq(roomBindings.projectId, projectId),
+        eq(roomBindings.roomId, roomId),
+        eq(roomBindings.id, bindingId),
+      ),
+    )
+    .limit(1);
+  if (bindingRows.length !== 1) {
+    throw new RoomStoreError(
+      "delivery_target_conflict",
+      `Binding ${bindingId} does not belong to Room ${roomId}`,
+    );
+  }
+}
+
+async function lockRoomConnectorIngestion(
+  tx: DbTransaction,
+  projectId: string,
+  bindingId: string,
+): Promise<void> {
+  const lockKey = `fusion-room-connector-ingestion-v1:${projectId}:${bindingId}`;
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
+}
+
+async function loadRoomConnectorIngestionState(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  bindingId: string,
+): Promise<RoomConnectorIngestionStateV1> {
+  const rows = await handle
+    .select()
+    .from(roomBindingIngestionState)
+    .where(
+      and(
+        eq(roomBindingIngestionState.projectId, projectId),
+        eq(roomBindingIngestionState.roomId, roomId),
+        eq(roomBindingIngestionState.bindingId, bindingId),
+      ),
+    )
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    return {
+      contractVersion: 1,
+      roomId,
+      bindingId,
+      mode: "starting",
+      transcriptCursor: null,
+      statusCursor: null,
+      lastNativeMessageId: null,
+      lastPayloadHash: null,
+      connectorStatus: null,
+      nativeWriterDetected: false,
+      gapExpectedCursor: null,
+      gapObservedCursor: null,
+      gapDetectedAt: null,
+      lastTranscriptAt: null,
+      lastStatusAt: null,
+      lastModeAt: null,
+      updatedAt: null,
+    };
+  }
+  return {
+    contractVersion: 1,
+    roomId: row.roomId,
+    bindingId: row.bindingId,
+    mode: row.mode as RoomConnectorIngestionMode,
+    transcriptCursor: row.transcriptCursor,
+    statusCursor: row.statusCursor,
+    lastNativeMessageId: row.lastNativeMessageId,
+    lastPayloadHash: row.lastPayloadHash,
+    connectorStatus: row.connectorStatus as RoomConnectorStatus | null,
+    nativeWriterDetected: row.nativeWriterDetected,
+    gapExpectedCursor: row.gapExpectedCursor,
+    gapObservedCursor: row.gapObservedCursor,
+    gapDetectedAt: row.gapDetectedAt,
+    lastTranscriptAt: row.lastTranscriptAt,
+    lastStatusAt: row.lastStatusAt,
+    lastModeAt: row.lastModeAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+async function persistRoomConnectorIngestionState(
+  tx: DbTransaction,
+  projectId: string,
+  state: RoomConnectorIngestionStateV1,
+  updatedAt: string,
+): Promise<void> {
+  const values = {
+    bindingId: state.bindingId,
+    projectId,
+    roomId: state.roomId,
+    mode: state.mode,
+    transcriptCursor: state.transcriptCursor,
+    statusCursor: state.statusCursor,
+    lastNativeMessageId: state.lastNativeMessageId,
+    lastPayloadHash: state.lastPayloadHash,
+    connectorStatus: state.connectorStatus,
+    nativeWriterDetected: state.nativeWriterDetected,
+    gapExpectedCursor: state.gapExpectedCursor,
+    gapObservedCursor: state.gapObservedCursor,
+    gapDetectedAt: state.gapDetectedAt,
+    lastTranscriptAt: state.lastTranscriptAt,
+    lastStatusAt: state.lastStatusAt,
+    lastModeAt: state.lastModeAt,
+    updatedAt,
+  };
+  await tx
+    .insert(roomBindingIngestionState)
+    .values(values)
+    .onConflictDoUpdate({
+      target: roomBindingIngestionState.bindingId,
+      set: {
+        mode: values.mode,
+        transcriptCursor: values.transcriptCursor,
+        statusCursor: values.statusCursor,
+        lastNativeMessageId: values.lastNativeMessageId,
+        lastPayloadHash: values.lastPayloadHash,
+        connectorStatus: values.connectorStatus,
+        nativeWriterDetected: values.nativeWriterDetected,
+        gapExpectedCursor: values.gapExpectedCursor,
+        gapObservedCursor: values.gapObservedCursor,
+        gapDetectedAt: values.gapDetectedAt,
+        lastTranscriptAt: values.lastTranscriptAt,
+        lastStatusAt: values.lastStatusAt,
+        lastModeAt: values.lastModeAt,
+        updatedAt: values.updatedAt,
+      },
+    });
 }
 
 function deliveryStateForOutcome(

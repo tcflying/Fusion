@@ -9,6 +9,7 @@
 
 import {
   bigint,
+  boolean,
   check,
   foreignKey,
   index,
@@ -98,6 +99,7 @@ export const roomBindings = roomSchema.table("room_bindings", {
     foreignColumns: [roomSeats.id],
     name: "room_bindings_seat_fkey",
   }).onDelete("cascade"),
+  unique("room_bindings_id_room_project_unique").on(t.id, t.roomId, t.projectId),
   unique("room_bindings_seat_generation_unique").on(t.seatId, t.generation),
   index("idx_room_bindings_native_session").on(t.providerId, t.nativeSessionId),
   index("idx_room_bindings_room_state").on(t.projectId, t.roomId, t.state),
@@ -109,6 +111,34 @@ export const roomBindings = roomSchema.table("room_bindings", {
     .where(sql`${t.happierSessionId} IS NOT NULL AND ${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain')`),
   check("room_bindings_generation_check", sql`${t.generation} > 0`),
   check("room_bindings_state_check", sql`${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain','detached','replaced','failed')`),
+]);
+
+export const roomBindingIngestionState = roomSchema.table("room_binding_ingestion_state", {
+  bindingId: text("binding_id").primaryKey(),
+  ...scopedRoomColumns(),
+  mode: text("mode").notNull(),
+  transcriptCursor: text("transcript_cursor"),
+  statusCursor: text("status_cursor"),
+  lastNativeMessageId: text("last_native_message_id"),
+  lastPayloadHash: text("last_payload_hash"),
+  connectorStatus: text("connector_status"),
+  nativeWriterDetected: boolean("native_writer_detected").notNull().default(false),
+  gapExpectedCursor: text("gap_expected_cursor"),
+  gapObservedCursor: text("gap_observed_cursor"),
+  gapDetectedAt: text("gap_detected_at"),
+  lastTranscriptAt: text("last_transcript_at"),
+  lastStatusAt: text("last_status_at"),
+  lastModeAt: text("last_mode_at"),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.bindingId, t.roomId, t.projectId],
+    foreignColumns: [roomBindings.id, roomBindings.roomId, roomBindings.projectId],
+    name: "room_binding_ingestion_state_binding_room_project_fkey",
+  }).onDelete("cascade"),
+  index("idx_room_binding_ingestion_room_mode").on(t.projectId, t.roomId, t.mode),
+  check("room_binding_ingestion_mode_check", sql`${t.mode} IN ('starting','streaming','polling','reconciling','degraded','stopped')`),
+  check("room_binding_ingestion_status_check", sql`${t.connectorStatus} IS NULL OR ${t.connectorStatus} IN ('idle','running','waiting_input','paused','lost','unknown')`),
 ]);
 
 export const roomTurns = roomSchema.table("room_turns", {
@@ -299,13 +329,31 @@ export const roomInboxReceipts = roomSchema.table("room_inbox_receipts", {
   ...scopedRoomColumns(),
   bindingId: text("binding_id").notNull(),
   nativeMessageId: text("native_message_id"),
+  logicalMessageId: text("logical_message_id"),
   nativeCursor: text("native_cursor").notNull(),
   payloadHash: text("payload_hash").notNull(),
+  dedupeKey: text("dedupe_key").notNull(),
+  role: text("role").notNull(),
+  occurredAt: text("occurred_at").notNull(),
+  source: text("source").notNull(),
+  legacyPlaceholder: boolean("legacy_placeholder").notNull().default(false),
   receivedAt: text("received_at").notNull(),
 }, (t) => [
   foreignKey({ columns: [t.bindingId], foreignColumns: [roomBindings.id], name: "room_inbox_receipts_binding_fkey" }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.bindingId, t.roomId, t.projectId],
+    foreignColumns: [roomBindings.id, roomBindings.roomId, roomBindings.projectId],
+    name: "room_inbox_receipts_binding_room_project_fkey",
+  }).onDelete("cascade"),
   unique("room_inbox_receipts_binding_cursor_unique").on(t.bindingId, t.nativeCursor),
+  unique("room_inbox_receipts_binding_dedupe_unique").on(t.bindingId, t.dedupeKey),
+  uniqueIndex("idx_room_inbox_receipts_binding_logical_message")
+    .on(t.bindingId, t.logicalMessageId)
+    .where(sql`${t.logicalMessageId} IS NOT NULL`),
+  index("idx_room_inbox_receipts_native_message").on(t.bindingId, t.nativeMessageId),
   index("idx_room_inbox_receipts_room_time").on(t.projectId, t.roomId, t.receivedAt),
+  check("room_inbox_receipts_role_check", sql`${t.role} IN ('user','assistant','tool','system','unknown')`),
+  check("room_inbox_receipts_source_check", sql`${t.source} IN ('event','history')`),
 ]);
 
 export const roomIdempotencyKeys = roomSchema.table("room_idempotency_keys", {
@@ -601,6 +649,7 @@ export const ROOM_PROJECT_TABLE_NAMES = [
   "operational_rooms",
   "room_seats",
   "room_bindings",
+  "room_binding_ingestion_state",
   "room_turns",
   "room_membership_changes",
   "room_events",

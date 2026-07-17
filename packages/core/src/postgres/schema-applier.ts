@@ -41,7 +41,7 @@ FNXC:MigrationStatusRuntimeRead 2026-07-20:
 SCHEMA_BASELINE_VERSION advances to 0030 for project-scoped runtime reads of
 the SQLite cutover ledger.
 */
-export const SCHEMA_BASELINE_VERSION = "0033";
+export const SCHEMA_BASELINE_VERSION = "0034";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -139,12 +139,14 @@ export const SCHEMA_ROOM_VERSION = SESSION_ROOM_SCHEMA_VERSION;
 export const SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION = "0032";
 
 export const SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION = "0033";
+export const SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION = "0034";
 
 export const SCHEMA_MIGRATIONS = [
   { version: "0000", filename: "0000_initial.sql" },
   { version: SCHEMA_ROOM_VERSION, filename: "0001_session_rooms.sql" },
   { version: SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION, filename: "0002_room_binding_ownership.sql" },
   { version: SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION, filename: "0003_room_outbox_identity.sql" },
+  { version: SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION, filename: "0004_room_connector_ingestion.sql" },
 ] as const;
 
 export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];
@@ -455,6 +457,7 @@ export async function applySchemaBaseline(
     const sessionRoomAlreadyApplied = applied.includes(SESSION_ROOM_SCHEMA_VERSION);
     const sessionRoomBindingOwnershipAlreadyApplied = applied.includes(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
     const sessionRoomOutboxIdentityAlreadyApplied = applied.includes(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
+    const sessionRoomConnectorIngestionAlreadyApplied = applied.includes(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -922,6 +925,13 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(join(MIGRATIONS_DIR, "0003_room_outbox_identity.sql"), "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+
+    if (!sessionRoomConnectorIngestionAlreadyApplied) {
+      const migrationSql = await readFile(join(MIGRATIONS_DIR, "0004_room_connector_ingestion.sql"), "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
 

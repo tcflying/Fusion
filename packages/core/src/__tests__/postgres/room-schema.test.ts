@@ -4,6 +4,7 @@ import {
   ROOM_PROJECT_TABLE_NAMES,
   operationalRooms,
   roomAlerts,
+  roomBindingIngestionState,
   roomBindings,
   roomCandidates,
   roomCheckpoints,
@@ -38,6 +39,7 @@ describe("Session Room PostgreSQL schema", () => {
       "operational_rooms",
       "room_seats",
       "room_bindings",
+      "room_binding_ingestion_state",
       "room_turns",
       "room_membership_changes",
       "room_events",
@@ -65,6 +67,7 @@ describe("Session Room PostgreSQL schema", () => {
       operationalRooms,
       roomSeats,
       roomBindings,
+      roomBindingIngestionState,
       roomTurns,
       roomMembershipChanges,
       roomEvents,
@@ -90,12 +93,13 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003"]);
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004"]);
     const roomSql = await readSchemaMigrationSql("0001");
     const ownershipSql = await readSchemaMigrationSql("0002");
     const outboxIdentitySql = await readSchemaMigrationSql("0003");
+    const connectorIngestionSql = await readSchemaMigrationSql("0004");
 
-    for (const tableName of ROOM_PROJECT_TABLE_NAMES) {
+    for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => name !== "room_binding_ingestion_state")) {
       expect(roomSql).toContain(`project.${tableName}`);
     }
     expect(roomSql).toContain("UNIQUE (room_id, aggregate_version)");
@@ -104,5 +108,7 @@ describe("Session Room PostgreSQL schema", () => {
     expect(ownershipSql).toContain("idx_room_bindings_active_happier_session");
     expect(outboxIdentitySql).toContain("local_message_id");
     expect(outboxIdentitySql).toContain("idx_room_outbox_local_message");
+    expect(connectorIngestionSql).toContain("project.room_binding_ingestion_state");
+    expect(connectorIngestionSql).toContain("idx_room_inbox_receipts_native_message");
   });
 });

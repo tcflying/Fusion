@@ -44,14 +44,58 @@ function setup(overrides: Partial<HappierSessionConnectorDependencies> = {}) {
       },
       agentState: { status: "waitingOnInput", controlledByUser: true },
     })),
-    getSessionHistory: vi.fn(async () => ({
+    readDirectTranscript: vi.fn(async (input) => input.afterCursor === null ? ({
+      machineId: "machine-1",
+      providerId: "codex" as const,
+      remoteSessionId: "codex-thread-1",
       sessionId: "happier-session-1",
-      format: "raw",
-      messages: [
-        { id: "native-message-1", localId: "logical-1", createdAt: 1_752_729_000_000, role: "user", raw: { text: "first" } },
-        { id: "native-message-2", createdAt: 1_752_729_001_000, role: "agent", raw: { text: "second" } },
+      source: { kind: "codexHome" as const, home: "user" as const },
+      fromCursor: null,
+      nextCursor: "provider-cursor-2",
+      truncated: false,
+      items: [
+        { id: "native-message-1", localId: "logical-1", createdAtMs: 1_752_729_000_000, raw: { role: "user", text: "first" } },
+        { id: "native-message-2", createdAtMs: 1_752_729_001_000, raw: { role: "assistant", text: "second" } },
+      ],
+    }) : ({
+      machineId: "machine-1",
+      providerId: "codex" as const,
+      remoteSessionId: "codex-thread-1",
+      sessionId: "happier-session-1",
+      source: { kind: "codexHome" as const, home: "user" as const },
+      fromCursor: input.afterCursor,
+      nextCursor: "provider-cursor-3",
+      truncated: false,
+      items: [
+        { id: "native-message-3", createdAtMs: 1_752_729_002_000, raw: { role: "assistant", text: "third" } },
       ],
     })),
+    followDirectTranscriptEvents: vi.fn(() => (async function* () {
+      yield {
+        machineId: "machine-1",
+        providerId: "codex" as const,
+        remoteSessionId: "codex-thread-1",
+        sessionId: "happier-session-1",
+        source: { kind: "codexHome" as const, home: "user" as const },
+        fromCursor: "provider-cursor-2",
+        nextCursor: "provider-cursor-3",
+        truncated: false,
+        items: [
+          { id: "native-message-3", createdAtMs: 1_752_729_002_000, raw: { role: "assistant", text: "third" } },
+        ],
+      };
+      yield {
+        eventType: "status" as const,
+        machineId: "machine-1",
+        providerId: "codex" as const,
+        remoteSessionId: "codex-thread-1",
+        sessionId: "happier-session-1",
+        source: { kind: "codexHome" as const, home: "user" as const },
+        isRunning: true,
+        lastActivityAtMs: 1_752_729_002_000,
+        observedAtMs: 1_752_729_002_500,
+      };
+    })()),
     sendMessage: vi.fn(async (input) => ({
       sessionId: input.sessionId,
       localId: input.localId,
@@ -76,6 +120,7 @@ function setup(overrides: Partial<HappierSessionConnectorDependencies> = {}) {
     connector: new HappierSessionConnector({
       settings: {
         executable: "happier",
+        activeServerId: "server-1",
         webappUrl: "https://app.happier.dev",
       },
       now: () => NOW,
@@ -152,7 +197,7 @@ describe("HappierSessionConnector", () => {
     );
   });
 
-  it("maps bounded raw history to content-free durable cursor records", async () => {
+  it("maps official bounded Direct history to content-free durable cursor records", async () => {
     const { connector, dependencies } = setup();
     const first = await connector.readHistory({
       contractVersion: 1,
@@ -167,23 +212,32 @@ describe("HappierSessionConnector", () => {
         nativeMessageId: "native-message-1",
         logicalMessageId: "logical-1",
         role: "user",
-        contentHash: hashRoomValue({ text: "first" }),
+        contentHash: hashRoomValue({ role: "user", text: "first" }),
         occurredAt: "2025-07-17T05:10:00.000Z",
       }),
       expect.objectContaining({
         nativeMessageId: "native-message-2",
         logicalMessageId: null,
         role: "assistant",
-        contentHash: hashRoomValue({ text: "second" }),
+        contentHash: hashRoomValue({ role: "assistant", text: "second" }),
         occurredAt: "2025-07-17T05:10:01.000Z",
       }),
     ]);
-    expect(first.value.items[0]?.cursor).toMatch(/^happier-history-v1:/u);
-    expect(first.value.nextCursor).toBe(first.value.items[1]?.cursor);
+    expect(first.value.items[0]?.cursor).toMatch(/^happier-direct-message-v1:/u);
+    expect(first.value.items[1]?.cursor).toBe("provider-cursor-2");
+    expect(first.value.nextCursor).toBe("provider-cursor-2");
+    expect(first.value.completeThroughCursor).toBe("provider-cursor-2");
+    expect(first.value.truncated).toBe(false);
     expect(JSON.stringify(first.value)).not.toContain("first");
-    expect(dependencies.getSessionHistory).toHaveBeenCalledWith(
-      "happier-session-1",
-      2,
+    expect(dependencies.readDirectTranscript).toHaveBeenCalledWith(
+      {
+        providerId: "codex",
+        remoteSessionId: "codex-thread-1",
+        sessionId: "happier-session-1",
+        machineId: "machine-1",
+        afterCursor: null,
+        limit: 2,
+      },
       expect.objectContaining({ executable: "happier" }),
       undefined,
     );
@@ -191,19 +245,138 @@ describe("HappierSessionConnector", () => {
     const after = await connector.readHistory({
       contractVersion: 1,
       identity: IDENTITY,
-      afterCursor: first.value.items[0]!.cursor,
+      afterCursor: "provider-cursor-2",
       limit: 1,
     });
     expect(after).toMatchObject({
       ok: true,
-      value: { items: [{ nativeMessageId: "native-message-2" }] },
+      value: {
+        items: [{ nativeMessageId: "native-message-3", cursor: "provider-cursor-3" }],
+        nextCursor: "provider-cursor-3",
+      },
     });
-    expect(dependencies.getSessionHistory).toHaveBeenLastCalledWith(
-      "happier-session-1",
-      250,
+    expect(dependencies.readDirectTranscript).toHaveBeenLastCalledWith(
+      {
+        providerId: "codex",
+        remoteSessionId: "codex-thread-1",
+        sessionId: "happier-session-1",
+        machineId: "machine-1",
+        afterCursor: "provider-cursor-2",
+        limit: 1,
+      },
       expect.objectContaining({ executable: "happier" }),
       undefined,
     );
+  });
+
+  it("maps the official Direct transcript stream to content-free message events", async () => {
+    const { connector, dependencies } = setup();
+    const subscription = await connector.subscribeEvents(IDENTITY);
+    expect(subscription.ok).toBe(true);
+    if (!subscription.ok) throw new Error(subscription.error.message);
+
+    const iterator = subscription.value[Symbol.asyncIterator]();
+    const event = await iterator.next();
+    expect(event).toMatchObject({
+      done: false,
+      value: {
+        identity: IDENTITY,
+        eventType: "message",
+        cursor: "provider-cursor-3",
+        occurredAt: "2025-07-17T05:10:02.000Z",
+        payload: {
+          type: "transcript_delta",
+          fromCursor: "provider-cursor-2",
+          nextCursor: "provider-cursor-3",
+          completeThroughCursor: "provider-cursor-3",
+          truncated: false,
+          items: [{ nativeMessageId: "native-message-3", cursor: "provider-cursor-3" }],
+        },
+      },
+    });
+    expect(JSON.stringify(event)).not.toContain("third");
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        eventType: "status",
+        occurredAt: "2025-07-17T05:10:02.500Z",
+        payload: {
+          type: "status",
+          state: "running",
+          lastActivityAt: "2025-07-17T05:10:02.000Z",
+          connectorCursor: null,
+          nativeWriterDetected: false,
+        },
+      },
+    });
+    expect(dependencies.followDirectTranscriptEvents).toHaveBeenCalledWith(
+      {
+        providerId: "codex",
+        remoteSessionId: "codex-thread-1",
+        sessionId: "happier-session-1",
+        machineId: "machine-1",
+        afterCursor: null,
+        limit: 250,
+      },
+      expect.objectContaining({ executable: "happier" }),
+      undefined,
+    );
+  });
+
+  it("keeps recent provider activity idle when the provider is not running", async () => {
+    const { connector } = setup({
+      followDirectTranscriptEvents: vi.fn(() => (async function* events() {
+        yield {
+          eventType: "status" as const,
+          machineId: "machine-1",
+          providerId: "codex" as const,
+          remoteSessionId: "codex-thread-1",
+          sessionId: "happier-session-1",
+          source: { kind: "codexHome" as const, home: "user" as const },
+          isRunning: false,
+          lastActivityAtMs: 1_752_729_002_000,
+          observedAtMs: 1_752_729_002_500,
+        };
+      })()),
+    });
+    const subscription = await connector.subscribeEvents(IDENTITY);
+    if (!subscription.ok) throw new Error(subscription.error.message);
+
+    await expect(subscription.value[Symbol.asyncIterator]().next()).resolves.toMatchObject({
+      value: {
+        eventType: "status",
+        payload: { state: "idle", nativeWriterDetected: false },
+      },
+    });
+  });
+
+  it("fails closed when the immutable binding points at another Happier server profile", async () => {
+    const { connector, dependencies } = setup();
+    const driftedIdentity = { ...IDENTITY, serverProfileId: "server-2" };
+
+    await expect(connector.readHistory({
+      contractVersion: 1,
+      identity: driftedIdentity,
+      afterCursor: null,
+      limit: 2,
+    })).resolves.toMatchObject({ ok: false, error: { code: "conflict", retryable: false } });
+    expect(dependencies.readDirectTranscript).not.toHaveBeenCalled();
+    await expect(connector.getStatus(driftedIdentity)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "conflict", retryable: false },
+    });
+    expect(dependencies.getSessionStatus).not.toHaveBeenCalled();
+    await expect(connector.subscribeEvents(driftedIdentity)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "conflict", retryable: false },
+    });
+    expect(dependencies.followDirectTranscriptEvents).not.toHaveBeenCalled();
+    await expect(connector.getCapabilities(driftedIdentity)).resolves.toMatchObject({
+      capabilities: {
+        history: { state: "degraded" },
+        events: { state: "degraded" },
+      },
+    });
   });
 
   it("uses the persisted local id and returns the official send acknowledgement", async () => {
@@ -275,10 +448,10 @@ describe("HappierSessionConnector", () => {
       capabilities: {
         ensureExisting: { state: "unverified" },
         status: { state: "unverified" },
-        history: { state: "unverified" },
+        history: { state: "verified" },
         send: { state: "unverified" },
         create: { state: "unavailable" },
-        events: { state: "unavailable" },
+        events: { state: "verified" },
         interrupt: { state: "unavailable" },
         resume: { state: "unavailable" },
         takeover: { state: "unavailable" },

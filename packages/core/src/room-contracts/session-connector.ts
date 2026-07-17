@@ -150,6 +150,8 @@ export interface SessionConnectorHistoryPageV1 {
   readonly items: readonly SessionConnectorHistoryItemV1[];
   readonly nextCursor: EventCursor | null;
   readonly completeThroughCursor: EventCursor | null;
+  /** True when an official provider byte/item bound indicates more history remains. */
+  readonly truncated?: boolean;
 }
 
 export interface SessionConnectorEventV1 {

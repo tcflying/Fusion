@@ -22,30 +22,35 @@ import {
 
 import {
   ensureHappierDirectSession,
-  getHappierSessionHistory,
+  followHappierDirectSessionTranscriptEvents,
   getHappierSessionStatus,
+  readHappierDirectSessionTranscript,
+  resolveHappierCliSettings,
   sendHappierMessage,
 } from "./cli-spawn.js";
 import { probeHappierRuntime } from "./probe.js";
 import {
   HappierCliError,
+  type HappierBackend,
   type HappierCliSettings,
-  type HappierRawHistoryRow,
+  type HappierDirectSessionStatusDelta,
+  type HappierDirectSessionTranscriptDelta,
   type HappierSessionStatusResult,
 } from "./types.js";
 
 export const HAPPIER_SESSION_CONNECTOR_ID = "happier";
 export const HAPPIER_SESSION_CONNECTOR_VERSION = "0.2.73";
-export const HAPPIER_DIRECT_SESSION_SOURCE_REVISION = "2bcd6c170669b623086c84da218ac753b63c4fbf";
+export const HAPPIER_DIRECT_SESSION_SOURCE_REVISION = "f07b7317cd4c7f0cfa762189dc68d16750a48182";
 
-const HISTORY_CURSOR_PREFIX = "happier-history-v1:";
+const DIRECT_MESSAGE_CURSOR_PREFIX = "happier-direct-message-v1:";
 const HISTORY_RECONCILIATION_LIMIT = 250;
 const DEFAULT_SEND_TIMEOUT_SECONDS = 300;
 
 export interface HappierSessionConnectorDependencies {
   readonly ensureDirectSession: typeof ensureHappierDirectSession;
   readonly getSessionStatus: typeof getHappierSessionStatus;
-  readonly getSessionHistory: typeof getHappierSessionHistory;
+  readonly readDirectTranscript: typeof readHappierDirectSessionTranscript;
+  readonly followDirectTranscriptEvents: typeof followHappierDirectSessionTranscriptEvents;
   readonly sendMessage: typeof sendHappierMessage;
   readonly probeRuntime: typeof probeHappierRuntime;
 }
@@ -62,7 +67,8 @@ export interface HappierSessionConnectorOptions {
 const defaultDependencies: HappierSessionConnectorDependencies = {
   ensureDirectSession: ensureHappierDirectSession,
   getSessionStatus: getHappierSessionStatus,
-  getSessionHistory: getHappierSessionHistory,
+  readDirectTranscript: readHappierDirectSessionTranscript,
+  followDirectTranscriptEvents: followHappierDirectSessionTranscriptEvents,
   sendMessage: sendHappierMessage,
   probeRuntime: probeHappierRuntime,
 };
@@ -73,6 +79,10 @@ function unavailableCertification(reason: string) {
 
 function unverifiedCertification(reason: string) {
   return { state: "unverified" as const, evidenceRef: null, reason };
+}
+
+function verifiedCertification(evidenceRef: string, verifiedAt: string) {
+  return { state: "verified" as const, evidenceRef, lastVerifiedAt: verifiedAt };
 }
 
 function failure<T>(
@@ -142,12 +152,19 @@ function mapReadFailure<T>(error: unknown): SessionConnectorResultV1<T> {
 
 function validateIdentity(
   identity: SessionConnectorIdentityV1,
+  activeServerId: string | undefined,
 ): SessionConnectorResultV1<string> {
   if (identity.connectorId !== HAPPIER_SESSION_CONNECTOR_ID) {
     return failure("conflict", "Session identity belongs to a different connector", false);
   }
   if (!identity.happierSessionId?.trim()) {
     return failure("invalid_request", "A Happier Session identity is required", false);
+  }
+  if (!activeServerId?.trim()) {
+    return failure("degraded", "The Happier active server profile is not pinned", false);
+  }
+  if (identity.serverProfileId?.trim() !== activeServerId) {
+    return failure("conflict", "The Happier server profile does not match the immutable Session binding", false);
   }
   return { ok: true, value: identity.happierSessionId };
 }
@@ -215,8 +232,8 @@ function statusLastActivity(result: HappierSessionStatusResult): string | null {
   return null;
 }
 
-function historyRole(role: string): SessionConnectorHistoryItemV1["role"] {
-  const normalized = role.trim().toLowerCase();
+function historyRole(value: unknown): SessionConnectorHistoryItemV1["role"] {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (normalized === "user" || normalized === "human") return "user";
   if (normalized === "assistant" || normalized === "agent" || normalized === "ai") return "assistant";
   if (normalized === "tool" || normalized === "function") return "tool";
@@ -224,30 +241,128 @@ function historyRole(role: string): SessionConnectorHistoryItemV1["role"] {
   return "unknown";
 }
 
-function historyCursor(nativeMessageId: string): string {
-  return `${HISTORY_CURSOR_PREFIX}${Buffer.from(nativeMessageId, "utf8").toString("base64url")}`;
+function historyCursor(identity: SessionConnectorIdentityV1, nativeMessageId: string): string {
+  return `${DIRECT_MESSAGE_CURSOR_PREFIX}${hashRoomValue({
+    connectorId: identity.connectorId,
+    providerId: identity.providerId,
+    nativeSessionId: identity.nativeSessionId,
+    happierSessionId: identity.happierSessionId,
+    serverProfileId: identity.serverProfileId,
+    machineId: identity.machineId,
+    nativeMessageId,
+  })}`;
 }
 
-function mapHistoryRow(row: HappierRawHistoryRow): SessionConnectorHistoryItemV1 | null {
+type DirectIdentity = Readonly<{
+  providerId: HappierBackend;
+  remoteSessionId: string;
+  sessionId: string;
+  machineId: string;
+}>;
+
+function validateDirectIdentity(
+  identity: SessionConnectorIdentityV1,
+  activeServerId: string | undefined,
+): SessionConnectorResultV1<DirectIdentity> {
+  const linked = validateIdentity(identity, activeServerId);
+  if (!linked.ok) return linked;
   if (
-    typeof row.id !== "string"
-    || row.id.trim().length === 0
-    || typeof row.role !== "string"
-    || !Number.isFinite(row.createdAt)
-    || !asRecord(row.raw)
+    identity.providerId !== "codex"
+    && identity.providerId !== "claude"
+    && identity.providerId !== "opencode"
   ) {
-    return null;
+    return failure("invalid_request", "The Happier Direct Session provider is unsupported", false);
   }
-  const occurredAt = isoTimestamp(row.createdAt);
-  if (!occurredAt) return null;
+  if (!identity.nativeSessionId.trim() || !identity.machineId?.trim()) {
+    return failure("invalid_request", "Provider-native and machine identities are required", false);
+  }
   return {
-    nativeMessageId: row.id,
-    logicalMessageId: typeof row.localId === "string" && row.localId.trim() ? row.localId : null,
-    role: historyRole(row.role),
-    contentHash: hashRoomValue(row.raw),
-    occurredAt,
-    cursor: historyCursor(row.id),
+    ok: true,
+    value: {
+      providerId: identity.providerId,
+      remoteSessionId: identity.nativeSessionId,
+      sessionId: linked.value,
+      machineId: identity.machineId,
+    },
   };
+}
+
+function mapDirectTranscript(
+  identity: SessionConnectorIdentityV1,
+  delta: HappierDirectSessionTranscriptDelta,
+): SessionConnectorResultV1<readonly SessionConnectorHistoryItemV1[]> {
+  const nativeIds = new Set<string>();
+  const cursors = new Set<string>();
+  const items: SessionConnectorHistoryItemV1[] = [];
+  for (let index = 0; index < delta.items.length; index += 1) {
+    const row = delta.items[index]!;
+    if (nativeIds.has(row.id)) {
+      return failure("degraded", "Happier Direct history contained duplicate native messages", false);
+    }
+    const occurredAt = isoTimestamp(row.createdAtMs);
+    if (!occurredAt) {
+      return failure("degraded", "Happier Direct history contained an invalid timestamp", false);
+    }
+    const raw = asRecord(row.raw);
+    if (!raw) {
+      return failure("degraded", "Happier Direct history contained an invalid raw record", false);
+    }
+    const cursor = index === delta.items.length - 1 && delta.nextCursor
+      ? delta.nextCursor
+      : historyCursor(identity, row.id);
+    if (cursors.has(cursor)) {
+      return failure("degraded", "Happier Direct history contained duplicate message cursors", false);
+    }
+    nativeIds.add(row.id);
+    cursors.add(cursor);
+    items.push({
+      nativeMessageId: row.id,
+      logicalMessageId: typeof row.localId === "string" && row.localId.trim() ? row.localId : null,
+      role: historyRole(raw.role ?? raw.type),
+      contentHash: hashRoomValue(raw),
+      occurredAt,
+      cursor,
+    });
+  }
+  if (items.length > 0 && delta.nextCursor === null) {
+    return failure("degraded", "Happier Direct history did not provide a complete cursor", false);
+  }
+  return { ok: true, value: items };
+}
+
+function mapDirectStatusEvent(
+  identity: SessionConnectorIdentityV1,
+  delta: HappierDirectSessionStatusDelta,
+): SessionConnectorEventV1 {
+  const lastActivityAt = isoTimestamp(delta.lastActivityAtMs);
+  const eventHash = hashRoomValue({
+    identity,
+    isRunning: delta.isRunning,
+    lastActivityAtMs: delta.lastActivityAtMs,
+    observedAtMs: delta.observedAtMs,
+  });
+  const cursor = `happier-direct-status-v1:${delta.observedAtMs}:${eventHash}`;
+  return {
+    connectorEventId: cursor,
+    identity,
+    eventType: "status",
+    cursor,
+    occurredAt: new Date(delta.observedAtMs).toISOString(),
+    payload: {
+      type: "status",
+      state: delta.isRunning ? "running" : "idle",
+      lastActivityAt,
+      connectorCursor: null,
+      // Activity proves provider process state, not whether a human IDE authored it.
+      nativeWriterDetected: false,
+    },
+  };
+}
+
+function isDirectStatusDelta(
+  delta: HappierDirectSessionTranscriptDelta | HappierDirectSessionStatusDelta,
+): delta is HappierDirectSessionStatusDelta {
+  return "eventType" in delta && delta.eventType === "status";
 }
 
 function unavailableResult<T>(operation: string): SessionConnectorResultV1<T> {
@@ -277,9 +392,10 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   private readonly sendTimeoutSeconds: number;
   private readonly now: () => string;
   private readonly dependencies: HappierSessionConnectorDependencies;
+  private readonly transcriptCursors = new Map<string, string | null>();
 
   constructor(options: HappierSessionConnectorOptions = {}) {
-    this.settings = { ...(options.settings ?? {}) };
+    this.settings = resolveHappierCliSettings(options.settings);
     this.version = options.version?.trim() || HAPPIER_SESSION_CONNECTOR_VERSION;
     this.sourceRevision = options.sourceRevision?.trim() || HAPPIER_DIRECT_SESSION_SOURCE_REVISION;
     this.sendTimeoutSeconds = options.sendTimeoutSeconds ?? DEFAULT_SEND_TIMEOUT_SECONDS;
@@ -290,20 +406,41 @@ export class HappierSessionConnector implements SessionConnectorV1 {
     this.dependencies = { ...defaultDependencies, ...(options.dependencies ?? {}) };
   }
 
-  async getCapabilities(_identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
+  async getCapabilities(identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
     const pendingCertification = "Pending provider-specific source and runtime certification";
+    const verifiedAt = this.now();
+    const directTranscriptEvidence = `happier-source:${this.sourceRevision}:direct-session-transcript-control`;
+    const activeServerId = this.settings.activeServerId?.trim();
+    const profileMatches = Boolean(activeServerId)
+      && (identity === undefined || identity.serverProfileId === activeServerId);
+    const directHistoryCertification = profileMatches
+      ? verifiedCertification(`${directTranscriptEvidence}:read-after`, verifiedAt)
+      : {
+          state: "degraded" as const,
+          evidenceRef: null,
+          reason: "The active Happier server profile does not match the immutable Session binding",
+          lastVerifiedAt: verifiedAt,
+        };
+    const directEventCertification = profileMatches
+      ? verifiedCertification(`${directTranscriptEvidence}:delta-ndjson`, verifiedAt)
+      : {
+          state: "degraded" as const,
+          evidenceRef: null,
+          reason: "The active Happier server profile does not match the immutable Session binding",
+          lastVerifiedAt: verifiedAt,
+        };
     return {
       contractVersion: 1,
       connectorId: this.id,
       connectorVersion: this.version,
       sourceRevision: this.sourceRevision,
-      verifiedAt: this.now(),
+      verifiedAt,
       capabilities: {
         ensureExisting: unverifiedCertification(pendingCertification),
         create: unavailableCertification("Creation does not yet return both provider-native and Happier identities"),
         status: unverifiedCertification(pendingCertification),
-        history: unverifiedCertification(pendingCertification),
-        events: unavailableCertification("Event subscription is implemented in a later connector phase"),
+        history: directHistoryCertification,
+        events: directEventCertification,
         send: unverifiedCertification(pendingCertification),
         interrupt: unavailableCertification("No reviewed interrupt surface is wired"),
         resume: unavailableCertification("No reviewed resume surface is wired"),
@@ -350,6 +487,12 @@ export class HappierSessionConnector implements SessionConnectorV1 {
       if (input.requiredMachineId && ensured.machineId !== input.requiredMachineId) {
         return failure("conflict", "Happier linked the Session on a different machine", false);
       }
+      if (!this.settings.activeServerId) {
+        return failure("degraded", "The Happier active server profile is not pinned", false);
+      }
+      if (ensured.serverId !== this.settings.activeServerId) {
+        return failure("conflict", "Happier linked the Session on a different server profile", false);
+      }
       const identity: SessionConnectorIdentityV1 = {
         connectorId: this.id,
         providerId: ensured.providerId,
@@ -383,7 +526,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   async getStatus(
     identity: SessionConnectorIdentityV1,
   ): Promise<SessionConnectorResultV1<SessionConnectorStatusV1>> {
-    const target = validateIdentity(identity);
+    const target = validateIdentity(identity, this.settings.activeServerId);
     if (!target.ok) return target;
     try {
       const result = await this.dependencies.getSessionStatus(target.value, this.settings, undefined);
@@ -411,51 +554,32 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   async readHistory(
     input: SessionConnectorHistoryRequestV1,
   ): Promise<SessionConnectorResultV1<SessionConnectorHistoryPageV1>> {
-    const target = validateIdentity(input.identity);
+    const target = validateDirectIdentity(input.identity, this.settings.activeServerId);
     if (!target.ok) return target;
     if (input.contractVersion !== 1 || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > HISTORY_RECONCILIATION_LIMIT) {
       return failure("invalid_request", "History limit must be an integer from 1 through 250", false);
     }
-    const fetchLimit = input.afterCursor ? HISTORY_RECONCILIATION_LIMIT : input.limit;
     try {
-      const result = await this.dependencies.getSessionHistory(
-        target.value,
-        fetchLimit,
+      const result = await this.dependencies.readDirectTranscript(
+        {
+          ...target.value,
+          afterCursor: input.afterCursor,
+          limit: input.limit,
+        },
         this.settings,
         undefined,
       );
-      const mapped: SessionConnectorHistoryItemV1[] = [];
-      const nativeIds = new Set<string>();
-      for (const row of result.messages) {
-        const item = mapHistoryRow(row);
-        if (!item || nativeIds.has(item.nativeMessageId)) {
-          return failure("degraded", "Happier history contained an invalid or duplicate native message", false);
-        }
-        nativeIds.add(item.nativeMessageId);
-        mapped.push(item);
-      }
-
-      let start = 0;
-      if (input.afterCursor) {
-        const matched = mapped.findIndex((item) => item.cursor === input.afterCursor);
-        if (matched < 0) {
-          return failure(
-            "ambiguous",
-            "The requested history cursor is outside the bounded reconciliation window",
-            false,
-            { boundedWindow: HISTORY_RECONCILIATION_LIMIT },
-          );
-        }
-        start = matched + 1;
-      }
-      const items = mapped.slice(start, start + input.limit);
-      const completeThroughCursor = items.at(-1)?.cursor ?? input.afterCursor;
+      const mapped = mapDirectTranscript(input.identity, result);
+      if (!mapped.ok) return mapped;
+      const completeThroughCursor = result.nextCursor ?? result.fromCursor;
+      this.transcriptCursors.set(this.identityKey(input.identity), completeThroughCursor);
       return {
         ok: true,
         value: {
-          items,
-          nextCursor: items.at(-1)?.cursor ?? null,
-          completeThroughCursor: completeThroughCursor ?? null,
+          items: mapped.value,
+          nextCursor: result.nextCursor,
+          completeThroughCursor,
+          truncated: result.truncated,
         },
       };
     } catch (error) {
@@ -464,15 +588,75 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   }
 
   async subscribeEvents(
-    _identity: SessionConnectorIdentityV1,
+    identity: SessionConnectorIdentityV1,
   ): Promise<SessionConnectorResultV1<AsyncIterable<SessionConnectorEventV1>>> {
-    return unavailableResult("event subscription");
+    const target = validateDirectIdentity(identity, this.settings.activeServerId);
+    if (!target.ok) return target;
+    try {
+      const rawEvents = this.dependencies.followDirectTranscriptEvents(
+        {
+          ...target.value,
+          afterCursor: this.transcriptCursors.get(this.identityKey(identity)) ?? null,
+          limit: HISTORY_RECONCILIATION_LIMIT,
+        },
+        this.settings,
+        undefined,
+      );
+      const transcriptCursorKey = this.identityKey(identity);
+      const transcriptCursors = this.transcriptCursors;
+      const now = this.now;
+      return {
+        ok: true,
+        value: {
+          async *[Symbol.asyncIterator](): AsyncIterator<SessionConnectorEventV1> {
+            for await (const delta of rawEvents) {
+              if (isDirectStatusDelta(delta)) {
+                yield mapDirectStatusEvent(identity, delta);
+                continue;
+              }
+              const mapped = mapDirectTranscript(identity, delta);
+              if (!mapped.ok) {
+                throw new HappierCliError("protocol", mapped.error.message);
+              }
+              const completeThroughCursor = delta.nextCursor ?? delta.fromCursor;
+              if (completeThroughCursor !== null) {
+                transcriptCursors.set(transcriptCursorKey, completeThroughCursor);
+              }
+              const occurredAt = mapped.value.at(-1)?.occurredAt ?? now();
+              const eventHash = hashRoomValue({
+                identity,
+                fromCursor: delta.fromCursor,
+                nextCursor: delta.nextCursor,
+                nativeMessageIds: mapped.value.map((item) => item.nativeMessageId),
+              });
+              yield {
+                connectorEventId: `happier-direct-transcript-v1:${eventHash}`,
+                identity,
+                eventType: "message",
+                cursor: delta.nextCursor ?? delta.fromCursor ?? `happier-direct-event-v1:${eventHash}`,
+                occurredAt,
+                payload: {
+                  type: "transcript_delta",
+                  fromCursor: delta.fromCursor,
+                  nextCursor: delta.nextCursor,
+                  completeThroughCursor,
+                  truncated: delta.truncated,
+                  items: mapped.value,
+                },
+              };
+            }
+          },
+        },
+      };
+    } catch (error) {
+      return mapReadFailure(error);
+    }
   }
 
   async send(
     input: SessionConnectorSendRequestV1,
   ): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>> {
-    const target = validateIdentity(input.identity);
+    const target = validateIdentity(input.identity, this.settings.activeServerId);
     if (!target.ok) return target;
     if (
       input.contractVersion !== 1
@@ -576,6 +760,18 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         retryAfterMs: null,
       };
     }
+  }
+
+  private identityKey(identity: SessionConnectorIdentityV1): string {
+    return hashRoomValue({
+      connectorId: identity.connectorId,
+      providerId: identity.providerId,
+      nativeSessionId: identity.nativeSessionId,
+      happierSessionId: identity.happierSessionId,
+      serverProfileId: identity.serverProfileId,
+      machineId: identity.machineId,
+      hostId: identity.hostId,
+    });
   }
 
   async getDeepLinks(

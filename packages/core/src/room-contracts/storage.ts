@@ -196,6 +196,56 @@ export interface RoomOutboxRecordV1 {
   readonly updatedAt: IsoTimestamp;
 }
 
+export type RoomConnectorIngestionMode =
+  | "starting"
+  | "streaming"
+  | "polling"
+  | "reconciling"
+  | "degraded"
+  | "stopped";
+
+export type RoomConnectorTranscriptSource = "event" | "history";
+export type RoomConnectorMessageRole = "user" | "assistant" | "tool" | "system" | "unknown";
+export type RoomConnectorStatus = "idle" | "running" | "waiting_input" | "paused" | "lost" | "unknown";
+
+export interface RoomConnectorTranscriptItemV1 {
+  readonly nativeMessageId: string | null;
+  readonly logicalMessageId: RoomMessageId | null;
+  readonly nativeCursor: EventCursor;
+  readonly payloadHash: ContentHash;
+  readonly role: RoomConnectorMessageRole;
+  readonly occurredAt: IsoTimestamp;
+}
+
+export interface RoomConnectorIngestionStateV1 {
+  readonly contractVersion: RoomStorageContractVersion;
+  readonly roomId: RoomId;
+  readonly bindingId: RoomBindingId;
+  readonly mode: RoomConnectorIngestionMode;
+  readonly transcriptCursor: EventCursor | null;
+  readonly statusCursor: EventCursor | null;
+  readonly lastNativeMessageId: string | null;
+  readonly lastPayloadHash: ContentHash | null;
+  readonly connectorStatus: RoomConnectorStatus | null;
+  readonly nativeWriterDetected: boolean;
+  readonly gapExpectedCursor: EventCursor | null;
+  readonly gapObservedCursor: EventCursor | null;
+  readonly gapDetectedAt: IsoTimestamp | null;
+  readonly lastTranscriptAt: IsoTimestamp | null;
+  readonly lastStatusAt: IsoTimestamp | null;
+  readonly lastModeAt: IsoTimestamp | null;
+  readonly updatedAt: IsoTimestamp | null;
+}
+
+export interface RoomConnectorTranscriptBatchResultV1 {
+  readonly state: RoomConnectorIngestionStateV1;
+  readonly insertedCount: number;
+  readonly duplicateCount: number;
+  readonly duplicateNativeMessageIdCount: number;
+  readonly duplicatePayloadHashCount: number;
+  readonly gapDetected: boolean;
+}
+
 export interface RoomLeaseRecordV1 {
   readonly contractVersion: RoomStorageContractVersion;
   readonly id: RoomLeaseId;

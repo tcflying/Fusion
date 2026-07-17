@@ -2,11 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 
-const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn() }));
+const { mockSpawn, mockExecFile } = vi.hoisted(() => ({
+  mockSpawn: vi.fn(),
+  mockExecFile: vi.fn(),
+}));
 
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
   spawn: mockSpawn,
+  execFile: mockExecFile,
 }));
 
 import {
@@ -15,10 +19,12 @@ import {
   buildHappierInvocation,
   createHappierSession,
   ensureHappierDirectSession,
+  followHappierDirectSessionTranscriptEvents,
   getHappierSessionHistory,
   getHappierSessionStatus,
   invokeHappierJson,
   parseHappierJson,
+  readHappierDirectSessionTranscript,
   resolveHappierCliSettings,
   sendHappierMessage,
 } from "../cli-spawn.js";
@@ -36,6 +42,12 @@ const AUTH_FAILURE =
   '{"v":1,"ok":false,"kind":"session_send","error":{"code":"not_authenticated","message":"accessToken=do-not-leak"}}';
 const DIRECT_SESSION_SUCCESS =
   '{"v":1,"ok":true,"kind":"direct_session_ensure","data":{"providerId":"codex","remoteSessionId":"remote-1","machineId":"machine-1","serverId":"server-1","sessionId":"session-1","created":true,"openUrl":"https://app.happier.dev/session/session-1"}}';
+const DIRECT_TRANSCRIPT_SUCCESS =
+  '{"v":1,"ok":true,"kind":"direct_session_transcript_read_after","data":{"machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"fromCursor":null,"nextCursor":"cursor-2","truncated":false,"items":[{"id":"message-1","localId":"local-1","createdAtMs":1752729000000,"raw":{"role":"user","text":"hello"}}]}}';
+const DIRECT_TRANSCRIPT_EVENT =
+  '{"v":1,"ok":true,"kind":"direct_session_transcript_delta","data":{"machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"fromCursor":"cursor-2","nextCursor":"cursor-3","truncated":false,"items":[{"id":"message-2","createdAtMs":1752729001000,"raw":{"role":"assistant","text":"world"}}]}}';
+const DIRECT_STATUS_EVENT =
+  '{"v":1,"ok":true,"kind":"direct_session_status_delta","data":{"eventType":"status","machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"isRunning":true,"lastActivityAtMs":1752729001000,"observedAtMs":1752729001500}}';
 
 function settings(overrides: Partial<HappierCliSettings> = {}): HappierCliSettings {
   return {
@@ -46,7 +58,7 @@ function settings(overrides: Partial<HappierCliSettings> = {}): HappierCliSettin
   };
 }
 
-function fakeChild(): {
+function fakeChild(pid?: number): {
   child: ChildProcess;
   stdout: (value: string) => void;
   stderr: (value: string) => void;
@@ -57,8 +69,8 @@ function fakeChild(): {
   const child = new EventEmitter() as ChildProcess;
   const stdout = new EventEmitter();
   const stderr = new EventEmitter();
-  const kill = vi.fn();
-  Object.assign(child, { stdout, stderr, kill });
+  const kill = vi.fn(() => true);
+  Object.assign(child, { stdout, stderr, kill, pid });
   return {
     child,
     stdout: (value) => stdout.emit("data", Buffer.from(value)),
@@ -88,6 +100,7 @@ beforeEach(() => {
 
 afterEach(() => {
   mockSpawn.mockReset();
+  mockExecFile.mockReset();
   vi.unstubAllEnvs();
 });
 
@@ -154,12 +167,13 @@ describe("Happier official JSON envelopes", () => {
   });
 
   it("rejects malformed JSON with bounded, recursively redacted diagnostics", async () => {
-    const raw = '{"accessToken":"access-secret","nested":{"client_secret":"client-secret","private-key":"private-secret"';
+    const raw = '{"accessToken":"access-secret","nested":{"client_secret":"client-secret","private-key":"private-secret","text":"private-plaintext"';
 
     await expect(parseHappierJson(raw, 80)).rejects.toMatchObject({ code: "invalid-json" });
     await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("access-secret");
     await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("client-secret");
     await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("private-secret");
+    await expect(parseHappierJson(raw, 80)).rejects.not.toThrow("private-plaintext");
     await expect(parseHappierJson(raw, 80)).rejects.toSatisfy((error: Error) => error.message.length < 240);
   });
 
@@ -169,9 +183,24 @@ describe("Happier official JSON envelopes", () => {
     await expect(parseHappierJson(raw)).rejects.toMatchObject({ code: "invalid-json" });
     await expect(parseHappierJson(raw)).rejects.not.toThrow("live-token");
     await expect(parseHappierJson(raw)).rejects.not.toThrow("live-access");
-    await expect(parseHappierJson(raw)).rejects.toThrow("Bearer [REDACTED]");
-    await expect(parseHappierJson(raw)).rejects.toThrow("accessToken=[REDACTED]");
-    await expect(parseHappierJson(raw)).rejects.toThrow("keep this context");
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("keep this context");
+    await expect(parseHappierJson(raw)).rejects.toThrow("invalid JSON envelope");
+  });
+
+  it("never echoes an untrusted one-shot envelope kind", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = invokeHappierJson(
+      ["session", "status", "session-1", "--json"],
+      settings(),
+      undefined,
+      "session_status",
+    );
+    fake.stdout('{"v":1,"ok":true,"kind":"private-transcript-plaintext","data":{}}');
+    fake.close(0);
+
+    await expect(promise).rejects.toMatchObject({ code: "invalid-json" });
+    await expect(promise).rejects.not.toThrow("private-transcript-plaintext");
   });
 
   it("maps the official error code before considering any message text", async () => {
@@ -434,6 +463,239 @@ describe("Happier session wrappers", () => {
       await expect(promise).rejects.toMatchObject({ code: "session" });
     },
   );
+
+  it("reads the official Direct Session transcript from a nullable startup cursor", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = readHappierDirectSessionTranscript({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: null,
+      limit: 25,
+    }, settings());
+
+    fake.stdout(DIRECT_TRANSCRIPT_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).resolves.toMatchObject({
+      fromCursor: null,
+      nextCursor: "cursor-2",
+      truncated: false,
+      items: [{ id: "message-1", localId: "local-1" }],
+    });
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "happier",
+      [
+        "direct-session", "read-after",
+        "--provider", "codex",
+        "--remote-session-id", "remote-1",
+        "--session-id", "session-1",
+        "--machine-id", "machine-1",
+        "--source-json", JSON.stringify({ kind: "codexHome", home: "user" }),
+        "--after-cursor", "null",
+        "--limit", "25",
+        "--json",
+      ],
+      expect.objectContaining({ shell: false, stdio: ["ignore", "pipe", "pipe"] }),
+    );
+  });
+
+  it("streams bounded official Direct Session NDJSON and terminates on iterator return", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const stream = followHappierDirectSessionTranscriptEvents({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: "cursor-2",
+      limit: 25,
+    }, settings());
+    const iterator = stream[Symbol.asyncIterator]();
+    const first = iterator.next();
+
+    fake.stdout(`${DIRECT_TRANSCRIPT_EVENT}\n`);
+    await expect(first).resolves.toMatchObject({
+      done: false,
+      value: {
+        fromCursor: "cursor-2",
+        nextCursor: "cursor-3",
+        items: [{ id: "message-2" }],
+      },
+    });
+    const second = iterator.next();
+    fake.stdout(`${DIRECT_STATUS_EVENT}\n`);
+    await expect(second).resolves.toMatchObject({
+      done: false,
+      value: {
+        eventType: "status",
+        isRunning: true,
+        lastActivityAtMs: 1_752_729_001_000,
+        observedAtMs: 1_752_729_001_500,
+      },
+    });
+    expect(mockSpawn.mock.calls[0]?.[1]).toEqual([
+      "direct-session", "events",
+      "--provider", "codex",
+      "--remote-session-id", "remote-1",
+      "--session-id", "session-1",
+      "--machine-id", "machine-1",
+      "--source-json", JSON.stringify({ kind: "codexHome", home: "user" }),
+      "--after-cursor", "cursor-2",
+      "--limit", "25",
+      "--ndjson",
+    ]);
+
+    let returnSettled = false;
+    const returned = iterator.return?.().then((result) => {
+      returnSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(returnSettled).toBe(false);
+    expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+    fake.close(0);
+    await expect(returned).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("terminates the full Windows Direct Session process tree before iterator return settles", async () => {
+    if (process.platform !== "win32") return;
+    const fake = fakeChild(42424);
+    mockSpawn.mockReturnValue(fake.child);
+    const iterator = followHappierDirectSessionTranscriptEvents({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: "cursor-2",
+      limit: 25,
+    }, settings())[Symbol.asyncIterator]();
+    const next = iterator.next();
+    const returned = iterator.return?.();
+
+    expect(mockExecFile).toHaveBeenCalledWith(
+      "taskkill.exe",
+      ["/PID", "42424", "/T", "/F"],
+      expect.objectContaining({ shell: false, timeout: 2_000, windowsHide: true }),
+      expect.any(Function),
+    );
+    const callback = mockExecFile.mock.calls[0]?.[3] as (error: Error | null) => void;
+    callback(null);
+    fake.close(0);
+    await expect(next).resolves.toEqual({ done: true, value: undefined });
+    await expect(returned).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("rejects iterator cancellation when Windows process-tree termination fails", async () => {
+    if (process.platform !== "win32") return;
+    const fake = fakeChild(42425);
+    mockSpawn.mockReturnValue(fake.child);
+    const iterator = followHappierDirectSessionTranscriptEvents({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: "cursor-2",
+      limit: 25,
+    }, settings())[Symbol.asyncIterator]();
+    const next = iterator.next();
+    const returned = iterator.return?.();
+    const returnedFailure = expect(returned).rejects.toMatchObject({ code: "process" });
+    const returnedRedaction = expect(returned).rejects.not.toThrow("private-plaintext");
+    const callback = mockExecFile.mock.calls[0]?.[3] as (error: Error | null) => void;
+    callback(new Error("taskkill timed out with private-plaintext"));
+    fake.close(0);
+
+    expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+    await expect(next).resolves.toEqual({ done: true, value: undefined });
+    await returnedFailure;
+    await returnedRedaction;
+  });
+
+  it("rejects iterator cancellation when the child never confirms close", async () => {
+    if (process.platform !== "win32") return;
+    vi.useFakeTimers();
+    try {
+      const fake = fakeChild(42426);
+      mockSpawn.mockReturnValue(fake.child);
+      const iterator = followHappierDirectSessionTranscriptEvents({
+        providerId: "codex",
+        remoteSessionId: "remote-1",
+        sessionId: "session-1",
+        machineId: "machine-1",
+        afterCursor: "cursor-2",
+        limit: 25,
+      }, settings())[Symbol.asyncIterator]();
+      const next = iterator.next();
+      const returned = iterator.return?.();
+      const returnedFailure = expect(returned).rejects.toMatchObject({ code: "process" });
+      const callback = mockExecFile.mock.calls[0]?.[3] as (error: Error | null) => void;
+      callback(null);
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      await expect(next).resolves.toEqual({ done: true, value: undefined });
+      await returnedFailure;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails closed when a Direct transcript envelope drifts to another native Session", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = readHappierDirectSessionTranscript({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: null,
+      limit: 25,
+    }, settings());
+    fake.stdout(DIRECT_TRANSCRIPT_SUCCESS.replace('"remoteSessionId":"remote-1"', '"remoteSessionId":"other"'));
+    fake.close(0);
+
+    await expect(promise).rejects.toMatchObject({ code: "protocol" });
+  });
+
+  it("never includes transcript plaintext in malformed NDJSON diagnostics", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const stream = followHappierDirectSessionTranscriptEvents({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: "cursor-2",
+      limit: 25,
+    }, settings());
+    const next = stream[Symbol.asyncIterator]().next();
+    fake.stdout('{"transcript":"private-plaintext","token":"secret-value"\n');
+
+    await expect(next).rejects.toMatchObject({ code: "invalid-json" });
+    await expect(next).rejects.not.toThrow("private-plaintext");
+    await expect(next).rejects.not.toThrow("secret-value");
+    expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("never echoes an untrusted NDJSON envelope kind", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const stream = followHappierDirectSessionTranscriptEvents({
+      providerId: "codex",
+      remoteSessionId: "remote-1",
+      sessionId: "session-1",
+      machineId: "machine-1",
+      afterCursor: "cursor-2",
+      limit: 25,
+    }, settings());
+    const next = stream[Symbol.asyncIterator]().next();
+    fake.stdout('{"v":1,"ok":true,"kind":"private-transcript-plaintext","data":{}}\n');
+
+    await expect(next).rejects.toMatchObject({ code: "invalid-json" });
+    await expect(next).rejects.not.toThrow("private-transcript-plaintext");
+  });
 
   it("normalizes the webapp trailing slash and encodes session-open ids", () => {
     expect(buildHappierSessionOpenUrl("https://app.happier.dev/", "server/id", "session id?#")).toBe(

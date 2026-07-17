@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 
 import {
   HAPPIER_BACKENDS,
@@ -7,6 +8,12 @@ import {
   type HappierCliInvocation,
   type HappierCliSettings,
   type HappierDirectSessionEnsureResult,
+  type HappierDirectSessionEvent,
+  type HappierDirectSessionSource,
+  type HappierDirectSessionStatusDelta,
+  type HappierDirectSessionTranscriptDelta,
+  type HappierDirectSessionTranscriptInput,
+  type HappierDirectSessionTranscriptRawMessage,
   type HappierErrorCode,
   type HappierFailureEnvelope,
   type HappierJsonEnvelope,
@@ -169,11 +176,98 @@ function isRecord(value: unknown): value is HappierJsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function invalidEnvelope(reason: string, raw: string, maxBytes: number): HappierCliError {
+function invalidEnvelope(reason: string): HappierCliError {
   return new HappierCliError(
     "invalid-json",
-    `Happier CLI returned an invalid JSON envelope: ${reason}; output=${redactHappierOutput(raw, maxBytes)}`,
+    `Happier CLI returned an invalid JSON envelope: ${reason}`,
   );
+}
+
+function parseHappierJsonEnvelope<T = unknown>(
+  raw: string,
+  _maxBytes = DEFAULT_MAX_OUTPUT_BYTES,
+): HappierJsonEnvelope<T> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
+  } catch {
+    // FNXC:HappierRuntime 2026-07-17: JSON parser diagnostics may echo the
+    // offending payload. Connector envelopes can contain transcript text, so
+    // malformed output is represented by metadata only.
+    throw invalidEnvelope("malformed JSON");
+  }
+
+  if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.ok !== "boolean" || typeof parsed.kind !== "string" || !parsed.kind.trim()) {
+    throw invalidEnvelope("expected v=1, boolean ok, and non-empty kind");
+  }
+  if (parsed.ok === true && !("data" in parsed)) throw invalidEnvelope("success envelope is missing data");
+  if (parsed.ok === false && (!isRecord(parsed.error) || typeof parsed.error.code !== "string" || !parsed.error.code.trim())) {
+    throw invalidEnvelope("failure envelope is missing error.code");
+  }
+  return parsed as unknown as HappierJsonEnvelope<T>;
+}
+
+const CHILD_TERMINATION_TIMEOUT_MS = 2_000;
+
+function signalHappierChild(child: ReturnType<typeof spawn>): boolean {
+  try {
+    return child.kill("SIGTERM");
+  } catch {
+    return false;
+  }
+}
+
+function terminateHappierChild(child: ReturnType<typeof spawn> | undefined): Promise<boolean> {
+  if (
+    !child
+    || typeof child.exitCode === "number"
+    || typeof child.signalCode === "string"
+  ) return Promise.resolve(true);
+  if (process.platform === "win32" && typeof child.pid === "number") {
+    return new Promise((resolve) => {
+      execFile(
+        "taskkill.exe",
+        ["/PID", String(child.pid), "/T", "/F"],
+        {
+          shell: false,
+          timeout: CHILD_TERMINATION_TIMEOUT_MS,
+          windowsHide: true,
+          maxBuffer: 64 * 1024,
+        },
+        (error) => {
+          if (!error) {
+            resolve(true);
+            return;
+          }
+          // Direct-child fallback is best effort only. A failed or timed-out
+          // tree kill remains observable to iterator cancellation callers.
+          signalHappierChild(child);
+          resolve(false);
+        },
+      );
+    });
+  }
+  return Promise.resolve(signalHappierChild(child));
+}
+
+function waitForHappierChildClose(child: ReturnType<typeof spawn> | undefined): Promise<boolean> {
+  if (
+    !child
+    || typeof child.exitCode === "number"
+    || typeof child.signalCode === "string"
+  ) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (closed: boolean): void => {
+      child.removeListener("close", onClose);
+      if (timer) clearTimeout(timer);
+      resolve(closed);
+    };
+    const onClose = (): void => finish(true);
+    child.once("close", onClose);
+    timer = setTimeout(() => finish(false), CHILD_TERMINATION_TIMEOUT_MS);
+    timer.unref();
+  });
 }
 
 /** Parse and validate Happier's exact `{v,ok,kind,data|error}` envelope. */
@@ -181,22 +275,7 @@ export async function parseHappierJson<T = unknown>(
   raw: string,
   maxBytes = DEFAULT_MAX_OUTPUT_BYTES,
 ): Promise<HappierJsonEnvelope<T>> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw.trim());
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "invalid JSON";
-    throw invalidEnvelope(reason, raw, maxBytes);
-  }
-
-  if (!isRecord(parsed) || parsed.v !== 1 || typeof parsed.ok !== "boolean" || typeof parsed.kind !== "string" || !parsed.kind.trim()) {
-    throw invalidEnvelope("expected v=1, boolean ok, and non-empty kind", raw, maxBytes);
-  }
-  if (parsed.ok === true && !("data" in parsed)) throw invalidEnvelope("success envelope is missing data", raw, maxBytes);
-  if (parsed.ok === false && (!isRecord(parsed.error) || typeof parsed.error.code !== "string" || !parsed.error.code.trim())) {
-    throw invalidEnvelope("failure envelope is missing error.code", raw, maxBytes);
-  }
-  return parsed as unknown as HappierJsonEnvelope<T>;
+  return parseHappierJsonEnvelope<T>(raw, maxBytes);
 }
 
 class BoundedOutputAccumulator {
@@ -307,11 +386,7 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
     };
 
     function terminate(): void {
-      try {
-        child?.kill("SIGTERM");
-      } catch {
-        // The process may have already exited.
-      }
+      void terminateHappierChild(child);
     }
 
     function onAbort(): void {
@@ -371,7 +446,7 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       void parseHappierJson<unknown>(rawStdout, maxOutputBytes).then(
         (envelope) => {
           if (expectedKind && envelope.kind !== expectedKind) {
-            finishReject(new HappierCliError("invalid-json", `Expected Happier envelope kind ${expectedKind}, received ${envelope.kind}`));
+            finishReject(new HappierCliError("invalid-json", "Happier CLI returned an unexpected JSON envelope kind"));
             return;
           }
           if (!envelope.ok) {
@@ -407,6 +482,231 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       );
     });
   });
+}
+
+type NdjsonWaiter<T> = Readonly<{
+  resolve: (result: IteratorResult<T>) => void;
+  reject: (error: unknown) => void;
+}>;
+
+/**
+ * FNXC:HappierRuntime 2026-07-17-07:12:
+ * Direct Session follow is an unbounded process, so bound each NDJSON line,
+ * stderr, and the unread queue rather than applying the one-shot total-output
+ * limit. Consumer cancellation owns process termination.
+ */
+function createHappierNdjsonStream<T>(
+  commandArgs: readonly string[],
+  expectedKind: string | readonly string[],
+  parseData: (data: HappierJsonRecord, kind: string) => T,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): AsyncIterable<T> {
+  const resolved = resolveHappierCliSettings(settings);
+  const invocation = buildHappierInvocation(commandArgs, resolved);
+  const maxBytes = resolved.maxOutputBytes;
+  const expectedKinds = typeof expectedKind === "string" ? [expectedKind] : Array.from(expectedKind);
+  let child: ReturnType<typeof spawn> | undefined;
+  let started = false;
+  let consumerClosed = false;
+  let done = false;
+  let childClosed = false;
+  let terminationPromise: Promise<boolean> | null = null;
+  let terminalError: HappierCliError | null = null;
+  let queuedBytes = 0;
+  let pendingText = "";
+  let processing = Promise.resolve();
+  const decoder = new StringDecoder("utf8");
+  const stderr = new BoundedOutputAccumulator(maxBytes);
+  const queue: Array<{ readonly value: T; readonly bytes: number }> = [];
+  const waiters: Array<NdjsonWaiter<T>> = [];
+
+  const terminate = (): Promise<boolean> => {
+    terminationPromise ??= terminateHappierChild(child);
+    return terminationPromise;
+  };
+
+  const removeAbortListener = (): void => signal?.removeEventListener("abort", onAbort);
+
+  const rejectAll = (error: HappierCliError): void => {
+    for (const waiter of waiters.splice(0)) waiter.reject(error);
+  };
+
+  const resolveDone = (): void => {
+    for (const waiter of waiters.splice(0)) waiter.resolve({ done: true, value: undefined });
+  };
+
+  const fail = (error: unknown): void => {
+    if (done || terminalError || consumerClosed) return;
+    terminalError = error instanceof HappierCliError
+      ? error
+      : new HappierCliError(
+        "protocol",
+        `Happier NDJSON stream failed: ${redactHappierOutput(error instanceof Error ? error.message : String(error), maxBytes)}`,
+      );
+    void terminate();
+    removeAbortListener();
+    rejectAll(terminalError);
+  };
+
+  function onAbort(): void {
+    fail(new HappierCliError("timeout", "Happier CLI event stream aborted"));
+  }
+
+  const deliver = (value: T, bytes: number): void => {
+    const waiter = waiters.shift();
+    if (waiter) {
+      waiter.resolve({ done: false, value });
+      return;
+    }
+    if (queuedBytes + bytes > maxBytes) {
+      fail(new HappierCliError("output-limit", `Happier CLI unread NDJSON queue exceeded ${maxBytes} bytes`));
+      return;
+    }
+    queue.push({ value, bytes });
+    queuedBytes += bytes;
+  };
+
+  const parseLine = (line: string): void => {
+    if (!line.trim()) return;
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    if (lineBytes > maxBytes) {
+      throw new HappierCliError("output-limit", `Happier CLI NDJSON line exceeded ${maxBytes} bytes`);
+    }
+    let envelope: HappierJsonEnvelope<unknown>;
+    try {
+      envelope = parseHappierJsonEnvelope<unknown>(line, maxBytes);
+    } catch {
+      // FNXC:HappierRuntime 2026-07-17: Stream lines can contain transcript
+      // plaintext. Never echo an unparseable line into durable diagnostics.
+      throw new HappierCliError("invalid-json", "Happier CLI returned an invalid NDJSON envelope");
+    }
+    if (!expectedKinds.includes(envelope.kind)) {
+      throw new HappierCliError("invalid-json", "Happier CLI returned an unexpected NDJSON envelope kind");
+    }
+    if (!envelope.ok) throwOfficialFailure(envelope);
+    if (!isRecord(envelope.data)) {
+      throw new HappierCliError("invalid-json", "Happier NDJSON success envelope data must be an object");
+    }
+    deliver(parseData(envelope.data, envelope.kind), lineBytes);
+  };
+
+  const enqueueText = (text: string, flush = false): void => {
+    pendingText += text;
+    if (Buffer.byteLength(pendingText, "utf8") > maxBytes && !pendingText.includes("\n")) {
+      fail(new HappierCliError("output-limit", `Happier CLI partial NDJSON line exceeded ${maxBytes} bytes`));
+      return;
+    }
+    const lines = pendingText.split("\n");
+    pendingText = flush ? "" : lines.pop() ?? "";
+    const completeLines = flush ? lines : lines;
+    processing = processing.then(() => {
+      for (const rawLine of completeLines) parseLine(rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine);
+      if (flush && pendingText.trim()) parseLine(pendingText);
+    }).catch(fail);
+  };
+
+  const finishAfterProcessing = (exitCode: number | null): void => {
+    const tail = decoder.end();
+    if (tail || pendingText) {
+      const remaining = `${pendingText}${tail}`;
+      pendingText = "";
+      processing = processing.then(() => parseLine(remaining)).catch(fail);
+    }
+    void processing.then(() => {
+      if (consumerClosed || terminalError) return;
+      if (exitCode !== 0) {
+        const diagnostic = redactHappierOutput(stderr.toString(), maxBytes);
+        fail(new HappierCliError(
+          classifyProcessFailure(diagnostic),
+          `Happier CLI event stream exited with code ${String(exitCode)}: ${diagnostic}`,
+          { exitCode, stderr: diagnostic },
+        ));
+        return;
+      }
+      done = true;
+      removeAbortListener();
+      resolveDone();
+    });
+  };
+
+  const start = (): void => {
+    if (started || consumerClosed) return;
+    started = true;
+    try {
+      child = spawn(invocation.command, invocation.args, {
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: buildHappierProcessEnv(resolved),
+      });
+    } catch (error) {
+      fail(new HappierCliError(
+        "process",
+        `Happier CLI stream spawn failed: ${redactHappierOutput(error instanceof Error ? error.message : String(error), maxBytes)}`,
+      ));
+      return;
+    }
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      enqueueText(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    });
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (!stderr.append(value)) {
+        fail(new HappierCliError("output-limit", `Happier CLI event stderr exceeded ${maxBytes} bytes`));
+      }
+    });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      fail(new HappierCliError(
+        "process",
+        `Happier CLI event process error: ${redactHappierOutput(error.message, maxBytes)}`,
+      ));
+    });
+    child.once("close", (exitCode: number | null) => {
+      childClosed = true;
+      finishAfterProcessing(exitCode);
+    });
+  };
+
+  const iterator: AsyncIterableIterator<T> = {
+    next(): Promise<IteratorResult<T>> {
+      start();
+      const queued = queue.shift();
+      if (queued) {
+        queuedBytes -= queued.bytes;
+        return Promise.resolve({ done: false, value: queued.value });
+      }
+      if (terminalError) return Promise.reject(terminalError);
+      if (done || consumerClosed) return Promise.resolve({ done: true, value: undefined });
+      return new Promise<IteratorResult<T>>((resolve, reject) => waiters.push({ resolve, reject }));
+    },
+    async return(): Promise<IteratorResult<T>> {
+      const closed = childClosed ? Promise.resolve(true) : waitForHappierChildClose(child);
+      if (!consumerClosed) {
+        consumerClosed = true;
+        void terminate();
+        removeAbortListener();
+        queue.length = 0;
+        queuedBytes = 0;
+        resolveDone();
+      }
+      const [terminationSucceeded, closeConfirmed] = await Promise.all([terminate(), closed]);
+      if (!terminationSucceeded || !closeConfirmed) {
+        throw new HappierCliError("process", "Happier CLI process cleanup could not be confirmed");
+      }
+      return { done: true, value: undefined };
+    },
+    [Symbol.asyncIterator](): AsyncIterableIterator<T> {
+      return this;
+    },
+  };
+  return iterator;
 }
 
 function ensureRecord(value: unknown, operation: string): HappierJsonRecord {
@@ -512,6 +812,201 @@ export async function ensureHappierDirectSession(input: {
     created: data.created,
     openUrl: directSessionString(data, "openUrl"),
   };
+}
+
+function directSessionSource(providerId: HappierBackend): HappierDirectSessionSource {
+  if (providerId === "codex") return { kind: "codexHome", home: "user" };
+  if (providerId === "claude") return { kind: "claudeConfig" };
+  return { kind: "opencodeServer" };
+}
+
+function directTranscriptIdentifier(value: unknown, field: string): string {
+  if (typeof value !== "string") {
+    throw new HappierCliError("session", `Happier Direct Session ${field} must be a string`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 2_000 || hasForbiddenControlCharacter(trimmed)) {
+    throw new HappierCliError("session", `Happier Direct Session ${field} is invalid`);
+  }
+  return trimmed;
+}
+
+function directTranscriptCursor(value: unknown, field: string): string | null {
+  if (value === null || value === undefined) return null;
+  return directTranscriptIdentifier(value, field);
+}
+
+function normalizeDirectTranscriptInput(
+  input: HappierDirectSessionTranscriptInput,
+): HappierDirectSessionTranscriptInput & { readonly source: HappierDirectSessionSource } {
+  const providerId = validateBackend(input.providerId);
+  const limit = validatePositiveInteger(input.limit, "limit");
+  if (limit > 5_000) throw new HappierCliError("session", "limit must not exceed 5000");
+  return {
+    providerId,
+    remoteSessionId: directTranscriptIdentifier(input.remoteSessionId, "remoteSessionId"),
+    sessionId: directTranscriptIdentifier(input.sessionId, "sessionId"),
+    machineId: directTranscriptIdentifier(input.machineId, "machineId"),
+    afterCursor: directTranscriptCursor(input.afterCursor, "afterCursor"),
+    limit,
+    source: directSessionSource(providerId),
+  };
+}
+
+function directTranscriptArgs(
+  command: "read-after" | "events",
+  input: HappierDirectSessionTranscriptInput & { readonly source: HappierDirectSessionSource },
+): string[] {
+  return [
+    "direct-session",
+    command,
+    "--provider",
+    input.providerId,
+    "--remote-session-id",
+    input.remoteSessionId,
+    "--session-id",
+    input.sessionId,
+    "--machine-id",
+    input.machineId,
+    "--source-json",
+    JSON.stringify(input.source),
+    "--after-cursor",
+    input.afterCursor ?? "null",
+    "--limit",
+    String(input.limit),
+    command === "events" ? "--ndjson" : "--json",
+  ];
+}
+
+function sameDirectSessionSource(
+  actual: unknown,
+  expected: HappierDirectSessionSource,
+): boolean {
+  if (!isRecord(actual) || actual.kind !== expected.kind) return false;
+  return expected.kind !== "codexHome" || actual.home === expected.home;
+}
+
+function normalizeDirectTranscriptRawMessage(
+  value: unknown,
+): HappierDirectSessionTranscriptRawMessage {
+  if (!isRecord(value)) {
+    throw new HappierCliError("protocol", "Happier Direct Session transcript item must be an object");
+  }
+  const id = directTranscriptIdentifier(value.id, "message id");
+  if (!Number.isInteger(value.createdAtMs) || (value.createdAtMs as number) < 0 || !isRecord(value.raw)) {
+    throw new HappierCliError("protocol", "Happier Direct Session transcript item is invalid");
+  }
+  const localId = value.localId === null || value.localId === undefined
+    ? value.localId
+    : directTranscriptIdentifier(value.localId, "message localId");
+  return {
+    id,
+    createdAtMs: value.createdAtMs as number,
+    ...(localId !== undefined ? { localId } : {}),
+    raw: value.raw,
+  };
+}
+
+function normalizeDirectTranscriptDelta(
+  data: HappierJsonRecord,
+  expected: HappierDirectSessionTranscriptInput & { readonly source: HappierDirectSessionSource },
+): HappierDirectSessionTranscriptDelta {
+  if (
+    data.machineId !== expected.machineId
+    || data.providerId !== expected.providerId
+    || data.remoteSessionId !== expected.remoteSessionId
+    || data.sessionId !== expected.sessionId
+    || !sameDirectSessionSource(data.source, expected.source)
+  ) {
+    throw new HappierCliError("protocol", "Happier Direct Session transcript identity drifted");
+  }
+  if (typeof data.truncated !== "boolean" || !Array.isArray(data.items)) {
+    throw new HappierCliError("protocol", "Happier Direct Session transcript delta is invalid");
+  }
+  return {
+    machineId: expected.machineId,
+    providerId: expected.providerId,
+    remoteSessionId: expected.remoteSessionId,
+    sessionId: expected.sessionId,
+    source: expected.source,
+    fromCursor: directTranscriptCursor(data.fromCursor, "fromCursor"),
+    nextCursor: directTranscriptCursor(data.nextCursor, "nextCursor"),
+    truncated: data.truncated,
+    items: data.items.map(normalizeDirectTranscriptRawMessage),
+  };
+}
+
+function normalizeDirectStatusDelta(
+  data: HappierJsonRecord,
+  expected: HappierDirectSessionTranscriptInput & { readonly source: HappierDirectSessionSource },
+): HappierDirectSessionStatusDelta {
+  if (
+    data.eventType !== "status"
+    || data.machineId !== expected.machineId
+    || data.providerId !== expected.providerId
+    || data.remoteSessionId !== expected.remoteSessionId
+    || data.sessionId !== expected.sessionId
+    || !sameDirectSessionSource(data.source, expected.source)
+    || typeof data.isRunning !== "boolean"
+    || !Number.isInteger(data.observedAtMs)
+    || (data.observedAtMs as number) < 0
+    || !(
+      data.lastActivityAtMs === null
+      || (Number.isInteger(data.lastActivityAtMs) && (data.lastActivityAtMs as number) >= 0)
+    )
+  ) {
+    throw new HappierCliError("protocol", "Happier Direct Session status delta is invalid");
+  }
+  return {
+    eventType: "status",
+    machineId: expected.machineId,
+    providerId: expected.providerId,
+    remoteSessionId: expected.remoteSessionId,
+    sessionId: expected.sessionId,
+    source: expected.source,
+    isRunning: data.isRunning,
+    lastActivityAtMs: data.lastActivityAtMs as number | null,
+    observedAtMs: data.observedAtMs as number,
+  };
+}
+
+export async function readHappierDirectSessionTranscript(
+  input: HappierDirectSessionTranscriptInput,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<HappierDirectSessionTranscriptDelta> {
+  const normalized = normalizeDirectTranscriptInput(input);
+  const data = ensureRecord(
+    await invokeHappierJsonForKind(
+      directTranscriptArgs("read-after", normalized),
+      "direct_session_transcript_read_after",
+      settings,
+      signal,
+    ),
+    "Direct Session transcript read",
+  );
+  const delta = normalizeDirectTranscriptDelta(data, normalized);
+  if (delta.fromCursor !== normalized.afterCursor) {
+    throw new HappierCliError("protocol", "Happier Direct Session transcript returned a mismatched cursor");
+  }
+  return delta;
+}
+
+export function followHappierDirectSessionTranscriptEvents(
+  input: HappierDirectSessionTranscriptInput,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): AsyncIterable<HappierDirectSessionEvent> {
+  const normalized = normalizeDirectTranscriptInput(input);
+  return createHappierNdjsonStream(
+    directTranscriptArgs("events", normalized),
+    ["direct_session_transcript_delta", "direct_session_status_delta"],
+    (data, kind) => kind === "direct_session_status_delta"
+      ? normalizeDirectStatusDelta(data, normalized)
+      : normalizeDirectTranscriptDelta(data, normalized),
+    settings,
+    signal,
+  );
 }
 
 export async function createHappierSession(

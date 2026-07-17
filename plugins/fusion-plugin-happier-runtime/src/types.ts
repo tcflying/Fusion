@@ -131,6 +131,55 @@ export type HappierDirectSessionEnsureResult = {
   openUrl: string;
 };
 
+export type HappierDirectSessionSource =
+  | { readonly kind: "codexHome"; readonly home: "user" }
+  | { readonly kind: "claudeConfig" }
+  | { readonly kind: "opencodeServer" };
+
+export interface HappierDirectSessionTranscriptInput {
+  readonly providerId: HappierBackend;
+  readonly remoteSessionId: string;
+  readonly sessionId: string;
+  readonly machineId: string;
+  readonly afterCursor: string | null;
+  readonly limit: number;
+}
+
+export interface HappierDirectSessionTranscriptRawMessage {
+  readonly id: string;
+  readonly createdAtMs: number;
+  readonly localId?: string | null;
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+export interface HappierDirectSessionTranscriptDelta {
+  readonly machineId: string;
+  readonly providerId: HappierBackend;
+  readonly remoteSessionId: string;
+  readonly sessionId: string;
+  readonly source: HappierDirectSessionSource;
+  readonly fromCursor: string | null;
+  readonly nextCursor: string | null;
+  readonly truncated: boolean;
+  readonly items: readonly HappierDirectSessionTranscriptRawMessage[];
+}
+
+export interface HappierDirectSessionStatusDelta {
+  readonly eventType: "status";
+  readonly machineId: string;
+  readonly providerId: HappierBackend;
+  readonly remoteSessionId: string;
+  readonly sessionId: string;
+  readonly source: HappierDirectSessionSource;
+  readonly isRunning: boolean;
+  readonly lastActivityAtMs: number | null;
+  readonly observedAtMs: number;
+}
+
+export type HappierDirectSessionEvent =
+  | HappierDirectSessionTranscriptDelta
+  | HappierDirectSessionStatusDelta;
+
 export type HappierRuntimeState =
   | "starting"
   | "ready"
