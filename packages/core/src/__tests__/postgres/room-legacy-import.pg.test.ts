@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -51,7 +51,9 @@ afterEach(async () => {
       context.connections = null;
     }
     await context.lifecycle.stop();
-    rmSync(context.dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
+    // The data directory is inside Vitest's private worker root. Global teardown
+    // removes that root after the worker has released Windows AV/indexer handles;
+    // recursively deleting thousands of PG files per case can stall this hook.
   }
 }, EMBEDDED_DATABASE_TIMEOUT_MS);
 
