@@ -1953,6 +1953,7 @@ export const chatTokenUsage = projectSchema.table("chat_token_usage", {
 export const runAuditEvents = projectSchema.table("run_audit_events", {
   id: text("id").primaryKey(),
   timestamp: text("timestamp").notNull(),
+  projectId: text("project_id"),
   taskId: text("task_id"),
   agentId: text("agent_id").notNull(),
   runId: text("run_id").notNull(),
@@ -1961,9 +1962,47 @@ export const runAuditEvents = projectSchema.table("run_audit_events", {
   target: text("target").notNull(),
   metadata: jsonb("metadata"),
 }, (t) => [
+  index("idxRunAuditEventsProjectIdTimestamp").on(t.projectId, t.timestamp),
   index("idxRunAuditEventsRunIdTimestamp").on(t.runId, t.timestamp),
   index("idxRunAuditEventsTaskIdTimestamp").on(t.taskId, t.timestamp),
   index("idxRunAuditEventsTimestamp").on(t.timestamp),
+]);
+
+/*
+FNXC:SessionRoomAuditOutbox 2026-07-18-02:23:
+Room controller audit delivery is a durable state machine. Stable payloads are
+enqueued before sink delivery, expired claims are restart-recoverable, and an
+exhausted row remains queryable instead of disappearing into process memory.
+*/
+export const runAuditOutbox = projectSchema.table("run_audit_outbox", {
+  id: text("id").primaryKey(),
+  dispatchSequence: bigint("dispatch_sequence", { mode: "number" })
+    .generatedAlwaysAsIdentity()
+    .notNull(),
+  projectId: text("project_id").notNull(),
+  roomId: text("room_id").notNull(),
+  timestamp: text("timestamp").notNull(),
+  taskId: text("task_id"),
+  agentId: text("agent_id").notNull(),
+  runId: text("run_id").notNull(),
+  domain: text("domain").notNull(),
+  mutationType: text("mutation_type").notNull(),
+  target: text("target").notNull(),
+  metadata: jsonb("metadata"),
+  state: text("state").notNull().default("pending"),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  nextAttemptAt: text("next_attempt_at"),
+  claimToken: text("claim_token"),
+  claimExpiresAt: text("claim_expires_at"),
+  lastErrorCode: text("last_error_code"),
+  deliveredAt: text("delivered_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  unique("run_audit_outbox_dispatch_sequence_unique").on(t.dispatchSequence),
+  index("idxRunAuditOutboxDispatch").on(t.projectId, t.state, t.nextAttemptAt, t.claimExpiresAt),
+  index("idxRunAuditOutboxRoom").on(t.projectId, t.roomId, t.dispatchSequence),
+  check("run_audit_outbox_state_check", sql`${t.state} IN ('pending','dispatching','exhausted','delivered')`),
 ]);
 
 export const missionContractAssertions = projectSchema.table("mission_contract_assertions", {

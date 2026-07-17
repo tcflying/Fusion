@@ -103,6 +103,7 @@ import {
   RoomController,
   type RoomWorker,
 } from "./room-controller.js";
+import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
 import type {
   ExternalTunnelInfo,
   TunnelProvider,
@@ -128,6 +129,12 @@ export interface RoomControllerLifecycle {
   stop(): void | Promise<void>;
 }
 
+export interface RoomRunAuditDispatcherLifecycle {
+  start(): void | Promise<void>;
+  stop(): void | Promise<void>;
+  enqueue(event: Parameters<RoomRunAuditDispatcher["enqueue"]>[0]): Promise<void>;
+}
+
 export interface RoomControllerFactoryContext {
   readonly projectId: string;
   readonly taskStore: TaskStore;
@@ -137,6 +144,14 @@ export interface RoomControllerFactoryContext {
 export type RoomControllerFactory = (
   context: RoomControllerFactoryContext,
 ) => RoomControllerLifecycle;
+
+export interface RoomRunAuditDispatcherFactoryContext extends RoomControllerFactoryContext {
+  readonly roomStore: AsyncRoomStore;
+}
+
+export type RoomRunAuditDispatcherFactory = (
+  context: RoomRunAuditDispatcherFactoryContext,
+) => RoomRunAuditDispatcherLifecycle;
 
 const execFileAsync = promisify(execFile);
 
@@ -379,6 +394,8 @@ export interface ProjectEngineOptions {
    * is explicitly true, and a project-bound AsyncDataLayer is available.
    */
   roomControllerFactory?: RoomControllerFactory;
+  /** Test/host seam for durable Room lifecycle audit delivery. */
+  roomRunAuditDispatcherFactory?: RoomRunAuditDispatcherFactory;
   /** Worker implementation delegated to the default RoomController. */
   roomWorker?: RoomWorker;
 }
@@ -405,6 +422,8 @@ export class ProjectEngine {
   private starting = false;
   private runtimeStarted = false;
   private roomController?: RoomControllerLifecycle;
+  private roomRunAuditDispatcher?: RoomRunAuditDispatcherLifecycle;
+  private stopInFlight: Promise<void> | null = null;
   private prMonitor?: PrMonitor;
   /**
    * FNXC:PlannerOversight 2026-07-04-00:00:
@@ -841,6 +860,20 @@ export class ProjectEngine {
           const leaseStore = new AsyncRoomLeaseStore(context.asyncLayer, { projectId: context.projectId });
           const checkpointStore = new AsyncRoomCheckpointStore(context.asyncLayer, { projectId: context.projectId });
           const hostId = hostname();
+          const auditDispatcherFactory = this.options.roomRunAuditDispatcherFactory
+            ?? ((dispatcherContext: RoomRunAuditDispatcherFactoryContext) =>
+              new RoomRunAuditDispatcher({
+                store: dispatcherContext.roomStore,
+                sink: async (event) => {
+                  await dispatcherContext.taskStore.recordRunAuditEvent(event);
+                },
+                onError: (message) => runtimeLog.warn(message),
+              }));
+          const auditDispatcher = auditDispatcherFactory({
+            ...context,
+            roomStore,
+          });
+          this.roomRunAuditDispatcher = auditDispatcher;
           return new RoomController({
             projectId: context.projectId,
             workerId: `${hostId}:${process.pid}:${randomUUID()}`,
@@ -849,6 +882,9 @@ export class ProjectEngine {
             leaseStore,
             checkpointStore,
             worker: this.options.roomWorker ?? PASSIVE_ROOM_WORKER,
+            recordRunAuditEvent: async (event) => {
+              await auditDispatcher.enqueue(event);
+            },
           });
         });
         const roomController = roomControllerFactory({
@@ -857,7 +893,28 @@ export class ProjectEngine {
           asyncLayer,
         });
         this.roomController = roomController;
-        await roomController.start();
+        try {
+          await this.roomRunAuditDispatcher?.start();
+          await roomController.start();
+        } catch (error) {
+          await roomController.stop().catch((stopError) => {
+            runtimeLog.warn(
+              `Session Room controller cleanup failed for ${this.config.projectId}: ${
+                stopError instanceof Error ? stopError.message : String(stopError)
+              }`,
+            );
+          });
+          await this.roomRunAuditDispatcher?.stop().catch((stopError) => {
+            runtimeLog.warn(
+              `Session Room audit dispatcher cleanup failed for ${this.config.projectId}: ${
+                stopError instanceof Error ? stopError.message : String(stopError)
+              }`,
+            );
+          });
+          this.roomRunAuditDispatcher = undefined;
+          this.roomController = undefined;
+          throw error;
+        }
       }
     }
 
@@ -1314,6 +1371,17 @@ export class ProjectEngine {
    * promptly without continuing git/verification work after shutdown starts.
    */
   async stop(): Promise<void> {
+    if (this.stopInFlight) return this.stopInFlight;
+    const operation = Promise.resolve()
+      .then(() => this.stopOnce())
+      .finally(() => {
+        if (this.stopInFlight === operation) this.stopInFlight = null;
+      });
+    this.stopInFlight = operation;
+    return operation;
+  }
+
+  private async stopOnce(): Promise<void> {
     /*
     FNXC:FasterStartup 2026-07-15-00:20:
     Always raise shuttingDown first so deferred startup work (OAuth, automation
@@ -1344,6 +1412,20 @@ export class ProjectEngine {
     }
     // FNXC:VerificationConcurrency 2026-07-15-09:05: Drop this project's cap so it no longer pins process min.
     unregisterProjectVerificationLimit(this.config.projectId);
+
+    const roomRunAuditDispatcher = this.roomRunAuditDispatcher;
+    this.roomRunAuditDispatcher = undefined;
+    if (roomRunAuditDispatcher) {
+      try {
+        await roomRunAuditDispatcher.stop();
+      } catch (error) {
+        runtimeLog.warn(
+          `Session Room audit dispatcher shutdown failed for ${this.config.projectId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
     // Stop merge retry timer
     if (this.mergeRetryTimer) {
       clearTimeout(this.mergeRetryTimer);

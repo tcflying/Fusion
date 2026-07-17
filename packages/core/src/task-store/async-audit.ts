@@ -56,6 +56,7 @@ function rowToRunAuditEvent(row: RunAuditEventRow): RunAuditEvent {
   return {
     id: row.id,
     timestamp: row.timestamp,
+    projectId: row.projectId ?? null,
     taskId: row.taskId,
     agentId: row.agentId,
     runId: row.runId,
@@ -75,22 +76,59 @@ function safeJsonParse(value: string | null): Record<string, unknown> | null {
   }
 }
 
-/**
- * FNXC:TaskStoreAudit 2026-06-24-09:05:
- * Query run-audit events with optional filtering by runId, taskId, agentId,
- * domain, mutationType, and timestamp range. This is the async equivalent of
- * `queryRunAuditEvents`. Ordered by timestamp DESC (newest first), with an
- * optional limit.
- *
- * @param db The Drizzle instance.
- * @param filter Optional filter (runId, taskId, agentId, domain, mutationType, startTime, endTime, limit).
- * @returns The matching run-audit events.
- */
-export async function queryRunAuditEvents(
-  db: AsyncDataLayer["db"] | DbTransaction,
-  filter: RunAuditEventFilter = {},
-): Promise<RunAuditEvent[]> {
+type AuditQuerySource = AsyncDataLayer | AsyncDataLayer["db"] | DbTransaction;
+
+export class RunAuditEventQueryScopeError extends Error {
+  readonly code = "run_audit_event_project_scope_required" as const;
+
+  constructor(message = "Run-audit queries require a bound projectId. Pass a project-bound AsyncDataLayer, supply filter.projectId, or use the explicit admin seam for cross-project reads.") {
+    super(message);
+    this.name = "RunAuditEventQueryScopeError";
+  }
+}
+
+function resolveAuditQuerySource(source: AuditQuerySource): {
+  readonly db: AsyncDataLayer["db"] | DbTransaction;
+  readonly projectId: string | undefined;
+} {
+  if ("db" in source) {
+    return { db: source.db, projectId: source.projectId };
+  }
+  return { db: source, projectId: undefined };
+}
+
+function resolveRequiredAuditProjectId(
+  source: AuditQuerySource,
+  filter: RunAuditEventFilter,
+): {
+  readonly db: AsyncDataLayer["db"] | DbTransaction;
+  readonly projectId: string;
+} {
+  const { db, projectId: boundProjectId } = resolveAuditQuerySource(source);
+  if (
+    boundProjectId
+    && filter.projectId
+    && filter.projectId !== boundProjectId
+  ) {
+    throw new RunAuditEventQueryScopeError(
+      `Run-audit query attempted to override bound projectId ${boundProjectId} with ${filter.projectId}.`,
+    );
+  }
+  const projectId = boundProjectId ?? filter.projectId;
+  if (!projectId) {
+    throw new RunAuditEventQueryScopeError();
+  }
+  return { db, projectId };
+}
+
+function buildRunAuditConditions(
+  filter: RunAuditEventFilter,
+  projectId?: string,
+) {
   const conditions = [];
+  if (projectId) {
+    conditions.push(eq(schema.project.runAuditEvents.projectId, projectId));
+  }
   if (filter.runId) {
     conditions.push(eq(schema.project.runAuditEvents.runId, filter.runId));
   }
@@ -112,6 +150,26 @@ export async function queryRunAuditEvents(
   if (filter.endTime) {
     conditions.push(lte(schema.project.runAuditEvents.timestamp, filter.endTime));
   }
+  return conditions;
+}
+
+/**
+ * FNXC:TaskStoreAudit 2026-06-24-09:05:
+ * Query run-audit events with optional filtering by runId, taskId, agentId,
+ * domain, mutationType, and timestamp range. This is the async equivalent of
+ * `queryRunAuditEvents`. Ordered by timestamp DESC (newest first), with an
+ * optional limit.
+ *
+ * @param db The Drizzle instance.
+ * @param filter Optional filter (runId, taskId, agentId, domain, mutationType, startTime, endTime, limit).
+ * @returns The matching run-audit events.
+ */
+export async function queryRunAuditEvents(
+  source: AuditQuerySource,
+  filter: RunAuditEventFilter = {},
+): Promise<RunAuditEvent[]> {
+  const { db, projectId } = resolveRequiredAuditProjectId(source, filter);
+  const conditions = buildRunAuditConditions(filter, projectId);
 
   // FNXC:TaskStoreAudit 2026-06-26-10:15:
   // Apply LIMIT in SQL, not JS. Previously the whole matching set was fetched
@@ -131,35 +189,49 @@ export async function queryRunAuditEvents(
 }
 
 /**
+ * Explicit cross-project seam for admin / analytics callers that genuinely need
+ * an unbound read over run_audit_events. Ordinary project code should call
+ * queryRunAuditEvents() with a bound AsyncDataLayer instead.
+ */
+export async function queryRunAuditEventsAdmin(
+  db: AsyncDataLayer["db"] | DbTransaction,
+  filter: RunAuditEventFilter = {},
+): Promise<RunAuditEvent[]> {
+  const conditions = buildRunAuditConditions(filter, filter.projectId);
+  const baseQuery = db
+    .select()
+    .from(schema.project.runAuditEvents)
+    .orderBy(desc(schema.project.runAuditEvents.timestamp));
+  const filtered =
+    conditions.length > 0 ? baseQuery.where(and(...conditions)) : baseQuery;
+  const limited =
+    filter.limit && filter.limit > 0 ? filtered.limit(filter.limit) : filtered;
+  const rows = (await limited) as RunAuditEventRow[];
+  return rows.map((row) => rowToRunAuditEvent(row));
+}
+
+/**
  * Count run-audit events matching a filter. Useful for dashboards/metrics.
  */
 export async function countRunAuditEvents(
+  source: AuditQuerySource,
+  filter: RunAuditEventFilter = {},
+): Promise<number> {
+  const { db, projectId } = resolveRequiredAuditProjectId(source, filter);
+  const conditions = buildRunAuditConditions(filter, projectId);
+
+  const query = db
+    .select({ value: count() })
+    .from(schema.project.runAuditEvents);
+  const rows = conditions.length > 0 ? await query.where(and(...conditions)) : await query;
+  return rows[0]?.value ?? 0;
+}
+
+export async function countRunAuditEventsAdmin(
   db: AsyncDataLayer["db"] | DbTransaction,
   filter: RunAuditEventFilter = {},
 ): Promise<number> {
-  const conditions = [];
-  if (filter.runId) {
-    conditions.push(eq(schema.project.runAuditEvents.runId, filter.runId));
-  }
-  if (filter.taskId) {
-    conditions.push(eq(schema.project.runAuditEvents.taskId, filter.taskId));
-  }
-  if (filter.agentId) {
-    conditions.push(eq(schema.project.runAuditEvents.agentId, filter.agentId));
-  }
-  if (filter.domain) {
-    conditions.push(eq(schema.project.runAuditEvents.domain, filter.domain));
-  }
-  if (filter.mutationType) {
-    conditions.push(eq(schema.project.runAuditEvents.mutationType, filter.mutationType));
-  }
-  if (filter.startTime) {
-    conditions.push(gte(schema.project.runAuditEvents.timestamp, filter.startTime));
-  }
-  if (filter.endTime) {
-    conditions.push(lte(schema.project.runAuditEvents.timestamp, filter.endTime));
-  }
-
+  const conditions = buildRunAuditConditions(filter, filter.projectId);
   const query = db
     .select({ value: count() })
     .from(schema.project.runAuditEvents);

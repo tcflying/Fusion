@@ -239,6 +239,7 @@ export function rowToRunAuditEventImpl(store: TaskStore, row: RunAuditEventRow):
     return {
       id: row.id,
       timestamp: row.timestamp,
+      projectId: row.projectId || undefined,
       taskId: row.taskId || undefined,
       agentId: row.agentId,
       runId: row.runId,

@@ -970,7 +970,16 @@ export {
   type ResolvedSessionResult,
 } from "./agent-session-helpers.js";
 export { ProjectManager } from "./project-manager.js";
-export { ProjectEngine, type ProjectEngineOptions } from "./project-engine.js";
+export {
+  ProjectEngine,
+  type ProjectEngineOptions,
+  type RoomControllerFactory,
+  type RoomControllerFactoryContext,
+  type RoomControllerLifecycle,
+  type RoomRunAuditDispatcherFactory,
+  type RoomRunAuditDispatcherFactoryContext,
+  type RoomRunAuditDispatcherLifecycle,
+} from "./project-engine.js";
 export {
   PASSIVE_ROOM_WORKER,
   RoomController,
@@ -981,6 +990,11 @@ export {
   type RoomWorker,
   type RoomWorkerRunInput,
 } from "./room-controller.js";
+export {
+  RoomRunAuditDispatcher,
+  type RoomRunAuditDispatcherOptions,
+  type RoomRunAuditOutboxStore,
+} from "./room-run-audit-dispatcher.js";
 export { ProjectEngineManager, type EngineManagerOptions } from "./project-engine-manager.js";
 export {
   acquireEngineSingleton,

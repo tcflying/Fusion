@@ -141,6 +141,7 @@ export interface GoalCitationRow {
 export interface RunAuditEventRow {
   id: string;
   timestamp: string;
+  projectId: string | null;
   taskId: string | null;
   agentId: string;
   runId: string;

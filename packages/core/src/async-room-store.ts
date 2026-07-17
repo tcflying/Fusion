@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import {
   RoomDomainError,
@@ -11,6 +11,11 @@ import {
   type RoomBindingReplacementV1,
   type TransitionRoomLifecycleInput,
 } from "./room-domain.js";
+import type { RoomLifecycleState } from "./room-contracts/storage.js";
+import {
+  assertRoomLeaseFence,
+  type StoredRoomLeaseV1,
+} from "./async-room-lease-store.js";
 import type {
   RoomBindingRecordV1,
   RoomConnectorIngestionMode,
@@ -28,6 +33,7 @@ import {
   recordRunAuditEventWithinTransaction,
   type AsyncDataLayer,
   type DbTransaction,
+  type RunAuditEventInput,
 } from "./postgres/data-layer.js";
 import {
   buildRoomConnectorLocalMessageId,
@@ -35,7 +41,7 @@ import {
   hashRoomValue,
 } from "./room-integrity.js";
 import { parseRoomAggregateProjection } from "./room-projection-replay.js";
-import { cliSessions } from "./postgres/schema/project.js";
+import { approvalRequests, cliSessions, runAuditOutbox } from "./postgres/schema/project.js";
 import {
   operationalRooms,
   roomBindingIngestionState,
@@ -43,11 +49,13 @@ import {
   roomEvents,
   roomIdempotencyKeys,
   roomInboxReceipts,
+  roomLeases,
   roomMembershipChanges,
   roomMessages,
   roomOutbox,
   roomOutboxAttempts,
   roomSeats,
+  roomTaskNodes,
   roomTurns,
 } from "./postgres/schema/room.js";
 
@@ -61,6 +69,180 @@ export interface RoomCommandContext {
   readonly correlationId: string;
   readonly causationId: string | null;
   readonly occurredAt: string;
+}
+
+export interface RoomRecoveryPostureV1 {
+  readonly lifecycleState: RoomLifecycleState;
+  readonly aggregateVersion: number;
+  readonly humanPaused: boolean;
+  readonly approvalState: "none" | "waiting" | "blocked";
+}
+
+export interface AssertRoomWorkerAuthorityInput {
+  readonly roomId: string;
+  readonly lease: StoredRoomLeaseV1;
+  readonly expectedAggregateVersion: number;
+  readonly now: string;
+}
+
+export interface RoomWorkerAuthorityV1 {
+  readonly lease: StoredRoomLeaseV1;
+  readonly posture: RoomRecoveryPostureV1;
+}
+
+export class RoomWorkerAuthorityError extends Error {
+  readonly code = "room_worker_authority_revoked" as const;
+
+  constructor(
+    readonly posture: RoomRecoveryPostureV1,
+    readonly reason: string,
+  ) {
+    super(`Room worker authority revoked: ${reason}`);
+    this.name = "RoomWorkerAuthorityError";
+  }
+}
+
+export type RoomRunAuditOutboxState = "pending" | "dispatching" | "exhausted" | "delivered";
+
+export type RoomRunAuditOutboxEvent = RunAuditEventInput & {
+  readonly id: string;
+  readonly projectId: string;
+  readonly timestamp: string;
+};
+
+export interface RoomRunAuditOutboxRecordV1 {
+  readonly id: string;
+  readonly dispatchSequence: number;
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly event: RoomRunAuditOutboxEvent;
+  readonly state: RoomRunAuditOutboxState;
+  readonly attemptCount: number;
+  readonly nextAttemptAt: string | null;
+  readonly claimToken: string | null;
+  readonly claimExpiresAt: string | null;
+  readonly lastErrorCode: string | null;
+  readonly deliveredAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+interface RoomRunAuditOutboxRow {
+  readonly id: string;
+  readonly dispatchSequence: number;
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly timestamp: string;
+  readonly taskId: string | null;
+  readonly agentId: string;
+  readonly runId: string;
+  readonly domain: string;
+  readonly mutationType: string;
+  readonly target: string;
+  readonly metadata: Record<string, unknown> | null;
+  readonly state: string;
+  readonly attemptCount: number;
+  readonly nextAttemptAt: string | null;
+  readonly claimToken: string | null;
+  readonly claimExpiresAt: string | null;
+  readonly lastErrorCode: string | null;
+  readonly deliveredAt: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export class RoomRunAuditOutboxConflictError extends Error {
+  readonly code = "room_run_audit_outbox_conflict" as const;
+
+  constructor(readonly eventId: string) {
+    super(`Room run-audit outbox id ${eventId} already exists with a different payload`);
+    this.name = "RoomRunAuditOutboxConflictError";
+  }
+}
+
+function normalizeRunAuditOutboxJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => normalizeRunAuditOutboxJson(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, normalizeRunAuditOutboxJson(nested)]),
+    );
+  }
+  return value ?? null;
+}
+
+function roomIdFromRunAuditEvent(event: RoomRunAuditOutboxEvent): string {
+  const metadataRoomId = event.metadata && typeof event.metadata === "object"
+    ? (event.metadata as Record<string, unknown>).roomId
+    : null;
+  if (typeof metadataRoomId === "string" && metadataRoomId.trim()) return metadataRoomId;
+  return event.target;
+}
+
+function comparableRunAuditOutboxEvent(
+  roomId: string,
+  event: RoomRunAuditOutboxEvent,
+): Record<string, unknown> {
+  return {
+    projectId: event.projectId,
+    roomId,
+    timestamp: event.timestamp,
+    taskId: event.taskId ?? null,
+    agentId: event.agentId,
+    runId: event.runId,
+    domain: event.domain,
+    mutationType: event.mutationType,
+    target: event.target,
+    metadata: normalizeRunAuditOutboxJson(event.metadata ?? null),
+  };
+}
+
+function rowToRunAuditOutboxRecord(row: RoomRunAuditOutboxRow): RoomRunAuditOutboxRecordV1 {
+  return {
+    id: row.id,
+    dispatchSequence: row.dispatchSequence,
+    projectId: row.projectId,
+    roomId: row.roomId,
+    event: {
+      id: row.id,
+      projectId: row.projectId,
+      timestamp: row.timestamp,
+      taskId: row.taskId ?? undefined,
+      agentId: row.agentId,
+      runId: row.runId,
+      domain: row.domain,
+      mutationType: row.mutationType,
+      target: row.target,
+      metadata: row.metadata,
+    },
+    state: row.state as RoomRunAuditOutboxState,
+    attemptCount: row.attemptCount,
+    nextAttemptAt: row.nextAttemptAt,
+    claimToken: row.claimToken,
+    claimExpiresAt: row.claimExpiresAt,
+    lastErrorCode: row.lastErrorCode,
+    deliveredAt: row.deliveredAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function recoveryWithheldReason(posture: RoomRecoveryPostureV1): string | null {
+  if (posture.humanPaused) return "human_paused";
+  if (posture.approvalState === "waiting") return "approval_waiting";
+  if (posture.approvalState === "blocked") return "approval_blocked";
+  if ([
+    "completed",
+    "completed_with_risks",
+    "partial",
+    "cancelled",
+    "failed",
+    "archived",
+  ].includes(posture.lifecycleState)) {
+    return "terminal_state";
+  }
+  return posture.lifecycleState === "running" ? null : "lifecycle_not_running";
 }
 
 export type RoomCommittedEventListener = (
@@ -612,6 +794,23 @@ export class AsyncRoomStore {
           { expected: input.expectedAggregateVersion },
         );
       }
+      if (current.room.state === "running" && next.room.state !== "running") {
+        /*
+        FNXC:SessionRoomAuthority 2026-07-18-02:14:
+        A committed pause, approval block, or terminal lifecycle transition
+        revokes every active Room-worker lease in the same transaction. The
+        process signal remains a latency hint; the durable fence is authority.
+        */
+        await tx
+          .update(roomLeases)
+          .set({ releasedAt: input.now })
+          .where(and(
+            eq(roomLeases.projectId, this.projectId),
+            eq(roomLeases.roomId, roomId),
+            eq(roomLeases.kind, "room_worker"),
+            isNull(roomLeases.releasedAt),
+          ));
+      }
       const event = await insertRoomEvent(tx, next, "room_lifecycle_transitioned", context, {
         projectionVersion: 1,
         from: current.room.state,
@@ -646,6 +845,351 @@ export class AsyncRoomStore {
       rows.map(({ id }) => loadRoomAggregateProjection(this.layer.db, this.projectId, id)),
     );
     return projections.filter((room): room is RoomAggregateV1 => room?.room.state === "running");
+  }
+
+  async enqueueRunAuditEvent(event: RoomRunAuditOutboxEvent): Promise<RoomRunAuditOutboxRecordV1> {
+    if (event.projectId !== this.projectId) {
+      throw new RoomRunAuditOutboxConflictError(event.id);
+    }
+    const roomId = roomIdFromRunAuditEvent(event);
+    return this.layer.transactionImmediate(async (tx) => {
+      const lockKey = `fusion-room-run-audit-outbox-v1:${this.projectId}:${roomId}`;
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      const inserted = await tx
+        .insert(runAuditOutbox)
+        .values({
+          id: event.id,
+          projectId: this.projectId,
+          roomId,
+          timestamp: event.timestamp,
+          taskId: event.taskId ?? null,
+          agentId: event.agentId,
+          runId: event.runId,
+          domain: event.domain,
+          mutationType: event.mutationType,
+          target: event.target,
+          metadata: event.metadata ?? null,
+          state: "pending",
+          attemptCount: 0,
+          nextAttemptAt: null,
+          claimToken: null,
+          claimExpiresAt: null,
+          lastErrorCode: null,
+          deliveredAt: null,
+          createdAt: event.timestamp,
+          updatedAt: event.timestamp,
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (inserted[0]) return rowToRunAuditOutboxRecord(inserted[0] as RoomRunAuditOutboxRow);
+
+      const existing = await tx
+        .select()
+        .from(runAuditOutbox)
+        .where(and(
+          eq(runAuditOutbox.projectId, this.projectId),
+          eq(runAuditOutbox.id, event.id),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] as RoomRunAuditOutboxRow | undefined);
+      if (!existing) throw new RoomRunAuditOutboxConflictError(event.id);
+      const existingEvent: RoomRunAuditOutboxEvent = {
+        id: existing.id,
+        projectId: existing.projectId,
+        timestamp: existing.timestamp,
+        taskId: existing.taskId ?? undefined,
+        agentId: existing.agentId,
+        runId: existing.runId,
+        domain: existing.domain,
+        mutationType: existing.mutationType,
+        target: existing.target,
+        metadata: existing.metadata,
+      };
+      if (
+        JSON.stringify(comparableRunAuditOutboxEvent(existing.roomId, existingEvent))
+        !== JSON.stringify(comparableRunAuditOutboxEvent(roomId, event))
+      ) {
+        throw new RoomRunAuditOutboxConflictError(event.id);
+      }
+      return rowToRunAuditOutboxRecord(existing);
+    });
+  }
+
+  async claimRunAuditEvents(input: {
+    readonly claimToken: string;
+    readonly now: string;
+    readonly claimExpiresAt: string;
+    readonly limit: number;
+  }): Promise<readonly RoomRunAuditOutboxRecordV1[]> {
+    return this.layer.transactionImmediate(async (tx) => {
+      const rows = await tx
+        .select()
+        .from(runAuditOutbox)
+        .where(and(
+          eq(runAuditOutbox.projectId, this.projectId),
+          or(
+            and(
+              eq(runAuditOutbox.state, "pending"),
+              or(
+                isNull(runAuditOutbox.nextAttemptAt),
+                sql`${runAuditOutbox.nextAttemptAt} <= ${input.now}`,
+              ),
+            ),
+            and(
+              eq(runAuditOutbox.state, "dispatching"),
+              sql`${runAuditOutbox.claimExpiresAt} IS NOT NULL AND ${runAuditOutbox.claimExpiresAt} <= ${input.now}`,
+            ),
+          ),
+          sql`NOT EXISTS (
+            SELECT 1
+            FROM project.run_audit_outbox AS earlier
+            WHERE earlier.project_id = ${runAuditOutbox.projectId}
+              AND earlier.room_id = ${runAuditOutbox.roomId}
+              AND earlier.dispatch_sequence < ${runAuditOutbox.dispatchSequence}
+              AND earlier.state NOT IN ('delivered', 'exhausted')
+          )`,
+        ))
+        .orderBy(asc(runAuditOutbox.dispatchSequence))
+        .limit(input.limit)
+        .for("update");
+      const claimed: RoomRunAuditOutboxRecordV1[] = [];
+      for (const row of rows as RoomRunAuditOutboxRow[]) {
+        const updated = await tx
+          .update(runAuditOutbox)
+          .set({
+            state: "dispatching",
+            attemptCount: sql`${runAuditOutbox.attemptCount} + 1`,
+            claimToken: input.claimToken,
+            claimExpiresAt: input.claimExpiresAt,
+            updatedAt: input.now,
+          })
+          .where(and(
+            eq(runAuditOutbox.projectId, this.projectId),
+            eq(runAuditOutbox.id, row.id),
+          ))
+          .returning()
+          .then((nextRows) => nextRows[0] as RoomRunAuditOutboxRow | undefined);
+        if (updated) claimed.push(rowToRunAuditOutboxRecord(updated));
+      }
+      return claimed;
+    });
+  }
+
+  async markRunAuditEventDelivered(input: {
+    readonly id: string;
+    readonly claimToken: string;
+    readonly now: string;
+  }): Promise<RoomRunAuditOutboxRecordV1> {
+    return this.layer.transactionImmediate(async (tx) => {
+      const updated = await tx
+        .update(runAuditOutbox)
+        .set({
+          state: "delivered",
+          claimToken: null,
+          claimExpiresAt: null,
+          nextAttemptAt: null,
+          deliveredAt: input.now,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(runAuditOutbox.projectId, this.projectId),
+          eq(runAuditOutbox.id, input.id),
+          eq(runAuditOutbox.state, "dispatching"),
+          eq(runAuditOutbox.claimToken, input.claimToken),
+        ))
+        .returning()
+        .then((rows) => rows[0] as RoomRunAuditOutboxRow | undefined);
+      if (!updated) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Run-audit outbox ${input.id} is not claimed by ${input.claimToken}`,
+        );
+      }
+      return rowToRunAuditOutboxRecord(updated);
+    });
+  }
+
+  async markRunAuditEventFailed(input: {
+    readonly id: string;
+    readonly claimToken: string;
+    readonly now: string;
+    readonly errorCode: string;
+    readonly nextAttemptAt: string | null;
+    readonly exhausted: boolean;
+  }): Promise<RoomRunAuditOutboxRecordV1> {
+    if (!input.errorCode.trim()) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Run-audit outbox ${input.id} failure requires an error code`,
+      );
+    }
+    if (!input.exhausted && !input.nextAttemptAt) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Run-audit outbox ${input.id} retry requires nextAttemptAt`,
+      );
+    }
+    if (input.exhausted && input.nextAttemptAt !== null) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Exhausted run-audit outbox ${input.id} cannot schedule a retry`,
+      );
+    }
+    return this.layer.transactionImmediate(async (tx) => {
+      const updated = await tx
+        .update(runAuditOutbox)
+        .set({
+          state: input.exhausted ? "exhausted" : "pending",
+          claimToken: null,
+          claimExpiresAt: null,
+          nextAttemptAt: input.nextAttemptAt,
+          lastErrorCode: input.errorCode.trim(),
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(runAuditOutbox.projectId, this.projectId),
+          eq(runAuditOutbox.id, input.id),
+          eq(runAuditOutbox.state, "dispatching"),
+          eq(runAuditOutbox.claimToken, input.claimToken),
+        ))
+        .returning()
+        .then((rows) => rows[0] as RoomRunAuditOutboxRow | undefined);
+      if (!updated) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Run-audit outbox ${input.id} is not claimed by ${input.claimToken}`,
+        );
+      }
+      return rowToRunAuditOutboxRecord(updated);
+    });
+  }
+
+  async listRunAuditOutbox(): Promise<readonly RoomRunAuditOutboxRecordV1[]> {
+    const rows = await this.layer.db
+      .select()
+      .from(runAuditOutbox)
+      .where(eq(runAuditOutbox.projectId, this.projectId))
+      .orderBy(asc(runAuditOutbox.dispatchSequence));
+    return (rows as RoomRunAuditOutboxRow[]).map((row) => rowToRunAuditOutboxRecord(row));
+  }
+
+  /**
+   * Re-read the durable human-control posture immediately before a worker claim
+   * or renewal. Discovery is intentionally broader than this guard so a stale
+   * running projection can never steal-run a newer pause, approval hold, or
+   * terminal outcome after restart.
+   */
+  async getRecoveryPosture(roomId: string): Promise<RoomRecoveryPostureV1> {
+    return this.readRecoveryPosture(this.layer.db, roomId);
+  }
+
+  async assertWorkerAuthority(
+    input: AssertRoomWorkerAuthorityInput,
+  ): Promise<RoomWorkerAuthorityV1> {
+    return this.layer.transaction(async (tx) => {
+      const lease = await assertRoomLeaseFence(tx, this.projectId, {
+        leaseId: input.lease.id,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        holderId: input.lease.holderId,
+        hostId: input.lease.hostId,
+        expectedEpoch: input.lease.epoch,
+        now: input.now,
+      });
+      const posture = await this.readRecoveryPosture(tx, input.roomId);
+      const reason = recoveryWithheldReason(posture)
+        ?? (posture.aggregateVersion === input.expectedAggregateVersion
+          ? null
+          : "posture_version_changed");
+      if (reason) throw new RoomWorkerAuthorityError(posture, reason);
+      return { lease, posture };
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  private async readRecoveryPosture(
+    handle: QueryHandle,
+    roomId: string,
+  ): Promise<RoomRecoveryPostureV1> {
+    const [room] = await handle
+      .select({
+        lifecycleState: operationalRooms.lifecycleState,
+        aggregateVersion: operationalRooms.aggregateVersion,
+      })
+      .from(operationalRooms)
+      .where(and(
+        eq(operationalRooms.projectId, this.projectId),
+        eq(operationalRooms.id, roomId),
+      ))
+      .limit(1);
+    if (!room) {
+      throw new RoomDomainError("room_state_conflict", `Operational Room ${roomId} does not exist`);
+    }
+
+    const [lastLifecycleEvent, roomApproval, waitingNode] = await Promise.all([
+      handle
+        .select({ actorType: roomEvents.actorType, payload: roomEvents.payload })
+        .from(roomEvents)
+        .where(and(
+          eq(roomEvents.projectId, this.projectId),
+          eq(roomEvents.roomId, roomId),
+          eq(roomEvents.eventType, "room_lifecycle_transitioned"),
+        ))
+        .orderBy(desc(roomEvents.cursor))
+        .limit(1)
+        .then((rows) => rows[0]),
+      handle
+        .select({ status: approvalRequests.status })
+        .from(approvalRequests)
+        .where(and(
+          eq(approvalRequests.targetResourceId, roomId),
+          inArray(approvalRequests.targetResourceType, ["room", "operational_room"]),
+        ))
+        /*
+        FNXC:SessionRoomApproval 2026-07-17-00:58:
+        Restart recovery must classify approval from the newest REQUEST, not the
+        row with the newest update. Older denied requests can receive later
+        bookkeeping updates after a newer request is already approved/completed,
+        and those stale writes must never re-block the Room.
+        */
+        .orderBy(
+          desc(approvalRequests.requestedAt),
+          desc(approvalRequests.createdAt),
+          desc(approvalRequests.id),
+        )
+        .limit(1)
+        .then((rows) => rows[0]),
+      handle
+        .select({ id: roomTaskNodes.id })
+        .from(roomTaskNodes)
+        .where(and(
+          eq(roomTaskNodes.projectId, this.projectId),
+          eq(roomTaskNodes.roomId, roomId),
+          eq(roomTaskNodes.state, "waiting_approval"),
+        ))
+        .limit(1)
+        .then((rows) => rows[0]),
+    ]);
+    const payload = lastLifecycleEvent?.payload;
+    const transitionedToPaused = Boolean(
+      payload
+      && typeof payload === "object"
+      && !Array.isArray(payload)
+      && (payload as Record<string, unknown>).to === "paused",
+    );
+    const approvalState = roomApproval?.status === "pending" || waitingNode
+      ? "waiting"
+      : roomApproval?.status === "denied" && room.lifecycleState === "blocked"
+        ? "blocked"
+        : "none";
+    return {
+      lifecycleState: room.lifecycleState as RoomLifecycleState,
+      aggregateVersion: room.aggregateVersion,
+      humanPaused: room.lifecycleState === "paused"
+        && lastLifecycleEvent?.actorType === "human"
+        && transitionedToPaused,
+      approvalState,
+    };
   }
 
   async requestMembershipChange(
@@ -1168,6 +1712,21 @@ export class AsyncRoomStore {
           `Room outbox ${input.outboxId} cannot dispatch from state ${current.deliveryState}`,
         );
       }
+      if (
+        current.nextAttemptAt
+        && Date.parse(current.nextAttemptAt) > Date.parse(input.now)
+      ) {
+        /*
+        FNXC:SessionRoomDelivery 2026-07-17-02:43:
+        Retry scheduling is a durable fence, not a hint. Recovery may only
+        re-dispatch once the stored nextAttemptAt window has opened; otherwise a
+        restart could blind-resend earlier than the committed backoff contract.
+        */
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} is not due until ${current.nextAttemptAt}`,
+        );
+      }
 
       const attempt = current.attemptCount + 1;
       const updated = await tx
@@ -1382,6 +1941,7 @@ export class AsyncRoomStore {
       }
 
       await recordRunAuditEventWithinTransaction(tx, {
+        projectId: this.projectId,
         timestamp: input.now,
         taskId: input.audit.taskId,
         agentId: input.audit.agentId,
@@ -1476,7 +2036,10 @@ export class AsyncRoomStore {
         );
       }
 
-      const nextState = deliveryStateForOutcome(input.outcome);
+      const hasAcceptedEvidence = Boolean(
+        input.connectorAcknowledgementId || input.nativeMessageId || input.nativeCursor,
+      );
+      const nextState = deliveryStateForOutcome(input.outcome, hasAcceptedEvidence);
       const nativeAcknowledgement = input.connectorAcknowledgementId || input.nativeMessageId
         ? {
             connectorAcknowledgementId: input.connectorAcknowledgementId,
@@ -1486,13 +2049,20 @@ export class AsyncRoomStore {
       const updated = await tx
         .update(roomOutbox)
         .set({
-          deliveryState: nextState,
-          nativeAcknowledgement,
-          nativeCursor: input.nativeCursor,
-          lastErrorCode: input.errorCode,
-          nextAttemptAt: input.outcome === "retryable_failure" ? input.nextAttemptAt : null,
-          updatedAt: input.now,
-        })
+            deliveryState: nextState,
+            nativeAcknowledgement,
+            nativeCursor: input.nativeCursor,
+            lastErrorCode: input.errorCode,
+            /*
+            FNXC:SessionRoomDelivery 2026-07-17-02:43:
+            A retryable transport failure that already carries connector/native
+            acknowledgement evidence becomes delivery_uncertain immediately. The
+            system must surface the ambiguity and wait for reconciliation instead
+            of parking it back in pending where crash recovery could resend.
+            */
+            nextAttemptAt: nextState === "pending" ? input.nextAttemptAt : null,
+            updatedAt: input.now,
+          })
         .where(
           and(
             eq(roomOutbox.projectId, this.projectId),
@@ -1535,6 +2105,7 @@ export class AsyncRoomStore {
       // Message plaintext, authority envelopes, connector settings, and official
       // credential material are intentionally unavailable to this payload.
       await recordRunAuditEventWithinTransaction(tx, {
+        projectId: this.projectId,
         timestamp: input.now,
         taskId: input.audit.taskId,
         agentId: input.audit.agentId,
@@ -2575,6 +3146,7 @@ async function persistRoomConnectorIngestionState(
 
 function deliveryStateForOutcome(
   outcome: CompleteRoomDeliveryAttemptInput["outcome"],
+  hasAcceptedEvidence = false,
 ): RoomOutboxRecordV1["state"] {
   switch (outcome) {
     case "confirmed":
@@ -2582,7 +3154,7 @@ function deliveryStateForOutcome(
     case "delivery_uncertain":
       return "delivery_uncertain";
     case "retryable_failure":
-      return "pending";
+      return hasAcceptedEvidence ? "delivery_uncertain" : "pending";
     case "rejected":
       return "rejected";
   }

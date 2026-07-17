@@ -623,24 +623,25 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       now: "2026-07-17T03:06:04.500Z",
       audit: { runId: "room-run-stale-attempt-1", agentId: "room-worker-1" },
     });
-    await store.beginDeliveryAttempt({
+    await expect(store.beginDeliveryAttempt({
       outboxId: "outbox-stale-reconciliation",
       attemptId: "attempt-stale-2",
       reconciliationFromCursor: "cursor-before-stale-attempt-2",
       now: "2026-07-17T03:06:05.000Z",
-    });
+    })).rejects.toThrow(/uncertain|reconcile/i);
     expect(await store.getDelivery("outbox-stale-reconciliation")).toMatchObject({
-      state: "dispatching",
-      attemptCount: 2,
-      connectorAcknowledgementId: null,
-      nativeMessageId: null,
-      nativeCursor: null,
+      state: "delivery_uncertain",
+      attemptCount: 1,
+      connectorAcknowledgementId: "ack-stale-attempt-1",
+      nativeMessageId: "native-stale-attempt-1",
+      nativeCursor: "cursor-stale-attempt-1",
       reconciliationEvidenceRef: null,
-      lastErrorCode: null,
+      lastErrorCode: "pre_send_transport",
+      nextAttemptAt: null,
     });
     await expect(store.reconcileDelivery({
       outboxId: "outbox-stale-reconciliation",
-      expectedAttemptCount: 2,
+      expectedAttemptCount: 1,
       outcome: "confirmed",
       connectorAcknowledgementId: null,
       nativeMessageId: "native-invalid-evidence",
@@ -652,7 +653,7 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     })).rejects.toThrow(/evidence/i);
     await expect(store.reconcileDelivery({
       outboxId: "outbox-stale-reconciliation",
-      expectedAttemptCount: 2,
+      expectedAttemptCount: 1,
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
       nativeMessageId: null,
@@ -664,7 +665,7 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     })).rejects.toThrow(/error code/i);
     await expect(store.reconcileDelivery({
       outboxId: "outbox-stale-reconciliation",
-      expectedAttemptCount: 1,
+      expectedAttemptCount: 2,
       outcome: "confirmed",
       connectorAcknowledgementId: null,
       nativeMessageId: "native-stale-attempt-1",
@@ -675,22 +676,22 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       audit: { runId: "room-run-stale-evidence", agentId: "room-recovery-worker-1" },
     })).rejects.toThrow(/attempt/i);
     expect(await store.getDelivery("outbox-stale-reconciliation")).toMatchObject({
-      state: "dispatching",
-      attemptCount: 2,
-      reconciliationFromCursor: "cursor-before-stale-attempt-2",
+      state: "delivery_uncertain",
+      attemptCount: 1,
+      reconciliationFromCursor: "cursor-before-stale-attempt-1",
     });
     expect(await store.reconcileDelivery({
       outboxId: "outbox-stale-reconciliation",
-      expectedAttemptCount: 2,
+      expectedAttemptCount: 1,
       outcome: "confirmed",
       connectorAcknowledgementId: null,
-      nativeMessageId: "native-stale-attempt-2",
-      nativeCursor: "cursor-stale-attempt-2",
+      nativeMessageId: "native-stale-attempt-1",
+      nativeCursor: "cursor-stale-attempt-1",
       errorCode: null,
       evidenceRef: HISTORY_EVIDENCE_STALE,
       now: "2026-07-17T03:06:08.000Z",
       audit: { runId: "room-run-current-evidence", agentId: "room-recovery-worker-2" },
-    })).toMatchObject({ state: "confirmed", attemptCount: 2 });
+    })).toMatchObject({ state: "confirmed", attemptCount: 1 });
 
     const inboxInput = {
       id: "inbox-1",
@@ -712,5 +713,234 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
         payloadHash: "sha256:different-native-payload",
       }),
     ).rejects.toThrow(/payload hash/i);
+  });
+
+  /*
+  FNXC:SessionRoomDeliveryRetry 2026-07-17-23:48:
+  Task 4.7 RED keeps retryable delivery failures fail-closed. A future
+  nextAttemptAt must gate redispatch from the durable outbox, and any accepted
+  connector/native evidence on a retryable failure must stay ambiguous instead
+  of dropping back to pending for a blind resend.
+  */
+  it("fails closed on retryable delivery failures until retry time elapses and keeps accepted evidence out of pending", async () => {
+    const context = await startEmbeddedDatabase();
+    const layer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
+    const store = new AsyncRoomStore(layer);
+    const created = await store.createRoom(
+      {
+        id: "room-retry-boundary-1",
+        projectId: "project-1",
+        objective: "Retry only when the durable retry window is open",
+        protocolId: "implementation",
+        protocolVersion: 1,
+        now: "2026-07-17T04:00:00.000Z",
+      },
+      {
+        eventId: "event-retry-boundary-room-created",
+        actorType: "human",
+        actorId: "operator-1",
+        correlationId: "correlation-retry-boundary-room-created",
+        causationId: null,
+        occurredAt: "2026-07-17T04:00:00.000Z",
+      },
+    );
+    await layer.db.insert(roomSeats).values({
+      id: "seat-retry-boundary-1",
+      projectId: "project-1",
+      roomId: created.room.id,
+      role: "producer",
+      roleVersion: 1,
+      roleHistory: [],
+      permissionScope: ["room:message"],
+      state: "active",
+      activeBindingId: "binding-retry-boundary-1",
+      createdAt: "2026-07-17T04:00:00.000Z",
+      updatedAt: "2026-07-17T04:00:00.000Z",
+    });
+    await layer.db.insert(roomBindings).values({
+      id: "binding-retry-boundary-1",
+      projectId: "project-1",
+      roomId: created.room.id,
+      seatId: "seat-retry-boundary-1",
+      generation: 1,
+      connectorId: "happier",
+      providerId: "codex",
+      nativeSessionId: "codex-thread-retry-boundary-1",
+      happierSessionId: "happier-retry-boundary-1",
+      serverProfileId: "server-retry-boundary-1",
+      machineId: "machine-retry-boundary-1",
+      hostId: "windows-host-1",
+      state: "attached",
+      attachedAt: "2026-07-17T04:00:00.000Z",
+    });
+
+    const queuedNoEvidence = await store.enqueueMessage({
+      roomId: created.room.id,
+      expectedAggregateVersion: 0,
+      idempotencyKey: "retry-boundary:no-evidence",
+      message: {
+        id: "message-retry-boundary-no-evidence",
+        turnId: null,
+        nodeId: null,
+        originType: "controller",
+        originId: "room-controller-1",
+        targetSeatIds: ["seat-retry-boundary-1"],
+        intent: "instruction",
+        content: "Do not retry before the durable retry window opens.",
+        authorityEnvelope: { allowedActions: ["session:send"] },
+        createdAt: "2026-07-17T04:00:01.000Z",
+      },
+      deliveries: [{ id: "outbox-retry-boundary-no-evidence", bindingId: "binding-retry-boundary-1" }],
+    }, {
+      eventId: "event-retry-boundary-no-evidence",
+      actorType: "controller",
+      actorId: "room-controller-1",
+      correlationId: "correlation-retry-boundary-no-evidence",
+      causationId: "event-retry-boundary-room-created",
+      occurredAt: "2026-07-17T04:00:01.000Z",
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-retry-boundary-no-evidence",
+      attemptId: "attempt-retry-boundary-no-evidence-1",
+      reconciliationFromCursor: "cursor-before-retry-boundary-1",
+      now: "2026-07-17T04:00:02.000Z",
+    });
+    const retryScheduled = await store.completeDeliveryAttempt({
+      outboxId: "outbox-retry-boundary-no-evidence",
+      attemptId: "attempt-retry-boundary-no-evidence-1",
+      outcome: "retryable_failure",
+      connectorAcknowledgementId: null,
+      nativeMessageId: null,
+      nativeCursor: null,
+      errorCode: "transport_retryable",
+      nextAttemptAt: "2026-07-17T04:05:00.000Z",
+      now: "2026-07-17T04:00:03.000Z",
+      audit: { runId: "room-run-retry-boundary-no-evidence", agentId: "room-worker-1" },
+    });
+    expect(retryScheduled).toMatchObject({
+      state: "pending",
+      nextAttemptAt: "2026-07-17T04:05:00.000Z",
+      connectorAcknowledgementId: null,
+      nativeMessageId: null,
+      nativeCursor: null,
+    });
+    await expect(store.beginDeliveryAttempt({
+      outboxId: "outbox-retry-boundary-no-evidence",
+      attemptId: "attempt-retry-boundary-no-evidence-2",
+      reconciliationFromCursor: "cursor-before-retry-boundary-2",
+      now: "2026-07-17T04:04:59.000Z",
+    })).rejects.toThrow(/nextattemptat|retry window|not due/i);
+  });
+
+  it("keeps retryable failures with accepted evidence out of pending so recovery cannot blind-resend them", async () => {
+    const context = await startEmbeddedDatabase();
+    const layer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
+    const store = new AsyncRoomStore(layer);
+    const created = await store.createRoom(
+      {
+        id: "room-retry-boundary-accepted",
+        projectId: "project-1",
+        objective: "Accepted evidence must stay ambiguous until reconciled",
+        protocolId: "implementation",
+        protocolVersion: 1,
+        now: "2026-07-17T04:10:00.000Z",
+      },
+      {
+        eventId: "event-retry-boundary-accepted-room-created",
+        actorType: "human",
+        actorId: "operator-1",
+        correlationId: "correlation-retry-boundary-accepted-room-created",
+        causationId: null,
+        occurredAt: "2026-07-17T04:10:00.000Z",
+      },
+    );
+    await layer.db.insert(roomSeats).values({
+      id: "seat-retry-boundary-accepted",
+      projectId: "project-1",
+      roomId: created.room.id,
+      role: "producer",
+      roleVersion: 1,
+      roleHistory: [],
+      permissionScope: ["room:message"],
+      state: "active",
+      activeBindingId: "binding-retry-boundary-accepted",
+      createdAt: "2026-07-17T04:10:00.000Z",
+      updatedAt: "2026-07-17T04:10:00.000Z",
+    });
+    await layer.db.insert(roomBindings).values({
+      id: "binding-retry-boundary-accepted",
+      projectId: "project-1",
+      roomId: created.room.id,
+      seatId: "seat-retry-boundary-accepted",
+      generation: 1,
+      connectorId: "happier",
+      providerId: "codex",
+      nativeSessionId: "codex-thread-retry-boundary-accepted",
+      happierSessionId: "happier-retry-boundary-accepted",
+      serverProfileId: "server-retry-boundary-accepted",
+      machineId: "machine-retry-boundary-accepted",
+      hostId: "windows-host-1",
+      state: "attached",
+      attachedAt: "2026-07-17T04:10:00.000Z",
+    });
+
+    const queuedAccepted = await store.enqueueMessage({
+      roomId: created.room.id,
+      expectedAggregateVersion: 0,
+      idempotencyKey: "retry-boundary:accepted-evidence",
+      message: {
+        id: "message-retry-boundary-accepted",
+        turnId: null,
+        nodeId: null,
+        originType: "controller",
+        originId: "room-controller-1",
+        targetSeatIds: ["seat-retry-boundary-accepted"],
+        intent: "instruction",
+        content: "Accepted evidence must stay ambiguous, never blind-pending.",
+        authorityEnvelope: { allowedActions: ["session:send"] },
+        createdAt: "2026-07-17T04:10:01.000Z",
+      },
+      deliveries: [{ id: "outbox-retry-boundary-accepted", bindingId: "binding-retry-boundary-accepted" }],
+    }, {
+      eventId: "event-retry-boundary-accepted",
+      actorType: "controller",
+      actorId: "room-controller-1",
+      correlationId: "correlation-retry-boundary-accepted",
+      causationId: "event-retry-boundary-accepted-room-created",
+      occurredAt: "2026-07-17T04:10:01.000Z",
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-retry-boundary-accepted",
+      attemptId: "attempt-retry-boundary-accepted-1",
+      reconciliationFromCursor: "cursor-before-retry-boundary-accepted",
+      now: "2026-07-17T04:10:02.000Z",
+    });
+    const acceptedFailure = await store.completeDeliveryAttempt({
+      outboxId: "outbox-retry-boundary-accepted",
+      attemptId: "attempt-retry-boundary-accepted-1",
+      outcome: "retryable_failure",
+      connectorAcknowledgementId: "ack-retry-boundary-accepted-1",
+      nativeMessageId: "native-retry-boundary-accepted-1",
+      nativeCursor: "cursor-retry-boundary-accepted-1",
+      errorCode: "transport_retryable",
+      nextAttemptAt: "2026-07-17T04:16:00.000Z",
+      now: "2026-07-17T04:10:03.000Z",
+      audit: { runId: "room-run-retry-boundary-accepted", agentId: "room-worker-1" },
+    });
+    expect(acceptedFailure).toMatchObject({
+      logicalMessageId: queuedAccepted.message.id,
+      localMessageId: queuedAccepted.deliveries[0]?.localMessageId,
+      state: "delivery_uncertain",
+      connectorAcknowledgementId: "ack-retry-boundary-accepted-1",
+      nativeMessageId: "native-retry-boundary-accepted-1",
+      nativeCursor: "cursor-retry-boundary-accepted-1",
+      nextAttemptAt: null,
+    });
+    await expect(store.beginDeliveryAttempt({
+      outboxId: "outbox-retry-boundary-accepted",
+      attemptId: "attempt-retry-boundary-accepted-2",
+      reconciliationFromCursor: "cursor-after-accepted-evidence",
+      now: "2026-07-17T04:16:01.000Z",
+    })).rejects.toThrow(/uncertain|accepted evidence|reconcile/i);
   });
 });

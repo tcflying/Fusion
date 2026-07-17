@@ -5836,8 +5836,12 @@ export type RunAuditMutationType =
 
 /** Input for recording a run-audit event. */
 export interface RunAuditEventInput {
+  /** Optional caller-stable event id for bounded retry/deduplication. */
+  id?: string;
   /** ISO-8601 timestamp when the event occurred. Defaults to current time if not provided. */
   timestamp?: string;
+  /** Optional bound project id for durable project-scoped audit queries. */
+  projectId?: string;
   /** Task ID associated with this event (if applicable). */
   taskId?: string;
   /** Agent ID that performed the mutation. */
@@ -5860,6 +5864,8 @@ export interface RunAuditEvent {
   id: string;
   /** ISO-8601 timestamp when the event occurred */
   timestamp: string;
+  /** Project ID associated with this event when the caller is project-bound. */
+  projectId?: string;
   /** Task ID associated with this event (if applicable) */
   taskId?: string;
   /** Agent ID that performed the mutation */
@@ -5878,6 +5884,8 @@ export interface RunAuditEvent {
 
 /** Filter options for querying run-audit events. */
 export interface RunAuditEventFilter {
+  /** Filter by bound project ID. */
+  projectId?: string;
   /** Filter by heartbeat run ID. */
   runId?: string;
   /** Filter by task ID. */

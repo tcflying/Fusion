@@ -88,7 +88,7 @@ pgDescribe("TaskStore.bypassFailedPreMergeReviewStep", () => {
     // FNXC:PostgresCutover 2026-07-10: getRunAuditEvents is the sync/sqlite
     // reader and intentionally returns [] in backend mode; the authoritative
     // PG read is the async queryRunAuditEvents helper.
-    const events = await queryRunAuditEvents(h.layer().db, { taskId: "FN-BYP-002" });
+    const events = await queryRunAuditEvents(h.layer(), { taskId: "FN-BYP-002" });
     const bypassEvent = events.find((event) => event.mutationType === "task:bypass-review");
     expect(bypassEvent).toBeDefined();
     expect(bypassEvent?.agentId).toBe("operator-2");

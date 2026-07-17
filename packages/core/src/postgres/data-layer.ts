@@ -86,6 +86,14 @@ export type DrizzleDb = PostgresJsDatabase<Record<string, never>>;
  */
 export type DbTransaction = PostgresJsTransaction<Record<string, never>, Record<string, never>>;
 
+type TransactionRunAuditScope = string | null;
+
+/*
+FNXC:RunAuditProjectScope 2026-07-18-02:04:
+Run-audit writes inside a project-bound transaction must inherit that transaction's project identity. A bare transaction may only write a project audit when the caller supplies projectId explicitly; NULL project_id is reserved for the explicit global/admin seam.
+*/
+const transactionRunAuditScopes = new WeakMap<object, TransactionRunAuditScope>();
+
 /**
  * Transaction configuration. Maps the SQLite transaction modes onto PostgreSQL.
  *
@@ -187,7 +195,9 @@ export interface AsyncDataLayer {
  * schemas.
  */
 export interface RunAuditEventInput {
+  readonly id?: string;
   readonly timestamp?: string;
+  readonly projectId?: string;
   readonly taskId?: string;
   readonly agentId: string;
   readonly runId: string;
@@ -201,6 +211,7 @@ export interface RunAuditEventInput {
 export interface RunAuditEvent {
   readonly id: string;
   readonly timestamp: string;
+  readonly projectId: string | null;
   readonly taskId: string | null;
   readonly agentId: string;
   readonly runId: string;
@@ -208,6 +219,84 @@ export interface RunAuditEvent {
   readonly mutationType: string;
   readonly target: string;
   readonly metadata: Record<string, unknown> | null;
+}
+
+type RunAuditComparablePayload = Omit<RunAuditEvent, "id">;
+
+export class RunAuditEventConflictError extends Error {
+  readonly code = "run_audit_event_conflict" as const;
+  readonly eventId: string;
+  readonly differingFields: readonly (keyof RunAuditComparablePayload)[];
+  readonly existing: RunAuditEvent;
+  readonly attempted: RunAuditEvent;
+
+  constructor(
+    eventId: string,
+    existing: RunAuditEvent,
+    attempted: RunAuditEvent,
+    differingFields: readonly (keyof RunAuditComparablePayload)[],
+  ) {
+    super(
+      `Run-audit event ${eventId} already exists with a different payload (${differingFields.join(", ")}).`,
+    );
+    this.name = "RunAuditEventConflictError";
+    this.eventId = eventId;
+    this.existing = existing;
+    this.attempted = attempted;
+    this.differingFields = differingFields;
+  }
+}
+
+export class RunAuditEventProjectScopeError extends Error {
+  readonly code = "run_audit_event_project_scope_required" as const;
+
+  constructor(message = "Run-audit writes require a project-bound transaction or explicit projectId") {
+    super(message);
+    this.name = "RunAuditEventProjectScopeError";
+  }
+}
+
+function normalizeRunAuditJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeRunAuditJson(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, normalizeRunAuditJson(nested)]),
+    );
+  }
+  return value ?? null;
+}
+
+function comparableRunAuditPayload(event: RunAuditEvent): RunAuditComparablePayload {
+  return {
+    timestamp: event.timestamp,
+    projectId: event.projectId ?? null,
+    taskId: event.taskId ?? null,
+    agentId: event.agentId,
+    runId: event.runId,
+    domain: event.domain,
+    mutationType: event.mutationType,
+    target: event.target,
+    metadata: normalizeRunAuditJson(event.metadata ?? null) as Record<string, unknown> | null,
+  };
+}
+
+function diffRunAuditPayload(
+  existing: RunAuditEvent,
+  attempted: RunAuditEvent,
+): Array<keyof RunAuditComparablePayload> {
+  const left = comparableRunAuditPayload(existing);
+  const right = comparableRunAuditPayload(attempted);
+  const differing: Array<keyof RunAuditComparablePayload> = [];
+  for (const key of Object.keys(left) as Array<keyof RunAuditComparablePayload>) {
+    if (JSON.stringify(left[key]) !== JSON.stringify(right[key])) {
+      differing.push(key);
+    }
+  }
+  return differing;
 }
 
 /**
@@ -231,18 +320,19 @@ export function createAsyncDataLayer(
   // any caller). We cast to the schema-typed view so callers get
   // compile-time table references via `layer.db`.
   const db = connections.runtime as unknown as DrizzleDb;
+  const projectId = options?.projectId;
 
   return {
     db,
-    projectId: options?.projectId,
-    async transaction<T>(fn: (tx: DbTransaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
-      return runInTransaction(db, fn, options);
+    projectId,
+    async transaction<T>(fn: (tx: DbTransaction) => Promise<T>, transactionOptions?: TransactionOptions): Promise<T> {
+      return runInTransaction(db, fn, transactionOptions, projectId);
     },
-    async transactionImmediate<T>(fn: (tx: DbTransaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
+    async transactionImmediate<T>(fn: (tx: DbTransaction) => Promise<T>, transactionOptions?: TransactionOptions): Promise<T> {
       return runInTransaction(db, fn, {
         accessMode: "read write",
-        ...options,
-      });
+        ...transactionOptions,
+      }, projectId);
     },
     async ping(): Promise<void> {
       await connections.ping();
@@ -272,6 +362,7 @@ async function runInTransaction<T>(
   db: DrizzleDb,
   fn: (tx: DbTransaction) => Promise<T>,
   options?: TransactionOptions,
+  projectId?: string,
 ): Promise<T> {
   const config: {
     isolationLevel?: TransactionOptions["isolationLevel"];
@@ -290,9 +381,35 @@ async function runInTransaction<T>(
     config.accessMode !== undefined ||
     config.deferrable !== undefined;
   return db.transaction(
-    async (tx) => fn(tx as unknown as DbTransaction),
+    async (tx) => {
+      const transaction = tx as unknown as DbTransaction;
+      transactionRunAuditScopes.set(transaction, projectId ?? null);
+      try {
+        return await fn(transaction);
+      } finally {
+        transactionRunAuditScopes.delete(transaction);
+      }
+    },
     hasConfig ? config : undefined,
   );
+}
+
+function resolveRunAuditProjectId(
+  tx: DbTransaction,
+  inputProjectId: string | undefined,
+): string {
+  const hasTransactionScope = transactionRunAuditScopes.has(tx);
+  const transactionProjectId = transactionRunAuditScopes.get(tx);
+  if (hasTransactionScope && transactionProjectId) {
+    if (inputProjectId && inputProjectId !== transactionProjectId) {
+      throw new RunAuditEventProjectScopeError(
+        `Run-audit write attempted to override bound projectId ${transactionProjectId} with ${inputProjectId}`,
+      );
+    }
+    return transactionProjectId;
+  }
+  if (inputProjectId) return inputProjectId;
+  throw new RunAuditEventProjectScopeError();
 }
 
 /**
@@ -317,11 +434,29 @@ export async function recordRunAuditEventWithinTransaction(
   tx: DbTransaction,
   input: RunAuditEventInput,
 ): Promise<RunAuditEvent> {
-  const id = randomUUID();
+  const projectId = resolveRunAuditProjectId(tx, input.projectId);
+  return persistRunAuditEventWithinTransaction(tx, input, projectId);
+}
+
+/** Explicit admin seam for the rare audit facts that are intentionally global. */
+export async function recordGlobalRunAuditEventWithinTransaction(
+  tx: DbTransaction,
+  input: Omit<RunAuditEventInput, "projectId">,
+): Promise<RunAuditEvent> {
+  return persistRunAuditEventWithinTransaction(tx, input, null);
+}
+
+async function persistRunAuditEventWithinTransaction(
+  tx: DbTransaction,
+  input: RunAuditEventInput,
+  projectId: string | null,
+): Promise<RunAuditEvent> {
+  const id = input.id ?? randomUUID();
   const timestamp = input.timestamp ?? new Date().toISOString();
-  const event: RunAuditEvent = {
+  const attempted: RunAuditEvent = {
     id,
     timestamp,
+    projectId,
     taskId: input.taskId ?? null,
     agentId: input.agentId,
     runId: input.runId,
@@ -330,20 +465,63 @@ export async function recordRunAuditEventWithinTransaction(
     target: input.target,
     metadata: input.metadata ?? null,
   };
-
+  /*
+   * FNXC:SessionRoomAudit 2026-07-17-00:50:
+   * Room lifecycle audits now supply a caller-stable id and a bound projectId.
+   * The id makes bounded retry safe against duplicate inserts, and the explicit
+   * project column is the authority for cross-project isolation; metadata is
+   * only a backfill source for older rows, never the live partition key.
+   */
   await tx.insert(schema.project.runAuditEvents).values({
-    id: event.id,
-    timestamp: event.timestamp,
-    taskId: event.taskId,
-    agentId: event.agentId,
-    runId: event.runId,
-    domain: event.domain,
-    mutationType: event.mutationType,
-    target: event.target,
-    metadata: event.metadata,
+    id,
+    timestamp,
+    projectId,
+    taskId: input.taskId ?? null,
+    agentId: input.agentId,
+    runId: input.runId,
+    domain: input.domain,
+    mutationType: input.mutationType,
+    target: input.target,
+    metadata: input.metadata ?? null,
+  }).onConflictDoNothing({
+    target: schema.project.runAuditEvents.id,
   });
-
-  return event;
+  const stored = await tx
+    .select()
+    .from(schema.project.runAuditEvents)
+    .where(eq(schema.project.runAuditEvents.id, id))
+    .limit(1)
+    .then((rows) => rows[0]);
+  if (!stored) {
+    throw new Error(`Run audit insert for ${id} did not persist a readable row`);
+  }
+  const persisted: RunAuditEvent = {
+    id: stored.id,
+    timestamp: stored.timestamp,
+    projectId: stored.projectId,
+    taskId: stored.taskId,
+    agentId: stored.agentId,
+    runId: stored.runId,
+    domain: stored.domain,
+    mutationType: stored.mutationType,
+    target: stored.target,
+    metadata: stored.metadata as Record<string, unknown> | null,
+  };
+  /*
+   * FNXC:RunAuditIdempotency 2026-07-18-02:04:
+   * A caller-stable id with no timestamp treats the first persisted timestamp
+   * as canonical. Retries compare every caller-controlled field while reusing
+   * that timestamp, so clock movement alone cannot turn a safe retry into a
+   * false payload conflict.
+   */
+  const comparableAttempted = input.id && input.timestamp === undefined
+    ? { ...attempted, timestamp: persisted.timestamp }
+    : attempted;
+  const differingFields = diffRunAuditPayload(persisted, comparableAttempted);
+  if (differingFields.length > 0) {
+    throw new RunAuditEventConflictError(id, persisted, comparableAttempted, differingFields);
+  }
+  return persisted;
 }
 
 /**
@@ -359,7 +537,10 @@ export async function recordRunAuditEvent(
   input: RunAuditEventInput,
 ): Promise<RunAuditEvent> {
   return layer.transactionImmediate(async (tx) =>
-    recordRunAuditEventWithinTransaction(tx, input),
+    recordRunAuditEventWithinTransaction(tx, {
+      ...input,
+      projectId: layer.projectId ?? input.projectId,
+    }),
   );
 }
 

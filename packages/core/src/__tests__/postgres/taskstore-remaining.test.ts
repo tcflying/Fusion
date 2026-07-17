@@ -425,7 +425,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
       });
     });
 
-    const events = await queryRunAuditEvents(ctx.layer.db, { taskId: "KB-AUDIT" });
+    const events = await queryRunAuditEvents(ctx.layer, { taskId: "KB-AUDIT" });
     expect(events).toHaveLength(1);
     expect(events[0]?.mutationType).toBe("task:create");
     expect(events[0]?.metadata).toEqual({ foo: "bar" });

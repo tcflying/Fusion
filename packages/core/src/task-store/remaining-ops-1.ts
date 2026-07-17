@@ -512,7 +512,9 @@ export async function recordRunAuditEventImpl(store: TaskStore, input: RunAuditE
     if (store.backendMode) {
       const layer = store.asyncLayer!;
       const raw = await recordRunAuditEventAsync(layer, {
+        id: input.id,
         timestamp: input.timestamp,
+        projectId: input.projectId,
         taskId: input.taskId,
         agentId: input.agentId,
         runId: input.runId,
@@ -523,17 +525,19 @@ export async function recordRunAuditEventImpl(store: TaskStore, input: RunAuditE
       });
       return {
         ...raw,
+        projectId: raw.projectId ?? undefined,
         taskId: raw.taskId ?? undefined,
         domain: raw.domain as RunAuditEvent["domain"],
         metadata: raw.metadata ?? undefined,
       };
     }
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
     const timestamp = input.timestamp ?? new Date().toISOString();
 
     const event: RunAuditEvent = {
       id,
       timestamp,
+      projectId: input.projectId,
       taskId: input.taskId,
       agentId: input.agentId,
       runId: input.runId,

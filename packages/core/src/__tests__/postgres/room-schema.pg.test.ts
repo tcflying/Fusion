@@ -19,6 +19,8 @@ import {
   SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
   SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
+  SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+  SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -75,6 +77,8 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -85,6 +89,8 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -245,6 +251,8 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -276,6 +284,8 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -326,6 +336,8 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -403,6 +415,8 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -548,6 +562,8 @@ describe("Session Room PostgreSQL migration", () => {
     expect(result.appliedVersions).toEqual([
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
     ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable
@@ -569,5 +585,50 @@ describe("Session Room PostgreSQL migration", () => {
         AND column_name = 'machine_id'
     `)) as unknown as Array<{ column_name: string; is_nullable: string }>;
     expect(bindingColumns).toEqual([{ column_name: "machine_id", is_nullable: "YES" }]);
+  });
+
+  it("idempotently backfills legacy Room run-audit rows from metadata during 0007", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.tasks (
+        id, project_id, description, "column", created_at, updated_at
+      ) VALUES (
+        'legacy-task-audit-target', 'project-task-owner', 'legacy task', 'done',
+        '2026-07-17T12:49:00.000Z', '2026-07-17T12:49:00.000Z'
+      )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.run_audit_events (
+        id, timestamp, project_id, task_id, agent_id, run_id,
+        domain, mutation_type, target, metadata
+      ) VALUES
+        (
+          'legacy-room-audit', '2026-07-17T12:50:00.000Z', NULL, NULL,
+          'legacy-worker', 'room-controller:legacy', 'database',
+          'room:worker-started', 'legacy-room',
+          ${JSON.stringify({ projectId: "project-legacy", roomId: "legacy-room" })}::jsonb
+        ),
+        (
+          'legacy-task-audit', '2026-07-17T12:51:00.000Z', NULL, 'legacy-task-audit-target',
+          'legacy-worker', 'task-run:legacy', 'database',
+          'mergeQueue:enqueue', 'legacy-task-audit-target', '{}'::jsonb
+        )
+    `);
+
+    await context.connections!.migration.execute(
+      sql.raw(await readSchemaMigrationSql(SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION)),
+    );
+
+    const rows = (await context.connections!.migration.execute(sql`
+      SELECT id, project_id
+      FROM project.run_audit_events
+      WHERE id IN ('legacy-room-audit', 'legacy-task-audit')
+      ORDER BY id
+    `)) as unknown as Array<{ id: string; project_id: string | null }>;
+    expect(rows).toEqual([
+      { id: "legacy-room-audit", project_id: "project-legacy" },
+      { id: "legacy-task-audit", project_id: "project-task-owner" },
+    ]);
   });
 });
