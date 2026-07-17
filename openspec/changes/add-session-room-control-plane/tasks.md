@@ -98,7 +98,7 @@
 - [ ] 9.5 Add native LAN listener configuration plus authenticated HTTPS public gateway, device pairing/revocation, rate limits, emergency ingress disablement, and private internal service ports.
 - [ ] 9.6 Add separate operational-retention, anonymized-evaluation, and evolution-sample authorizations; prove Room deletion cannot delete provider Sessions.
 - [ ] 9.7 Add complete operator/device/policy/approval/denial audit events without secret or unrestricted prompt content.
-- [ ] 9.8 Add dependency license/source/SHA/NOTICE inventory and automated gates for reused external orchestrator code or strategies.
+- [x] 9.8 Add dependency license/source/SHA/NOTICE inventory and automated gates for reused external orchestrator code or strategies.
 
 ## 10. Controlled Evolution Controller
 
