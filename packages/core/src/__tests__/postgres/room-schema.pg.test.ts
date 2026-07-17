@@ -17,6 +17,7 @@ import {
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
   SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+  SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
@@ -73,6 +74,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -82,6 +84,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -95,6 +98,18 @@ describe("Session Room PostgreSQL migration", () => {
       ORDER BY table_name
     `)) as unknown as Array<{ table_name: string }>;
     expect(rows.map((row) => row.table_name)).toEqual([...ROOM_PROJECT_TABLE_NAMES].sort());
+
+    const membershipForeignKeys = (await context.connections!.migration.execute(sql`
+      SELECT constraint_name
+      FROM information_schema.table_constraints
+      WHERE table_schema = 'project'
+        AND table_name = 'room_membership_changes'
+        AND constraint_type = 'FOREIGN KEY'
+      ORDER BY constraint_name
+    `)) as unknown as Array<{ constraint_name: string }>;
+    expect(membershipForeignKeys).toEqual([
+      { constraint_name: "room_membership_changes_room_project_fkey" },
+    ]);
 
     await context.connections!.migration.execute(sql`
       INSERT INTO project.operational_rooms (
@@ -229,6 +244,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -259,6 +275,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -308,6 +325,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -384,6 +402,7 @@ describe("Session Room PostgreSQL migration", () => {
     expect(result.appliedVersions).toEqual([
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
       SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -526,7 +545,10 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION]);
+    expect(result.appliedVersions).toEqual([
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+    ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable
       FROM information_schema.columns

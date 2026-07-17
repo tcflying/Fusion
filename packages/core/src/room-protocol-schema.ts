@@ -169,10 +169,13 @@ function objectAt(
     return null;
   }
   const allowed = new Set(allowedKeys);
-  for (const key of Object.keys(value)) {
+  for (const key of Object.getOwnPropertyNames(value)) {
     if (!allowed.has(key)) {
       issue(issues, "unknown_field", `${path}.${key}`, `Unknown field '${key}'`);
     }
+  }
+  for (const key of Object.getOwnPropertySymbols(value)) {
+    issue(issues, "unknown_field", `${path}[${String(key)}]`, "Symbol-keyed fields are not supported");
   }
   for (const key of requiredKeys) {
     if (!Object.prototype.hasOwnProperty.call(value, key)) {
@@ -241,6 +244,34 @@ function arrayAt(
   if (!Array.isArray(value)) {
     issue(issues, "invalid_type", path, "Expected an array");
     return null;
+  }
+  let populatedIndexes = 0;
+  for (const key of Reflect.ownKeys(value)) {
+    if (key === "length") continue;
+    if (typeof key === "symbol") {
+      issue(issues, "unknown_field", `${path}[${String(key)}]`, "Symbol-keyed array fields are not supported");
+      continue;
+    }
+    const index = Number(key);
+    const isElementIndex =
+      Number.isInteger(index) && index >= 0 && index < value.length && String(index) === key;
+    if (!isElementIndex) {
+      issue(issues, "unknown_field", `${path}.${key}`, `Unknown array field '${key}'`);
+      continue;
+    }
+    populatedIndexes += 1;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      issue(
+        issues,
+        "invalid_array_element",
+        `${path}[${index}]`,
+        "Array elements must be enumerable data properties",
+      );
+    }
+  }
+  if (populatedIndexes !== value.length) {
+    issue(issues, "sparse_array", path, "Sparse arrays are not valid declarative protocol data");
   }
   return value;
 }
@@ -484,7 +515,23 @@ function containsCycle(nodes: ReadonlySet<string>, adjacency: ReadonlyMap<string
   return false;
 }
 
-function validateRoomProtocolDefinitionUnchecked(input: unknown): ProtocolValidationResult {
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (typeof value !== "object" || value === null) return value;
+  const objectValue = value as object;
+  if (seen.has(objectValue)) return value;
+  seen.add(objectValue);
+  for (const key of Reflect.ownKeys(objectValue)) {
+    const descriptor = Object.getOwnPropertyDescriptor(objectValue, key);
+    if (descriptor && "value" in descriptor) deepFreeze(descriptor.value, seen);
+  }
+  Object.freeze(objectValue);
+  return value;
+}
+
+function validateRoomProtocolDefinitionUnchecked(
+  input: unknown,
+  normalize = true,
+): ProtocolValidationResult {
   const issues: ProtocolValidationIssue[] = [];
   const protocol = objectAt(input, "$", PROTOCOL_KEYS, PROTOCOL_KEYS, issues);
   if (!protocol) return { ok: false, issues };
@@ -729,9 +776,13 @@ function validateRoomProtocolDefinitionUnchecked(input: unknown): ProtocolValida
     }
   });
 
-  return issues.length === 0
-    ? { ok: true, value: input as RoomProtocolDefinitionV1 }
-    : { ok: false, issues };
+  if (issues.length > 0) return { ok: false, issues };
+  if (!normalize) return { ok: true, value: input as RoomProtocolDefinitionV1 };
+
+  const normalized = structuredClone(input);
+  const normalizedResult = validateRoomProtocolDefinitionUnchecked(normalized, false);
+  if (!normalizedResult.ok) return normalizedResult;
+  return { ok: true, value: deepFreeze(normalizedResult.value) };
 }
 
 export function validateRoomProtocolDefinition(input: unknown): ProtocolValidationResult {
@@ -930,6 +981,25 @@ function validateRoomProtocolMigrationUnchecked(input: unknown): ProtocolMigrati
   }
   if (new Set(Object.values(roleIdMap)).size !== Object.values(roleIdMap).length) {
     issue(issues, "non_injective_role_mapping", "$.migration.roleIdMap", "Role mappings must not merge authority roles");
+  }
+
+  const sourcePhasesById = new Map(fromProtocol.phases.map((phase) => [phase.id, phase]));
+  const targetPhasesById = new Map(toProtocol.phases.map((phase) => [phase.id, phase]));
+  for (const [sourcePhaseId, targetPhaseId] of Object.entries(phaseIdMap)) {
+    const sourcePhase = sourcePhasesById.get(sourcePhaseId);
+    const targetPhase = targetPhasesById.get(targetPhaseId);
+    if (!sourcePhase || !targetPhase) continue;
+    for (const sourceRoleId of sourcePhase.roleIds) {
+      const targetRoleId = roleIdMap[sourceRoleId];
+      if (targetRoleId !== undefined && !targetPhase.roleIds.includes(targetRoleId)) {
+        issue(
+          issues,
+          "phase_role_mapping_mismatch",
+          `$.migration.phaseIdMap.${sourcePhaseId}`,
+          `Mapped role '${targetRoleId}' is not a member of target phase '${targetPhaseId}'`,
+        );
+      }
+    }
   }
 
   if (issues.length > 0) return { ok: false, issues };

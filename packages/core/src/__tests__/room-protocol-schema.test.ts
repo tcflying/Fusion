@@ -275,6 +275,99 @@ describe("Room declarative protocol schema v1", () => {
     expect(issues.some((issue) => issue.path.includes("executableHook"))).toBe(true);
   });
 
+  it("rejects sparse arrays at both aggregate and nested schema levels", () => {
+    const protocol = validProtocol();
+    const sparsePhases = [...protocol.phases];
+    sparsePhases.length += 1;
+    expectProtocolIssues({ ...protocol, phases: sparsePhases }, ["sparse_array"]);
+
+    const sparseRoleIds = [...protocol.phases[0].roleIds];
+    sparseRoleIds.length += 1;
+    expectProtocolIssues(
+      {
+        ...protocol,
+        phases: [
+          { ...protocol.phases[0], roleIds: sparseRoleIds },
+          protocol.phases[1],
+        ],
+      },
+      ["sparse_array"],
+    );
+  });
+
+  it("rejects non-enumerable unknown fields", () => {
+    const protocol = validProtocol();
+    Object.defineProperty(protocol, "hiddenExecutableHook", {
+      configurable: true,
+      enumerable: false,
+      value: "run arbitrary code",
+    });
+
+    expectProtocolIssues(protocol, ["unknown_field"]);
+  });
+
+  it("rejects symbol-keyed unknown fields", () => {
+    const protocol = validProtocol();
+    Object.defineProperty(protocol, Symbol("hiddenExecutableHook"), {
+      configurable: true,
+      enumerable: true,
+      value: "run arbitrary code",
+    });
+
+    expectProtocolIssues(protocol, ["unknown_field"]);
+  });
+
+  it("rejects hidden and symbol-keyed fields attached to schema arrays", () => {
+    const protocol = validProtocol();
+    const phasesWithHiddenField = [...protocol.phases];
+    Object.defineProperty(phasesWithHiddenField, "hiddenExecutableHook", {
+      configurable: true,
+      enumerable: false,
+      value: "run arbitrary code",
+    });
+    expectProtocolIssues(
+      { ...protocol, phases: phasesWithHiddenField },
+      ["unknown_field"],
+    );
+
+    const phasesWithSymbol = [...protocol.phases];
+    Object.defineProperty(phasesWithSymbol, Symbol("hiddenExecutableHook"), {
+      configurable: true,
+      enumerable: true,
+      value: "run arbitrary code",
+    });
+    expectProtocolIssues({ ...protocol, phases: phasesWithSymbol }, ["unknown_field"]);
+  });
+
+  it("fails closed for reflective proxy objects even when their visible shape is valid", () => {
+    const protocol = new Proxy(validProtocol(), {});
+
+    expectProtocolIssues(protocol, ["invalid_runtime_value"]);
+  });
+
+  it("returns a normalized deeply frozen value that cannot drift after validation", () => {
+    const protocol = validProtocol();
+    const result = requireProtocolValidator()(protocol);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error("Expected valid protocol normalization to succeed");
+    }
+    expect(result.value).not.toBe(protocol);
+    expect(result.value.phases).not.toBe(protocol.phases);
+    expect(Object.isFrozen(result.value)).toBe(true);
+    expect(Object.isFrozen(result.value.phases)).toBe(true);
+    expect(Object.isFrozen(result.value.phases[0])).toBe(true);
+    expect(Object.isFrozen(result.value.phases[0].roleIds)).toBe(true);
+
+    const normalizedPhases = result.value.phases as unknown as unknown[];
+    expect(() => normalizedPhases.push(result.value.phases[0])).toThrow(TypeError);
+
+    const originalRoleIds = protocol.phases[0].roleIds as unknown as string[];
+    originalRoleIds.push("verifier");
+    expect(result.value.phases[0].roleIds).toEqual(["producer"]);
+  });
+
   it("rejects duplicate identifiers inside every declarative namespace", () => {
     const protocol = validProtocol();
     const duplicateCases: readonly unknown[] = [
@@ -594,6 +687,26 @@ describe("Room declarative protocol schema v1", () => {
         nextPhaseId: "produce_v2",
       },
     });
+  });
+
+  it("preserves phase role membership across protocol migration mappings", () => {
+    const validateMigration = requireProtocolMigrationValidator();
+    const fixture = migrationFixture();
+    const result = validateMigration({
+      ...fixture,
+      migration: {
+        ...fixture.migration,
+        roleIdMap: { producer: "verifier", verifier: "producer" },
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      throw new Error("Expected incompatible phase/role membership to fail migration");
+    }
+    expect(result.issues.map((entry) => entry.code)).toContain(
+      "phase_role_mapping_mismatch",
+    );
   });
 
   it.each([
