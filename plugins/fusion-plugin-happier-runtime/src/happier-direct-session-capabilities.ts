@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { lstat, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, parse, relative } from "node:path";
 
 import type {
   SessionConnectorCapabilityName,
@@ -57,6 +59,195 @@ export const HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST = {
 export const HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT = `sha256:${createHash("sha256")
   .update(JSON.stringify(HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST))
   .digest("hex")}`;
+
+export interface HappierDirectSessionRuntimeBuildPin {
+  readonly pinId: string;
+  readonly entrypointSha256: `sha256:${string}`;
+  readonly runtimeArtifactSha256: `sha256:${string}`;
+}
+
+export type HappierDirectSessionRuntimeBuildFailureReason =
+  | "cli_path_unbound"
+  | "cli_path_forbidden"
+  | "cli_artifact_unpinned"
+  | "cli_artifact_mismatch"
+  | "cli_capabilities_invalid";
+
+export type HappierDirectSessionRuntimeBuildVerification =
+  | Readonly<{
+    ok: true;
+    pinId: string;
+    entrypointPath: string;
+    runtimeArtifactPath: string;
+    entrypointSha256: `sha256:${string}`;
+    runtimeArtifactSha256: `sha256:${string}`;
+    launchDigest: `sha256:${string}`;
+    trustLevel: "local_artifact_hash_only";
+  }>
+  | Readonly<{
+    ok: false;
+    reasonCode: HappierDirectSessionRuntimeBuildFailureReason;
+  }>;
+
+interface HappierRuntimeBuildFilesystem {
+  readonly lstat: typeof lstat;
+  readonly readFile: typeof readFile;
+  readonly realpath: typeof realpath;
+}
+
+interface HappierRuntimeBuildVerificationOptions {
+  readonly pins?: readonly HappierDirectSessionRuntimeBuildPin[];
+  readonly filesystem?: HappierRuntimeBuildFilesystem;
+}
+
+/**
+ * Exact local package-dist build accepted by the Session Connector review.
+ * This pin detects ordinary path/build drift only. It is deliberately not
+ * described as Git provenance, a complete Node dependency closure, live
+ * provider certification, or protection from a hostile same-user process.
+ */
+export const HAPPIER_DIRECT_SESSION_RUNTIME_BUILD_PINS: readonly HappierDirectSessionRuntimeBuildPin[] = Object.freeze([
+  Object.freeze({
+    pinId: "happier-cli-0.2.10-package-dist-2026-07-17.1",
+    entrypointSha256: "sha256:293d55ba1267cf8a297fd641887538ae43726f4b23fc9ce6ad2d9db212c95f2d",
+    runtimeArtifactSha256: "sha256:13a3a35835359949c119d8e3c11800cd949aa4877075ced5603948333bcce6b6",
+  }),
+]);
+
+const DEFAULT_RUNTIME_BUILD_FILESYSTEM: HappierRuntimeBuildFilesystem = {
+  lstat,
+  readFile,
+  realpath,
+};
+
+function runtimeBuildRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function sha256Bytes(bytes: Uint8Array): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function isForbiddenRuntimePath(value: string): boolean {
+  if (!isAbsolute(value) || value.startsWith("\\\\") || value.startsWith("//")) return true;
+  const root = parse(value).root;
+  return value.slice(root.length).includes(":");
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toLocaleLowerCase("en-US") === right.toLocaleLowerCase("en-US")
+    : left === right;
+}
+
+function hasExactRuntimeTrustMetadata(record: Record<string, unknown>): boolean {
+  const artifact = runtimeBuildRecord(record.runtimeArtifact);
+  const attestation = runtimeBuildRecord(record.attestation);
+  const build = runtimeBuildRecord(attestation?.buildAttestation);
+  const git = runtimeBuildRecord(attestation?.gitProvenance);
+  const provider = runtimeBuildRecord(attestation?.liveProviderCertification);
+  return record.fingerprintScope === "capability_manifest"
+    && typeof artifact?.path === "string"
+    && /^sha256:[a-f0-9]{64}$/.test(String(artifact.sha256))
+    && attestation?.schemaVersion === 1
+    && attestation.trustModel === "self_reported_local_process"
+    && build?.kind === "loaded_module_file_sha256"
+    && build.hashScope === "file_bytes"
+    && git?.status === "not_attested"
+    && provider?.status === "not_certified";
+}
+
+/**
+ * Independently hashes the explicitly configured package-dist entrypoint and
+ * the command chunk reported by the just-invoked Happier process. PATH names,
+ * shell shims, bin/happier.mjs, dist, and backup launchers fail closed.
+ */
+export async function verifyHappierDirectSessionRuntimeBuild(
+  value: unknown,
+  configuredEntrypoint: string | undefined,
+  options: HappierRuntimeBuildVerificationOptions = {},
+): Promise<HappierDirectSessionRuntimeBuildVerification> {
+  if (!configuredEntrypoint?.trim()) return { ok: false, reasonCode: "cli_path_unbound" };
+  if (!isCertifiedHappierDirectSessionRuntimeManifest(value) || !hasExactRuntimeTrustMetadata(value as Record<string, unknown>)) {
+    return { ok: false, reasonCode: "cli_capabilities_invalid" };
+  }
+
+  const entrypoint = configuredEntrypoint.trim();
+  const observed = value as Record<string, unknown>;
+  const runtimeArtifact = observed.runtimeArtifact as Record<string, unknown>;
+  const reportedRuntimePath = runtimeArtifact.path as string;
+  if (isForbiddenRuntimePath(entrypoint) || isForbiddenRuntimePath(reportedRuntimePath)) {
+    return { ok: false, reasonCode: "cli_path_forbidden" };
+  }
+
+  const filesystem = options.filesystem ?? DEFAULT_RUNTIME_BUILD_FILESYSTEM;
+  try {
+    const [entrypointInfo, runtimeInfo] = await Promise.all([
+      filesystem.lstat(entrypoint),
+      filesystem.lstat(reportedRuntimePath),
+    ]);
+    if (
+      !entrypointInfo.isFile()
+      || entrypointInfo.isSymbolicLink()
+      || !runtimeInfo.isFile()
+      || runtimeInfo.isSymbolicLink()
+    ) return { ok: false, reasonCode: "cli_path_forbidden" };
+
+    const [canonicalEntrypoint, canonicalRuntimeArtifact] = await Promise.all([
+      filesystem.realpath(entrypoint),
+      filesystem.realpath(reportedRuntimePath),
+    ]);
+    const packageDistDirectory = dirname(canonicalEntrypoint);
+    const runtimeRelativePath = relative(packageDistDirectory, canonicalRuntimeArtifact);
+    if (
+      basename(packageDistDirectory) !== "package-dist"
+      || basename(canonicalEntrypoint) !== "index.mjs"
+      || runtimeRelativePath.includes("/")
+      || runtimeRelativePath.includes("\\")
+      || runtimeRelativePath.startsWith("..")
+      || !/^index-[A-Za-z0-9_-]+\.mjs$/.test(runtimeRelativePath)
+      || !samePath(dirname(canonicalRuntimeArtifact), packageDistDirectory)
+    ) return { ok: false, reasonCode: "cli_path_forbidden" };
+
+    const [entrypointBytes, runtimeArtifactBytes] = await Promise.all([
+      filesystem.readFile(canonicalEntrypoint),
+      filesystem.readFile(canonicalRuntimeArtifact),
+    ]);
+    const entrypointSha256 = sha256Bytes(entrypointBytes);
+    const runtimeArtifactSha256 = sha256Bytes(runtimeArtifactBytes);
+    if (runtimeArtifact.sha256 !== runtimeArtifactSha256) {
+      return { ok: false, reasonCode: "cli_artifact_mismatch" };
+    }
+    const pin = (options.pins ?? HAPPIER_DIRECT_SESSION_RUNTIME_BUILD_PINS).find(
+      (candidate) => candidate.entrypointSha256 === entrypointSha256
+        && candidate.runtimeArtifactSha256 === runtimeArtifactSha256,
+    );
+    if (!pin) return { ok: false, reasonCode: "cli_artifact_unpinned" };
+
+    const launchDigest = `sha256:${createHash("sha256").update(JSON.stringify({
+      version: 1,
+      pinId: pin.pinId,
+      entrypointPath: canonicalEntrypoint,
+      runtimeArtifactPath: canonicalRuntimeArtifact,
+      entrypointSha256,
+      runtimeArtifactSha256,
+    })).digest("hex")}` as const;
+    return {
+      ok: true,
+      pinId: pin.pinId,
+      entrypointPath: canonicalEntrypoint,
+      runtimeArtifactPath: canonicalRuntimeArtifact,
+      entrypointSha256,
+      runtimeArtifactSha256,
+      launchDigest,
+      trustLevel: "local_artifact_hash_only",
+    };
+  } catch {
+    return { ok: false, reasonCode: "cli_path_forbidden" };
+  }
+}
 
 export type HappierDirectSessionProviderId = (typeof HAPPIER_DIRECT_SESSION_PROVIDER_IDS)[number];
 export type HappierDirectSessionUpstreamSurface =

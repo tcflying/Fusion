@@ -53,13 +53,47 @@ const DIRECT_TRANSCRIPT_EVENT =
   '{"v":1,"ok":true,"kind":"direct_session_transcript_delta","data":{"machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"fromCursor":"cursor-2","nextCursor":"cursor-3","truncated":false,"items":[{"id":"message-2","createdAtMs":1752729001000,"raw":{"role":"assistant","text":"world"}}]}}';
 const DIRECT_STATUS_EVENT =
   '{"v":1,"ok":true,"kind":"direct_session_status_delta","data":{"eventType":"status","machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"isRunning":true,"lastActivityAtMs":1752729001000,"observedAtMs":1752729001500}}';
+
+/*
+FNXC:HappierManifestContract 2026-07-17-19:53:
+This literal mirrors Happier apps/cli/src/cli/commands/directSession/capabilities.ts rather than spreading Fusion's manifest into the fake upstream response. Equality proves the two repositories agree on the declared manifest and file-hash review boundary; it does not certify every executable behavior, unlisted source drift, or a live provider.
+*/
+const UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE = {
+  contractVersion: 1,
+  manifestVersion: "2026-07-17.1",
+  reviewedSourceRevision: "f07b7317cd4c7f0cfa762189dc68d16750a48182",
+  publicCommands: ["capabilities", "ensure", "read-after", "events"],
+  sourceBinding: "ensure_does_not_export_normalized_source",
+  providers: {
+    codex: {
+      canonicalUri: "codex://threads/<native-session-id>",
+      transcript: "bounded_polling",
+      runningSignal: "unavailable",
+      takeover: "provider_internal_only",
+    },
+    claude: {
+      canonicalUri: "claude://sessions/<native-session-id>",
+      transcript: "bounded_polling",
+      runningSignal: "unavailable",
+      takeover: "provider_internal_only",
+    },
+    opencode: {
+      canonicalUri: "opencode://sessions/<native-session-id>",
+      transcript: "bounded_polling",
+      runningSignal: "busy",
+      takeover: "provider_internal_only",
+    },
+  },
+} as const;
+const UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE =
+  "sha256:f6675f1e96e156a3e0b8bad8bb28e8e8f94f769164647a636ba6713929d65200";
 const DIRECT_CAPABILITIES_SUCCESS = JSON.stringify({
   v: 1,
   ok: true,
   kind: "direct_session_capabilities",
   data: {
-    ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
-    fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+    ...UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE,
+    fingerprint: UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE,
     cliVersion: "0.2.10",
   },
 });
@@ -359,7 +393,12 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
-  it("reads the executable Direct Session capability attestation with exact shell-free argv", async () => {
+  it("reads the Direct Session manifest attestation with exact shell-free argv", async () => {
+    expect(UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE)
+      .toEqual(HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST);
+    expect(UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE)
+      .toBe(HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT);
+
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
     const promise = getHappierDirectSessionCapabilities(settings());
@@ -367,8 +406,8 @@ describe("Happier session wrappers", () => {
     fake.close(0);
 
     await expect(promise).resolves.toEqual({
-      ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
-      fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+      ...UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE,
+      fingerprint: UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE,
       cliVersion: "0.2.10",
     });
     expect(mockSpawn).toHaveBeenCalledWith(

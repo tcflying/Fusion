@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
 import {
   SESSION_CONNECTOR_CAPABILITIES,
   type SessionConnectorCapabilityName,
@@ -21,6 +24,31 @@ const NOW = "2026-07-17T08:30:00.000Z";
 const SERVER_ID = "server-1";
 const MACHINE_ID = "machine-1";
 const HOST_ID = "fusion-host-1";
+const HAPPIER_REPOSITORY_ENV = "FUSION_HAPPIER_REPOSITORY";
+const CONFIGURED_HAPPIER_REPOSITORY = process.env[HAPPIER_REPOSITORY_ENV]?.trim() || null;
+const execFileAsync = promisify(execFile);
+
+/*
+FNXC:HappierSourceAttestation 2026-07-17-19:53:
+The source matrix is a manifest/file-hash attestation, so a configured Happier checkout must resolve every reviewed revision:path to the declared Git blob. An unset checkout is an explicit external-fixture skip; a configured but unavailable or incomplete checkout must fail instead of silently downgrading the assertion.
+*/
+async function runConfiguredHappierGit(...args: string[]): Promise<string> {
+  if (!CONFIGURED_HAPPIER_REPOSITORY) {
+    throw new Error(`${HAPPIER_REPOSITORY_ENV} is unset; the external Happier checkout test must be skipped`);
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", CONFIGURED_HAPPIER_REPOSITORY, ...args],
+      { encoding: "utf8", timeout: 10_000, windowsHide: true },
+    );
+    return stdout.trim();
+  } catch {
+    throw new Error(
+      `Configured Happier repository "${CONFIGURED_HAPPIER_REPOSITORY}" cannot resolve: git ${args.join(" ")}. Unset ${HAPPIER_REPOSITORY_ENV} only when the external checkout is intentionally unavailable.`,
+    );
+  }
+}
 
 const EXPECTED_CONNECTOR_STATES = {
   ensureExisting: "unverified",
@@ -133,6 +161,16 @@ function connectorFor(providerId: HappierDirectSessionProviderId): HappierSessio
       fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
       cliVersion: "0.2.10",
     })),
+    verifyRuntimeBuild: vi.fn(async () => ({
+      ok: true as const,
+      pinId: "test-package-dist-v1",
+      entrypointPath: "G:\\happier\\package-dist\\index.mjs",
+      runtimeArtifactPath: "G:\\happier\\package-dist\\index-test.mjs",
+      entrypointSha256: `sha256:${"1".repeat(64)}` as const,
+      runtimeArtifactSha256: `sha256:${"2".repeat(64)}` as const,
+      launchDigest: `sha256:${"3".repeat(64)}` as const,
+      trustLevel: "local_artifact_hash_only" as const,
+    })),
   };
   return new HappierSessionConnector({
     settings: {
@@ -221,7 +259,7 @@ describe("Happier source-backed provider capability matrix", () => {
     }
   });
 
-  it("pins every Happier source reference to an exact blob at the reviewed revision", () => {
+  it("declares one exact blob hash for every Happier source reference", () => {
     const referencedPaths = new Set<string>();
     for (const providerId of HAPPIER_DIRECT_SESSION_PROVIDER_IDS) {
       for (const capability of SESSION_CONNECTOR_CAPABILITIES) {
@@ -236,6 +274,21 @@ describe("Happier source-backed provider capability matrix", () => {
       expect(HAPPIER_DIRECT_SESSION_SOURCE_BLOBS[path]).toMatch(/^[0-9a-f]{40}$/u);
     }
   });
+
+  const configuredCheckoutConformance = CONFIGURED_HAPPIER_REPOSITORY ? it : it.skip;
+  configuredCheckoutConformance(
+    `resolves every pinned revision:path in the configured Happier checkout (${HAPPIER_REPOSITORY_ENV}; unset explicitly skips)`,
+    async () => {
+      expect(await runConfiguredHappierGit("cat-file", "-t", `${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}^{commit}`))
+        .toBe("commit");
+
+      for (const [path, declaredBlob] of Object.entries(HAPPIER_DIRECT_SESSION_SOURCE_BLOBS)) {
+        const revisionPath = `${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:${path}`;
+        expect(await runConfiguredHappierGit("cat-file", "-t", revisionPath), revisionPath).toBe("blob");
+        expect(await runConfiguredHappierGit("rev-parse", "--verify", revisionPath), revisionPath).toBe(declaredBlob);
+      }
+    },
+  );
 
   for (const providerId of HAPPIER_DIRECT_SESSION_PROVIDER_IDS) {
     describe(providerId, () => {
@@ -324,7 +377,7 @@ describe("Happier source-backed provider capability matrix", () => {
       expect(capabilities.capabilities[capability].state).toBe(EXPECTED_CONNECTOR_STATES[capability]);
     }
     expect(capabilities.capabilities.deepLinks.evidenceRef).toBe(
-      `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:reviewed-source=${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:provider=all:provider-matrix-deepLinks`,
+      `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:local-build=sha256:${"3".repeat(64)}:reviewed-source=${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:provider=all:provider-matrix-deepLinks`,
     );
 
     const health = await connector.getHealth(HOST_ID);

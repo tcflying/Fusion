@@ -108,6 +108,16 @@ function setup(
       fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
       cliVersion: "0.2.10",
     })),
+    verifyRuntimeBuild: vi.fn(async () => ({
+      ok: true as const,
+      pinId: "test-package-dist-v1",
+      entrypointPath: "G:\\happier\\package-dist\\index.mjs",
+      runtimeArtifactPath: "G:\\happier\\package-dist\\index-test.mjs",
+      entrypointSha256: `sha256:${"1".repeat(64)}` as const,
+      runtimeArtifactSha256: `sha256:${"2".repeat(64)}` as const,
+      launchDigest: `sha256:${"3".repeat(64)}` as const,
+      trustLevel: "local_artifact_hash_only" as const,
+    })),
     sendMessage: vi.fn(async (input) => ({
       sessionId: input.sessionId,
       localId: input.localId,
@@ -685,6 +695,37 @@ describe("HappierSessionConnector", () => {
     }
   });
 
+  it("requires Fusion's independent local build verification before publishing a verified surface", async () => {
+    const verifyRuntimeBuild = vi.fn(async () => ({
+      ok: false as const,
+      reasonCode: "cli_artifact_mismatch" as const,
+    }));
+    const { connector, dependencies } = setup(
+      { verifyRuntimeBuild },
+      () => NOW,
+      { entrypoint: "G:\\happier\\package-dist\\index.mjs" },
+    );
+
+    await expect(connector.getCapabilities(IDENTITY)).resolves.toMatchObject({
+      capabilities: {
+        deepLinks: {
+          state: "unverified",
+          evidenceRef: null,
+          reasonCode: "source_unverified",
+          lastVerifiedAt: null,
+        },
+      },
+    });
+    expect(dependencies.getDirectSessionCapabilities).toHaveBeenCalledOnce();
+    expect(verifyRuntimeBuild).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
+        fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+      }),
+      "G:\\happier\\package-dist\\index.mjs",
+    );
+  });
+
   it("reports uncertified and unavailable surfaces instead of fabricating parity", async () => {
     const { connector } = setup();
     const capabilities = await connector.getCapabilities(IDENTITY);
@@ -705,7 +746,7 @@ describe("HappierSessionConnector", () => {
         health: { state: "unverified" },
         deepLinks: {
           state: "verified",
-          evidenceRef: `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:reviewed-source=${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:provider=codex:direct-session-open-url-codex`,
+          evidenceRef: `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:local-build=sha256:${"3".repeat(64)}:reviewed-source=${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:provider=codex:direct-session-open-url-codex`,
         },
       },
     });

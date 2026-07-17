@@ -44,6 +44,7 @@ import {
   HAPPIER_DIRECT_SESSION_SOURCE_REVISION,
   isCertifiedHappierDirectSessionRuntimeManifest,
   isHappierDirectSessionProviderId,
+  verifyHappierDirectSessionRuntimeBuild,
 } from "./happier-direct-session-capabilities.js";
 import {
   HappierCliError,
@@ -69,6 +70,7 @@ export interface HappierSessionConnectorDependencies {
   readonly readDirectTranscript: typeof readHappierDirectSessionTranscript;
   readonly followDirectTranscriptEvents: typeof followHappierDirectSessionTranscriptEvents;
   readonly getDirectSessionCapabilities: typeof getHappierDirectSessionCapabilities;
+  readonly verifyRuntimeBuild: typeof verifyHappierDirectSessionRuntimeBuild;
   readonly sendMessage: typeof sendHappierMessage;
   readonly probeRuntime: typeof probeHappierRuntime;
 }
@@ -89,6 +91,7 @@ const defaultDependencies: HappierSessionConnectorDependencies = {
   readDirectTranscript: readHappierDirectSessionTranscript,
   followDirectTranscriptEvents: followHappierDirectSessionTranscriptEvents,
   getDirectSessionCapabilities: getHappierDirectSessionCapabilities,
+  verifyRuntimeBuild: verifyHappierDirectSessionRuntimeBuild,
   sendMessage: sendHappierMessage,
   probeRuntime: probeHappierRuntime,
 };
@@ -541,12 +544,21 @@ export class HappierSessionConnector implements SessionConnectorV1 {
     const profileMatches = Boolean(activeServerId)
       && (identity === undefined || identity.serverProfileId === activeServerId);
     let runtimeManifestCertified = false;
+    let runtimeBuildEvidenceRef: string | null = null;
     try {
       const observedManifest = await this.dependencies.getDirectSessionCapabilities(this.settings, undefined);
-      runtimeManifestCertified = isCertifiedHappierDirectSessionRuntimeManifest(
+      const manifestMatches = isCertifiedHappierDirectSessionRuntimeManifest(
         observedManifest,
         this.sourceRevision,
       );
+      if (manifestMatches) {
+        const runtimeBuild = await this.dependencies.verifyRuntimeBuild(
+          observedManifest,
+          this.settings.entrypoint,
+        );
+        runtimeManifestCertified = runtimeBuild.ok;
+        if (runtimeBuild.ok) runtimeBuildEvidenceRef = runtimeBuild.launchDigest;
+      }
     } catch {
       // Old, drifted, or unavailable executables remain source_unverified.
     }
@@ -609,7 +621,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         : `provider-matrix-${capability}`;
       if (!evidenceKey) return unverifiedCertification("source_unverified");
       return verifiedCertification(
-        `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:reviewed-source=${this.sourceRevision}:provider=${identity === undefined ? "all" : providerScope}:${evidenceKey}`,
+        `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:local-build=${runtimeBuildEvidenceRef}:reviewed-source=${this.sourceRevision}:provider=${identity === undefined ? "all" : providerScope}:${evidenceKey}`,
         verifiedAt,
       );
     };
