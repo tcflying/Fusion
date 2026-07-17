@@ -345,6 +345,22 @@ describe("Room declarative protocol schema v1", () => {
     expectProtocolIssues(protocol, ["invalid_runtime_value"]);
   });
 
+  it("rejects accessor-backed fields without executing their getters", () => {
+    const protocol = validProtocol();
+    let getterExecuted = false;
+    Object.defineProperty(protocol, "name", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterExecuted = true;
+        return "Reflective protocol";
+      },
+    });
+
+    expectProtocolIssues(protocol, ["invalid_runtime_value"]);
+    expect(getterExecuted).toBe(false);
+  });
+
   it("returns a normalized deeply frozen value that cannot drift after validation", () => {
     const protocol = validProtocol();
     const result = requireProtocolValidator()(protocol);

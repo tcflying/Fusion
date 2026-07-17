@@ -169,7 +169,18 @@ function objectAt(
     return null;
   }
   const allowed = new Set(allowedKeys);
+  let invalidDescriptor = false;
   for (const key of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      issue(
+        issues,
+        "invalid_runtime_value",
+        `${path}.${key}`,
+        "Declarative protocol fields must be enumerable data properties",
+      );
+      invalidDescriptor = true;
+    }
     if (!allowed.has(key)) {
       issue(issues, "unknown_field", `${path}.${key}`, `Unknown field '${key}'`);
     }
@@ -177,6 +188,7 @@ function objectAt(
   for (const key of Object.getOwnPropertySymbols(value)) {
     issue(issues, "unknown_field", `${path}[${String(key)}]`, "Symbol-keyed fields are not supported");
   }
+  if (invalidDescriptor) return null;
   for (const key of requiredKeys) {
     if (!Object.prototype.hasOwnProperty.call(value, key)) {
       issue(issues, "missing_field", `${path}.${key}`, `Missing required field '${key}'`);
