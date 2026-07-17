@@ -115,6 +115,10 @@ export function resolveHappierCliSettings(
     nonEmptyString(settings?.executable) ??
     nonEmptyString(process.env.HAPPIER_CLI_EXECUTABLE) ??
     (entrypoint ? process.execPath : "happier");
+  const backend = typeof settings?.backend === "string"
+    && HAPPIER_BACKENDS.includes(settings.backend as HappierBackend)
+    ? settings.backend as HappierBackend
+    : undefined;
 
   return {
     executable,
@@ -127,6 +131,7 @@ export function resolveHappierCliSettings(
       nonEmptyString(settings?.publicServerUrl) ?? nonEmptyString(process.env.HAPPIER_PUBLIC_SERVER_URL),
     webappUrl: nonEmptyString(settings?.webappUrl) ?? nonEmptyString(process.env.HAPPIER_WEBAPP_URL),
     profile: nonEmptyString(settings?.profile) ?? nonEmptyString(process.env.HAPPIER_PROFILE),
+    ...(backend ? { backend } : {}),
     timeoutMs: positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     maxOutputBytes: Math.max(
       1,
@@ -834,6 +839,21 @@ export async function ensureHappierDirectSession(input: {
     created: data.created,
     openUrl: directSessionString(data, "openUrl"),
   };
+}
+
+export async function getHappierDirectSessionCapabilities(
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<HappierJsonRecord> {
+  return ensureRecord(
+    await invokeHappierJsonForKind(
+      ["direct-session", "capabilities", "--json"],
+      "direct_session_capabilities",
+      settings,
+      signal,
+    ),
+    "Direct Session capabilities",
+  );
 }
 
 function directSessionSource(providerId: HappierBackend): HappierDirectSessionSource {

@@ -30,12 +30,21 @@ import {
   buildHappierSessionOpenUrl,
   ensureHappierDirectSession,
   followHappierDirectSessionTranscriptEvents,
+  getHappierDirectSessionCapabilities,
   getHappierSessionStatus,
   readHappierDirectSessionTranscript,
   resolveHappierCliSettings,
   sendHappierMessage,
 } from "./cli-spawn.js";
 import { probeHappierRuntime } from "./probe.js";
+import {
+  HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX,
+  HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+  HAPPIER_DIRECT_SESSION_PROVIDER_IDS,
+  HAPPIER_DIRECT_SESSION_SOURCE_REVISION,
+  isCertifiedHappierDirectSessionRuntimeManifest,
+  isHappierDirectSessionProviderId,
+} from "./happier-direct-session-capabilities.js";
 import {
   HappierCliError,
   type HappierBackend,
@@ -47,7 +56,7 @@ import {
 
 export const HAPPIER_SESSION_CONNECTOR_ID = "happier";
 export const HAPPIER_SESSION_CONNECTOR_VERSION = "0.2.73";
-export const HAPPIER_DIRECT_SESSION_SOURCE_REVISION = "f07b7317cd4c7f0cfa762189dc68d16750a48182";
+export * from "./happier-direct-session-capabilities.js";
 
 const DIRECT_MESSAGE_CURSOR_PREFIX = "happier-direct-message-v1:";
 const DEFAULT_SEND_TIMEOUT_SECONDS = 300;
@@ -59,6 +68,7 @@ export interface HappierSessionConnectorDependencies {
   readonly getSessionStatus: typeof getHappierSessionStatus;
   readonly readDirectTranscript: typeof readHappierDirectSessionTranscript;
   readonly followDirectTranscriptEvents: typeof followHappierDirectSessionTranscriptEvents;
+  readonly getDirectSessionCapabilities: typeof getHappierDirectSessionCapabilities;
   readonly sendMessage: typeof sendHappierMessage;
   readonly probeRuntime: typeof probeHappierRuntime;
 }
@@ -78,6 +88,7 @@ const defaultDependencies: HappierSessionConnectorDependencies = {
   getSessionStatus: getHappierSessionStatus,
   readDirectTranscript: readHappierDirectSessionTranscript,
   followDirectTranscriptEvents: followHappierDirectSessionTranscriptEvents,
+  getDirectSessionCapabilities: getHappierDirectSessionCapabilities,
   sendMessage: sendHappierMessage,
   probeRuntime: probeHappierRuntime,
 };
@@ -473,7 +484,11 @@ function unavailableResult<T>(operation: string): SessionConnectorResultV1<T> {
 }
 
 function certifiedNativeSessionUrl(identity: SessionConnectorIdentityV1): string | null {
-  if (identity.providerId !== "codex") return null;
+  if (
+    !isHappierDirectSessionProviderId(identity.providerId)
+    || HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[identity.providerId].nativeDeepLink !== "certified"
+    || identity.providerId !== "codex"
+  ) return null;
   return `codex://threads/${encodeURIComponent(identity.nativeSessionId)}`;
 }
 
@@ -521,64 +536,94 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   }
 
   async getCapabilities(identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
-    const pendingCertification = "pending_provider_certification" as const;
     const verifiedAt = this.now();
-    const directTranscriptEvidence = `happier-source:${this.sourceRevision}:direct-session-transcript-control`;
     const activeServerId = this.settings.activeServerId?.trim();
     const profileMatches = Boolean(activeServerId)
       && (identity === undefined || identity.serverProfileId === activeServerId);
-    const directHistoryCertification = profileMatches
-      ? verifiedCertification(`${directTranscriptEvidence}:read-after`, verifiedAt)
-      : {
-          state: "degraded" as const,
-          evidenceRef: null,
-          reasonCode: "server_profile_mismatch" as const,
-          lastVerifiedAt: null,
-        };
-    const directEventCertification = profileMatches
-      ? verifiedCertification(`${directTranscriptEvidence}:delta-ndjson`, verifiedAt)
-      : {
-          state: "degraded" as const,
-          evidenceRef: null,
-          reasonCode: "server_profile_mismatch" as const,
-          lastVerifiedAt: null,
-        };
-    let deepLinksCertification: SessionConnectorCapabilityCertificationV1 = {
-      state: "degraded" as const,
-      evidenceRef: null,
-      reasonCode: "runtime_degraded" as const,
-      lastVerifiedAt: null,
-    };
-    if (profileMatches && this.settings.webappUrl?.trim()) {
-      try {
-        buildHappierSessionOpenUrl(this.settings.webappUrl, activeServerId!, "capability-probe");
-        deepLinksCertification = verifiedCertification(
-          `happier-source:${this.sourceRevision}:direct-session-open-url`,
-          verifiedAt,
-        );
-      } catch {
-        // A malformed or unsafe current origin remains observable as degraded.
-      }
+    let runtimeManifestCertified = false;
+    try {
+      const observedManifest = await this.dependencies.getDirectSessionCapabilities(this.settings, undefined);
+      runtimeManifestCertified = isCertifiedHappierDirectSessionRuntimeManifest(
+        observedManifest,
+        this.sourceRevision,
+      );
+    } catch {
+      // Old, drifted, or unavailable executables remain source_unverified.
     }
+    const providerRows = identity === undefined
+      ? HAPPIER_DIRECT_SESSION_PROVIDER_IDS.map((providerId) => HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[providerId])
+      : isHappierDirectSessionProviderId(identity.providerId)
+        ? [HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[identity.providerId]]
+        : [];
+    const providerScope = identity === undefined ? "codex+claude+opencode" : identity.providerId;
+
+    const certificationFor = (
+      capability: (typeof SESSION_CONNECTOR_CAPABILITIES)[number],
+    ): SessionConnectorCapabilityCertificationV1 => {
+      const auditedEntries = providerRows.map((row) => row.capabilities[capability]);
+      const universallyUnavailable = HAPPIER_DIRECT_SESSION_PROVIDER_IDS.every(
+        (providerId) => HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[providerId].capabilities[capability].connectorState === "unavailable",
+      );
+      if (auditedEntries.length === 0) {
+        return universallyUnavailable
+          ? unavailableCertification("operation_unavailable")
+          : unverifiedCertification("source_unverified");
+      }
+
+      const first = auditedEntries[0]!;
+      const statesMatch = auditedEntries.every((entry) => entry.connectorState === first.connectorState);
+      if (!statesMatch) return unverifiedCertification("pending_provider_certification");
+      if (first.connectorState === "unavailable") {
+        return unavailableCertification(first.reasonCode ?? "operation_unavailable");
+      }
+      if (first.connectorState !== "verified") {
+        return unverifiedCertification(first.reasonCode ?? "pending_provider_certification");
+      }
+      if (identity === undefined && capability !== "deepLinks") {
+        return unverifiedCertification("pending_provider_certification");
+      }
+      if (!runtimeManifestCertified) return unverifiedCertification("source_unverified");
+      if ((capability === "history" || capability === "events" || capability === "deepLinks") && !profileMatches) {
+        return {
+          state: "degraded",
+          evidenceRef: null,
+          reasonCode: "server_profile_mismatch",
+          lastVerifiedAt: null,
+        };
+      }
+      if (capability === "deepLinks") {
+        try {
+          if (!this.settings.webappUrl?.trim()) throw new Error("missing webapp origin");
+          buildHappierSessionOpenUrl(this.settings.webappUrl, activeServerId!, "capability-probe");
+        } catch {
+          return {
+            state: "degraded",
+            evidenceRef: null,
+            reasonCode: "runtime_degraded",
+            lastVerifiedAt: null,
+          };
+        }
+      }
+      const evidenceKey = auditedEntries.length === 1
+        ? first.evidenceKey
+        : `provider-matrix-${capability}`;
+      if (!evidenceKey) return unverifiedCertification("source_unverified");
+      return verifiedCertification(
+        `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:reviewed-source=${this.sourceRevision}:provider=${identity === undefined ? "all" : providerScope}:${evidenceKey}`,
+        verifiedAt,
+      );
+    };
+
+    const capabilities = Object.fromEntries(
+      SESSION_CONNECTOR_CAPABILITIES.map((capability) => [capability, certificationFor(capability)]),
+    ) as SessionConnectorCapabilitiesV1["capabilities"];
     return {
       contractVersion: 1,
       connectorId: this.id,
       connectorVersion: this.version,
       sourceRevision: this.sourceRevision,
       verifiedAt,
-      capabilities: {
-        ensureExisting: unverifiedCertification(pendingCertification),
-        create: unavailableCertification("operation_unavailable"),
-        status: unverifiedCertification(pendingCertification),
-        history: directHistoryCertification,
-        events: directEventCertification,
-        send: unverifiedCertification(pendingCertification),
-        interrupt: unavailableCertification("operation_unavailable"),
-        resume: unavailableCertification("operation_unavailable"),
-        takeover: unavailableCertification("operation_unavailable"),
-        health: unverifiedCertification(pendingCertification),
-        deepLinks: deepLinksCertification,
-      },
+      capabilities,
     };
   }
 
@@ -880,7 +925,13 @@ export class HappierSessionConnector implements SessionConnectorV1 {
       const health = await this.dependencies.probeRuntime(this.settings);
       const checkedAt = this.now();
       let retryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
+      const configuredBackend = this.settings.backend;
+      const backendMismatch = Boolean(configuredBackend)
+        && health.backendId !== configuredBackend;
       const mappedReasonCodes = typedHealthReasonCodes(health.details);
+      if (backendMismatch && !mappedReasonCodes.includes("backend_unavailable")) {
+        mappedReasonCodes.push("backend_unavailable");
+      }
       if (mappedReasonCodes.includes("rate_limited") && retryAfterMs === null) {
         this.observeRateLimit(checkedAt);
         retryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
@@ -906,7 +957,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         : health.serverState === "unreachable"
           ? "unreachable" as const
           : "unknown" as const;
-      const backend = health.backend
+      const backend = health.backend && !backendMismatch
         ? "ready" as const
         : reasonCodes.some((code) => code.startsWith("backend_"))
           ? "unavailable" as const
@@ -924,7 +975,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
             ? "unavailable" as const
             : authentication === "required"
               ? "authentication_required" as const
-              : health.ready
+              : health.ready && backend === "ready"
                 ? "healthy" as const
                 : "degraded" as const;
       return {

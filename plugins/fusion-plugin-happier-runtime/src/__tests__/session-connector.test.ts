@@ -7,6 +7,8 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+  HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
   HAPPIER_DIRECT_SESSION_SOURCE_REVISION,
   HappierSessionConnector,
   type HappierSessionConnectorDependencies,
@@ -101,6 +103,11 @@ function setup(
         observedAtMs: 1_752_729_002_500,
       };
     })()),
+    getDirectSessionCapabilities: vi.fn(async () => ({
+      ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
+      fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+      cliVersion: "0.2.10",
+    })),
     sendMessage: vi.fn(async (input) => ({
       sessionId: input.sessionId,
       localId: input.localId,
@@ -396,8 +403,8 @@ describe("HappierSessionConnector", () => {
     expect(dependencies.followDirectTranscriptEvents).not.toHaveBeenCalled();
     await expect(connector.getCapabilities(driftedIdentity)).resolves.toMatchObject({
       capabilities: {
-        history: { state: "degraded" },
-        events: { state: "degraded" },
+        history: { state: "unverified" },
+        events: { state: "unverified" },
       },
     });
   });
@@ -556,8 +563,8 @@ describe("HappierSessionConnector", () => {
       rateLimit: "clear",
       host: "reachable",
       capabilities: {
-        history: "verified",
-        events: "verified",
+        history: "unverified",
+        events: "unverified",
         send: "unverified",
       },
       reasonCodes: [],
@@ -626,6 +633,58 @@ describe("HappierSessionConnector", () => {
     });
   });
 
+  it("fails health closed when the runtime probe reports another configured backend", async () => {
+    const { connector } = setup({
+      probeRuntime: vi.fn(async () => ({
+        discovered: true,
+        executable: true,
+        server: true,
+        serverState: "reachable" as const,
+        authenticated: true,
+        daemon: true,
+        backend: true,
+        ready: true,
+        backendId: "claude" as const,
+        details: [],
+      })),
+    }, () => NOW, { backend: "codex" });
+
+    await expect(connector.getHealth("fusion-host-1")).resolves.toMatchObject({
+      state: "degraded",
+      backend: "unavailable",
+      reasonCodes: ["backend_unavailable"],
+    });
+  });
+
+  it("demotes executable-backed certification when the attestation is missing or drifted", async () => {
+    const unavailable = setup({
+      getDirectSessionCapabilities: vi.fn(async () => {
+        throw new HappierCliError("process", "capability command unavailable");
+      }),
+    });
+    const drifted = setup({
+      getDirectSessionCapabilities: vi.fn(async () => ({
+        ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
+        fingerprint: "sha256:drifted",
+        cliVersion: "0.2.10",
+      })),
+    });
+
+    for (const current of [unavailable, drifted]) {
+      await expect(current.connector.getCapabilities(IDENTITY)).resolves.toMatchObject({
+        capabilities: {
+          deepLinks: {
+            state: "unverified",
+            evidenceRef: null,
+            reasonCode: "source_unverified",
+            lastVerifiedAt: null,
+          },
+        },
+      });
+      expect(current.dependencies.getDirectSessionCapabilities).toHaveBeenCalledOnce();
+    }
+  });
+
   it("reports uncertified and unavailable surfaces instead of fabricating parity", async () => {
     const { connector } = setup();
     const capabilities = await connector.getCapabilities(IDENTITY);
@@ -636,17 +695,17 @@ describe("HappierSessionConnector", () => {
       capabilities: {
         ensureExisting: { state: "unverified" },
         status: { state: "unverified" },
-        history: { state: "verified" },
+        history: { state: "unverified" },
         send: { state: "unverified" },
         create: { state: "unavailable" },
-        events: { state: "verified" },
+        events: { state: "unverified" },
         interrupt: { state: "unavailable" },
         resume: { state: "unavailable" },
         takeover: { state: "unavailable" },
         health: { state: "unverified" },
         deepLinks: {
           state: "verified",
-          evidenceRef: `happier-source:${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:direct-session-open-url`,
+          evidenceRef: `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:reviewed-source=${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:provider=codex:direct-session-open-url-codex`,
         },
       },
     });
@@ -693,7 +752,7 @@ describe("HappierSessionConnector", () => {
       value: {
         ...identities,
         happierUrl: "https://app.happier.dev/session/happier-session-1?serverId=server-1",
-        nativeSessionUrl: "codex://threads/codex-thread-1",
+        nativeSessionUrl: null,
       },
     });
     expect(moved).toEqual({
@@ -701,7 +760,7 @@ describe("HappierSessionConnector", () => {
       value: {
         ...identities,
         happierUrl: "https://new.happier.example/root/session/happier-session-1?serverId=server-1",
-        nativeSessionUrl: "codex://threads/codex-thread-1",
+        nativeSessionUrl: null,
       },
     });
 

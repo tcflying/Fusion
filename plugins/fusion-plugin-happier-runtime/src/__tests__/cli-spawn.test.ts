@@ -20,6 +20,7 @@ import {
   createHappierSession,
   ensureHappierDirectSession,
   followHappierDirectSessionTranscriptEvents,
+  getHappierDirectSessionCapabilities,
   getHappierSessionHistory,
   getHappierSessionStatus,
   invokeHappierJson,
@@ -28,6 +29,10 @@ import {
   resolveHappierCliSettings,
   sendHappierMessage,
 } from "../cli-spawn.js";
+import {
+  HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+  HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
+} from "../happier-direct-session-capabilities.js";
 import type { HappierCliSettings } from "../types.js";
 
 const CREATE_SUCCESS =
@@ -48,6 +53,16 @@ const DIRECT_TRANSCRIPT_EVENT =
   '{"v":1,"ok":true,"kind":"direct_session_transcript_delta","data":{"machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"fromCursor":"cursor-2","nextCursor":"cursor-3","truncated":false,"items":[{"id":"message-2","createdAtMs":1752729001000,"raw":{"role":"assistant","text":"world"}}]}}';
 const DIRECT_STATUS_EVENT =
   '{"v":1,"ok":true,"kind":"direct_session_status_delta","data":{"eventType":"status","machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"isRunning":true,"lastActivityAtMs":1752729001000,"observedAtMs":1752729001500}}';
+const DIRECT_CAPABILITIES_SUCCESS = JSON.stringify({
+  v: 1,
+  ok: true,
+  kind: "direct_session_capabilities",
+  data: {
+    ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
+    fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+    cliVersion: "0.2.10",
+  },
+});
 
 function settings(overrides: Partial<HappierCliSettings> = {}): HappierCliSettings {
   return {
@@ -344,6 +359,25 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
+  it("reads the executable Direct Session capability attestation with exact shell-free argv", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = getHappierDirectSessionCapabilities(settings());
+    fake.stdout(DIRECT_CAPABILITIES_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).resolves.toEqual({
+      ...HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
+      fingerprint: HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
+      cliVersion: "0.2.10",
+    });
+    expect(mockSpawn).toHaveBeenCalledWith(
+      "happier",
+      ["direct-session", "capabilities", "--json"],
+      expect.objectContaining({ shell: false, stdio: ["ignore", "pipe", "pipe"] }),
+    );
+  });
+
   it.each([
     ["U+0000", "\u0000"],
     ["U+001F", "\u001f"],
@@ -419,6 +453,37 @@ describe("Happier session wrappers", () => {
       "--uri",
       "happier://direct/codex/remote-1",
       "--json",
+    ]);
+  });
+
+  it.each([
+    ["codex", "codex://threads/codex-native-1"],
+    ["claude", "claude://sessions/claude-native-1"],
+    ["opencode", "opencode://sessions/opencode-native-1"],
+  ] as const)("preserves the %s canonical URI and returned native identity", async (providerId, uri) => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const nativeSessionId = `${providerId}-native-1`;
+    const promise = ensureHappierDirectSession({ uri, settings: settings() });
+    fake.stdout(JSON.stringify({
+      v: 1,
+      ok: true,
+      kind: "direct_session_ensure",
+      data: {
+        providerId,
+        remoteSessionId: nativeSessionId,
+        machineId: "machine-1",
+        serverId: "server-1",
+        sessionId: `happier-${providerId}-1`,
+        created: false,
+        openUrl: `https://app.happier.dev/session/happier-${providerId}-1`,
+      },
+    }));
+    fake.close(0);
+
+    await expect(promise).resolves.toMatchObject({ providerId, remoteSessionId: nativeSessionId });
+    expect(mockSpawn.mock.calls[0]?.[1]).toEqual([
+      "direct-session", "ensure", "--uri", uri, "--json",
     ]);
   });
 
@@ -500,6 +565,52 @@ describe("Happier session wrappers", () => {
       ],
       expect.objectContaining({ shell: false, stdio: ["ignore", "pipe", "pipe"] }),
     );
+  });
+
+  it.each([
+    ["claude", { kind: "claudeConfig" }],
+    ["opencode", { kind: "opencodeServer" }],
+  ] as const)("binds %s transcript reads to its provider-specific default source", async (providerId, source) => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const promise = readHappierDirectSessionTranscript({
+      providerId,
+      remoteSessionId: `${providerId}-native-1`,
+      sessionId: `happier-${providerId}-1`,
+      machineId: "machine-1",
+      afterCursor: null,
+      limit: 25,
+    }, settings());
+    fake.stdout(JSON.stringify({
+      v: 1,
+      ok: true,
+      kind: "direct_session_transcript_read_after",
+      data: {
+        machineId: "machine-1",
+        providerId,
+        remoteSessionId: `${providerId}-native-1`,
+        sessionId: `happier-${providerId}-1`,
+        source,
+        fromCursor: null,
+        nextCursor: "cursor-2",
+        truncated: false,
+        items: [],
+      },
+    }));
+    fake.close(0);
+
+    await expect(promise).resolves.toMatchObject({ providerId, source });
+    expect(mockSpawn.mock.calls[0]?.[1]).toEqual([
+      "direct-session", "read-after",
+      "--provider", providerId,
+      "--remote-session-id", `${providerId}-native-1`,
+      "--session-id", `happier-${providerId}-1`,
+      "--machine-id", "machine-1",
+      "--source-json", JSON.stringify(source),
+      "--after-cursor", "null",
+      "--limit", "25",
+      "--json",
+    ]);
   });
 
   it("streams bounded official Direct Session NDJSON and terminates on iterator return", async () => {
