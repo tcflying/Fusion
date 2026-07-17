@@ -12,7 +12,12 @@ import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-l
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import { cliSessions } from "../../postgres/schema/project.js";
-import { roomBindings } from "../../postgres/schema/room.js";
+import {
+  operationalRooms,
+  roomBindings,
+  roomMembershipChanges,
+  roomTurns,
+} from "../../postgres/schema/room.js";
 
 interface EmbeddedTestContext {
   readonly dataDir: string;
@@ -239,6 +244,121 @@ describe("one-way legacy Happier Session import", () => {
       .select()
       .from(cliSessions)
       .where(eq(cliSessions.id, legacy.source.cliSessionId)))[0]).toEqual(legacy.row);
+  }, EMBEDDED_DATABASE_TIMEOUT_MS);
+
+  it("admits exactly one winner when legacy import races a pending membership reservation", async () => {
+    const context = await startEmbeddedDatabase();
+    const legacyLayer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
+    const targetLayer = createAsyncDataLayer(context.connections!, { projectId: "project-2" });
+    const legacy = await createLegacyBinding(legacyLayer, "concurrent-pending", "semantic-v2");
+    const legacyStore = new AsyncRoomStore(legacyLayer);
+    const targetStore = new AsyncRoomStore(targetLayer, { projectId: "project-2" });
+    const roomId = "room-import-concurrent-pending-target";
+    await targetStore.createRoom(
+      {
+        id: roomId,
+        projectId: "project-2",
+        objective: "Race one global Session identity through two supported entry points",
+        protocolId: "implementation",
+        protocolVersion: 1,
+        now: "2026-07-17T09:03:00.000Z",
+      },
+      commandContext("event-concurrent-pending-room-created"),
+    );
+    await targetStore.transitionLifecycle(
+      roomId,
+      { to: "ready", expectedAggregateVersion: 0, now: "2026-07-17T09:03:30.000Z" },
+      commandContext("event-concurrent-pending-room-ready"),
+    );
+    await targetStore.transitionLifecycle(
+      roomId,
+      { to: "running", expectedAggregateVersion: 1, now: "2026-07-17T09:04:00.000Z" },
+      commandContext("event-concurrent-pending-room-running"),
+    );
+    const turnId = `${roomId}-turn-1`;
+    await targetLayer.db.insert(roomTurns).values({
+      id: turnId,
+      projectId: "project-2",
+      roomId,
+      sequence: 1,
+      protocolPhaseId: "implementation",
+      membershipVersion: 0,
+      state: "running",
+      startedAt: "2026-07-17T09:04:00.000Z",
+      endedAt: null,
+    });
+    await targetLayer.db
+      .update(operationalRooms)
+      .set({ activeTurnId: turnId, updatedAt: "2026-07-17T09:04:00.000Z" })
+      .where(and(
+        eq(operationalRooms.projectId, "project-2"),
+        eq(operationalRooms.id, roomId),
+      ));
+    const target = await targetStore.getRoom(roomId);
+    if (!target) throw new Error("target Room was not persisted");
+
+    const outcomes = await Promise.allSettled([
+      legacyStore.importLegacyHappierBinding(
+        importInput("concurrent-pending", legacy.source),
+        commandContext("event-import-concurrent-pending"),
+      ),
+      targetStore.requestMembershipChange(
+        {
+          roomId,
+          changeId: "change-concurrent-legacy-pending",
+          idempotencyKey: "membership:concurrent-legacy-pending",
+          expectedAggregateVersion: target.room.aggregateVersion,
+          expectedMembershipVersion: target.membershipVersion,
+          activateAt: "next_turn_boundary",
+          mutation: {
+            action: "add",
+            seat: {
+              id: `${roomId}-seat-producer`,
+              role: "producer",
+              permissionScope: ["room:message"],
+            },
+            binding: {
+              id: `${roomId}-binding-producer`,
+              connectorId: "happier",
+              providerId: legacy.source.providerId,
+              nativeSessionId: legacy.source.nativeSessionId,
+              happierSessionId: legacy.source.happierSessionId,
+              serverProfileId: legacy.source.serverProfileId,
+              machineId: legacy.source.machineId,
+              hostId: legacy.source.hostId,
+            },
+          },
+          reason: "concurrently reserve the legacy Session through membership",
+          requestedAt: "2026-07-17T09:05:00.000Z",
+        },
+        commandContext("event-membership-concurrent-legacy-pending"),
+      ),
+    ]);
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const rejected = outcomes.find(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    expect(["binding_identity_conflict", "legacy_binding_integrity_conflict"]).toContain(
+      rejected?.reason?.code,
+    );
+    const activeOwners = await legacyLayer.db
+      .select()
+      .from(roomBindings)
+      .where(and(
+        eq(roomBindings.providerId, legacy.source.providerId),
+        eq(roomBindings.nativeSessionId, legacy.source.nativeSessionId),
+        eq(roomBindings.state, "attached"),
+      ));
+    const pendingOwners = await legacyLayer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(and(
+        eq(roomMembershipChanges.reservedProviderId, legacy.source.providerId),
+        eq(roomMembershipChanges.reservedNativeSessionId, legacy.source.nativeSessionId),
+        eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+      ));
+    expect(activeOwners.length + pendingOwners.length).toBe(1);
   }, EMBEDDED_DATABASE_TIMEOUT_MS);
 
   it("rolls back Room, seat, and binding writes when the final event append fails", async () => {

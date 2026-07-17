@@ -87,6 +87,7 @@ interface RequestRoomMembershipChangeInput {
 interface ApplyRoomMembershipChangesAtTurnBoundaryInput {
   readonly roomId: string;
   readonly turnId: string;
+  readonly idempotencyKey?: string;
   readonly expectedAggregateVersion: number;
   readonly expectedMembershipVersion: number;
   readonly now: string;
@@ -212,13 +213,16 @@ async function createActiveTurnFixture(
       `${roomId}-codex-thread-active`,
     ),
   ],
+  projectId: string = PROJECT_ID,
 ): Promise<ActiveTurnFixture> {
-  const layer = sharedLayer;
-  const store = new AsyncRoomStore(layer, { projectId: PROJECT_ID });
+  const layer = projectId === PROJECT_ID
+    ? sharedLayer
+    : createAsyncDataLayer(sharedContext.connections!, { projectId });
+  const store = new AsyncRoomStore(layer, { projectId });
   await store.createRoom(
     {
       id: roomId,
-      projectId: PROJECT_ID,
+      projectId,
       objective: "Mutate Room membership only at turn boundaries",
       protocolId: "implementation",
       protocolVersion: 1,
@@ -229,7 +233,7 @@ async function createActiveTurnFixture(
 
   await layer.db.insert(roomSeats).values(participants.map((participant) => ({
     id: participant.seatId,
-    projectId: PROJECT_ID,
+    projectId,
     roomId,
     role: participant.role,
     roleVersion: 1,
@@ -242,7 +246,7 @@ async function createActiveTurnFixture(
   })));
   await layer.db.insert(roomBindings).values(participants.map((participant) => ({
     id: participant.binding.id,
-    projectId: PROJECT_ID,
+    projectId,
     roomId,
     seatId: participant.seatId,
     generation: 1,
@@ -259,7 +263,7 @@ async function createActiveTurnFixture(
   await layer.db
     .update(operationalRooms)
     .set({ membershipVersion: 1 })
-    .where(and(eq(operationalRooms.projectId, PROJECT_ID), eq(operationalRooms.id, roomId)));
+    .where(and(eq(operationalRooms.projectId, projectId), eq(operationalRooms.id, roomId)));
 
   const ready = await store.transitionLifecycle(
     roomId,
@@ -274,7 +278,7 @@ async function createActiveTurnFixture(
   const turnId = `${roomId}-turn-1`;
   await layer.db.insert(roomTurns).values({
     id: turnId,
-    projectId: PROJECT_ID,
+    projectId,
     roomId,
     sequence: 1,
     protocolPhaseId: "implementation",
@@ -286,14 +290,14 @@ async function createActiveTurnFixture(
   await layer.db
     .update(operationalRooms)
     .set({ activeTurnId: turnId, updatedAt: BASE_TIME })
-    .where(and(eq(operationalRooms.projectId, PROJECT_ID), eq(operationalRooms.id, roomId)));
+    .where(and(eq(operationalRooms.projectId, projectId), eq(operationalRooms.id, roomId)));
 
   const aggregate = await store.getRoom(roomId);
   if (!aggregate) throw new Error(`Fixture Room ${roomId} was not persisted`);
   expect(aggregate.room.aggregateVersion).toBe(running.room.aggregateVersion);
   expect(aggregate.membershipVersion).toBe(1);
   expect(aggregate.activeTurnId).toBe(turnId);
-  await new AsyncRoomCheckpointStore(layer, { projectId: PROJECT_ID }).createCheckpoint({
+  await new AsyncRoomCheckpointStore(layer, { projectId }).createCheckpoint({
     id: `${roomId}-membership-baseline`,
     roomId,
     turnId,
@@ -509,6 +513,47 @@ describe("AsyncRoomStore PostgreSQL membership mutations", () => {
       .from(roomMembershipChanges)
       .where(eq(roomMembershipChanges.roomId, fixture.roomId))).toHaveLength(1);
     expect(await fixture.store.listEvents(fixture.roomId)).toHaveLength(5);
+  });
+
+  it("replays a committed boundary activation idempotently after an acknowledgement loss", async () => {
+    const fixture = await createActiveTurnFixture("room-membership-idempotent-boundary");
+    const requested = await requireRequestMembershipChange(fixture.store)(
+      {
+        roomId: fixture.roomId,
+        changeId: "change-idempotent-boundary-pause",
+        idempotencyKey: "membership:idempotent-boundary-pause",
+        expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+        expectedMembershipVersion: fixture.aggregate.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: { action: "pause", seatId: fixture.aggregate.seats[0]!.id },
+        reason: "retry the committed boundary after losing its acknowledgement",
+        requestedAt: REQUEST_TIME,
+      },
+      commandContext("event-change-idempotent-boundary-requested", REQUEST_TIME),
+    );
+    await settleActiveTurnFixture(fixture);
+    const input: ApplyRoomMembershipChangesAtTurnBoundaryInput = {
+      roomId: fixture.roomId,
+      turnId: fixture.turnId,
+      idempotencyKey: "membership-boundary:turn-1",
+      expectedAggregateVersion: requested.room.aggregateVersion,
+      expectedMembershipVersion: requested.membershipVersion,
+      now: BOUNDARY_TIME,
+    };
+    const applyAtBoundary = requireApplyMembershipChangesAtTurnBoundary(fixture.store);
+    const first = await applyAtBoundary(
+      input,
+      commandContext("event-change-idempotent-boundary-activated", BOUNDARY_TIME),
+    );
+    const replay = await applyAtBoundary(
+      input,
+      commandContext("event-change-idempotent-boundary-retry", BOUNDARY_TIME),
+    );
+
+    expect(replay).toEqual(first);
+    expect((await fixture.store.listEvents(fixture.roomId)).filter(
+      (event) => event.eventType === "membership_change_activated",
+    )).toHaveLength(1);
   });
 
   it("queues participant pause during an active turn and pauses the binding at the boundary", async () => {
@@ -847,6 +892,439 @@ describe("AsyncRoomStore PostgreSQL membership mutations", () => {
       .from(roomMembershipChanges)
       .where(eq(roomMembershipChanges.roomId, fixture.roomId))).toHaveLength(0);
     expect(await fixture.store.listEvents(fixture.roomId)).toHaveLength(eventCountBefore);
+  });
+
+  it("rejects cross-project duplicate native and Happier identity reservations", async () => {
+    const sharedNativeSessionId = "shared-cross-project-native-session";
+    const sharedHappierSessionId = `happier-${sharedNativeSessionId}`;
+    const sourceProjectId = `${PROJECT_ID}-source`;
+    const targetProjectId = `${PROJECT_ID}-target`;
+    const sourceFixture = await createActiveTurnFixture(
+      "room-membership-cross-project-source",
+      [
+        seedParticipant(
+          "room-membership-cross-project-source-seat-producer",
+          "producer",
+          "claude",
+          sharedNativeSessionId,
+        ),
+      ],
+      sourceProjectId,
+    );
+    const targetFixture = await createActiveTurnFixture(
+      "room-membership-cross-project-target",
+      undefined,
+      targetProjectId,
+    );
+    const requestMembershipChange = requireRequestMembershipChange(targetFixture.store);
+
+    await expect(requestMembershipChange(
+      {
+        roomId: targetFixture.roomId,
+        changeId: "change-cross-project-duplicate-binding",
+        idempotencyKey: "membership:cross-project-duplicate-binding",
+        expectedAggregateVersion: targetFixture.aggregate.room.aggregateVersion,
+        expectedMembershipVersion: targetFixture.aggregate.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: {
+          action: "add",
+          seat: {
+            id: `${targetFixture.roomId}-seat-reviewer`,
+            role: "reviewer",
+            permissionScope: ["room:message"],
+          },
+          binding: {
+            id: `${targetFixture.roomId}-binding-reviewer-generation-1`,
+            connectorId: "happier",
+            providerId: "claude",
+            nativeSessionId: sharedNativeSessionId,
+            happierSessionId: sharedHappierSessionId,
+            serverProfileId: "server-profile-1",
+            machineId: `${targetFixture.roomId}-machine-reviewer`,
+            hostId: "windows-host-1",
+          },
+        },
+        reason: "must reject duplicate binding identity even when it lives in another project",
+        requestedAt: REQUEST_TIME,
+      },
+      commandContext("event-change-cross-project-duplicate-binding", REQUEST_TIME),
+    )).rejects.toMatchObject({ code: "binding_identity_conflict" });
+
+    expect(await sourceFixture.store.getRoom(sourceFixture.roomId)).toEqual(sourceFixture.aggregate);
+    expect(await targetFixture.layer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(eq(roomMembershipChanges.roomId, targetFixture.roomId))).toHaveLength(0);
+    expect(await targetFixture.store.listEvents(targetFixture.roomId)).toHaveLength(3);
+  });
+
+  it("rejects a missing-seat request before a later poisoned boundary batch can block the valid change", async () => {
+    const fixture = await createActiveTurnFixture("room-membership-missing-seat-batch");
+    const originalSeat = fixture.aggregate.seats[0]!;
+    const requestMembershipChange = requireRequestMembershipChange(fixture.store);
+    await expect(requestMembershipChange(
+      {
+        roomId: fixture.roomId,
+        changeId: "change-missing-seat-pause",
+        idempotencyKey: "membership:missing-seat-pause",
+        expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+        expectedMembershipVersion: fixture.aggregate.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: { action: "pause", seatId: `${fixture.roomId}-seat-missing` },
+        reason: "missing seat must fail fast",
+        requestedAt: REQUEST_TIME,
+      },
+      commandContext("event-change-missing-seat-pause", REQUEST_TIME),
+    )).rejects.toMatchObject({ code: "seat_not_found" });
+
+    expect(await fixture.layer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(eq(roomMembershipChanges.roomId, fixture.roomId))).toHaveLength(0);
+
+    const validRequest = await requestMembershipChange(
+      {
+        roomId: fixture.roomId,
+        changeId: "change-valid-pause-after-missing-seat",
+        idempotencyKey: "membership:valid-pause-after-missing-seat",
+        expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+        expectedMembershipVersion: fixture.aggregate.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: { action: "pause", seatId: originalSeat.id },
+        reason: "legitimate boundary batch should still apply",
+        requestedAt: REQUEST_TIME,
+      },
+      commandContext("event-change-valid-pause-after-missing-seat", REQUEST_TIME),
+    );
+
+    await fixture.layer.db.insert(roomMembershipChanges).values({
+      id: "change-poison-missing-seat",
+      projectId: PROJECT_ID,
+      roomId: fixture.roomId,
+      seatId: `${fixture.roomId}-seat-poison`,
+      kind: "pause",
+      payload: {},
+      reason: "poisoned pending membership change",
+      requestedAt: "2026-07-17T12:01:30.000Z",
+      requestedBy: "operator-1",
+      effectiveAfterTurnId: fixture.turnId,
+      appliedAt: null,
+      state: "waiting_turn_boundary",
+    });
+
+    await settleActiveTurnFixture(fixture);
+    const activated = await requireApplyMembershipChangesAtTurnBoundary(fixture.store)(
+      {
+        roomId: fixture.roomId,
+        turnId: fixture.turnId,
+        expectedAggregateVersion: validRequest.room.aggregateVersion,
+        expectedMembershipVersion: validRequest.membershipVersion,
+        now: BOUNDARY_TIME,
+      },
+      commandContext("event-change-valid-pause-after-missing-seat-activated", BOUNDARY_TIME),
+    );
+
+    expect(activated.seats[0]).toMatchObject({
+      id: originalSeat.id,
+      state: "paused",
+    });
+    expect(await fixture.layer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(eq(roomMembershipChanges.id, "change-poison-missing-seat"))).toEqual([
+      expect.objectContaining({
+        state: "failed",
+        failedAt: BOUNDARY_TIME,
+        failureCode: "missing_request_event",
+      }),
+    ]);
+    const activation = (await fixture.store.listEvents(fixture.roomId)).find(
+      (event) => event.eventType === "membership_change_activated",
+    );
+    expect(activation?.payload).toMatchObject({
+      projectionVersion: 2,
+      outcomes: [{ changeId: "change-valid-pause-after-missing-seat", status: "applied" }],
+      quarantinedChangeIds: ["change-poison-missing-seat"],
+    });
+    expect((await new AsyncRoomCheckpointStore(fixture.layer, {
+      projectId: PROJECT_ID,
+    }).replayProjection(fixture.roomId)).aggregate).toEqual(activated);
+  });
+
+  it("reserves a future binding identity when the first pending add is accepted", async () => {
+    const fixture = await createActiveTurnFixture("room-membership-future-identity-conflict");
+    const requestMembershipChange = requireRequestMembershipChange(fixture.store);
+    const sharedNativeSessionId = `${fixture.roomId}-claude-session-shared`;
+    const first = await requestMembershipChange(
+      {
+        roomId: fixture.roomId,
+        changeId: "change-add-future-reviewer-a",
+        idempotencyKey: "membership:add-future-reviewer-a",
+        expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+        expectedMembershipVersion: fixture.aggregate.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: {
+          action: "add",
+          seat: {
+            id: `${fixture.roomId}-seat-reviewer-a`,
+            role: "reviewer",
+            permissionScope: ["room:message"],
+          },
+          binding: {
+            id: `${fixture.roomId}-binding-reviewer-a`,
+            connectorId: "happier",
+            providerId: "claude",
+            nativeSessionId: sharedNativeSessionId,
+            happierSessionId: `happier-${sharedNativeSessionId}`,
+            serverProfileId: "server-profile-1",
+            machineId: `${fixture.roomId}-machine-reviewer-a`,
+            hostId: "windows-host-1",
+          },
+        },
+        reason: "reserve the future identity for reviewer A",
+        requestedAt: REQUEST_TIME,
+      },
+      commandContext("event-add-future-reviewer-a", REQUEST_TIME),
+    );
+
+    await expect(requestMembershipChange(
+      {
+        roomId: fixture.roomId,
+        changeId: "change-add-future-reviewer-b",
+        idempotencyKey: "membership:add-future-reviewer-b",
+        expectedAggregateVersion: first.room.aggregateVersion,
+        expectedMembershipVersion: first.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: {
+          action: "add",
+          seat: {
+            id: `${fixture.roomId}-seat-reviewer-b`,
+            role: "reviewer",
+            permissionScope: ["room:message"],
+          },
+          binding: {
+            id: `${fixture.roomId}-binding-reviewer-b`,
+            connectorId: "happier",
+            providerId: "claude",
+            nativeSessionId: sharedNativeSessionId,
+            happierSessionId: `happier-${sharedNativeSessionId}`,
+            serverProfileId: "server-profile-1",
+            machineId: `${fixture.roomId}-machine-reviewer-b`,
+            hostId: "windows-host-1",
+          },
+        },
+        reason: "must not steal reviewer A's pending identity reservation",
+        requestedAt: "2026-07-17T12:01:01.000Z",
+      },
+      commandContext("event-add-future-reviewer-b", "2026-07-17T12:01:01.000Z"),
+    )).rejects.toMatchObject({ code: "binding_identity_conflict" });
+
+    expect(await fixture.layer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(eq(roomMembershipChanges.roomId, fixture.roomId))).toHaveLength(1);
+  });
+
+  it("admits exactly one concurrent cross-project reservation for the same Session identity", async () => {
+    const sharedNativeSessionId = "shared-concurrent-native-session";
+    const fixtures = await Promise.all([
+      createActiveTurnFixture(
+        "room-membership-concurrent-reservation-a",
+        undefined,
+        `${PROJECT_ID}-concurrent-a`,
+      ),
+      createActiveTurnFixture(
+        "room-membership-concurrent-reservation-b",
+        undefined,
+        `${PROJECT_ID}-concurrent-b`,
+      ),
+    ]);
+    const inputFor = (
+      fixture: ActiveTurnFixture,
+      suffix: string,
+    ): RequestRoomMembershipChangeInput => ({
+      roomId: fixture.roomId,
+      changeId: `change-concurrent-reservation-${suffix}`,
+      idempotencyKey: `membership:concurrent-reservation-${suffix}`,
+      expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+      expectedMembershipVersion: fixture.aggregate.membershipVersion,
+      activateAt: "next_turn_boundary",
+      mutation: {
+        action: "add",
+        seat: {
+          id: `${fixture.roomId}-seat-reviewer`,
+          role: "reviewer",
+          permissionScope: ["room:message"],
+        },
+        binding: {
+          id: `${fixture.roomId}-binding-reviewer`,
+          connectorId: "happier",
+          providerId: "claude",
+          nativeSessionId: sharedNativeSessionId,
+          happierSessionId: `happier-${sharedNativeSessionId}`,
+          serverProfileId: "server-profile-1",
+          machineId: `${fixture.roomId}-machine-reviewer`,
+          hostId: "windows-host-1",
+        },
+      },
+      reason: "concurrently reserve one machine-wide Session identity",
+      requestedAt: REQUEST_TIME,
+    });
+
+    const outcomes = await Promise.allSettled(fixtures.map((fixture, index) => (
+      requireRequestMembershipChange(fixture.store)(
+        inputFor(fixture, index === 0 ? "a" : "b"),
+        commandContext(`event-concurrent-reservation-${index}`, REQUEST_TIME),
+      )
+    )));
+
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const rejected = outcomes.find(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    expect(rejected?.reason).toMatchObject({ code: "binding_identity_conflict" });
+    expect(await sharedLayer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(and(
+        eq(roomMembershipChanges.reservedProviderId, "claude"),
+        eq(roomMembershipChanges.reservedNativeSessionId, sharedNativeSessionId),
+        eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+      ))).toHaveLength(1);
+  });
+
+  it("quarantines an unledgered boundary row with a replayable idempotent result", async () => {
+    const fixture = await createActiveTurnFixture("room-membership-unledgered-boundary-row");
+    await fixture.layer.db.insert(roomMembershipChanges).values({
+      id: "change-unledgered-pause",
+      projectId: PROJECT_ID,
+      roomId: fixture.roomId,
+      seatId: fixture.aggregate.seats[0]!.id,
+      kind: "pause",
+      payload: {},
+      reason: "simulate a row that bypassed the command/event ledger",
+      requestedAt: REQUEST_TIME,
+      requestedBy: "unknown-writer",
+      effectiveAfterTurnId: fixture.turnId,
+      appliedAt: null,
+      state: "waiting_turn_boundary",
+    });
+    await settleActiveTurnFixture(fixture);
+    const input: ApplyRoomMembershipChangesAtTurnBoundaryInput = {
+      roomId: fixture.roomId,
+      turnId: fixture.turnId,
+      idempotencyKey: "membership:unledgered-boundary-row",
+      expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+      expectedMembershipVersion: fixture.aggregate.membershipVersion,
+      now: BOUNDARY_TIME,
+    };
+    const applyAtBoundary = requireApplyMembershipChangesAtTurnBoundary(fixture.store);
+
+    const first = await applyAtBoundary(
+      input,
+      commandContext("event-unledgered-boundary-row", BOUNDARY_TIME),
+    );
+    const replay = await applyAtBoundary(
+      input,
+      commandContext("event-unledgered-boundary-row-retry", BOUNDARY_TIME),
+    );
+
+    expect(first.room.aggregateVersion).toBe(fixture.aggregate.room.aggregateVersion + 1);
+    expect(first.membershipVersion).toBe(fixture.aggregate.membershipVersion);
+    expect(replay).toEqual(first);
+    expect(await fixture.layer.db
+      .select()
+      .from(roomMembershipChanges)
+      .where(eq(roomMembershipChanges.id, "change-unledgered-pause"))).toEqual([
+      expect.objectContaining({
+        state: "failed",
+        failedAt: BOUNDARY_TIME,
+        failureCode: "missing_request_event",
+      }),
+    ]);
+    const events = await fixture.store.listEvents(fixture.roomId);
+    expect(events).toHaveLength(4);
+    expect(events.at(-1)?.payload).toMatchObject({
+      projectionVersion: 2,
+      outcomes: [],
+      quarantinedChangeIds: ["change-unledgered-pause"],
+    });
+    expect((await new AsyncRoomCheckpointStore(fixture.layer, {
+      projectId: PROJECT_ID,
+    }).replayProjection(fixture.roomId)).aggregate).toEqual(first);
+  });
+
+  it("rejects applying the previous turn boundary after the next turn has started", async () => {
+    const fixture = await createActiveTurnFixture("room-membership-late-boundary");
+    const requestMembershipChange = requireRequestMembershipChange(fixture.store);
+    const requested = await requestMembershipChange(
+      {
+        roomId: fixture.roomId,
+        changeId: "change-late-boundary-pause",
+        idempotencyKey: "membership:late-boundary-pause",
+        expectedAggregateVersion: fixture.aggregate.room.aggregateVersion,
+        expectedMembershipVersion: fixture.aggregate.membershipVersion,
+        activateAt: "next_turn_boundary",
+        mutation: { action: "pause", seatId: fixture.aggregate.seats[0]!.id },
+        reason: "must not interleave an old membership boundary with the next running turn",
+        requestedAt: REQUEST_TIME,
+      },
+      commandContext("event-change-late-boundary-requested", REQUEST_TIME),
+    );
+
+    await settleActiveTurnFixture(fixture);
+    const nextTurnId = `${fixture.roomId}-turn-2`;
+    await fixture.layer.db.insert(roomTurns).values({
+      id: nextTurnId,
+      projectId: PROJECT_ID,
+      roomId: fixture.roomId,
+      sequence: 2,
+      protocolPhaseId: "implementation",
+      membershipVersion: requested.membershipVersion,
+      state: "running",
+      startedAt: "2026-07-17T12:02:30.000Z",
+      endedAt: null,
+    });
+    await fixture.layer.db
+      .update(operationalRooms)
+      .set({ activeTurnId: nextTurnId, updatedAt: "2026-07-17T12:02:30.000Z" })
+      .where(and(
+        eq(operationalRooms.projectId, PROJECT_ID),
+        eq(operationalRooms.id, fixture.roomId),
+      ));
+
+    await expect(requireApplyMembershipChangesAtTurnBoundary(fixture.store)(
+      {
+        roomId: fixture.roomId,
+        turnId: fixture.turnId,
+        expectedAggregateVersion: requested.room.aggregateVersion,
+        expectedMembershipVersion: requested.membershipVersion,
+        now: "2026-07-17T12:03:00.000Z",
+      },
+      commandContext("event-change-late-boundary-activated", "2026-07-17T12:03:00.000Z"),
+    )).rejects.toMatchObject({ code: "turn_boundary_required" });
+
+    await fixture.layer.db
+      .update(roomTurns)
+      .set({ state: "completed", endedAt: "2026-07-17T12:03:30.000Z" })
+      .where(eq(roomTurns.id, nextTurnId));
+    await fixture.layer.db
+      .update(operationalRooms)
+      .set({ activeTurnId: null, updatedAt: "2026-07-17T12:03:30.000Z" })
+      .where(and(
+        eq(operationalRooms.projectId, PROJECT_ID),
+        eq(operationalRooms.id, fixture.roomId),
+      ));
+    await expect(requireApplyMembershipChangesAtTurnBoundary(fixture.store)(
+      {
+        roomId: fixture.roomId,
+        turnId: fixture.turnId,
+        expectedAggregateVersion: requested.room.aggregateVersion,
+        expectedMembershipVersion: requested.membershipVersion,
+        now: "2026-07-17T12:04:00.000Z",
+      },
+      commandContext("event-change-late-boundary-after-next-completed", "2026-07-17T12:04:00.000Z"),
+    )).rejects.toMatchObject({ code: "turn_boundary_required" });
   });
 
   it("fails closed when expected aggregate version is stale", async () => {

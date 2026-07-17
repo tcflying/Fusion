@@ -21,6 +21,7 @@ import {
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
   SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+  SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -51,6 +52,31 @@ async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
   return context;
 }
 
+async function restorePreMembershipProductionInvariantState(
+  context: EmbeddedTestContext,
+): Promise<void> {
+  await context.connections!.migration.execute(sql.raw(`
+    DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+    WHERE version = '${SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION}';
+
+    DROP INDEX IF EXISTS project.idx_room_membership_changes_pending_native_session;
+    DROP INDEX IF EXISTS project.idx_room_membership_changes_pending_happier_session;
+    DROP INDEX IF EXISTS project.idx_room_bindings_active_native_session;
+    DROP INDEX IF EXISTS project.idx_room_bindings_active_happier_session;
+
+    ALTER TABLE project.room_membership_changes
+      DROP COLUMN IF EXISTS reserved_connector_id,
+      DROP COLUMN IF EXISTS reserved_provider_id,
+      DROP COLUMN IF EXISTS reserved_native_session_id,
+      DROP COLUMN IF EXISTS reserved_happier_session_id,
+      DROP COLUMN IF EXISTS failed_at,
+      DROP COLUMN IF EXISTS failure_code;
+  `));
+  await context.connections!.migration.execute(
+    sql.raw(await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION)),
+  );
+}
+
 afterEach(async () => {
   while (contexts.length > 0) {
     const context = contexts.pop();
@@ -79,6 +105,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -91,6 +118,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -253,6 +281,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -286,6 +315,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -338,6 +368,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -417,6 +448,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -564,6 +596,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable
@@ -630,5 +663,273 @@ describe("Session Room PostgreSQL migration", () => {
       { id: "legacy-room-audit", project_id: "project-legacy" },
       { id: "legacy-task-audit", project_id: "project-task-owner" },
     ]);
+  });
+
+  it("upgrades 0008 pending membership rows into global Session identity reservations", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await restorePreMembershipProductionInvariantState(context);
+    const binding = {
+      id: "binding-upgrade-0009",
+      connectorId: "happier",
+      providerId: "claude",
+      nativeSessionId: "native-upgrade-0009",
+      happierSessionId: "happier-upgrade-0009",
+      serverProfileId: "server-profile-1",
+      machineId: "machine-upgrade-0009",
+      hostId: "windows-host-1",
+    };
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, aggregate_version, membership_version,
+        created_at, updated_at
+      ) VALUES (
+        'room-upgrade-0009', 'project-upgrade-0009', 'upgrade membership reservations',
+        'implementation', 1, 'running', 3, 1,
+        '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+      )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_membership_changes (
+        id, project_id, room_id, seat_id, kind, payload, reason,
+        requested_at, requested_by, effective_after_turn_id, applied_at, state
+      ) VALUES (
+        'change-upgrade-0009', 'project-upgrade-0009', 'room-upgrade-0009',
+        'future-seat-upgrade-0009', 'add',
+        ${JSON.stringify({ seat: { id: "future-seat-upgrade-0009" }, binding })}::jsonb,
+        'preserve the pending Session identity reservation',
+        '2026-07-17T12:01:00.000Z', 'operator-1', 'turn-upgrade-0009', NULL,
+        'waiting_turn_boundary'
+      )
+    `);
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+
+    expect(result.appliedVersions).toEqual([
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+    ]);
+    const reservations = (await context.connections!.migration.execute(sql`
+      SELECT
+        reserved_connector_id,
+        reserved_provider_id,
+        reserved_native_session_id,
+        reserved_happier_session_id,
+        failed_at,
+        failure_code
+      FROM project.room_membership_changes
+      WHERE id = 'change-upgrade-0009'
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(reservations).toEqual([{
+      reserved_connector_id: "happier",
+      reserved_provider_id: "claude",
+      reserved_native_session_id: "native-upgrade-0009",
+      reserved_happier_session_id: "happier-upgrade-0009",
+      failed_at: null,
+      failure_code: null,
+    }]);
+    const activeIndexes = (await context.connections!.migration.execute(sql`
+      SELECT indexname, indexdef
+      FROM pg_indexes
+      WHERE schemaname = 'project'
+        AND indexname IN (
+          'idx_room_bindings_active_native_session',
+          'idx_room_bindings_active_happier_session'
+        )
+      ORDER BY indexname
+    `)) as unknown as Array<{ indexname: string; indexdef: string }>;
+    expect(activeIndexes).toHaveLength(2);
+    for (const index of activeIndexes) {
+      expect(index.indexdef).not.toContain("project_id");
+    }
+  });
+
+  it("fails the 0009 upgrade closed when two projects already own one active Session identity", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await restorePreMembershipProductionInvariantState(context);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, aggregate_version, membership_version,
+        created_at, updated_at
+      ) VALUES
+        (
+          'room-upgrade-0009-conflict-a', 'project-upgrade-0009-conflict-a',
+          'first historical owner', 'implementation', 1, 'running', 3, 1,
+          '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+        ),
+        (
+          'room-upgrade-0009-conflict-b', 'project-upgrade-0009-conflict-b',
+          'second historical owner', 'implementation', 1, 'running', 3, 1,
+          '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+        )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_seats (
+        id, project_id, room_id, role, role_version, permission_scope,
+        state, active_binding_id, created_at, updated_at
+      ) VALUES
+        (
+          'seat-upgrade-0009-conflict-a', 'project-upgrade-0009-conflict-a',
+          'room-upgrade-0009-conflict-a', 'producer', 1, '[]'::jsonb,
+          'active', 'binding-upgrade-0009-conflict-a',
+          '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+        ),
+        (
+          'seat-upgrade-0009-conflict-b', 'project-upgrade-0009-conflict-b',
+          'room-upgrade-0009-conflict-b', 'producer', 1, '[]'::jsonb,
+          'active', 'binding-upgrade-0009-conflict-b',
+          '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+        )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, happier_session_id, host_id,
+        state, attached_at
+      ) VALUES
+        (
+          'binding-upgrade-0009-conflict-a', 'project-upgrade-0009-conflict-a',
+          'room-upgrade-0009-conflict-a', 'seat-upgrade-0009-conflict-a', 1,
+          'happier', 'claude', 'native-upgrade-0009-conflict',
+          'happier-upgrade-0009-conflict', 'windows-host-1', 'attached',
+          '2026-07-17T12:00:00.000Z'
+        ),
+        (
+          'binding-upgrade-0009-conflict-b', 'project-upgrade-0009-conflict-b',
+          'room-upgrade-0009-conflict-b', 'seat-upgrade-0009-conflict-b', 1,
+          'happier', 'claude', 'native-upgrade-0009-conflict',
+          'happier-upgrade-0009-conflict', 'windows-host-1', 'attached',
+          '2026-07-17T12:00:00.000Z'
+        )
+    `);
+
+    await expect(applySchemaBaseline(
+      context.connections!.migration,
+      { pluginHooks: [] },
+    )).rejects.toMatchObject({
+      cause: {
+        code: "23505",
+        constraint_name: "idx_room_bindings_active_native_session",
+      },
+    });
+    expect(await getAppliedMigrations(context.connections!.migration)).not.toContain(
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+    );
+  });
+
+  it("fails the 0009 upgrade closed for a malformed pending binding reservation", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await restorePreMembershipProductionInvariantState(context);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, aggregate_version, membership_version,
+        created_at, updated_at
+      ) VALUES (
+        'room-upgrade-0009-malformed', 'project-upgrade-0009-malformed',
+        'malformed historical reservation', 'implementation', 1,
+        'running', 3, 1,
+        '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+      )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_membership_changes (
+        id, project_id, room_id, seat_id, kind, payload, reason,
+        requested_at, requested_by, effective_after_turn_id, applied_at, state
+      ) VALUES (
+        'change-upgrade-0009-malformed', 'project-upgrade-0009-malformed',
+        'room-upgrade-0009-malformed', 'future-seat-upgrade-0009-malformed',
+        'add', '{"binding":{"connectorId":"happier"}}'::jsonb,
+        'must not migrate without a native Session identity',
+        '2026-07-17T12:01:00.000Z', 'unknown-writer', 'turn-upgrade-0009-malformed',
+        NULL, 'waiting_turn_boundary'
+      )
+    `);
+
+    await expect(applySchemaBaseline(
+      context.connections!.migration,
+      { pluginHooks: [] },
+    )).rejects.toMatchObject({ cause: { code: "23514" } });
+    expect(await getAppliedMigrations(context.connections!.migration)).not.toContain(
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+    );
+  });
+
+  it("fails the 0009 upgrade closed when active and pending rows share one Session identity", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await restorePreMembershipProductionInvariantState(context);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, aggregate_version, membership_version,
+        created_at, updated_at
+      ) VALUES
+        (
+          'room-upgrade-0009-active-owner', 'project-upgrade-0009-active-owner',
+          'active historical owner', 'implementation', 1, 'running', 3, 1,
+          '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+        ),
+        (
+          'room-upgrade-0009-pending-owner', 'project-upgrade-0009-pending-owner',
+          'pending historical owner', 'implementation', 1, 'running', 3, 0,
+          '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+        )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_seats (
+        id, project_id, room_id, role, role_version, permission_scope,
+        state, active_binding_id, created_at, updated_at
+      ) VALUES (
+        'seat-upgrade-0009-active-owner', 'project-upgrade-0009-active-owner',
+        'room-upgrade-0009-active-owner', 'producer', 1, '[]'::jsonb,
+        'active', 'binding-upgrade-0009-active-owner',
+        '2026-07-17T12:00:00.000Z', '2026-07-17T12:01:00.000Z'
+      )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, happier_session_id, host_id,
+        state, attached_at
+      ) VALUES (
+        'binding-upgrade-0009-active-owner', 'project-upgrade-0009-active-owner',
+        'room-upgrade-0009-active-owner', 'seat-upgrade-0009-active-owner', 1,
+        'happier', 'claude', 'native-upgrade-0009-cross-table',
+        'happier-upgrade-0009-cross-table', 'windows-host-1', 'attached',
+        '2026-07-17T12:00:00.000Z'
+      )
+    `);
+    await context.connections!.migration.execute(sql`
+      INSERT INTO project.room_membership_changes (
+        id, project_id, room_id, seat_id, kind, payload, reason,
+        requested_at, requested_by, effective_after_turn_id, applied_at, state
+      ) VALUES (
+        'change-upgrade-0009-pending-owner', 'project-upgrade-0009-pending-owner',
+        'room-upgrade-0009-pending-owner', 'future-seat-upgrade-0009-pending-owner',
+        'add', ${JSON.stringify({
+          binding: {
+            connectorId: "happier",
+            providerId: "claude",
+            nativeSessionId: "native-upgrade-0009-cross-table",
+            happierSessionId: "happier-upgrade-0009-cross-table",
+          },
+        })}::jsonb,
+        'must not coexist with the active owner',
+        '2026-07-17T12:01:00.000Z', 'operator-1', 'turn-upgrade-0009-pending-owner',
+        NULL, 'waiting_turn_boundary'
+      )
+    `);
+
+    await expect(applySchemaBaseline(
+      context.connections!.migration,
+      { pluginHooks: [] },
+    )).rejects.toMatchObject({ cause: { code: "23505" } });
+    expect(await getAppliedMigrations(context.connections!.migration)).not.toContain(
+      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+    );
   });
 });

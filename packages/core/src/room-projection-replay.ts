@@ -399,6 +399,27 @@ function validateMembershipChangeActivated(
   event: RoomEventRecordV1,
   payload: Readonly<Record<string, unknown>>,
 ): RoomAggregateV1 {
+  const projectionVersion = requireNonNegativeInteger(
+    payload.projectionVersion,
+    `${event.id} projectionVersion`,
+  );
+  if (projectionVersion === 1) {
+    return validateMembershipChangeActivatedV1(aggregate, event, payload);
+  }
+  if (projectionVersion === 2) {
+    return validateMembershipChangeActivatedV2(aggregate, event, payload);
+  }
+  throw new RoomProjectionReplayError(
+    "invalid_event_payload",
+    `Room membership activation ${event.id} uses unsupported projection version ${projectionVersion}`,
+  );
+}
+
+function validateMembershipChangeActivatedV1(
+  aggregate: RoomAggregateV1,
+  event: RoomEventRecordV1,
+  payload: Readonly<Record<string, unknown>>,
+): RoomAggregateV1 {
   assertExactKeys(payload, [
     "projectionVersion",
     "turnId",
@@ -487,6 +508,206 @@ function validateMembershipChangeActivated(
     );
   }
   return expected;
+}
+
+type MembershipActivationOutcomeV2 =
+  | { readonly changeId: string; readonly status: "applied" }
+  | {
+      readonly changeId: string;
+      readonly status: "failed";
+      readonly failureCode: "seat_not_found" | "binding_not_found";
+    };
+
+function validateMembershipChangeActivatedV2(
+  aggregate: RoomAggregateV1,
+  event: RoomEventRecordV1,
+  payload: Readonly<Record<string, unknown>>,
+): RoomAggregateV1 {
+  assertExactKeys(payload, [
+    "projectionVersion",
+    "turnId",
+    "outcomes",
+    "quarantinedChangeIds",
+    "membershipVersion",
+    "projection",
+    "projectionHash",
+    "updatedAt",
+  ], `${event.id} payload`);
+  const projectionHash = requireString(payload.projectionHash, `${event.id} projectionHash`);
+  if (hashRoomValue(payload.projection) !== projectionHash) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership event ${event.id} projection hash does not match its payload`,
+    );
+  }
+  const turnId = requireTrimmedString(payload.turnId, `${event.id} turnId`);
+  const outcomes = parseMembershipActivationOutcomesV2(payload.outcomes, event.id);
+  const quarantinedChangeIds = requireUniqueStringArray(
+    payload.quarantinedChangeIds,
+    `${event.id} quarantinedChangeIds`,
+  );
+  if (outcomes.length === 0 && quarantinedChangeIds.length === 0) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} has neither ledger outcomes nor quarantined rows`,
+    );
+  }
+  const outcomeIds = new Set(outcomes.map((outcome) => outcome.changeId));
+  if (quarantinedChangeIds.some((changeId) => outcomeIds.has(changeId))) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} overlaps ledger outcomes and quarantined rows`,
+    );
+  }
+  const updatedAt = requireIsoTimestamp(payload.updatedAt, `${event.id} updatedAt`);
+  const declaredMembershipVersion = requireNonNegativeInteger(
+    payload.membershipVersion,
+    `${event.id} membershipVersion`,
+  );
+  const projection = requireEventRecord(payload.projection, `${event.id} projection`);
+  assertExactKeys(projection, [
+    "room",
+    "membershipVersion",
+    "activeTurnId",
+    "seats",
+    "bindings",
+    "turns",
+    "pendingMembershipChanges",
+  ], `${event.id} projection`);
+  const validatedPending = validatePendingMembershipChangeSet(
+    aggregate.pendingMembershipChanges,
+    `${event.id} pending changes`,
+  );
+  const replayBase: RoomAggregateV1 = {
+    ...aggregate,
+    pendingMembershipChanges: validatedPending,
+  };
+  const applicableChanges = validatedPending
+    .filter((change) => change.effectiveAfterTurnId === turnId)
+    .slice()
+    .sort((left, right) => comparePendingMembershipChanges(left, right));
+  const applicableIds = applicableChanges.map((change) => change.id);
+  if (
+    outcomes.length !== applicableIds.length
+    || outcomes.some((outcome, index) => outcome.changeId !== applicableIds[index])
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} outcomes do not match the ordered pending change set for turn ${turnId}`,
+    );
+  }
+
+  const boundaryBase = deriveMembershipActivationBoundary(
+    replayBase,
+    projection,
+    event.id,
+    turnId,
+    updatedAt,
+  );
+  let projected = boundaryBase;
+  let appliedCount = 0;
+  for (let index = 0; index < applicableChanges.length; index += 1) {
+    const change = applicableChanges[index]!;
+    const outcome = outcomes[index]!;
+    const failureCode = classifyMembershipReplayFailure(projected, change);
+    if (failureCode) {
+      if (outcome.status !== "failed" || outcome.failureCode !== failureCode) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Room membership activation ${event.id} has an invalid failed outcome for ${change.id}`,
+        );
+      }
+      continue;
+    }
+    if (outcome.status !== "applied") {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership activation ${event.id} falsely failed applicable change ${change.id}`,
+      );
+    }
+    projected = applyMembershipChangeForReplay(projected, change, updatedAt);
+    appliedCount += 1;
+  }
+  const completedIds = new Set(applicableIds);
+  const expected: RoomAggregateV1 = {
+    ...projected,
+    room: {
+      ...projected.room,
+      aggregateVersion: aggregate.room.aggregateVersion + 1,
+      updatedAt,
+    },
+    membershipVersion: aggregate.membershipVersion + (appliedCount > 0 ? 1 : 0),
+    pendingMembershipChanges: boundaryBase.pendingMembershipChanges.filter(
+      (change) => !completedIds.has(change.id),
+    ),
+  };
+  if (
+    expected.room.aggregateVersion !== event.aggregateVersion
+    || expected.membershipVersion !== declaredMembershipVersion
+    || hashRoomValue(payload.projection) !== hashRoomValue(expected)
+  ) {
+    throw new RoomProjectionReplayError(
+      "invalid_event_payload",
+      `Room membership activation ${event.id} projection is not the exact version-2 boundary delta`,
+    );
+  }
+  return expected;
+}
+
+function parseMembershipActivationOutcomesV2(
+  value: unknown,
+  eventId: string,
+): readonly MembershipActivationOutcomeV2[] {
+  const rows = requireEventArray(value, `${eventId} outcomes`);
+  const seen = new Set<string>();
+  return rows.map((value, index) => {
+    const row = requireEventRecord(value, `${eventId} outcomes[${index}]`);
+    const status = row.status;
+    if (status !== "applied" && status !== "failed") {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership activation ${eventId} has an invalid outcome status`,
+      );
+    }
+    assertExactKeys(
+      row,
+      status === "applied" ? ["changeId", "status"] : ["changeId", "status", "failureCode"],
+      `${eventId} outcomes[${index}]`,
+    );
+    const changeId = requireTrimmedString(row.changeId, `${eventId} outcomes[${index}].changeId`);
+    if (seen.has(changeId)) {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership activation ${eventId} duplicates outcome ${changeId}`,
+      );
+    }
+    seen.add(changeId);
+    if (status === "applied") return { changeId, status };
+    if (row.failureCode !== "seat_not_found" && row.failureCode !== "binding_not_found") {
+      throw new RoomProjectionReplayError(
+        "invalid_event_payload",
+        `Room membership activation ${eventId} has an invalid failure code`,
+      );
+    }
+    return { changeId, status, failureCode: row.failureCode };
+  });
+}
+
+function classifyMembershipReplayFailure(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+): "seat_not_found" | "binding_not_found" | null {
+  if (change.kind === "add") return null;
+  const seat = aggregate.seats.find((candidate) => candidate.id === change.seatId);
+  if (!seat) return "seat_not_found";
+  if (change.kind === "change_role") return null;
+  if (
+    !seat.activeBindingId
+    || !aggregate.bindings.some((binding) => binding.id === seat.activeBindingId)
+  ) {
+    return "binding_not_found";
+  }
+  return null;
 }
 
 /*
@@ -1219,7 +1440,12 @@ function requireEventPayload(event: RoomEventRecordV1): Readonly<Record<string, 
       `Room event ${event.id} payload must be an object`,
     );
   }
-  if (event.payload.projectionVersion !== 1) {
+  const supportedVersion = event.payload.projectionVersion === 1
+    || (
+      event.eventType === "membership_change_activated"
+      && event.payload.projectionVersion === 2
+    );
+  if (!supportedVersion) {
     throw new RoomProjectionReplayError(
       "invalid_event_payload",
       `Room event ${event.id} has unsupported projection payload version`,

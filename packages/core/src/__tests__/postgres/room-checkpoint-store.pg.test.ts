@@ -693,6 +693,28 @@ describe("Session Room checkpoints and projection replay", () => {
 
     expect(replayed.aggregate).toEqual(fixture.activated);
     expect(await fixture.roomStore.listEvents(fixture.roomId)).toEqual(eventsBeforeReplay);
+
+    const activation = structuredClone(eventsBeforeReplay.at(-1)!);
+    const beforeActivation = fixture.requested;
+    const falseFailure = structuredClone(activation);
+    const falseFailurePayload = falseFailure.payload as Record<string, unknown>;
+    const falseFailureOutcomes = falseFailurePayload.outcomes as Array<Record<string, unknown>>;
+    falseFailureOutcomes[0] = {
+      changeId: falseFailureOutcomes[0]!.changeId,
+      status: "failed",
+      failureCode: "seat_not_found",
+    };
+    expect(() => applyRoomProjectionEvents(beforeActivation, [falseFailure])).toThrow(
+      /falsely failed|invalid failed outcome/iu,
+    );
+
+    const smuggledProjection = cloneEventWithProjection(activation, (projection) => {
+      const room = projection.room as Record<string, unknown>;
+      room.objective = "smuggled unrelated objective";
+    });
+    expect(() => applyRoomProjectionEvents(beforeActivation, [smuggledProjection])).toThrow(
+      /exact version-2 boundary delta/iu,
+    );
   }, 60000);
 
   it("accepts only the exact target-turn boundary transition during membership activation", () => {

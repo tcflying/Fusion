@@ -479,6 +479,7 @@ export interface RequestRoomMembershipChangeInput {
 export interface ApplyRoomMembershipChangesAtTurnBoundaryInput {
   readonly roomId: string;
   readonly turnId: string;
+  readonly idempotencyKey?: string;
   readonly expectedAggregateVersion: number;
   readonly expectedMembershipVersion: number;
   readonly now: string;
@@ -638,9 +639,9 @@ export class AsyncRoomStore {
     const committed = await this.layer.transactionImmediate(async (tx) => {
       await lockLegacyHappierBindingSource(
         tx,
-        this.projectId,
         input.source.providerId,
         input.source.nativeSessionId,
+        input.source.happierSessionId,
       );
       await verifyLegacyHappierBindingSource(tx, this.projectId, input.source);
 
@@ -648,7 +649,6 @@ export class AsyncRoomStore {
         .select({ roomId: roomBindings.roomId, bindingId: roomBindings.id })
         .from(roomBindings)
         .where(and(
-          eq(roomBindings.projectId, this.projectId),
           eq(roomBindings.providerId, input.source.providerId),
           eq(roomBindings.nativeSessionId, input.source.nativeSessionId),
           inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
@@ -666,7 +666,6 @@ export class AsyncRoomStore {
         .select({ roomId: roomBindings.roomId, bindingId: roomBindings.id })
         .from(roomBindings)
         .where(and(
-          eq(roomBindings.projectId, this.projectId),
           eq(roomBindings.connectorId, "happier"),
           eq(roomBindings.happierSessionId, input.source.happierSessionId),
           inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
@@ -677,6 +676,30 @@ export class AsyncRoomStore {
         throw new RoomStoreError(
           "legacy_binding_integrity_conflict",
           `Happier Session ${input.source.happierSessionId} already belongs to Room ${activeHappierOwner.roomId} as binding ${activeHappierOwner.bindingId}`,
+        );
+      }
+
+      const pendingOwners = await tx
+        .select({ roomId: roomMembershipChanges.roomId, changeId: roomMembershipChanges.id })
+        .from(roomMembershipChanges)
+        .where(and(
+          eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+          or(
+            and(
+              eq(roomMembershipChanges.reservedProviderId, input.source.providerId),
+              eq(roomMembershipChanges.reservedNativeSessionId, input.source.nativeSessionId),
+            ),
+            and(
+              eq(roomMembershipChanges.reservedConnectorId, "happier"),
+              eq(roomMembershipChanges.reservedHappierSessionId, input.source.happierSessionId),
+            ),
+          ),
+        ))
+        .limit(1);
+      if (pendingOwners[0]) {
+        throw new RoomStoreError(
+          "legacy_binding_integrity_conflict",
+          `Legacy Happier binding ${input.source.cliSessionId} conflicts with pending membership change ${pendingOwners[0].changeId} in Room ${pendingOwners[0].roomId}`,
         );
       }
 
@@ -1262,10 +1285,11 @@ export class AsyncRoomStore {
             `Idempotency key ${input.idempotencyKey} has no committed membership result`,
           );
         }
-        const aggregate = await loadMembershipRequestResult(
+        const aggregate = await loadMembershipResult(
           tx,
           this.projectId,
           existing.resultEventId,
+          "membership_change_requested",
         );
         return { aggregate, event: null };
       }
@@ -1285,7 +1309,6 @@ export class AsyncRoomStore {
       }
       const pending = await preparePendingMembershipChange(
         tx,
-        this.projectId,
         current,
         input,
       );
@@ -1328,7 +1351,29 @@ export class AsyncRoomStore {
         requestedAt: input.requestedAt,
         requestedBy: context.actorId,
         effectiveAfterTurnId: current.activeTurnId,
+        reservedConnectorId: pending.kind === "add"
+          ? pending.binding?.connectorId ?? null
+          : pending.kind === "replace"
+            ? pending.replacement?.connectorId ?? null
+            : null,
+        reservedProviderId: pending.kind === "add"
+          ? pending.binding?.providerId ?? null
+          : pending.kind === "replace"
+            ? pending.replacement?.providerId ?? null
+            : null,
+        reservedNativeSessionId: pending.kind === "add"
+          ? pending.binding?.nativeSessionId ?? null
+          : pending.kind === "replace"
+            ? pending.replacement?.nativeSessionId ?? null
+            : null,
+        reservedHappierSessionId: pending.kind === "add"
+          ? pending.binding?.happierSessionId ?? null
+          : pending.kind === "replace"
+            ? pending.replacement?.happierSessionId ?? null
+            : null,
         appliedAt: null,
+        failedAt: null,
+        failureCode: null,
         state: "waiting_turn_boundary",
       });
       const event = await insertRoomEvent(tx, next, "membership_change_requested", context, {
@@ -1355,16 +1400,84 @@ export class AsyncRoomStore {
     context: RoomCommandContext,
   ): Promise<RoomAggregateV1> {
     validateMembershipBoundaryInput(input);
+    const idempotencyKey = input.idempotencyKey?.trim()
+      || `membership-boundary:${input.turnId}`;
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      turnId: input.turnId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedMembershipVersion: input.expectedMembershipVersion,
+      now: input.now,
+    });
     const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: `room-idempotency-${randomUUID()}`,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey,
+          commandType: "apply_membership_changes_at_turn_boundary",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.now,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "apply_membership_changes_at_turn_boundary"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${idempotencyKey} has no committed membership boundary result`,
+          );
+        }
+        const aggregate = await loadMembershipResult(
+          tx,
+          this.projectId,
+          existing.resultEventId,
+          "membership_change_activated",
+        );
+        return { aggregate, event: null };
+      }
+
       const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
       if (!current) {
         throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
       }
       assertMembershipVersions(current, input);
       const boundaryTurn = current.turns.find((turn) => turn.id === input.turnId);
+      const laterTurnStarted = boundaryTurn
+        ? current.turns.some((turn) => (
+            turn.sequence > boundaryTurn.sequence
+            && turn.startedAt !== null
+          ))
+        : false;
       if (
         !boundaryTurn
+        || current.activeTurnId !== null
         || current.activeTurnId === input.turnId
+        || laterTurnStarted
         || !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)
       ) {
         throw new RoomDomainError(
@@ -1389,14 +1502,78 @@ export class AsyncRoomStore {
         );
       }
 
+      const membershipRequestEvents = await tx
+        .select({ payload: roomEvents.payload })
+        .from(roomEvents)
+        .where(and(
+          eq(roomEvents.projectId, this.projectId),
+          eq(roomEvents.roomId, input.roomId),
+          eq(roomEvents.eventType, "membership_change_requested"),
+        ));
+      const eventBackedChangeIds = new Set(
+        membershipRequestEvents
+          .map((event) => asRecord(event.payload).changeId)
+          .filter((changeId): changeId is string => (
+            typeof changeId === "string" && changeId.trim().length > 0
+          )),
+      );
+
       let projected = current;
+      const failedIds = new Set<string>();
+      const appliedIds = new Set<string>();
+      const quarantinedChangeIds: string[] = [];
+      const outcomes: Array<
+        | { readonly changeId: string; readonly status: "applied" }
+        | {
+            readonly changeId: string;
+            readonly status: "failed";
+            readonly failureCode: "seat_not_found" | "binding_not_found";
+          }
+      > = [];
       for (const row of rows) {
+        if (!eventBackedChangeIds.has(row.id)) {
+          failedIds.add(row.id);
+          quarantinedChangeIds.push(row.id);
+          await tx
+            .update(roomMembershipChanges)
+            .set({
+              state: "failed",
+              failedAt: input.now,
+              failureCode: "missing_request_event",
+            })
+            .where(and(
+              eq(roomMembershipChanges.projectId, this.projectId),
+              eq(roomMembershipChanges.roomId, input.roomId),
+              eq(roomMembershipChanges.id, row.id),
+              eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+            ));
+          continue;
+        }
         const change = rowToPendingMembershipChange(row);
         const before = projected;
-        projected = applyPendingMembershipChange(before, change, input.now);
-        await persistAppliedMembershipChange(tx, this.projectId, before, projected, change, input.now);
+        try {
+          projected = applyPendingMembershipChange(before, change, input.now);
+          await persistAppliedMembershipChange(tx, this.projectId, before, projected, change, input.now);
+          appliedIds.add(row.id);
+          outcomes.push({ changeId: row.id, status: "applied" });
+        } catch (error) {
+          if (
+            !(error instanceof RoomDomainError)
+            || (error.code !== "seat_not_found" && error.code !== "binding_not_found")
+          ) throw error;
+          failedIds.add(row.id);
+          outcomes.push({ changeId: row.id, status: "failed", failureCode: error.code });
+          await tx
+            .update(roomMembershipChanges)
+            .set({ state: "failed", failedAt: input.now, failureCode: error.code })
+            .where(and(
+              eq(roomMembershipChanges.projectId, this.projectId),
+              eq(roomMembershipChanges.roomId, input.roomId),
+              eq(roomMembershipChanges.id, row.id),
+              eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+            ));
+        }
       }
-      const appliedIds = new Set(rows.map((row) => row.id));
       const next: RoomAggregateV1 = {
         ...projected,
         room: {
@@ -1404,9 +1581,9 @@ export class AsyncRoomStore {
           aggregateVersion: current.room.aggregateVersion + 1,
           updatedAt: input.now,
         },
-        membershipVersion: current.membershipVersion + 1,
+        membershipVersion: current.membershipVersion + (appliedIds.size > 0 ? 1 : 0),
         pendingMembershipChanges: current.pendingMembershipChanges.filter(
-          (change) => !appliedIds.has(change.id),
+          (change) => !appliedIds.has(change.id) && !failedIds.has(change.id),
         ),
       };
       const updated = await tx
@@ -1429,27 +1606,34 @@ export class AsyncRoomStore {
           `Concurrent membership activation rejected for Room ${input.roomId}`,
         );
       }
-      await tx
-        .update(roomMembershipChanges)
-        .set({ state: "applied", appliedAt: input.now })
-        .where(and(
-          eq(roomMembershipChanges.projectId, this.projectId),
-          eq(roomMembershipChanges.roomId, input.roomId),
-          inArray(roomMembershipChanges.id, [...appliedIds]),
-          eq(roomMembershipChanges.state, "waiting_turn_boundary"),
-        ));
+      if (appliedIds.size > 0) {
+        await tx
+          .update(roomMembershipChanges)
+          .set({ state: "applied", appliedAt: input.now })
+          .where(and(
+            eq(roomMembershipChanges.projectId, this.projectId),
+            eq(roomMembershipChanges.roomId, input.roomId),
+            inArray(roomMembershipChanges.id, [...appliedIds]),
+            eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+          ));
+      }
       const event = await insertRoomEvent(tx, next, "membership_change_activated", context, {
-        projectionVersion: 1,
+        projectionVersion: 2,
         turnId: input.turnId,
-        changeIds: [...appliedIds],
+        outcomes,
+        quarantinedChangeIds,
         membershipVersion: next.membershipVersion,
         projection: next,
         projectionHash: hashRoomValue(next),
         updatedAt: next.room.updatedAt,
       });
+      await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservation[0]!.id));
       return { aggregate: next, event };
     });
-    this.publishCommittedEvent(committed.event);
+    if (committed.event) this.publishCommittedEvent(committed.event);
     return committed.aggregate;
   }
 
@@ -2416,10 +2600,11 @@ export class AsyncRoomStore {
 
 type LoadedEnqueueMessageResult = Omit<EnqueueRoomMessageResult, "replayed">;
 
-async function loadMembershipRequestResult(
+async function loadMembershipResult(
   handle: QueryHandle,
   projectId: string,
   eventId: string,
+  expectedEventType: "membership_change_requested" | "membership_change_activated",
 ): Promise<RoomAggregateV1> {
   const eventRows = await handle
     .select()
@@ -2427,7 +2612,7 @@ async function loadMembershipRequestResult(
     .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.id, eventId)))
     .limit(1);
   const eventRow = eventRows[0];
-  if (!eventRow || eventRow.eventType !== "membership_change_requested") {
+  if (!eventRow || eventRow.eventType !== expectedEventType) {
     throw new RoomStoreError(
       "idempotency_result_missing",
       `Committed membership event ${eventId} no longer exists or has the wrong type`,
@@ -3270,12 +3455,16 @@ function isIsoTimestamp(value: string): boolean {
 
 async function lockLegacyHappierBindingSource(
   tx: DbTransaction,
-  projectId: string,
   providerId: LegacyHappierBindingProviderId,
   nativeSessionId: string,
+  happierSessionId: string,
 ): Promise<void> {
-  const lockKey = `fusion-room-native-session-v1:${projectId}:${providerId}:${nativeSessionId}`;
-  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`);
+  await lockRoomBindingIdentity(tx, {
+    connectorId: "happier",
+    providerId,
+    nativeSessionId,
+    happierSessionId,
+  });
 }
 
 async function verifyLegacyHappierBindingSource(
@@ -3628,7 +3817,6 @@ function assertMembershipVersions(
 
 async function preparePendingMembershipChange(
   tx: DbTransaction,
-  projectId: string,
   aggregate: RoomAggregateV1,
   input: RequestRoomMembershipChangeInput,
 ): Promise<PendingRoomMembershipChangeV1> {
@@ -3664,7 +3852,7 @@ async function preparePendingMembershipChange(
     if (aggregate.seats.some((seat) => seat.id === seatId)) {
       throw new RoomDomainError("seat_identity_conflict", `Room seat ${seatId} already exists`);
     }
-    await assertProjectBindingIdentityAvailable(tx, projectId, input.mutation.binding);
+    await assertRoomBindingIdentityAvailable(tx, input.mutation.binding);
     return {
       ...base,
       kind: "add",
@@ -3686,23 +3874,23 @@ async function preparePendingMembershipChange(
     case "pause":
       return { ...base, kind: "pause" };
     case "replace":
-      await assertProjectBindingIdentityAvailable(tx, projectId, input.mutation.replacement);
+      await assertRoomBindingIdentityAvailable(tx, input.mutation.replacement);
       return { ...base, kind: "replace", replacement: { ...input.mutation.replacement } };
     case "change_role":
       return { ...base, kind: "change_role", role: input.mutation.role };
   }
 }
 
-async function assertProjectBindingIdentityAvailable(
+async function assertRoomBindingIdentityAvailable(
   tx: DbTransaction,
-  projectId: string,
   binding: RoomBindingReplacementV1,
 ): Promise<void> {
+  await lockRoomBindingIdentity(tx, binding);
+
   const nativeRows = await tx
     .select({ id: roomBindings.id })
     .from(roomBindings)
     .where(and(
-      eq(roomBindings.projectId, projectId),
       eq(roomBindings.providerId, binding.providerId),
       eq(roomBindings.nativeSessionId, binding.nativeSessionId),
       inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
@@ -3714,12 +3902,26 @@ async function assertProjectBindingIdentityAvailable(
       `Native Session ${binding.providerId}:${binding.nativeSessionId} already has an active Room binding`,
     );
   }
+  const pendingNativeRows = await tx
+    .select({ id: roomMembershipChanges.id })
+    .from(roomMembershipChanges)
+    .where(and(
+      eq(roomMembershipChanges.reservedProviderId, binding.providerId),
+      eq(roomMembershipChanges.reservedNativeSessionId, binding.nativeSessionId),
+      eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+    ))
+    .limit(1);
+  if (pendingNativeRows.length > 0) {
+    throw new RoomDomainError(
+      "binding_identity_conflict",
+      `Native Session ${binding.providerId}:${binding.nativeSessionId} already has a pending Room binding`,
+    );
+  }
   if (binding.happierSessionId) {
     const happierRows = await tx
       .select({ id: roomBindings.id })
       .from(roomBindings)
       .where(and(
-        eq(roomBindings.projectId, projectId),
         eq(roomBindings.connectorId, binding.connectorId),
         eq(roomBindings.happierSessionId, binding.happierSessionId),
         inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
@@ -3731,6 +3933,41 @@ async function assertProjectBindingIdentityAvailable(
         `Happier Session ${binding.happierSessionId} already has an active Room binding`,
       );
     }
+    const pendingHappierRows = await tx
+      .select({ id: roomMembershipChanges.id })
+      .from(roomMembershipChanges)
+      .where(and(
+        eq(roomMembershipChanges.reservedConnectorId, binding.connectorId),
+        eq(roomMembershipChanges.reservedHappierSessionId, binding.happierSessionId),
+        eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+      ))
+      .limit(1);
+    if (pendingHappierRows.length > 0) {
+      throw new RoomDomainError(
+        "binding_identity_conflict",
+        `Happier Session ${binding.happierSessionId} already has a pending Room binding`,
+      );
+    }
+  }
+}
+
+async function lockRoomBindingIdentity(
+  tx: DbTransaction,
+  binding: {
+    readonly connectorId: string;
+    readonly providerId: string;
+    readonly nativeSessionId: string;
+    readonly happierSessionId?: string | null;
+  },
+): Promise<void> {
+  const lockKeys = [
+    `fusion-room-native-session-v2:${binding.providerId}:${binding.nativeSessionId}`,
+    ...(binding.happierSessionId
+      ? [`fusion-room-happier-session-v2:${binding.connectorId}:${binding.happierSessionId}`]
+      : []),
+  ].sort();
+  for (const lockKey of lockKeys) {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
   }
 }
 

@@ -105,10 +105,10 @@ export const roomBindings = roomSchema.table("room_bindings", {
   index("idx_room_bindings_native_session").on(t.providerId, t.nativeSessionId),
   index("idx_room_bindings_room_state").on(t.projectId, t.roomId, t.state),
   uniqueIndex("idx_room_bindings_active_native_session")
-    .on(t.projectId, t.providerId, t.nativeSessionId)
+    .on(t.providerId, t.nativeSessionId)
     .where(sql`${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain')`),
   uniqueIndex("idx_room_bindings_active_happier_session")
-    .on(t.projectId, t.connectorId, t.happierSessionId)
+    .on(t.connectorId, t.happierSessionId)
     .where(sql`${t.happierSessionId} IS NOT NULL AND ${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain')`),
   check("room_bindings_generation_check", sql`${t.generation} > 0`),
   check("room_bindings_state_check", sql`${t.state} IN ('pending','attached','paused','authentication_blocked','host_unavailable','delivery_uncertain','detached','replaced','failed')`),
@@ -172,7 +172,13 @@ export const roomMembershipChanges = roomSchema.table("room_membership_changes",
   requestedAt: text("requested_at").notNull(),
   requestedBy: text("requested_by").notNull(),
   effectiveAfterTurnId: text("effective_after_turn_id"),
+  reservedConnectorId: text("reserved_connector_id"),
+  reservedProviderId: text("reserved_provider_id"),
+  reservedNativeSessionId: text("reserved_native_session_id"),
+  reservedHappierSessionId: text("reserved_happier_session_id"),
   appliedAt: text("applied_at"),
+  failedAt: text("failed_at"),
+  failureCode: text("failure_code"),
   state: text("state").notNull(),
 }, (t) => [
   foreignKey({
@@ -181,6 +187,12 @@ export const roomMembershipChanges = roomSchema.table("room_membership_changes",
     name: "room_membership_changes_room_project_fkey",
   }).onDelete("cascade"),
   index("idx_room_membership_changes_pending").on(t.projectId, t.roomId, t.state, t.requestedAt),
+  uniqueIndex("idx_room_membership_changes_pending_native_session")
+    .on(t.reservedProviderId, t.reservedNativeSessionId)
+    .where(sql`${t.state} = 'waiting_turn_boundary' AND ${t.reservedProviderId} IS NOT NULL AND ${t.reservedNativeSessionId} IS NOT NULL`),
+  uniqueIndex("idx_room_membership_changes_pending_happier_session")
+    .on(t.reservedConnectorId, t.reservedHappierSessionId)
+    .where(sql`${t.state} = 'waiting_turn_boundary' AND ${t.reservedConnectorId} IS NOT NULL AND ${t.reservedHappierSessionId} IS NOT NULL`),
   check("room_membership_changes_state_check", sql`${t.state} IN ('requested','waiting_turn_boundary','applied','cancelled','failed')`),
 ]);
 
