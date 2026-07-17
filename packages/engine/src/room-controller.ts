@@ -68,6 +68,7 @@ export type RoomControllerAuditMutationType =
 export type RoomControllerAuditEvent = Omit<RunAuditEventInput, "mutationType"> & {
   readonly id: string;
   readonly projectId: string;
+  readonly timestamp: string;
   readonly mutationType: RoomControllerAuditMutationType;
 };
 
@@ -167,6 +168,7 @@ export interface RoomControllerOptions {
 
 interface RoomWorkerHandle {
   readonly roomId: string;
+  readonly lifecycleGeneration: number;
   readonly projectionVersion: number;
   readonly source: string;
   readonly abortController: AbortController;
@@ -252,6 +254,7 @@ export class RoomController {
   private started = false;
   private stopping = false;
   private lifecycleWritesClosed = true;
+  private lifecycleGeneration = 0;
   private stopInFlight: Promise<void> | null = null;
 
   constructor(private readonly options: RoomControllerOptions) {
@@ -298,7 +301,9 @@ export class RoomController {
   }
 
   async start(): Promise<void> {
+    if (this.stopInFlight) await this.stopInFlight;
     if (this.started) return;
+    this.lifecycleGeneration += 1;
     this.lifecycleWritesClosed = false;
     this.started = true;
     this.stopping = false;
@@ -373,7 +378,8 @@ export class RoomController {
   reconcile(reason = "manual"): Promise<void> {
     if (this.stopping || !this.started) return Promise.resolve();
     if (this.reconcileInFlight) return this.reconcileInFlight;
-    const operation = this.reconcileNow(reason)
+    const lifecycleGeneration = this.lifecycleGeneration;
+    const operation = this.reconcileNow(reason, lifecycleGeneration)
       .catch((error) => {
         roomControllerLog.warn(
           `Room reconcile failed for ${this.options.projectId} (${reason}): ${error instanceof Error ? error.message : String(error)}`,
@@ -394,13 +400,14 @@ export class RoomController {
     }, this.pollIntervalMs);
   }
 
-  private async reconcileNow(reason: string): Promise<void> {
+  private async reconcileNow(reason: string, lifecycleGeneration: number): Promise<void> {
     const runnableRooms = await this.options.roomStore.listRunnableRooms();
-    if (!this.started || this.stopping) return;
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
     const runnableById = new Map(runnableRooms.map((room) => [room.room.id, room]));
     const runnableIds = new Set(runnableById.keys());
     const operations: Promise<void>[] = [];
     for (const handle of [...this.handles.values()]) {
+      if (handle.lifecycleGeneration !== lifecycleGeneration) continue;
       if (!runnableIds.has(handle.roomId)) {
         operations.push(this.runRoomOperation(handle.roomId, () => (
           this.stopHandle(handle, true, "room_not_runnable", reason)
@@ -412,22 +419,37 @@ export class RoomController {
       )));
     }
     for (const room of runnableRooms) {
-      if (this.stopping || !this.started || this.handles.has(room.room.id)) continue;
+      if (!this.canStartLeaseMutation(lifecycleGeneration) || this.handles.has(room.room.id)) continue;
       if (!this.canClaimRoom(room)) continue;
-      operations.push(this.runRoomOperation(room.room.id, () => this.claimRoom(room, reason)));
+      operations.push(this.runRoomOperation(
+        room.room.id,
+        () => this.claimRoom(room, reason, lifecycleGeneration),
+      ));
     }
     await Promise.all(operations);
   }
 
-  private async claimRoom(room: RoomAggregateV1, source: string): Promise<void> {
+  private async claimRoom(
+    room: RoomAggregateV1,
+    source: string,
+    lifecycleGeneration: number,
+  ): Promise<void> {
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
     if (this.options.roomStore.getRecoveryPosture) {
       const initialGuard = await this.readRunGuard(room.room.id);
+      if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
       const initialReason = initialGuard.reason
         ?? (initialGuard.posture.aggregateVersion === room.room.aggregateVersion
           ? null
           : "posture_version_changed");
       if (initialReason) {
-        await this.recordRecoveryWithheld(room.room.id, initialGuard.posture, initialReason, source);
+        await this.recordRecoveryWithheld(
+          room.room.id,
+          initialGuard.posture,
+          initialReason,
+          source,
+          lifecycleGeneration,
+        );
         return;
       }
     }
@@ -447,11 +469,14 @@ export class RoomController {
       ...baseInput,
       expectedEpoch: null,
     });
+    if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
     if (!acquired.ok && acquired.reason === "stale_epoch" && acquired.current) {
+      if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
       acquired = await this.options.leaseStore.acquireLease({
         ...baseInput,
         expectedEpoch: acquired.current.epoch,
       });
+      if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
     }
     if (!acquired.ok) return;
 
@@ -459,40 +484,47 @@ export class RoomController {
     try {
       if (this.options.checkpointStore) {
         authoritativeRoom = (await this.options.checkpointStore.replayProjection(room.room.id)).aggregate;
+        if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
       }
       if (authoritativeRoom.room.state !== "running" || this.stopping || !this.started) {
-        await this.options.leaseStore.releaseLease(leaseMutationInput(acquired.lease, this.now()));
+        await this.releaseLeaseIfOpen(acquired.lease, lifecycleGeneration);
         return;
       }
 
       if (this.options.roomStore.getRecoveryPosture) {
         const postLeasePosture = await this.options.roomStore.getRecoveryPosture(room.room.id);
+        if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
         const withheldReason = this.recoveryWithheldReason(postLeasePosture);
         const postureChanged = postLeasePosture.aggregateVersion
           !== authoritativeRoom.room.aggregateVersion;
         if (withheldReason || postureChanged || this.stopping || !this.started) {
-          await this.options.leaseStore.releaseLease(
-            leaseMutationInput(acquired.lease, this.now()),
-          );
+          await this.releaseLeaseIfOpen(acquired.lease, lifecycleGeneration);
           if (withheldReason || postureChanged) {
             await this.recordRecoveryWithheld(
               room.room.id,
               postLeasePosture,
               withheldReason ?? "posture_version_changed",
               source,
+              lifecycleGeneration,
             );
           }
           return;
         }
       }
     } catch (error) {
-      await this.options.leaseStore.releaseLease(leaseMutationInput(acquired.lease, this.now())).catch(() => undefined);
+      await this.releaseLeaseIfOpen(acquired.lease, lifecycleGeneration).catch(() => undefined);
       throw error;
+    }
+
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) {
+      await this.releaseLeaseIfOpen(acquired.lease, lifecycleGeneration);
+      return;
     }
 
     const abortController = new AbortController();
     const handle: RoomWorkerHandle = {
       roomId: authoritativeRoom.room.id,
+      lifecycleGeneration,
       projectionVersion: authoritativeRoom.room.aggregateVersion,
       source,
       abortController,
@@ -519,6 +551,7 @@ export class RoomController {
           leaseEpoch: acquired.lease.epoch,
           source,
         },
+        lifecycleGeneration,
       );
     } catch (error) {
       abortController.abort();
@@ -530,7 +563,7 @@ export class RoomController {
     // was in flight. Never register a new handle after shutdown cleanup; the
     // fenced lease will expire without issuing another store operation through
     // a runtime that may already be closing.
-    if (!this.started || this.stopping) return;
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
     try {
       await this.assertCombinedAuthority(handle);
     } catch (error) {
@@ -538,13 +571,18 @@ export class RoomController {
       await this.releaseHandle(handle).catch(() => undefined);
       throw error;
     }
-    if (!this.started || this.stopping) return;
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
 
-    const startAuditPromise = this.recordLifecycleAudit("room:worker-started", handle.roomId, {
-      leaseId: handle.lease.id,
-      leaseEpoch: handle.lease.epoch,
-      source,
-    });
+    const startAuditPromise = this.recordLifecycleAudit(
+      "room:worker-started",
+      handle.roomId,
+      {
+        leaseId: handle.lease.id,
+        leaseEpoch: handle.lease.epoch,
+        source,
+      },
+      handle.lifecycleGeneration,
+    );
     handle.startAuditPromise = startAuditPromise;
     this.handles.set(handle.roomId, handle);
     try {
@@ -558,6 +596,7 @@ export class RoomController {
     if (
       !this.started
       || this.stopping
+      || !this.isLifecycleGenerationOpen(lifecycleGeneration)
       || this.handles.get(handle.roomId) !== handle
       || abortController.signal.aborted
     ) {
@@ -571,6 +610,7 @@ export class RoomController {
       if (
         !this.started
         || this.stopping
+        || !this.isLifecycleGenerationOpen(lifecycleGeneration)
         || this.handles.get(handle.roomId) !== handle
         || abortController.signal.aborted
       ) return;
@@ -582,12 +622,20 @@ export class RoomController {
         assertLeaseAuthority: async () => (await this.assertCombinedAuthority(handle)).lease,
       })).catch(async (error) => {
         if (!isRoomWorkerAuthorityError(error)) throw error;
+        if (error.reason === "controller_stopped") return;
+        if (!this.isLifecycleGenerationOpen(handle.lifecycleGeneration)) return;
         handle.stopReason = "recovery_withheld";
         handle.stopSource = source;
         if (this.handles.get(handle.roomId) === handle) this.handles.delete(handle.roomId);
         abortController.abort();
         try {
-          await this.recordRecoveryWithheld(handle.roomId, error.posture, error.reason, source);
+          await this.recordRecoveryWithheld(
+            handle.roomId,
+            error.posture,
+            error.reason,
+            source,
+            handle.lifecycleGeneration,
+          );
         } finally {
           await this.releaseHandle(handle);
         }
@@ -601,13 +649,18 @@ export class RoomController {
             roomControllerLog.warn(
               `Room worker failed for ${handle.roomId}: code=room_worker_failed`,
             );
-            await this.recordLifecycleAudit("room:worker-recovery-failed", handle.roomId, {
-              leaseId: handle.lease.id,
-              leaseEpoch: handle.lease.epoch,
-              errorCode: "room_worker_failed",
-              recoverable: true,
-              source: handle.source,
-            });
+            await this.recordLifecycleAudit(
+              "room:worker-recovery-failed",
+              handle.roomId,
+              {
+                leaseId: handle.lease.id,
+                leaseEpoch: handle.lease.epoch,
+                errorCode: "room_worker_failed",
+                recoverable: true,
+                source: handle.source,
+              },
+              handle.lifecycleGeneration,
+            );
           }
         } finally {
           await this.finishHandle(handle, "worker_failed");
@@ -626,9 +679,12 @@ export class RoomController {
     source: string,
     room: RoomAggregateV1 | undefined,
   ): Promise<void> {
+    const lifecycleGeneration = handle.lifecycleGeneration;
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
     let preRenewPosture: RoomControllerRecoveryPosture | null = null;
     if (this.options.roomStore.getRecoveryPosture) {
       const guard = await this.readRunGuard(handle.roomId);
+      if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
       preRenewPosture = guard.posture;
       const reason = guard.reason
         ?? (room && guard.posture.aggregateVersion !== room.room.aggregateVersion
@@ -636,27 +692,42 @@ export class RoomController {
           : null);
       if (reason) {
         const stopPromise = this.stopHandle(handle, true, "recovery_withheld", source);
-        await this.recordRecoveryWithheld(handle.roomId, guard.posture, reason, source);
+        await this.recordRecoveryWithheld(
+          handle.roomId,
+          guard.posture,
+          reason,
+          source,
+          lifecycleGeneration,
+        );
         await stopPromise;
         return;
       }
     }
+    if (!this.canStartLeaseMutation(lifecycleGeneration)) return;
     const now = this.now();
     const renewed = await this.options.leaseStore.renewLease({
       ...leaseMutationInput(handle.lease, now),
       expiresAt: this.expiresAt(now),
     });
+    if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
     if (renewed.ok) {
       handle.lease = renewed.lease;
       if (this.options.roomStore.getRecoveryPosture && preRenewPosture) {
         const postRenewGuard = await this.readRunGuard(handle.roomId);
+        if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
         const reason = postRenewGuard.reason
           ?? (postRenewGuard.posture.aggregateVersion === preRenewPosture.aggregateVersion
             ? null
             : "posture_version_changed");
         if (reason) {
           const stopPromise = this.stopHandle(handle, true, "recovery_withheld", source);
-          await this.recordRecoveryWithheld(handle.roomId, postRenewGuard.posture, reason, source);
+          await this.recordRecoveryWithheld(
+            handle.roomId,
+            postRenewGuard.posture,
+            reason,
+            source,
+            lifecycleGeneration,
+          );
           await stopPromise;
           return;
         }
@@ -666,15 +737,21 @@ export class RoomController {
       }
       return;
     }
+    if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
     handle.released = true;
     handle.releasePromise = Promise.resolve();
     const stopPromise = this.stopHandle(handle, false, "lease_lost", source);
-    await this.recordLifecycleAudit("room:worker-lease-lost", handle.roomId, {
-      leaseId: handle.lease.id,
-      leaseEpoch: handle.lease.epoch,
-      reason: renewed.reason,
-      source,
-    });
+    await this.recordLifecycleAudit(
+      "room:worker-lease-lost",
+      handle.roomId,
+      {
+        leaseId: handle.lease.id,
+        leaseEpoch: handle.lease.epoch,
+        reason: renewed.reason,
+        source,
+      },
+      handle.lifecycleGeneration,
+    );
     await stopPromise;
   }
 
@@ -684,7 +761,7 @@ export class RoomController {
     if (wasCurrent && !handle.abortController.signal.aborted && this.started && !this.stopping) {
       this.recordAbnormalWorkerExit(handle);
     }
-    if (this.lifecycleWritesClosed) return;
+    if (!this.isLifecycleGenerationOpen(handle.lifecycleGeneration)) return;
     const releasePromise = this.releaseHandle(handle);
     void releasePromise.catch(() => undefined);
     try {
@@ -752,17 +829,21 @@ export class RoomController {
   }
 
   private async assertCombinedAuthority(handle: RoomWorkerHandle): Promise<RoomWorkerAuthorityV1> {
+    this.assertAuthorityRequestAllowed(handle);
     if (this.options.roomStore.assertWorkerAuthority) {
-      return this.options.roomStore.assertWorkerAuthority({
+      const authority = await this.options.roomStore.assertWorkerAuthority({
         roomId: handle.roomId,
         lease: handle.lease,
         expectedAggregateVersion: handle.projectionVersion,
         now: this.now(),
       });
+      this.assertAuthorityResultCurrent(handle);
+      return authority;
     }
     const lease = await this.options.leaseStore.assertFence(
       leaseMutationInput(handle.lease, this.now()),
     );
+    this.assertAuthorityResultCurrent(handle);
     if (!this.options.roomStore.getRecoveryPosture) {
       return {
         lease,
@@ -775,6 +856,7 @@ export class RoomController {
       };
     }
     const guard = await this.readRunGuard(handle.roomId);
+    this.assertAuthorityResultCurrent(handle);
     const reason = guard.reason
       ?? (guard.posture.aggregateVersion === handle.projectionVersion
         ? null
@@ -788,13 +870,14 @@ export class RoomController {
     posture: RoomControllerRecoveryPosture,
     reason: string,
     source: string,
+    lifecycleGeneration: number,
   ): Promise<void> {
     return this.recordLifecycleAudit("room:worker-recovery-withheld", roomId, {
       lifecycleState: posture.lifecycleState,
       aggregateVersion: posture.aggregateVersion,
       reason,
       source,
-    });
+    }, lifecycleGeneration);
   }
 
   private recoveryWithheldReason(posture: RoomControllerRecoveryPosture): string | null {
@@ -827,7 +910,7 @@ export class RoomController {
       reason,
       source,
       terminationOutcome,
-    });
+    }, handle.lifecycleGeneration);
     const tracked = persistence.catch((error) => {
       handle.terminationAuditPromise = null;
       throw error;
@@ -858,7 +941,7 @@ export class RoomController {
       reason,
       source,
       terminationOutcome: "termination_unknown",
-    });
+    }, handle.lifecycleGeneration);
     const tracked = persistence.catch((error) => {
       if (!this.stopping) handle.terminationAuditPromise = null;
       throw error;
@@ -871,8 +954,9 @@ export class RoomController {
     mutationType: RoomControllerAuditMutationType,
     roomId: string,
     metadata: Record<string, unknown>,
+    lifecycleGeneration: number,
   ): Promise<void> {
-    if (this.lifecycleWritesClosed) {
+    if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) {
       return Promise.reject(new Error("room_controller_lifecycle_writes_closed"));
     }
     const event: RoomControllerAuditEvent = {
@@ -924,13 +1008,15 @@ export class RoomController {
 
   private async releaseHandle(handle: RoomWorkerHandle): Promise<void> {
     if (handle.releasePromise) return handle.releasePromise;
-    if (handle.released || this.lifecycleWritesClosed) return;
+    if (handle.released || !this.isLifecycleGenerationOpen(handle.lifecycleGeneration)) return;
     const operation = (async () => {
       for (let attempt = 1; attempt <= LEASE_RELEASE_MAX_ATTEMPTS; attempt += 1) {
+        if (!this.isLifecycleGenerationOpen(handle.lifecycleGeneration)) return;
         try {
           await this.options.leaseStore.releaseLease(
             leaseMutationInput(handle.lease, this.now()),
           );
+          if (!this.isLifecycleGenerationOpen(handle.lifecycleGeneration)) return;
           handle.released = true;
           return;
         } catch (error) {
@@ -1026,6 +1112,47 @@ export class RoomController {
     const timestamp = Date.parse(now);
     if (!Number.isFinite(timestamp)) throw new Error(`RoomController received invalid time ${now}`);
     return new Date(timestamp + this.leaseDurationMs).toISOString();
+  }
+
+  private isLifecycleGenerationOpen(lifecycleGeneration: number): boolean {
+    return lifecycleGeneration === this.lifecycleGeneration && !this.lifecycleWritesClosed;
+  }
+
+  private assertAuthorityRequestAllowed(handle: RoomWorkerHandle): void {
+    if (this.canStartLeaseMutation(handle.lifecycleGeneration)) return;
+    this.throwControllerStoppedAuthority(handle);
+  }
+
+  private assertAuthorityResultCurrent(handle: RoomWorkerHandle): void {
+    const requiresCurrentRegistration = handle.startAuditPromise !== null
+      || handle.workerLaunchCommitted;
+    if (
+      this.canStartLeaseMutation(handle.lifecycleGeneration)
+      && !handle.abortController.signal.aborted
+      && (!requiresCurrentRegistration || this.handles.get(handle.roomId) === handle)
+    ) return;
+    this.throwControllerStoppedAuthority(handle);
+  }
+
+  private throwControllerStoppedAuthority(handle: RoomWorkerHandle): never {
+    throw new RoomWorkerAuthorityError({
+      lifecycleState: "blocked",
+      aggregateVersion: handle.projectionVersion,
+      humanPaused: false,
+      approvalState: "blocked",
+    }, "controller_stopped");
+  }
+
+  private canStartLeaseMutation(lifecycleGeneration: number): boolean {
+    return this.isLifecycleGenerationOpen(lifecycleGeneration) && this.started && !this.stopping;
+  }
+
+  private async releaseLeaseIfOpen(
+    lease: StoredRoomLeaseV1,
+    lifecycleGeneration: number,
+  ): Promise<void> {
+    if (!this.isLifecycleGenerationOpen(lifecycleGeneration)) return;
+    await this.options.leaseStore.releaseLease(leaseMutationInput(lease, this.now()));
   }
 }
 

@@ -33,8 +33,8 @@ import {
   recordRunAuditEventWithinTransaction,
   type AsyncDataLayer,
   type DbTransaction,
-  type RunAuditEventInput,
 } from "./postgres/data-layer.js";
+import type { RunAuditEventInput } from "./types.js";
 import {
   buildRoomConnectorLocalMessageId,
   compareRoomText,
@@ -198,6 +198,13 @@ function comparableRunAuditOutboxEvent(
   };
 }
 
+function parseRoomRunAuditDomain(domain: string): RunAuditEventInput["domain"] {
+  if (domain === "database" || domain === "git" || domain === "filesystem" || domain === "sandbox") {
+    return domain;
+  }
+  throw new Error("room_run_audit_outbox_invalid_domain");
+}
+
 function rowToRunAuditOutboxRecord(row: RoomRunAuditOutboxRow): RoomRunAuditOutboxRecordV1 {
   return {
     id: row.id,
@@ -211,10 +218,10 @@ function rowToRunAuditOutboxRecord(row: RoomRunAuditOutboxRow): RoomRunAuditOutb
       taskId: row.taskId ?? undefined,
       agentId: row.agentId,
       runId: row.runId,
-      domain: row.domain,
+      domain: parseRoomRunAuditDomain(row.domain),
       mutationType: row.mutationType,
       target: row.target,
-      metadata: row.metadata,
+      metadata: row.metadata ?? undefined,
     },
     state: row.state as RoomRunAuditOutboxState,
     attemptCount: row.attemptCount,
@@ -900,10 +907,10 @@ export class AsyncRoomStore {
         taskId: existing.taskId ?? undefined,
         agentId: existing.agentId,
         runId: existing.runId,
-        domain: existing.domain,
+        domain: parseRoomRunAuditDomain(existing.domain),
         mutationType: existing.mutationType,
         target: existing.target,
-        metadata: existing.metadata,
+        metadata: existing.metadata ?? undefined,
       };
       if (
         JSON.stringify(comparableRunAuditOutboxEvent(existing.roomId, existingEvent))

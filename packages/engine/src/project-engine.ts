@@ -897,14 +897,14 @@ export class ProjectEngine {
           await this.roomRunAuditDispatcher?.start();
           await roomController.start();
         } catch (error) {
-          await roomController.stop().catch((stopError) => {
+          await Promise.resolve(roomController.stop()).catch((stopError: unknown) => {
             runtimeLog.warn(
               `Session Room controller cleanup failed for ${this.config.projectId}: ${
                 stopError instanceof Error ? stopError.message : String(stopError)
               }`,
             );
           });
-          await this.roomRunAuditDispatcher?.stop().catch((stopError) => {
+          await Promise.resolve(this.roomRunAuditDispatcher?.stop()).catch((stopError: unknown) => {
             runtimeLog.warn(
               `Session Room audit dispatcher cleanup failed for ${this.config.projectId}: ${
                 stopError instanceof Error ? stopError.message : String(stopError)

@@ -55,6 +55,7 @@ interface HarnessOptions {
   readonly acquireEpoch?: number;
   readonly renewFailure?: "not_found" | "stale_fence" | "expired";
   readonly worker?: RoomWorker;
+  readonly checkpointStore?: RoomControllerOptions["checkpointStore"];
   readonly recoveryPostures?: Readonly<Record<string, RoomLifecycleRecoveryPosture>>;
   readonly recordRunAuditEventImpl?: RecordRoomLifecycleAuditEvent;
   readonly shutdownGraceMs?: number;
@@ -64,8 +65,14 @@ interface RoomControllerHarness {
   readonly controller: RoomController;
   readonly roomStore: RoomLifecycleRecoveryStore;
   readonly leaseStore: RoomControllerLeaseStore;
+  readonly leaseState: FakeRoomLeaseState;
   readonly worker: RoomWorker;
   readonly recordRunAuditEvent: ReturnType<typeof vi.fn<RecordRoomLifecycleAuditEvent>>;
+}
+
+interface FakeRoomLeaseState {
+  current: StoredRoomLeaseV1 | null;
+  readonly mutations: Array<"acquire" | "renew" | "release">;
 }
 
 const controllers: RoomController[] = [];
@@ -166,11 +173,17 @@ function recoveryPosture(
   };
 }
 
-function createLeaseStore(options: HarnessOptions): RoomControllerLeaseStore {
-  let current: StoredRoomLeaseV1 | null = null;
-  return {
+function createLeaseStore(options: HarnessOptions): {
+  readonly leaseStore: RoomControllerLeaseStore;
+  readonly state: FakeRoomLeaseState;
+} {
+  const state: FakeRoomLeaseState = {
+    current: null,
+    mutations: [],
+  };
+  const leaseStore: RoomControllerLeaseStore = {
     acquireLease: vi.fn(async (input) => {
-      current = {
+      state.current = {
         contractVersion: 1,
         id: input.leaseId,
         roomId: input.roomId,
@@ -184,10 +197,11 @@ function createLeaseStore(options: HarnessOptions): RoomControllerLeaseStore {
         expiresAt: input.expiresAt,
         releasedAt: null,
       };
+      state.mutations.push("acquire");
       return {
         ok: true as const,
         action: options.acquireAction ?? "acquired",
-        lease: current,
+        lease: state.current,
       };
     }),
     renewLease: vi.fn(async (input) => {
@@ -195,28 +209,31 @@ function createLeaseStore(options: HarnessOptions): RoomControllerLeaseStore {
         return {
           ok: false as const,
           reason: options.renewFailure,
-          current,
+          current: state.current,
         };
       }
-      if (!current) {
+      if (!state.current) {
         return { ok: false as const, reason: "not_found" as const, current: null };
       }
-      current = {
-        ...current,
+      state.current = {
+        ...state.current,
         heartbeatAt: input.now,
         expiresAt: input.expiresAt,
       };
-      return { ok: true as const, lease: current };
+      state.mutations.push("renew");
+      return { ok: true as const, lease: state.current };
     }),
     releaseLease: vi.fn(async (input) => {
-      if (current) current = { ...current, releasedAt: input.now };
-      return { ok: true as const, lease: current };
+      if (state.current) state.current = { ...state.current, releasedAt: input.now };
+      state.mutations.push("release");
+      return { ok: true as const, lease: state.current };
     }),
     assertFence: vi.fn(async () => {
-      if (!current || current.releasedAt) throw new Error("stale_lease_fence");
-      return current;
+      if (!state.current || state.current.releasedAt) throw new Error("stale_lease_fence");
+      return state.current;
     }),
   };
+  return { leaseStore, state };
 }
 
 function createHarness(options: HarnessOptions = {}): RoomControllerHarness {
@@ -234,7 +251,7 @@ function createHarness(options: HarnessOptions = {}): RoomControllerHarness {
       };
     }),
   };
-  const leaseStore = createLeaseStore(options);
+  const { leaseStore, state: leaseState } = createLeaseStore(options);
   const worker = options.worker ?? {
     runRoom: vi.fn(async ({ signal }) => holdUntilAbort(signal)),
   };
@@ -247,6 +264,7 @@ function createHarness(options: HarnessOptions = {}): RoomControllerHarness {
     hostId: "host-1",
     roomStore,
     leaseStore,
+    checkpointStore: options.checkpointStore,
     worker,
     recordRunAuditEvent,
     now: () => FIXED_NOW,
@@ -261,6 +279,7 @@ function createHarness(options: HarnessOptions = {}): RoomControllerHarness {
     controller,
     roomStore,
     leaseStore,
+    leaseState,
     worker,
     recordRunAuditEvent,
   };
@@ -606,6 +625,467 @@ describe("Room lifecycle run audit and startup self-healing", () => {
       harness.recordRunAuditEvent,
       "room:worker-recovery-withheld",
     )).toBeUndefined();
+  });
+
+  /*
+  FNXC:SessionRoomLifecycleGeneration 2026-07-18-05:19:
+  Every asynchronous discovery, recovery, authority, and lease-store result is
+  owned by the controller generation that started it. Once stop wins, that
+  result must not renew a replacement handle, emit lifecycle audit, release a
+  newer lease, launch a worker, or retry a failed write in a later generation.
+  A concurrent start must wait for stop to finish before opening that new
+  generation. The same fail-closed rule applies as soon as stop begins: a
+  successful authority-store result cannot pass the stopping/abort/handle
+  guard merely because lifecycle writes have not closed yet.
+  */
+  it("does not let delayed room discovery from a stopped generation renew the replacement handle", async () => {
+    const listEntered = deferred<void>();
+    const releaseList = deferred<void>();
+    const stoppedGenerationRoom = roomInState("room-1");
+    const replacementGenerationRoom = roomInState("room-1");
+    const harness = createHarness({ shutdownGraceMs: 30 });
+    vi.mocked(harness.roomStore.listRunnableRooms)
+      .mockImplementationOnce(async () => {
+        listEntered.resolve();
+        await releaseList.promise;
+        return [stoppedGenerationRoom];
+      })
+      .mockResolvedValueOnce([replacementGenerationRoom])
+      .mockResolvedValue([]);
+
+    const stoppedStart = harness.controller.start();
+    await listEntered.promise;
+    await harness.controller.stop();
+    await harness.controller.start();
+    await flushWorkerMicrotasks();
+
+    expect(harness.worker.runRoom).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.worker.runRoom).mock.calls[0]?.[0].room)
+      .toBe(replacementGenerationRoom);
+    expect(harness.leaseState.mutations).toEqual(["acquire"]);
+
+    releaseList.resolve();
+    await stoppedStart;
+    await flushWorkerMicrotasks();
+
+    expect(
+      harness.leaseStore.renewLease,
+      "a stale list result must not renew the replacement generation's handle",
+    ).not.toHaveBeenCalled();
+    expect(harness.leaseState.mutations).toEqual(["acquire"]);
+    expect(harness.worker.runRoom).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["replayProjection", "getRecoveryPosture"] as const)(
+    "drops a delayed post-lease %s result when stop and restart advance the generation",
+    async (delayedSeam) => {
+      const seamEntered = deferred<void>();
+      const releaseSeam = deferred<void>();
+      const room = roomInState("room-1");
+      const harness = createHarness({
+        rooms: [room],
+        shutdownGraceMs: 30,
+        checkpointStore: delayedSeam === "replayProjection"
+          ? {
+              replayProjection: vi.fn(async () => {
+                seamEntered.resolve();
+                await releaseSeam.promise;
+                return { aggregate: room };
+              }),
+            }
+          : undefined,
+      });
+      if (delayedSeam === "getRecoveryPosture") {
+        let postureReads = 0;
+        vi.mocked(harness.roomStore.getRecoveryPosture!).mockImplementation(async () => {
+          postureReads += 1;
+          if (postureReads === 2) {
+            seamEntered.resolve();
+            await releaseSeam.promise;
+          }
+          return recoveryPosture("running", {
+            aggregateVersion: room.room.aggregateVersion,
+          });
+        });
+      }
+
+      const stoppedStart = harness.controller.start();
+      await seamEntered.promise;
+      expect(harness.leaseState.mutations).toEqual(["acquire"]);
+      expect(harness.leaseState.current?.releasedAt).toBeNull();
+
+      await harness.controller.stop();
+      vi.mocked(harness.roomStore.listRunnableRooms).mockResolvedValue([]);
+      await harness.controller.start();
+      const auditCallsAfterRestart = harness.recordRunAuditEvent.mock.calls.length;
+      const releaseCallsAfterRestart = vi.mocked(harness.leaseStore.releaseLease).mock.calls.length;
+
+      releaseSeam.resolve();
+      await stoppedStart;
+      await flushWorkerMicrotasks();
+
+      expect(harness.recordRunAuditEvent).toHaveBeenCalledTimes(auditCallsAfterRestart);
+      expect(harness.leaseStore.releaseLease).toHaveBeenCalledTimes(releaseCallsAfterRestart);
+      expect(harness.worker.runRoom).not.toHaveBeenCalled();
+      expect(harness.leaseState.mutations).toEqual(["acquire"]);
+      expect(harness.leaseState.current).toMatchObject({
+        roomId: "room-1",
+        epoch: 1,
+        releasedAt: null,
+      });
+    },
+  );
+
+  it("fails closed when a successful assertWorkerAuthority result returns in a later generation", async () => {
+    const authorityEntered = deferred<void>();
+    const releaseAuthority = deferred<void>();
+    const externalEffect = vi.fn();
+    const worker: RoomWorker = {
+      runRoom: vi.fn(async ({ assertAuthority }) => {
+        await assertAuthority();
+        externalEffect();
+      }),
+    };
+    const harness = createHarness({ shutdownGraceMs: 30, worker });
+    let authorityChecks = 0;
+    harness.roomStore.assertWorkerAuthority = vi.fn(async (input) => {
+      authorityChecks += 1;
+      if (authorityChecks === 3) {
+        authorityEntered.resolve();
+        await releaseAuthority.promise;
+      }
+      return {
+        lease: input.lease,
+        posture: recoveryPosture("running", { aggregateVersion: 2 }),
+      };
+    });
+
+    await harness.controller.start();
+    await authorityEntered.promise;
+    await harness.controller.stop();
+    vi.mocked(harness.roomStore.listRunnableRooms).mockResolvedValue([]);
+    await harness.controller.start();
+    const auditCallsAfterRestart = harness.recordRunAuditEvent.mock.calls.length;
+    const releaseCallsAfterRestart = vi.mocked(harness.leaseStore.releaseLease).mock.calls.length;
+
+    releaseAuthority.resolve();
+    await vi.mocked(worker.runRoom).mock.results[0]?.value.catch(() => undefined);
+    await flushWorkerMicrotasks();
+
+    expect(authorityChecks).toBe(3);
+    expect(externalEffect).not.toHaveBeenCalled();
+    expect(harness.recordRunAuditEvent).toHaveBeenCalledTimes(auditCallsAfterRestart);
+    expect(harness.leaseStore.releaseLease).toHaveBeenCalledTimes(releaseCallsAfterRestart);
+  });
+
+  it("does not launch runRoom when stop begins during the second startup authority assertion", async () => {
+    const secondAuthorityEntered = deferred<void>();
+    const releaseSecondAuthority = deferred<void>();
+    const leaseReleaseCommitted = deferred<void>();
+    const harness = createHarness();
+    let authorityChecks = 0;
+    let secondAuthorityStoreSucceeded = false;
+    harness.roomStore.assertWorkerAuthority = vi.fn(async (input) => {
+      authorityChecks += 1;
+      if (authorityChecks === 2) {
+        secondAuthorityEntered.resolve();
+        await releaseSecondAuthority.promise;
+        secondAuthorityStoreSucceeded = true;
+      }
+      return {
+        lease: input.lease,
+        posture: recoveryPosture("running", { aggregateVersion: 2 }),
+      };
+    });
+    const releaseLease = vi.mocked(harness.leaseStore.releaseLease);
+    const originalRelease = releaseLease.getMockImplementation()!;
+    releaseLease.mockImplementationOnce(async (input) => {
+      const result = await originalRelease(input);
+      leaseReleaseCommitted.resolve();
+      return result;
+    });
+
+    const startPromise = harness.controller.start();
+    await secondAuthorityEntered.promise;
+    await startPromise;
+    let stopSettled = false;
+    const stopPromise = harness.controller.stop().then(() => {
+      stopSettled = true;
+    });
+    await leaseReleaseCommitted.promise;
+    await flushWorkerMicrotasks();
+
+    expect(stopSettled).toBe(false);
+    expect(harness.leaseState.current?.releasedAt).toBe(FIXED_NOW);
+    expect(harness.worker.runRoom).not.toHaveBeenCalled();
+
+    releaseSecondAuthority.resolve();
+    await stopPromise;
+    await flushWorkerMicrotasks();
+
+    expect(secondAuthorityStoreSucceeded).toBe(true);
+    expect(authorityChecks).toBe(2);
+    expect(harness.worker.runRoom).not.toHaveBeenCalled();
+    expect(findAuditEvent(
+      harness.recordRunAuditEvent,
+      "room:worker-recovery-withheld",
+    )).toBeUndefined();
+    expect(findAuditEvent(harness.recordRunAuditEvent, "room:worker-stopped")).toMatchObject({
+      metadata: expect.objectContaining({
+        reason: "controller_stop",
+        source: "shutdown",
+      }),
+    });
+  });
+
+  it("rejects an in-worker authority promise when stop begins before its successful result returns", async () => {
+    const workerAuthorityEntered = deferred<void>();
+    const releaseWorkerAuthority = deferred<void>();
+    const leaseReleaseCommitted = deferred<void>();
+    const externalEffect = vi.fn();
+    let workerAuthorityPromise: Promise<unknown> | null = null;
+    const worker: RoomWorker = {
+      runRoom: vi.fn(async ({ assertAuthority }) => {
+        workerAuthorityPromise = assertAuthority();
+        await workerAuthorityPromise;
+        externalEffect();
+      }),
+    };
+    const harness = createHarness({ worker });
+    let authorityChecks = 0;
+    let workerAuthorityStoreSucceeded = false;
+    harness.roomStore.assertWorkerAuthority = vi.fn(async (input) => {
+      authorityChecks += 1;
+      if (authorityChecks === 3) {
+        workerAuthorityEntered.resolve();
+        await releaseWorkerAuthority.promise;
+        workerAuthorityStoreSucceeded = true;
+      }
+      return {
+        lease: input.lease,
+        posture: recoveryPosture("running", { aggregateVersion: 2 }),
+      };
+    });
+    const releaseLease = vi.mocked(harness.leaseStore.releaseLease);
+    const originalRelease = releaseLease.getMockImplementation()!;
+    releaseLease.mockImplementationOnce(async (input) => {
+      const result = await originalRelease(input);
+      leaseReleaseCommitted.resolve();
+      return result;
+    });
+
+    const startPromise = harness.controller.start();
+    await workerAuthorityEntered.promise;
+    await startPromise;
+    if (!workerAuthorityPromise) throw new Error("worker authority promise was not captured");
+    const authorityOutcome = workerAuthorityPromise.then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    let stopSettled = false;
+    const stopPromise = harness.controller.stop().then(() => {
+      stopSettled = true;
+    });
+    await leaseReleaseCommitted.promise;
+    await flushWorkerMicrotasks();
+
+    expect(stopSettled).toBe(false);
+    expect(harness.leaseState.current?.releasedAt).toBe(FIXED_NOW);
+    expect(externalEffect).not.toHaveBeenCalled();
+
+    releaseWorkerAuthority.resolve();
+    const outcome = await authorityOutcome;
+    await stopPromise;
+    await flushWorkerMicrotasks();
+
+    expect(workerAuthorityStoreSucceeded).toBe(true);
+    expect(outcome).toMatchObject({
+      ok: false,
+      error: {
+        code: "room_worker_authority_revoked",
+        reason: "controller_stopped",
+      },
+    });
+    expect(authorityChecks).toBe(3);
+    expect(harness.worker.runRoom).toHaveBeenCalledTimes(1);
+    expect(externalEffect).not.toHaveBeenCalled();
+    expect(findAuditEvent(
+      harness.recordRunAuditEvent,
+      "room:worker-recovery-withheld",
+    )).toBeUndefined();
+    expect(findAuditEvent(harness.recordRunAuditEvent, "room:worker-stopped")).toMatchObject({
+      metadata: expect.objectContaining({
+        reason: "controller_stop",
+        source: "shutdown",
+      }),
+    });
+  });
+
+  it("does not retry a failed lease release after stop and restart advance the generation", async () => {
+    const releaseEntered = deferred<void>();
+    const rejectRelease = deferred<void>();
+    const harness = createHarness({ shutdownGraceMs: 30 });
+    await harness.controller.start();
+    await flushWorkerMicrotasks();
+    vi.mocked(harness.leaseStore.releaseLease).mockImplementationOnce(async () => {
+      releaseEntered.resolve();
+      await rejectRelease.promise;
+      throw new Error("first_release_attempt_failed");
+    });
+
+    const stopPromise = harness.controller.stop();
+    await releaseEntered.promise;
+    await stopPromise;
+    vi.mocked(harness.roomStore.listRunnableRooms).mockResolvedValue([]);
+    await harness.controller.start();
+
+    rejectRelease.resolve();
+    await vi.mocked(harness.leaseStore.releaseLease).mock.results[0]?.value.catch(() => undefined);
+    await flushWorkerMicrotasks();
+    await flushWorkerMicrotasks();
+
+    expect(
+      harness.leaseStore.releaseLease,
+      "the old generation must not issue release attempts two or three through the reopened store",
+    ).toHaveBeenCalledTimes(1);
+    expect(harness.leaseState.mutations).toEqual(["acquire"]);
+    expect(harness.leaseState.current?.releasedAt).toBeNull();
+  });
+
+  it("waits for an overlapping stop before starting a safe replacement generation", async () => {
+    const releaseEntered = deferred<void>();
+    const finishRelease = deferred<void>();
+    const workerSignals: AbortSignal[] = [];
+    const firstRoom = roomInState("room-1");
+    const replacementRoom = roomInState("room-1");
+    const harness = createHarness({
+      rooms: [firstRoom],
+      worker: {
+        runRoom: vi.fn(async ({ signal }) => {
+          workerSignals.push(signal);
+          await holdUntilAbort(signal);
+        }),
+      },
+    });
+    vi.mocked(harness.roomStore.listRunnableRooms)
+      .mockResolvedValueOnce([firstRoom])
+      .mockResolvedValueOnce([replacementRoom])
+      .mockResolvedValue([]);
+
+    await harness.controller.start();
+    await flushWorkerMicrotasks();
+    const releaseLease = vi.mocked(harness.leaseStore.releaseLease);
+    const originalRelease = releaseLease.getMockImplementation()!;
+    releaseLease.mockImplementationOnce(async (input) => {
+      releaseEntered.resolve();
+      await finishRelease.promise;
+      return originalRelease(input);
+    });
+
+    const stopPromise = harness.controller.stop();
+    await releaseEntered.promise;
+    let restartSettled = false;
+    const restartPromise = harness.controller.start().then(() => {
+      restartSettled = true;
+    });
+    await flushWorkerMicrotasks();
+
+    expect(restartSettled).toBe(false);
+    expect(harness.roomStore.listRunnableRooms).toHaveBeenCalledTimes(1);
+    expect(harness.leaseStore.acquireLease).toHaveBeenCalledTimes(1);
+    expect(workerSignals).toHaveLength(1);
+    expect(workerSignals[0]?.aborted).toBe(true);
+
+    finishRelease.resolve();
+    await Promise.all([stopPromise, restartPromise]);
+    await flushWorkerMicrotasks();
+
+    expect(restartSettled).toBe(true);
+    expect(harness.roomStore.listRunnableRooms).toHaveBeenCalledTimes(2);
+    expect(harness.leaseStore.acquireLease).toHaveBeenCalledTimes(2);
+    expect(harness.leaseState.mutations).toEqual(["acquire", "release", "acquire"]);
+    expect(workerSignals).toHaveLength(2);
+    expect(workerSignals[1]?.aborted).toBe(false);
+    expect(vi.mocked(harness.worker.runRoom).mock.calls[1]?.[0].room).toBe(replacementRoom);
+  });
+
+  it("does not release or audit a delayed lease acquisition after stop returns", async () => {
+    const acquireEntered = deferred<void>();
+    const releaseAcquire = deferred<void>();
+    const harness = createHarness({ shutdownGraceMs: 30 });
+    const acquireLease = vi.mocked(harness.leaseStore.acquireLease);
+    const originalAcquire = acquireLease.getMockImplementation()!;
+    acquireLease.mockImplementationOnce(async (input) => {
+      const acquired = await originalAcquire(input);
+      acquireEntered.resolve();
+      await releaseAcquire.promise;
+      return acquired;
+    });
+
+    const startPromise = harness.controller.start();
+    await acquireEntered.promise;
+    expect(harness.leaseState.mutations).toEqual(["acquire"]);
+    expect(harness.leaseState.current?.releasedAt).toBeNull();
+    await harness.controller.stop();
+    vi.mocked(harness.roomStore.listRunnableRooms).mockResolvedValue([]);
+    await harness.controller.start();
+    const auditCallCountAfterStop = harness.recordRunAuditEvent.mock.calls.length;
+    const releaseCallCountAfterStop = vi.mocked(harness.leaseStore.releaseLease).mock.calls.length;
+
+    releaseAcquire.resolve();
+    await startPromise;
+    await flushWorkerMicrotasks();
+
+    expect(acquireLease).toHaveBeenCalledTimes(1);
+    expect(harness.recordRunAuditEvent).toHaveBeenCalledTimes(auditCallCountAfterStop);
+    expect(harness.leaseStore.releaseLease).toHaveBeenCalledTimes(releaseCallCountAfterStop);
+    expect(harness.worker.runRoom).not.toHaveBeenCalled();
+    expect(harness.leaseState.mutations).toEqual(["acquire"]);
+    expect(harness.leaseState.current).toMatchObject({
+      roomId: "room-1",
+      epoch: 1,
+      releasedAt: null,
+    });
+  });
+
+  it("does not audit or mutate a lease after a delayed renewal crosses stop", async () => {
+    const renewEntered = deferred<void>();
+    const releaseRenew = deferred<void>();
+    const harness = createHarness({ shutdownGraceMs: 30 });
+    await harness.controller.start();
+    await flushWorkerMicrotasks();
+    const leaseBeforeRenew = harness.leaseState.current;
+    const renewLease = vi.mocked(harness.leaseStore.renewLease);
+    const originalRenew = renewLease.getMockImplementation()!;
+    renewLease.mockImplementationOnce(async (input) => {
+      const renewed = await originalRenew(input);
+      renewEntered.resolve();
+      await releaseRenew.promise;
+      return renewed;
+    });
+
+    const reconcilePromise = harness.controller.reconcile("poll");
+    await renewEntered.promise;
+    expect(harness.leaseState.current).not.toBe(leaseBeforeRenew);
+    expect(harness.leaseState.mutations).toEqual(["acquire", "renew"]);
+    await harness.controller.stop();
+    vi.mocked(harness.roomStore.listRunnableRooms).mockResolvedValue([]);
+    await harness.controller.start();
+    const auditCallCountAfterStop = harness.recordRunAuditEvent.mock.calls.length;
+    const releaseCallCountAfterStop = vi.mocked(harness.leaseStore.releaseLease).mock.calls.length;
+    const releasedLease = harness.leaseState.current;
+    const leaseMutationsAfterRestart = [...harness.leaseState.mutations];
+
+    releaseRenew.resolve();
+    await reconcilePromise;
+    await flushWorkerMicrotasks();
+
+    expect(renewLease).toHaveBeenCalledTimes(1);
+    expect(harness.recordRunAuditEvent).toHaveBeenCalledTimes(auditCallCountAfterStop);
+    expect(harness.leaseStore.releaseLease).toHaveBeenCalledTimes(releaseCallCountAfterStop);
+    expect(harness.leaseState.current).toBe(releasedLease);
+    expect(harness.leaseState.current?.releasedAt).toBe(FIXED_NOW);
+    expect(harness.leaseState.mutations).toEqual(leaseMutationsAfterRestart);
   });
 
   it("aborts and fences lease loss before a hung audit delivery can settle", async () => {
