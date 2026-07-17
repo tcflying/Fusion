@@ -971,6 +971,16 @@ export {
 } from "./agent-session-helpers.js";
 export { ProjectManager } from "./project-manager.js";
 export { ProjectEngine, type ProjectEngineOptions } from "./project-engine.js";
+export {
+  PASSIVE_ROOM_WORKER,
+  RoomController,
+  type RoomControllerCheckpointStore,
+  type RoomControllerLeaseStore,
+  type RoomControllerOptions,
+  type RoomControllerRoomStore,
+  type RoomWorker,
+  type RoomWorkerRunInput,
+} from "./room-controller.js";
 export { ProjectEngineManager, type EngineManagerOptions } from "./project-engine-manager.js";
 export {
   acquireEngineSingleton,

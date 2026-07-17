@@ -588,6 +588,26 @@ export class AsyncRoomStore {
     return loadRoomAggregateProjection(this.layer.db, this.projectId, roomId);
   }
 
+  /**
+   * Durable restart discovery for backend Room workers. The process-local
+   * committed-event subscription is only a latency hint; this PostgreSQL scan
+   * is the correctness path across crashes and controller instances.
+   */
+  async listRunnableRooms(): Promise<readonly RoomAggregateV1[]> {
+    const rows = await this.layer.db
+      .select({ id: operationalRooms.id })
+      .from(operationalRooms)
+      .where(and(
+        eq(operationalRooms.projectId, this.projectId),
+        eq(operationalRooms.lifecycleState, "running"),
+      ))
+      .orderBy(asc(operationalRooms.updatedAt), asc(operationalRooms.id));
+    const projections = await Promise.all(
+      rows.map(({ id }) => loadRoomAggregateProjection(this.layer.db, this.projectId, id)),
+    );
+    return projections.filter((room): room is RoomAggregateV1 => room?.room.state === "running");
+  }
+
   async getDelivery(outboxId: string): Promise<RoomOutboxRecordV1 | null> {
     const rows = await this.layer.db
       .select()

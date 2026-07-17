@@ -15,8 +15,12 @@ import type {
   PlannerOverseerRuntimeSnapshot,
   PlannerInterventionSourceLink,
   PlannerOversightStage,
+  AsyncDataLayer,
 } from "@fusion/core";
 import {
+  AsyncRoomCheckpointStore,
+  AsyncRoomLeaseStore,
+  AsyncRoomStore,
   allowsAutoMergeProcessing,
   compareTasksByPriorityThenAgeAndId,
   emitOverseerConfirmation,
@@ -26,6 +30,7 @@ import {
   emitOverseerRetry,
   emitOverseerSteering,
   getTaskHardMergeBlocker,
+  isSessionRoomControlPlaneEnabled,
   isLiveSharedBranchGroupMemberIntegration,
   isSharedBranchGroupMemberIntegration,
   isWorkspaceTask,
@@ -38,6 +43,8 @@ import {
 } from "@fusion/core";
 import { assemblePlannerOverseerRuntimeSnapshot } from "./planner-overseer-runtime-snapshot.js";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { promisify } from "node:util";
 import { InProcessRuntime } from "./runtimes/in-process-runtime.js";
 import type { WorktreePool } from "./worktree-pool.js";
@@ -91,6 +98,11 @@ import {
   deliverPostgresMigrationCompleteNoticeIfNeeded,
   deliverPostgresMigrationNoticeIfNeeded,
 } from "./postgres-migration-notice.js";
+import {
+  PASSIVE_ROOM_WORKER,
+  RoomController,
+  type RoomWorker,
+} from "./room-controller.js";
 import type {
   ExternalTunnelInfo,
   TunnelProvider,
@@ -110,6 +122,21 @@ export type ProcessPullRequestMergeFn = (
   taskId: string,
   pool?: WorktreePool,
 ) => Promise<"merged" | "waiting" | "skipped">;
+
+export interface RoomControllerLifecycle {
+  start(): void | Promise<void>;
+  stop(): void | Promise<void>;
+}
+
+export interface RoomControllerFactoryContext {
+  readonly projectId: string;
+  readonly taskStore: TaskStore;
+  readonly asyncLayer: AsyncDataLayer;
+}
+
+export type RoomControllerFactory = (
+  context: RoomControllerFactoryContext,
+) => RoomControllerLifecycle;
 
 const execFileAsync = promisify(execFile);
 
@@ -346,6 +373,14 @@ export interface ProjectEngineOptions {
    * notifications independently. Defaults to false (notifier is started).
    */
   skipNotifier?: boolean;
+  /**
+   * Test/host seam for the backend-owned Room supervisor. The factory runs
+   * only after the runtime TaskStore is initialized, the project feature gate
+   * is explicitly true, and a project-bound AsyncDataLayer is available.
+   */
+  roomControllerFactory?: RoomControllerFactory;
+  /** Worker implementation delegated to the default RoomController. */
+  roomWorker?: RoomWorker;
 }
 
 /**
@@ -367,6 +402,7 @@ type MergeResolver = { resolve: (result: MergeResult) => void; reject: (err: Err
 export class ProjectEngine {
   private runtime: InProcessRuntime;
   private started = false;
+  private roomController?: RoomControllerLifecycle;
   private prMonitor?: PrMonitor;
   /**
    * FNXC:PlannerOversight 2026-07-04-00:00:
@@ -783,6 +819,68 @@ export class ProjectEngine {
         : undefined,
       log: runtimeLog,
     });
+
+    // FNXC:SessionRoomController 2026-07-17-21:15:
+    // The existing ProjectEngine is the sole process lifecycle owner. Room
+    // workers reuse its initialized TaskStore/AsyncDataLayer and never create a
+    // second scheduler, backend connection, or browser-owned execution loop.
+    if (isSessionRoomControlPlaneEnabled(settings)) {
+      const asyncLayer = store.getAsyncLayer();
+      if (!asyncLayer) {
+        runtimeLog.warn(
+          `Session Room control plane is enabled for ${this.config.projectId}, but no AsyncDataLayer is available; Room workers remain stopped`,
+        );
+      } else {
+        const roomControllerFactory = this.options.roomControllerFactory ?? ((context: RoomControllerFactoryContext) => {
+          const roomStore = new AsyncRoomStore(context.asyncLayer, { projectId: context.projectId });
+          const leaseStore = new AsyncRoomLeaseStore(context.asyncLayer, { projectId: context.projectId });
+          const checkpointStore = new AsyncRoomCheckpointStore(context.asyncLayer, { projectId: context.projectId });
+          const hostId = hostname();
+          return new RoomController({
+            projectId: context.projectId,
+            workerId: `${hostId}:${process.pid}:${randomUUID()}`,
+            hostId,
+            roomStore,
+            leaseStore,
+            checkpointStore,
+            worker: this.options.roomWorker ?? PASSIVE_ROOM_WORKER,
+          });
+        });
+        let roomController: RoomControllerLifecycle | undefined;
+        try {
+          roomController = roomControllerFactory({
+            projectId: this.config.projectId,
+            taskStore: store,
+            asyncLayer,
+          });
+          this.roomController = roomController;
+          await roomController.start();
+        } catch (error) {
+          this.roomController = undefined;
+          if (roomController) {
+            try {
+              await roomController.stop();
+            } catch (cleanupError) {
+              runtimeLog.warn(
+                `Failed to clean up Session Room controller after startup error: ${
+                  cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+                }`,
+              );
+            }
+          }
+          try {
+            await this.runtime.stop();
+          } catch (cleanupError) {
+            runtimeLog.warn(
+              `Failed to stop project runtime after Session Room startup error: ${
+                cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+              }`,
+            );
+          }
+          throw error;
+        }
+      }
+    }
 
     /*
      * FNXC:BackendFlip 2026-06-26-15:30:
@@ -1233,6 +1331,22 @@ export class ProjectEngine {
     this.shuttingDown = true;
     this.startupGeneration += 1;
 
+    // Stop the backend-owned Room supervisor before the runtime closes its
+    // TaskStore/AsyncDataLayer. A RoomController failure must not strand the
+    // rest of ProjectEngine shutdown.
+    const roomController = this.roomController;
+    this.roomController = undefined;
+    if (roomController) {
+      try {
+        await roomController.stop();
+      } catch (error) {
+        runtimeLog.warn(
+          `Session Room controller shutdown failed for ${this.config.projectId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
     // FNXC:VerificationConcurrency 2026-07-15-09:05: Drop this project's cap so it no longer pins process min.
     unregisterProjectVerificationLimit(this.config.projectId);
     // Stop merge retry timer

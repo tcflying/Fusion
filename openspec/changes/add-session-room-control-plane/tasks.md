@@ -32,8 +32,8 @@
 
 ## 4. Durable Room controller vertical spine
 
-- [ ] 4.1 Add RED tests for backend-owned Room lifecycle, worker lease acquisition, restart takeover, browser independence, and project-engine startup/shutdown integration.
-- [ ] 4.2 Implement the supervised `RoomController`/worker lifecycle and wire it into the existing project engine without creating a second scheduler process.
+- [x] 4.1 Add RED tests for backend-owned Room lifecycle, worker lease acquisition, restart takeover, browser independence, and project-engine startup/shutdown integration.
+- [x] 4.2 Implement the supervised `RoomController`/worker lifecycle and wire it into the existing project engine without creating a second scheduler process.
 - [ ] 4.3 Implement participant add/remove/pause/replace and role changes at turn boundaries with immutable binding lineage.
 - [ ] 4.4 Implement routed operator messages to controller, all, group, or selected seats using structured authority envelopes and durable target records.
 - [ ] 4.5 Implement one-sender lease and native IDE takeover reconciliation so observation can be concurrent but provider writes cannot interleave.
