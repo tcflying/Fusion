@@ -82,8 +82,17 @@ const GATE_KEYS = [
   "hard",
   "evaluatorRoleIds",
   "evidenceRequirements",
+  "provenanceKind",
+  "minimumDistinctProducerBindings",
 ] as const;
-const RECOVERY_KEYS = ["id", "trigger", "action", "maxAttempts"] as const;
+const RECOVERY_KEYS = [
+  "id",
+  "trigger",
+  "action",
+  "maxAttempts",
+  "phaseIds",
+  "exhaustedGateId",
+] as const;
 const EXIT_KEYS = [
   "outcome",
   "requiredGateIds",
@@ -130,6 +139,12 @@ const RECOVERY_ACTIONS = new Set([
   "change_model",
   "request_operator",
 ]);
+const PROVENANCE_KINDS = new Set(["candidate", "hypothesis"]);
+const REQUIRED_BOUNDED_RECOVERY_TRIGGERS = [
+  "timeout",
+  "no_progress",
+  "hard_gate_failed",
+] as const;
 const EXIT_OUTCOMES = new Set([
   "completed",
   "completed_with_risks",
@@ -432,6 +447,39 @@ function validateGate(value: unknown, path: string, issues: ProtocolValidationIs
   if ("evidenceRequirements" in object) {
     stringArray(object.evidenceRequirements, `${path}.evidenceRequirements`, issues);
   }
+  if ("provenanceKind" in object) {
+    enumString(
+      object.provenanceKind,
+      PROVENANCE_KINDS,
+      `${path}.provenanceKind`,
+      "unsupported_gate_provenance",
+      issues,
+    );
+    if (!("minimumDistinctProducerBindings" in object)) {
+      issue(
+        issues,
+        "missing_gate_producer_binding_count",
+        `${path}.minimumDistinctProducerBindings`,
+        "Producer provenance gates must declare a distinct binding count",
+      );
+    }
+  }
+  if ("minimumDistinctProducerBindings" in object) {
+    positiveInteger(
+      object.minimumDistinctProducerBindings,
+      `${path}.minimumDistinctProducerBindings`,
+      "invalid_gate_producer_binding_count",
+      issues,
+    );
+    if (!("provenanceKind" in object)) {
+      issue(
+        issues,
+        "missing_gate_provenance_kind",
+        `${path}.provenanceKind`,
+        "Producer provenance gates must declare a provenance kind",
+      );
+    }
+  }
   return object;
 }
 
@@ -440,13 +488,18 @@ function validateRecovery(value: unknown, path: string, issues: ProtocolValidati
     value,
     path,
     RECOVERY_KEYS,
-    ["id", "trigger", "action", "maxAttempts"],
+    ["id", "trigger", "action", "maxAttempts", "phaseIds", "exhaustedGateId"],
     issues,
   );
   if (!object) return null;
   enumString(object.trigger, RECOVERY_TRIGGERS, `${path}.trigger`, "unsupported_recovery_trigger", issues);
   enumString(object.action, RECOVERY_ACTIONS, `${path}.action`, "unsupported_recovery_action", issues);
   positiveInteger(object.maxAttempts, `${path}.maxAttempts`, "invalid_recovery_attempts", issues);
+  const phaseIds = stringArray(object.phaseIds, `${path}.phaseIds`, issues);
+  if (phaseIds?.length === 0) {
+    issue(issues, "missing_recovery_phase", `${path}.phaseIds`, "Recovery must cover at least one phase");
+  }
+  nonEmptyString(object.exhaustedGateId, `${path}.exhaustedGateId`, issues);
   return object;
 }
 
@@ -583,7 +636,6 @@ function validateRoomProtocolDefinitionUnchecked(
     issues,
     validateRecovery,
   );
-  void recoveryActions;
 
   const transitionValues = arrayAt(protocol.transitions, "$.transitions", issues) ?? [];
   const transitions = transitionValues
@@ -608,6 +660,22 @@ function validateRoomProtocolDefinitionUnchecked(
       .filter((phase): phase is JsonObject & { id: string } => typeof phase.id === "string")
       .map((phase) => [phase.id, phase]),
   );
+  const gatesById = new Map(
+    gates
+      .filter((gate): gate is JsonObject & { id: string } => typeof gate.id === "string")
+      .map((gate) => [gate.id, gate]),
+  );
+  const provenanceGateRequirements = protocol.family === "analysis_decision"
+    ? {
+        provenanceKind: "candidate" as const,
+        minDistinctProducerBindings: 2,
+      }
+    : protocol.family === "diagnosis"
+      ? {
+          provenanceKind: "hypothesis" as const,
+          minDistinctProducerBindings: 2,
+        }
+      : null;
 
   phases.forEach((phase, index) => {
     checkReferences(phase.roleIds, roleIds, `$.phases[${index}].roleIds`, issues);
@@ -682,6 +750,126 @@ function validateRoomProtocolDefinitionUnchecked(
     checkReferences(exit.requiredGateIds, gateIds, `$.exitConditions[${index}].requiredGateIds`, issues);
   });
 
+  const terminalRecoveryGateIds = new Set<string>();
+  for (const exit of exits) {
+    if (exit.outcome !== "blocked" && exit.outcome !== "failed") continue;
+    if (!Array.isArray(exit.requiredGateIds)) continue;
+    for (const gateId of exit.requiredGateIds) {
+      if (typeof gateId === "string") terminalRecoveryGateIds.add(gateId);
+    }
+  }
+  recoveryActions.forEach((recovery, index) => {
+    checkReferences(recovery.phaseIds, phaseIds, `$.recoveryActions[${index}].phaseIds`, issues);
+    checkReferences(
+      [recovery.exhaustedGateId],
+      gateIds,
+      `$.recoveryActions[${index}].exhaustedGateId`,
+      issues,
+    );
+    const exhaustedGateId = typeof recovery.exhaustedGateId === "string"
+      ? recovery.exhaustedGateId
+      : undefined;
+    const exhaustedGate = exhaustedGateId === undefined ? undefined : gatesById.get(exhaustedGateId);
+    if (
+      exhaustedGateId !== undefined &&
+      exhaustedGate !== undefined &&
+      exhaustedGate.kind !== "operator_approval" &&
+      !terminalRecoveryGateIds.has(exhaustedGateId)
+    ) {
+      issue(
+        issues,
+        "invalid_recovery_exhaustion_destination",
+        `$.recoveryActions[${index}].exhaustedGateId`,
+        "Recovery exhaustion must enter blocked, failed, or operator approval",
+      );
+    }
+    if (!Array.isArray(recovery.phaseIds) || exhaustedGateId === undefined) return;
+    for (const phaseId of recovery.phaseIds) {
+      if (typeof phaseId !== "string") continue;
+      const phase = phasesById.get(phaseId);
+      if (
+        phase &&
+        Array.isArray(phase.exitGateIds) &&
+        !phase.exitGateIds.includes(exhaustedGateId)
+      ) {
+        issue(
+          issues,
+          "recovery_exhaustion_gate_not_phase_exit",
+          `$.recoveryActions[${index}].exhaustedGateId`,
+          `Recovery exhaustion gate '${exhaustedGateId}' is not an exit gate for phase '${phaseId}'`,
+        );
+      }
+    }
+  });
+  if (provenanceGateRequirements) {
+    const provenanceGate = gates.find(
+      (gate): gate is JsonObject & { id: string; provenanceKind?: string; minimumDistinctProducerBindings?: number } =>
+        typeof gate.id === "string" &&
+        gate.provenanceKind === provenanceGateRequirements.provenanceKind,
+    );
+    if (!provenanceGate) {
+      issue(
+        issues,
+        "missing_producer_provenance_gate",
+        "$.gates",
+        `Protocol family '${protocol.family}' requires a '${provenanceGateRequirements.provenanceKind}' provenance gate`,
+      );
+    } else {
+      if (provenanceGate.minimumDistinctProducerBindings === undefined) {
+        issue(
+          issues,
+          "missing_distinct_producer_bindings",
+          `$.gates[${gates.indexOf(provenanceGate)}].minimumDistinctProducerBindings`,
+          `Protocol family '${protocol.family}' requires explicit distinct producer binding count of at least ${provenanceGateRequirements.minDistinctProducerBindings}`,
+        );
+      } else if (
+        provenanceGate.minimumDistinctProducerBindings <
+        provenanceGateRequirements.minDistinctProducerBindings
+      ) {
+        issue(
+          issues,
+          "insufficient_distinct_producer_bindings",
+          `$.gates[${gates.indexOf(provenanceGate)}].minimumDistinctProducerBindings`,
+          `Protocol family '${protocol.family}' requires at least ${provenanceGateRequirements.minDistinctProducerBindings} distinct producer bindings`,
+        );
+      }
+      if (
+        !phases.some(
+          (phase) =>
+            typeof phase.id === "string" &&
+            Array.isArray(phase.exitGateIds) &&
+            phase.exitGateIds.includes(provenanceGate.id),
+        )
+      ) {
+        issue(
+          issues,
+          "provenance_gate_not_phase_exit",
+          `$.gates[${gates.indexOf(provenanceGate)}].id`,
+          `Protocol family '${protocol.family}' provenance gate must be an exit gate of at least one phase`,
+        );
+      }
+    }
+  }
+  phases.forEach((phase, phaseIndex) => {
+    if (typeof phase.id !== "string") return;
+    for (const trigger of REQUIRED_BOUNDED_RECOVERY_TRIGGERS) {
+      const covered = recoveryActions.some(
+        (recovery) =>
+          recovery.trigger === trigger &&
+          Array.isArray(recovery.phaseIds) &&
+          recovery.phaseIds.includes(phase.id),
+      );
+      if (!covered) {
+        issue(
+          issues,
+          "missing_bounded_recovery",
+          `$.phases[${phaseIndex}].id`,
+          `Phase '${phase.id}' has no bounded '${trigger}' recovery action`,
+        );
+      }
+    }
+  });
+
   const adjacency = new Map<string, string[]>();
   const reverseAdjacency = new Map<string, string[]>();
   for (const phaseId of phaseIds) {
@@ -750,11 +938,6 @@ function validateRoomProtocolDefinitionUnchecked(
       .filter((role) => role.mayVerify === true && role.mayProduce === false)
       .map((role) => role.id)
       .filter((id): id is string => typeof id === "string"),
-  );
-  const gatesById = new Map(
-    gates
-      .filter((gate): gate is JsonObject & { id: string } => typeof gate.id === "string")
-      .map((gate) => [gate.id, gate]),
   );
   exits.forEach((exit, index) => {
     if (exit.requireIndependentVerifier !== true) return;

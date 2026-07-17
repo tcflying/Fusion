@@ -60,6 +60,8 @@ export interface RoomProtocolGateV1 {
   readonly hard: boolean;
   readonly evaluatorRoleIds?: readonly string[];
   readonly evidenceRequirements?: readonly string[];
+  readonly provenanceKind?: "candidate" | "hypothesis";
+  readonly minimumDistinctProducerBindings?: number;
 }
 
 export interface RoomProtocolRecoveryActionV1 {
@@ -67,6 +69,8 @@ export interface RoomProtocolRecoveryActionV1 {
   readonly trigger: RoomProtocolRecoveryTrigger;
   readonly action: RoomProtocolRecoveryAction;
   readonly maxAttempts: number;
+  readonly phaseIds: readonly string[];
+  readonly exhaustedGateId: string;
 }
 
 export interface RoomProtocolExitConditionV1 {

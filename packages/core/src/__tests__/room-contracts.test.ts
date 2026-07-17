@@ -177,8 +177,8 @@ describe("Session Room versioned contracts", () => {
       family: "implementation",
       name: "Independent implementation and review",
       phases: [
-        { id: "produce", roleIds: ["producer"], entryGateIds: [], exitGateIds: ["candidate_ready"], timeoutMs: 900_000 },
-        { id: "verify", roleIds: ["verifier"], entryGateIds: ["candidate_ready"], exitGateIds: ["hard_gates"], timeoutMs: 900_000 },
+        { id: "produce", roleIds: ["producer"], entryGateIds: [], exitGateIds: ["candidate_ready", "recovery_exhausted"], timeoutMs: 900_000 },
+        { id: "verify", roleIds: ["verifier"], entryGateIds: ["candidate_ready"], exitGateIds: ["hard_gates", "recovery_exhausted"], timeoutMs: 900_000 },
       ],
       roles: [
         { id: "producer", requiredCapabilities: ["workspace_write"], mayProduce: true, mayVerify: false, mayAccept: false },
@@ -190,9 +190,17 @@ describe("Session Room versioned contracts", () => {
       gates: [
         { id: "candidate_ready", kind: "deterministic", hard: true },
         { id: "hard_gates", kind: "deterministic", hard: true },
+        { id: "recovery_exhausted", kind: "deterministic", hard: true },
       ],
-      recoveryActions: [{ id: "replace_producer", trigger: "no_progress", action: "replace_participant", maxAttempts: 1 }],
-      exitConditions: [{ outcome: "completed", requiredGateIds: ["hard_gates"], requireIndependentVerifier: true }],
+      recoveryActions: [
+        { id: "retry_timeout", trigger: "timeout", action: "retry", maxAttempts: 1, phaseIds: ["produce", "verify"], exhaustedGateId: "recovery_exhausted" },
+        { id: "replace_producer", trigger: "no_progress", action: "replace_participant", maxAttempts: 1, phaseIds: ["produce", "verify"], exhaustedGateId: "recovery_exhausted" },
+        { id: "escalate_hard_gate", trigger: "hard_gate_failed", action: "request_operator", maxAttempts: 1, phaseIds: ["produce", "verify"], exhaustedGateId: "recovery_exhausted" },
+      ],
+      exitConditions: [
+        { outcome: "completed", requiredGateIds: ["hard_gates"], requireIndependentVerifier: true },
+        { outcome: "blocked", requiredGateIds: ["recovery_exhausted"], requireIndependentVerifier: false },
+      ],
     } satisfies RoomProtocolDefinitionV1;
 
     expect(ROOM_PROTOCOL_FAMILIES).toContain(protocol.family);

@@ -79,7 +79,7 @@ function validProtocol(overrides: Partial<RoomProtocolDefinitionV1> = {}): RoomP
         id: "produce",
         roleIds: ["producer"],
         entryGateIds: ["brief_ready"],
-        exitGateIds: ["candidate_ready"],
+        exitGateIds: ["candidate_ready", "recovery_exhausted"],
         timeoutMs: 900_000,
         channelIds: ["work"],
         contextPackIds: ["authoritative"],
@@ -88,7 +88,7 @@ function validProtocol(overrides: Partial<RoomProtocolDefinitionV1> = {}): RoomP
         id: "verify",
         roleIds: ["verifier"],
         entryGateIds: ["candidate_ready"],
-        exitGateIds: ["hard_gates_passed"],
+        exitGateIds: ["hard_gates_passed", "recovery_exhausted"],
         timeoutMs: 600_000,
         channelIds: ["review"],
         contextPackIds: ["blind_review"],
@@ -155,6 +155,7 @@ function validProtocol(overrides: Partial<RoomProtocolDefinitionV1> = {}): RoomP
         evaluatorRoleIds: ["verifier"],
         evidenceRequirements: ["test", "source"],
       },
+      { id: "recovery_exhausted", kind: "deterministic", hard: true },
     ],
     recoveryActions: [
       {
@@ -162,12 +163,24 @@ function validProtocol(overrides: Partial<RoomProtocolDefinitionV1> = {}): RoomP
         trigger: "timeout",
         action: "retry",
         maxAttempts: 2,
+        phaseIds: ["produce", "verify"],
+        exhaustedGateId: "recovery_exhausted",
       },
       {
         id: "replace_stalled_producer",
         trigger: "no_progress",
         action: "replace_participant",
         maxAttempts: 1,
+        phaseIds: ["produce", "verify"],
+        exhaustedGateId: "recovery_exhausted",
+      },
+      {
+        id: "escalate_failed_gate",
+        trigger: "hard_gate_failed",
+        action: "request_operator",
+        maxAttempts: 1,
+        phaseIds: ["produce", "verify"],
+        exhaustedGateId: "recovery_exhausted",
       },
     ],
     exitConditions: [
@@ -178,7 +191,7 @@ function validProtocol(overrides: Partial<RoomProtocolDefinitionV1> = {}): RoomP
       },
       {
         outcome: "blocked",
-        requiredGateIds: ["brief_ready"],
+        requiredGateIds: ["recovery_exhausted"],
         requireIndependentVerifier: false,
       },
     ],
@@ -217,6 +230,10 @@ function migrationFixture(): {
         whenGateId: "candidate_ready",
       },
     ],
+    recoveryActions: fromProtocol.recoveryActions.map((recovery) => ({
+      ...recovery,
+      phaseIds: ["produce_v2", "verify_v2"],
+    })),
   });
   return {
     fromProtocol,
