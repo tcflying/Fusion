@@ -354,23 +354,23 @@ describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
 
     expect(result).toMatchObject({
       cliSessionId: resolveTaskHappierCliSessionId({ taskId, purpose: "execute" }),
-      nativeSessionId: ensuredA.sessionId,
       providerId: "codex",
-      remoteSessionId: "remote-a",
+      nativeSessionId: "remote-a",
+      happierSessionId: ensuredA.sessionId,
       machineId: "machine-a",
-      serverId: "server-a",
+      serverProfileId: "server-a",
     });
     expect(Date.parse(result.linkedAt)).not.toBeNaN();
     expect(harness.operations).toEqual(["claim", "metadata"]);
     expect(harness.readPosture(taskId)).toEqual({
       autoApprove: true,
       unrelated: { keep: "yes" },
-      happierDirectSession: result,
+      happierDirectSession: { schemaVersion: 2, ...result },
     });
     expect(harness.readPosture(taskId)?.happierDirectSession).not.toHaveProperty("openUrl");
   });
 
-  it("is idempotent for the same native id without duplicating or relinking", async () => {
+  it("is idempotent for the same Happier Session without duplicating or relinking", async () => {
     const taskId = `FN-HAPPIER-IDEMPOTENT-${backend}`;
     const harness = createHarness(backend);
 
@@ -383,7 +383,7 @@ describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
     expect(harness.operations).toEqual(["claim", "metadata"]);
   });
 
-  it("raises a typed conflict when another native id already owns the task", async () => {
+  it("raises a typed conflict when another Happier Session already owns the task", async () => {
     const taskId = `FN-HAPPIER-CONFLICT-${backend}`;
     const harness = createHarness(backend);
     await bindTaskHappierDirectSession({ store: harness.store, taskId, ensured: ensuredA });
@@ -393,7 +393,7 @@ describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
       taskId,
       ensured: { ...ensuredA, sessionId: "hp-session-b" },
     })).rejects.toBeInstanceOf(TaskHappierDirectSessionConflictError);
-    expect((harness.readPosture(taskId)?.happierDirectSession as { nativeSessionId: string }).nativeSessionId).toBe("hp-session-a");
+    expect((harness.readPosture(taskId)?.happierDirectSession as { happierSessionId: string }).happierSessionId).toBe("hp-session-a");
   });
 
   it("does not write connected metadata when claiming fails", async () => {
@@ -418,6 +418,22 @@ describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
     await expect(readTaskHappierDirectSessionBinding({ store: harness.store, taskId })).resolves.toBeNull();
 
     harness.patchSession(taskId, {
+      autonomyPosture: JSON.stringify({
+        happierDirectSession: {
+          schemaVersion: 2,
+          cliSessionId: resolveTaskHappierCliSessionId({ taskId, purpose: "execute" }),
+          nativeSessionId: "hp-session-a",
+          providerId: "codex",
+          remoteSessionId: "remote-a",
+          machineId: "machine-a",
+          serverId: "server-a",
+          linkedAt: new Date().toISOString(),
+        },
+      }),
+    });
+    await expect(readTaskHappierDirectSessionBinding({ store: harness.store, taskId })).resolves.toBeNull();
+
+    harness.patchSession(taskId, {
       nativeSessionId: null,
       autonomyPosture: JSON.stringify({
         happierDirectSession: {
@@ -434,6 +450,36 @@ describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
     await expect(readTaskHappierDirectSessionBinding({ store: harness.store, taskId })).resolves.toBeNull();
   });
 
+  it("reads legacy reversed metadata through the corrected semantic field names", async () => {
+    const taskId = `FN-HAPPIER-LEGACY-${backend}`;
+    const harness = createHarness(backend);
+    await createCanonicalSession(harness.store, taskId);
+    harness.patchSession(taskId, {
+      nativeSessionId: "hp-session-a",
+      autonomyPosture: JSON.stringify({
+        happierDirectSession: {
+          cliSessionId: resolveTaskHappierCliSessionId({ taskId, purpose: "execute" }),
+          nativeSessionId: "hp-session-a",
+          providerId: "codex",
+          remoteSessionId: "remote-a",
+          machineId: "machine-a",
+          serverId: "server-a",
+          linkedAt: "2026-07-15T00:00:00.000Z",
+        },
+      }),
+    });
+
+    await expect(readTaskHappierDirectSessionBinding({ store: harness.store, taskId })).resolves.toEqual({
+      cliSessionId: resolveTaskHappierCliSessionId({ taskId, purpose: "execute" }),
+      providerId: "codex",
+      nativeSessionId: "remote-a",
+      happierSessionId: "hp-session-a",
+      machineId: "machine-a",
+      serverProfileId: "server-a",
+      linkedAt: "2026-07-15T00:00:00.000Z",
+    });
+  });
+
   it("raises a typed integrity error when native identity and metadata disagree", async () => {
     const taskId = `FN-HAPPIER-INTEGRITY-${backend}`;
     const harness = createHarness(backend);
@@ -442,6 +488,6 @@ describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
 
     await expect(readTaskHappierDirectSessionBinding({ store: harness.store, taskId }))
       .rejects.toBeInstanceOf(TaskHappierDirectSessionIntegrityError);
-    expect(binding.nativeSessionId).toBe("hp-session-a");
+    expect(binding).toMatchObject({ nativeSessionId: "remote-a", happierSessionId: "hp-session-a" });
   });
 });

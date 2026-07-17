@@ -21,6 +21,7 @@ interface EmbeddedTestContext {
 }
 
 const contexts: EmbeddedTestContext[] = [];
+const EMBEDDED_DATABASE_TIMEOUT_MS = 60_000;
 
 async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
   const dataDir = mkdtempSync(join(tmpdir(), "fusion-room-legacy-import-"));
@@ -50,17 +51,18 @@ afterEach(async () => {
       context.connections = null;
     }
     await context.lifecycle.stop();
-    rmSync(context.dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    rmSync(context.dataDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 });
   }
-});
+}, EMBEDDED_DATABASE_TIMEOUT_MS);
 
 async function createLegacyBinding(
   layer: AsyncDataLayer,
   suffix: string,
+  persistedFormat: "legacy" | "semantic-v2" | "unsupported-version" = "legacy",
 ) {
   const taskId = `task-legacy-${suffix}`;
   const cliSessionId = `cli-task-legacy-${suffix}`;
-  const binding = {
+  const sourceBinding = {
     cliSessionId,
     // Legacy bridge naming is inverted relative to the Room contract:
     // nativeSessionId stores Happier's linked Session id, while
@@ -72,6 +74,20 @@ async function createLegacyBinding(
     serverId: `happier-server-${suffix}`,
     linkedAt: "2026-07-17T09:00:00.000Z",
   };
+  const persistedBinding = persistedFormat === "semantic-v2"
+    ? {
+        schemaVersion: 2,
+        cliSessionId,
+        providerId: sourceBinding.providerId,
+        nativeSessionId: sourceBinding.remoteSessionId,
+        happierSessionId: sourceBinding.nativeSessionId,
+        machineId: sourceBinding.machineId,
+        serverProfileId: sourceBinding.serverId,
+        linkedAt: sourceBinding.linkedAt,
+      }
+    : persistedFormat === "unsupported-version"
+      ? { ...sourceBinding, schemaVersion: 3 }
+      : sourceBinding;
   const session = await new AsyncCliSessionStore(layer).createSession({
     id: cliSessionId,
     taskId,
@@ -79,17 +95,24 @@ async function createLegacyBinding(
     projectId: "project-1",
     adapterId: "happier",
     agentState: "idle",
-    nativeSessionId: binding.nativeSessionId,
+    nativeSessionId: sourceBinding.nativeSessionId,
     autonomyPosture: {
       autoApprove: false,
-      happierDirectSession: binding,
+      happierDirectSession: persistedBinding,
     },
     worktreePath: `G:\\codex-project\\legacy-${suffix}`,
   });
   return {
     source: {
       taskId,
-      ...binding,
+      cliSessionId,
+      providerId: sourceBinding.providerId,
+      nativeSessionId: sourceBinding.remoteSessionId,
+      happierSessionId: sourceBinding.nativeSessionId,
+      machineId: sourceBinding.machineId,
+      hostId: `fusion-host-${suffix}`,
+      serverProfileId: sourceBinding.serverId,
+      linkedAt: sourceBinding.linkedAt,
       cliSessionUpdatedAt: session.updatedAt,
     },
     row: (await layer.db
@@ -133,6 +156,42 @@ function commandContext(eventId: string) {
 }
 
 describe("one-way legacy Happier Session import", () => {
+  it("accepts semantic-v2 metadata and rejects unknown versioned metadata", async () => {
+    const context = await startEmbeddedDatabase();
+    const layer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
+    const legacy = await createLegacyBinding(layer, "semantic-v2", "semantic-v2");
+    const store = new AsyncRoomStore(layer);
+
+    const imported = await store.importLegacyHappierBinding(
+      importInput("semantic-v2", legacy.source),
+      commandContext("event-import-semantic-v2"),
+    );
+
+    expect(imported.bindings).toEqual([expect.objectContaining({
+      id: "binding-import-semantic-v2",
+      nativeSessionId: "codex-thread-legacy-semantic-v2",
+      happierSessionId: "happier-session-legacy-semantic-v2",
+      serverProfileId: "happier-server-semantic-v2",
+      machineId: "windows-host-semantic-v2",
+      hostId: "fusion-host-semantic-v2",
+    })]);
+    expect((await layer.db
+      .select()
+      .from(cliSessions)
+      .where(eq(cliSessions.id, legacy.source.cliSessionId)))[0]).toEqual(legacy.row);
+
+    const unsupported = await createLegacyBinding(
+      layer,
+      "unsupported-version",
+      "unsupported-version",
+    );
+    await expect(store.importLegacyHappierBinding(
+      importInput("unsupported-version", unsupported.source),
+      commandContext("event-import-unsupported-version"),
+    )).rejects.toThrow(/integrity|version/iu);
+    expect(await store.getRoom("room-import-unsupported-version")).toBeUndefined();
+  }, EMBEDDED_DATABASE_TIMEOUT_MS);
+
   it("creates a one-seat Room while leaving the task-bound CLI Session byte-for-byte unchanged", async () => {
     const context = await startEmbeddedDatabase();
     const layer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
@@ -149,11 +208,11 @@ describe("one-way legacy Happier Session import", () => {
       seats: [{ id: "seat-import-success", activeBindingId: "binding-import-success" }],
       bindings: [{
         id: "binding-import-success",
-        nativeSessionId: legacy.source.remoteSessionId,
-        happierSessionId: legacy.source.nativeSessionId,
-        serverProfileId: legacy.source.serverId,
+        nativeSessionId: legacy.source.nativeSessionId,
+        happierSessionId: legacy.source.happierSessionId,
+        serverProfileId: legacy.source.serverProfileId,
         machineId: legacy.source.machineId,
-        hostId: legacy.source.machineId,
+        hostId: legacy.source.hostId,
         generation: 1,
       }],
     });
@@ -178,7 +237,7 @@ describe("one-way legacy Happier Session import", () => {
       .select()
       .from(cliSessions)
       .where(eq(cliSessions.id, legacy.source.cliSessionId)))[0]).toEqual(legacy.row);
-  });
+  }, EMBEDDED_DATABASE_TIMEOUT_MS);
 
   it("rolls back Room, seat, and binding writes when the final event append fails", async () => {
     const context = await startEmbeddedDatabase();
@@ -217,5 +276,5 @@ describe("one-way legacy Happier Session import", () => {
       .select()
       .from(cliSessions)
       .where(eq(cliSessions.id, legacy.source.cliSessionId)))[0]).toEqual(legacy.row);
-  });
+  }, EMBEDDED_DATABASE_TIMEOUT_MS);
 });

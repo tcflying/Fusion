@@ -228,13 +228,12 @@ export type LegacyHappierBindingProviderId = "codex" | "claude" | "opencode";
 export interface LegacyHappierBindingSourceV1 {
   readonly taskId: string;
   readonly cliSessionId: string;
-  /** Legacy field: stores the Happier linked Session id, not the provider id. */
-  readonly nativeSessionId: string;
   readonly providerId: LegacyHappierBindingProviderId;
-  /** Official Happier remoteSessionId: the provider-native Session id. */
-  readonly remoteSessionId: string;
+  readonly nativeSessionId: string;
+  readonly happierSessionId: string;
   readonly machineId: string;
-  readonly serverId: string;
+  readonly hostId: string;
+  readonly serverProfileId: string;
   readonly linkedAt: string;
   readonly cliSessionUpdatedAt: string;
 }
@@ -363,13 +362,6 @@ export class AsyncRoomStore {
     context: RoomCommandContext,
   ): Promise<RoomAggregateV1> {
     assertLegacyImportInput(input);
-    // FNXC:LegacyHappierIdentity 2026-07-17-05:03:
-    // The old task bridge persisted Happier's `sessionId` in its misleading
-    // `nativeSessionId` field and the actual provider id in `remoteSessionId`.
-    // Normalize only at the Room boundary; never rewrite the legacy row that
-    // the existing AgentRuntime still uses to address Happier CLI operations.
-    const providerNativeSessionId = input.source.remoteSessionId;
-    const happierSessionId = input.source.nativeSessionId;
     const base = createRoomAggregate({
       id: input.room.id,
       projectId: this.projectId,
@@ -401,11 +393,11 @@ export class AsyncRoomStore {
         generation: 1,
         connectorId: "happier",
         providerId: input.source.providerId,
-        nativeSessionId: providerNativeSessionId,
-        happierSessionId,
-        serverProfileId: input.source.serverId,
+        nativeSessionId: input.source.nativeSessionId,
+        happierSessionId: input.source.happierSessionId,
+        serverProfileId: input.source.serverProfileId,
         machineId: input.source.machineId,
-        hostId: input.source.machineId,
+        hostId: input.source.hostId,
         state: "attached",
         attachedAt: input.source.linkedAt,
         detachedAt: null,
@@ -419,7 +411,7 @@ export class AsyncRoomStore {
         tx,
         this.projectId,
         input.source.providerId,
-        providerNativeSessionId,
+        input.source.nativeSessionId,
       );
       await verifyLegacyHappierBindingSource(tx, this.projectId, input.source);
 
@@ -429,7 +421,7 @@ export class AsyncRoomStore {
         .where(and(
           eq(roomBindings.projectId, this.projectId),
           eq(roomBindings.providerId, input.source.providerId),
-          eq(roomBindings.nativeSessionId, providerNativeSessionId),
+          eq(roomBindings.nativeSessionId, input.source.nativeSessionId),
           inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
         ))
         .limit(1);
@@ -447,7 +439,7 @@ export class AsyncRoomStore {
         .where(and(
           eq(roomBindings.projectId, this.projectId),
           eq(roomBindings.connectorId, "happier"),
-          eq(roomBindings.happierSessionId, happierSessionId),
+          eq(roomBindings.happierSessionId, input.source.happierSessionId),
           inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
         ))
         .limit(1);
@@ -455,7 +447,7 @@ export class AsyncRoomStore {
       if (activeHappierOwner) {
         throw new RoomStoreError(
           "legacy_binding_integrity_conflict",
-          `Happier Session ${happierSessionId} already belongs to Room ${activeHappierOwner.roomId} as binding ${activeHappierOwner.bindingId}`,
+          `Happier Session ${input.source.happierSessionId} already belongs to Room ${activeHappierOwner.roomId} as binding ${activeHappierOwner.bindingId}`,
         );
       }
 
@@ -510,11 +502,11 @@ export class AsyncRoomStore {
         generation: 1,
         connectorId: "happier",
         providerId: input.source.providerId,
-        nativeSessionId: providerNativeSessionId,
-        happierSessionId,
-        serverProfileId: input.source.serverId,
+        nativeSessionId: input.source.nativeSessionId,
+        happierSessionId: input.source.happierSessionId,
+        serverProfileId: input.source.serverProfileId,
         machineId: input.source.machineId,
-        hostId: input.source.machineId,
+        hostId: input.source.hostId,
         state: "attached",
         attachedAt: input.source.linkedAt,
         detachedAt: null,
@@ -2275,9 +2267,10 @@ function assertLegacyImportInput(input: ImportLegacyHappierBindingInput): void {
     ["source.taskId", input.source.taskId],
     ["source.cliSessionId", input.source.cliSessionId],
     ["source.nativeSessionId", input.source.nativeSessionId],
-    ["source.remoteSessionId", input.source.remoteSessionId],
+    ["source.happierSessionId", input.source.happierSessionId],
     ["source.machineId", input.source.machineId],
-    ["source.serverId", input.source.serverId],
+    ["source.hostId", input.source.hostId],
+    ["source.serverProfileId", input.source.serverProfileId],
   ] as const;
   for (const [label, value] of requiredValues) {
     if (typeof value !== "string" || value.trim().length === 0) {
@@ -2364,7 +2357,7 @@ async function verifyLegacyHappierBindingSource(
     row.taskId !== source.taskId
     || row.purpose !== "execute"
     || row.adapterId !== "happier"
-    || row.nativeSessionId !== source.nativeSessionId
+    || row.nativeSessionId !== source.happierSessionId
     || row.updatedAt !== source.cliSessionUpdatedAt
   ) {
     throw new RoomStoreError(
@@ -2383,22 +2376,38 @@ async function verifyLegacyHappierBindingSource(
     );
   }
   const persisted = asRecord(asRecord(posture).happierDirectSession);
-  const persistedSnapshot = {
-    cliSessionId: persisted.cliSessionId,
-    nativeSessionId: persisted.nativeSessionId,
-    providerId: persisted.providerId,
-    remoteSessionId: persisted.remoteSessionId,
-    machineId: persisted.machineId,
-    serverId: persisted.serverId,
-    linkedAt: persisted.linkedAt,
-  };
+  if (persisted.schemaVersion !== undefined && persisted.schemaVersion !== 2) {
+    throw new RoomStoreError(
+      "legacy_binding_integrity_conflict",
+      `Legacy Happier CLI Session ${source.cliSessionId} uses an unsupported metadata version`,
+    );
+  }
+  const persistedSnapshot = persisted.schemaVersion === 2
+    ? {
+        cliSessionId: persisted.cliSessionId,
+        happierSessionId: persisted.happierSessionId,
+        providerId: persisted.providerId,
+        nativeSessionId: persisted.nativeSessionId,
+        machineId: persisted.machineId,
+        serverProfileId: persisted.serverProfileId,
+        linkedAt: persisted.linkedAt,
+      }
+    : {
+        cliSessionId: persisted.cliSessionId,
+        happierSessionId: persisted.nativeSessionId,
+        providerId: persisted.providerId,
+        nativeSessionId: persisted.remoteSessionId,
+        machineId: persisted.machineId,
+        serverProfileId: persisted.serverId,
+        linkedAt: persisted.linkedAt,
+      };
   const expectedSnapshot = {
     cliSessionId: source.cliSessionId,
-    nativeSessionId: source.nativeSessionId,
+    happierSessionId: source.happierSessionId,
     providerId: source.providerId,
-    remoteSessionId: source.remoteSessionId,
+    nativeSessionId: source.nativeSessionId,
     machineId: source.machineId,
-    serverId: source.serverId,
+    serverProfileId: source.serverProfileId,
     linkedAt: source.linkedAt,
   };
   if (hashRoomValue(persistedSnapshot) !== hashRoomValue(expectedSnapshot)) {

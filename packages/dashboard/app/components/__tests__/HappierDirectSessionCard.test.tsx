@@ -22,11 +22,11 @@ const connected: HappierDirectSessionConnected = {
   cliSessionId: "cli-executor-FN-500-primary",
   nativeSessionId: "native-session-abcdefghijklmnopqrstuvwxyz-0123456789",
   providerId: "codex",
-  remoteSessionId: "happier-session-abcdefghijklmnopqrstuvwxyz-0123456789",
+  happierSessionId: "happier-session-abcdefghijklmnopqrstuvwxyz-0123456789",
   machineId: "machine-abcdefghijklmnopqrstuvwxyz-0123456789",
-  serverId: "server-abcdefghijklmnopqrstuvwxyz-0123456789",
+  serverProfileId: "server-abcdefghijklmnopqrstuvwxyz-0123456789",
   linkedAt: "2026-07-15T00:00:00.000Z",
-  openUrl: "https://app.happier.dev/session/server-1/session-1",
+  openUrl: "https://app.happier.dev/session/session-1?serverId=server-1",
 };
 const postConnected = {
   ...connected,
@@ -189,9 +189,10 @@ describe("HappierDirectSessionCard", () => {
     expect(await screen.findByText("Bound, not running")).toBeInTheDocument();
     expect(screen.getByText("codex")).toBeInTheDocument();
     expect(screen.getByText(connected.nativeSessionId)).toBeInTheDocument();
-    expect(screen.getByText(connected.remoteSessionId)).toBeInTheDocument();
+    expect(screen.getByText(connected.happierSessionId)).toBeInTheDocument();
     expect(screen.getByText(connected.machineId)).toBeInTheDocument();
-    expect(screen.getByText(connected.serverId)).toBeInTheDocument();
+    expect(screen.getByText(connected.serverProfileId)).toBeInTheDocument();
+    expect(screen.getByText("Server/profile ID")).toBeInTheDocument();
     expect(openMock).toHaveBeenCalledWith(connected.openUrl, "_blank", "noopener,noreferrer");
   });
 
@@ -488,9 +489,9 @@ describe("HappierDirectSessionCard", () => {
     expect(await screen.findByText(connected.nativeSessionId)).toHaveClass("happier-direct-session-card__id-value");
     for (const [label, value] of [
       ["Copy native session ID", connected.nativeSessionId],
-      ["Copy Happier session ID", connected.remoteSessionId],
+      ["Copy Happier session ID", connected.happierSessionId],
       ["Copy machine ID", connected.machineId],
-      ["Copy server ID", connected.serverId],
+      ["Copy server/profile ID", connected.serverProfileId],
     ] as const) {
       fireEvent.click(screen.getByRole("button", { name: label }));
       expect(clipboardWrite).toHaveBeenLastCalledWith(value);

@@ -170,7 +170,10 @@ function makeConnector(input: {
     })),
     getHealth: vi.fn(async () => input.health?.() ?? healthyHealth()),
     getDeepLinks: vi.fn(async () => ok<SessionConnectorDeepLinksV1>({
-      happierUrl: "http://127.0.0.1:18287/session/happier-session-1",
+      contractVersion: 1,
+      bindingId: "binding-1",
+      ...IDENTITY,
+      happierUrl: "http://127.0.0.1:18287/session/happier-session-1?serverId=happier-server-1",
       nativeSessionUrl: "codex://threads/codex-thread-1",
     })),
   };
@@ -555,12 +558,16 @@ describe("provider-neutral Session Connector registry contract", () => {
       reasonCodes: [],
       retryAfterMs: null,
     });
-    const links = await (await requireVerified(registry, "deepLinks")).getDeepLinks(IDENTITY);
+    const request = { contractVersion: 1 as const, bindingId: "binding-1", identity: IDENTITY };
+    const links = await (await requireVerified(registry, "deepLinks")).getDeepLinks(request);
     expect(links).toEqual(ok({
-      happierUrl: "http://127.0.0.1:18287/session/happier-session-1",
+      contractVersion: 1,
+      bindingId: "binding-1",
+      ...IDENTITY,
+      happierUrl: "http://127.0.0.1:18287/session/happier-session-1?serverId=happier-server-1",
       nativeSessionUrl: "codex://threads/codex-thread-1",
     }));
     expect(connector.getHealth).toHaveBeenCalledWith(IDENTITY.hostId);
-    expect(connector.getDeepLinks).toHaveBeenCalledWith(IDENTITY);
+    expect(connector.getDeepLinks).toHaveBeenCalledWith(request);
   });
 });

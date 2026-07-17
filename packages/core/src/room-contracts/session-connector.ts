@@ -264,7 +264,22 @@ export const SESSION_CONNECTOR_HEALTH_REASON_CODES = [
 export type SessionConnectorHealthReasonCode =
   (typeof SESSION_CONNECTOR_HEALTH_REASON_CODES)[number];
 
+export interface SessionConnectorDeepLinksRequestV1 {
+  readonly contractVersion: SessionConnectorContractVersion;
+  readonly bindingId: RoomBindingId;
+  readonly identity: SessionConnectorIdentityV1;
+}
+
 export interface SessionConnectorDeepLinksV1 {
+  readonly contractVersion: SessionConnectorContractVersion;
+  readonly bindingId: RoomBindingId;
+  readonly connectorId: SessionConnectorId;
+  readonly providerId: string;
+  readonly nativeSessionId: string;
+  readonly happierSessionId: string | null;
+  readonly serverProfileId: string | null;
+  readonly machineId: string | null;
+  readonly hostId: string;
   readonly happierUrl: string | null;
   readonly nativeSessionUrl: string | null;
 }
@@ -284,5 +299,5 @@ export interface SessionConnectorV1 {
   resume(input: SessionConnectorControlRequestV1): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>>;
   takeover(input: SessionConnectorControlRequestV1): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>>;
   getHealth(hostId: string): Promise<SessionConnectorHealthV1>;
-  getDeepLinks(identity: SessionConnectorIdentityV1): Promise<SessionConnectorResultV1<SessionConnectorDeepLinksV1>>;
+  getDeepLinks(input: SessionConnectorDeepLinksRequestV1): Promise<SessionConnectorResultV1<SessionConnectorDeepLinksV1>>;
 }

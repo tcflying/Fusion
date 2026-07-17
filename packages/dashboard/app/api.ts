@@ -23,9 +23,9 @@ export interface HappierDirectSessionConnected {
   cliSessionId: string;
   nativeSessionId: string;
   providerId: HappierDirectSessionProviderId;
-  remoteSessionId: string;
+  happierSessionId: string;
   machineId: string;
-  serverId: string;
+  serverProfileId: string;
   linkedAt: string;
   openUrl: string;
 }

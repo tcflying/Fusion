@@ -7,10 +7,11 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  HAPPIER_DIRECT_SESSION_SOURCE_REVISION,
   HappierSessionConnector,
   type HappierSessionConnectorDependencies,
 } from "../session-connector.js";
-import { HappierCliError } from "../types.js";
+import { HappierCliError, type HappierCliSettings } from "../types.js";
 
 const NOW = "2026-07-17T05:10:00.000Z";
 
@@ -27,6 +28,7 @@ const IDENTITY: SessionConnectorIdentityV1 = {
 function setup(
   overrides: Partial<HappierSessionConnectorDependencies> = {},
   now: () => string = () => NOW,
+  settings: Partial<HappierCliSettings> = {},
 ) {
   const dependencies: HappierSessionConnectorDependencies = {
     ensureDirectSession: vi.fn(async () => ({
@@ -125,6 +127,7 @@ function setup(
         executable: "happier",
         activeServerId: "server-1",
         webappUrl: "https://app.happier.dev",
+        ...settings,
       },
       now,
       dependencies,
@@ -178,6 +181,23 @@ describe("HappierSessionConnector", () => {
         attachedAt: NOW,
       },
     });
+  });
+
+  it("refuses to invent a Fusion host identity from Happier's machine identity", async () => {
+    const { connector, dependencies } = setup();
+
+    const result = await connector.ensureExisting({
+      contractVersion: 1,
+      canonicalSessionUri: "codex://threads/codex-thread-1",
+      requiredMachineId: "machine-1",
+      idempotencyKey: "attach-without-host",
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "invalid_request" },
+    });
+    expect(dependencies.ensureDirectSession).not.toHaveBeenCalled();
   });
 
   it("targets Happier's linked Session for status while retaining provider-native identity", async () => {
@@ -624,7 +644,10 @@ describe("HappierSessionConnector", () => {
         resume: { state: "unavailable" },
         takeover: { state: "unavailable" },
         health: { state: "unverified" },
-        deepLinks: { state: "unavailable" },
+        deepLinks: {
+          state: "verified",
+          evidenceRef: `happier-source:${HAPPIER_DIRECT_SESSION_SOURCE_REVISION}:direct-session-open-url`,
+        },
       },
     });
 
@@ -641,5 +664,77 @@ describe("HappierSessionConnector", () => {
       idempotencyKey: "interrupt-1",
       reason: "operator request",
     })).resolves.toMatchObject({ ok: false, error: { code: "unavailable" } });
+  });
+
+  it("rebuilds certified links from current configuration without changing separate binding identities", async () => {
+    const request = {
+      contractVersion: 1 as const,
+      bindingId: "binding-1",
+      identity: IDENTITY,
+    };
+    const original = await setup().connector.getDeepLinks(request);
+    const moved = await setup({}, () => NOW, {
+      webappUrl: "https://new.happier.example/root/",
+    }).connector.getDeepLinks(request);
+    const identities = {
+      contractVersion: 1,
+      bindingId: "binding-1",
+      connectorId: "happier",
+      providerId: "codex",
+      nativeSessionId: "codex-thread-1",
+      happierSessionId: "happier-session-1",
+      serverProfileId: "server-1",
+      machineId: "machine-1",
+      hostId: "fusion-host-1",
+    };
+
+    expect(original).toEqual({
+      ok: true,
+      value: {
+        ...identities,
+        happierUrl: "https://app.happier.dev/session/happier-session-1?serverId=server-1",
+        nativeSessionUrl: "codex://threads/codex-thread-1",
+      },
+    });
+    expect(moved).toEqual({
+      ok: true,
+      value: {
+        ...identities,
+        happierUrl: "https://new.happier.example/root/session/happier-session-1?serverId=server-1",
+        nativeSessionUrl: "codex://threads/codex-thread-1",
+      },
+    });
+
+    await expect(setup().connector.getDeepLinks({
+      ...request,
+      identity: {
+        ...IDENTITY,
+        providerId: "claude",
+        nativeSessionId: "claude-session-1",
+      },
+    })).resolves.toMatchObject({
+      ok: true,
+      value: {
+        bindingId: "binding-1",
+        providerId: "claude",
+        nativeSessionId: "claude-session-1",
+        happierSessionId: "happier-session-1",
+        nativeSessionUrl: null,
+      },
+    });
+
+    await expect(setup().connector.getDeepLinks({
+      ...request,
+      identity: { ...IDENTITY, serverProfileId: "server-2" },
+    })).resolves.toMatchObject({ ok: false, error: { code: "conflict" } });
+
+    const unsafe = setup({}, () => NOW, { webappUrl: "javascript:alert(1)" }).connector;
+    await expect(unsafe.getCapabilities(IDENTITY)).resolves.toMatchObject({
+      capabilities: { deepLinks: { state: "degraded", evidenceRef: null } },
+    });
+    await expect(unsafe.getDeepLinks(request)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "degraded" },
+    });
   });
 });

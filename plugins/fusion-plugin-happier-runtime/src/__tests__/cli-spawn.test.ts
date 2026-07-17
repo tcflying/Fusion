@@ -699,8 +699,18 @@ describe("Happier session wrappers", () => {
 
   it("normalizes the webapp trailing slash and encodes session-open ids", () => {
     expect(buildHappierSessionOpenUrl("https://app.happier.dev/", "server/id", "session id?#")).toBe(
-      "https://app.happier.dev/session/server%2Fid/session%20id%3F%23",
+      "https://app.happier.dev/session/session%20id%3F%23?serverId=server%2Fid",
     );
+  });
+
+  it.each([
+    "javascript:alert(1)",
+    "https://user:password@app.happier.dev",
+    "https://app.happier.dev/?accessToken=secret",
+    "https://app.happier.dev/#session",
+  ])("rejects an unsafe current Happier web origin: %s", (webappUrl) => {
+    expect(() => buildHappierSessionOpenUrl(webappUrl, "server-1", "session-1"))
+      .toThrow("Happier webapp URL or Session identity is unsafe");
   });
 
   it("retries a bounded synchronous Windows spawn file lock", async () => {

@@ -222,13 +222,15 @@ describe("Happier direct-session task routes", () => {
       connected: true,
       taskId: task.id,
       cliSessionId: resolveTaskHappierCliSessionId({ taskId: task.id, purpose: "execute" }),
-      nativeSessionId: "happier-session-1",
+      nativeSessionId: "thread-1",
       providerId: "codex",
-      remoteSessionId: "thread-1",
+      happierSessionId: "happier-session-1",
       machineId: "machine-a",
-      serverId: "server/a",
-      openUrl: "https://new.happier.example/root/session/server%2Fa/happier-session-1",
+      serverProfileId: "server/a",
+      openUrl: "https://new.happier.example/root/session/happier-session-1?serverId=server%2Fa",
     });
+    expect(response.body).not.toHaveProperty("remoteSessionId");
+    expect(response.body).not.toHaveProperty("serverId");
   });
 
   it("GET reports malformed persisted binding metadata as a typed integrity failure", async () => {
@@ -277,6 +279,21 @@ describe("Happier direct-session task routes", () => {
     expect(ensureHarness.ensure).not.toHaveBeenCalled();
   });
 
+  it("POST rejects an unsafe Happier web origin before ensuring or persisting a binding", async () => {
+    const task = await createTask();
+    await store.getPluginStore().updatePluginSettings(HAPPIER_RUNTIME_PLUGIN_ID, {
+      webappUrl: "javascript:alert(1)",
+    });
+    const { app } = createApp();
+
+    const response = await post(app, task.id);
+
+    expect(response.status).toBe(409);
+    expect((response.body as TestResponseBody).details.code).toBe("HAPPIER_WEBAPP_URL_INVALID");
+    expect(ensureHarness.ensure).not.toHaveBeenCalled();
+    await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toBeNull();
+  });
+
   it("POST persists one stateful remote session, one exact-role bridge, and one assignment across retries", async () => {
     const task = await createTask();
     const before = await store.getTask(task.id);
@@ -288,8 +305,8 @@ describe("Happier direct-session task routes", () => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
-    expect(first.body).toMatchObject({ created: true, nativeSessionId: "happier-session-1" });
-    expect(second.body).toMatchObject({ created: false, nativeSessionId: "happier-session-1" });
+    expect(first.body).toMatchObject({ created: true, nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
+    expect(second.body).toMatchObject({ created: false, nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
     expect(ensureHarness.ensure).toHaveBeenCalledTimes(2);
     expect(ensureHarness.sessions).toHaveLength(1);
     expect(ensureHarness.ensure).toHaveBeenNthCalledWith(1, {
@@ -312,7 +329,7 @@ describe("Happier direct-session task routes", () => {
       taskId: task.id,
     });
     const binding = await readTaskHappierDirectSessionBinding({ store, taskId: task.id });
-    expect(binding?.nativeSessionId).toBe("happier-session-1");
+    expect(binding).toMatchObject({ nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
 
     const after = await store.getTask(task.id);
     expect(after.assignedAgentId).toBe(bridgeAgents[0]?.id);
@@ -342,7 +359,8 @@ describe("Happier direct-session task routes", () => {
       code: "HAPPIER_BRIDGE_AGENT_CONFLICT",
       agentId: existing.id,
       sessionBound: true,
-      nativeSessionId: "happier-session-1",
+      nativeSessionId: "thread-1",
+      happierSessionId: "happier-session-1",
     });
     expect(assignSpy).not.toHaveBeenCalled();
     expect((await agentStore.getAgent(existing.id))?.role).toBe("reviewer");
@@ -377,7 +395,7 @@ describe("Happier direct-session task routes", () => {
     expect(response.status).toBe(409);
     expect((response.body as TestResponseBody).details.code).toBe("HAPPIER_DIRECT_SESSION_CONFLICT");
     await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toMatchObject({
-      nativeSessionId: "happier-session-1",
+      nativeSessionId: "thread-1",
     });
   });
 
@@ -441,15 +459,17 @@ describe("Happier direct-session task routes", () => {
     expect((first.body as TestResponseBody).details).toMatchObject({
       code: "HAPPIER_SESSION_BOUND_ASSIGNMENT_FAILED",
       sessionBound: true,
-      nativeSessionId: "happier-session-1",
+      nativeSessionId: "thread-1",
+      happierSessionId: "happier-session-1",
     });
     await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toMatchObject({
-      nativeSessionId: "happier-session-1",
+      nativeSessionId: "thread-1",
+      happierSessionId: "happier-session-1",
     });
 
     const second = await post(app, task.id);
     expect(second.status).toBe(200);
-    expect(second.body).toMatchObject({ created: false, nativeSessionId: "happier-session-1" });
+    expect(second.body).toMatchObject({ created: false, nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
     expect(assignTaskToBridge).toHaveBeenCalledTimes(2);
     expect(ensureHarness.ensure).toHaveBeenCalledTimes(2);
     expect(ensureHarness.sessions).toHaveLength(1);

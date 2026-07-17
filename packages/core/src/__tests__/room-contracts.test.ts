@@ -317,6 +317,7 @@ describe("Session Room versioned contracts", () => {
           nativeSessionId: "claude-native-session",
           happierSessionId: "happier-session",
           serverProfileId: "server-profile-1",
+          machineId: "machine-1",
           hostId: "windows-host-1",
           health: "recovering",
           lastHeartbeatAt: "2026-07-17T00:02:00.000Z",
@@ -329,7 +330,7 @@ describe("Session Room versioned contracts", () => {
           waitReason: "process_exited",
           recoveryOwnerId: "controller-1",
           happierDeepLink: "http://127.0.0.1:18287/session/happier-session",
-          nativeDeepLink: "claude://sessions/claude-native-session",
+          nativeDeepLink: null,
         },
       ],
       tasks: [

@@ -3,11 +3,13 @@ import {
   SESSION_CONNECTOR_CAPABILITIES,
   SESSION_CONNECTOR_HISTORY_PAGE_LIMIT,
   type SessionConnectorCapabilitiesV1,
+  type SessionConnectorCapabilityCertificationV1,
   type SessionConnectorCapabilityReasonCode,
   type SessionConnectorControlRequestV1,
   type SessionConnectorControlResultV1,
   type SessionConnectorCreateRequestV1,
   type SessionConnectorDeepLinksV1,
+  type SessionConnectorDeepLinksRequestV1,
   type SessionConnectorEnsureExistingRequestV1,
   type SessionConnectorEnsureExistingResultV1,
   type SessionConnectorEventV1,
@@ -25,6 +27,7 @@ import {
 } from "@fusion/core";
 
 import {
+  buildHappierSessionOpenUrl,
   ensureHappierDirectSession,
   followHappierDirectSessionTranscriptEvents,
   getHappierSessionStatus,
@@ -469,6 +472,11 @@ function unavailableResult<T>(operation: string): SessionConnectorResultV1<T> {
   );
 }
 
+function certifiedNativeSessionUrl(identity: SessionConnectorIdentityV1): string | null {
+  if (identity.providerId !== "codex") return null;
+  return `codex://threads/${encodeURIComponent(identity.nativeSessionId)}`;
+}
+
 /**
  * Provider-neutral adapter over the reviewed, shell-free Happier JSON CLI.
  *
@@ -535,6 +543,23 @@ export class HappierSessionConnector implements SessionConnectorV1 {
           reasonCode: "server_profile_mismatch" as const,
           lastVerifiedAt: null,
         };
+    let deepLinksCertification: SessionConnectorCapabilityCertificationV1 = {
+      state: "degraded" as const,
+      evidenceRef: null,
+      reasonCode: "runtime_degraded" as const,
+      lastVerifiedAt: null,
+    };
+    if (profileMatches && this.settings.webappUrl?.trim()) {
+      try {
+        buildHappierSessionOpenUrl(this.settings.webappUrl, activeServerId!, "capability-probe");
+        deepLinksCertification = verifiedCertification(
+          `happier-source:${this.sourceRevision}:direct-session-open-url`,
+          verifiedAt,
+        );
+      } catch {
+        // A malformed or unsafe current origin remains observable as degraded.
+      }
+    }
     return {
       contractVersion: 1,
       connectorId: this.id,
@@ -552,7 +577,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         resume: unavailableCertification("operation_unavailable"),
         takeover: unavailableCertification("operation_unavailable"),
         health: unverifiedCertification(pendingCertification),
-        deepLinks: unavailableCertification("operation_unavailable"),
+        deepLinks: deepLinksCertification,
       },
     };
   }
@@ -564,8 +589,13 @@ export class HappierSessionConnector implements SessionConnectorV1 {
       input.contractVersion !== 1
       || !input.canonicalSessionUri.trim()
       || !input.idempotencyKey.trim()
+      || !input.requiredHostId?.trim()
     ) {
-      return failure("invalid_request", "A canonical Session URI and idempotency key are required", false);
+      return failure(
+        "invalid_request",
+        "A canonical Session URI, host identity, and idempotency key are required",
+        false,
+      );
     }
     let requestedProviderId: string;
     let requestedNativeSessionId: string;
@@ -606,7 +636,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         happierSessionId: ensured.sessionId,
         serverProfileId: ensured.serverId,
         machineId: ensured.machineId,
-        hostId: input.requiredHostId?.trim() || ensured.machineId,
+        hostId: input.requiredHostId.trim(),
       };
       return {
         ok: true,
@@ -983,8 +1013,39 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   }
 
   async getDeepLinks(
-    _identity: SessionConnectorIdentityV1,
+    input: SessionConnectorDeepLinksRequestV1,
   ): Promise<SessionConnectorResultV1<SessionConnectorDeepLinksV1>> {
-    return unavailableResult("deep links");
+    if (input.contractVersion !== 1 || !input.bindingId.trim() || !input.identity.hostId.trim()) {
+      return failure("invalid_request", "Room binding and host identities are required for deep links", false);
+    }
+    const target = validateDirectIdentity(input.identity, this.settings.activeServerId);
+    if (!target.ok) return target;
+    if (!this.settings.webappUrl?.trim() || !input.identity.serverProfileId) {
+      return failure("degraded", "The current Happier web origin or server profile is unavailable", false);
+    }
+    try {
+      return {
+        ok: true,
+        value: {
+          contractVersion: 1,
+          bindingId: input.bindingId,
+          connectorId: input.identity.connectorId,
+          providerId: input.identity.providerId,
+          nativeSessionId: input.identity.nativeSessionId,
+          happierSessionId: input.identity.happierSessionId,
+          serverProfileId: input.identity.serverProfileId,
+          machineId: input.identity.machineId,
+          hostId: input.identity.hostId,
+          happierUrl: buildHappierSessionOpenUrl(
+            this.settings.webappUrl,
+            input.identity.serverProfileId,
+            target.value.sessionId,
+          ),
+          nativeSessionUrl: certifiedNativeSessionUrl(input.identity),
+        },
+      };
+    } catch {
+      return failure("degraded", "The current Happier web origin cannot build a certified link", false);
+    }
   }
 }

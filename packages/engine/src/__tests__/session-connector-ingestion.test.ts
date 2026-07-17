@@ -247,6 +247,9 @@ function connectorFixture(options: ConnectorFixtureOptions): SessionConnectorV1 
       retryAfterMs: null,
     } satisfies SessionConnectorHealthV1),
     getDeepLinks: async () => ok<SessionConnectorDeepLinksV1>({
+      contractVersion: 1,
+      bindingId: "binding-1",
+      ...IDENTITY,
       happierUrl: null,
       nativeSessionUrl: null,
     }),

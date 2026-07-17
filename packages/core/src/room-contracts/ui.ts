@@ -120,8 +120,9 @@ export interface RoomUiSeatV1 {
   readonly providerId: string;
   readonly actualModelRef: string;
   readonly nativeSessionId: string;
-  readonly happierSessionId: string;
-  readonly serverProfileId: string;
+  readonly happierSessionId: string | null;
+  readonly serverProfileId: string | null;
+  readonly machineId: string | null;
   readonly hostId: string;
   readonly health: RoomUiSeatHealthState;
   readonly lastHeartbeatAt: IsoTimestamp | null;

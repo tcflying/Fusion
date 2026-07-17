@@ -27,12 +27,16 @@ export type HappierDirectSessionEnsureMetadata = {
 
 export type TaskHappierDirectSessionBinding = {
   cliSessionId: string;
-  nativeSessionId: string;
   providerId: HappierDirectSessionProviderId;
-  remoteSessionId: string;
+  nativeSessionId: string;
+  happierSessionId: string;
   machineId: string;
-  serverId: string;
+  serverProfileId: string;
   linkedAt: string;
+};
+
+type PersistedTaskHappierDirectSessionBindingV2 = TaskHappierDirectSessionBinding & {
+  schemaVersion: 2;
 };
 
 export type Store = Pick<TaskStore, "getFusionDir" | "getDatabase" | "getAsyncLayer">;
@@ -43,11 +47,11 @@ export class TaskHappierDirectSessionConflictError extends Error {
   constructor(
     readonly taskId: string,
     readonly cliSessionId: string,
-    readonly existingNativeSessionId: string,
-    readonly requestedNativeSessionId: string,
+    readonly existingHappierSessionId: string,
+    readonly requestedHappierSessionId: string,
   ) {
     super(
-      `Task ${taskId} Happier CLI session ${cliSessionId} already belongs to native session ${existingNativeSessionId}; cannot bind ${requestedNativeSessionId}`,
+      `Task ${taskId} Happier CLI session ${cliSessionId} already belongs to Happier Session ${existingHappierSessionId}; cannot bind ${requestedHappierSessionId}`,
     );
     this.name = "TaskHappierDirectSessionConflictError";
   }
@@ -59,11 +63,11 @@ export class TaskHappierDirectSessionIntegrityError extends Error {
   constructor(
     readonly taskId: string,
     readonly cliSessionId: string,
-    readonly nativeSessionId: string,
-    readonly metadataNativeSessionId: string,
+    readonly cliHappierSessionId: string,
+    readonly metadataHappierSessionId: string,
   ) {
     super(
-      `Task ${taskId} Happier CLI session ${cliSessionId} has native session ${nativeSessionId}, but connected metadata names ${metadataNativeSessionId}`,
+      `Task ${taskId} Happier CLI session ${cliSessionId} has Happier Session ${cliHappierSessionId}, but connected metadata names ${metadataHappierSessionId}`,
     );
     this.name = "TaskHappierDirectSessionIntegrityError";
   }
@@ -99,26 +103,48 @@ function parsePersistedBinding(
   const candidate = value as Record<string, unknown>;
   if (
     candidate.cliSessionId !== expectedCliSessionId
-    || !isNonEmptyString(candidate.nativeSessionId)
     || !isProviderId(candidate.providerId)
-    || !isNonEmptyString(candidate.remoteSessionId)
     || !isNonEmptyString(candidate.machineId)
-    || !isNonEmptyString(candidate.serverId)
     || !isNonEmptyString(candidate.linkedAt)
     || !Number.isFinite(Date.parse(candidate.linkedAt))
   ) {
     return null;
   }
-
-  return {
-    cliSessionId: expectedCliSessionId,
-    nativeSessionId: candidate.nativeSessionId,
-    providerId: candidate.providerId,
-    remoteSessionId: candidate.remoteSessionId,
-    machineId: candidate.machineId,
-    serverId: candidate.serverId,
-    linkedAt: candidate.linkedAt,
-  };
+  if (candidate.schemaVersion !== undefined) {
+    if (
+      candidate.schemaVersion === 2
+      && isNonEmptyString(candidate.nativeSessionId)
+      && isNonEmptyString(candidate.happierSessionId)
+      && isNonEmptyString(candidate.serverProfileId)
+    ) {
+      return {
+        cliSessionId: expectedCliSessionId,
+        providerId: candidate.providerId,
+        nativeSessionId: candidate.nativeSessionId,
+        happierSessionId: candidate.happierSessionId,
+        machineId: candidate.machineId,
+        serverProfileId: candidate.serverProfileId,
+        linkedAt: candidate.linkedAt,
+      };
+    }
+    return null;
+  }
+  if (
+    isNonEmptyString(candidate.nativeSessionId)
+    && isNonEmptyString(candidate.remoteSessionId)
+    && isNonEmptyString(candidate.serverId)
+  ) {
+    return {
+      cliSessionId: expectedCliSessionId,
+      providerId: candidate.providerId,
+      nativeSessionId: candidate.remoteSessionId,
+      happierSessionId: candidate.nativeSessionId,
+      machineId: candidate.machineId,
+      serverProfileId: candidate.serverId,
+      linkedAt: candidate.linkedAt,
+    };
+  }
+  return null;
 }
 
 function bindingFromSession(input: {
@@ -133,12 +159,12 @@ function bindingFromSession(input: {
     input.cliSessionId,
   );
   if (!persisted || !session.nativeSessionId) return null;
-  if (session.nativeSessionId !== persisted.nativeSessionId) {
+  if (session.nativeSessionId !== persisted.happierSessionId) {
     throw new TaskHappierDirectSessionIntegrityError(
       input.taskId,
       input.cliSessionId,
       session.nativeSessionId,
-      persisted.nativeSessionId,
+      persisted.happierSessionId,
     );
   }
   return persisted;
@@ -173,15 +199,15 @@ function existingBindingForEnsure(input: {
   taskId: string;
   cliSessionId: string;
   session: CliSession | undefined;
-  ensuredNativeSessionId: string;
+  ensuredHappierSessionId: string;
 }): TaskHappierDirectSessionBinding | null {
   const existing = bindingFromSession(input);
-  if (existing && existing.nativeSessionId !== input.ensuredNativeSessionId) {
+  if (existing && existing.happierSessionId !== input.ensuredHappierSessionId) {
     throw new TaskHappierDirectSessionConflictError(
       input.taskId,
       input.cliSessionId,
-      existing.nativeSessionId,
-      input.ensuredNativeSessionId,
+      existing.happierSessionId,
+      input.ensuredHappierSessionId,
     );
   }
   return existing;
@@ -189,32 +215,36 @@ function existingBindingForEnsure(input: {
 
 function createConnectedBinding(input: {
   cliSessionId: string;
-  nativeSessionId: string;
+  happierSessionId: string;
   ensured: HappierDirectSessionEnsureMetadata;
 }): TaskHappierDirectSessionBinding {
   return {
     cliSessionId: input.cliSessionId,
-    nativeSessionId: input.nativeSessionId,
     providerId: input.ensured.providerId,
-    remoteSessionId: input.ensured.remoteSessionId,
+    nativeSessionId: input.ensured.remoteSessionId,
+    happierSessionId: input.happierSessionId,
     machineId: input.ensured.machineId,
-    serverId: input.ensured.serverId,
+    serverProfileId: input.ensured.serverId,
     linkedAt: new Date().toISOString(),
   };
 }
 
-function assertClaimedNativeSession(input: {
+function persistedBinding(binding: TaskHappierDirectSessionBinding): PersistedTaskHappierDirectSessionBindingV2 {
+  return { schemaVersion: 2, ...binding };
+}
+
+function assertClaimedHappierSession(input: {
   taskId: string;
   cliSessionId: string;
-  claimedNativeSessionId: string;
-  ensuredNativeSessionId: string;
+  claimedHappierSessionId: string;
+  ensuredHappierSessionId: string;
 }): void {
-  if (input.claimedNativeSessionId === input.ensuredNativeSessionId) return;
+  if (input.claimedHappierSessionId === input.ensuredHappierSessionId) return;
   throw new TaskHappierDirectSessionConflictError(
     input.taskId,
     input.cliSessionId,
-    input.claimedNativeSessionId,
-    input.ensuredNativeSessionId,
+    input.claimedHappierSessionId,
+    input.ensuredHappierSessionId,
   );
 }
 
@@ -229,7 +259,7 @@ async function bindAsyncTransaction(input: {
   const currentBinding = existingBindingForEnsure({
     ...input,
     session: currentSession,
-    ensuredNativeSessionId: input.ensured.sessionId,
+    ensuredHappierSessionId: input.ensured.sessionId,
   });
   if (currentBinding) return currentBinding;
 
@@ -238,10 +268,10 @@ async function bindAsyncTransaction(input: {
     input.ensured.sessionId,
   );
   if (!claim) throw new Error(`CLI session not found during native-session claim: ${input.cliSessionId}`);
-  assertClaimedNativeSession({
+  assertClaimedHappierSession({
     ...input,
-    claimedNativeSessionId: claim.nativeSessionId,
-    ensuredNativeSessionId: input.ensured.sessionId,
+    claimedHappierSessionId: claim.nativeSessionId,
+    ensuredHappierSessionId: input.ensured.sessionId,
   });
 
   const latestSession = await input.sessionStore.getSession(input.cliSessionId);
@@ -249,18 +279,18 @@ async function bindAsyncTransaction(input: {
   const existingAfterClaim = existingBindingForEnsure({
     ...input,
     session: latestSession,
-    ensuredNativeSessionId: input.ensured.sessionId,
+    ensuredHappierSessionId: input.ensured.sessionId,
   });
   if (existingAfterClaim) return existingAfterClaim;
 
   const binding = createConnectedBinding({
     cliSessionId: input.cliSessionId,
-    nativeSessionId: claim.nativeSessionId,
+    happierSessionId: claim.nativeSessionId,
     ensured: input.ensured,
   });
   const autonomyPosture: CliAutonomyPosture = {
     ...(latestSession.autonomyPosture ?? {}),
-    happierDirectSession: binding,
+    happierDirectSession: persistedBinding(binding),
   };
   const updated = await input.sessionStore.updateSession(input.cliSessionId, { autonomyPosture });
   if (!updated) throw new Error(`CLI session not found while linking Happier metadata: ${input.cliSessionId}`);
@@ -278,7 +308,7 @@ function bindSyncTransaction(input: {
   const currentBinding = existingBindingForEnsure({
     ...input,
     session: currentSession,
-    ensuredNativeSessionId: input.ensured.sessionId,
+    ensuredHappierSessionId: input.ensured.sessionId,
   });
   if (currentBinding) return currentBinding;
 
@@ -287,10 +317,10 @@ function bindSyncTransaction(input: {
     input.ensured.sessionId,
   );
   if (!claim) throw new Error(`CLI session not found during native-session claim: ${input.cliSessionId}`);
-  assertClaimedNativeSession({
+  assertClaimedHappierSession({
     ...input,
-    claimedNativeSessionId: claim.nativeSessionId,
-    ensuredNativeSessionId: input.ensured.sessionId,
+    claimedHappierSessionId: claim.nativeSessionId,
+    ensuredHappierSessionId: input.ensured.sessionId,
   });
 
   const latestSession = input.sessionStore.getSession(input.cliSessionId);
@@ -298,18 +328,18 @@ function bindSyncTransaction(input: {
   const existingAfterClaim = existingBindingForEnsure({
     ...input,
     session: latestSession,
-    ensuredNativeSessionId: input.ensured.sessionId,
+    ensuredHappierSessionId: input.ensured.sessionId,
   });
   if (existingAfterClaim) return existingAfterClaim;
 
   const binding = createConnectedBinding({
     cliSessionId: input.cliSessionId,
-    nativeSessionId: claim.nativeSessionId,
+    happierSessionId: claim.nativeSessionId,
     ensured: input.ensured,
   });
   const autonomyPosture: CliAutonomyPosture = {
     ...(latestSession.autonomyPosture ?? {}),
-    happierDirectSession: binding,
+    happierDirectSession: persistedBinding(binding),
   };
   const updated = input.sessionStore.updateSession(input.cliSessionId, { autonomyPosture });
   if (!updated) throw new Error(`CLI session not found while linking Happier metadata: ${input.cliSessionId}`);

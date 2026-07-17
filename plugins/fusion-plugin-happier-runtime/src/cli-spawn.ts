@@ -772,8 +772,30 @@ export async function invokeHappierJsonForKind<T extends HappierJsonRecord>(
   throw new HappierCliError("process", "Happier CLI startup retry exhausted");
 }
 
-export function buildHappierSessionOpenUrl(webappUrl: string, serverId: string, sessionId: string): string {
-  return `${webappUrl.replace(/\/+$/u, "")}/session/${encodeURIComponent(serverId)}/${encodeURIComponent(sessionId)}`;
+export function buildHappierSessionOpenUrl(
+  webappUrl: string,
+  serverProfileId: string,
+  happierSessionId: string,
+): string {
+  const base = webappUrl.trim().replace(/\/+$/u, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(base);
+  } catch {
+    throw new HappierCliError("protocol", "Happier webapp URL is invalid");
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    || parsed.username.length > 0
+    || parsed.password.length > 0
+    || parsed.search.length > 0
+    || parsed.hash.length > 0
+    || !serverProfileId.trim()
+    || !happierSessionId.trim()
+  ) {
+    throw new HappierCliError("protocol", "Happier webapp URL or Session identity is unsafe");
+  }
+  return `${base}/session/${encodeURIComponent(happierSessionId)}?serverId=${encodeURIComponent(serverProfileId)}`;
 }
 
 function directSessionString(data: HappierJsonRecord, field: string): string {

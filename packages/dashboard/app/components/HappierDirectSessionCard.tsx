@@ -259,9 +259,9 @@ export function HappierDirectSessionCard({
               <dd>{binding.providerId}</dd>
             </div>
             <IdRow label="Native session ID" value={binding.nativeSessionId} copyLabel="Copy native session ID" onCopy={copyValue} />
-            <IdRow label="Happier session ID" value={binding.remoteSessionId} copyLabel="Copy Happier session ID" onCopy={copyValue} />
+            <IdRow label="Happier session ID" value={binding.happierSessionId} copyLabel="Copy Happier session ID" onCopy={copyValue} />
             <IdRow label="Machine ID" value={binding.machineId} copyLabel="Copy machine ID" onCopy={copyValue} />
-            <IdRow label="Server ID" value={binding.serverId} copyLabel="Copy server ID" onCopy={copyValue} />
+            <IdRow label="Server/profile ID" value={binding.serverProfileId} copyLabel="Copy server/profile ID" onCopy={copyValue} />
           </dl>
           <div className="happier-direct-session-card__actions">
             <button

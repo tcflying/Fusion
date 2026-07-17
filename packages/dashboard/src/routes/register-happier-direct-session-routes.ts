@@ -172,6 +172,19 @@ async function resolveHappierSettings(store: TaskStore): Promise<HappierCliSetti
   return { ...settings, webappUrl: settings.webappUrl.trim() };
 }
 
+function assertHappierOpenUrlConfiguration(
+  webappUrl: string,
+  buildOpenUrl: typeof buildHappierSessionOpenUrl,
+): void {
+  try {
+    buildOpenUrl(webappUrl, "configuration-probe-server", "configuration-probe-session");
+  } catch {
+    throw new ApiError(409, "Happier Web URL is invalid or unsafe", {
+      code: "HAPPIER_WEBAPP_URL_INVALID",
+    });
+  }
+}
+
 async function hasPersistedBindingMetadata(store: TaskStore, taskId: string): Promise<boolean> {
   const cliSessionId = resolveTaskHappierCliSessionId({ taskId, purpose: "execute" });
   const asyncLayer = store.getAsyncLayer();
@@ -223,8 +236,8 @@ function connectedResponse(input: {
     ...input.binding,
     openUrl: input.buildOpenUrl(
       input.webappUrl,
-      input.binding.serverId,
-      input.binding.nativeSessionId,
+      input.binding.serverProfileId,
+      input.binding.happierSessionId,
     ),
     ...(input.created !== undefined ? { created: input.created } : {}),
     ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
@@ -246,8 +259,8 @@ function mapPreBindingError(error: unknown): never {
       code: error.code,
       taskId: error.taskId,
       cliSessionId: error.cliSessionId,
-      existingNativeSessionId: error.existingNativeSessionId,
-      requestedNativeSessionId: error.requestedNativeSessionId,
+      existingHappierSessionId: error.existingHappierSessionId,
+      requestedHappierSessionId: error.requestedHappierSessionId,
     });
   }
   if (error instanceof TaskHappierDirectSessionIntegrityError) {
@@ -269,6 +282,7 @@ function assignmentFailure(error: unknown, binding: TaskHappierDirectSessionBind
     sessionBound: true,
     cliSessionId: binding.cliSessionId,
     nativeSessionId: binding.nativeSessionId,
+    happierSessionId: binding.happierSessionId,
   };
   if (error instanceof HappierBridgeAgentConflictError) {
     return new ApiError(409, error.message, {
@@ -304,6 +318,7 @@ export function registerHappierDirectSessionRoutes(
       return;
     }
     const settings = await resolveHappierSettings(store);
+    assertHappierOpenUrlConfiguration(settings.webappUrl, buildOpenUrl);
     res.json(connectedResponse({ taskId, binding, webappUrl: settings.webappUrl, buildOpenUrl }));
   });
 
@@ -319,6 +334,7 @@ export function registerHappierDirectSessionRoutes(
       ? body.machineId.trim()
       : undefined;
     const settings = await resolveHappierSettings(store);
+    assertHappierOpenUrlConfiguration(settings.webappUrl, buildOpenUrl);
 
     let ensured: HappierDirectSessionEnsureResult;
     let binding: TaskHappierDirectSessionBinding;
