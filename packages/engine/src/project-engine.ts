@@ -402,6 +402,8 @@ type MergeResolver = { resolve: (result: MergeResult) => void; reject: (err: Err
 export class ProjectEngine {
   private runtime: InProcessRuntime;
   private started = false;
+  private starting = false;
+  private runtimeStarted = false;
   private roomController?: RoomControllerLifecycle;
   private prMonitor?: PrMonitor;
   /**
@@ -782,7 +784,7 @@ export class ProjectEngine {
    * Start the engine: initialize the runtime and all auxiliary subsystems.
    */
   async start(): Promise<void> {
-    if (this.started) {
+    if (this.started || this.starting) {
       return;
     }
 
@@ -793,9 +795,12 @@ export class ProjectEngine {
     start begins a new lifecycle, never at the end of stop().
     */
     this.shuttingDown = false;
+    this.starting = true;
+    try {
 
     // 1. Start the core runtime (TaskStore, Scheduler, Executor, Triage, etc.)
     await this.runtime.start();
+    this.runtimeStarted = true;
 
     await deliverPostgresMigrationNoticeIfNeeded({
       messageStore: this.runtime.getMessageStore(),
@@ -846,39 +851,13 @@ export class ProjectEngine {
             worker: this.options.roomWorker ?? PASSIVE_ROOM_WORKER,
           });
         });
-        let roomController: RoomControllerLifecycle | undefined;
-        try {
-          roomController = roomControllerFactory({
-            projectId: this.config.projectId,
-            taskStore: store,
-            asyncLayer,
-          });
-          this.roomController = roomController;
-          await roomController.start();
-        } catch (error) {
-          this.roomController = undefined;
-          if (roomController) {
-            try {
-              await roomController.stop();
-            } catch (cleanupError) {
-              runtimeLog.warn(
-                `Failed to clean up Session Room controller after startup error: ${
-                  cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-                }`,
-              );
-            }
-          }
-          try {
-            await this.runtime.stop();
-          } catch (cleanupError) {
-            runtimeLog.warn(
-              `Failed to stop project runtime after Session Room startup error: ${
-                cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-              }`,
-            );
-          }
-          throw error;
-        }
+        const roomController = roomControllerFactory({
+          projectId: this.config.projectId,
+          taskStore: store,
+          asyncLayer,
+        });
+        this.roomController = roomController;
+        await roomController.start();
       }
     }
 
@@ -1147,9 +1126,22 @@ export class ProjectEngine {
     this.scheduleStaleAutostashSweep(store);
 
     this.started = true;
+    this.starting = false;
     runtimeLog.log(
       `ProjectEngine started for ${this.config.projectId} (critical path ${Date.now() - engineStartT0}ms; deferred work in background)`,
     );
+    } catch (error) {
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        runtimeLog.warn(
+          `ProjectEngine startup rollback failed for ${this.config.projectId}: ${
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+          }`,
+        );
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1328,6 +1320,9 @@ export class ProjectEngine {
     sync, merge enqueue) observes the flag even if start() has not flipped
     started yet — prevents unhandled post-stop side effects on fast recycle.
     */
+    if (!this.started && !this.starting && !this.runtimeStarted && !this.roomController) {
+      return;
+    }
     this.shuttingDown = true;
     this.startupGeneration += 1;
 
@@ -1370,7 +1365,7 @@ export class ProjectEngine {
     critical-path timers already running (gridlock, cron) so abandon/stop does
     not leak intervals (Greptile partial-start cleanup).
     */
-    if (!this.started) {
+    if (!this.started && !this.runtimeStarted) {
       try {
         this.gridlockDetector?.stop();
         this.cronRunner?.stop();
@@ -1383,6 +1378,7 @@ export class ProjectEngine {
       } catch {
         // Best-effort partial cleanup
       }
+      this.starting = false;
       return;
     }
 
@@ -1447,7 +1443,15 @@ export class ProjectEngine {
     this.gridlockDetector?.stop();
     this.cronRunner?.stop();
     this.setAutomationSubsystemHealth("not-initialized", "Automation subsystem stopped");
-    await this.researchDispatcher?.stop();
+    try {
+      await this.researchDispatcher?.stop();
+    } catch (error) {
+      runtimeLog.warn(
+        `Research dispatcher shutdown failed for ${this.config.projectId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
     this.researchDispatcher = undefined;
     this.researchOrchestrator = undefined;
 
@@ -1479,9 +1483,13 @@ export class ProjectEngine {
     }
 
     // Stop the core runtime (Triage, Scheduler, Executor, etc.)
-    await this.runtime.stop();
-
-    this.started = false;
+    try {
+      if (this.runtimeStarted) await this.runtime.stop();
+    } finally {
+      this.runtimeStarted = false;
+      this.started = false;
+      this.starting = false;
+    }
     runtimeLog.log(`ProjectEngine stopped for ${this.config.projectId}`);
   }
 

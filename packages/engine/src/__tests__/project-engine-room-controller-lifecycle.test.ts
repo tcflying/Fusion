@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   cronRunnerStart: vi.fn(),
   cronRunnerStop: vi.fn(),
   currentStore: null as Record<string, unknown> | null,
+  notificationServiceStart: vi.fn(async () => undefined),
   runtimeConfigurePrMonitoring: vi.fn(),
   runtimeStart: vi.fn(async () => undefined),
   runtimeStop: vi.fn(async () => undefined),
@@ -53,7 +54,7 @@ vi.mock("../merger.js", () => ({
 
 vi.mock("../notification/index.js", () => ({
   NotificationService: vi.fn().mockImplementation(function () {
-    return { start: vi.fn(async () => undefined), stop: vi.fn() };
+    return { start: mocks.notificationServiceStart, stop: vi.fn() };
   }),
   OAuthAlertStateStore: vi.fn().mockImplementation(function () {
     return {};
@@ -161,10 +162,14 @@ function createMockStore(): Record<string, unknown> {
   };
 }
 
-function createEngine(roomControllerFactory: RoomControllerFactory): ProjectEngine {
+function createEngine(
+  roomControllerFactory: RoomControllerFactory,
+  overrides: Partial<ProjectEngineOptions> = {},
+): ProjectEngine {
   const options = {
     skipNotifier: true,
     roomControllerFactory,
+    ...overrides,
   } as unknown as ProjectEngineOptions;
   return new ProjectEngine(
     {
@@ -258,6 +263,29 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
     expect(roomController.stop).toHaveBeenCalledTimes(1);
     expect(mocks.runtimeStop).toHaveBeenCalledTimes(1);
     expect(roomController.start.mock.invocationCallOrder[0]).toBeLessThan(
+      roomController.stop.mock.invocationCallOrder[0]!,
+    );
+    expect(roomController.stop.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.runtimeStop.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("rolls back the RoomController and runtime when a later awaited subsystem fails", async () => {
+    const roomController = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+    };
+    mocks.notificationServiceStart.mockRejectedValueOnce(
+      new Error("notification subsystem startup failed"),
+    );
+    const engine = createEngine(vi.fn(() => roomController), { skipNotifier: false });
+
+    await expect(engine.start()).rejects.toThrow("notification subsystem startup failed");
+
+    expect(roomController.start).toHaveBeenCalledTimes(1);
+    expect(roomController.stop).toHaveBeenCalledTimes(1);
+    expect(mocks.runtimeStop).toHaveBeenCalledTimes(1);
+    expect(mocks.notificationServiceStart.mock.invocationCallOrder[0]).toBeLessThan(
       roomController.stop.mock.invocationCallOrder[0]!,
     );
     expect(roomController.stop.mock.invocationCallOrder[0]).toBeLessThan(

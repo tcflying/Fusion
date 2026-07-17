@@ -71,6 +71,7 @@ interface RoomWorkerRunInput {
   readonly room: RoomAggregateV1;
   readonly lease: StoredRoomLeaseV1;
   readonly signal: AbortSignal;
+  readonly assertLeaseAuthority: () => Promise<StoredRoomLeaseV1>;
 }
 
 interface RoomControllerOptions {
@@ -86,11 +87,16 @@ interface RoomControllerOptions {
   readonly createLeaseId: (roomId: string, workerId: string) => string;
   readonly leaseDurationMs: number;
   readonly pollIntervalMs: number;
+  readonly shutdownGraceMs?: number;
+  readonly workerRestartBaseDelayMs?: number;
+  readonly workerRestartMaxDelayMs?: number;
+  readonly workerRestartMaxRestarts?: number;
 }
 
 interface RoomControllerApi {
   start(): void | Promise<void>;
   stop(): void | Promise<void>;
+  reconcile(reason?: string): Promise<void>;
 }
 
 type RoomControllerConstructor = new (options: RoomControllerOptions) => RoomControllerApi;
@@ -123,6 +129,18 @@ function runningRoom(): RoomAggregateV1 {
     expectedAggregateVersion: 1,
     now: "2026-07-17T12:00:02.000Z",
   });
+}
+
+function runningRoomWithId(id: string): RoomAggregateV1 {
+  const room = runningRoom();
+  return {
+    ...room,
+    room: {
+      ...room.room,
+      id,
+      objective: `Continue durable work for ${id}`,
+    },
+  };
 }
 
 function lease(expiresAt = "2026-07-17T12:01:00.000Z"): StoredRoomLeaseV1 {
@@ -373,10 +391,16 @@ describe("RoomController backend lifecycle", () => {
     const leaseStore = createTakeoverLeaseStore();
     const startedEpochs: number[] = [];
     const workerSignals = new Map<number, AbortSignal>();
+    const workerAuthority = new Map<number, () => Promise<StoredRoomLeaseV1>>();
     const createWorker = () => ({
-      runRoom: vi.fn(async ({ lease: workerLease, signal }: RoomWorkerRunInput) => {
+      runRoom: vi.fn(async ({
+        lease: workerLease,
+        signal,
+        assertLeaseAuthority,
+      }: RoomWorkerRunInput) => {
         startedEpochs.push(workerLease.epoch);
         workerSignals.set(workerLease.epoch, signal);
+        workerAuthority.set(workerLease.epoch, assertLeaseAuthority);
         await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
       }),
     });
@@ -426,7 +450,11 @@ describe("RoomController backend lifecycle", () => {
     expect(leaseStore.staleWorkerRejections).toBeGreaterThan(0);
     expect(workerSignals.get(1)?.aborted).toBe(true);
     expect(workerSignals.get(2)?.aborted).toBe(false);
-    await expect(leaseStore.assertFence({
+    await expect(
+      workerAuthority.get(1)?.(),
+      "the worker-facing authority seam must delegate to leaseStore.assertFence",
+    ).rejects.toThrow("Stale Room worker fence rejected at epoch 1");
+    expect(leaseStore.assertFence).toHaveBeenCalledWith({
       leaseId: "lease-worker-1-incarnation-1",
       roomId: "room-1",
       kind: "room_worker",
@@ -435,6 +463,232 @@ describe("RoomController backend lifecycle", () => {
       hostId: "host-1",
       expectedEpoch: 1,
       now,
-    })).rejects.toThrow("Stale Room worker fence rejected at epoch 1");
+    });
+  });
+
+  it("renews healthy Rooms even while a different Room lease operation is hung", async () => {
+    const rooms = [runningRoomWithId("room-1"), runningRoomWithId("room-2")];
+    const active = new Map<string, StoredRoomLeaseV1>();
+    let hangRoomOneRenew = false;
+    let resolveRoomOneRenew!: () => void;
+    const roomOneRenewGate = new Promise<void>((resolve) => {
+      resolveRoomOneRenew = resolve;
+    });
+    const renewedRooms: string[] = [];
+    const leaseStore: RoomWorkerLeaseStore = {
+      getActiveLease: vi.fn(async () => null),
+      acquireLease: vi.fn(async (input) => {
+        const acquired: StoredRoomLeaseV1 = {
+          contractVersion: 1,
+          id: input.leaseId,
+          roomId: input.roomId,
+          kind: "room_worker",
+          resourceId: input.resourceId,
+          holderId: input.holderId,
+          hostId: input.hostId,
+          epoch: 1,
+          acquiredAt: input.now,
+          heartbeatAt: input.now,
+          expiresAt: input.expiresAt,
+          releasedAt: null,
+        };
+        active.set(input.roomId, acquired);
+        return { ok: true as const, action: "acquired" as const, lease: acquired };
+      }),
+      renewLease: vi.fn(async (input) => {
+        if (input.roomId === "room-1" && hangRoomOneRenew) {
+          await roomOneRenewGate;
+        }
+        renewedRooms.push(input.roomId);
+        const current = active.get(input.roomId)!;
+        const renewed = { ...current, heartbeatAt: input.now, expiresAt: input.expiresAt };
+        active.set(input.roomId, renewed);
+        return { ok: true as const, lease: renewed };
+      }),
+      releaseLease: vi.fn(async (input) => {
+        const current = active.get(input.roomId)!;
+        const released = { ...current, releasedAt: input.now };
+        active.set(input.roomId, released);
+        return { ok: true as const, lease: released };
+      }),
+      assertFence: vi.fn(async (input) => active.get(input.roomId)!),
+    };
+    const RoomController = requireRoomController("per-Room renewal isolation requires RoomController");
+    const controller = new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: { listRunnableRooms: vi.fn(async () => rooms) },
+      leaseStore,
+      worker: {
+        runRoom: async ({ signal }) => new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve(), { once: true });
+        }),
+      },
+      now: () => "2026-07-17T12:00:00.000Z",
+      createLeaseId: (roomId) => `lease-${roomId}`,
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 1_000,
+    });
+    controllers.push(controller);
+    await controller.start();
+
+    hangRoomOneRenew = true;
+    const reconcile = controller.reconcile("fair-renewal-test");
+    await Promise.resolve();
+    await Promise.resolve();
+    try {
+      expect(
+        renewedRooms,
+        "room-2 renewal must start without waiting for room-1's hung renewal",
+      ).toContain("room-2");
+    } finally {
+      resolveRoomOneRenew();
+      await reconcile;
+    }
+  });
+
+  it("uses one total shutdown budget across hung reconcile, workers, and lease release", async () => {
+    vi.useFakeTimers();
+    let listCalls = 0;
+    let resolveReconcile!: (rooms: readonly RoomAggregateV1[]) => void;
+    const reconcileGate = new Promise<readonly RoomAggregateV1[]>((resolve) => {
+      resolveReconcile = resolve;
+    });
+    let resolveWorker!: () => void;
+    const workerGate = new Promise<void>((resolve) => {
+      resolveWorker = resolve;
+    });
+    let resolveRelease!: () => void;
+    const releaseGate = new Promise<void>((resolve) => {
+      resolveRelease = resolve;
+    });
+    const leaseStore = createLeaseStore();
+    leaseStore.releaseLease = vi.fn(async (input) => {
+      await releaseGate;
+      return { ok: true, lease: { ...lease(), releasedAt: input.now } };
+    });
+    const RoomController = requireRoomController("bounded shutdown requires RoomController");
+    const controller = new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: {
+        listRunnableRooms: vi.fn(async () => {
+          listCalls += 1;
+          return listCalls === 1 ? [runningRoom()] : reconcileGate;
+        }),
+      },
+      leaseStore,
+      worker: { runRoom: vi.fn(async () => workerGate) },
+      now: () => "2026-07-17T12:00:00.000Z",
+      createLeaseId: () => "lease-worker-1-incarnation-1",
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 1_000,
+      shutdownGraceMs: 25,
+    });
+    controllers.push(controller);
+    await controller.start();
+    void controller.reconcile("hung-reconcile");
+    await Promise.resolve();
+
+    let stopped = false;
+    const stopPromise = Promise.resolve(controller.stop()).then(() => {
+      stopped = true;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(25);
+      expect(stopped, "stop must return after one total 25ms budget").toBe(true);
+    } finally {
+      resolveReconcile([]);
+      resolveWorker();
+      resolveRelease();
+      await vi.runAllTimersAsync();
+      await stopPromise;
+    }
+  });
+
+  it("backs off abnormal worker exits, exhausts a restart budget, and resets only on projection change", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-17T12:00:00.000Z"));
+    let projection = runningRoom();
+    let epoch = 0;
+    const leaseStore: RoomWorkerLeaseStore = {
+      getActiveLease: vi.fn(async () => null),
+      acquireLease: vi.fn(async (input) => {
+        epoch += 1;
+        const acquired: StoredRoomLeaseV1 = {
+          contractVersion: 1,
+          id: `${input.leaseId}-${epoch}`,
+          roomId: input.roomId,
+          kind: "room_worker",
+          resourceId: input.resourceId,
+          holderId: input.holderId,
+          hostId: input.hostId,
+          epoch,
+          acquiredAt: input.now,
+          heartbeatAt: input.now,
+          expiresAt: input.expiresAt,
+          releasedAt: null,
+        };
+        return { ok: true as const, action: "acquired" as const, lease: acquired };
+      }),
+      renewLease: vi.fn(async () => {
+        throw new Error("a completed worker should not be renewed");
+      }),
+      releaseLease: vi.fn(async (input) => ({
+        ok: true as const,
+        lease: { ...lease(), id: input.leaseId, epoch: input.expectedEpoch, releasedAt: input.now },
+      })),
+      assertFence: vi.fn(async () => lease()),
+    };
+    const runRoom = vi.fn(async () => {
+      if (runRoom.mock.calls.length === 2) throw new Error("deterministic worker failure");
+    });
+    const RoomController = requireRoomController("bounded restart supervision requires RoomController");
+    const controller = new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: { listRunnableRooms: vi.fn(async () => [projection]) },
+      leaseStore,
+      worker: { runRoom },
+      now: () => new Date().toISOString(),
+      createLeaseId: () => "lease-room-1",
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 100,
+      workerRestartBaseDelayMs: 100,
+      workerRestartMaxDelayMs: 400,
+      workerRestartMaxRestarts: 2,
+    });
+    controllers.push(controller);
+
+    await controller.start();
+    await Promise.resolve();
+    expect(runRoom).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(99);
+    expect(runRoom).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runRoom).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(runRoom).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runRoom).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runRoom, "the exhausted projection must not create more lease epochs").toHaveBeenCalledTimes(3);
+    expect(leaseStore.acquireLease).toHaveBeenCalledTimes(3);
+
+    projection = {
+      ...projection,
+      room: {
+        ...projection.room,
+        aggregateVersion: projection.room.aggregateVersion + 1,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    await controller.reconcile("projection-changed");
+    await Promise.resolve();
+    expect(runRoom, "a durable projection change resets the restart budget").toHaveBeenCalledTimes(4);
   });
 });
