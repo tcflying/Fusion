@@ -93,12 +93,13 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005"]);
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006"]);
     const roomSql = await readSchemaMigrationSql("0001");
     const ownershipSql = await readSchemaMigrationSql("0002");
     const outboxIdentitySql = await readSchemaMigrationSql("0003");
     const connectorIngestionSql = await readSchemaMigrationSql("0004");
     const deliveryReconciliationSql = await readSchemaMigrationSql("0005");
+    const membershipFutureSeatsSql = await readSchemaMigrationSql("0006");
 
     for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => name !== "room_binding_ingestion_state")) {
       expect(roomSql).toContain(`project.${tableName}`);
@@ -114,5 +115,6 @@ describe("Session Room PostgreSQL schema", () => {
     expect(deliveryReconciliationSql).toContain("reconciliation_from_cursor");
     expect(deliveryReconciliationSql).toContain("reconciliation_evidence_ref");
     expect(deliveryReconciliationSql).toContain("machine_id");
+    expect(membershipFutureSeatsSql).toContain("DROP CONSTRAINT IF EXISTS room_membership_changes_seat_fkey");
   });
 });

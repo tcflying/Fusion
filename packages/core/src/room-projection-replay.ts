@@ -271,6 +271,54 @@ function applyOneEvent(
         },
       };
     }
+    case "membership_change_requested":
+    case "membership_change_activated": {
+      const projectionHash = requireString(payload.projectionHash, `${event.id} projectionHash`);
+      if (hashRoomValue(payload.projection) !== projectionHash) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Room membership event ${event.id} projection hash does not match its payload`,
+        );
+      }
+      let projection: RoomAggregateV1;
+      try {
+        projection = parseRoomAggregateProjection(payload.projection);
+      } catch (error) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Room membership event ${event.id} projection is invalid: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (
+        projection.room.id !== aggregate.room.id
+        || projection.room.projectId !== aggregate.room.projectId
+        || projection.room.aggregateVersion !== event.aggregateVersion
+      ) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Room membership event ${event.id} projection identity/version does not match its event`,
+        );
+      }
+      if (
+        event.eventType === "membership_change_requested"
+        && projection.membershipVersion !== aggregate.membershipVersion
+      ) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Membership request ${event.id} changed the active membership snapshot`,
+        );
+      }
+      if (
+        event.eventType === "membership_change_activated"
+        && projection.membershipVersion !== aggregate.membershipVersion + 1
+      ) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Membership activation ${event.id} must advance membership version exactly once`,
+        );
+      }
+      return projection;
+    }
     default:
       throw new RoomProjectionReplayError(
         "unsupported_event",

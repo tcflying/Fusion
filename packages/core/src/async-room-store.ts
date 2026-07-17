@@ -34,6 +34,7 @@ import {
   compareRoomText,
   hashRoomValue,
 } from "./room-integrity.js";
+import { parseRoomAggregateProjection } from "./room-projection-replay.js";
 import { cliSessions } from "./postgres/schema/project.js";
 import {
   operationalRooms,
@@ -252,6 +253,45 @@ export interface ImportLegacyHappierBindingInput {
   };
   readonly bindingId: string;
   readonly source: LegacyHappierBindingSourceV1;
+  readonly now: string;
+}
+
+export type RoomMembershipMutationV1 =
+  | {
+      readonly action: "add";
+      readonly seat: {
+        readonly id: string;
+        readonly role: string;
+        readonly permissionScope: readonly string[];
+      };
+      readonly binding: RoomBindingReplacementV1;
+    }
+  | { readonly action: "remove"; readonly seatId: string }
+  | { readonly action: "pause"; readonly seatId: string }
+  | {
+      readonly action: "replace";
+      readonly seatId: string;
+      readonly replacement: RoomBindingReplacementV1;
+    }
+  | { readonly action: "change_role"; readonly seatId: string; readonly role: string };
+
+export interface RequestRoomMembershipChangeInput {
+  readonly roomId: string;
+  readonly changeId: string;
+  readonly idempotencyKey: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedMembershipVersion: number;
+  readonly activateAt: "next_turn_boundary";
+  readonly mutation: RoomMembershipMutationV1;
+  readonly reason: string;
+  readonly requestedAt: string;
+}
+
+export interface ApplyRoomMembershipChangesAtTurnBoundaryInput {
+  readonly roomId: string;
+  readonly turnId: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedMembershipVersion: number;
   readonly now: string;
 }
 
@@ -606,6 +646,260 @@ export class AsyncRoomStore {
       rows.map(({ id }) => loadRoomAggregateProjection(this.layer.db, this.projectId, id)),
     );
     return projections.filter((room): room is RoomAggregateV1 => room?.room.state === "running");
+  }
+
+  async requestMembershipChange(
+    input: RequestRoomMembershipChangeInput,
+    context: RoomCommandContext,
+  ): Promise<RoomAggregateV1> {
+    validateMembershipChangeRequest(input);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      changeId: input.changeId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedMembershipVersion: input.expectedMembershipVersion,
+      activateAt: input.activateAt,
+      mutation: input.mutation,
+      reason: input.reason,
+      requestedAt: input.requestedAt,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: `room-idempotency-${randomUUID()}`,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "request_membership_change",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.requestedAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "request_membership_change"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${input.idempotencyKey} has no committed membership result`,
+          );
+        }
+        const aggregate = await loadMembershipRequestResult(
+          tx,
+          this.projectId,
+          existing.resultEventId,
+        );
+        return { aggregate, event: null };
+      }
+
+      assertMembershipVersions(current, input);
+      if (current.room.state !== "running" && current.room.state !== "paused") {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Membership changes require a running or paused Room, found ${current.room.state}`,
+        );
+      }
+      if (!current.activeTurnId) {
+        throw new RoomDomainError(
+          "turn_boundary_required",
+          `Room ${input.roomId} has no active turn whose boundary can activate the membership change`,
+        );
+      }
+      const pending = await preparePendingMembershipChange(
+        tx,
+        this.projectId,
+        current,
+        input,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: current.room.aggregateVersion + 1,
+          updatedAt: input.requestedAt,
+        },
+        pendingMembershipChanges: [...current.pendingMembershipChanges, pending],
+      };
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion: next.room.aggregateVersion,
+          updatedAt: next.room.updatedAt,
+        })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+          eq(operationalRooms.membershipVersion, input.expectedMembershipVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent membership request rejected for Room ${input.roomId}`,
+        );
+      }
+      await tx.insert(roomMembershipChanges).values({
+        id: input.changeId,
+        projectId: this.projectId,
+        roomId: input.roomId,
+        seatId: pending.seatId,
+        kind: pending.kind,
+        payload: membershipChangePayload(pending),
+        reason: input.reason,
+        requestedAt: input.requestedAt,
+        requestedBy: context.actorId,
+        effectiveAfterTurnId: current.activeTurnId,
+        appliedAt: null,
+        state: "waiting_turn_boundary",
+      });
+      const event = await insertRoomEvent(tx, next, "membership_change_requested", context, {
+        projectionVersion: 1,
+        changeId: input.changeId,
+        changeKind: pending.kind,
+        effectiveAfterTurnId: current.activeTurnId,
+        projection: next,
+        projectionHash: hashRoomValue(next),
+        updatedAt: next.room.updatedAt,
+      });
+      await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservation[0]!.id));
+      return { aggregate: next, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.aggregate;
+  }
+
+  async applyMembershipChangesAtTurnBoundary(
+    input: ApplyRoomMembershipChangesAtTurnBoundaryInput,
+    context: RoomCommandContext,
+  ): Promise<RoomAggregateV1> {
+    validateMembershipBoundaryInput(input);
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      assertMembershipVersions(current, input);
+      const boundaryTurn = current.turns.find((turn) => turn.id === input.turnId);
+      if (
+        !boundaryTurn
+        || current.activeTurnId === input.turnId
+        || !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)
+      ) {
+        throw new RoomDomainError(
+          "turn_boundary_required",
+          `Turn ${input.turnId} has not reached a safe membership boundary`,
+        );
+      }
+      const rows = await tx
+        .select()
+        .from(roomMembershipChanges)
+        .where(and(
+          eq(roomMembershipChanges.projectId, this.projectId),
+          eq(roomMembershipChanges.roomId, input.roomId),
+          eq(roomMembershipChanges.effectiveAfterTurnId, input.turnId),
+          eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+        ))
+        .orderBy(asc(roomMembershipChanges.requestedAt), asc(roomMembershipChanges.id));
+      if (rows.length === 0) {
+        throw new RoomDomainError(
+          "membership_change_conflict",
+          `No pending membership changes target turn ${input.turnId}`,
+        );
+      }
+
+      let projected = current;
+      for (const row of rows) {
+        const change = rowToPendingMembershipChange(row);
+        const before = projected;
+        projected = applyPendingMembershipChange(before, change, input.now);
+        await persistAppliedMembershipChange(tx, this.projectId, before, projected, change, input.now);
+      }
+      const appliedIds = new Set(rows.map((row) => row.id));
+      const next: RoomAggregateV1 = {
+        ...projected,
+        room: {
+          ...projected.room,
+          aggregateVersion: current.room.aggregateVersion + 1,
+          updatedAt: input.now,
+        },
+        membershipVersion: current.membershipVersion + 1,
+        pendingMembershipChanges: current.pendingMembershipChanges.filter(
+          (change) => !appliedIds.has(change.id),
+        ),
+      };
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion: next.room.aggregateVersion,
+          membershipVersion: next.membershipVersion,
+          updatedAt: next.room.updatedAt,
+        })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+          eq(operationalRooms.membershipVersion, input.expectedMembershipVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent membership activation rejected for Room ${input.roomId}`,
+        );
+      }
+      await tx
+        .update(roomMembershipChanges)
+        .set({ state: "applied", appliedAt: input.now })
+        .where(and(
+          eq(roomMembershipChanges.projectId, this.projectId),
+          eq(roomMembershipChanges.roomId, input.roomId),
+          inArray(roomMembershipChanges.id, [...appliedIds]),
+          eq(roomMembershipChanges.state, "waiting_turn_boundary"),
+        ));
+      const event = await insertRoomEvent(tx, next, "membership_change_activated", context, {
+        projectionVersion: 1,
+        turnId: input.turnId,
+        changeIds: [...appliedIds],
+        membershipVersion: next.membershipVersion,
+        projection: next,
+        projectionHash: hashRoomValue(next),
+        updatedAt: next.room.updatedAt,
+      });
+      return { aggregate: next, event };
+    });
+    this.publishCommittedEvent(committed.event);
+    return committed.aggregate;
   }
 
   async getDelivery(outboxId: string): Promise<RoomOutboxRecordV1 | null> {
@@ -1543,6 +1837,55 @@ export class AsyncRoomStore {
 }
 
 type LoadedEnqueueMessageResult = Omit<EnqueueRoomMessageResult, "replayed">;
+
+async function loadMembershipRequestResult(
+  handle: QueryHandle,
+  projectId: string,
+  eventId: string,
+): Promise<RoomAggregateV1> {
+  const eventRows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.id, eventId)))
+    .limit(1);
+  const eventRow = eventRows[0];
+  if (!eventRow || eventRow.eventType !== "membership_change_requested") {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed membership event ${eventId} no longer exists or has the wrong type`,
+    );
+  }
+  const payload = asRecord(eventRow.payload);
+  const projectionHash = typeof payload.projectionHash === "string"
+    ? payload.projectionHash
+    : null;
+  if (!projectionHash || hashRoomValue(payload.projection) !== projectionHash) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed membership event ${eventId} has no valid projection evidence`,
+    );
+  }
+  let aggregate: RoomAggregateV1;
+  try {
+    aggregate = parseRoomAggregateProjection(payload.projection);
+  } catch {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed membership event ${eventId} has an invalid projection`,
+    );
+  }
+  if (
+    aggregate.room.projectId !== projectId
+    || aggregate.room.id !== eventRow.roomId
+    || aggregate.room.aggregateVersion !== eventRow.aggregateVersion
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed membership event ${eventId} projection identity does not match the event`,
+    );
+  }
+  return aggregate;
+}
 
 async function loadEnqueueMessageResult(
   handle: QueryHandle,
@@ -2603,24 +2946,493 @@ async function insertRoomEvent(
   };
 }
 
+function validateMembershipChangeRequest(input: RequestRoomMembershipChangeInput): void {
+  for (const [field, value] of Object.entries({
+    roomId: input.roomId,
+    changeId: input.changeId,
+    idempotencyKey: input.idempotencyKey,
+    reason: input.reason,
+  })) {
+    if (!value.trim()) {
+      throw new RoomDomainError("membership_change_conflict", `${field} must not be empty`);
+    }
+  }
+  if (input.activateAt !== "next_turn_boundary") {
+    throw new RoomDomainError(
+      "turn_boundary_required",
+      "Membership changes must activate at the next durable turn boundary",
+    );
+  }
+  for (const [field, value] of Object.entries({
+    expectedAggregateVersion: input.expectedAggregateVersion,
+    expectedMembershipVersion: input.expectedMembershipVersion,
+  })) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RoomDomainError("membership_change_conflict", `${field} must be a non-negative safe integer`);
+    }
+  }
+  if (!Number.isFinite(Date.parse(input.requestedAt))) {
+    throw new RoomDomainError("membership_change_conflict", "requestedAt must be a valid timestamp");
+  }
+  if (input.mutation.action === "add") {
+    if (!input.mutation.seat.id.trim() || !input.mutation.seat.role.trim()) {
+      throw new RoomDomainError("membership_change_conflict", "Added seat identity and role are required");
+    }
+    if (
+      input.mutation.seat.permissionScope.some((permission) => !permission.trim())
+      || new Set(input.mutation.seat.permissionScope).size !== input.mutation.seat.permissionScope.length
+    ) {
+      throw new RoomDomainError("membership_change_conflict", "Added seat permissions must be unique non-empty strings");
+    }
+    validateMembershipBinding(input.mutation.binding);
+  } else {
+    if (!input.mutation.seatId.trim()) {
+      throw new RoomDomainError("membership_change_conflict", "Membership seatId must not be empty");
+    }
+    if (input.mutation.action === "replace") validateMembershipBinding(input.mutation.replacement);
+    if (input.mutation.action === "change_role" && !input.mutation.role.trim()) {
+      throw new RoomDomainError("membership_change_conflict", "Replacement role must not be empty");
+    }
+  }
+}
+
+function validateMembershipBoundaryInput(
+  input: ApplyRoomMembershipChangesAtTurnBoundaryInput,
+): void {
+  if (!input.roomId.trim() || !input.turnId.trim()) {
+    throw new RoomDomainError("turn_boundary_required", "Room and turn identities are required");
+  }
+  if (!Number.isFinite(Date.parse(input.now))) {
+    throw new RoomDomainError("turn_boundary_required", "Boundary time must be a valid timestamp");
+  }
+  for (const [field, value] of Object.entries({
+    expectedAggregateVersion: input.expectedAggregateVersion,
+    expectedMembershipVersion: input.expectedMembershipVersion,
+  })) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RoomDomainError("membership_change_conflict", `${field} must be a non-negative safe integer`);
+    }
+  }
+}
+
+function validateMembershipBinding(binding: RoomBindingReplacementV1): void {
+  for (const [field, value] of Object.entries({
+    id: binding.id,
+    connectorId: binding.connectorId,
+    providerId: binding.providerId,
+    nativeSessionId: binding.nativeSessionId,
+    hostId: binding.hostId,
+  })) {
+    if (!value.trim()) {
+      throw new RoomDomainError("binding_identity_conflict", `Binding ${field} must not be empty`);
+    }
+  }
+}
+
+function assertMembershipVersions(
+  aggregate: RoomAggregateV1,
+  input: { readonly expectedAggregateVersion: number; readonly expectedMembershipVersion: number },
+): void {
+  if (aggregate.room.aggregateVersion !== input.expectedAggregateVersion) {
+    throw new RoomDomainError(
+      "aggregate_version_conflict",
+      `Room ${aggregate.room.id} expected aggregate version ${input.expectedAggregateVersion} but is ${aggregate.room.aggregateVersion}`,
+    );
+  }
+  if (aggregate.membershipVersion !== input.expectedMembershipVersion) {
+    throw new RoomDomainError(
+      "membership_version_conflict",
+      `Room ${aggregate.room.id} expected membership version ${input.expectedMembershipVersion} but is ${aggregate.membershipVersion}`,
+    );
+  }
+}
+
+async function preparePendingMembershipChange(
+  tx: DbTransaction,
+  projectId: string,
+  aggregate: RoomAggregateV1,
+  input: RequestRoomMembershipChangeInput,
+): Promise<PendingRoomMembershipChangeV1> {
+  const existingIds = await tx
+    .select({ id: roomMembershipChanges.id })
+    .from(roomMembershipChanges)
+    .where(eq(roomMembershipChanges.id, input.changeId))
+    .limit(1);
+  if (existingIds.length > 0 || aggregate.pendingMembershipChanges.some((change) => change.id === input.changeId)) {
+    throw new RoomDomainError(
+      "membership_change_conflict",
+      `Membership change ${input.changeId} already exists`,
+    );
+  }
+  const seatId = input.mutation.action === "add" ? input.mutation.seat.id : input.mutation.seatId;
+  if (aggregate.pendingMembershipChanges.some((change) => change.seatId === seatId)) {
+    throw new RoomDomainError(
+      "membership_change_conflict",
+      `Seat ${seatId} already has a pending membership change`,
+    );
+  }
+
+  const base = {
+    id: input.changeId,
+    roomId: input.roomId,
+    seatId,
+    reason: input.reason,
+    effectiveAfterTurnId: aggregate.activeTurnId,
+    requestedAt: input.requestedAt,
+    state: "waiting_turn_boundary" as const,
+  };
+  if (input.mutation.action === "add") {
+    if (aggregate.seats.some((seat) => seat.id === seatId)) {
+      throw new RoomDomainError("seat_identity_conflict", `Room seat ${seatId} already exists`);
+    }
+    await assertProjectBindingIdentityAvailable(tx, projectId, input.mutation.binding);
+    return {
+      ...base,
+      kind: "add",
+      seat: { ...input.mutation.seat, permissionScope: [...input.mutation.seat.permissionScope] },
+      binding: { ...input.mutation.binding },
+    };
+  }
+
+  const seat = aggregate.seats.find((candidate) => candidate.id === seatId);
+  if (!seat || seat.state === "removed") {
+    throw new RoomDomainError("seat_not_found", `Room seat ${seatId} does not exist or was removed`);
+  }
+  if (input.mutation.action !== "change_role" && !seat.activeBindingId) {
+    throw new RoomDomainError("binding_not_found", `Seat ${seatId} has no active binding`);
+  }
+  switch (input.mutation.action) {
+    case "remove":
+      return { ...base, kind: "remove" };
+    case "pause":
+      return { ...base, kind: "pause" };
+    case "replace":
+      await assertProjectBindingIdentityAvailable(tx, projectId, input.mutation.replacement);
+      return { ...base, kind: "replace", replacement: { ...input.mutation.replacement } };
+    case "change_role":
+      return { ...base, kind: "change_role", role: input.mutation.role };
+  }
+}
+
+async function assertProjectBindingIdentityAvailable(
+  tx: DbTransaction,
+  projectId: string,
+  binding: RoomBindingReplacementV1,
+): Promise<void> {
+  const nativeRows = await tx
+    .select({ id: roomBindings.id })
+    .from(roomBindings)
+    .where(and(
+      eq(roomBindings.projectId, projectId),
+      eq(roomBindings.providerId, binding.providerId),
+      eq(roomBindings.nativeSessionId, binding.nativeSessionId),
+      inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
+    ))
+    .limit(1);
+  if (nativeRows.length > 0) {
+    throw new RoomDomainError(
+      "binding_identity_conflict",
+      `Native Session ${binding.providerId}:${binding.nativeSessionId} already has an active Room binding`,
+    );
+  }
+  if (binding.happierSessionId) {
+    const happierRows = await tx
+      .select({ id: roomBindings.id })
+      .from(roomBindings)
+      .where(and(
+        eq(roomBindings.projectId, projectId),
+        eq(roomBindings.connectorId, binding.connectorId),
+        eq(roomBindings.happierSessionId, binding.happierSessionId),
+        inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
+      ))
+      .limit(1);
+    if (happierRows.length > 0) {
+      throw new RoomDomainError(
+        "binding_identity_conflict",
+        `Happier Session ${binding.happierSessionId} already has an active Room binding`,
+      );
+    }
+  }
+}
+
+function membershipChangePayload(
+  change: PendingRoomMembershipChangeV1,
+): Readonly<Record<string, unknown>> {
+  return {
+    seat: change.seat,
+    binding: change.binding,
+    replacement: change.replacement,
+    role: change.role,
+  };
+}
+
+function applyPendingMembershipChange(
+  aggregate: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): RoomAggregateV1 {
+  if (change.kind === "add") {
+    if (!change.seat || !change.binding) {
+      throw new RoomDomainError("membership_change_conflict", `Add change ${change.id} is incomplete`);
+    }
+    const seat = {
+      contractVersion: 1 as const,
+      id: change.seat.id,
+      roomId: aggregate.room.id,
+      role: change.seat.role,
+      state: "active" as const,
+      permissionScope: [...change.seat.permissionScope],
+      activeBindingId: change.binding.id,
+      roleVersion: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const binding = createMembershipBindingRecord(
+      aggregate.room.id,
+      seat.id,
+      1,
+      change.binding,
+      now,
+    );
+    return { ...aggregate, seats: [...aggregate.seats, seat], bindings: [...aggregate.bindings, binding] };
+  }
+
+  const seat = aggregate.seats.find((candidate) => candidate.id === change.seatId);
+  if (!seat) throw new RoomDomainError("seat_not_found", `Room seat ${change.seatId} does not exist`);
+  const oldBinding = seat.activeBindingId
+    ? aggregate.bindings.find((binding) => binding.id === seat.activeBindingId)
+    : undefined;
+  if (change.kind !== "change_role" && !oldBinding) {
+    throw new RoomDomainError("binding_not_found", `Seat ${seat.id} has no active binding`);
+  }
+  if (change.kind === "pause") {
+    return {
+      ...aggregate,
+      seats: aggregate.seats.map((candidate) => candidate.id === seat.id
+        ? { ...candidate, state: "paused" as const, updatedAt: now }
+        : candidate),
+      bindings: aggregate.bindings.map((binding) => binding.id === oldBinding!.id
+        ? { ...binding, state: "paused" as const }
+        : binding),
+    };
+  }
+  if (change.kind === "remove") {
+    return {
+      ...aggregate,
+      seats: aggregate.seats.map((candidate) => candidate.id === seat.id
+        ? { ...candidate, state: "removed" as const, activeBindingId: null, updatedAt: now }
+        : candidate),
+      bindings: aggregate.bindings.map((binding) => binding.id === oldBinding!.id
+        ? { ...binding, state: "detached" as const, detachedAt: now }
+        : binding),
+    };
+  }
+  if (change.kind === "change_role") {
+    if (!change.role) {
+      throw new RoomDomainError("membership_change_conflict", `Role change ${change.id} has no role`);
+    }
+    return {
+      ...aggregate,
+      seats: aggregate.seats.map((candidate) => candidate.id === seat.id
+        ? { ...candidate, role: change.role!, roleVersion: candidate.roleVersion + 1, updatedAt: now }
+        : candidate),
+    };
+  }
+  if (!change.replacement) {
+    throw new RoomDomainError("membership_change_conflict", `Replacement ${change.id} is incomplete`);
+  }
+  const generation = aggregate.bindings.reduce(
+    (highest, binding) => binding.seatId === seat.id ? Math.max(highest, binding.generation) : highest,
+    0,
+  ) + 1;
+  const replacement = createMembershipBindingRecord(
+    aggregate.room.id,
+    seat.id,
+    generation,
+    change.replacement,
+    now,
+  );
+  return {
+    ...aggregate,
+    seats: aggregate.seats.map((candidate) => candidate.id === seat.id
+      ? { ...candidate, state: "active" as const, activeBindingId: replacement.id, updatedAt: now }
+      : candidate),
+    bindings: [
+      ...aggregate.bindings.map((binding) => binding.id === oldBinding!.id
+        ? {
+            ...binding,
+            state: "replaced" as const,
+            detachedAt: now,
+            replacedByBindingId: replacement.id,
+          }
+        : binding),
+      replacement,
+    ],
+  };
+}
+
+function createMembershipBindingRecord(
+  roomId: string,
+  seatId: string,
+  generation: number,
+  binding: RoomBindingReplacementV1,
+  now: string,
+) {
+  return {
+    contractVersion: 1 as const,
+    id: binding.id,
+    roomId,
+    seatId,
+    generation,
+    connectorId: binding.connectorId,
+    providerId: binding.providerId,
+    nativeSessionId: binding.nativeSessionId,
+    happierSessionId: binding.happierSessionId,
+    serverProfileId: binding.serverProfileId,
+    machineId: binding.machineId,
+    hostId: binding.hostId,
+    state: "attached" as const,
+    attachedAt: now,
+    detachedAt: null,
+    replacedByBindingId: null,
+  };
+}
+
+async function persistAppliedMembershipChange(
+  tx: DbTransaction,
+  projectId: string,
+  before: RoomAggregateV1,
+  after: RoomAggregateV1,
+  change: PendingRoomMembershipChangeV1,
+  now: string,
+): Promise<void> {
+  const oldSeat = before.seats.find((seat) => seat.id === change.seatId);
+  const newSeat = after.seats.find((seat) => seat.id === change.seatId);
+  if (!newSeat) throw new RoomDomainError("seat_not_found", `Seat ${change.seatId} disappeared during activation`);
+  if (change.kind === "add") {
+    const binding = after.bindings.find((candidate) => candidate.id === newSeat.activeBindingId);
+    if (!binding) throw new RoomDomainError("binding_not_found", `Added seat ${newSeat.id} has no binding`);
+    await tx.insert(roomSeats).values({
+      id: newSeat.id,
+      projectId,
+      roomId: newSeat.roomId,
+      role: newSeat.role,
+      roleVersion: newSeat.roleVersion,
+      roleHistory: [],
+      permissionScope: [...newSeat.permissionScope],
+      state: newSeat.state,
+      activeBindingId: newSeat.activeBindingId,
+      createdAt: newSeat.createdAt,
+      updatedAt: newSeat.updatedAt,
+    });
+    await tx.insert(roomBindings).values({
+      ...binding,
+      projectId,
+      replacementReason: null,
+    });
+    return;
+  }
+  if (!oldSeat) throw new RoomDomainError("seat_not_found", `Seat ${change.seatId} has no prior lineage`);
+  if (change.kind === "change_role") {
+    const rows = await tx
+      .select({ roleHistory: roomSeats.roleHistory })
+      .from(roomSeats)
+      .where(and(eq(roomSeats.projectId, projectId), eq(roomSeats.id, oldSeat.id)))
+      .limit(1);
+    const roleHistory = Array.isArray(rows[0]?.roleHistory) ? rows[0]!.roleHistory : [];
+    await tx
+      .update(roomSeats)
+      .set({
+        role: newSeat.role,
+        roleVersion: newSeat.roleVersion,
+        roleHistory: [...roleHistory, { role: oldSeat.role, roleVersion: oldSeat.roleVersion, endedAt: now }],
+        updatedAt: now,
+      })
+      .where(and(eq(roomSeats.projectId, projectId), eq(roomSeats.id, oldSeat.id)));
+    return;
+  }
+  const oldBinding = oldSeat.activeBindingId
+    ? before.bindings.find((binding) => binding.id === oldSeat.activeBindingId)
+    : undefined;
+  if (!oldBinding) throw new RoomDomainError("binding_not_found", `Seat ${oldSeat.id} has no prior binding`);
+  const nextOldBinding = after.bindings.find((binding) => binding.id === oldBinding.id);
+  if (!nextOldBinding) throw new RoomDomainError("binding_not_found", `Binding ${oldBinding.id} lost its lineage`);
+  await tx
+    .update(roomSeats)
+    .set({
+      state: newSeat.state,
+      activeBindingId: newSeat.activeBindingId,
+      updatedAt: newSeat.updatedAt,
+    })
+    .where(and(eq(roomSeats.projectId, projectId), eq(roomSeats.id, oldSeat.id)));
+  await tx
+    .update(roomBindings)
+    .set({
+      state: nextOldBinding.state,
+      detachedAt: nextOldBinding.detachedAt,
+      replacedByBindingId: nextOldBinding.replacedByBindingId,
+      replacementReason: change.kind === "replace" ? change.reason : null,
+    })
+    .where(and(eq(roomBindings.projectId, projectId), eq(roomBindings.id, oldBinding.id)));
+  if (change.kind === "replace") {
+    const replacement = after.bindings.find((binding) => binding.id === newSeat.activeBindingId);
+    if (!replacement) throw new RoomDomainError("binding_not_found", `Replacement for seat ${newSeat.id} was not created`);
+    await tx.insert(roomBindings).values({
+      ...replacement,
+      projectId,
+      replacementReason: null,
+    });
+  }
+}
+
 function rowToPendingMembershipChange(
   row: typeof roomMembershipChanges.$inferSelect,
 ): PendingRoomMembershipChangeV1 {
-  const payload = row.payload as { replacement?: RoomBindingReplacementV1 };
-  if (!payload.replacement) {
-    throw new Error(`Room membership change ${row.id} has no replacement payload`);
-  }
-  return {
+  const payload = asRecord(row.payload);
+  const common = {
     id: row.id,
     roomId: row.roomId,
     seatId: row.seatId,
-    kind: "replace_binding",
-    replacement: payload.replacement,
     reason: row.reason,
     effectiveAfterTurnId: row.effectiveAfterTurnId,
     requestedAt: row.requestedAt,
-    state: "waiting_turn_boundary",
+    state: "waiting_turn_boundary" as const,
   };
+  switch (row.kind) {
+    case "add": {
+      const seat = asRecord(payload.seat);
+      const binding = payload.binding as RoomBindingReplacementV1 | undefined;
+      if (!binding || typeof seat.id !== "string" || typeof seat.role !== "string") {
+        throw new Error(`Room membership add change ${row.id} has an invalid payload`);
+      }
+      return {
+        ...common,
+        kind: "add",
+        seat: {
+          id: seat.id,
+          role: seat.role,
+          permissionScope: asStringArray(seat.permissionScope),
+        },
+        binding,
+      };
+    }
+    case "remove":
+      return { ...common, kind: "remove" };
+    case "pause":
+      return { ...common, kind: "pause" };
+    case "replace": {
+      const replacement = payload.replacement as RoomBindingReplacementV1 | undefined;
+      if (!replacement) throw new Error(`Room membership replacement ${row.id} has no payload`);
+      return { ...common, kind: "replace", replacement };
+    }
+    case "change_role":
+      if (typeof payload.role !== "string") {
+        throw new Error(`Room membership role change ${row.id} has no role payload`);
+      }
+      return { ...common, kind: "change_role", role: payload.role };
+    default:
+      throw new Error(`Room membership change ${row.id} has unsupported kind ${row.kind}`);
+  }
 }
 
 function rowToRoomEvent(row: typeof roomEvents.$inferSelect): RoomEventRecordV1 {

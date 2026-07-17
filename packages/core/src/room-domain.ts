@@ -29,7 +29,8 @@ export type RoomDomainErrorCode =
   | "turn_identity_conflict"
   | "turn_not_found"
   | "turn_boundary_required"
-  | "membership_change_conflict";
+  | "membership_change_conflict"
+  | "membership_version_conflict";
 
 export class RoomDomainError extends Error {
   readonly code: RoomDomainErrorCode;
@@ -58,8 +59,15 @@ export interface PendingRoomMembershipChangeV1 {
   readonly id: string;
   readonly roomId: RoomId;
   readonly seatId: RoomSeatId;
-  readonly kind: "replace_binding";
-  readonly replacement: RoomBindingReplacementV1;
+  readonly kind: "add" | "remove" | "pause" | "replace" | "change_role";
+  readonly seat?: {
+    readonly id: RoomSeatId;
+    readonly role: string;
+    readonly permissionScope: readonly string[];
+  };
+  readonly binding?: RoomBindingReplacementV1;
+  readonly replacement?: RoomBindingReplacementV1;
+  readonly role?: string;
   readonly reason: string;
   readonly effectiveAfterTurnId: RoomTurnId | null;
   readonly requestedAt: IsoTimestamp;
@@ -326,7 +334,7 @@ export function requestRoomBindingReplacement(
     id: input.changeId,
     roomId: aggregate.room.id,
     seatId: seat.id,
-    kind: "replace_binding",
+    kind: "replace",
     replacement: { ...input.replacement },
     reason: input.reason,
     effectiveAfterTurnId: aggregate.activeTurnId,
@@ -368,6 +376,12 @@ export function applyRoomMembershipChangesAtTurnBoundary(
   let seats = [...aggregate.seats];
   let bindings = [...aggregate.bindings];
   for (const change of applicable) {
+    if (change.kind !== "replace" || !change.replacement) {
+      throw new RoomDomainError(
+        "membership_change_conflict",
+        `Domain replacement helper cannot apply membership change ${change.id} of kind ${change.kind}`,
+      );
+    }
     const seat = seats.find((candidate) => candidate.id === change.seatId);
     if (!seat?.activeBindingId) {
       throw new RoomDomainError("binding_not_found", `Seat ${change.seatId} has no active binding at the boundary`);

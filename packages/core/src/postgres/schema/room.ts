@@ -180,7 +180,6 @@ export const roomMembershipChanges = roomSchema.table("room_membership_changes",
     foreignColumns: [operationalRooms.id, operationalRooms.projectId],
     name: "room_membership_changes_room_project_fkey",
   }).onDelete("cascade"),
-  foreignKey({ columns: [t.seatId], foreignColumns: [roomSeats.id], name: "room_membership_changes_seat_fkey" }).onDelete("cascade"),
   index("idx_room_membership_changes_pending").on(t.projectId, t.roomId, t.state, t.requestedAt),
   check("room_membership_changes_state_check", sql`${t.state} IN ('requested','waiting_turn_boundary','applied','cancelled','failed')`),
 ]);

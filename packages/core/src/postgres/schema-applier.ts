@@ -41,7 +41,7 @@ FNXC:MigrationStatusRuntimeRead 2026-07-20:
 SCHEMA_BASELINE_VERSION advances to 0030 for project-scoped runtime reads of
 the SQLite cutover ledger.
 */
-export const SCHEMA_BASELINE_VERSION = "0035";
+export const SCHEMA_BASELINE_VERSION = "0036";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -141,6 +141,7 @@ export const SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION = "0032";
 export const SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION = "0033";
 export const SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION = "0034";
 export const SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION = "0035";
+export const SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION = "0036";
 
 export const SCHEMA_MIGRATIONS = [
   { version: "0000", filename: "0000_initial.sql" },
@@ -149,6 +150,7 @@ export const SCHEMA_MIGRATIONS = [
   { version: SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION, filename: "0003_room_outbox_identity.sql" },
   { version: SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION, filename: "0004_room_connector_ingestion.sql" },
   { version: SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION, filename: "0005_room_delivery_reconciliation.sql" },
+  { version: SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION, filename: "0006_room_membership_future_seats.sql" },
 ] as const;
 
 export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];
@@ -461,6 +463,7 @@ export async function applySchemaBaseline(
     const sessionRoomOutboxIdentityAlreadyApplied = applied.includes(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
     const sessionRoomConnectorIngestionAlreadyApplied = applied.includes(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION);
     const sessionRoomDeliveryReconciliationAlreadyApplied = applied.includes(SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION);
+    const sessionRoomMembershipFutureSeatsAlreadyApplied = applied.includes(SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -942,6 +945,13 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(join(MIGRATIONS_DIR, "0005_room_delivery_reconciliation.sql"), "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+
+    if (!sessionRoomMembershipFutureSeatsAlreadyApplied) {
+      const migrationSql = await readFile(join(MIGRATIONS_DIR, "0006_room_membership_future_seats.sql"), "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
 
