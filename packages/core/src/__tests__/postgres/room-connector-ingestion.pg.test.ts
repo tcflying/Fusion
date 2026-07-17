@@ -98,6 +98,7 @@ describe("Room connector transcript ingestion", () => {
       nativeSessionId: "codex-thread-ingestion-1",
       happierSessionId: "happier-session-ingestion-1",
       serverProfileId: "server-1",
+      machineId: "machine-ingestion-1",
       hostId: "windows-host-1",
       state: "attached",
       attachedAt: "2026-07-17T06:00:00.000Z",

@@ -379,6 +379,20 @@ describe("HappierSessionConnector", () => {
     });
   });
 
+  it("fails closed before send when the immutable Happier machine identity is missing", async () => {
+    const { connector, dependencies } = setup();
+    const request = sendRequest();
+
+    await expect(connector.send({
+      ...request,
+      identity: { ...request.identity, machineId: null },
+    })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalid_request", retryable: false },
+    });
+    expect(dependencies.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("uses the persisted local id and returns the official send acknowledgement", async () => {
     const { connector, dependencies } = setup();
     const request = sendRequest();

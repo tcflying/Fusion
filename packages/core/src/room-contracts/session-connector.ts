@@ -22,6 +22,9 @@ export const SESSION_CONNECTOR_CAPABILITIES = [
   "deepLinks",
 ] as const;
 
+/** Cross-connector upper bound for one reconciliation read. */
+export const SESSION_CONNECTOR_HISTORY_PAGE_LIMIT = 250;
+
 export type SessionConnectorCapabilityName = (typeof SESSION_CONNECTOR_CAPABILITIES)[number];
 export type SessionConnectorMutatingCapabilityName =
   | "ensureExisting"

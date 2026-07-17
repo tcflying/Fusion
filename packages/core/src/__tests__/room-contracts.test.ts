@@ -68,6 +68,7 @@ describe("Session Room versioned contracts", () => {
       nativeSessionId: "thread-1",
       happierSessionId: "happier-1",
       serverProfileId: "server-1",
+      machineId: "machine-1",
       hostId: "windows-1",
       state: "attached",
       attachedAt: "2026-07-17T00:00:00.000Z",

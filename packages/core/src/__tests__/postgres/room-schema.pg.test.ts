@@ -16,6 +16,7 @@ import {
   SCHEMA_BASELINE_VERSION,
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+  SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
@@ -71,6 +72,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -79,6 +81,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -225,6 +228,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -254,6 +258,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -302,6 +307,7 @@ describe("Session Room PostgreSQL migration", () => {
     expect(result.appliedVersions).toEqual([
       SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
       SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -375,7 +381,10 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION]);
+    expect(result.appliedVersions).toEqual([
+      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+    ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
       FROM project.room_inbox_receipts
@@ -489,5 +498,54 @@ describe("Session Room PostgreSQL migration", () => {
       WHERE table_schema = 'project' AND table_name = 'room_binding_ingestion_state'
     `)) as unknown as Array<{ table_name: string }>;
     expect(stateTables).toEqual([{ table_name: "room_binding_ingestion_state" }]);
+  });
+
+  it("upgrades an existing 0004 schema with durable delivery reconciliation evidence", async () => {
+    const context = await startEmbeddedDatabase();
+    const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
+    const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
+    const outboxSql = await readSchemaMigrationSql(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
+    const ingestionSql = await readSchemaMigrationSql(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION);
+    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
+    await context.connections!.migration.execute(sql.raw(roomSql));
+    await context.connections!.migration.execute(sql.raw(ownershipSql));
+    await context.connections!.migration.execute(sql.raw(outboxSql));
+    await context.connections!.migration.execute(sql.raw(ingestionSql));
+    await context.connections!.migration.execute(sql.raw(`
+      CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
+        version text PRIMARY KEY,
+        applied_at timestamptz NOT NULL DEFAULT now()
+      );
+      INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
+      VALUES
+        ('${SCHEMA_BASELINE_VERSION}'),
+        ('${SCHEMA_ROOM_VERSION}'),
+        ('${SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION}'),
+        ('${SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION}'),
+        ('${SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION}');
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION]);
+    const columns = (await context.connections!.migration.execute(sql`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'room_outbox'
+        AND column_name IN ('reconciliation_from_cursor', 'reconciliation_evidence_ref')
+      ORDER BY column_name
+    `)) as unknown as Array<{ column_name: string; is_nullable: string }>;
+    expect(columns).toEqual([
+      { column_name: "reconciliation_evidence_ref", is_nullable: "YES" },
+      { column_name: "reconciliation_from_cursor", is_nullable: "YES" },
+    ]);
+    const bindingColumns = (await context.connections!.migration.execute(sql`
+      SELECT column_name, is_nullable
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'room_bindings'
+        AND column_name = 'machine_id'
+    `)) as unknown as Array<{ column_name: string; is_nullable: string }>;
+    expect(bindingColumns).toEqual([{ column_name: "machine_id", is_nullable: "YES" }]);
   });
 });

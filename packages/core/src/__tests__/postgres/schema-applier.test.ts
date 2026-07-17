@@ -40,6 +40,7 @@ import {
   reportsPluginSchemaInit,
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+  SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_VERSION,
   roadmapPluginSchemaInit,
@@ -670,6 +671,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
     expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
     expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION);
+    expect(rows.map((r) => r.version)).toContain(SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION);
   });
 
   it("is idempotent: re-applying is a no-op", async () => {

@@ -1,5 +1,6 @@
 import {
   hashRoomValue,
+  SESSION_CONNECTOR_HISTORY_PAGE_LIMIT,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorControlRequestV1,
   type SessionConnectorControlResultV1,
@@ -43,7 +44,6 @@ export const HAPPIER_SESSION_CONNECTOR_VERSION = "0.2.73";
 export const HAPPIER_DIRECT_SESSION_SOURCE_REVISION = "f07b7317cd4c7f0cfa762189dc68d16750a48182";
 
 const DIRECT_MESSAGE_CURSOR_PREFIX = "happier-direct-message-v1:";
-const HISTORY_RECONCILIATION_LIMIT = 250;
 const DEFAULT_SEND_TIMEOUT_SECONDS = 300;
 
 export interface HappierSessionConnectorDependencies {
@@ -156,6 +156,9 @@ function validateIdentity(
 ): SessionConnectorResultV1<string> {
   if (identity.connectorId !== HAPPIER_SESSION_CONNECTOR_ID) {
     return failure("conflict", "Session identity belongs to a different connector", false);
+  }
+  if (!identity.machineId?.trim()) {
+    return failure("invalid_request", "A Happier machine identity is required", false);
   }
   if (!identity.happierSessionId?.trim()) {
     return failure("invalid_request", "A Happier Session identity is required", false);
@@ -556,7 +559,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   ): Promise<SessionConnectorResultV1<SessionConnectorHistoryPageV1>> {
     const target = validateDirectIdentity(input.identity, this.settings.activeServerId);
     if (!target.ok) return target;
-    if (input.contractVersion !== 1 || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > HISTORY_RECONCILIATION_LIMIT) {
+    if (input.contractVersion !== 1 || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > SESSION_CONNECTOR_HISTORY_PAGE_LIMIT) {
       return failure("invalid_request", "History limit must be an integer from 1 through 250", false);
     }
     try {
@@ -597,7 +600,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         {
           ...target.value,
           afterCursor: this.transcriptCursors.get(this.identityKey(identity)) ?? null,
-          limit: HISTORY_RECONCILIATION_LIMIT,
+          limit: SESSION_CONNECTOR_HISTORY_PAGE_LIMIT,
         },
         this.settings,
         undefined,

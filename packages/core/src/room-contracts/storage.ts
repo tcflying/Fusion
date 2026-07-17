@@ -103,6 +103,7 @@ export interface RoomBindingRecordV1 {
   readonly nativeSessionId: string;
   readonly happierSessionId: string | null;
   readonly serverProfileId: string | null;
+  readonly machineId: string | null;
   readonly hostId: string;
   readonly state: RoomBindingState;
   readonly attachedAt: IsoTimestamp;
@@ -191,6 +192,8 @@ export interface RoomOutboxRecordV1 {
   readonly connectorAcknowledgementId: string | null;
   readonly nativeMessageId: string | null;
   readonly nativeCursor: EventCursor | null;
+  readonly reconciliationFromCursor: EventCursor | null;
+  readonly reconciliationEvidenceRef: string | null;
   readonly lastErrorCode: string | null;
   readonly nextAttemptAt: IsoTimestamp | null;
   readonly updatedAt: IsoTimestamp;

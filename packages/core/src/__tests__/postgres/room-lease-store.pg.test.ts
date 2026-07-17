@@ -221,6 +221,7 @@ describe("AsyncRoomLeaseStore PostgreSQL fencing", () => {
       nativeSessionId: "codex-thread-concurrency-1",
       happierSessionId: "happier-concurrency-1",
       serverProfileId: "server-1",
+      machineId: "machine-concurrency-1",
       hostId: "windows-host-1",
       state: "attached",
       attachedAt: "2026-07-17T06:00:00.000Z",

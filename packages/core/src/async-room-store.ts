@@ -12,6 +12,7 @@ import {
   type TransitionRoomLifecycleInput,
 } from "./room-domain.js";
 import type {
+  RoomBindingRecordV1,
   RoomConnectorIngestionMode,
   RoomConnectorIngestionStateV1,
   RoomConnectorMessageRole,
@@ -129,6 +130,7 @@ export interface EnqueueRoomMessageResult {
 export interface BeginRoomDeliveryAttemptInput {
   readonly outboxId: string;
   readonly attemptId: string;
+  readonly reconciliationFromCursor: string | null;
   readonly now: string;
 }
 
@@ -141,6 +143,23 @@ export interface CompleteRoomDeliveryAttemptInput {
   readonly nativeCursor: string | null;
   readonly errorCode: string | null;
   readonly nextAttemptAt: string | null;
+  readonly now: string;
+  readonly audit: {
+    readonly runId: string;
+    readonly agentId: string;
+    readonly taskId?: string;
+  };
+}
+
+export interface ReconcileRoomDeliveryInput {
+  readonly outboxId: string;
+  readonly expectedAttemptCount: number;
+  readonly outcome: "confirmed" | "delivery_uncertain";
+  readonly connectorAcknowledgementId: string | null;
+  readonly nativeMessageId: string | null;
+  readonly nativeCursor: string | null;
+  readonly errorCode: string | null;
+  readonly evidenceRef: string;
   readonly now: string;
   readonly audit: {
     readonly runId: string;
@@ -385,6 +404,7 @@ export class AsyncRoomStore {
         nativeSessionId: providerNativeSessionId,
         happierSessionId,
         serverProfileId: input.source.serverId,
+        machineId: input.source.machineId,
         hostId: input.source.machineId,
         state: "attached",
         attachedAt: input.source.linkedAt,
@@ -493,6 +513,7 @@ export class AsyncRoomStore {
         nativeSessionId: providerNativeSessionId,
         happierSessionId,
         serverProfileId: input.source.serverId,
+        machineId: input.source.machineId,
         hostId: input.source.machineId,
         state: "attached",
         attachedAt: input.source.linkedAt,
@@ -573,6 +594,24 @@ export class AsyncRoomStore {
 
   async getRoom(roomId: string): Promise<RoomAggregateV1 | undefined> {
     return loadRoomAggregateProjection(this.layer.db, this.projectId, roomId);
+  }
+
+  async getDelivery(outboxId: string): Promise<RoomOutboxRecordV1 | null> {
+    const rows = await this.layer.db
+      .select()
+      .from(roomOutbox)
+      .where(and(eq(roomOutbox.projectId, this.projectId), eq(roomOutbox.id, outboxId)))
+      .limit(1);
+    return rows[0] ? rowToOutboxRecord(rows[0]) : null;
+  }
+
+  async getBinding(bindingId: string): Promise<RoomBindingRecordV1 | null> {
+    const rows = await this.layer.db
+      .select()
+      .from(roomBindings)
+      .where(and(eq(roomBindings.projectId, this.projectId), eq(roomBindings.id, bindingId)))
+      .limit(1);
+    return rows[0] ? rowToBindingRecord(rows[0]) : null;
   }
 
   async listEvents(roomId: string, afterCursor?: string): Promise<RoomEventRecordV1[]> {
@@ -747,6 +786,8 @@ export class AsyncRoomStore {
           deliveryState: "pending",
           nativeAcknowledgement: null,
           nativeCursor: null,
+          reconciliationFromCursor: null,
+          reconciliationEvidenceRef: null,
           attemptCount: 0,
           lastErrorCode: null,
           nextAttemptAt: null,
@@ -789,12 +830,19 @@ export class AsyncRoomStore {
   async beginDeliveryAttempt(
     input: BeginRoomDeliveryAttemptInput,
   ): Promise<RoomOutboxRecordV1> {
+    if (input.reconciliationFromCursor !== null && !input.reconciliationFromCursor.trim()) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Room outbox ${input.outboxId} reconciliation cursor cannot be blank`,
+      );
+    }
     return this.layer.transactionImmediate(async (tx) => {
       const rows = await tx
         .select()
         .from(roomOutbox)
         .where(and(eq(roomOutbox.projectId, this.projectId), eq(roomOutbox.id, input.outboxId)))
-        .limit(1);
+        .limit(1)
+        .for("update");
       const current = rows[0];
       if (!current) {
         throw new RoomStoreError(
@@ -821,6 +869,11 @@ export class AsyncRoomStore {
         .set({
           deliveryState: "dispatching",
           attemptCount: attempt,
+          nativeAcknowledgement: null,
+          nativeCursor: null,
+          reconciliationFromCursor: input.reconciliationFromCursor,
+          reconciliationEvidenceRef: null,
+          lastErrorCode: null,
           nextAttemptAt: null,
           updatedAt: input.now,
         })
@@ -864,9 +917,198 @@ export class AsyncRoomStore {
     });
   }
 
+  async reconcileDelivery(
+    input: ReconcileRoomDeliveryInput,
+  ): Promise<RoomOutboxRecordV1> {
+    if (!ROOM_HISTORY_EVIDENCE_REF_PATTERN.test(input.evidenceRef)) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Delivery reconciliation for ${input.outboxId} requires a canonical hashed history evidence reference`,
+      );
+    }
+    if (!Number.isSafeInteger(input.expectedAttemptCount) || input.expectedAttemptCount < 1) {
+      throw new RoomStoreError(
+        "delivery_attempt_conflict",
+        `Delivery reconciliation for ${input.outboxId} requires a positive expected attempt count`,
+      );
+    }
+    assertSafeRoomAuditCode(input.errorCode, `Delivery reconciliation for ${input.outboxId}`);
+    if (!input.audit.runId.trim() || !input.audit.agentId.trim()) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Delivery reconciliation for ${input.outboxId} requires run and agent audit identity`,
+      );
+    }
+    if (
+      input.outcome === "confirmed"
+      && !input.connectorAcknowledgementId
+      && !input.nativeMessageId
+      && !input.nativeCursor
+    ) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Confirmed reconciliation for ${input.outboxId} requires connector or native acknowledgement evidence`,
+      );
+    }
+    if (input.outcome === "confirmed" && input.errorCode !== null) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Confirmed reconciliation for ${input.outboxId} cannot retain an error code`,
+      );
+    }
+    if (input.outcome === "delivery_uncertain" && !input.errorCode?.trim()) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Uncertain reconciliation for ${input.outboxId} requires an error code`,
+      );
+    }
+
+    return this.layer.transactionImmediate(async (tx) => {
+      const rows = await tx
+        .select()
+        .from(roomOutbox)
+        .where(and(eq(roomOutbox.projectId, this.projectId), eq(roomOutbox.id, input.outboxId)))
+        .limit(1)
+        .for("update");
+      const current = rows[0];
+      if (!current) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} does not exist in project ${this.projectId}`,
+        );
+      }
+      if (current.attemptCount !== input.expectedAttemptCount) {
+        throw new RoomStoreError(
+          "delivery_attempt_conflict",
+          `Room outbox ${input.outboxId} is on attempt ${current.attemptCount}, not expected attempt ${input.expectedAttemptCount}`,
+        );
+      }
+
+      const currentRecord = rowToOutboxRecord(current);
+      if (current.deliveryState === "confirmed") {
+        if (
+          input.outcome === "confirmed"
+          && currentRecord.connectorAcknowledgementId === input.connectorAcknowledgementId
+          && currentRecord.nativeMessageId === input.nativeMessageId
+          && currentRecord.nativeCursor === input.nativeCursor
+          && currentRecord.reconciliationEvidenceRef === input.evidenceRef
+        ) {
+          return currentRecord;
+        }
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} is already confirmed with different evidence`,
+        );
+      }
+      if (current.deliveryState !== "dispatching" && current.deliveryState !== "delivery_uncertain") {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} cannot reconcile from state ${current.deliveryState}`,
+        );
+      }
+      if (
+        current.deliveryState === "delivery_uncertain"
+        && input.outcome === "delivery_uncertain"
+        && current.reconciliationEvidenceRef === input.evidenceRef
+        && current.lastErrorCode === input.errorCode
+      ) {
+        return currentRecord;
+      }
+
+      const nextAcknowledgement = input.outcome === "confirmed"
+        ? {
+            connectorAcknowledgementId: input.connectorAcknowledgementId,
+            nativeMessageId: input.nativeMessageId,
+          }
+        : current.nativeAcknowledgement;
+      const updated = await tx
+        .update(roomOutbox)
+        .set({
+          deliveryState: input.outcome,
+          nativeAcknowledgement: nextAcknowledgement,
+          nativeCursor: input.outcome === "confirmed" ? input.nativeCursor : current.nativeCursor,
+          reconciliationEvidenceRef: input.evidenceRef,
+          lastErrorCode: input.errorCode,
+          nextAttemptAt: null,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(roomOutbox.projectId, this.projectId),
+            eq(roomOutbox.id, input.outboxId),
+            eq(roomOutbox.deliveryState, current.deliveryState),
+            eq(roomOutbox.attemptCount, current.attemptCount),
+          ),
+        )
+        .returning();
+      const updatedRow = updated[0];
+      if (!updatedRow) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Concurrent reconciliation changed Room outbox ${input.outboxId}`,
+        );
+      }
+
+      if (current.deliveryState === "dispatching") {
+        const completedAttempts = await tx
+          .update(roomOutboxAttempts)
+          .set({
+            endedAt: input.now,
+            outcome: input.outcome,
+            errorCode: input.errorCode,
+            evidenceRef: input.evidenceRef,
+          })
+          .where(
+            and(
+              eq(roomOutboxAttempts.projectId, this.projectId),
+              eq(roomOutboxAttempts.outboxId, input.outboxId),
+              eq(roomOutboxAttempts.attempt, current.attemptCount),
+              isNull(roomOutboxAttempts.endedAt),
+            ),
+          )
+          .returning({ id: roomOutboxAttempts.id });
+        if (completedAttempts.length !== 1) {
+          throw new RoomStoreError(
+            "delivery_attempt_conflict",
+            `Room outbox ${input.outboxId} has no single active attempt to reconcile`,
+          );
+        }
+      }
+
+      await recordRunAuditEventWithinTransaction(tx, {
+        timestamp: input.now,
+        taskId: input.audit.taskId,
+        agentId: input.audit.agentId,
+        runId: input.audit.runId,
+        domain: "database",
+        mutationType: "room:connector-delivery-reconciliation",
+        target: input.outboxId,
+        metadata: {
+          roomId: current.roomId,
+          bindingId: current.bindingId,
+          messageId: current.messageId,
+          logicalMessageId: current.logicalMessageId,
+          localMessageId: current.localMessageId,
+          payloadHash: current.payloadHash,
+          attempt: current.attemptCount,
+          fromState: current.deliveryState,
+          outcome: input.outcome,
+          connectorAcknowledgementId: input.connectorAcknowledgementId,
+          nativeMessageId: input.nativeMessageId,
+          nativeCursor: input.nativeCursor,
+          reconciliationFromCursor: current.reconciliationFromCursor,
+          evidenceRef: input.evidenceRef,
+          errorCode: input.errorCode,
+        },
+      });
+      return rowToOutboxRecord(updatedRow);
+    });
+  }
+
   async completeDeliveryAttempt(
     input: CompleteRoomDeliveryAttemptInput,
   ): Promise<RoomOutboxRecordV1> {
+    assertSafeRoomAuditCode(input.errorCode, `Delivery completion for ${input.outboxId}`);
     return this.layer.transactionImmediate(async (tx) => {
       const rows = await tx
         .select()
@@ -1437,6 +1679,27 @@ function rowToStoredMessage(row: typeof roomMessages.$inferSelect): StoredRoomMe
   };
 }
 
+function rowToBindingRecord(row: typeof roomBindings.$inferSelect): RoomBindingRecordV1 {
+  return {
+    contractVersion: 1,
+    id: row.id,
+    roomId: row.roomId,
+    seatId: row.seatId,
+    generation: row.generation,
+    connectorId: row.connectorId,
+    providerId: row.providerId,
+    nativeSessionId: row.nativeSessionId,
+    happierSessionId: row.happierSessionId,
+    serverProfileId: row.serverProfileId,
+    machineId: row.machineId,
+    hostId: row.hostId,
+    state: row.state as RoomBindingRecordV1["state"],
+    attachedAt: row.attachedAt,
+    detachedAt: row.detachedAt,
+    replacedByBindingId: row.replacedByBindingId,
+  };
+}
+
 function rowToOutboxRecord(row: typeof roomOutbox.$inferSelect): RoomOutboxRecordV1 {
   const acknowledgement = asRecord(row.nativeAcknowledgement);
   return {
@@ -1459,6 +1722,8 @@ function rowToOutboxRecord(row: typeof roomOutbox.$inferSelect): RoomOutboxRecor
       ? acknowledgement.nativeMessageId
       : null,
     nativeCursor: row.nativeCursor,
+    reconciliationFromCursor: row.reconciliationFromCursor,
+    reconciliationEvidenceRef: row.reconciliationEvidenceRef,
     lastErrorCode: row.lastErrorCode,
     nextAttemptAt: row.nextAttemptAt,
     updatedAt: row.updatedAt,
@@ -1978,6 +2243,18 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const ROOM_HISTORY_EVIDENCE_REF_PATTERN = /^room-history:sha256:[a-f0-9]{64}$/u;
+const ROOM_AUDIT_ERROR_CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/u;
+
+function assertSafeRoomAuditCode(errorCode: string | null, context: string): void {
+  if (errorCode !== null && !ROOM_AUDIT_ERROR_CODE_PATTERN.test(errorCode)) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `${context} error code must be a bounded machine-readable identifier`,
+    );
+  }
+}
+
 const ACTIVE_ROOM_BINDING_STATES = [
   "pending",
   "attached",
@@ -2210,6 +2487,7 @@ export async function loadRoomAggregateProjection(
       nativeSessionId: binding.nativeSessionId,
       happierSessionId: binding.happierSessionId,
       serverProfileId: binding.serverProfileId,
+      machineId: binding.machineId,
       hostId: binding.hostId,
       state: binding.state as RoomAggregateV1["bindings"][number]["state"],
       attachedAt: binding.attachedAt,

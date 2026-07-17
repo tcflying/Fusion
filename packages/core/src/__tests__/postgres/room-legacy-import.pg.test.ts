@@ -152,6 +152,7 @@ describe("one-way legacy Happier Session import", () => {
         nativeSessionId: legacy.source.remoteSessionId,
         happierSessionId: legacy.source.nativeSessionId,
         serverProfileId: legacy.source.serverId,
+        machineId: legacy.source.machineId,
         hostId: legacy.source.machineId,
         generation: 1,
       }],

@@ -25,7 +25,7 @@
 - [x] 3.3 Adapt the existing Happier runtime plugin's reviewed CLI runner and Direct Session wrapper to implement connector ensure/status/history/send while preserving its current AgentRuntime API.
 - [x] 3.4 Add logical/local message IDs to connector sends and persist native acknowledgements/cursors without logging message content or credentials in run audit.
 - [x] 3.5 Implement event-first transcript/status ingestion using certified Happier event surfaces, with bounded history polling for startup, reconnect, gap repair, and degraded mode.
-- [ ] 3.6 Implement ambiguous-send reconciliation and `delivery_uncertain` handling; prove an accepted-before-crash message is not blindly sent twice.
+- [x] 3.6 Implement ambiguous-send reconciliation and `delivery_uncertain` handling; prove an accepted-before-crash message is not blindly sent twice.
 - [ ] 3.7 Implement typed authentication, daemon, server, backend, rate-limit, host, and capability health with secret redaction and fail-closed mutating actions.
 - [ ] 3.8 Correctly expose native Session ID, Happier Session ID, server/profile ID, binding ID, and certified deep links as separate fields.
 - [ ] 3.9 Build a source-backed Codex/Claude/OpenCode capability matrix and add connector conformance tests that skip or fail explicitly by certified capability rather than claiming parity.

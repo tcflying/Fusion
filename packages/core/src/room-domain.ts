@@ -50,6 +50,7 @@ export interface RoomBindingReplacementV1 {
   readonly nativeSessionId: string;
   readonly happierSessionId: string | null;
   readonly serverProfileId: string | null;
+  readonly machineId: string | null;
   readonly hostId: string;
 }
 
@@ -498,6 +499,7 @@ function createBindingRecord(
     nativeSessionId: input.nativeSessionId,
     happierSessionId: input.happierSessionId,
     serverProfileId: input.serverProfileId,
+    machineId: input.machineId,
     hostId: input.hostId,
     state: "attached",
     attachedAt: now,

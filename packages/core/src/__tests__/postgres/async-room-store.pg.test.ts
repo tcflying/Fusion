@@ -15,6 +15,7 @@ import {
   roomInboxReceipts,
   roomMessages,
   roomOutbox,
+  roomOutboxAttempts,
   roomSeats,
 } from "../../postgres/schema/room.js";
 
@@ -25,6 +26,11 @@ interface EmbeddedTestContext {
 }
 
 const contexts: EmbeddedTestContext[] = [];
+const HISTORY_EVIDENCE_ACCEPTED = `room-history:sha256:${"a".repeat(64)}`;
+const HISTORY_EVIDENCE_CRASH = `room-history:sha256:${"b".repeat(64)}`;
+const HISTORY_EVIDENCE_UNCERTAIN = `room-history:sha256:${"c".repeat(64)}`;
+const HISTORY_EVIDENCE_CONFIRMED = `room-history:sha256:${"d".repeat(64)}`;
+const HISTORY_EVIDENCE_STALE = `room-history:sha256:${"e".repeat(64)}`;
 
 async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
   const dataDir = mkdtempSync(join(tmpdir(), "fusion-async-room-store-"));
@@ -223,9 +229,14 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       nativeSessionId: "codex-thread-delivery-1",
       happierSessionId: "happier-delivery-1",
       serverProfileId: "server-1",
+      machineId: "machine-delivery-1",
       hostId: "windows-host-1",
       state: "attached",
       attachedAt: "2026-07-17T03:00:00.000Z",
+    });
+    expect(await store.getBinding("binding-delivery-1")).toMatchObject({
+      machineId: "machine-delivery-1",
+      hostId: "windows-host-1",
     });
 
     const input = {
@@ -294,9 +305,14 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     const dispatching = await store.beginDeliveryAttempt({
       outboxId: "outbox-1",
       attemptId: "attempt-1",
+      reconciliationFromCursor: "cursor-before-send",
       now: "2026-07-17T03:03:00.000Z",
     });
-    expect(dispatching).toMatchObject({ state: "dispatching", attemptCount: 1 });
+    expect(dispatching).toMatchObject({
+      state: "dispatching",
+      attemptCount: 1,
+      reconciliationFromCursor: "cursor-before-send",
+    });
     const uncertain = await store.completeDeliveryAttempt({
       outboxId: "outbox-1",
       attemptId: "attempt-1",
@@ -314,14 +330,46 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       attemptCount: 1,
       lastErrorCode: "ack_timeout",
       nextAttemptAt: null,
+      reconciliationFromCursor: "cursor-before-send",
     });
     await expect(
       store.beginDeliveryAttempt({
         outboxId: "outbox-1",
         attemptId: "attempt-2",
+        reconciliationFromCursor: "cursor-before-send",
         now: "2026-07-17T03:05:00.000Z",
       }),
     ).rejects.toThrow(/uncertain/i);
+
+    const reconciled = await store.reconcileDelivery({
+      outboxId: "outbox-1",
+      expectedAttemptCount: 1,
+      outcome: "confirmed",
+      connectorAcknowledgementId: "fusion-reconciliation-ack-1",
+      nativeMessageId: "native-reconciled-1",
+      nativeCursor: "cursor-accepted",
+      errorCode: null,
+      evidenceRef: HISTORY_EVIDENCE_ACCEPTED,
+      now: "2026-07-17T03:05:10.000Z",
+      audit: { runId: "room-run-reconciled", agentId: "room-recovery-worker-1" },
+    });
+    expect(reconciled).toMatchObject({
+      state: "confirmed",
+      connectorAcknowledgementId: "fusion-reconciliation-ack-1",
+      nativeMessageId: "native-reconciled-1",
+      nativeCursor: "cursor-accepted",
+      reconciliationFromCursor: "cursor-before-send",
+      reconciliationEvidenceRef: HISTORY_EVIDENCE_ACCEPTED,
+    });
+    expect(await store.getDelivery("outbox-1")).toEqual(reconciled);
+    await expect(
+      store.beginDeliveryAttempt({
+        outboxId: "outbox-1",
+        attemptId: "attempt-after-reconciliation",
+        reconciliationFromCursor: "cursor-accepted",
+        now: "2026-07-17T03:05:20.000Z",
+      }),
+    ).rejects.toThrow(/confirmed/i);
 
     const protectedContent = "Bearer room-audit-secret must cross only the connector boundary.";
     const protectedCredentialReference = "credential://room-provider-secret";
@@ -355,6 +403,7 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     await store.beginDeliveryAttempt({
       outboxId: "outbox-2",
       attemptId: "attempt-confirmed-1",
+      reconciliationFromCursor: "cursor-before-confirmed",
       now: "2026-07-17T03:05:40.000Z",
     });
     const confirmed = await store.completeDeliveryAttempt({
@@ -397,6 +446,251 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     });
     expect(JSON.stringify(confirmedAudit)).not.toContain(protectedContent);
     expect(JSON.stringify(confirmedAudit)).not.toContain(protectedCredentialReference);
+
+    const crashQueued = await store.enqueueMessage({
+      ...input,
+      expectedAggregateVersion: 2,
+      idempotencyKey: "operator-device-1:message-accepted-before-crash",
+      message: {
+        ...input.message,
+        id: "message-accepted-before-crash",
+        content: "Persist the pre-send cursor, then reconcile the accepted provider record.",
+        createdAt: "2026-07-17T03:05:55.000Z",
+      },
+      deliveries: [{ id: "outbox-accepted-before-crash", bindingId: "binding-delivery-1" }],
+    }, {
+      eventId: "event-message-accepted-before-crash",
+      actorType: "controller",
+      actorId: "room-controller-1",
+      correlationId: "correlation-accepted-before-crash",
+      causationId: "event-message-confirmed",
+      occurredAt: "2026-07-17T03:05:55.000Z",
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-accepted-before-crash",
+      attemptId: "attempt-accepted-before-crash",
+      reconciliationFromCursor: "cursor-immediately-before-send",
+      now: "2026-07-17T03:05:56.000Z",
+    });
+    const recoveredAfterCrash = await store.reconcileDelivery({
+      outboxId: "outbox-accepted-before-crash",
+      expectedAttemptCount: 1,
+      outcome: "confirmed",
+      connectorAcknowledgementId: null,
+      nativeMessageId: "native-accepted-before-crash",
+      nativeCursor: "cursor-after-accepted-message",
+      errorCode: null,
+      evidenceRef: HISTORY_EVIDENCE_CRASH,
+      now: "2026-07-17T03:05:57.000Z",
+      audit: { runId: "room-run-accepted-before-crash", agentId: "room-recovery-worker-1" },
+    });
+    expect(recoveredAfterCrash).toMatchObject({
+      logicalMessageId: crashQueued.message.id,
+      localMessageId: crashQueued.deliveries[0]?.localMessageId,
+      state: "confirmed",
+      attemptCount: 1,
+      nativeMessageId: "native-accepted-before-crash",
+      nativeCursor: "cursor-after-accepted-message",
+      reconciliationFromCursor: "cursor-immediately-before-send",
+      reconciliationEvidenceRef: HISTORY_EVIDENCE_CRASH,
+    });
+    expect(await store.reconcileDelivery({
+      outboxId: "outbox-accepted-before-crash",
+      expectedAttemptCount: 1,
+      outcome: "confirmed",
+      connectorAcknowledgementId: null,
+      nativeMessageId: "native-accepted-before-crash",
+      nativeCursor: "cursor-after-accepted-message",
+      errorCode: null,
+      evidenceRef: HISTORY_EVIDENCE_CRASH,
+      now: "2026-07-17T03:05:58.000Z",
+      audit: { runId: "room-run-accepted-before-crash-replay", agentId: "room-recovery-worker-1" },
+    })).toEqual(recoveredAfterCrash);
+    const crashAttempt = (await layer.db.select().from(roomOutboxAttempts))
+      .find((row) => row.id === "attempt-accepted-before-crash");
+    expect(crashAttempt).toMatchObject({
+      endedAt: "2026-07-17T03:05:57.000Z",
+      outcome: "confirmed",
+      errorCode: null,
+      evidenceRef: HISTORY_EVIDENCE_CRASH,
+    });
+    const reconciliationAudit = (await layer.db.select().from(runAuditEvents))
+      .find((row) => row.runId === "room-run-accepted-before-crash");
+    expect(reconciliationAudit).toMatchObject({
+      mutationType: "room:connector-delivery-reconciliation",
+      target: "outbox-accepted-before-crash",
+      metadata: expect.objectContaining({
+        fromState: "dispatching",
+        outcome: "confirmed",
+        reconciliationFromCursor: "cursor-immediately-before-send",
+        evidenceRef: HISTORY_EVIDENCE_CRASH,
+      }),
+    });
+
+    await store.enqueueMessage({
+      ...input,
+      expectedAggregateVersion: 3,
+      idempotencyKey: "operator-device-1:message-concurrent-reconciliation",
+      message: {
+        ...input.message,
+        id: "message-concurrent-reconciliation",
+        content: "Serialize competing uncertain and confirmed reconciliation outcomes.",
+        createdAt: "2026-07-17T03:05:59.000Z",
+      },
+      deliveries: [{ id: "outbox-concurrent-reconciliation", bindingId: "binding-delivery-1" }],
+    }, {
+      eventId: "event-message-concurrent-reconciliation",
+      actorType: "controller",
+      actorId: "room-controller-1",
+      correlationId: "correlation-concurrent-reconciliation",
+      causationId: "event-message-accepted-before-crash",
+      occurredAt: "2026-07-17T03:05:59.000Z",
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-concurrent-reconciliation",
+      attemptId: "attempt-concurrent-reconciliation",
+      reconciliationFromCursor: "cursor-before-concurrent-send",
+      now: "2026-07-17T03:06:00.000Z",
+    });
+    const competingReconciliations = await Promise.allSettled([
+      store.reconcileDelivery({
+        outboxId: "outbox-concurrent-reconciliation",
+        expectedAttemptCount: 1,
+        outcome: "delivery_uncertain",
+        connectorAcknowledgementId: null,
+        nativeMessageId: null,
+        nativeCursor: null,
+        errorCode: "history_match_not_found",
+        evidenceRef: HISTORY_EVIDENCE_UNCERTAIN,
+        now: "2026-07-17T03:06:01.000Z",
+        audit: { runId: "room-run-concurrent-uncertain", agentId: "room-recovery-worker-1" },
+      }),
+      store.reconcileDelivery({
+        outboxId: "outbox-concurrent-reconciliation",
+        expectedAttemptCount: 1,
+        outcome: "confirmed",
+        connectorAcknowledgementId: null,
+        nativeMessageId: "native-concurrent-confirmed",
+        nativeCursor: "cursor-concurrent-confirmed",
+        errorCode: null,
+        evidenceRef: HISTORY_EVIDENCE_CONFIRMED,
+        now: "2026-07-17T03:06:02.000Z",
+        audit: { runId: "room-run-concurrent-confirmed", agentId: "room-recovery-worker-2" },
+      }),
+    ]);
+    expect(competingReconciliations[1]?.status).toBe("fulfilled");
+    expect(await store.getDelivery("outbox-concurrent-reconciliation")).toMatchObject({
+      state: "confirmed",
+      nativeMessageId: "native-concurrent-confirmed",
+      nativeCursor: "cursor-concurrent-confirmed",
+      reconciliationEvidenceRef: HISTORY_EVIDENCE_CONFIRMED,
+    });
+
+    await store.enqueueMessage({
+      ...input,
+      expectedAggregateVersion: 4,
+      idempotencyKey: "operator-device-1:message-stale-reconciliation",
+      message: {
+        ...input.message,
+        id: "message-stale-reconciliation",
+        content: "Reject reconciliation evidence captured for an older delivery attempt.",
+        createdAt: "2026-07-17T03:06:03.000Z",
+      },
+      deliveries: [{ id: "outbox-stale-reconciliation", bindingId: "binding-delivery-1" }],
+    }, {
+      eventId: "event-message-stale-reconciliation",
+      actorType: "controller",
+      actorId: "room-controller-1",
+      correlationId: "correlation-stale-reconciliation",
+      causationId: "event-message-concurrent-reconciliation",
+      occurredAt: "2026-07-17T03:06:03.000Z",
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-stale-reconciliation",
+      attemptId: "attempt-stale-1",
+      reconciliationFromCursor: "cursor-before-stale-attempt-1",
+      now: "2026-07-17T03:06:04.000Z",
+    });
+    await store.completeDeliveryAttempt({
+      outboxId: "outbox-stale-reconciliation",
+      attemptId: "attempt-stale-1",
+      outcome: "retryable_failure",
+      connectorAcknowledgementId: "ack-stale-attempt-1",
+      nativeMessageId: "native-stale-attempt-1",
+      nativeCursor: "cursor-stale-attempt-1",
+      errorCode: "pre_send_transport",
+      nextAttemptAt: "2026-07-17T03:06:05.000Z",
+      now: "2026-07-17T03:06:04.500Z",
+      audit: { runId: "room-run-stale-attempt-1", agentId: "room-worker-1" },
+    });
+    await store.beginDeliveryAttempt({
+      outboxId: "outbox-stale-reconciliation",
+      attemptId: "attempt-stale-2",
+      reconciliationFromCursor: "cursor-before-stale-attempt-2",
+      now: "2026-07-17T03:06:05.000Z",
+    });
+    expect(await store.getDelivery("outbox-stale-reconciliation")).toMatchObject({
+      state: "dispatching",
+      attemptCount: 2,
+      connectorAcknowledgementId: null,
+      nativeMessageId: null,
+      nativeCursor: null,
+      reconciliationEvidenceRef: null,
+      lastErrorCode: null,
+    });
+    await expect(store.reconcileDelivery({
+      outboxId: "outbox-stale-reconciliation",
+      expectedAttemptCount: 2,
+      outcome: "confirmed",
+      connectorAcknowledgementId: null,
+      nativeMessageId: "native-invalid-evidence",
+      nativeCursor: "cursor-invalid-evidence",
+      errorCode: null,
+      evidenceRef: "Bearer audit-secret-must-not-persist",
+      now: "2026-07-17T03:06:06.000Z",
+      audit: { runId: "room-run-invalid-evidence", agentId: "room-recovery-worker-1" },
+    })).rejects.toThrow(/evidence/i);
+    await expect(store.reconcileDelivery({
+      outboxId: "outbox-stale-reconciliation",
+      expectedAttemptCount: 2,
+      outcome: "delivery_uncertain",
+      connectorAcknowledgementId: null,
+      nativeMessageId: null,
+      nativeCursor: null,
+      errorCode: "Bearer audit-secret-must-not-persist",
+      evidenceRef: HISTORY_EVIDENCE_STALE,
+      now: "2026-07-17T03:06:06.500Z",
+      audit: { runId: "room-run-invalid-error", agentId: "room-recovery-worker-1" },
+    })).rejects.toThrow(/error code/i);
+    await expect(store.reconcileDelivery({
+      outboxId: "outbox-stale-reconciliation",
+      expectedAttemptCount: 1,
+      outcome: "confirmed",
+      connectorAcknowledgementId: null,
+      nativeMessageId: "native-stale-attempt-1",
+      nativeCursor: "cursor-stale-attempt-1",
+      errorCode: null,
+      evidenceRef: HISTORY_EVIDENCE_STALE,
+      now: "2026-07-17T03:06:07.000Z",
+      audit: { runId: "room-run-stale-evidence", agentId: "room-recovery-worker-1" },
+    })).rejects.toThrow(/attempt/i);
+    expect(await store.getDelivery("outbox-stale-reconciliation")).toMatchObject({
+      state: "dispatching",
+      attemptCount: 2,
+      reconciliationFromCursor: "cursor-before-stale-attempt-2",
+    });
+    expect(await store.reconcileDelivery({
+      outboxId: "outbox-stale-reconciliation",
+      expectedAttemptCount: 2,
+      outcome: "confirmed",
+      connectorAcknowledgementId: null,
+      nativeMessageId: "native-stale-attempt-2",
+      nativeCursor: "cursor-stale-attempt-2",
+      errorCode: null,
+      evidenceRef: HISTORY_EVIDENCE_STALE,
+      now: "2026-07-17T03:06:08.000Z",
+      audit: { runId: "room-run-current-evidence", agentId: "room-recovery-worker-2" },
+    })).toMatchObject({ state: "confirmed", attemptCount: 2 });
 
     const inboxInput = {
       id: "inbox-1",
