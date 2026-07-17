@@ -24,7 +24,10 @@ const IDENTITY: SessionConnectorIdentityV1 = {
   hostId: "fusion-host-1",
 };
 
-function setup(overrides: Partial<HappierSessionConnectorDependencies> = {}) {
+function setup(
+  overrides: Partial<HappierSessionConnectorDependencies> = {},
+  now: () => string = () => NOW,
+) {
   const dependencies: HappierSessionConnectorDependencies = {
     ensureDirectSession: vi.fn(async () => ({
       providerId: "codex" as const,
@@ -123,7 +126,7 @@ function setup(overrides: Partial<HappierSessionConnectorDependencies> = {}) {
         activeServerId: "server-1",
         webappUrl: "https://app.happier.dev",
       },
-      now: () => NOW,
+      now,
       dependencies,
     }),
   };
@@ -450,6 +453,157 @@ describe("HappierSessionConnector", () => {
       error: { code: "authentication_required", retryable: false },
     });
     expect(JSON.stringify(status)).not.toContain("secret-token");
+  });
+
+  it("remembers official rate limits as a typed cooldown and expires them", async () => {
+    let currentNow = NOW;
+    const { connector } = setup({
+      sendMessage: vi.fn(async () => {
+        throw new HappierCliError(
+          "server",
+          "429 Bearer secret-rate-limit-token",
+          undefined,
+          "rate_limited",
+        );
+      }),
+    }, () => currentNow);
+
+    const failed = await connector.send(sendRequest());
+    expect(failed).toMatchObject({
+      ok: false,
+      error: {
+        code: "rate_limited",
+        retryable: true,
+        safeDetails: { officialCode: "rate_limited" },
+      },
+    });
+
+    const limited = await connector.getHealth("fusion-host-1");
+    expect(limited).toMatchObject({
+      state: "rate_limited",
+      rateLimit: "limited",
+      reasonCodes: ["rate_limited"],
+      retryAfterMs: 60_000,
+    });
+    expect(JSON.stringify(limited)).not.toContain("secret-rate-limit-token");
+
+    currentNow = "2026-07-17T05:11:00.001Z";
+    await expect(connector.getHealth("fusion-host-1")).resolves.toMatchObject({
+      state: "healthy",
+      rateLimit: "clear",
+      reasonCodes: [],
+      retryAfterMs: null,
+    });
+  });
+
+  it("never echoes unknown token-shaped official error codes", async () => {
+    const { connector } = setup({
+      getSessionStatus: vi.fn(async () => {
+        throw new HappierCliError(
+          "server",
+          "provider rejected accessTokenSecret123",
+          undefined,
+          "accessTokenSecret123",
+        );
+      }),
+    });
+
+    const status = await connector.getStatus(IDENTITY);
+    expect(status).toMatchObject({
+      ok: false,
+      error: {
+        code: "transport",
+        safeDetails: {
+          source: "happier_cli",
+          category: "server",
+        },
+      },
+    });
+    expect(JSON.stringify(status)).not.toContain("accessTokenSecret123");
+    expect(status.ok || status.error.safeDetails).not.toHaveProperty("officialCode");
+  });
+
+  it("reports typed runtime health and strips untrusted probe details", async () => {
+    const healthy = await setup().connector.getHealth("fusion-host-1");
+    expect(healthy).toMatchObject({
+      connectorId: "happier",
+      hostId: "fusion-host-1",
+      state: "healthy",
+      authentication: "authenticated",
+      daemon: "running",
+      server: "reachable",
+      backend: "ready",
+      rateLimit: "clear",
+      host: "reachable",
+      capabilities: {
+        history: "verified",
+        events: "verified",
+        send: "unverified",
+      },
+      reasonCodes: [],
+      retryAfterMs: null,
+    });
+
+    const { connector } = setup({
+      probeRuntime: vi.fn(async () => ({
+        discovered: true,
+        executable: true,
+        server: true,
+        serverState: "reachable" as const,
+        authenticated: false,
+        daemon: true,
+        backend: true,
+        ready: false,
+        backendId: "codex" as const,
+        details: ["authentication-required", "Bearer top-secret-health-token"],
+      })),
+    });
+    const blocked = await connector.getHealth("fusion-host-1");
+    expect(blocked).toMatchObject({
+      state: "authentication_required",
+      authentication: "required",
+      reasonCodes: ["authentication_required"],
+    });
+    expect(JSON.stringify(blocked)).not.toContain("top-secret-health-token");
+
+    const rateLimitedProbe = await setup({
+      probeRuntime: vi.fn(async () => {
+        throw new HappierCliError(
+          "server",
+          "Bearer top-secret-probe-token",
+          undefined,
+          "too_many_requests",
+        );
+      }),
+    }).connector.getHealth("fusion-host-1");
+    expect(rateLimitedProbe).toMatchObject({
+      state: "rate_limited",
+      rateLimit: "limited",
+      reasonCodes: ["probe_failed", "rate_limited"],
+      retryAfterMs: 60_000,
+    });
+    expect(JSON.stringify(rateLimitedProbe)).not.toContain("top-secret-probe-token");
+
+    const declaredRateLimit = await setup({
+      probeRuntime: vi.fn(async () => ({
+        discovered: true,
+        executable: true,
+        server: true,
+        serverState: "reachable" as const,
+        authenticated: true,
+        daemon: true,
+        backend: true,
+        ready: false,
+        backendId: "codex" as const,
+        details: ["rate-limited"],
+      })),
+    }).connector.getHealth("fusion-host-1");
+    expect(declaredRateLimit).toMatchObject({
+      state: "rate_limited",
+      rateLimit: "limited",
+      reasonCodes: ["rate_limited"],
+      retryAfterMs: 60_000,
+    });
   });
 
   it("reports uncertified and unavailable surfaces instead of fabricating parity", async () => {

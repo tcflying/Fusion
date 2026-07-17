@@ -25,21 +25,43 @@ export const SESSION_CONNECTOR_CAPABILITIES = [
 /** Cross-connector upper bound for one reconciliation read. */
 export const SESSION_CONNECTOR_HISTORY_PAGE_LIMIT = 250;
 
+/** Default freshness window for a health sample that can authorize mutation. */
+export const SESSION_CONNECTOR_HEALTH_MAX_AGE_MS = 30_000;
+
+/** Maximum accepted forward clock skew for connector health samples. */
+export const SESSION_CONNECTOR_HEALTH_MAX_FUTURE_SKEW_MS = 5_000;
+
+/** One-week hard bound for a connector-provided retry delay. */
+export const SESSION_CONNECTOR_HEALTH_MAX_RETRY_AFTER_MS = 604_800_000;
+
 export type SessionConnectorCapabilityName = (typeof SESSION_CONNECTOR_CAPABILITIES)[number];
+export const SESSION_CONNECTOR_MUTATING_CAPABILITIES = [
+  "ensureExisting",
+  "create",
+  "send",
+  "interrupt",
+  "resume",
+  "takeover",
+] as const satisfies readonly SessionConnectorCapabilityName[];
 export type SessionConnectorMutatingCapabilityName =
-  | "ensureExisting"
-  | "create"
-  | "send"
-  | "interrupt"
-  | "resume"
-  | "takeover";
+  (typeof SESSION_CONNECTOR_MUTATING_CAPABILITIES)[number];
 export type SessionConnectorCapabilityState = "verified" | "degraded" | "unavailable" | "unverified";
+
+export const SESSION_CONNECTOR_CAPABILITY_REASON_CODES = [
+  "pending_provider_certification",
+  "operation_unavailable",
+  "server_profile_mismatch",
+  "runtime_degraded",
+  "source_unverified",
+] as const;
+export type SessionConnectorCapabilityReasonCode =
+  (typeof SESSION_CONNECTOR_CAPABILITY_REASON_CODES)[number];
 
 export interface SessionConnectorCapabilityCertificationV1 {
   readonly state: SessionConnectorCapabilityState;
   readonly evidenceRef: string | null;
-  readonly reason?: string;
-  readonly lastVerifiedAt?: IsoTimestamp;
+  readonly reasonCode: SessionConnectorCapabilityReasonCode | null;
+  readonly lastVerifiedAt: IsoTimestamp | null;
 }
 
 export interface SessionConnectorCapabilitiesV1 {
@@ -200,11 +222,47 @@ export interface SessionConnectorControlResultV1 {
 export interface SessionConnectorHealthV1 {
   readonly connectorId: SessionConnectorId;
   readonly hostId: string;
-  readonly state: "healthy" | "degraded" | "authentication_required" | "unavailable";
+  readonly state:
+    | "healthy"
+    | "degraded"
+    | "authentication_required"
+    | "rate_limited"
+    | "host_unavailable"
+    | "unavailable";
   readonly checkedAt: IsoTimestamp;
-  readonly safeReason: string | null;
+  readonly authentication: "authenticated" | "required" | "unknown";
+  readonly daemon: "running" | "stopped" | "not_applicable" | "unknown";
+  readonly server: "reachable" | "unreachable" | "not_applicable" | "unknown";
+  readonly backend: "ready" | "unavailable" | "not_applicable" | "unknown";
+  readonly rateLimit: "clear" | "limited" | "unknown";
+  readonly host: "reachable" | "unavailable" | "mismatch" | "unknown";
+  readonly capabilities: Readonly<Record<SessionConnectorCapabilityName, SessionConnectorCapabilityState>>;
+  readonly reasonCodes: readonly SessionConnectorHealthReasonCode[];
   readonly retryAfterMs: number | null;
 }
+
+export const SESSION_CONNECTOR_HEALTH_REASON_CODES = [
+  "executable_unavailable",
+  "executable_timeout",
+  "executable_not_found",
+  "authentication_required",
+  "authentication_timeout",
+  "authentication_invalid",
+  "server_unreachable",
+  "server_not_probed",
+  "daemon_stopped",
+  "status_timeout",
+  "status_invalid",
+  "backend_unavailable",
+  "backend_timeout",
+  "backend_invalid",
+  "rate_limited",
+  "host_unavailable",
+  "capability_not_verified",
+  "probe_failed",
+] as const;
+export type SessionConnectorHealthReasonCode =
+  (typeof SESSION_CONNECTOR_HEALTH_REASON_CODES)[number];
 
 export interface SessionConnectorDeepLinksV1 {
   readonly happierUrl: string | null;

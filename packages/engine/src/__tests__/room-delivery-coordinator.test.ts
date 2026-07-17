@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  SESSION_CONNECTOR_CAPABILITIES,
   buildRoomConnectorLocalMessageId,
   hashRoomValue,
   type RoomBindingRecordV1,
@@ -146,7 +147,7 @@ function capabilities(): SessionConnectorCapabilitiesV1 {
   const verified = {
     state: "verified" as const,
     evidenceRef: "test-certification",
-    reason: null,
+    reasonCode: null,
     lastVerifiedAt: NOW,
   };
   return {
@@ -215,12 +216,21 @@ function connectorFixture(options: {
       hostId: IDENTITY.hostId,
       state: "healthy",
       checkedAt: NOW,
-      safeReason: null,
+      authentication: "authenticated",
+      daemon: "running",
+      server: "reachable",
+      backend: "ready",
+      rateLimit: "clear",
+      host: "reachable",
+      capabilities: Object.fromEntries(
+        SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, "verified"]),
+      ),
+      reasonCodes: [],
       retryAfterMs: null,
     }),
     getDeepLinks: async () => ({ ok: false, error: { code: "unavailable", message: "not used", retryable: false } }),
   } as unknown as SessionConnectorV1;
-  const registry = new SessionConnectorRegistry();
+  const registry = new SessionConnectorRegistry({ now: () => Date.parse(NOW) });
   registry.register(connector);
   return {
     connector,

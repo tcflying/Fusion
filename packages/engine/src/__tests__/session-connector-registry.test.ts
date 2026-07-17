@@ -42,8 +42,8 @@ function capabilityMatrix(
       return [name, {
         state,
         evidenceRef: state === "verified" ? `evidence://happier/${name}` : null,
-        reason: state === "verified" ? undefined : `${name} is ${state}`,
-        lastVerifiedAt: NOW,
+        reasonCode: state === "verified" ? null : "runtime_degraded",
+        lastVerifiedAt: state === "verified" ? NOW : null,
       }];
     }),
   ) as unknown as SessionConnectorCapabilitiesV1["capabilities"];
@@ -54,6 +54,35 @@ function capabilityMatrix(
     sourceRevision: "happier-source-revision",
     verifiedAt: NOW,
     capabilities,
+  };
+}
+
+function healthCapabilities(
+  overrides: Partial<Record<SessionConnectorCapabilityName, SessionConnectorCapabilityState>> = {},
+): SessionConnectorHealthV1["capabilities"] {
+  return Object.fromEntries(
+    SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, overrides[name] ?? "verified"]),
+  ) as SessionConnectorHealthV1["capabilities"];
+}
+
+function healthyHealth(
+  overrides: Partial<SessionConnectorHealthV1> = {},
+): SessionConnectorHealthV1 {
+  return {
+    connectorId: "happier",
+    hostId: IDENTITY.hostId,
+    state: "healthy",
+    checkedAt: NOW,
+    authentication: "authenticated",
+    daemon: "running",
+    server: "reachable",
+    backend: "ready",
+    rateLimit: "clear",
+    host: "reachable",
+    capabilities: healthCapabilities(),
+    reasonCodes: [],
+    retryAfterMs: null,
+    ...overrides,
   };
 }
 
@@ -78,6 +107,7 @@ async function* eventStream(): AsyncIterable<SessionConnectorEventV1> {
 
 function makeConnector(input: {
   readonly capabilities?: () => SessionConnectorCapabilitiesV1;
+  readonly health?: () => SessionConnectorHealthV1;
 } = {}): SessionConnectorV1 {
   return {
     contractVersion: 1,
@@ -138,19 +168,16 @@ function makeConnector(input: {
       state: "accepted",
       connectorAcknowledgementId: "takeover-ack-1",
     })),
-    getHealth: vi.fn(async () => ({
-      connectorId: "happier",
-      hostId: IDENTITY.hostId,
-      state: "healthy",
-      checkedAt: NOW,
-      safeReason: null,
-      retryAfterMs: null,
-    } satisfies SessionConnectorHealthV1)),
+    getHealth: vi.fn(async () => input.health?.() ?? healthyHealth()),
     getDeepLinks: vi.fn(async () => ok<SessionConnectorDeepLinksV1>({
       happierUrl: "http://127.0.0.1:18287/session/happier-session-1",
       nativeSessionUrl: "codex://threads/codex-thread-1",
     })),
   };
+}
+
+function makeRegistry(): SessionConnectorRegistry {
+  return new SessionConnectorRegistry({ now: () => Date.parse(NOW) });
 }
 
 async function requireVerified(
@@ -167,7 +194,7 @@ async function requireVerified(
 
 describe("provider-neutral Session Connector registry contract", () => {
   it("registers by connector identity and rejects duplicate or unknown connectors", () => {
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     const connector = makeConnector();
     registry.register(connector);
 
@@ -186,7 +213,7 @@ describe("provider-neutral Session Connector registry contract", () => {
   it("fails closed for degraded, unavailable, or unverified operations and enforces host affinity", async () => {
     let overrides: Partial<Record<SessionConnectorCapabilityName, SessionConnectorCapabilityState>> = {};
     const connector = makeConnector({ capabilities: () => capabilityMatrix(overrides) });
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     registry.register(connector);
 
     await expect(requireVerified(registry, "send")).resolves.toBe(connector);
@@ -197,6 +224,7 @@ describe("provider-neutral Session Connector registry contract", () => {
         connectorId: "happier",
         capability: "send",
         state,
+        reasonCode: "runtime_degraded",
       });
     }
 
@@ -222,8 +250,114 @@ describe("provider-neutral Session Connector registry contract", () => {
     });
   });
 
+  it("fails closed for every unhealthy runtime dimension while degraded reads remain available", async () => {
+    const cases: Array<[string, Partial<SessionConnectorHealthV1>]> = [
+      ["authentication", {
+        state: "authentication_required",
+        authentication: "required",
+        reasonCodes: ["authentication_required"],
+      }],
+      ["daemon", {
+        state: "degraded",
+        daemon: "stopped",
+        reasonCodes: ["daemon_stopped"],
+      }],
+      ["server", {
+        state: "unavailable",
+        server: "unreachable",
+        reasonCodes: ["server_unreachable"],
+      }],
+      ["backend", {
+        state: "degraded",
+        backend: "unavailable",
+        reasonCodes: ["backend_unavailable"],
+      }],
+      ["rate-limit", {
+        state: "rate_limited",
+        rateLimit: "limited",
+        reasonCodes: ["rate_limited"],
+        retryAfterMs: 60_000,
+      }],
+      ["host", {
+        state: "host_unavailable",
+        host: "unavailable",
+        reasonCodes: ["host_unavailable"],
+      }],
+      ["capability-health", {
+        state: "degraded",
+        capabilities: healthCapabilities({ send: "unverified" }),
+        reasonCodes: ["capability_not_verified"],
+      }],
+    ];
+
+    for (const [dimension, healthPatch] of cases) {
+      const connector = makeConnector({ health: () => healthyHealth(healthPatch) });
+      const registry = makeRegistry();
+      registry.register(connector);
+
+      await expect(requireVerified(registry, "send"), dimension).rejects.toMatchObject({
+        code: "SESSION_CONNECTOR_HEALTH_NOT_READY",
+        connectorId: "happier",
+        capability: "send",
+      });
+      expect(connector.getHealth, dimension).toHaveBeenCalledWith(IDENTITY.hostId);
+      await expect(requireVerified(registry, "history"), dimension).resolves.toBe(connector);
+      expect(connector.getHealth, dimension).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("rejects stale, future, contradictory, or untimed rate-limit health", async () => {
+    const invalidHealth: Array<[string, Partial<SessionConnectorHealthV1>]> = [
+      ["stale", { checkedAt: "2026-07-17T09:59:29.999Z" }],
+      ["future", { checkedAt: "2026-07-17T10:00:05.001Z" }],
+      ["noncanonical-time", { checkedAt: "July 17, 2026 10:00:00 UTC" }],
+      ["contradictory-reason", { reasonCodes: ["rate_limited"] }],
+      ["untimed-rate-limit", {
+        state: "rate_limited",
+        rateLimit: "limited",
+        reasonCodes: ["rate_limited"],
+        retryAfterMs: null,
+      }],
+    ];
+
+    for (const [name, patch] of invalidHealth) {
+      const connector = makeConnector({ health: () => healthyHealth(patch) });
+      const registry = makeRegistry();
+      registry.register(connector);
+      await expect(requireVerified(registry, "send"), name).rejects.toMatchObject({
+        code: "SESSION_CONNECTOR_HEALTH_CONTRACT_CONFLICT",
+      });
+      await expect(requireVerified(registry, "history"), name).resolves.toBe(connector);
+    }
+  });
+
+  it("converts thrown or malformed health into secret-free typed contract failures", async () => {
+    const thrownConnector = makeConnector({
+      health: () => {
+        throw new Error("Bearer top-secret-health-token");
+      },
+    });
+    const thrownRegistry = makeRegistry();
+    thrownRegistry.register(thrownConnector);
+    const thrown = await requireVerified(thrownRegistry, "send").catch((error: unknown) => error);
+    expect(thrown).toMatchObject({ code: "SESSION_CONNECTOR_HEALTH_NOT_READY" });
+    expect(JSON.stringify(thrown)).not.toContain("top-secret-health-token");
+
+    const malformedConnector = makeConnector({
+      health: () => ({
+        ...healthyHealth(),
+        reasonCodes: ["accessToken=top-secret-health-token"],
+      } as unknown as SessionConnectorHealthV1),
+    });
+    const malformedRegistry = makeRegistry();
+    malformedRegistry.register(malformedConnector);
+    const malformed = await requireVerified(malformedRegistry, "send").catch((error: unknown) => error);
+    expect(malformed).toMatchObject({ code: "SESSION_CONNECTOR_HEALTH_CONTRACT_CONFLICT" });
+    expect(JSON.stringify(malformed)).not.toContain("top-secret-health-token");
+  });
+
   it("rejects malformed dynamic connector and capability registrations with typed contract errors", async () => {
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     expect(() => registry.register({
       ...makeConnector(),
       send: undefined,
@@ -245,9 +379,34 @@ describe("provider-neutral Session Connector registry contract", () => {
     });
   });
 
+  it("redacts thrown and token-shaped capability discovery payloads", async () => {
+    const thrownConnector = makeConnector({
+      capabilities: () => {
+        throw new Error("Bearer top-secret-capability-token");
+      },
+    });
+    const thrownRegistry = makeRegistry();
+    thrownRegistry.register(thrownConnector);
+    const thrown = await requireVerified(thrownRegistry, "send").catch((error: unknown) => error);
+    expect(thrown).toMatchObject({ code: "SESSION_CONNECTOR_CONTRACT_CONFLICT" });
+    expect(JSON.stringify(thrown)).not.toContain("top-secret-capability-token");
+
+    const malformedConnector = makeConnector({
+      capabilities: () => ({
+        ...capabilityMatrix(),
+        connectorId: "accessTokenSecret123",
+      }),
+    });
+    const malformedRegistry = makeRegistry();
+    malformedRegistry.register(malformedConnector);
+    const malformed = await requireVerified(malformedRegistry, "send").catch((error: unknown) => error);
+    expect(malformed).toMatchObject({ code: "SESSION_CONNECTOR_CONTRACT_CONFLICT" });
+    expect(JSON.stringify(malformed)).not.toContain("accessTokenSecret123");
+  });
+
   it("preserves exact existing-session ensure and explicit new-session creation requests", async () => {
     const connector = makeConnector();
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     registry.register(connector);
     const ensureRequest = {
       contractVersion: 1 as const,
@@ -291,7 +450,7 @@ describe("provider-neutral Session Connector registry contract", () => {
 
   it("routes status, bounded history cursors, and ordered events without provider branching", async () => {
     const connector = makeConnector();
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     registry.register(connector);
 
     const status = await (await requireVerified(registry, "status")).getStatus(IDENTITY);
@@ -329,7 +488,7 @@ describe("provider-neutral Session Connector registry contract", () => {
 
   it("carries stable logical/local send identity and returns native acknowledgement evidence", async () => {
     const connector = makeConnector();
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     registry.register(connector);
     const sendRequest = {
       contractVersion: 1 as const,
@@ -355,7 +514,7 @@ describe("provider-neutral Session Connector registry contract", () => {
 
   it("routes certified interrupt, resume, and takeover controls with exact identity", async () => {
     const connector = makeConnector();
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     registry.register(connector);
     const controlRequest = {
       contractVersion: 1 as const,
@@ -377,7 +536,7 @@ describe("provider-neutral Session Connector registry contract", () => {
 
   it("returns host-scoped health and rebuildable Happier/native deep links", async () => {
     const connector = makeConnector();
-    const registry = new SessionConnectorRegistry();
+    const registry = makeRegistry();
     registry.register(connector);
 
     const health = await (await requireVerified(registry, "health")).getHealth(IDENTITY.hostId);
@@ -386,7 +545,14 @@ describe("provider-neutral Session Connector registry contract", () => {
       hostId: IDENTITY.hostId,
       state: "healthy",
       checkedAt: NOW,
-      safeReason: null,
+      authentication: "authenticated",
+      daemon: "running",
+      server: "reachable",
+      backend: "ready",
+      rateLimit: "clear",
+      host: "reachable",
+      capabilities: healthCapabilities(),
+      reasonCodes: [],
       retryAfterMs: null,
     });
     const links = await (await requireVerified(registry, "deepLinks")).getDeepLinks(IDENTITY);

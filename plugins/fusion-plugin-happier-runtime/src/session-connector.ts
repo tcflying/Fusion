@@ -1,7 +1,9 @@
 import {
   hashRoomValue,
+  SESSION_CONNECTOR_CAPABILITIES,
   SESSION_CONNECTOR_HISTORY_PAGE_LIMIT,
   type SessionConnectorCapabilitiesV1,
+  type SessionConnectorCapabilityReasonCode,
   type SessionConnectorControlRequestV1,
   type SessionConnectorControlResultV1,
   type SessionConnectorCreateRequestV1,
@@ -10,6 +12,7 @@ import {
   type SessionConnectorEnsureExistingResultV1,
   type SessionConnectorEventV1,
   type SessionConnectorHealthV1,
+  type SessionConnectorHealthReasonCode,
   type SessionConnectorHistoryItemV1,
   type SessionConnectorHistoryPageV1,
   type SessionConnectorHistoryRequestV1,
@@ -45,6 +48,8 @@ export const HAPPIER_DIRECT_SESSION_SOURCE_REVISION = "f07b7317cd4c7f0cfa762189d
 
 const DIRECT_MESSAGE_CURSOR_PREFIX = "happier-direct-message-v1:";
 const DEFAULT_SEND_TIMEOUT_SECONDS = 300;
+const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000;
+const MAX_RATE_LIMIT_COOLDOWN_MS = 604_800_000;
 
 export interface HappierSessionConnectorDependencies {
   readonly ensureDirectSession: typeof ensureHappierDirectSession;
@@ -60,6 +65,7 @@ export interface HappierSessionConnectorOptions {
   readonly version?: string;
   readonly sourceRevision?: string;
   readonly sendTimeoutSeconds?: number;
+  readonly rateLimitCooldownMs?: number;
   readonly now?: () => string;
   readonly dependencies?: Partial<HappierSessionConnectorDependencies>;
 }
@@ -73,16 +79,58 @@ const defaultDependencies: HappierSessionConnectorDependencies = {
   probeRuntime: probeHappierRuntime,
 };
 
-function unavailableCertification(reason: string) {
-  return { state: "unavailable" as const, evidenceRef: null, reason };
+function unavailableCertification(reasonCode: SessionConnectorCapabilityReasonCode) {
+  return {
+    state: "unavailable" as const,
+    evidenceRef: null,
+    reasonCode,
+    lastVerifiedAt: null,
+  };
 }
 
-function unverifiedCertification(reason: string) {
-  return { state: "unverified" as const, evidenceRef: null, reason };
+function unverifiedCertification(reasonCode: SessionConnectorCapabilityReasonCode) {
+  return {
+    state: "unverified" as const,
+    evidenceRef: null,
+    reasonCode,
+    lastVerifiedAt: null,
+  };
 }
 
 function verifiedCertification(evidenceRef: string, verifiedAt: string) {
-  return { state: "verified" as const, evidenceRef, lastVerifiedAt: verifiedAt };
+  return {
+    state: "verified" as const,
+    evidenceRef,
+    reasonCode: null,
+    lastVerifiedAt: verifiedAt,
+  };
+}
+
+const HAPPIER_HEALTH_REASON_MAP: Readonly<Record<string, SessionConnectorHealthReasonCode>> = {
+  "executable-unavailable": "executable_unavailable",
+  "executable-timeout": "executable_timeout",
+  "executable-not-found": "executable_not_found",
+  "authentication-required": "authentication_required",
+  "authentication-timeout": "authentication_timeout",
+  "authentication-invalid": "authentication_invalid",
+  "server-unreachable": "server_unreachable",
+  "server-not-probed": "server_not_probed",
+  "daemon-stopped": "daemon_stopped",
+  "status-timeout": "status_timeout",
+  "status-invalid": "status_invalid",
+  "backend-unavailable": "backend_unavailable",
+  "backend-timeout": "backend_timeout",
+  "backend-invalid": "backend_invalid",
+  "rate-limited": "rate_limited",
+};
+
+function typedHealthReasonCodes(details: readonly unknown[]): SessionConnectorHealthReasonCode[] {
+  const codes = details.flatMap((detail) =>
+    typeof detail === "string" && HAPPIER_HEALTH_REASON_MAP[detail]
+      ? [HAPPIER_HEALTH_REASON_MAP[detail]]
+      : [],
+  );
+  return [...new Set(codes)];
 }
 
 function failure<T>(
@@ -103,11 +151,55 @@ function connectorError(
   return { code, message, retryable, ...(safeDetails ? { safeDetails } : {}) } as const;
 }
 
+const HAPPIER_SAFE_OFFICIAL_CODES = new Set([
+  "not_authenticated",
+  "authentication_required",
+  "auth_required",
+  "unauthorized",
+  "forbidden",
+  "invalid_token",
+  "token_expired",
+  "server_unreachable",
+  "server_unavailable",
+  "connection_failed",
+  "network_error",
+  "daemon_unavailable",
+  "daemon_not_running",
+  "backend_unavailable",
+  "backend_not_found",
+  "provider_unavailable",
+  "model_unavailable",
+  "session_not_found",
+  "session_archived",
+  "session_unavailable",
+  "invalid_session",
+  "session_create_failed",
+  "session_send_failed",
+  "candidate_not_found",
+  "candidate_ambiguous",
+  "machine_mismatch",
+  "invalid_uri",
+  "rate_limited",
+  "rate_limit",
+  "quota_exceeded",
+  "too_many_requests",
+]);
+
+const HAPPIER_RATE_LIMIT_OFFICIAL_CODES = new Set([
+  "rate_limited",
+  "rate_limit",
+  "quota_exceeded",
+  "too_many_requests",
+]);
+
+function normalizedSafeOfficialCode(error: HappierCliError): string | undefined {
+  if (typeof error.officialCode !== "string" || error.officialCode.length > 64) return undefined;
+  const normalized = error.officialCode.trim().toLowerCase().replace(/[-\s]+/gu, "_");
+  return HAPPIER_SAFE_OFFICIAL_CODES.has(normalized) ? normalized : undefined;
+}
+
 function safeCliDetails(error: HappierCliError): Readonly<Record<string, unknown>> {
-  const officialCode = typeof error.officialCode === "string"
-    && /^[A-Za-z0-9_-]{1,64}$/u.test(error.officialCode)
-    ? error.officialCode
-    : undefined;
+  const officialCode = normalizedSafeOfficialCode(error);
   return {
     source: "happier_cli",
     category: error.code,
@@ -120,22 +212,23 @@ function mapReadFailure<T>(error: unknown): SessionConnectorResultV1<T> {
     return failure("internal", "Happier connector operation failed", false);
   }
   const details = safeCliDetails(error);
+  const officialCode = normalizedSafeOfficialCode(error);
   if (error.code === "authentication") {
     return failure("authentication_required", "Happier authentication is required", false, details);
   }
-  if (error.officialCode === "session_not_found" || error.officialCode === "candidate_not_found") {
+  if (officialCode === "session_not_found" || officialCode === "candidate_not_found") {
     return failure("not_found", "The requested native Session was not found", false, details);
   }
-  if (error.officialCode === "candidate_ambiguous") {
+  if (officialCode === "candidate_ambiguous") {
     return failure("ambiguous", "The requested native Session was ambiguous", false, details);
   }
-  if (error.officialCode === "machine_mismatch") {
+  if (officialCode === "machine_mismatch") {
     return failure("conflict", "The requested Session belongs to another machine", false, details);
   }
-  if (error.officialCode === "invalid_uri") {
+  if (officialCode === "invalid_uri") {
     return failure("invalid_request", "The native Session URI is invalid", false, details);
   }
-  if (error.officialCode && /rate|quota|too_many_requests/iu.test(error.officialCode)) {
+  if (officialCode && HAPPIER_RATE_LIMIT_OFFICIAL_CODES.has(officialCode)) {
     return failure("rate_limited", "Happier rate limited the connector operation", true, details);
   }
   if (error.code === "daemon" || error.code === "backend") {
@@ -393,9 +486,11 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   private readonly settings: HappierCliSettings;
   private readonly sourceRevision: string;
   private readonly sendTimeoutSeconds: number;
+  private readonly rateLimitCooldownMs: number;
   private readonly now: () => string;
   private readonly dependencies: HappierSessionConnectorDependencies;
   private readonly transcriptCursors = new Map<string, string | null>();
+  private rateLimitedUntilMs: number | null = null;
 
   constructor(options: HappierSessionConnectorOptions = {}) {
     this.settings = resolveHappierCliSettings(options.settings);
@@ -405,12 +500,20 @@ export class HappierSessionConnector implements SessionConnectorV1 {
     if (!Number.isInteger(this.sendTimeoutSeconds) || this.sendTimeoutSeconds <= 0) {
       throw new Error("Happier Session Connector sendTimeoutSeconds must be a positive integer");
     }
+    this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+    if (
+      !Number.isSafeInteger(this.rateLimitCooldownMs)
+      || this.rateLimitCooldownMs <= 0
+      || this.rateLimitCooldownMs > MAX_RATE_LIMIT_COOLDOWN_MS
+    ) {
+      throw new Error("Happier Session Connector rateLimitCooldownMs must be an integer from 1 through 604800000");
+    }
     this.now = options.now ?? (() => new Date().toISOString());
     this.dependencies = { ...defaultDependencies, ...(options.dependencies ?? {}) };
   }
 
   async getCapabilities(identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
-    const pendingCertification = "Pending provider-specific source and runtime certification";
+    const pendingCertification = "pending_provider_certification" as const;
     const verifiedAt = this.now();
     const directTranscriptEvidence = `happier-source:${this.sourceRevision}:direct-session-transcript-control`;
     const activeServerId = this.settings.activeServerId?.trim();
@@ -421,16 +524,16 @@ export class HappierSessionConnector implements SessionConnectorV1 {
       : {
           state: "degraded" as const,
           evidenceRef: null,
-          reason: "The active Happier server profile does not match the immutable Session binding",
-          lastVerifiedAt: verifiedAt,
+          reasonCode: "server_profile_mismatch" as const,
+          lastVerifiedAt: null,
         };
     const directEventCertification = profileMatches
       ? verifiedCertification(`${directTranscriptEvidence}:delta-ndjson`, verifiedAt)
       : {
           state: "degraded" as const,
           evidenceRef: null,
-          reason: "The active Happier server profile does not match the immutable Session binding",
-          lastVerifiedAt: verifiedAt,
+          reasonCode: "server_profile_mismatch" as const,
+          lastVerifiedAt: null,
         };
     return {
       contractVersion: 1,
@@ -440,16 +543,16 @@ export class HappierSessionConnector implements SessionConnectorV1 {
       verifiedAt,
       capabilities: {
         ensureExisting: unverifiedCertification(pendingCertification),
-        create: unavailableCertification("Creation does not yet return both provider-native and Happier identities"),
+        create: unavailableCertification("operation_unavailable"),
         status: unverifiedCertification(pendingCertification),
         history: directHistoryCertification,
         events: directEventCertification,
         send: unverifiedCertification(pendingCertification),
-        interrupt: unavailableCertification("No reviewed interrupt surface is wired"),
-        resume: unavailableCertification("No reviewed resume surface is wired"),
-        takeover: unavailableCertification("No reviewed takeover surface is wired"),
+        interrupt: unavailableCertification("operation_unavailable"),
+        resume: unavailableCertification("operation_unavailable"),
+        takeover: unavailableCertification("operation_unavailable"),
         health: unverifiedCertification(pendingCertification),
-        deepLinks: unavailableCertification("Verified deep-link construction is implemented in a later connector phase"),
+        deepLinks: unavailableCertification("operation_unavailable"),
       },
     };
   }
@@ -516,7 +619,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         },
       };
     } catch (error) {
-      return mapReadFailure(error);
+      return this.mapOperationalFailure(error);
     }
   }
 
@@ -550,7 +653,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         },
       };
     } catch (error) {
-      return mapReadFailure(error);
+      return this.mapOperationalFailure(error);
     }
   }
 
@@ -586,7 +689,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         },
       };
     } catch (error) {
-      return mapReadFailure(error);
+      return this.mapOperationalFailure(error);
     }
   }
 
@@ -652,7 +755,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         },
       };
     } catch (error) {
-      return mapReadFailure(error);
+      return this.mapOperationalFailure(error);
     }
   }
 
@@ -693,6 +796,8 @@ export class HappierSessionConnector implements SessionConnectorV1 {
         },
       };
     } catch (error) {
+      const mapped = this.mapOperationalFailure<SessionConnectorSendReceiptV1>(error);
+      if (!mapped.ok && mapped.error.code === "rate_limited") return mapped;
       if (
         error instanceof HappierCliError
         && (error.code === "timeout"
@@ -713,7 +818,7 @@ export class HappierSessionConnector implements SessionConnectorV1 {
           },
         };
       }
-      return mapReadFailure(error);
+      return mapped;
     }
   }
 
@@ -736,33 +841,133 @@ export class HappierSessionConnector implements SessionConnectorV1 {
   }
 
   async getHealth(hostId: string): Promise<SessionConnectorHealthV1> {
+    const capabilityMatrix = await this.getCapabilities();
+    const capabilities = Object.fromEntries(
+      SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, capabilityMatrix.capabilities[name].state]),
+    ) as SessionConnectorHealthV1["capabilities"];
+    const host = hostId.trim() ? "reachable" as const : "unavailable" as const;
     try {
       const health = await this.dependencies.probeRuntime(this.settings);
-      const state = health.ready
-        ? "healthy"
-        : !health.authenticated
-          ? "authentication_required"
-          : health.discovered && health.executable
-            ? "degraded"
-            : "unavailable";
+      const checkedAt = this.now();
+      let retryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
+      const mappedReasonCodes = typedHealthReasonCodes(health.details);
+      if (mappedReasonCodes.includes("rate_limited") && retryAfterMs === null) {
+        this.observeRateLimit(checkedAt);
+        retryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
+      }
+      const rateLimitedReasonCodes = retryAfterMs === null
+        ? mappedReasonCodes
+        : [...new Set([...mappedReasonCodes, "rate_limited" as const])];
+      const reasonCodes = host === "reachable"
+        ? rateLimitedReasonCodes
+        : [...new Set([...rateLimitedReasonCodes, "host_unavailable" as const])];
+      const authentication = health.authenticated
+        ? "authenticated" as const
+        : reasonCodes.includes("authentication_required")
+          ? "required" as const
+          : "unknown" as const;
+      const daemon = health.daemon
+        ? "running" as const
+        : reasonCodes.includes("daemon_stopped")
+          ? "stopped" as const
+          : "unknown" as const;
+      const server = health.serverState === "reachable"
+        ? "reachable" as const
+        : health.serverState === "unreachable"
+          ? "unreachable" as const
+          : "unknown" as const;
+      const backend = health.backend
+        ? "ready" as const
+        : reasonCodes.some((code) => code.startsWith("backend_"))
+          ? "unavailable" as const
+          : "unknown" as const;
+      const rateLimit = reasonCodes.includes("rate_limited")
+        ? "limited" as const
+        : health.ready
+          ? "clear" as const
+          : "unknown" as const;
+      const state = host !== "reachable"
+        ? "host_unavailable" as const
+        : rateLimit === "limited"
+          ? "rate_limited" as const
+          : server === "unreachable" || !health.discovered || !health.executable
+            ? "unavailable" as const
+            : authentication === "required"
+              ? "authentication_required" as const
+              : health.ready
+                ? "healthy" as const
+                : "degraded" as const;
       return {
         connectorId: this.id,
         hostId,
         state,
-        checkedAt: this.now(),
-        safeReason: health.details.length > 0 ? health.details.join(",") : null,
-        retryAfterMs: null,
+        checkedAt,
+        authentication,
+        daemon,
+        server,
+        backend,
+        rateLimit,
+        host,
+        capabilities,
+        reasonCodes,
+        retryAfterMs,
       };
-    } catch {
+    } catch (error) {
+      const checkedAt = this.now();
+      this.mapOperationalFailure(error);
+      const failureRetryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
+      const reasonCodes: SessionConnectorHealthReasonCode[] = ["probe_failed"];
+      if (failureRetryAfterMs !== null) reasonCodes.push("rate_limited");
+      if (host !== "reachable") reasonCodes.push("host_unavailable");
       return {
         connectorId: this.id,
         hostId,
-        state: "unavailable",
-        checkedAt: this.now(),
-        safeReason: "happier-probe-failed",
-        retryAfterMs: null,
+        state: host !== "reachable"
+          ? "host_unavailable"
+          : failureRetryAfterMs !== null
+            ? "rate_limited"
+            : "unavailable",
+        checkedAt,
+        authentication: "unknown",
+        daemon: "unknown",
+        server: "unknown",
+        backend: "unknown",
+        rateLimit: failureRetryAfterMs === null ? "unknown" : "limited",
+        host,
+        capabilities,
+        reasonCodes,
+        retryAfterMs: failureRetryAfterMs,
       };
     }
+  }
+
+  private mapOperationalFailure<T>(error: unknown): SessionConnectorResultV1<T> {
+    const result = mapReadFailure<T>(error);
+    if (!result.ok && result.error.code === "rate_limited") {
+      this.observeRateLimit(this.now());
+    }
+    return result;
+  }
+
+  private observeRateLimit(observedAt: string): void {
+    const observedAtMs = Date.parse(observedAt);
+    if (!Number.isFinite(observedAtMs)) return;
+    this.rateLimitedUntilMs = Math.max(
+      this.rateLimitedUntilMs ?? 0,
+      observedAtMs + this.rateLimitCooldownMs,
+    );
+  }
+
+  private activeRateLimitRetryAfterMs(checkedAt: string): number | null {
+    if (this.rateLimitedUntilMs === null) return null;
+    const checkedAtMs = Date.parse(checkedAt);
+    if (!Number.isFinite(checkedAtMs)) return this.rateLimitCooldownMs;
+    const remainingMs = this.rateLimitedUntilMs - checkedAtMs;
+    if (remainingMs <= 0) {
+      this.rateLimitedUntilMs = null;
+      return null;
+    }
+    return Math.min(remainingMs, MAX_RATE_LIMIT_COOLDOWN_MS);
   }
 
   private identityKey(identity: SessionConnectorIdentityV1): string {

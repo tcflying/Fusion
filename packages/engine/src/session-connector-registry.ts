@@ -1,8 +1,17 @@
 import {
   SESSION_CONNECTOR_CAPABILITIES,
+  SESSION_CONNECTOR_CAPABILITY_REASON_CODES,
+  SESSION_CONNECTOR_HEALTH_MAX_AGE_MS,
+  SESSION_CONNECTOR_HEALTH_MAX_FUTURE_SKEW_MS,
+  SESSION_CONNECTOR_HEALTH_MAX_RETRY_AFTER_MS,
+  SESSION_CONNECTOR_HEALTH_REASON_CODES,
+  SESSION_CONNECTOR_MUTATING_CAPABILITIES,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorCapabilityName,
+  type SessionConnectorCapabilityReasonCode,
   type SessionConnectorCapabilityState,
+  type SessionConnectorHealthReasonCode,
+  type SessionConnectorHealthV1,
   type SessionConnectorIdentityV1,
   type SessionConnectorV1,
 } from "@fusion/core";
@@ -13,7 +22,9 @@ export type SessionConnectorRegistryErrorCode =
   | "SESSION_CONNECTOR_CONTRACT_CONFLICT"
   | "SESSION_CONNECTOR_IDENTITY_CONFLICT"
   | "SESSION_CONNECTOR_HOST_AFFINITY"
-  | "SESSION_CONNECTOR_CAPABILITY_NOT_VERIFIED";
+  | "SESSION_CONNECTOR_CAPABILITY_NOT_VERIFIED"
+  | "SESSION_CONNECTOR_HEALTH_CONTRACT_CONFLICT"
+  | "SESSION_CONNECTOR_HEALTH_NOT_READY";
 
 export class SessionConnectorRegistryError extends Error {
   constructor(
@@ -90,13 +101,42 @@ export class SessionConnectorCapabilityNotVerifiedError extends SessionConnector
     readonly connectorId: string,
     readonly capability: SessionConnectorCapabilityName,
     readonly state: SessionConnectorCapabilityState,
-    readonly reason: string | null,
+    readonly reasonCode: SessionConnectorCapabilityReasonCode | null,
   ) {
     super(
       "SESSION_CONNECTOR_CAPABILITY_NOT_VERIFIED",
-      `Session Connector ${connectorId} capability ${capability} is ${state}${reason ? `: ${reason}` : ""}`,
+      `Session Connector ${connectorId} capability ${capability} is ${state}${reasonCode ? ` (${reasonCode})` : ""}`,
     );
     this.name = "SessionConnectorCapabilityNotVerifiedError";
+  }
+}
+
+export class SessionConnectorHealthContractError extends SessionConnectorRegistryError {
+  constructor(
+    readonly connectorId: string,
+    readonly detail: string,
+  ) {
+    super(
+      "SESSION_CONNECTOR_HEALTH_CONTRACT_CONFLICT",
+      `Session Connector ${connectorId} returned invalid typed health: ${detail}`,
+    );
+    this.name = "SessionConnectorHealthContractError";
+  }
+}
+
+export class SessionConnectorHealthNotReadyError extends SessionConnectorRegistryError {
+  constructor(
+    readonly connectorId: string,
+    readonly capability: SessionConnectorCapabilityName,
+    readonly healthState: SessionConnectorHealthV1["state"],
+    readonly reasonCodes: readonly SessionConnectorHealthReasonCode[],
+    readonly retryAfterMs: number | null,
+  ) {
+    super(
+      "SESSION_CONNECTOR_HEALTH_NOT_READY",
+      `Session Connector ${connectorId} cannot perform ${capability}: runtime is ${healthState}${reasonCodes.length > 0 ? ` (${reasonCodes.join(",")})` : ""}`,
+    );
+    this.name = "SessionConnectorHealthNotReadyError";
   }
 }
 
@@ -112,6 +152,59 @@ const CAPABILITY_STATES = new Set<SessionConnectorCapabilityState>([
   "degraded",
   "unavailable",
   "unverified",
+]);
+const CAPABILITY_REASON_CODES = new Set<SessionConnectorCapabilityReasonCode>(
+  SESSION_CONNECTOR_CAPABILITY_REASON_CODES,
+);
+const HEALTH_REASON_CODES = new Set<SessionConnectorHealthReasonCode>(
+  SESSION_CONNECTOR_HEALTH_REASON_CODES,
+);
+const MUTATING_CAPABILITIES = new Set<SessionConnectorCapabilityName>(
+  SESSION_CONNECTOR_MUTATING_CAPABILITIES,
+);
+const MAX_CONFIGURABLE_HEALTH_AGE_MS = 300_000;
+const MAX_CONFIGURABLE_HEALTH_FUTURE_SKEW_MS = 60_000;
+const HEALTH_STATES = new Set<SessionConnectorHealthV1["state"]>([
+  "healthy",
+  "degraded",
+  "authentication_required",
+  "rate_limited",
+  "host_unavailable",
+  "unavailable",
+]);
+const AUTHENTICATION_STATES = new Set<SessionConnectorHealthV1["authentication"]>([
+  "authenticated",
+  "required",
+  "unknown",
+]);
+const DAEMON_STATES = new Set<SessionConnectorHealthV1["daemon"]>([
+  "running",
+  "stopped",
+  "not_applicable",
+  "unknown",
+]);
+const SERVER_STATES = new Set<SessionConnectorHealthV1["server"]>([
+  "reachable",
+  "unreachable",
+  "not_applicable",
+  "unknown",
+]);
+const BACKEND_STATES = new Set<SessionConnectorHealthV1["backend"]>([
+  "ready",
+  "unavailable",
+  "not_applicable",
+  "unknown",
+]);
+const RATE_LIMIT_STATES = new Set<SessionConnectorHealthV1["rateLimit"]>([
+  "clear",
+  "limited",
+  "unknown",
+]);
+const HOST_STATES = new Set<SessionConnectorHealthV1["host"]>([
+  "reachable",
+  "unavailable",
+  "mismatch",
+  "unknown",
 ]);
 
 const CONNECTOR_METHODS = [
@@ -129,6 +222,19 @@ const CONNECTOR_METHODS = [
   "getDeepLinks",
 ] as const satisfies readonly (keyof SessionConnectorV1)[];
 
+function parseCanonicalIsoTimestamp(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toISOString() === value ? parsed : null;
+}
+
+export interface SessionConnectorRegistryOptions {
+  readonly now?: () => number;
+  readonly healthMaxAgeMs?: number;
+  readonly healthMaxFutureSkewMs?: number;
+}
+
 /**
  * Per-runtime registry for provider-neutral Session Connectors.
  *
@@ -141,6 +247,30 @@ const CONNECTOR_METHODS = [
  */
 export class SessionConnectorRegistry {
   private readonly connectors = new Map<string, SessionConnectorV1>();
+  private readonly now: () => number;
+  private readonly healthMaxAgeMs: number;
+  private readonly healthMaxFutureSkewMs: number;
+
+  constructor(options: SessionConnectorRegistryOptions = {}) {
+    this.now = options.now ?? Date.now;
+    this.healthMaxAgeMs = options.healthMaxAgeMs ?? SESSION_CONNECTOR_HEALTH_MAX_AGE_MS;
+    this.healthMaxFutureSkewMs = options.healthMaxFutureSkewMs
+      ?? SESSION_CONNECTOR_HEALTH_MAX_FUTURE_SKEW_MS;
+    if (
+      !Number.isSafeInteger(this.healthMaxAgeMs)
+      || this.healthMaxAgeMs <= 0
+      || this.healthMaxAgeMs > MAX_CONFIGURABLE_HEALTH_AGE_MS
+    ) {
+      throw new Error("Session Connector healthMaxAgeMs must be an integer from 1 through 300000");
+    }
+    if (
+      !Number.isSafeInteger(this.healthMaxFutureSkewMs)
+      || this.healthMaxFutureSkewMs < 0
+      || this.healthMaxFutureSkewMs > MAX_CONFIGURABLE_HEALTH_FUTURE_SKEW_MS
+    ) {
+      throw new Error("Session Connector healthMaxFutureSkewMs must be an integer from 0 through 60000");
+    }
+  }
 
   register(connector: SessionConnectorV1): void {
     assertConnectorContract(connector);
@@ -198,7 +328,15 @@ export class SessionConnectorRegistry {
       );
     }
 
-    const certification: unknown = await connector.getCapabilities(input.identity);
+    let certification: unknown;
+    try {
+      certification = await connector.getCapabilities(input.identity);
+    } catch {
+      throw new SessionConnectorContractError(
+        connector.id,
+        "capability discovery failed",
+      );
+    }
     assertCapabilityMatrix(connector, certification);
     const capability = certification.capabilities[input.capability];
     if (capability.state !== "verified") {
@@ -206,8 +344,56 @@ export class SessionConnectorRegistry {
         connector.id,
         input.capability,
         capability.state,
-        capability.reason ?? null,
+        capability.reasonCode,
       );
+    }
+    if (MUTATING_CAPABILITIES.has(input.capability)) {
+      const healthHostId = input.requiredHostId ?? input.identity?.hostId;
+      if (!healthHostId?.trim()) {
+        throw new SessionConnectorHealthNotReadyError(
+          connector.id,
+          input.capability,
+          "host_unavailable",
+          ["host_unavailable"],
+          null,
+        );
+      }
+      let health: unknown;
+      try {
+        health = await connector.getHealth(healthHostId);
+      } catch {
+        throw new SessionConnectorHealthNotReadyError(
+          connector.id,
+          input.capability,
+          "unavailable",
+          ["probe_failed"],
+          null,
+        );
+      }
+      const nowMs = this.now();
+      if (!Number.isFinite(nowMs)) {
+        throw new SessionConnectorHealthContractError(connector.id, "registry clock is invalid");
+      }
+      assertHealthContract(
+        connector,
+        health,
+        healthHostId,
+        nowMs,
+        this.healthMaxAgeMs,
+        this.healthMaxFutureSkewMs,
+      );
+      if (!isMutationHealthReady(health, input.capability)) {
+        const reasonCodes = health.capabilities[input.capability] === "verified"
+          ? health.reasonCodes
+          : [...new Set([...health.reasonCodes, "capability_not_verified" as const])];
+        throw new SessionConnectorHealthNotReadyError(
+          connector.id,
+          input.capability,
+          health.state,
+          reasonCodes,
+          health.retryAfterMs,
+        );
+      }
     }
     return connector;
   }
@@ -251,13 +437,13 @@ function assertCapabilityMatrix(
   if (certification.connectorId !== connector.id) {
     throw new SessionConnectorContractError(
       connector.id,
-      `capability connectorId ${String(certification.connectorId)} does not match`,
+      "capability connectorId does not match connector registration",
     );
   }
   if (certification.connectorVersion !== connector.version) {
     throw new SessionConnectorContractError(
       connector.id,
-      `capability connectorVersion ${String(certification.connectorVersion)} does not match ${connector.version}`,
+      "capability connectorVersion does not match connector registration",
     );
   }
   if (
@@ -267,8 +453,7 @@ function assertCapabilityMatrix(
     throw new SessionConnectorContractError(connector.id, "sourceRevision is required");
   }
   if (
-    typeof certification.verifiedAt !== "string"
-    || !Number.isFinite(Date.parse(certification.verifiedAt))
+    parseCanonicalIsoTimestamp(certification.verifiedAt) === null
   ) {
     throw new SessionConnectorContractError(connector.id, "verifiedAt is invalid");
   }
@@ -308,5 +493,158 @@ function assertCapabilityMatrix(
         `verified capability ${capabilityName} requires an evidence reference`,
       );
     }
+    if ("reason" in capability) {
+      throw new SessionConnectorContractError(
+        connector.id,
+        `capability ${capabilityName} must use a typed reasonCode`,
+      );
+    }
+    if (
+      capability.reasonCode !== null
+      && !CAPABILITY_REASON_CODES.has(capability.reasonCode as SessionConnectorCapabilityReasonCode)
+    ) {
+      throw new SessionConnectorContractError(
+        connector.id,
+        `capability ${capabilityName} has an invalid reasonCode`,
+      );
+    }
+    if (capability.state === "verified" && capability.reasonCode !== null) {
+      throw new SessionConnectorContractError(
+        connector.id,
+        `verified capability ${capabilityName} cannot have a reasonCode`,
+      );
+    }
+    if (capability.state !== "verified" && capability.reasonCode === null) {
+      throw new SessionConnectorContractError(
+        connector.id,
+        `non-verified capability ${capabilityName} requires a reasonCode`,
+      );
+    }
+    if (
+      capability.lastVerifiedAt !== null
+      && parseCanonicalIsoTimestamp(capability.lastVerifiedAt) === null
+    ) {
+      throw new SessionConnectorContractError(
+        connector.id,
+        `capability ${capabilityName} has invalid lastVerifiedAt`,
+      );
+    }
+    if (capability.state === "verified" && capability.lastVerifiedAt === null) {
+      throw new SessionConnectorContractError(
+        connector.id,
+        `verified capability ${capabilityName} requires lastVerifiedAt`,
+      );
+    }
   }
+}
+
+function assertHealthContract(
+  connector: SessionConnectorV1,
+  value: unknown,
+  expectedHostId: string,
+  nowMs: number,
+  maxAgeMs: number,
+  maxFutureSkewMs: number,
+): asserts value is SessionConnectorHealthV1 {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new SessionConnectorHealthContractError(connector.id, "health must be an object");
+  }
+  const health = value as Record<string, unknown>;
+  if (health.connectorId !== connector.id) {
+    throw new SessionConnectorHealthContractError(connector.id, "connectorId does not match");
+  }
+  if (health.hostId !== expectedHostId) {
+    throw new SessionConnectorHealthContractError(connector.id, "hostId does not match the requested host");
+  }
+  if (!HEALTH_STATES.has(health.state as SessionConnectorHealthV1["state"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "state is invalid");
+  }
+  const checkedAtMs = parseCanonicalIsoTimestamp(health.checkedAt);
+  if (checkedAtMs === null) {
+    throw new SessionConnectorHealthContractError(connector.id, "checkedAt is invalid");
+  }
+  if (checkedAtMs < nowMs - maxAgeMs) {
+    throw new SessionConnectorHealthContractError(connector.id, "checkedAt is stale");
+  }
+  if (checkedAtMs > nowMs + maxFutureSkewMs) {
+    throw new SessionConnectorHealthContractError(connector.id, "checkedAt is in the future");
+  }
+  if (!AUTHENTICATION_STATES.has(health.authentication as SessionConnectorHealthV1["authentication"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "authentication state is invalid");
+  }
+  if (!DAEMON_STATES.has(health.daemon as SessionConnectorHealthV1["daemon"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "daemon state is invalid");
+  }
+  if (!SERVER_STATES.has(health.server as SessionConnectorHealthV1["server"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "server state is invalid");
+  }
+  if (!BACKEND_STATES.has(health.backend as SessionConnectorHealthV1["backend"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "backend state is invalid");
+  }
+  if (!RATE_LIMIT_STATES.has(health.rateLimit as SessionConnectorHealthV1["rateLimit"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "rate-limit state is invalid");
+  }
+  if (!HOST_STATES.has(health.host as SessionConnectorHealthV1["host"])) {
+    throw new SessionConnectorHealthContractError(connector.id, "host state is invalid");
+  }
+  if (
+    health.retryAfterMs !== null
+    && (
+      !Number.isSafeInteger(health.retryAfterMs)
+      || (health.retryAfterMs as number) < 0
+      || (health.retryAfterMs as number) > SESSION_CONNECTOR_HEALTH_MAX_RETRY_AFTER_MS
+    )
+  ) {
+    throw new SessionConnectorHealthContractError(connector.id, "retryAfterMs is invalid");
+  }
+  const retryAfterMs = health.retryAfterMs as number | null;
+  if (!health.capabilities || typeof health.capabilities !== "object" || Array.isArray(health.capabilities)) {
+    throw new SessionConnectorHealthContractError(connector.id, "capabilities must be an object");
+  }
+  const healthCapabilities = health.capabilities as Record<string, unknown>;
+  for (const capabilityName of SESSION_CONNECTOR_CAPABILITIES) {
+    if (!CAPABILITY_STATES.has(healthCapabilities[capabilityName] as SessionConnectorCapabilityState)) {
+      throw new SessionConnectorHealthContractError(connector.id, "capability health contains an invalid state");
+    }
+  }
+  if (!Array.isArray(health.reasonCodes) || health.reasonCodes.length > 18) {
+    throw new SessionConnectorHealthContractError(connector.id, "reasonCodes is invalid");
+  }
+  if (health.reasonCodes.some((reasonCode) => !HEALTH_REASON_CODES.has(reasonCode as SessionConnectorHealthReasonCode))) {
+    throw new SessionConnectorHealthContractError(connector.id, "reasonCodes contains an unsupported value");
+  }
+  const reportsRateLimit = health.reasonCodes.includes("rate_limited");
+  if (health.state === "healthy" && health.reasonCodes.length > 0) {
+    throw new SessionConnectorHealthContractError(connector.id, "healthy state cannot contain failure reasonCodes");
+  }
+  if (health.state === "rate_limited" && health.rateLimit !== "limited") {
+    throw new SessionConnectorHealthContractError(connector.id, "rate-limited state requires limited rateLimit");
+  }
+  if (health.rateLimit === "limited" && !reportsRateLimit) {
+    throw new SessionConnectorHealthContractError(connector.id, "limited rateLimit requires rate_limited reasonCode");
+  }
+  if (reportsRateLimit && health.rateLimit !== "limited") {
+    throw new SessionConnectorHealthContractError(connector.id, "rate_limited reasonCode requires limited rateLimit");
+  }
+  if (
+    health.rateLimit === "limited"
+    && (retryAfterMs === null || retryAfterMs <= 0)
+  ) {
+    throw new SessionConnectorHealthContractError(connector.id, "limited rateLimit requires positive retryAfterMs");
+  }
+}
+
+function isMutationHealthReady(
+  health: SessionConnectorHealthV1,
+  capability: SessionConnectorCapabilityName,
+): boolean {
+  return health.state === "healthy"
+    && health.authentication === "authenticated"
+    && (health.daemon === "running" || health.daemon === "not_applicable")
+    && (health.server === "reachable" || health.server === "not_applicable")
+    && (health.backend === "ready" || health.backend === "not_applicable")
+    && health.rateLimit === "clear"
+    && health.host === "reachable"
+    && health.reasonCodes.length === 0
+    && health.capabilities[capability] === "verified";
 }

@@ -51,8 +51,14 @@ function capabilityMatrix(
       return [name, {
         state,
         evidenceRef: state === "verified" ? `evidence://happier/${name}` : null,
-        reason: state === "verified" ? undefined : `${name} is ${state}`,
-        lastVerifiedAt: NOW,
+        reasonCode: state === "verified"
+          ? null
+          : state === "unavailable"
+            ? "operation_unavailable"
+            : state === "unverified"
+              ? "pending_provider_certification"
+              : "runtime_degraded",
+        lastVerifiedAt: state === "verified" ? NOW : null,
       }];
     }),
   ) as unknown as SessionConnectorCapabilitiesV1["capabilities"];
@@ -228,7 +234,16 @@ function connectorFixture(options: ConnectorFixtureOptions): SessionConnectorV1 
       hostId: IDENTITY.hostId,
       state: "healthy",
       checkedAt: NOW,
-      safeReason: null,
+      authentication: "authenticated",
+      daemon: "running",
+      server: "reachable",
+      backend: "ready",
+      rateLimit: "clear",
+      host: "reachable",
+      capabilities: Object.fromEntries(
+        SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, "verified"]),
+      ) as SessionConnectorHealthV1["capabilities"],
+      reasonCodes: [],
       retryAfterMs: null,
     } satisfies SessionConnectorHealthV1),
     getDeepLinks: async () => ok<SessionConnectorDeepLinksV1>({

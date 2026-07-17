@@ -89,17 +89,39 @@ describe("Session Room versioned contracts", () => {
       sourceRevision: "2bcd6c170",
       verifiedAt: "2026-07-17T00:00:00.000Z",
       capabilities: {
-        ensureExisting: { state: "verified", evidenceRef: "evidence://ensure" },
-        create: { state: "unverified", evidenceRef: null },
-        status: { state: "verified", evidenceRef: "evidence://status" },
-        history: { state: "degraded", evidenceRef: "evidence://history-empty" },
-        events: { state: "unverified", evidenceRef: null },
-        send: { state: "unverified", evidenceRef: null },
-        interrupt: { state: "unavailable", evidenceRef: null },
-        resume: { state: "unverified", evidenceRef: null },
-        takeover: { state: "unverified", evidenceRef: null },
-        health: { state: "verified", evidenceRef: "evidence://health" },
-        deepLinks: { state: "verified", evidenceRef: "evidence://links" },
+        ensureExisting: {
+          state: "verified", evidenceRef: "evidence://ensure", reasonCode: null, lastVerifiedAt: "2026-07-17T00:00:00.000Z",
+        },
+        create: {
+          state: "unverified", evidenceRef: null, reasonCode: "pending_provider_certification", lastVerifiedAt: null,
+        },
+        status: {
+          state: "verified", evidenceRef: "evidence://status", reasonCode: null, lastVerifiedAt: "2026-07-17T00:00:00.000Z",
+        },
+        history: {
+          state: "degraded", evidenceRef: "evidence://history-empty", reasonCode: "runtime_degraded", lastVerifiedAt: null,
+        },
+        events: {
+          state: "unverified", evidenceRef: null, reasonCode: "pending_provider_certification", lastVerifiedAt: null,
+        },
+        send: {
+          state: "unverified", evidenceRef: null, reasonCode: "pending_provider_certification", lastVerifiedAt: null,
+        },
+        interrupt: {
+          state: "unavailable", evidenceRef: null, reasonCode: "operation_unavailable", lastVerifiedAt: null,
+        },
+        resume: {
+          state: "unverified", evidenceRef: null, reasonCode: "pending_provider_certification", lastVerifiedAt: null,
+        },
+        takeover: {
+          state: "unverified", evidenceRef: null, reasonCode: "pending_provider_certification", lastVerifiedAt: null,
+        },
+        health: {
+          state: "verified", evidenceRef: "evidence://health", reasonCode: null, lastVerifiedAt: "2026-07-17T00:00:00.000Z",
+        },
+        deepLinks: {
+          state: "verified", evidenceRef: "evidence://links", reasonCode: null, lastVerifiedAt: "2026-07-17T00:00:00.000Z",
+        },
       },
     } satisfies SessionConnectorCapabilitiesV1;
 
