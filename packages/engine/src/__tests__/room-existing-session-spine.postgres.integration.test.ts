@@ -190,7 +190,7 @@ The spine may ensure identities and read history, but provider-write methods mus
 remain untouched because fenced delivery workers own external dispatch.
 */
 describe("Room existing-Session spine with real PostgreSQL", () => {
-  it("creates, restores, and ingests two exact Sessions without provider writes", async () => {
+  it("creates, routes, restores, and ingests two exact Sessions without provider writes", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "fusion-engine-existing-spine-pg-"));
     const lifecycle = new EmbeddedPostgresLifecycle({
       dataDir,
@@ -267,6 +267,51 @@ describe("Room existing-Session spine with real PostgreSQL", () => {
         SESSIONS.map((session) => session.identity)
           .toSorted((left, right) => left.providerId.localeCompare(right.providerId)),
       );
+
+      const targetSession = SESSIONS[0];
+      const delivery = await restoredSpine.sendToSeat({
+        roomId: ROOM_ID,
+        seatId: targetSession.seatId,
+        expectedAggregateVersion: restored.room.aggregateVersion,
+        commandId: "command-existing-spine-pg-codex",
+        correlationId: "correlation-existing-spine-pg-codex",
+        idempotencyKey: "route-existing-spine-pg-codex",
+        intent: "instruction",
+        content: "Continue only the exact Codex Session.",
+        authorityEnvelope: {
+          actorType: "human",
+          actorId: "operator-existing-spine-pg",
+          deviceId: "device-existing-spine-pg",
+          role: "owner",
+          allowedActions: ["room:message:route"],
+          projectId: PROJECT_ID,
+          roomId: ROOM_ID,
+          nodeIds: [],
+          seatIds: [targetSession.seatId],
+          evidenceRefs: ["evidence://existing-spine-pg-route"],
+        },
+      });
+      expect(delivery).toMatchObject({
+        roomId: ROOM_ID,
+        bindingId: targetSession.bindingId,
+        state: "pending",
+      });
+      expect(await restoredStore.getRoutedMessage(delivery.logicalMessageId)).toMatchObject({
+        roomId: ROOM_ID,
+        target: { kind: "seats", seatIds: [targetSession.seatId] },
+        targetSeatIds: [targetSession.seatId],
+        idempotencyKey: "route-existing-spine-pg-codex",
+        expectedAggregateVersion: restored.room.aggregateVersion,
+      });
+      expect(await restoredStore.listMessageTargets(delivery.logicalMessageId)).toEqual([
+        expect.objectContaining({
+          targetKind: "seat",
+          seatId: targetSession.seatId,
+          bindingId: targetSession.bindingId,
+          ordinal: 0,
+        }),
+      ]);
+      expect(connector.send).not.toHaveBeenCalled();
 
       for (const session of SESSIONS) {
         const result = await restoredSpine.ingestSeat({

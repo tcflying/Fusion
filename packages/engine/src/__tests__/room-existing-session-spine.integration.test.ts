@@ -9,21 +9,23 @@ import {
   type CompleteRoomDeliveryAttemptInput,
   type CreateRoomAggregateInput,
   type CreateRoomWithExistingBindingsInput,
-  type EnqueueRoomMessageInput,
-  type EnqueueRoomMessageResult,
   type GetRoomConnectorIngestionStateInput,
   type ReconcileRoomDeliveryInput,
   type RecordRoomConnectorIngestionModeInput,
   type RecordRoomConnectorStatusInput,
   type RecordRoomConnectorTranscriptBatchInput,
   type RoomAggregateV1,
+  type RoomAuthorityEnvelopeV1,
   type RoomBindingRecordV1,
   type RoomBindingReplacementV1,
   type RoomCommandContext,
+  type RoomControllerCommandEnvelopeV1,
   type RoomConnectorIngestionStateV1,
   type RoomConnectorTranscriptBatchResultV1,
   type RoomInboxReceiptV1,
+  type RoomMessageIntent,
   type RoomOutboxRecordV1,
+  type RouteOperatorMessageResultV1,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorCapabilityName,
   type SessionConnectorCapabilityState,
@@ -289,7 +291,7 @@ class DurableExistingSessionRoomStore {
   private readonly histories = new Map<string, RoomInboxReceiptV1[]>();
   private readonly ingestionStates = new Map<string, RoomConnectorIngestionStateV1>();
   readonly createInputs: CreateRoomWithExistingBindingsInput[] = [];
-  readonly enqueueInputs: EnqueueRoomMessageInput[] = [];
+  readonly routeInputs: RoomControllerCommandEnvelopeV1[] = [];
   readonly beginDeliveryInputs: BeginRoomDeliveryAttemptInput[] = [];
   private eventCursor = 0;
 
@@ -366,75 +368,117 @@ class DurableExistingSessionRoomStore {
     return this.rooms.get(roomId);
   }
 
-  async enqueueMessage(
-    input: EnqueueRoomMessageInput,
-    context: RoomCommandContext,
-  ): Promise<EnqueueRoomMessageResult> {
-    this.enqueueInputs.push(input);
-    const current = this.rooms.get(input.roomId);
-    if (!current) throw new Error(`Room ${input.roomId} is not durable`);
-    if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
-      throw new Error(`Room ${input.roomId} aggregate version drifted`);
+  async routeOperatorMessage(
+    envelope: RoomControllerCommandEnvelopeV1,
+  ): Promise<RouteOperatorMessageResultV1> {
+    this.routeInputs.push(envelope);
+    if (envelope.command.type !== "route_message") throw new Error("Expected a route_message command");
+    const current = this.rooms.get(envelope.roomId);
+    if (!current) throw new Error(`Room ${envelope.roomId} is not durable`);
+    if (current.room.aggregateVersion !== envelope.expectedAggregateVersion) {
+      throw new Error(`Room ${envelope.roomId} aggregate version drifted`);
     }
-    const contentHash = hashRoomValue(input.message.content);
+    if (
+      envelope.authority.actorType !== "human"
+      || !envelope.authority.allowedActions.includes("room:message:route")
+      || envelope.command.target.kind !== "seats"
+      || envelope.command.target.seatIds.length !== 1
+    ) {
+      throw Object.assign(new Error("Invalid deterministic route command"), { code: "routing_command_invalid" });
+    }
+    const seatId = envelope.command.target.seatIds[0]!;
+    if (!envelope.authority.seatIds.includes(seatId)) {
+      throw Object.assign(new Error("Authority excludes the targeted seat"), { code: "authority_scope_violation" });
+    }
+    const seat = current.seats.find((candidate) => candidate.id === seatId);
+    const binding = current.bindings.find((candidate) => candidate.id === seat?.activeBindingId);
+    if (!seat || !binding || binding.state !== "attached") {
+      throw Object.assign(new Error("Target seat has no attached binding"), { code: "routing_target_not_found" });
+    }
+    const messageId = `routed-message:${envelope.commandId}`;
+    const targetId = `routed-target:${envelope.commandId}`;
+    const outboxId = `routed-outbox:${envelope.commandId}`;
     const next: RoomAggregateV1 = {
       ...current,
       room: {
         ...current.room,
         aggregateVersion: current.room.aggregateVersion + 1,
-        updatedAt: input.message.createdAt,
+        updatedAt: envelope.issuedAt,
       },
     };
-    this.rooms.set(input.roomId, next);
-    const deliveries = input.deliveries.map((delivery) => {
-      const idempotencyKey = `${input.idempotencyKey}:${delivery.bindingId}`;
-      const localIdentity = {
-        logicalMessageId: input.message.id,
-        bindingId: delivery.bindingId,
-        idempotencyKey,
-        payloadHash: contentHash,
-      };
-      const record: RoomOutboxRecordV1 = {
-        contractVersion: 1,
-        id: delivery.id,
-        roomId: input.roomId,
-        ...localIdentity,
-        localMessageId: buildRoomConnectorLocalMessageId(localIdentity),
-        state: "pending",
-        attemptCount: 0,
-        connectorAcknowledgementId: null,
-        nativeMessageId: null,
-        nativeCursor: null,
-        reconciliationFromCursor: null,
-        reconciliationEvidenceRef: null,
-        lastErrorCode: null,
-        nextAttemptAt: null,
-        updatedAt: input.message.createdAt,
-      };
-      this.deliveries.set(record.id, record);
-      return record;
-    });
-    const event = this.roomEvent(next, "room_message_queued", context, {
-      messageId: input.message.id,
-      outboxIds: deliveries.map((delivery) => delivery.id),
+    this.rooms.set(envelope.roomId, next);
+    const idempotencyKey = `${envelope.idempotencyKey}:${binding.id}`;
+    const localIdentity = {
+      logicalMessageId: messageId,
+      bindingId: binding.id,
+      idempotencyKey,
+      payloadHash: envelope.command.contentHash,
+    };
+    const delivery: RoomOutboxRecordV1 = {
+      contractVersion: 1,
+      id: outboxId,
+      roomId: envelope.roomId,
+      ...localIdentity,
+      localMessageId: buildRoomConnectorLocalMessageId(localIdentity),
+      state: "pending",
+      attemptCount: 0,
+      connectorAcknowledgementId: null,
+      nativeMessageId: null,
+      nativeCursor: null,
+      reconciliationFromCursor: null,
+      reconciliationEvidenceRef: null,
+      lastErrorCode: null,
+      nextAttemptAt: null,
+      updatedAt: envelope.issuedAt,
+    };
+    this.deliveries.set(delivery.id, delivery);
+    const context: RoomCommandContext = {
+      eventId: `routed-event:${envelope.commandId}`,
+      actorType: "human",
+      actorId: envelope.authority.actorId,
+      correlationId: envelope.correlationId,
+      causationId: envelope.commandId,
+      occurredAt: envelope.issuedAt,
+    };
+    const event = this.roomEvent(next, "message_routed", context, {
+      messageId,
+      targetIds: [targetId],
+      outboxIds: [outboxId],
     });
     return {
       message: {
         contractVersion: 1,
-        id: input.message.id,
-        roomId: input.roomId,
-        turnId: input.message.turnId,
-        nodeId: input.message.nodeId,
-        originType: input.message.originType,
-        originId: input.message.originId,
-        targetSeatIds: input.message.targetSeatIds,
-        intent: input.message.intent,
-        contentHash,
-        authorityEnvelope: input.message.authorityEnvelope,
-        createdAt: input.message.createdAt,
-        content: input.message.content,
+        id: messageId,
+        roomId: envelope.roomId,
+        turnId: current.activeTurnId,
+        nodeId: envelope.command.nodeId,
+        originType: "operator",
+        originId: envelope.authority.actorId,
+        targetSeatIds: [seatId],
+        intent: envelope.command.intent,
+        contentHash: envelope.command.contentHash,
+        authorityEnvelope: envelope.authority,
+        createdAt: envelope.issuedAt,
+        content: envelope.command.content,
+        target: envelope.command.target,
+        idempotencyKey: envelope.idempotencyKey,
+        expectedAggregateVersion: envelope.expectedAggregateVersion,
       },
-      deliveries,
+      targets: [{
+        contractVersion: 1,
+        id: targetId,
+        projectId: PROJECT_ID,
+        roomId: envelope.roomId,
+        messageId,
+        selectorKind: "seats",
+        selectorRef: null,
+        targetKind: "seat",
+        seatId,
+        bindingId: binding.id,
+        ordinal: 0,
+        createdAt: envelope.issuedAt,
+      }],
+      deliveries: [delivery],
       event,
       replayed: false,
     };
@@ -724,12 +768,12 @@ interface RoomExistingSessionSpineApi {
     readonly roomId: string;
     readonly seatId: string;
     readonly expectedAggregateVersion: number;
-    readonly messageId: string;
-    readonly outboxId: string;
+    readonly commandId: string;
+    readonly correlationId: string;
     readonly idempotencyKey: string;
-    readonly intent: string;
+    readonly intent: RoomMessageIntent;
     readonly content: string;
-    readonly authorityEnvelope: Readonly<Record<string, unknown>>;
+    readonly authorityEnvelope: RoomAuthorityEnvelopeV1;
   }): Promise<RoomOutboxRecordV1>;
   ingestSeat(input: {
     readonly roomId: string;
@@ -782,6 +826,21 @@ function createInput() {
       requiredMachineId: session.identity.machineId!,
       idempotencyKey: `ensure:${session.identity.providerId}:${session.identity.nativeSessionId}`,
     })),
+  };
+}
+
+function operatorAuthority(seatIds: readonly string[]): RoomAuthorityEnvelopeV1 {
+  return {
+    actorType: "human",
+    actorId: "operator-existing-spine",
+    deviceId: "device-existing-spine",
+    role: "owner",
+    allowedActions: ["room:message:route"],
+    projectId: PROJECT_ID,
+    roomId: ROOM_ID,
+    nodeIds: [],
+    seatIds,
+    evidenceRefs: ["evidence://operator-command"],
   };
 }
 
@@ -891,17 +950,12 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
         roomId: ROOM_ID,
         seatId: session.seatId,
         expectedAggregateVersion: room.room.aggregateVersion,
-        messageId: `message-${session.identity.providerId}-1`,
-        outboxId: `outbox-${session.identity.providerId}-1`,
+        commandId: `message-${session.identity.providerId}-1`,
+        correlationId: `correlation-${session.identity.providerId}-1`,
         idempotencyKey: `route:${session.seatId}:1`,
         intent: "instruction",
         content,
-        authorityEnvelope: {
-          actorType: "human",
-          actorId: "operator-existing-spine",
-          allowedActions: ["session:send"],
-          targetSeatIds: [session.seatId],
-        },
+        authorityEnvelope: operatorAuthority([session.seatId]),
       }));
       const committed = await harness.roomStore.getRoom(ROOM_ID);
       if (!committed) throw new Error("Room disappeared after targeted send");
@@ -911,15 +965,15 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
     expect(deliveries).toEqual(EXISTING_SESSIONS.map((session) => expect.objectContaining({
       roomId: ROOM_ID,
       bindingId: session.bindingId,
-      logicalMessageId: `message-${session.identity.providerId}-1`,
+      logicalMessageId: `routed-message:message-${session.identity.providerId}-1`,
       state: "pending",
     })));
     expect(harness.connector.send).not.toHaveBeenCalled();
-    expect(harness.roomStore.enqueueInputs.map((input) => input.deliveries)).toEqual(
-      EXISTING_SESSIONS.map((session) => [{
-        id: `outbox-${session.identity.providerId}-1`,
-        bindingId: session.bindingId,
-      }]),
+    expect(harness.roomStore.routeInputs.map((input) => input.command)).toEqual(
+      EXISTING_SESSIONS.map((session) => expect.objectContaining({
+        type: "route_message",
+        target: { kind: "seats", seatIds: [session.seatId] },
+      })),
     );
     expect(harness.roomStore.beginDeliveryInputs).toEqual([]);
 
@@ -945,7 +999,7 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
       expect(harness.connector.send).toHaveBeenNthCalledWith(index + 1, expect.objectContaining({
         bindingId: session.bindingId,
         identity: session.identity,
-        logicalMessageId: `message-${session.identity.providerId}-1`,
+        logicalMessageId: `routed-message:message-${session.identity.providerId}-1`,
         content: `Target only ${session.seatId}.`,
       }));
     });
@@ -966,7 +1020,7 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
         expect.objectContaining({
           bindingId: session.bindingId,
           nativeMessageId: `native-${session.identity.providerId}-response-1`,
-          logicalMessageId: `message-${session.identity.providerId}-1`,
+          logicalMessageId: `routed-message:message-${session.identity.providerId}-1`,
           nativeCursor: `cursor-${session.identity.providerId}-response-1`,
           role: "assistant",
           source: "event",
@@ -1117,23 +1171,19 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
       roomId: ROOM_ID,
       seatId: codex.seatId,
       expectedAggregateVersion: room.room.aggregateVersion,
-      messageId: "message-hostile-target",
-      outboxId: "outbox-hostile-target",
+      commandId: "message-hostile-target",
+      correlationId: "correlation-hostile-target",
       idempotencyKey: "route:hostile-target",
       intent: "instruction",
       content: "This must reach only the Codex seat.",
-      authorityEnvelope: {
-        actorType: "human",
-        actorId: "operator-existing-spine",
-        allowedActions: ["session:send"],
-        targetSeatIds: [EXISTING_SESSIONS[1].seatId],
-      },
+      authorityEnvelope: operatorAuthority([EXISTING_SESSIONS[1].seatId]),
     };
 
     await expect(controller.sendToSeat(baseSend)).rejects.toMatchObject({
-      code: "ROOM_EXISTING_SESSION_AUTHORITY_CONFLICT",
+      code: "authority_scope_violation",
     });
-    expect(harness.roomStore.enqueueInputs).toHaveLength(0);
+    expect(harness.roomStore.routeInputs).toHaveLength(1);
+    expect(await harness.roomStore.getDelivery("routed-outbox:message-hostile-target")).toBeNull();
     expect(harness.roomStore.beginDeliveryInputs).toHaveLength(0);
     expect(harness.connector.send).not.toHaveBeenCalled();
   });

@@ -37,6 +37,12 @@ import type {
   NativeIdeSenderTakeoverProjectionV1,
   RoomOutboxRecordV1,
 } from "./room-contracts/storage.js";
+import type {
+  RoomAuthorityEnvelopeV1,
+  RoomControllerCommandEnvelopeV1,
+  RoomMessageIntent,
+  RoomMessageTargetV1,
+} from "./room-contracts/controller.js";
 import {
   recordRunAuditEventWithinTransaction,
   type AsyncDataLayer,
@@ -59,6 +65,7 @@ import {
   roomInboxReceipts,
   roomLeases,
   roomMembershipChanges,
+  roomMessageTargets,
   roomMessages,
   roomOutbox,
   roomOutboxAttempts,
@@ -273,6 +280,10 @@ export interface AsyncRoomStoreOptions {
 export type RoomStoreErrorCode =
   | "idempotency_conflict"
   | "idempotency_result_missing"
+  | "routing_command_invalid"
+  | "routing_target_not_found"
+  | "routing_group_not_found"
+  | "authority_scope_violation"
   | "connector_batch_invalid"
   | "delivery_target_conflict"
   | "delivery_state_conflict"
@@ -318,6 +329,36 @@ export interface EnqueueRoomMessageInput {
 
 export interface StoredRoomMessageV1 extends RoomMessageRecordV1 {
   readonly content: string;
+}
+
+export interface DurableRoomMessageTargetV1 {
+  readonly contractVersion: 1;
+  readonly id: string;
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly selectorKind: RoomMessageTargetV1["kind"];
+  readonly selectorRef: string | null;
+  readonly targetKind: "controller" | "seat";
+  readonly seatId: string | null;
+  readonly bindingId: string | null;
+  readonly ordinal: number;
+  readonly createdAt: string;
+}
+
+export interface StoredRoutedOperatorMessageV1 extends Omit<StoredRoomMessageV1, "authorityEnvelope"> {
+  readonly target: RoomMessageTargetV1;
+  readonly idempotencyKey: string;
+  readonly expectedAggregateVersion: number;
+  readonly authorityEnvelope: RoomAuthorityEnvelopeV1;
+}
+
+export interface RouteOperatorMessageResultV1 {
+  readonly message: StoredRoutedOperatorMessageV1;
+  readonly targets: readonly DurableRoomMessageTargetV1[];
+  readonly deliveries: readonly RoomOutboxRecordV1[];
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
 }
 
 export interface EnqueueRoomMessageResult {
@@ -1919,6 +1960,331 @@ export class AsyncRoomStore {
     return loadRoomEvents(this.layer.db, this.projectId, roomId, afterCursor);
   }
 
+  async getRoutedMessage(messageId: string): Promise<StoredRoutedOperatorMessageV1 | null> {
+    const rows = await this.layer.db
+      .select()
+      .from(roomMessages)
+      .where(and(eq(roomMessages.projectId, this.projectId), eq(roomMessages.id, messageId)))
+      .limit(1);
+    const row = rows[0];
+    if (
+      !row
+      || row.idempotencyKey === null
+      || row.expectedAggregateVersion === null
+    ) return null;
+    const targets = await loadDurableMessageTargets(
+      this.layer.db,
+      this.projectId,
+      row.roomId,
+      messageId,
+    );
+    return rowToStoredRoutedOperatorMessage(row, targets);
+  }
+
+  async listMessageTargets(messageId: string): Promise<readonly DurableRoomMessageTargetV1[]> {
+    const rows = await this.layer.db
+      .select({ roomId: roomMessages.roomId })
+      .from(roomMessages)
+      .where(and(eq(roomMessages.projectId, this.projectId), eq(roomMessages.id, messageId)))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return [];
+    return loadDurableMessageTargets(
+      this.layer.db,
+      this.projectId,
+      row.roomId,
+      messageId,
+    );
+  }
+
+  /**
+   * Resolve an operator selector and freeze its seat/binding lineage in the
+   * same transaction as the message, outbox intents, aggregate CAS, event, and
+   * idempotency result. This method persists connector work only; it never
+   * performs a provider send.
+   *
+   * FNXC:SessionRoomMessageRouting 2026-07-18-11:31:
+   * Task 4.4 requires exact project/Room/action/content-hash validation, authority-scoped target resolution, durable selector provenance, one outbox intent per seat, replay before optimistic-version rejection, and post-commit-only listener notification. Any validation, target, CAS, or persistence failure rolls back the complete command.
+   */
+  async routeOperatorMessage(
+    envelope: RoomControllerCommandEnvelopeV1,
+  ): Promise<RouteOperatorMessageResultV1> {
+    assertRouteOperatorMessageEnvelope(envelope, this.projectId);
+    // Retry identity is the immutable routing command, not the transport time
+    // at which a caller reconstructed the envelope after acknowledgement loss.
+    // The first committed issuedAt remains authoritative in the stored result.
+    const commandHash = hashRoomValue({
+      contractVersion: envelope.contractVersion,
+      apiVersion: envelope.apiVersion,
+      commandId: envelope.commandId,
+      correlationId: envelope.correlationId,
+      projectId: envelope.projectId,
+      roomId: envelope.roomId,
+      expectedAggregateVersion: envelope.expectedAggregateVersion,
+      authority: envelope.authority,
+      command: envelope.command,
+    });
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: envelope.roomId,
+          idempotencyKey: envelope.idempotencyKey,
+          commandType: "route_message",
+          commandHash,
+          resultEventId: null,
+          createdAt: envelope.issuedAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+
+      // Replay is intentionally resolved before loading or checking the latest
+      // aggregate version. A committed retry remains valid after later Room
+      // commands advance the aggregate.
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, envelope.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, envelope.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "route_message"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${envelope.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${envelope.idempotencyKey} has no committed routed-message event`,
+          );
+        }
+        const replay = await loadRouteOperatorMessageResult(
+          tx,
+          this.projectId,
+          existing.resultEventId,
+        );
+        return { result: { ...replay, replayed: true }, eventToPublish: null };
+      }
+
+      const current = await loadRoomAggregateProjection(tx, this.projectId, envelope.roomId);
+      if (!current) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${envelope.roomId} does not exist`,
+        );
+      }
+      if ([
+        "completed",
+        "completed_with_risks",
+        "partial",
+        "cancelled",
+        "failed",
+        "archived",
+      ].includes(current.room.state)) {
+        throw new RoomDomainError(
+          "terminal_state_immutable",
+          `Operational Room ${envelope.roomId} cannot accept a new routed message in ${current.room.state}`,
+        );
+      }
+      if (
+        envelope.command.target.kind !== "controller"
+        && !["draft", "ready", "running"].includes(current.room.state)
+      ) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${envelope.roomId} cannot route provider work while ${current.room.state}`,
+        );
+      }
+      if (current.room.aggregateVersion !== envelope.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Room ${envelope.roomId} expected aggregate version ${envelope.expectedAggregateVersion} but is ${current.room.aggregateVersion}`,
+          {
+            expected: envelope.expectedAggregateVersion,
+            actual: current.room.aggregateVersion,
+          },
+        );
+      }
+      if (isEarlierTimestamp(envelope.issuedAt, current.room.updatedAt)) {
+        throw new RoomStoreError(
+          "routing_command_invalid",
+          `Routed operator message timestamp cannot precede Room ${envelope.roomId} updatedAt`,
+        );
+      }
+
+      const resolvedSeats = resolveOperatorMessageTargets(current, envelope.command.target);
+      assertAuthoritySeatScope(envelope.authority, resolvedSeats.map((target) => target.seatId));
+
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: current.room.aggregateVersion + 1,
+          updatedAt: envelope.issuedAt,
+        },
+      };
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion: next.room.aggregateVersion,
+          updatedAt: next.room.updatedAt,
+        })
+        .where(and(
+          eq(operationalRooms.id, envelope.roomId),
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.aggregateVersion, envelope.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent routed-message update rejected for Room ${envelope.roomId}`,
+          { expected: envelope.expectedAggregateVersion },
+        );
+      }
+
+      const messageId = `room-message-${randomUUID()}`;
+      await tx.insert(roomMessages).values({
+        id: messageId,
+        projectId: this.projectId,
+        roomId: envelope.roomId,
+        turnId: current.activeTurnId,
+        nodeId: envelope.command.nodeId,
+        originType: "operator",
+        originId: envelope.authority.actorId,
+        intent: envelope.command.intent,
+        target: envelope.command.target,
+        targetSeatIds: resolvedSeats.map((target) => target.seatId),
+        authority: envelope.authority,
+        content: envelope.command.content,
+        contentHash: envelope.command.contentHash,
+        evidenceRefs: envelope.authority.evidenceRefs,
+        idempotencyKey: envelope.idempotencyKey,
+        expectedAggregateVersion: envelope.expectedAggregateVersion,
+        createdAt: envelope.issuedAt,
+      });
+
+      const selectorRef = envelope.command.target.kind === "group"
+        ? envelope.command.target.groupId
+        : null;
+      const targetValues = envelope.command.target.kind === "controller"
+        ? [{
+            id: `room-message-target-${randomUUID()}`,
+            projectId: this.projectId,
+            roomId: envelope.roomId,
+            messageId,
+            selectorKind: "controller" as const,
+            selectorRef: null,
+            targetKind: "controller" as const,
+            seatId: null,
+            bindingId: null,
+            ordinal: 0,
+            createdAt: envelope.issuedAt,
+          }]
+        : resolvedSeats.map((target, ordinal) => ({
+            id: `room-message-target-${randomUUID()}`,
+            projectId: this.projectId,
+            roomId: envelope.roomId,
+            messageId,
+            selectorKind: envelope.command.target.kind,
+            selectorRef,
+            targetKind: "seat" as const,
+            seatId: target.seatId,
+            bindingId: target.bindingId,
+            ordinal,
+            createdAt: envelope.issuedAt,
+          }));
+      await tx.insert(roomMessageTargets).values(targetValues);
+
+      const outboxValues = resolvedSeats.map((target) => {
+        const idempotencyKey = `${envelope.idempotencyKey}:${target.bindingId}`;
+        return {
+          id: `room-outbox-${randomUUID()}`,
+          projectId: this.projectId,
+          roomId: envelope.roomId,
+          messageId,
+          bindingId: target.bindingId,
+          logicalMessageId: messageId,
+          localMessageId: buildRoomConnectorLocalMessageId({
+            logicalMessageId: messageId,
+            bindingId: target.bindingId,
+            idempotencyKey,
+            payloadHash: envelope.command.contentHash,
+          }),
+          idempotencyKey,
+          payloadHash: envelope.command.contentHash,
+          deliveryState: "pending",
+          nativeAcknowledgement: null,
+          nativeCursor: null,
+          reconciliationFromCursor: null,
+          reconciliationEvidenceRef: null,
+          attemptCount: 0,
+          lastErrorCode: null,
+          nextAttemptAt: null,
+          createdAt: envelope.issuedAt,
+          updatedAt: envelope.issuedAt,
+        };
+      });
+      if (outboxValues.length > 0) await tx.insert(roomOutbox).values(outboxValues);
+
+      const event = await insertRoomEvent(
+        tx,
+        next,
+        "message_routed",
+        {
+          eventId: `room-event-${randomUUID()}`,
+          actorType: envelope.authority.actorType,
+          actorId: envelope.authority.actorId,
+          correlationId: envelope.correlationId,
+          causationId: envelope.commandId,
+          occurredAt: envelope.issuedAt,
+        },
+        {
+          projectionVersion: 1,
+          messageId,
+          targetIds: targetValues.map((target) => target.id),
+          outboxIds: outboxValues.map((delivery) => delivery.id),
+          target: envelope.command.target,
+          updatedAt: next.room.updatedAt,
+        },
+      );
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(and(
+          eq(roomIdempotencyKeys.id, reservationId),
+          eq(roomIdempotencyKeys.projectId, this.projectId),
+        ))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind idempotency key ${envelope.idempotencyKey} to event ${event.id}`,
+        );
+      }
+      const result = await loadRouteOperatorMessageResult(tx, this.projectId, event.id);
+      return { result: { ...result, replayed: false }, eventToPublish: event };
+    });
+
+    if (committed.eventToPublish) this.publishCommittedEvent(committed.eventToPublish);
+    return committed.result;
+  }
+
   /**
    * Persist one logical message, every native delivery intent, and the causal
    * Room event atomically. A replay with the same key returns the first result;
@@ -3518,6 +3884,18 @@ export class AsyncRoomStore {
 }
 
 type LoadedEnqueueMessageResult = Omit<EnqueueRoomMessageResult, "replayed">;
+type LoadedRouteOperatorMessageResult = Omit<RouteOperatorMessageResultV1, "replayed">;
+type RouteOperatorMessageEnvelopeV1 = Omit<RoomControllerCommandEnvelopeV1, "command"> & {
+  readonly command: Extract<
+    RoomControllerCommandEnvelopeV1["command"],
+    { readonly type: "route_message" }
+  >;
+};
+
+interface ResolvedOperatorMessageSeat {
+  readonly seatId: string;
+  readonly bindingId: string;
+}
 
 async function loadInitialRoomCreationResult(
   handle: QueryHandle,
@@ -3695,6 +4073,312 @@ async function loadEnqueueMessageResult(
   };
 }
 
+async function loadRouteOperatorMessageResult(
+  handle: QueryHandle,
+  projectId: string,
+  eventId: string,
+): Promise<LoadedRouteOperatorMessageResult> {
+  const eventRows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.id, eventId)))
+    .limit(1);
+  const eventRow = eventRows[0];
+  if (!eventRow || eventRow.eventType !== "message_routed") {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed routed-message event ${eventId} no longer exists`,
+    );
+  }
+  const payload = asRecord(eventRow.payload);
+  const messageId = typeof payload.messageId === "string" ? payload.messageId : undefined;
+  const targetIds = asStringArray(payload.targetIds);
+  const outboxIds = asStringArray(payload.outboxIds);
+  if (!messageId || targetIds.length === 0) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Routed-message event ${eventId} does not identify its message and frozen targets`,
+    );
+  }
+
+  const messageRows = await handle
+    .select()
+    .from(roomMessages)
+    .where(and(
+      eq(roomMessages.projectId, projectId),
+      eq(roomMessages.roomId, eventRow.roomId),
+      eq(roomMessages.id, messageId),
+    ))
+    .limit(1);
+  const messageRow = messageRows[0];
+  if (
+    !messageRow
+    || messageRow.idempotencyKey === null
+    || messageRow.expectedAggregateVersion === null
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Routed Room message ${messageId} for event ${eventId} no longer exists`,
+    );
+  }
+
+  const targetRows = await handle
+    .select()
+    .from(roomMessageTargets)
+    .where(and(
+      eq(roomMessageTargets.projectId, projectId),
+      eq(roomMessageTargets.roomId, eventRow.roomId),
+      eq(roomMessageTargets.messageId, messageId),
+    ));
+  const targetsById = new Map(targetRows.map((row) => [row.id, row]));
+  const orderedTargetRows = targetIds.map((id) => targetsById.get(id));
+  if (
+    orderedTargetRows.some((row) => row === undefined)
+    || targetRows.length !== targetIds.length
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `One or more frozen targets for routed-message event ${eventId} no longer exist`,
+    );
+  }
+  const targets = orderedTargetRows.map((row) => rowToDurableMessageTarget(row!));
+
+  let deliveries: readonly RoomOutboxRecordV1[] = [];
+  if (outboxIds.length > 0) {
+    const outboxRows = await handle
+      .select()
+      .from(roomOutbox)
+      .where(and(
+        eq(roomOutbox.projectId, projectId),
+        eq(roomOutbox.roomId, eventRow.roomId),
+        inArray(roomOutbox.id, outboxIds),
+      ));
+    const outboxById = new Map(outboxRows.map((row) => [row.id, row]));
+    const orderedOutboxRows = outboxIds.map((id) => outboxById.get(id));
+    if (orderedOutboxRows.some((row) => row === undefined)) {
+      throw new RoomStoreError(
+        "idempotency_result_missing",
+        `One or more outbox rows for routed-message event ${eventId} no longer exist`,
+      );
+    }
+    deliveries = orderedOutboxRows.map((row) => rowToOutboxRecord(row!));
+  }
+
+  return {
+    message: rowToStoredRoutedOperatorMessage(messageRow, targets),
+    targets,
+    deliveries,
+    event: rowToRoomEvent(eventRow),
+  };
+}
+
+async function loadDurableMessageTargets(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  messageId: string,
+): Promise<DurableRoomMessageTargetV1[]> {
+  const rows = await handle
+    .select()
+    .from(roomMessageTargets)
+    .where(and(
+      eq(roomMessageTargets.projectId, projectId),
+      eq(roomMessageTargets.roomId, roomId),
+      eq(roomMessageTargets.messageId, messageId),
+    ))
+    .orderBy(asc(roomMessageTargets.ordinal));
+  return rows.map(rowToDurableMessageTarget);
+}
+
+function assertRouteOperatorMessageEnvelope(
+  envelope: RoomControllerCommandEnvelopeV1,
+  projectId: string,
+): asserts envelope is RouteOperatorMessageEnvelopeV1 {
+  const candidate = envelope as unknown;
+  if (!isRuntimeRecord(candidate)) {
+    throwInvalidRoutingCommand();
+  }
+  const authority = candidate.authority;
+  const command = candidate.command;
+  if (
+    !isRuntimeRecord(authority)
+    || !isRuntimeRecord(command)
+    || candidate.contractVersion !== 1
+    || candidate.apiVersion !== "room.v1"
+    || command.type !== "route_message"
+    || candidate.projectId !== projectId
+    || authority.projectId !== projectId
+    || authority.roomId !== candidate.roomId
+    || authority.actorType !== "human"
+    || !isUniqueNonBlankStringArray(authority.allowedActions)
+    || !authority.allowedActions.includes("room:message:route")
+    || !isNonBlankString(candidate.commandId)
+    || !isNonBlankString(candidate.idempotencyKey)
+    || !isNonBlankString(candidate.correlationId)
+    || !isNonBlankString(candidate.roomId)
+    || !isCanonicalUtcIsoTimestamp(candidate.issuedAt)
+    || !isNonBlankString(authority.actorId)
+    || !(authority.deviceId === null || isNonBlankString(authority.deviceId))
+    || !isNonBlankString(authority.role)
+    || !isUniqueNonBlankStringArray(authority.nodeIds)
+    || !isUniqueNonBlankStringArray(authority.seatIds)
+    || !isUniqueNonBlankStringArray(authority.evidenceRefs)
+    || !Number.isSafeInteger(candidate.expectedAggregateVersion)
+    || (candidate.expectedAggregateVersion as number) < 0
+    || !isRoomMessageIntent(command.intent)
+    || !isRoomMessageTarget(command.target)
+    || typeof command.content !== "string"
+    || !isNonBlankString(command.contentHash)
+    || !(command.nodeId === null || isNonBlankString(command.nodeId))
+  ) {
+    throwInvalidRoutingCommand();
+  }
+  const routedCommand = envelope.command as RouteOperatorMessageEnvelopeV1["command"];
+  if (hashRoomValue(routedCommand.content) !== routedCommand.contentHash) {
+    throw new RoomStoreError(
+      "routing_command_invalid",
+      "Routed operator message content does not match its declared content hash",
+    );
+  }
+  if (
+    routedCommand.nodeId !== null
+    && !envelope.authority.nodeIds.includes(routedCommand.nodeId)
+  ) {
+    throw new RoomStoreError(
+      "authority_scope_violation",
+      `Authority envelope does not permit routed messages for node ${routedCommand.nodeId}`,
+    );
+  }
+}
+
+const ROOM_MESSAGE_INTENTS = new Set<RoomMessageIntent>([
+  "instruction",
+  "proposal",
+  "question",
+  "critique",
+  "challenge",
+  "verdict",
+  "handoff",
+  "help_request",
+]);
+
+function throwInvalidRoutingCommand(): never {
+  throw new RoomStoreError(
+    "routing_command_invalid",
+    "Routed operator message requires a canonical v1 timestamp, intent, target, authority, project, Room, action, actor, and aggregate version",
+  );
+}
+
+function isRuntimeRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isUniqueNonBlankStringArray(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.every(isNonBlankString)
+    && new Set(value).size === value.length;
+}
+
+function isCanonicalUtcIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function isRoomMessageIntent(value: unknown): value is RoomMessageIntent {
+  return typeof value === "string" && ROOM_MESSAGE_INTENTS.has(value as RoomMessageIntent);
+}
+
+function isRoomMessageTarget(value: unknown): value is RoomMessageTargetV1 {
+  if (!isRuntimeRecord(value)) return false;
+  if (value.kind === "controller" || value.kind === "all") return true;
+  if (value.kind === "group") {
+    return typeof value.groupId === "string" && /^role:[^:\s][^\s]*$/u.test(value.groupId);
+  }
+  if (value.kind === "seats") {
+    return isUniqueNonBlankStringArray(value.seatIds) && value.seatIds.length > 0;
+  }
+  return false;
+}
+
+function resolveOperatorMessageTargets(
+  aggregate: RoomAggregateV1,
+  target: RoomMessageTargetV1,
+): ResolvedOperatorMessageSeat[] {
+  if (target.kind === "controller") return [];
+
+  let seats: RoomAggregateV1["seats"];
+  if (target.kind === "all") {
+    seats = aggregate.seats.filter(isOperatorMessageSeatRoutable);
+    if (seats.length === 0) {
+      throw new RoomStoreError(
+        "routing_target_not_found",
+        `Room ${aggregate.room.id} has no routable seats`,
+      );
+    }
+  } else if (target.kind === "group") {
+    const role = target.groupId.slice("role:".length);
+    seats = aggregate.seats.filter((seat) => isOperatorMessageSeatRoutable(seat) && seat.role === role);
+    if (seats.length === 0) {
+      throw new RoomStoreError(
+        "routing_group_not_found",
+        `Room ${aggregate.room.id} has no routable ${target.groupId} group`,
+      );
+    }
+  } else {
+    seats = target.seatIds.map((seatId) => {
+      const seat = aggregate.seats.find((candidate) => candidate.id === seatId);
+      if (!seat || !isOperatorMessageSeatRoutable(seat)) {
+        throw new RoomStoreError(
+          "routing_target_not_found",
+          `Room ${aggregate.room.id} has no routable seat ${seatId}`,
+        );
+      }
+      return seat;
+    });
+  }
+
+  return seats.map((seat) => {
+    const binding = seat.activeBindingId === null
+      ? undefined
+      : aggregate.bindings.find((candidate) => candidate.id === seat.activeBindingId);
+    if (!binding || binding.seatId !== seat.id || binding.state !== "attached") {
+      throw new RoomStoreError(
+        "routing_target_not_found",
+        `Active seat ${seat.id} has no attached current binding`,
+      );
+    }
+    return { seatId: seat.id, bindingId: binding.id };
+  });
+}
+
+function isOperatorMessageSeatRoutable(
+  seat: RoomAggregateV1["seats"][number],
+): boolean {
+  // Exact existing Sessions are durably attached while their seats are still
+  // ready. Allow operator priming before the first turn, but never route new
+  // provider work to paused, waiting, lost, pending, or removed membership.
+  return seat.state === "ready" || seat.state === "active";
+}
+
+function assertAuthoritySeatScope(
+  authority: RoomAuthorityEnvelopeV1,
+  targetSeatIds: readonly string[],
+): void {
+  const authorizedSeatIds = new Set(authority.seatIds);
+  const unauthorizedSeatId = targetSeatIds.find((seatId) => !authorizedSeatIds.has(seatId));
+  if (unauthorizedSeatId) {
+    throw new RoomStoreError(
+      "authority_scope_violation",
+      `Authority envelope does not permit routed messages to seat ${unauthorizedSeatId}`,
+    );
+  }
+}
+
 function validateMessageDeliveries(
   aggregate: RoomAggregateV1,
   input: EnqueueRoomMessageInput,
@@ -3767,6 +4451,57 @@ function rowToStoredMessage(row: typeof roomMessages.$inferSelect): StoredRoomMe
     authorityEnvelope: asRecord(row.authority),
     createdAt: row.createdAt,
     content: row.content,
+  };
+}
+
+function rowToStoredRoutedOperatorMessage(
+  row: typeof roomMessages.$inferSelect,
+  targets: readonly DurableRoomMessageTargetV1[],
+): StoredRoutedOperatorMessageV1 {
+  if (row.idempotencyKey === null || row.expectedAggregateVersion === null) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Room message ${row.id} is missing routed-command provenance`,
+    );
+  }
+  return {
+    contractVersion: 1,
+    id: row.id,
+    roomId: row.roomId,
+    turnId: row.turnId,
+    nodeId: row.nodeId,
+    originType: row.originType as StoredRoutedOperatorMessageV1["originType"],
+    originId: row.originId,
+    targetSeatIds: targets
+      .filter((target) => target.targetKind === "seat" && target.seatId !== null)
+      .map((target) => target.seatId!),
+    intent: row.intent,
+    contentHash: row.contentHash,
+    authorityEnvelope: asRecord(row.authority) as unknown as RoomAuthorityEnvelopeV1,
+    createdAt: row.createdAt,
+    content: row.content,
+    target: asRecord(row.target) as unknown as RoomMessageTargetV1,
+    idempotencyKey: row.idempotencyKey,
+    expectedAggregateVersion: Number(row.expectedAggregateVersion),
+  };
+}
+
+function rowToDurableMessageTarget(
+  row: typeof roomMessageTargets.$inferSelect,
+): DurableRoomMessageTargetV1 {
+  return {
+    contractVersion: 1,
+    id: row.id,
+    projectId: row.projectId,
+    roomId: row.roomId,
+    messageId: row.messageId,
+    selectorKind: row.selectorKind as DurableRoomMessageTargetV1["selectorKind"],
+    selectorRef: row.selectorRef,
+    targetKind: row.targetKind as DurableRoomMessageTargetV1["targetKind"],
+    seatId: row.seatId,
+    bindingId: row.bindingId,
+    ordinal: row.ordinal,
+    createdAt: row.createdAt,
   };
 }
 

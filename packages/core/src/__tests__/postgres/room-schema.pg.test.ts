@@ -22,6 +22,7 @@ import {
   SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
   SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
   SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+  SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
   SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
@@ -172,6 +173,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -186,6 +188,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -558,6 +561,109 @@ describe("Session Room PostgreSQL migration", () => {
     }]);
   });
 
+  it("upgrades existing 0010 messages with durable routing targets and nullable provenance", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await context.connections!.migration.execute(sql.raw(`
+      DROP TABLE IF EXISTS project.room_message_targets;
+      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+      WHERE version = '${SCHEMA_ROOM_MESSAGE_ROUTING_VERSION}';
+
+      ALTER TABLE project.room_messages
+        DROP CONSTRAINT IF EXISTS room_messages_id_room_project_unique,
+        DROP COLUMN IF EXISTS target_seat_ids,
+        DROP COLUMN IF EXISTS idempotency_key,
+        DROP COLUMN IF EXISTS expected_aggregate_version;
+
+      ALTER TABLE project.room_seats
+        DROP CONSTRAINT IF EXISTS room_seats_id_room_project_unique;
+
+      ALTER TABLE project.room_bindings
+        DROP CONSTRAINT IF EXISTS room_bindings_id_seat_room_project_unique;
+
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-routing-upgrade', 'project-routing-upgrade', 'routing upgrade',
+        'implementation', 1, 'running',
+        '2026-07-18T03:00:00.000Z', '2026-07-18T03:00:00.000Z'
+      );
+
+      INSERT INTO project.room_seats (
+        id, project_id, room_id, role, state, created_at, updated_at
+      ) VALUES (
+        'seat-routing-upgrade', 'project-routing-upgrade', 'room-routing-upgrade',
+        'reviewer', 'active',
+        '2026-07-18T03:00:00.000Z', '2026-07-18T03:00:00.000Z'
+      );
+
+      INSERT INTO project.room_bindings (
+        id, project_id, room_id, seat_id, generation, connector_id,
+        provider_id, native_session_id, host_id, state, attached_at
+      ) VALUES (
+        'binding-routing-upgrade', 'project-routing-upgrade', 'room-routing-upgrade',
+        'seat-routing-upgrade', 1, 'happier', 'codex',
+        'native-routing-upgrade', 'windows-host-routing-upgrade', 'attached',
+        '2026-07-18T03:00:00.000Z'
+      );
+
+      INSERT INTO project.room_messages (
+        id, project_id, room_id, origin_type, origin_id, intent,
+        target, authority, content, content_hash, created_at
+      ) VALUES (
+        'message-routing-upgrade', 'project-routing-upgrade', 'room-routing-upgrade',
+        'operator', 'operator-routing-upgrade', 'instruction',
+        '{"kind":"seats","seatIds":["seat-routing-upgrade"]}'::jsonb,
+        '{}'::jsonb, 'legacy routed message', 'sha256:routing-upgrade',
+        '2026-07-18T03:01:00.000Z'
+      );
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_MESSAGE_ROUTING_VERSION]);
+
+    const messages = (await context.connections!.migration.execute(sql`
+      SELECT target_seat_ids, idempotency_key, expected_aggregate_version
+      FROM project.room_messages
+      WHERE id = 'message-routing-upgrade'
+    `)) as unknown as Array<{
+      target_seat_ids: string[];
+      idempotency_key: string | null;
+      expected_aggregate_version: number | null;
+    }>;
+    expect(messages).toEqual([{
+      target_seat_ids: ["seat-routing-upgrade"],
+      idempotency_key: null,
+      expected_aggregate_version: null,
+    }]);
+
+    await context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_message_targets (
+        id, project_id, room_id, message_id, selector_kind, selector_ref,
+        target_kind, seat_id, binding_id, ordinal, created_at
+      ) VALUES (
+        'target-routing-upgrade', 'project-routing-upgrade', 'room-routing-upgrade',
+        'message-routing-upgrade', 'group', 'role:reviewer', 'seat',
+        'seat-routing-upgrade', 'binding-routing-upgrade', 0,
+        '2026-07-18T03:01:00.000Z'
+      )
+    `));
+    const targets = (await context.connections!.migration.execute(sql`
+      SELECT selector_kind, selector_ref, target_kind, seat_id, binding_id, ordinal
+      FROM project.room_message_targets
+      WHERE message_id = 'message-routing-upgrade'
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(targets).toEqual([{
+      selector_kind: "group",
+      selector_ref: "role:reviewer",
+      target_kind: "seat",
+      seat_id: "seat-routing-upgrade",
+      binding_id: "binding-routing-upgrade",
+      ordinal: 0,
+    }]);
+  });
+
   it("upgrades an existing 0000 database without replaying the baseline", async () => {
     const context = await startEmbeddedDatabase();
     await context.connections!.migration.execute(sql.raw(`
@@ -583,6 +689,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -618,6 +725,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -672,6 +780,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -753,6 +862,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -902,6 +1012,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
     ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable

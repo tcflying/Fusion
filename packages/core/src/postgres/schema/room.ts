@@ -68,6 +68,7 @@ export const roomSeats = roomSchema.table("room_seats", {
     name: "room_seats_room_project_fkey",
   }).onDelete("cascade"),
   unique("room_seats_room_id_unique").on(t.roomId, t.id),
+  unique("room_seats_id_room_project_unique").on(t.id, t.roomId, t.projectId),
   index("idx_room_seats_project_room_state").on(t.projectId, t.roomId, t.state),
   check("room_seats_state_check", sql`${t.state} IN ('pending','ready','active','paused','waiting','lost','removed')`),
 ]);
@@ -101,6 +102,7 @@ export const roomBindings = roomSchema.table("room_bindings", {
     name: "room_bindings_seat_fkey",
   }).onDelete("cascade"),
   unique("room_bindings_id_room_project_unique").on(t.id, t.roomId, t.projectId),
+  unique("room_bindings_id_seat_room_project_unique").on(t.id, t.seatId, t.roomId, t.projectId),
   unique("room_bindings_seat_generation_unique").on(t.seatId, t.generation),
   index("idx_room_bindings_native_session").on(t.providerId, t.nativeSessionId),
   index("idx_room_bindings_room_state").on(t.projectId, t.roomId, t.state),
@@ -320,7 +322,10 @@ export const roomMessages = roomSchema.table("room_messages", {
   originId: text("origin_id").notNull(),
   intent: text("intent").notNull(),
   target: jsonb("target").notNull(),
+  targetSeatIds: jsonb("target_seat_ids").notNull().default([]),
   authority: jsonb("authority").notNull(),
+  idempotencyKey: text("idempotency_key"),
+  expectedAggregateVersion: bigint("expected_aggregate_version", { mode: "number" }),
   content: text("content").notNull(),
   contentHash: text("content_hash").notNull(),
   evidenceRefs: jsonb("evidence_refs").notNull().default([]),
@@ -331,8 +336,52 @@ export const roomMessages = roomSchema.table("room_messages", {
     foreignColumns: [operationalRooms.id, operationalRooms.projectId],
     name: "room_messages_room_project_fkey",
   }).onDelete("cascade"),
+  unique("room_messages_id_room_project_unique").on(t.id, t.roomId, t.projectId),
   index("idx_room_messages_room_time").on(t.projectId, t.roomId, t.createdAt, t.id),
   index("idx_room_messages_turn").on(t.turnId),
+  check("room_messages_target_seat_ids_check", sql`jsonb_typeof(${t.targetSeatIds}) = 'array'`),
+  check("room_messages_expected_aggregate_version_check", sql`${t.expectedAggregateVersion} IS NULL OR ${t.expectedAggregateVersion} BETWEEN 0 AND 9007199254740991`),
+]);
+
+/*
+FNXC:SessionRoomMessageRouting 2026-07-18-11:26:
+Routed operator messages must freeze their resolved controller/seat targets and active binding lineage at command commit. The selector remains on room_messages for backward-compatible reads, while these ordered target rows prevent later membership changes from rewriting delivery history.
+*/
+export const roomMessageTargets = roomSchema.table("room_message_targets", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  messageId: text("message_id").notNull(),
+  selectorKind: text("selector_kind").notNull(),
+  selectorRef: text("selector_ref"),
+  targetKind: text("target_kind").notNull(),
+  seatId: text("seat_id"),
+  bindingId: text("binding_id"),
+  ordinal: integer("ordinal").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.messageId, t.roomId, t.projectId],
+    foreignColumns: [roomMessages.id, roomMessages.roomId, roomMessages.projectId],
+    name: "room_message_targets_message_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.seatId, t.roomId, t.projectId],
+    foreignColumns: [roomSeats.id, roomSeats.roomId, roomSeats.projectId],
+    name: "room_message_targets_seat_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.bindingId, t.seatId, t.roomId, t.projectId],
+    foreignColumns: [roomBindings.id, roomBindings.seatId, roomBindings.roomId, roomBindings.projectId],
+    name: "room_message_targets_binding_seat_room_project_fkey",
+  }).onDelete("restrict"),
+  unique("room_message_targets_message_ordinal_unique").on(t.messageId, t.ordinal),
+  unique("room_message_targets_message_seat_unique").on(t.messageId, t.seatId),
+  index("idx_room_message_targets_room_message").on(t.projectId, t.roomId, t.messageId, t.ordinal),
+  check("room_message_targets_selector_kind_check", sql`${t.selectorKind} IN ('controller','all','group','seats')`),
+  check("room_message_targets_target_kind_check", sql`${t.targetKind} IN ('controller','seat')`),
+  check("room_message_targets_ordinal_check", sql`${t.ordinal} >= 0`),
+  check("room_message_targets_selector_ref_check", sql`(${t.selectorKind} = 'group' AND ${t.selectorRef} IS NOT NULL AND btrim(${t.selectorRef}) <> '') OR (${t.selectorKind} <> 'group' AND ${t.selectorRef} IS NULL)`),
+  check("room_message_targets_shape_check", sql`(${t.selectorKind} = 'controller' AND ${t.targetKind} = 'controller' AND ${t.seatId} IS NULL AND ${t.bindingId} IS NULL AND ${t.ordinal} = 0) OR (${t.selectorKind} IN ('all','group','seats') AND ${t.targetKind} = 'seat' AND ${t.seatId} IS NOT NULL AND ${t.bindingId} IS NOT NULL)`),
 ]);
 
 export const roomOutbox = roomSchema.table("room_outbox", {
@@ -716,6 +765,7 @@ export const ROOM_PROJECT_TABLE_NAMES = [
   "room_task_nodes",
   "room_task_edges",
   "room_messages",
+  "room_message_targets",
   "room_outbox",
   "room_outbox_attempts",
   "room_inbox_receipts",

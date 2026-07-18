@@ -17,6 +17,7 @@ import {
   roomInboxReceipts,
   roomLeases,
   roomMembershipChanges,
+  roomMessageTargets,
   roomMessages,
   roomOutbox,
   roomOutboxAttempts,
@@ -46,6 +47,7 @@ describe("Session Room PostgreSQL schema", () => {
       "room_task_nodes",
       "room_task_edges",
       "room_messages",
+      "room_message_targets",
       "room_outbox",
       "room_outbox_attempts",
       "room_inbox_receipts",
@@ -74,6 +76,7 @@ describe("Session Room PostgreSQL schema", () => {
       roomTaskNodes,
       roomTaskEdges,
       roomMessages,
+      roomMessageTargets,
       roomOutbox,
       roomOutboxAttempts,
       roomInboxReceipts,
@@ -93,7 +96,7 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"]);
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"]);
     const roomSql = await readSchemaMigrationSql("0001");
     const ownershipSql = await readSchemaMigrationSql("0002");
     const outboxIdentitySql = await readSchemaMigrationSql("0003");
@@ -104,8 +107,12 @@ describe("Session Room PostgreSQL schema", () => {
     const roomRunAuditOutboxSql = await readSchemaMigrationSql("0008");
     const membershipProductionInvariantsSql = await readSchemaMigrationSql("0009");
     const nativeSenderTakeoverSql = await readSchemaMigrationSql("0010");
+    const messageRoutingSql = await readSchemaMigrationSql("0011");
 
-    for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => name !== "room_binding_ingestion_state")) {
+    for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => ![
+      "room_binding_ingestion_state",
+      "room_message_targets",
+    ].includes(name))) {
       expect(roomSql).toContain(`project.${tableName}`);
     }
     expect(roomSql).toContain("UNIQUE (room_id, aggregate_version)");
@@ -133,6 +140,37 @@ describe("Session Room PostgreSQL schema", () => {
     expect(nativeSenderTakeoverSql).toContain("takeover_id");
     expect(nativeSenderTakeoverSql).toContain("blocked_outbox_ids");
     expect(nativeSenderTakeoverSql).toContain("room_binding_ingestion_takeover_projection_check");
+    expect(messageRoutingSql).toContain("project.room_message_targets");
+    expect(messageRoutingSql).toContain("room_bindings_id_seat_room_project_unique");
+    expect(messageRoutingSql).toContain("target_seat_ids");
+    expect(messageRoutingSql).toContain("idempotency_key");
+    expect(messageRoutingSql).toContain("expected_aggregate_version");
+  });
+
+  it("models durable routed-message targets and backward-compatible provenance", () => {
+    expect({
+      targetSeatIds: roomMessages.targetSeatIds.name,
+      idempotencyKey: roomMessages.idempotencyKey.name,
+      expectedAggregateVersion: roomMessages.expectedAggregateVersion.name,
+      messageId: roomMessageTargets.messageId.name,
+      selectorKind: roomMessageTargets.selectorKind.name,
+      selectorRef: roomMessageTargets.selectorRef.name,
+      targetKind: roomMessageTargets.targetKind.name,
+      seatId: roomMessageTargets.seatId.name,
+      bindingId: roomMessageTargets.bindingId.name,
+      ordinal: roomMessageTargets.ordinal.name,
+    }).toEqual({
+      targetSeatIds: "target_seat_ids",
+      idempotencyKey: "idempotency_key",
+      expectedAggregateVersion: "expected_aggregate_version",
+      messageId: "message_id",
+      selectorKind: "selector_kind",
+      selectorRef: "selector_ref",
+      targetKind: "target_kind",
+      seatId: "seat_id",
+      bindingId: "binding_id",
+      ordinal: "ordinal",
+    });
   });
 
   it("models the native IDE sender takeover projection on binding ingestion state", () => {

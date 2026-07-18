@@ -2,11 +2,14 @@ import type {
   AsyncRoomStore,
   CreateRoomWithExistingBindingsInput,
   RoomAggregateV1,
+  RoomAuthorityEnvelopeV1,
   RoomBindingRecordV1,
-  RoomCommandContext,
+  RoomMessageIntent,
   RoomOutboxRecordV1,
+  RouteOperatorMessageResultV1,
   SessionConnectorIdentityV1,
 } from "@fusion/core";
+import { hashRoomValue } from "@fusion/core";
 
 import {
   RoomSessionConnectorIngestionPersistence,
@@ -41,7 +44,7 @@ export class RoomExistingSessionSpineError extends Error {
 
 export type RoomExistingSessionStore = Pick<
   AsyncRoomStore,
-  "createRoomWithExistingBindings" | "getRoom" | "enqueueMessage"
+  "createRoomWithExistingBindings" | "getRoom" | "routeOperatorMessage"
 > & RoomConnectorIngestionStore;
 
 export interface ExactExistingSessionSeatRequest {
@@ -65,12 +68,12 @@ export interface SendToRoomSeatInput {
   readonly roomId: string;
   readonly seatId: string;
   readonly expectedAggregateVersion: number;
-  readonly messageId: string;
-  readonly outboxId: string;
+  readonly commandId: string;
+  readonly correlationId: string;
   readonly idempotencyKey: string;
-  readonly intent: string;
+  readonly intent: RoomMessageIntent;
   readonly content: string;
-  readonly authorityEnvelope: Readonly<Record<string, unknown>>;
+  readonly authorityEnvelope: RoomAuthorityEnvelopeV1;
 }
 
 export interface IngestRoomSeatInput {
@@ -96,12 +99,14 @@ Initial membership requires two or more exact existing Sessions; every ensure
 must finish and prove connector, host, and machine identity before the atomic
 Room/binding transaction starts. This path never invokes connector creation.
 
-FNXC:SessionRoomExistingSpine 2026-07-18-10:28:
-Targeted sends resolve the seat's persisted active binding and commit exactly
-one pending outbox delivery. The durable recovery worker is the sole owner of
-sender-lease acquisition and provider dispatch; this seam never becomes a
-second sender. Restore reads only durable Room state, while ingestion reloads
-durable cursors through the event-first/history-repair path.
+FNXC:SessionRoomExistingSpine 2026-07-18-11:53:
+Targeted sends delegate one complete typed operator command to the canonical
+Room routing transaction. That transaction freezes the seat/binding lineage
+and commits the message, durable target, and pending outbox intent together.
+The durable recovery worker is the sole owner of sender-lease acquisition and
+provider dispatch; this seam never becomes a second sender. Restore reads only
+durable Room state, while ingestion reloads durable cursors through the
+event-first/history-repair path.
 The integration suite uses deterministic doubles and is not live-provider proof.
 */
 export class RoomExistingSessionSpine {
@@ -201,39 +206,33 @@ export class RoomExistingSessionSpine {
   }
 
   async sendToSeat(input: SendToRoomSeatInput): Promise<RoomOutboxRecordV1> {
-    const room = await this.requireRoom(input.roomId);
-    const binding = activeBindingForSeat(room, input.seatId);
-    assertAuthorityTargetsSeat(input.authorityEnvelope, input.seatId);
+    requireNonEmpty(input.roomId, "roomId");
+    requireNonEmpty(input.seatId, "seatId");
+    requireNonEmpty(input.commandId, "commandId");
+    requireNonEmpty(input.correlationId, "correlationId");
+    requireNonEmpty(input.idempotencyKey, "idempotencyKey");
     const occurredAt = this.now();
-    const actor = authorityActor(input.authorityEnvelope);
-    const queued = await this.options.roomStore.enqueueMessage({
-      roomId: room.room.id,
-      expectedAggregateVersion: input.expectedAggregateVersion,
+    const routed = await this.options.roomStore.routeOperatorMessage({
+      contractVersion: 1,
+      apiVersion: "room.v1",
+      commandId: input.commandId,
       idempotencyKey: input.idempotencyKey,
-      message: {
-        id: input.messageId,
-        turnId: null,
-        nodeId: null,
-        originType: originTypeForActor(actor.actorType),
-        originId: actor.actorId,
-        targetSeatIds: [input.seatId],
+      correlationId: input.correlationId,
+      projectId: this.options.projectId,
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      issuedAt: occurredAt,
+      authority: input.authorityEnvelope,
+      command: {
+        type: "route_message",
+        target: { kind: "seats", seatIds: [input.seatId] },
         intent: input.intent,
+        nodeId: null,
         content: input.content,
-        authorityEnvelope: input.authorityEnvelope,
-        createdAt: occurredAt,
+        contentHash: hashRoomValue(input.content),
       },
-      deliveries: [{ id: input.outboxId, bindingId: binding.id }],
-    }, {
-      eventId: `room-existing-session:${input.messageId}:queued`,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      correlationId: input.idempotencyKey,
-      causationId: null,
-      occurredAt,
     });
-
-    const delivery = requireExactDelivery(queued.deliveries, input.outboxId, binding.id);
-    return delivery;
+    return requireExactRoutedSeatDelivery(routed, input.seatId);
   }
 
   async ingestSeat(input: IngestRoomSeatInput): Promise<SessionConnectorIngestionResult> {
@@ -404,70 +403,26 @@ function identityFromBinding(binding: RoomBindingRecordV1): SessionConnectorIden
   };
 }
 
-function assertAuthorityTargetsSeat(
-  envelope: Readonly<Record<string, unknown>>,
+function requireExactRoutedSeatDelivery(
+  routed: RouteOperatorMessageResultV1,
   seatId: string,
-): void {
-  const targets = envelope.targetSeatIds;
-  const allowedActions = envelope.allowedActions;
-  if (
-    !Array.isArray(targets)
-    || targets.length !== 1
-    || targets[0] !== seatId
-    || !Array.isArray(allowedActions)
-    || !allowedActions.includes("session:send")
-  ) {
-    throw new RoomExistingSessionSpineError(
-      "ROOM_EXISTING_SESSION_AUTHORITY_CONFLICT",
-      "The authority envelope must authorize only the exact targeted seat and Session send",
-    );
-  }
-}
-
-function authorityActor(envelope: Readonly<Record<string, unknown>>): {
-  readonly actorType: RoomCommandContext["actorType"];
-  readonly actorId: string;
-} {
-  const actorType = envelope.actorType;
-  const actorId = envelope.actorId;
-  if (
-    !["human", "controller", "seat", "system", "evolution"].includes(String(actorType))
-    || typeof actorId !== "string"
-    || !actorId.trim()
-  ) {
-    throw new RoomExistingSessionSpineError(
-      "ROOM_EXISTING_SESSION_AUTHORITY_CONFLICT",
-      "The authority envelope requires a typed non-empty actor identity",
-    );
-  }
-  return {
-    actorType: actorType as RoomCommandContext["actorType"],
-    actorId,
-  };
-}
-
-function originTypeForActor(
-  actorType: RoomCommandContext["actorType"],
-): "operator" | "controller" | "seat" {
-  if (actorType === "human") return "operator";
-  if (actorType === "seat") return "seat";
-  return "controller";
-}
-
-function requireExactDelivery(
-  deliveries: readonly RoomOutboxRecordV1[],
-  outboxId: string,
-  bindingId: string,
 ): RoomOutboxRecordV1 {
+  const target = routed.targets[0];
+  const delivery = routed.deliveries[0];
   if (
-    deliveries.length !== 1
-    || deliveries[0]?.id !== outboxId
-    || deliveries[0].bindingId !== bindingId
+    routed.targets.length !== 1
+    || target?.targetKind !== "seat"
+    || target.seatId !== seatId
+    || target.bindingId === null
+    || routed.deliveries.length !== 1
+    || !delivery
+    || delivery.bindingId !== target.bindingId
+    || delivery.logicalMessageId !== routed.message.id
   ) {
     throw new RoomExistingSessionSpineError(
       "ROOM_EXISTING_SESSION_DELIVERY_CONFLICT",
-      "The durable outbox did not return exactly the requested seat binding delivery",
+      "The canonical Room route did not return exactly one frozen seat binding and delivery",
     );
   }
-  return deliveries[0];
+  return delivery;
 }
