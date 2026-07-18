@@ -7,3 +7,4 @@ export * from "./protocol.js";
 export * from "./evidence.js";
 export * from "./ui.js";
 export * from "./assignment.js";
+export * from "./protocol-message.js";
