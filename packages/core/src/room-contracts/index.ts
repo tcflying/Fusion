@@ -6,3 +6,4 @@ export * from "./controller.js";
 export * from "./protocol.js";
 export * from "./evidence.js";
 export * from "./ui.js";
+export * from "./assignment.js";
