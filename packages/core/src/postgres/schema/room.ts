@@ -306,6 +306,8 @@ export const roomTaskNodes = roomSchema.table("room_task_nodes", {
   acceptanceEvidenceIds: jsonb("acceptance_evidence_ids").notNull().default([]),
   invalidatedByEvidenceId: text("invalidated_by_evidence_id"),
   reopenedByEvidenceId: text("reopened_by_evidence_id"),
+  origin: jsonb("origin").notNull().default({ kind: "created" }),
+  terminalLineage: jsonb("terminal_lineage"),
 }, (t) => [
   foreignKey({
     columns: [t.roomId, t.projectId],
@@ -414,6 +416,68 @@ export const roomTaskNodes = roomSchema.table("room_task_nodes", {
         AND ${t.invalidatedByEvidenceId} IS NULL
     END
   `),
+  /*
+  FNXC:SessionRoomTaskTopology 2026-07-18-15:20:
+  Origin and terminal lineage are typed, hash-safe tombstone facts. They retain
+  hierarchical history without copying causal reason text into projections.
+
+  FNXC:SessionRoomTaskTopology 2026-07-18-15:58:
+  Single-row topology facts must reject SQL UNKNOWN, require real JSON strings,
+  and retain only canonical, calendar-valid UTC ISO timestamps.
+
+  FNXC:SessionRoomTaskTopology 2026-07-18-16:12:
+  Ordinary edges have no creation operation and no derived lineage. Derived
+  edges require both a nonblank creation operation and nonempty source lineage.
+  */
+  check("room_task_nodes_origin_check", sql`
+    (
+      jsonb_typeof(${t.origin}) = 'object'
+      AND (
+        ${t.origin} = '{"kind":"created"}'::jsonb
+        OR (
+          ${t.origin} ?& ARRAY['kind','operationId','sourceNodeIds']
+          AND ${t.origin} - 'kind' - 'operationId' - 'sourceNodeIds' = '{}'::jsonb
+          AND jsonb_typeof(${t.origin}->'kind') = 'string'
+          AND ${t.origin}->>'kind' IN ('split_child','merge_result')
+          AND jsonb_typeof(${t.origin}->'operationId') = 'string'
+          AND btrim(${t.origin}->>'operationId') <> ''
+          AND CASE WHEN jsonb_typeof(${t.origin}->'sourceNodeIds') = 'array'
+            THEN jsonb_array_length(${t.origin}->'sourceNodeIds') > 0
+              AND NOT jsonb_path_exists(${t.origin}->'sourceNodeIds', '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+              AND project.room_jsonb_text_array_is_unique(${t.origin}->'sourceNodeIds')
+              AND (
+                (${t.origin}->>'kind' = 'split_child' AND jsonb_array_length(${t.origin}->'sourceNodeIds') = 1)
+                OR (${t.origin}->>'kind' = 'merge_result' AND jsonb_array_length(${t.origin}->'sourceNodeIds') >= 2)
+              )
+            ELSE false
+          END
+        )
+      )
+    ) IS TRUE
+  `),
+  check("room_task_nodes_terminal_lineage_check", sql`
+    (
+      ${t.terminalLineage} IS NULL
+      OR (
+        jsonb_typeof(${t.terminalLineage}) = 'object'
+        AND ${t.terminalLineage} ?& ARRAY['kind','operationId','at','reasonHash']
+        AND ${t.terminalLineage} - 'kind' - 'operationId' - 'at' - 'reasonHash' = '{}'::jsonb
+        AND jsonb_typeof(${t.terminalLineage}->'kind') = 'string'
+        AND ${t.terminalLineage}->>'kind' IN ('split','merge','cancel')
+        AND jsonb_typeof(${t.terminalLineage}->'operationId') = 'string'
+        AND btrim(${t.terminalLineage}->>'operationId') <> ''
+        AND CASE
+          WHEN jsonb_typeof(${t.terminalLineage}->'at') = 'string'
+            AND ${t.terminalLineage}->>'at' ~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$'
+          THEN to_char((${t.terminalLineage}->>'at')::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') = ${t.terminalLineage}->>'at'
+          ELSE false
+        END
+        AND jsonb_typeof(${t.terminalLineage}->'reasonHash') = 'string'
+        AND ${t.terminalLineage}->>'reasonHash' ~ '^sha256:[0-9a-f]{64}$'
+        AND ${t.state} = 'cancelled'
+      )
+    ) IS TRUE
+  `),
 ]);
 
 export const roomTaskEdges = roomSchema.table("room_task_edges", {
@@ -423,6 +487,10 @@ export const roomTaskEdges = roomSchema.table("room_task_edges", {
   toNodeId: text("to_node_id").notNull(),
   kind: text("kind").notNull(),
   createdAt: text("created_at").notNull(),
+  retiredAt: text("retired_at"),
+  retiredByOperationId: text("retired_by_operation_id"),
+  createdByOperationId: text("created_by_operation_id"),
+  derivedFromEdgeIds: jsonb("derived_from_edge_ids").notNull().default([]),
 }, (t) => [
   foreignKey({
     columns: [t.roomId, t.projectId],
@@ -439,10 +507,44 @@ export const roomTaskEdges = roomSchema.table("room_task_edges", {
     foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
     name: "room_task_edges_to_room_project_fkey",
   }).onDelete("cascade"),
-  unique("room_task_edges_shape_unique").on(t.roomId, t.fromNodeId, t.toNodeId, t.kind),
+  uniqueIndex("room_task_edges_active_shape_unique")
+    .on(t.projectId, t.roomId, t.fromNodeId, t.toNodeId, t.kind)
+    .where(sql`${t.retiredAt} IS NULL`),
   index("idx_room_task_edges_to").on(t.projectId, t.roomId, t.toNodeId),
   check("room_task_edges_kind_check", sql`${t.kind} IN ('requires','informs','invalidates')`),
   check("room_task_edges_self_check", sql`${t.fromNodeId} <> ${t.toNodeId}`),
+  check("room_task_edges_retirement_check", sql`
+    (
+      (${t.retiredAt} IS NULL AND ${t.retiredByOperationId} IS NULL)
+      OR (
+        ${t.retiredAt} IS NOT NULL
+        AND CASE
+          WHEN ${t.retiredAt} ~ '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$'
+          THEN to_char(${t.retiredAt}::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') = ${t.retiredAt}
+          ELSE false
+        END
+        AND ${t.retiredByOperationId} IS NOT NULL
+        AND btrim(${t.retiredByOperationId}) <> ''
+      )
+    ) IS TRUE
+  `),
+  check("room_task_edges_derived_lineage_check", sql`
+    (
+      CASE WHEN jsonb_typeof(${t.derivedFromEdgeIds}) = 'array'
+        THEN NOT jsonb_path_exists(${t.derivedFromEdgeIds}, '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+          AND project.room_jsonb_text_array_is_unique(${t.derivedFromEdgeIds})
+          AND (
+            (${t.createdByOperationId} IS NULL AND ${t.derivedFromEdgeIds} = '[]'::jsonb)
+            OR (
+              ${t.createdByOperationId} IS NOT NULL
+              AND btrim(${t.createdByOperationId}) <> ''
+              AND jsonb_array_length(${t.derivedFromEdgeIds}) > 0
+            )
+          )
+        ELSE false
+      END
+    ) IS TRUE
+  `),
 ]);
 
 export const roomMessages = roomSchema.table("room_messages", {

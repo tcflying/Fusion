@@ -369,7 +369,8 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
       expect.objectContaining({ ...observer, state: "ready", nodeVersion: 0 }),
     ]));
     expect(graph.edges).toHaveLength(3);
-    expect(graph.edges).toEqual(expect.arrayContaining(edges));
+    expect(graph.edges).toEqual(expect.arrayContaining(edges.map((edge) =>
+      expect.objectContaining({ ...edge, derivedFromEdgeIds: [] }))));
     expect(graph.readyNodeIds).toHaveLength(2);
     expect(graph.readyNodeIds).toEqual(expect.arrayContaining([producer.id, observer.id]));
 

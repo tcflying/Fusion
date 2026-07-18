@@ -154,7 +154,7 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"]);
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]);
     const roomSql = await readSchemaMigrationSql("0001");
     const ownershipSql = await readSchemaMigrationSql("0002");
     const outboxIdentitySql = await readSchemaMigrationSql("0003");
@@ -167,6 +167,7 @@ describe("Session Room PostgreSQL schema", () => {
     const nativeSenderTakeoverSql = await readSchemaMigrationSql("0010");
     const messageRoutingSql = await readSchemaMigrationSql("0011");
     const taskGraphCommandsSql = await readSchemaMigrationSql("0012");
+    const taskTopologyLineageSql = await readSchemaMigrationSql("0013");
 
     for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => ![
       "room_binding_ingestion_state",
@@ -209,6 +210,12 @@ describe("Session Room PostgreSQL schema", () => {
     expect(taskGraphCommandsSql).toContain("acceptance_evidence_ids");
     expect(taskGraphCommandsSql).toContain("room_task_edges_from_room_project_fkey");
     expect(taskGraphCommandsSql).toContain("room_task_edges_kind_check");
+    expect(taskTopologyLineageSql).toContain("terminal_lineage");
+    expect(taskTopologyLineageSql).toContain("retired_by_operation_id");
+    expect(taskTopologyLineageSql).toContain("created_by_operation_id");
+    expect(taskTopologyLineageSql).toContain("derived_from_edge_ids");
+    expect(taskTopologyLineageSql).toContain("room_task_edges_active_shape_unique");
+    expect(taskTopologyLineageSql).toContain("WHERE retired_at IS NULL");
   });
 
   it("models typed task-graph command projections on the existing Room tables", () => {
@@ -221,6 +228,12 @@ describe("Session Room PostgreSQL schema", () => {
       retryPolicy: roomTaskNodes.retryPolicy.name,
       acceptanceEvidenceIds: roomTaskNodes.acceptanceEvidenceIds.name,
       reopenedByEvidenceId: roomTaskNodes.reopenedByEvidenceId.name,
+      origin: roomTaskNodes.origin.name,
+      terminalLineage: roomTaskNodes.terminalLineage.name,
+      retiredAt: roomTaskEdges.retiredAt.name,
+      retiredByOperationId: roomTaskEdges.retiredByOperationId.name,
+      createdByOperationId: roomTaskEdges.createdByOperationId.name,
+      derivedFromEdgeIds: roomTaskEdges.derivedFromEdgeIds.name,
     }).toEqual({
       taskGraphVersion: "task_graph_version",
       roleRequirements: "role_requirements",
@@ -230,7 +243,49 @@ describe("Session Room PostgreSQL schema", () => {
       retryPolicy: "retry_policy",
       acceptanceEvidenceIds: "acceptance_evidence_ids",
       reopenedByEvidenceId: "reopened_by_evidence_id",
+      origin: "origin",
+      terminalLineage: "terminal_lineage",
+      retiredAt: "retired_at",
+      retiredByOperationId: "retired_by_operation_id",
+      createdByOperationId: "created_by_operation_id",
+      derivedFromEdgeIds: "derived_from_edge_ids",
     });
+  });
+
+  it("keeps topology-lineage CHECK constraints aligned with migration 0013", async () => {
+    const migrationSql = await readSchemaMigrationSql("0013");
+    const nodeChecks = declarativeChecks(roomTaskNodes);
+    const edgeChecks = declarativeChecks(roomTaskEdges);
+
+    for (const constraintName of [
+      "room_task_nodes_origin_check",
+      "room_task_nodes_terminal_lineage_check",
+      "room_task_edges_retirement_check",
+      "room_task_edges_derived_lineage_check",
+    ]) {
+      const checks = constraintName.startsWith("room_task_edges_") ? edgeChecks : nodeChecks;
+      expect(checks.get(constraintName), constraintName).toBe(migrationCheck(migrationSql, constraintName));
+    }
+
+    const originCheck = nodeChecks.get("room_task_nodes_origin_check");
+    const terminalLineageCheck = nodeChecks.get("room_task_nodes_terminal_lineage_check");
+    const retirementCheck = edgeChecks.get("room_task_edges_retirement_check");
+    for (const field of ["kind", "operationId"]) {
+      expect(originCheck).toContain(`jsonb_typeof(origin->'${field}') = 'string'`);
+    }
+    expect(originCheck).toMatch(/\) IS TRUE$/);
+    for (const field of ["kind", "operationId", "at", "reasonHash"]) {
+      expect(terminalLineageCheck).toContain(`jsonb_typeof(terminal_lineage->'${field}') = 'string'`);
+    }
+    expect(terminalLineageCheck).toContain("terminal_lineage->>'at' ~ '^[0-9]{4}-");
+    expect(terminalLineageCheck).toMatch(/\) IS TRUE$/);
+    expect(retirementCheck).toContain("retired_at ~ '^[0-9]{4}-");
+    expect(retirementCheck).toMatch(/\) IS TRUE$/);
+    const derivedLineageCheck = edgeChecks.get("room_task_edges_derived_lineage_check");
+    expect(derivedLineageCheck).toContain("created_by_operation_id IS NULL");
+    expect(derivedLineageCheck).toContain("btrim(created_by_operation_id) <> ''");
+    expect(derivedLineageCheck).toContain("jsonb_array_length(derived_from_edge_ids) > 0");
+    expect(derivedLineageCheck).toMatch(/\) IS TRUE$/);
   });
 
   it("keeps task-graph CHECK constraints aligned with migration 0012", async () => {

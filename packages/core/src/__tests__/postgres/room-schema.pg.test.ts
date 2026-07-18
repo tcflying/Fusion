@@ -25,6 +25,7 @@ import {
   SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
   SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
   SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+  SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -176,6 +177,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -192,6 +194,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -945,6 +948,260 @@ describe("Session Room PostgreSQL migration", () => {
     `))).resolves.toBeDefined();
   });
 
+  it("upgrades 0012 topology rows and enforces one active edge shape while retaining tombstones", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await context.connections!.migration.execute(sql.raw(`
+      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+      WHERE version = '${SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION}';
+
+      DROP INDEX IF EXISTS project.room_task_edges_active_shape_unique;
+
+      ALTER TABLE project.room_task_nodes
+        DROP CONSTRAINT IF EXISTS room_task_nodes_origin_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_terminal_lineage_check,
+        DROP COLUMN IF EXISTS origin,
+        DROP COLUMN IF EXISTS terminal_lineage;
+
+      ALTER TABLE project.room_task_edges
+        DROP CONSTRAINT IF EXISTS room_task_edges_retirement_check,
+        DROP CONSTRAINT IF EXISTS room_task_edges_derived_lineage_check,
+        DROP COLUMN IF EXISTS retired_at,
+        DROP COLUMN IF EXISTS retired_by_operation_id,
+        DROP COLUMN IF EXISTS created_by_operation_id,
+        DROP COLUMN IF EXISTS derived_from_edge_ids,
+        ADD CONSTRAINT room_task_edges_shape_unique
+          UNIQUE (room_id, from_node_id, to_node_id, kind);
+
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-topology-upgrade', 'project-topology-upgrade', 'legacy topology',
+        'implementation', 1, 'running',
+        '2026-07-18T07:20:00.000Z', '2026-07-18T07:20:00.000Z'
+      );
+
+      INSERT INTO project.room_task_nodes (
+        id, project_id, room_id, objective, state, progress_signature
+      ) VALUES
+        (
+          'node-topology-upgrade-a', 'project-topology-upgrade',
+          'room-topology-upgrade', 'legacy source', 'ready', 'progress:legacy:a'
+        ),
+        (
+          'node-topology-upgrade-b', 'project-topology-upgrade',
+          'room-topology-upgrade', 'legacy target', 'waiting_dependency', 'progress:legacy:b'
+        );
+
+      INSERT INTO project.room_task_edges (
+        id, project_id, room_id, from_node_id, to_node_id, kind, created_at
+      ) VALUES (
+        'edge-topology-upgrade-old', 'project-topology-upgrade', 'room-topology-upgrade',
+        'node-topology-upgrade-a', 'node-topology-upgrade-b', 'requires',
+        '2026-07-18T07:20:01.000Z'
+      );
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION]);
+
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_edges
+      SET derived_from_edge_ids = '["edge-topology-upgrade-source"]'::jsonb
+      WHERE id = 'edge-topology-upgrade-old'
+    `))).rejects.toThrow();
+
+    const nodes = (await context.connections!.migration.execute(sql`
+      SELECT id, origin, terminal_lineage
+      FROM project.room_task_nodes
+      WHERE room_id = 'room-topology-upgrade'
+      ORDER BY id
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(nodes).toEqual([
+      { id: "node-topology-upgrade-a", origin: { kind: "created" }, terminal_lineage: null },
+      { id: "node-topology-upgrade-b", origin: { kind: "created" }, terminal_lineage: null },
+    ]);
+    const edges = (await context.connections!.migration.execute(sql`
+      SELECT id, retired_at, retired_by_operation_id, created_by_operation_id, derived_from_edge_ids
+      FROM project.room_task_edges
+      WHERE room_id = 'room-topology-upgrade'
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(edges).toEqual([{
+      id: "edge-topology-upgrade-old",
+      retired_at: null,
+      retired_by_operation_id: null,
+      created_by_operation_id: null,
+      derived_from_edge_ids: [],
+    }]);
+    const indexes = (await context.connections!.migration.execute(sql`
+      SELECT indexdef
+      FROM pg_indexes
+      WHERE schemaname = 'project'
+        AND tablename = 'room_task_edges'
+        AND indexname = 'room_task_edges_active_shape_unique'
+    `)) as unknown as Array<{ indexdef: string }>;
+    expect(indexes).toHaveLength(1);
+    expect(indexes[0]!.indexdef).toContain("WHERE (retired_at IS NULL)");
+
+    const expectRejectedTopologyShape = async (statement: string): Promise<void> => {
+      await expect(context.connections!.migration.execute(sql.raw(statement))).rejects.toThrow();
+    };
+    const operationId = "room-task-topology:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const reasonHash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_nodes
+      SET origin = '{"kind":"split_child","operationId":null,"sourceNodeIds":["node-topology-upgrade-a"]}'::jsonb
+      WHERE id = 'node-topology-upgrade-a'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_nodes
+      SET
+        state = 'cancelled',
+        terminal_lineage = '{"kind":"cancel","operationId":42,"at":"2026-07-18T07:22:00.000Z","reasonHash":"${reasonHash}"}'::jsonb
+      WHERE id = 'node-topology-upgrade-a'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_nodes
+      SET
+        state = 'cancelled',
+        terminal_lineage = '{"kind":"cancel","operationId":"${operationId}","at":null,"reasonHash":"${reasonHash}"}'::jsonb
+      WHERE id = 'node-topology-upgrade-a'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_nodes
+      SET
+        state = 'cancelled',
+        terminal_lineage = '{"kind":"cancel","operationId":"${operationId}","at":"2026-07-18T07:22:00Z","reasonHash":"${reasonHash}"}'::jsonb
+      WHERE id = 'node-topology-upgrade-a'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_nodes
+      SET
+        state = 'cancelled',
+        terminal_lineage = '{"kind":"cancel","operationId":"${operationId}","at":"2026-02-30T07:22:00.000Z","reasonHash":"${reasonHash}"}'::jsonb
+      WHERE id = 'node-topology-upgrade-a'
+    `);
+    await context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET
+        state = 'cancelled',
+        terminal_lineage = '{"kind":"cancel","operationId":"${operationId}","at":"2026-07-18T07:22:00.000Z","reasonHash":"${reasonHash}"}'::jsonb
+      WHERE id = 'node-topology-upgrade-a'
+    `));
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET created_by_operation_id = '${operationId}'
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET
+        created_by_operation_id = '   ',
+        derived_from_edge_ids = '["edge-topology-upgrade-source"]'::jsonb
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET derived_from_edge_ids = 'null'::jsonb
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+    await context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_edges
+      SET
+        created_by_operation_id = '${operationId}',
+        derived_from_edge_ids = '["edge-topology-upgrade-source"]'::jsonb
+      WHERE id = 'edge-topology-upgrade-old';
+
+      UPDATE project.room_task_edges
+      SET
+        created_by_operation_id = NULL,
+        derived_from_edge_ids = '[]'::jsonb
+      WHERE id = 'edge-topology-upgrade-old';
+    `));
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET retired_by_operation_id = '${operationId}'
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET retired_at = '2026-07-18T07:22:00.000Z'
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET
+        retired_at = '2026-07-18T07:22:00Z',
+        retired_by_operation_id = '${operationId}'
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+    await expectRejectedTopologyShape(`
+      UPDATE project.room_task_edges
+      SET
+        retired_at = '2026-02-30T07:22:00.000Z',
+        retired_by_operation_id = '${operationId}'
+      WHERE id = 'edge-topology-upgrade-old'
+    `);
+
+    await context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_edges
+      SET
+        retired_at = '2026-07-18T07:21:00.000Z',
+        retired_by_operation_id = 'room-task-topology:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+      WHERE id = 'edge-topology-upgrade-old';
+
+      INSERT INTO project.room_task_edges (
+        id, project_id, room_id, from_node_id, to_node_id, kind, created_at
+      ) VALUES (
+        'edge-topology-upgrade-active', 'project-topology-upgrade', 'room-topology-upgrade',
+        'node-topology-upgrade-a', 'node-topology-upgrade-b', 'requires',
+        '2026-07-18T07:21:00.000Z'
+      );
+    `));
+    await expectRejectedTopologyShape(`
+      INSERT INTO project.room_task_edges (
+        id, project_id, room_id, from_node_id, to_node_id, kind, created_at
+      ) VALUES (
+        'edge-topology-upgrade-old', 'project-topology-upgrade', 'room-topology-upgrade',
+        'node-topology-upgrade-a', 'node-topology-upgrade-b', 'requires',
+        '2026-07-18T07:21:01.000Z'
+      )
+    `);
+
+    await expectRejectedTopologyShape(`
+      INSERT INTO project.room_task_edges (
+        id, project_id, room_id, from_node_id, to_node_id, kind, created_at
+      ) VALUES (
+        'edge-topology-upgrade-duplicate', 'project-topology-upgrade', 'room-topology-upgrade',
+        'node-topology-upgrade-a', 'node-topology-upgrade-b', 'requires',
+        '2026-07-18T07:21:01.000Z'
+      )
+    `);
+
+    const persistedTopology = (await context.connections!.migration.execute(sql`
+      SELECT id, retired_at, retired_by_operation_id, created_by_operation_id
+      FROM project.room_task_edges
+      WHERE room_id = 'room-topology-upgrade'
+      ORDER BY id
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(persistedTopology).toEqual([
+      {
+        id: "edge-topology-upgrade-active",
+        retired_at: null,
+        retired_by_operation_id: null,
+        created_by_operation_id: null,
+      },
+      {
+        id: "edge-topology-upgrade-old",
+        retired_at: "2026-07-18T07:21:00.000Z",
+        retired_by_operation_id: operationId,
+        created_by_operation_id: null,
+      },
+    ]);
+  });
+
   it("upgrades a legacy accepted node with deterministic hash-only acceptance evidence", async () => {
     const context = await startEmbeddedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
@@ -1139,6 +1396,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -1176,6 +1434,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -1232,6 +1491,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -1315,6 +1575,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -1466,6 +1727,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
     ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable
