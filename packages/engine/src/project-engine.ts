@@ -99,10 +99,11 @@ import {
   deliverPostgresMigrationNoticeIfNeeded,
 } from "./postgres-migration-notice.js";
 import {
-  PASSIVE_ROOM_WORKER,
   RoomController,
   type RoomWorker,
 } from "./room-controller.js";
+import { DurableRoomRecoveryWorker } from "./room-durable-recovery-worker.js";
+import { SessionConnectorRegistry } from "./session-connector-registry.js";
 import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
 import type {
   ExternalTunnelInfo,
@@ -398,6 +399,8 @@ export interface ProjectEngineOptions {
   roomRunAuditDispatcherFactory?: RoomRunAuditDispatcherFactory;
   /** Worker implementation delegated to the default RoomController. */
   roomWorker?: RoomWorker;
+  /** Project-scoped connector registry consumed by the durable Room recovery worker. */
+  roomSessionConnectorRegistry?: SessionConnectorRegistry;
 }
 
 /**
@@ -855,11 +858,48 @@ export class ProjectEngine {
           `Session Room control plane is enabled for ${this.config.projectId}, but no AsyncDataLayer is available; Room workers remain stopped`,
         );
       } else {
+        let roomSessionConnectorRegistry = this.options.roomSessionConnectorRegistry;
+        if (!this.options.roomControllerFactory && !roomSessionConnectorRegistry) {
+          roomSessionConnectorRegistry = new SessionConnectorRegistry();
+          const pluginRunner = this.runtime.getPluginRunner?.();
+          for (const registration of pluginRunner?.getPluginSessionConnectors() ?? []) {
+            try {
+              const pluginContext = await pluginRunner!.createRuntimeContext(registration.pluginId);
+              if (!pluginContext) {
+                throw new Error(`Plugin ${registration.pluginId} has no runtime context`);
+              }
+              const connector = await registration.sessionConnector.factory(pluginContext);
+              if (connector.id !== registration.sessionConnector.metadata.connectorId) {
+                throw new Error(
+                  `Session Connector factory returned ${connector.id}; expected ${registration.sessionConnector.metadata.connectorId}`,
+                );
+              }
+              roomSessionConnectorRegistry.register(connector);
+            } catch (error) {
+              runtimeLog.warn(
+                `Session Connector plugin ${registration.pluginId} could not join Room recovery: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+          }
+        }
         const roomControllerFactory = this.options.roomControllerFactory ?? ((context: RoomControllerFactoryContext) => {
           const roomStore = new AsyncRoomStore(context.asyncLayer, { projectId: context.projectId });
           const leaseStore = new AsyncRoomLeaseStore(context.asyncLayer, { projectId: context.projectId });
           const checkpointStore = new AsyncRoomCheckpointStore(context.asyncLayer, { projectId: context.projectId });
           const hostId = hostname();
+          const workerId = `${hostId}:${process.pid}:${randomUUID()}`;
+          const worker = this.options.roomWorker ?? new DurableRoomRecoveryWorker({
+            projectId: context.projectId,
+            workerId,
+            hostId,
+            layer: context.asyncLayer,
+            roomStore,
+            leaseStore,
+            checkpointStore,
+            registry: roomSessionConnectorRegistry!,
+          });
           const auditDispatcherFactory = this.options.roomRunAuditDispatcherFactory
             ?? ((dispatcherContext: RoomRunAuditDispatcherFactoryContext) =>
               new RoomRunAuditDispatcher({
@@ -876,12 +916,12 @@ export class ProjectEngine {
           this.roomRunAuditDispatcher = auditDispatcher;
           return new RoomController({
             projectId: context.projectId,
-            workerId: `${hostId}:${process.pid}:${randomUUID()}`,
+            workerId,
             hostId,
             roomStore,
             leaseStore,
             checkpointStore,
-            worker: this.options.roomWorker ?? PASSIVE_ROOM_WORKER,
+            worker,
             recordRunAuditEvent: async (event) => {
               await auditDispatcher.enqueue(event);
             },

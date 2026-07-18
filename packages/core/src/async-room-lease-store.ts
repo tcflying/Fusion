@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import type {
   RoomLeaseKind,
@@ -9,6 +9,7 @@ import {
   operationalRooms,
   roomBindings,
   roomLeases,
+  roomOutbox,
 } from "./postgres/schema/room.js";
 
 type QueryHandle = AsyncDataLayer["db"] | DbTransaction;
@@ -31,6 +32,8 @@ export interface AcquireRoomLeaseInput {
   readonly expectedEpoch: number | null;
   readonly now: string;
   readonly expiresAt: string;
+  /** Recovery-only: do not advance the sender epoch across an unresolved external effect. */
+  readonly denyTakeoverWhileDeliveryUnresolved?: boolean;
 }
 
 export type AcquireRoomLeaseResult =
@@ -172,6 +175,29 @@ export class AsyncRoomLeaseStore {
 
       if (active && timestampMs(active.expiresAt, "current lease expiresAt") > timestampMs(input.now, "now")) {
         return { ok: false, reason: "active", current: active };
+      }
+
+      if (
+        input.kind === "sender"
+        && input.denyTakeoverWhileDeliveryUnresolved === true
+        && await hasUnresolvedExternalDelivery(
+          tx,
+          this.projectId,
+          input.roomId,
+          input.resourceId,
+        )
+      ) {
+        /*
+        FNXC:SessionRoomSenderDispatchGuard 2026-07-18-09:06:
+        A recovery sender must not take over an expired lease while the previous
+        epoch has a dispatching or delivery-uncertain external effect. Explicit
+        native-IDE takeover keeps its separately reconciled Task 4.5 path. The query does not
+        lock outbox rows: the sender advisory lock serializes competing epochs,
+        while beginDeliveryAttempt later takes that same sender lock before it
+        can commit a new dispatching row. This closes claim-before-send expiry
+        without introducing an outbox-row/sender-lock deadlock.
+        */
+        return { ok: false, reason: "active", current: active ?? latest };
       }
 
       if (active) {
@@ -320,6 +346,25 @@ export class AsyncRoomLeaseStore {
       .orderBy(asc(roomLeases.epoch));
     return rows.map(rowToStoredLease);
   }
+}
+
+async function hasUnresolvedExternalDelivery(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  bindingId: string,
+): Promise<boolean> {
+  const rows = await handle
+    .select({ id: roomOutbox.id })
+    .from(roomOutbox)
+    .where(and(
+      eq(roomOutbox.projectId, projectId),
+      eq(roomOutbox.roomId, roomId),
+      eq(roomOutbox.bindingId, bindingId),
+      inArray(roomOutbox.deliveryState, ["dispatching", "delivery_uncertain"]),
+    ))
+    .limit(1);
+  return rows.length > 0;
 }
 
 /**

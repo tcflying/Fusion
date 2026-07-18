@@ -184,6 +184,7 @@ function capabilities(): SessionConnectorCapabilitiesV1 {
 
 function connectorFixture(options: {
   sendResult?: SessionConnectorResultV1<SessionConnectorSendReceiptV1>;
+  send?: SessionConnectorV1["send"];
   history?: (afterCursor: string | null) => SessionConnectorResultV1<SessionConnectorHistoryPageV1>;
   capabilities?: () => unknown;
 }) {
@@ -197,8 +198,9 @@ function connectorFixture(options: {
     ensureExisting: async () => ({ ok: false, error: { code: "unavailable", message: "not used", retryable: false } }),
     create: async () => ({ ok: false, error: { code: "unavailable", message: "not used", retryable: false } }),
     getStatus: async () => ({ ok: false, error: { code: "unavailable", message: "not used", retryable: false } }),
-    send: async () => {
+    send: async (input) => {
       sendCalls += 1;
+      if (options.send) return options.send(input);
       return options.sendResult ?? {
         ok: true,
         value: {
@@ -251,6 +253,94 @@ function connectorFixture(options: {
 }
 
 describe("Room connector delivery reconciliation", () => {
+  it("does not start connector.send after Room authority is revoked at the durable claim boundary", async () => {
+    const store = new MemoryDeliveryStore();
+    const originalBegin = store.beginDeliveryAttempt.bind(store);
+    let authorityRevoked = false;
+    store.beginDeliveryAttempt = async (input) => {
+      const claimed = await originalBegin(input);
+      authorityRevoked = true;
+      return claimed;
+    };
+    const fixture = connectorFixture({});
+
+    await expect(dispatchRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      attemptId: "attempt-authority-revoked-before-send",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      reconciliationFromCursor: null,
+      now: NOW,
+      currentTime: () => NOW,
+      assertAuthority: async () => {
+        if (authorityRevoked) throw new Error("room_authority_revoked");
+      },
+      audit: { runId: "run-authority-revoked-before-send", agentId: "worker-1" },
+    })).rejects.toThrow("room_authority_revoked");
+
+    expect(store.current).toMatchObject({ state: "dispatching", attemptCount: 1 });
+    expect(fixture.sendCalls).toBe(0);
+  });
+
+  it("preserves a late send acknowledgement after controller abort once the external effect has started", async () => {
+    const abortController = new AbortController();
+    let resolveSend: ((value: SessionConnectorResultV1<SessionConnectorSendReceiptV1>) => void) | null = null;
+    let notifySendStarted: (() => void) | null = null;
+    const sendStarted = new Promise<void>((resolve) => {
+      notifySendStarted = resolve;
+    });
+    const fixture = connectorFixture({
+      send: () => new Promise((resolve) => {
+        resolveSend = resolve;
+        notifySendStarted?.();
+      }),
+    });
+    const store = new MemoryDeliveryStore();
+
+    const delivery = dispatchRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      attemptId: "attempt-controller-abort-during-send",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      reconciliationFromCursor: null,
+      now: NOW,
+      currentTime: () => NOW,
+      signal: abortController.signal,
+      assertAuthority: async () => undefined,
+      audit: { runId: "run-controller-abort-during-send", agentId: "worker-1" },
+    });
+    await sendStarted;
+    abortController.abort();
+    const stateBeforeReceipt = await Promise.race([
+      delivery.then(() => "settled", () => "settled"),
+      new Promise<"waiting">((resolve) => setTimeout(() => resolve("waiting"), 5)),
+    ]);
+    expect(stateBeforeReceipt).toBe("waiting");
+    expect(store.current).toMatchObject({ state: "dispatching", attemptCount: 1 });
+    resolveSend?.({
+      ok: true,
+      value: {
+        outcome: "accepted",
+        connectorAcknowledgementId: "late-ack",
+        nativeMessageId: "late-native-message",
+        cursor: "late-cursor",
+        acceptedAt: NOW,
+      },
+    });
+    await expect(delivery).resolves.toMatchObject({
+      state: "confirmed",
+      connectorAcknowledgementId: "late-ack",
+      nativeMessageId: "late-native-message",
+      nativeCursor: "late-cursor",
+    });
+  });
+
   it("confirms accepted-before-crash from history without sending twice", async () => {
     const store = new MemoryDeliveryStore();
     store.crashOnComplete = true;

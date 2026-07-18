@@ -1,5 +1,108 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const roomControllerSeams = vi.hoisted(() => ({
+  constructorCalls: [] as Array<Record<string, unknown>>,
+  startMocks: [] as Array<ReturnType<typeof vi.fn>>,
+  stopMocks: [] as Array<ReturnType<typeof vi.fn>>,
+  passiveWorker: {
+    runRoom: vi.fn(async () => undefined),
+  },
+  simulateWorkerRestart: false,
+}));
+
+const roomAuditDispatcherSeams = vi.hoisted(() => ({
+  start: vi.fn(async () => undefined),
+  stop: vi.fn(async () => undefined),
+  enqueue: vi.fn(async () => undefined),
+}));
+
+const durableRoomRecoveryWorkerSeams = vi.hoisted(() => ({
+  constructorCalls: [] as Array<Record<string, unknown>>,
+  runRoom: vi.fn(async () => undefined),
+}));
+
+const pluginRunnerSeams = vi.hoisted(() => ({
+  registrations: [] as Array<Record<string, unknown>>,
+  createRuntimeContext: vi.fn(async () => ({ pluginId: "room-connector-plugin" })),
+}));
+
+vi.mock("../room-durable-recovery-worker.js", () => ({
+  DurableRoomRecoveryWorker: class MockDurableRoomRecoveryWorker {
+    readonly runRoom = durableRoomRecoveryWorkerSeams.runRoom;
+
+    constructor(options: Record<string, unknown>) {
+      durableRoomRecoveryWorkerSeams.constructorCalls.push(options);
+    }
+  },
+}));
+
+vi.mock("../room-controller.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../room-controller.js")>();
+  class MockRoomController {
+    readonly start: ReturnType<typeof vi.fn>;
+    readonly stop: ReturnType<typeof vi.fn>;
+
+    constructor(private readonly options: Record<string, unknown>) {
+      roomControllerSeams.constructorCalls.push(options);
+      this.start = vi.fn(async () => {
+        if (!roomControllerSeams.simulateWorkerRestart) return;
+        const worker = this.options.worker as {
+          runRoom(input: Record<string, unknown>): Promise<void>;
+        };
+        const runInput = {
+          room: { room: { id: "room-restart-1", projectId: "project-1", aggregateVersion: 3 } },
+          lease: {
+            contractVersion: 1,
+            id: "lease-room-restart-1",
+            roomId: "room-restart-1",
+            kind: "room_worker",
+            resourceId: "room-restart-1",
+            holderId: "worker-1",
+            hostId: "host-1",
+            epoch: 1,
+            acquiredAt: "2026-07-17T12:00:00.000Z",
+            heartbeatAt: "2026-07-17T12:00:00.000Z",
+            expiresAt: "2026-07-17T12:01:00.000Z",
+            releasedAt: null,
+          },
+          signal: new AbortController().signal,
+          assertLeaseAuthority: async () => ({
+            contractVersion: 1,
+            id: "lease-room-restart-1",
+            roomId: "room-restart-1",
+            kind: "room_worker",
+            resourceId: "room-restart-1",
+            holderId: "worker-1",
+            hostId: "host-1",
+            epoch: 1,
+            acquiredAt: "2026-07-17T12:00:00.000Z",
+            heartbeatAt: "2026-07-17T12:00:00.000Z",
+            expiresAt: "2026-07-17T12:01:00.000Z",
+            releasedAt: null,
+          }),
+        };
+        await worker.runRoom(runInput);
+        await worker.runRoom({
+          ...runInput,
+          lease: {
+            ...(runInput.lease as Record<string, unknown>),
+            id: "lease-room-restart-2",
+            epoch: 2,
+          },
+        });
+      });
+      this.stop = vi.fn(async () => undefined);
+      roomControllerSeams.startMocks.push(this.start);
+      roomControllerSeams.stopMocks.push(this.stop);
+    }
+  }
+  return {
+    ...actual,
+    PASSIVE_ROOM_WORKER: roomControllerSeams.passiveWorker,
+    RoomController: MockRoomController,
+  };
+});
+
 import { ProjectEngine, type ProjectEngineOptions } from "../project-engine.js";
 
 const mocks = vi.hoisted(() => ({
@@ -99,6 +202,12 @@ vi.mock("../runtimes/in-process-runtime.js", () => ({
       getAgentStore: vi.fn(() => undefined),
       getHeartbeatMonitor: vi.fn(() => undefined),
       getMessageStore: vi.fn(() => undefined),
+      getPluginRunner: vi.fn(() => pluginRunnerSeams.registrations.length > 0
+        ? {
+          getPluginSessionConnectors: () => pluginRunnerSeams.registrations,
+          createRuntimeContext: pluginRunnerSeams.createRuntimeContext,
+        }
+        : undefined),
       getRoutineRunner: vi.fn(() => undefined),
       getRoutineStore: vi.fn(() => undefined),
       getTaskStore: vi.fn(() => mocks.currentStore),
@@ -158,19 +267,32 @@ function createMockStore(): Record<string, unknown> {
     off: vi.fn(),
     on: vi.fn(),
     parseFileScopeFromPrompt: vi.fn(async () => []),
+    recordRunAuditEvent: vi.fn(async () => undefined),
     updateTask: vi.fn(async () => undefined),
   };
 }
 
 function createEngine(
-  roomControllerFactory: RoomControllerFactory,
+  roomControllerFactory?: RoomControllerFactory,
   overrides: Partial<ProjectEngineOptions> = {},
 ): ProjectEngine {
   const options = {
     skipNotifier: true,
-    roomControllerFactory,
+    roomRunAuditDispatcherFactory: (context: RoomControllerFactoryContext) => ({
+      start: roomAuditDispatcherSeams.start,
+      stop: roomAuditDispatcherSeams.stop,
+      enqueue: async (event: Record<string, unknown>) => {
+        await roomAuditDispatcherSeams.enqueue(event);
+        await (context.taskStore as unknown as {
+          recordRunAuditEvent(input: Record<string, unknown>): Promise<void>;
+        }).recordRunAuditEvent(event);
+      },
+    }),
     ...overrides,
   } as unknown as ProjectEngineOptions;
+  if (roomControllerFactory) {
+    (options as { roomControllerFactory?: RoomControllerFactory }).roomControllerFactory = roomControllerFactory;
+  }
   return new ProjectEngine(
     {
       projectId: "project-1",
@@ -187,6 +309,18 @@ function createEngine(
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.currentStore = createMockStore();
+  roomControllerSeams.constructorCalls.length = 0;
+  roomControllerSeams.startMocks.length = 0;
+  roomControllerSeams.stopMocks.length = 0;
+  roomControllerSeams.simulateWorkerRestart = false;
+  roomControllerSeams.passiveWorker.runRoom.mockClear();
+  durableRoomRecoveryWorkerSeams.constructorCalls.length = 0;
+  durableRoomRecoveryWorkerSeams.runRoom.mockClear();
+  roomAuditDispatcherSeams.start.mockClear();
+  roomAuditDispatcherSeams.stop.mockClear();
+  roomAuditDispatcherSeams.enqueue.mockClear();
+  pluginRunnerSeams.registrations.length = 0;
+  pluginRunnerSeams.createRuntimeContext.mockClear();
 });
 
 /*
@@ -291,5 +425,126 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
     expect(roomController.stop.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.runtimeStop.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("routes Room lifecycle audits into the existing project TaskStore audit writer", async () => {
+    const engine = createEngine();
+
+    await engine.start();
+    try {
+      expect(roomAuditDispatcherSeams.start).toHaveBeenCalledTimes(1);
+      expect(roomAuditDispatcherSeams.start.mock.invocationCallOrder[0]).toBeLessThan(
+        roomControllerSeams.startMocks.at(-1)!.mock.invocationCallOrder[0]!,
+      );
+      const constructed = roomControllerSeams.constructorCalls.at(-1);
+      const recordRunAuditEvent = constructed?.recordRunAuditEvent as (
+        event: Record<string, unknown>,
+      ) => Promise<void>;
+      const event = {
+        id: "room-audit-wiring-1",
+        projectId: "project-1",
+        timestamp: "2026-07-17T13:25:00.000Z",
+        agentId: "room-worker-1",
+        runId: "room-controller:wiring",
+        domain: "database",
+        mutationType: "room:worker-started",
+        target: "room-1",
+        metadata: { roomId: "room-1" },
+      };
+
+      await recordRunAuditEvent(event);
+
+      expect(roomAuditDispatcherSeams.enqueue).toHaveBeenCalledWith(event);
+      expect(mocks.currentStore?.recordRunAuditEvent).toHaveBeenCalledWith(event);
+    } finally {
+      await engine.stop();
+    }
+    expect(roomControllerSeams.stopMocks.at(-1)).toHaveBeenCalledTimes(1);
+    expect(roomAuditDispatcherSeams.stop).toHaveBeenCalledTimes(1);
+    expect(roomControllerSeams.stopMocks.at(-1)!.mock.invocationCallOrder[0]).toBeLessThan(
+      roomAuditDispatcherSeams.stop.mock.invocationCallOrder[0]!,
+    );
+    expect(roomAuditDispatcherSeams.stop.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.runtimeStop.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  /*
+  FNXC:SessionRoomController 2026-07-17-23:18:
+  Task 4.7 RED rejects the placeholder PASSIVE Room worker on the default
+  ProjectEngine wiring. Startup may keep the controller lifecycle, but restart
+  recovery must come from a real production worker rather than the abort-only
+  placeholder.
+  */
+  it("default ProjectEngine wiring passes the durable recovery worker into the production controller", async () => {
+    const engine = createEngine();
+
+    await engine.start();
+    try {
+      const constructed = roomControllerSeams.constructorCalls.at(-1);
+      expect(
+        constructed?.worker,
+        "Task 4.7 requires the default RoomController worker to be recovery-capable in production",
+      ).not.toBe(roomControllerSeams.passiveWorker);
+      expect(durableRoomRecoveryWorkerSeams.constructorCalls).toHaveLength(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("registers plugin-provided Session Connectors in the default durable recovery worker", async () => {
+    const connector = {
+      contractVersion: 1,
+      id: "room-connector-test",
+      version: "1.0.0",
+      getCapabilities: vi.fn(),
+      ensureExisting: vi.fn(),
+      create: vi.fn(),
+      getStatus: vi.fn(),
+      readHistory: vi.fn(),
+      subscribeEvents: vi.fn(),
+      send: vi.fn(),
+      interrupt: vi.fn(),
+      resume: vi.fn(),
+      takeover: vi.fn(),
+      getHealth: vi.fn(),
+      getDeepLinks: vi.fn(),
+    };
+    const factory = vi.fn(async () => connector);
+    pluginRunnerSeams.registrations.push({
+      pluginId: "room-connector-plugin",
+      sessionConnector: {
+        metadata: { connectorId: connector.id, name: "Room connector test" },
+        factory,
+      },
+    });
+    const engine = createEngine();
+
+    await engine.start();
+    try {
+      const workerOptions = durableRoomRecoveryWorkerSeams.constructorCalls.at(-1);
+      const registry = workerOptions?.registry as { has(connectorId: string): boolean };
+      expect(registry.has(connector.id)).toBe(true);
+      expect(pluginRunnerSeams.createRuntimeContext).toHaveBeenCalledWith("room-connector-plugin");
+      expect(factory).toHaveBeenCalledTimes(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("re-enters durable crash recovery when the default Room worker restarts", async () => {
+    roomControllerSeams.simulateWorkerRestart = true;
+    const engine = createEngine();
+
+    await engine.start();
+    try {
+      expect(
+        roomControllerSeams.passiveWorker.runRoom,
+        "Task 4.7 requires restart recovery to call a real Room recovery worker, not PASSIVE_ROOM_WORKER twice",
+      ).not.toHaveBeenCalled();
+      expect(durableRoomRecoveryWorkerSeams.runRoom).toHaveBeenCalledTimes(2);
+    } finally {
+      await engine.stop();
+    }
   });
 });

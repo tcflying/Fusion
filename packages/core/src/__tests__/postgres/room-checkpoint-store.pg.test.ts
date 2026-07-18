@@ -642,6 +642,19 @@ describe("Session Room checkpoints and projection replay", () => {
     expect(checkpoint.projectionHash).toMatch(/^sha256:/);
     expect(Number(checkpoint.eventCursor)).toBeGreaterThan(0);
 
+    await expect(checkpointStore.replaceCheckpointAfterDeliveryRecovery({
+      previousCheckpointId: checkpoint.id,
+      id: "checkpoint-turn-1-illegal-replacement",
+      roomId: "room-checkpoint-1",
+      turnId: "turn-checkpoint-1",
+      expectedAggregateVersion: 1,
+      protocolState: { phaseId: "illegally-rewritten" },
+      dagVersion: 0,
+      bindingCursors: {},
+      artifactRefs: [],
+      now: "2026-07-17T08:01:31.000Z",
+    })).rejects.toMatchObject({ code: "checkpoint_version_conflict" });
+
     await roomStore.transitionLifecycle(
       "room-checkpoint-1",
       { to: "running", expectedAggregateVersion: 1, now: "2026-07-17T08:02:00.000Z" },

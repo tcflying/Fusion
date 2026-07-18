@@ -42,6 +42,9 @@ export interface DispatchRoomDeliveryInput {
   readonly content: string;
   readonly reconciliationFromCursor: string | null;
   readonly now: string;
+  readonly currentTime?: () => string;
+  readonly signal?: AbortSignal;
+  readonly assertAuthority?: () => Promise<void>;
   readonly audit: RoomDeliveryAuditIdentity;
 }
 
@@ -53,6 +56,9 @@ export interface ReconcileAmbiguousRoomDeliveryInput {
   readonly historyPageSize: number;
   readonly maxHistoryPages: number;
   readonly now: string;
+  readonly currentTime?: () => string;
+  readonly signal?: AbortSignal;
+  readonly assertAuthority?: () => Promise<void>;
   readonly audit: RoomDeliveryAuditIdentity;
 }
 
@@ -87,6 +93,7 @@ export async function dispatchRoomDelivery(
 ): Promise<RoomOutboxRecordV1> {
   assertAuditIdentity(input.audit);
   assertOptionalCursor(input.reconciliationFromCursor);
+  await assertOperationAuthority(input);
   const delivery = await requireDelivery(input.store, input.outboxId);
   const binding = await requireBinding(input.store, delivery.bindingId);
   assertDispatchIdentity(delivery, binding, input.identity);
@@ -110,16 +117,24 @@ export async function dispatchRoomDelivery(
     requiredHostId: binding.hostId,
   });
 
+  const claimNow = await assertOperationAuthority(input);
   const claimed = await input.store.beginDeliveryAttempt({
     outboxId: input.outboxId,
     attemptId: input.attemptId,
     senderFence: input.senderFence,
     reconciliationFromCursor: input.reconciliationFromCursor,
-    now: input.now,
+    now: claimNow,
   });
 
   let result: Awaited<ReturnType<SessionConnectorV1["send"]>>;
+  await assertOperationAuthority(input);
   try {
+    /*
+    Once send() starts, cancellation cannot prove that the provider side effect
+    did not happen. Keep the worker Promise attached to the bounded connector
+    operation and durably persist any late receipt; AbortSignal only fences the
+    pre-send boundary and subsequent work.
+    */
     result = await connector.send({
       contractVersion: 1,
       bindingId: claimed.bindingId,
@@ -131,6 +146,7 @@ export async function dispatchRoomDelivery(
       contentHash: claimed.payloadHash,
     });
   } catch {
+    if (input.signal?.aborted) throw abortError();
     return input.store.completeDeliveryAttempt({
       outboxId: input.outboxId,
       attemptId: input.attemptId,
@@ -140,7 +156,7 @@ export async function dispatchRoomDelivery(
       nativeCursor: null,
       errorCode: "connector_send_exception",
       nextAttemptAt: null,
-      now: input.now,
+      now: operationTime(input),
       audit: input.audit,
     });
   }
@@ -155,7 +171,7 @@ export async function dispatchRoomDelivery(
       nativeCursor: null,
       errorCode: `connector_${result.error.code}`,
       nextAttemptAt: null,
-      now: input.now,
+      now: operationTime(input),
       audit: input.audit,
     });
   }
@@ -171,7 +187,7 @@ export async function dispatchRoomDelivery(
       nativeCursor: receipt.cursor,
       errorCode: "connector_rejected",
       nextAttemptAt: null,
-      now: input.now,
+      now: operationTime(input),
       audit: input.audit,
     });
   }
@@ -190,7 +206,7 @@ export async function dispatchRoomDelivery(
     nativeCursor: receipt.cursor,
     errorCode: confirmed ? null : "connector_delivery_uncertain",
     nextAttemptAt: null,
-    now: input.now,
+    now: operationTime(input),
     audit: input.audit,
   });
 }
@@ -199,6 +215,7 @@ export async function reconcileAmbiguousRoomDelivery(
   input: ReconcileAmbiguousRoomDeliveryInput,
 ): Promise<RoomOutboxRecordV1> {
   assertAuditIdentity(input.audit);
+  await assertOperationAuthority(input);
   assertBoundedPositiveInteger(
     input.historyPageSize,
     "historyPageSize",
@@ -245,14 +262,16 @@ export async function reconcileAmbiguousRoomDelivery(
     visitedCursors.add(cursor);
 
     let pageResult: Awaited<ReturnType<SessionConnectorV1["readHistory"]>>;
+    await assertOperationAuthority(input);
     try {
-      pageResult = await connector.readHistory({
+      pageResult = await raceConnectorOperation(connector.readHistory({
         contractVersion: 1,
         identity: input.identity,
         afterCursor: cursor,
         limit: input.historyPageSize,
-      });
+      }), input.signal);
     } catch {
+      if (input.signal?.aborted) throw abortError();
       return persistUncertainReconciliation(input, delivery, "history_read_exception", {
         pageNumber,
         cursor,
@@ -321,8 +340,76 @@ export async function reconcileAmbiguousRoomDelivery(
     nativeCursor: match.cursor,
     errorCode: null,
     evidenceRef,
-    now: input.now,
+    now: operationTime(input),
     audit: input.audit,
+  });
+}
+
+type ControlledConnectorOperation = {
+  readonly now: string;
+  readonly currentTime?: () => string;
+  readonly signal?: AbortSignal;
+  readonly assertAuthority?: () => Promise<void>;
+};
+
+async function assertOperationAuthority(input: ControlledConnectorOperation): Promise<string> {
+  throwIfAborted(input.signal);
+  await input.assertAuthority?.();
+  throwIfAborted(input.signal);
+  return operationTime(input);
+}
+
+function operationTime(input: ControlledConnectorOperation): string {
+  const now = input.currentTime?.() ?? input.now;
+  const parsed = Date.parse(now);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== now) {
+    throw new RoomDeliveryCoordinatorError(
+      "delivery_state_conflict",
+      `Room delivery operation clock returned invalid timestamp ${now}`,
+    );
+  }
+  return now;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function abortError(): Error {
+  const error = new Error("Room connector operation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+async function raceConnectorOperation<T>(
+  operation: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return operation;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    let abortTimer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      signal.removeEventListener("abort", onAbort);
+      if (abortTimer) clearTimeout(abortTimer);
+    };
+    const onAbort = () => {
+      // Give a receipt that settled in the aborting turn one microtask checkpoint
+      // to win. Otherwise abandon the wait and leave the durable dispatching row
+      // for history reconciliation; never synthesize a rejection or retry send.
+      abortTimer = setTimeout(() => {
+        cleanup();
+        reject(abortError());
+      }, 0);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then((value) => {
+      cleanup();
+      resolve(value);
+    }, (error: unknown) => {
+      cleanup();
+      reject(error);
+    });
   });
 }
 
@@ -341,7 +428,7 @@ async function persistUncertainReconciliation(
     nativeCursor: delivery.nativeCursor,
     errorCode,
     evidenceRef: buildReconciliationEvidenceRef(delivery, errorCode, details),
-    now: input.now,
+    now: operationTime(input),
     audit: input.audit,
   });
 }

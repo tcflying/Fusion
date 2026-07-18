@@ -2105,6 +2105,7 @@ export * from "./room-projection-replay.js";
 export * from "./external-component-provenance.js";
 export * from "./session-room-external-components.js";
 export * from "./async-room-store.js";
+export * from "./room-delivery-coordinator.js";
 export * from "./async-room-lease-store.js";
 export * from "./async-room-checkpoint-store.js";
 export {

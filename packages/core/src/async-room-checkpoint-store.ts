@@ -39,6 +39,11 @@ export interface CreateRoomCheckpointInput {
   readonly now: string;
 }
 
+export interface ReplaceRoomCheckpointAfterDeliveryRecoveryInput
+  extends CreateRoomCheckpointInput {
+  readonly previousCheckpointId: string;
+}
+
 export interface StoredRoomCheckpointV1 extends RoomCheckpointRecordV1 {
   readonly eventId: string;
   readonly projectionHash: string;
@@ -227,6 +232,204 @@ export class AsyncRoomCheckpointStore {
     });
   }
 
+  /**
+   * Replace the one checkpoint allowed at an aggregate version after durable
+   * delivery reconciliation. This is deliberately narrower than
+   * createCheckpoint: the Room/event/protocol/DAG/artifact snapshot must be
+   * identical, the pending outbox set may only shrink, every removed outbox
+   * must now be confirmed, and binding cursors must equal each confirmed native
+   * cursor when one exists. A valid acknowledgement-only confirmation removes
+   * pending work without inventing a cursor.
+   *
+   * FNXC:SessionRoomCrashRecovery 2026-07-18-09:05:
+   * Recovery cursors are opaque. Prove strict progress through persisted
+   * confirmed rows by requiring each cursor to be non-empty and different from
+   * the prior cursor for its binding, then require the replacement checkpoint
+   * to equal the final database result without lexicographic ordering.
+   */
+  async replaceCheckpointAfterDeliveryRecovery(
+    input: ReplaceRoomCheckpointAfterDeliveryRecoveryInput,
+  ): Promise<StoredRoomCheckpointV1> {
+    validateCheckpointInput(input);
+    if (!input.previousCheckpointId.trim() || input.id === input.previousCheckpointId) {
+      throw new RoomCheckpointStoreError(
+        "checkpoint_version_conflict",
+        "Delivery recovery checkpoint replacement requires distinct non-empty checkpoint IDs",
+      );
+    }
+
+    return this.layer.transactionImmediate(async (tx) => {
+      const aggregate = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!aggregate) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_room_not_found",
+          `Operational Room ${input.roomId} does not exist`,
+        );
+      }
+      if (aggregate.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          `Room ${input.roomId} expected aggregate version ${input.expectedAggregateVersion} but is ${aggregate.room.aggregateVersion}`,
+        );
+      }
+
+      const existing = await findCheckpointById(
+        tx,
+        this.projectId,
+        input.roomId,
+        input.previousCheckpointId,
+      );
+      if (!existing || existing.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          `Checkpoint ${input.previousCheckpointId} is not the recovery base for Room ${input.roomId}`,
+        );
+      }
+      const events = await loadRoomEvents(tx, this.projectId, input.roomId);
+      const anchor = events.at(-1);
+      const projectionHash = hashRoomValue(aggregate);
+      if (
+        !anchor
+        || anchor.id !== existing.eventId
+        || anchor.cursor !== existing.eventCursor
+        || anchor.aggregateVersion !== existing.aggregateVersion
+        || projectionHash !== existing.projectionHash
+        || existing.turnId !== input.turnId
+        || hashRoomValue(existing.protocolState) !== hashRoomValue(input.protocolState)
+        || existing.dagVersion !== input.dagVersion
+        || hashRoomValue(existing.artifactRefs) !== hashRoomValue(input.artifactRefs)
+      ) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          `Checkpoint ${input.previousCheckpointId} differs outside delivery recovery state`,
+        );
+      }
+      if (Date.parse(input.now) < Date.parse(existing.createdAt)) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          "Delivery recovery checkpoint time cannot move backwards",
+        );
+      }
+
+      /*
+      REPEATABLE READ gives every projection/outbox query one stable database
+      snapshot without taking the room -> outbox row-lock order that can cycle
+      against delivery claim and native-writer takeover. A concurrent delivery
+      committed after this snapshot remains pending in this checkpoint and is
+      safely consumed by the next recovery pass.
+      */
+      const currentPendingRows = await tx
+        .select({ id: roomOutbox.id })
+        .from(roomOutbox)
+        .where(and(
+          eq(roomOutbox.projectId, this.projectId),
+          eq(roomOutbox.roomId, input.roomId),
+          inArray(roomOutbox.deliveryState, ["pending", "dispatching", "delivery_uncertain"]),
+        ))
+        .orderBy(asc(roomOutbox.id));
+      const currentPendingOutboxIds = currentPendingRows.map((row) => row.id);
+      const priorPending = new Set(existing.pendingOutboxIds);
+      const currentPending = new Set(currentPendingOutboxIds);
+      const added = currentPendingOutboxIds.filter((id) => !priorPending.has(id));
+      const removed = existing.pendingOutboxIds.filter((id) => !currentPending.has(id));
+      if (added.length > 0 || removed.length === 0) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          "Delivery recovery checkpoint pending outbox IDs must be a strict subset",
+        );
+      }
+
+      const resolvedRows = await tx
+        .select({
+          id: roomOutbox.id,
+          bindingId: roomOutbox.bindingId,
+          deliveryState: roomOutbox.deliveryState,
+          nativeCursor: roomOutbox.nativeCursor,
+          updatedAt: roomOutbox.updatedAt,
+        })
+        .from(roomOutbox)
+        .where(and(
+          eq(roomOutbox.projectId, this.projectId),
+          eq(roomOutbox.roomId, input.roomId),
+          inArray(roomOutbox.id, removed),
+        ))
+        .orderBy(asc(roomOutbox.updatedAt), asc(roomOutbox.id));
+      if (
+        resolvedRows.length !== removed.length
+        || resolvedRows.some((row) =>
+          row.deliveryState !== "confirmed" || Date.parse(row.updatedAt) > Date.parse(input.now)
+        )
+      ) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          "Delivery recovery checkpoint may remove only durably confirmed outbox records",
+        );
+      }
+
+      const expectedBindingCursors: Record<string, string | null> = {
+        ...existing.bindingCursors,
+      };
+      const affectedBindingIds = new Set<string>();
+      const seenBindingCursors = new Map<string, Set<string>>();
+      for (const row of resolvedRows) {
+        const checkpointCursor = existing.bindingCursors[row.bindingId] ?? null;
+        if (!row.nativeCursor) continue;
+        let seen = seenBindingCursors.get(row.bindingId);
+        if (!seen) {
+          seen = new Set<string>();
+          if (checkpointCursor) seen.add(checkpointCursor);
+          seenBindingCursors.set(row.bindingId, seen);
+        }
+        if (seen.has(row.nativeCursor)) {
+          throw new RoomCheckpointStoreError(
+            "checkpoint_version_conflict",
+            `Confirmed outbox ${row.id} repeats an opaque cursor for binding ${row.bindingId}`,
+          );
+        }
+        seen.add(row.nativeCursor);
+        expectedBindingCursors[row.bindingId] = row.nativeCursor;
+        affectedBindingIds.add(row.bindingId);
+      }
+      if ([...affectedBindingIds].some((bindingId) =>
+        expectedBindingCursors[bindingId] === (existing.bindingCursors[bindingId] ?? null)
+      )) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          "Delivery recovery checkpoint cursors must advance for every affected binding",
+        );
+      }
+      if (hashRoomValue(expectedBindingCursors) !== hashRoomValue(input.bindingCursors)) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          "Delivery recovery checkpoint cursors must match confirmed native delivery evidence",
+        );
+      }
+
+      const rows = await tx
+        .update(roomCheckpoints)
+        .set({
+          id: input.id,
+          bindingCursors: input.bindingCursors,
+          pendingOutboxIds: currentPendingOutboxIds,
+          createdAt: input.now,
+        })
+        .where(and(
+          eq(roomCheckpoints.projectId, this.projectId),
+          eq(roomCheckpoints.roomId, input.roomId),
+          eq(roomCheckpoints.id, input.previousCheckpointId),
+          eq(roomCheckpoints.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning();
+      if (!rows[0]) {
+        throw new RoomCheckpointStoreError(
+          "checkpoint_version_conflict",
+          `Checkpoint ${input.previousCheckpointId} lost its recovery replacement race`,
+        );
+      }
+      return rowToStoredCheckpoint(rows[0]);
+    }, { isolationLevel: "repeatable read" });
+  }
+
   async getLatestCheckpoint(roomId: string): Promise<StoredRoomCheckpointV1 | null> {
     return findLatestCheckpoint(this.layer.db, this.projectId, roomId);
   }
@@ -350,6 +553,24 @@ async function findCheckpointAtVersion(
         eq(roomCheckpoints.aggregateVersion, aggregateVersion),
       ),
     )
+    .limit(1);
+  return rows[0] ? rowToStoredCheckpoint(rows[0]) : null;
+}
+
+async function findCheckpointById(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  checkpointId: string,
+): Promise<StoredRoomCheckpointV1 | null> {
+  const rows = await handle
+    .select()
+    .from(roomCheckpoints)
+    .where(and(
+      eq(roomCheckpoints.projectId, projectId),
+      eq(roomCheckpoints.roomId, roomId),
+      eq(roomCheckpoints.id, checkpointId),
+    ))
     .limit(1);
   return rows[0] ? rowToStoredCheckpoint(rows[0]) : null;
 }

@@ -2061,6 +2061,23 @@ export class AsyncRoomStore {
           );
         }
       }
+      const unresolvedSibling = await tx
+        .select({ id: roomOutbox.id })
+        .from(roomOutbox)
+        .where(and(
+          eq(roomOutbox.projectId, this.projectId),
+          eq(roomOutbox.roomId, current.roomId),
+          eq(roomOutbox.bindingId, current.bindingId),
+          inArray(roomOutbox.deliveryState, ["dispatching", "delivery_uncertain"]),
+          sql`${roomOutbox.id} <> ${current.id}`,
+        ))
+        .limit(1);
+      if (unresolvedSibling[0]) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} cannot dispatch while ${unresolvedSibling[0].id} is unresolved for binding ${current.bindingId}`,
+        );
+      }
       if (
         current.nextAttemptAt
         && Date.parse(current.nextAttemptAt) > Date.parse(input.now)
