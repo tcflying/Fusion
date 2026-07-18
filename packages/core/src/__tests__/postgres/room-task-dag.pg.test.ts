@@ -3,165 +3,41 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 
-import { AsyncRoomStore, type RoomCommandContext } from "../../async-room-store.js";
+import {
+  AsyncRoomStore,
+  RoomStoreError,
+  type MutateRoomTaskGraphInputV1,
+  type RoomCommandContext,
+  type RoomTaskEdgeDefinitionV1,
+  type RoomTaskEdgeKindV1,
+  type RoomTaskGraphMutationV1,
+  type RoomTaskGraphProjectionV1,
+  type RoomTaskNodeDefinitionV1,
+  type RoomTaskNodeProjectionV1,
+} from "../../async-room-store.js";
+import { hashRoomValue } from "../../room-integrity.js";
 import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
-import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
+import {
+  createAsyncDataLayer,
+  type AsyncDataLayer,
+  type DbTransaction,
+  type TransactionOptions,
+} from "../../postgres/data-layer.js";
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
+import { operationalRooms, roomTaskNodes } from "../../postgres/schema/room.js";
 import type { RoomTaskNodeState } from "../../room-contracts/storage.js";
-
-type RoomTaskEdgeKind = "requires" | "informs" | "invalidates";
-
-interface RoomTaskResourceHintsV1 {
-  readonly estimatedDurationMs: number;
-  readonly concurrencyClass: "serial" | "parallel";
-  readonly preferredProviderIds: readonly string[];
-}
-
-interface RoomTaskAuthorityScopeV1 {
-  readonly allowedActions: readonly string[];
-  readonly readPaths: readonly string[];
-  readonly writePaths: readonly string[];
-}
-
-interface RoomTaskRetryPolicyV1 {
-  readonly maxAttempts: number;
-  readonly backoff: "fixed" | "exponential";
-  readonly baseDelayMs: number;
-  readonly recoveryActions: readonly string[];
-}
-
-interface RoomTaskNodeDefinitionV1 {
-  readonly id: string;
-  readonly parentNodeId: string | null;
-  readonly objective: string;
-  readonly inputRefs: readonly string[];
-  readonly outputRefs: readonly string[];
-  readonly roleRequirements: readonly string[];
-  readonly capabilityRequirements: readonly string[];
-  readonly resourceHints: RoomTaskResourceHintsV1;
-  readonly authorityScope: RoomTaskAuthorityScopeV1;
-  readonly acceptanceGateIds: readonly string[];
-  readonly retryPolicy: RoomTaskRetryPolicyV1;
-  readonly progressSignature: string;
-}
-
-interface RoomTaskNodeProjectionV1 extends RoomTaskNodeDefinitionV1 {
-  readonly state: RoomTaskNodeState;
-  readonly nodeVersion: number;
-  readonly acceptedAt: string | null;
-  readonly acceptanceEvidenceIds: readonly string[];
-  readonly invalidatedByEvidenceId: string | null;
-  readonly reopenedByEvidenceId: string | null;
-}
-
-interface RoomTaskEdgeDefinitionV1 {
-  readonly id: string;
-  readonly fromNodeId: string;
-  readonly toNodeId: string;
-  readonly kind: RoomTaskEdgeKind;
-}
-
-interface AddRoomTaskNodeMutationV1 {
-  readonly action: "add_node";
-  readonly node: RoomTaskNodeDefinitionV1;
-}
-
-interface AddRoomTaskEdgeMutationV1 {
-  readonly action: "add_edge";
-  readonly edge: RoomTaskEdgeDefinitionV1;
-}
-
-interface UpdateRoomTaskNodeMutationV1 {
-  readonly action: "update_node";
-  readonly nodeId: string;
-  readonly expectedNodeVersion: number;
-  readonly patch: Partial<
-    Pick<
-      RoomTaskNodeDefinitionV1,
-      | "objective"
-      | "inputRefs"
-      | "outputRefs"
-      | "roleRequirements"
-      | "capabilityRequirements"
-      | "resourceHints"
-      | "authorityScope"
-      | "acceptanceGateIds"
-      | "retryPolicy"
-      | "progressSignature"
-    >
-  >;
-  readonly evidenceIds: readonly string[];
-}
-
-interface TransitionRoomTaskNodeMutationV1 {
-  readonly action: "transition_node";
-  readonly nodeId: string;
-  readonly expectedNodeVersion: number;
-  readonly to: RoomTaskNodeState;
-  readonly acceptanceEvidenceIds: readonly string[];
-  readonly progressSignature: string;
-}
-
-interface InvalidateRoomTaskEvidenceMutationV1 {
-  readonly action: "invalidate_acceptance_evidence";
-  readonly nodeId: string;
-  readonly expectedNodeVersion: number;
-  readonly acceptanceEvidenceId: string;
-  readonly invalidatedByEvidenceId: string;
-  readonly reason: string;
-}
-
-interface ReopenRoomTaskNodeMutationV1 {
-  readonly action: "reopen_node";
-  readonly nodeId: string;
-  readonly expectedNodeVersion: number;
-  readonly upstreamNodeId: string;
-  readonly invalidatedByEvidenceId: string;
-  readonly reason: string;
-}
-
-type RoomTaskGraphMutationV1 =
-  | AddRoomTaskNodeMutationV1
-  | AddRoomTaskEdgeMutationV1
-  | UpdateRoomTaskNodeMutationV1
-  | TransitionRoomTaskNodeMutationV1
-  | InvalidateRoomTaskEvidenceMutationV1
-  | ReopenRoomTaskNodeMutationV1;
-
-interface MutateRoomTaskGraphInputV1 {
-  readonly roomId: string;
-  readonly expectedAggregateVersion: number;
-  readonly expectedDagVersion: number;
-  readonly idempotencyKey: string;
-  readonly mutations: readonly RoomTaskGraphMutationV1[];
-  readonly mutatedAt: string;
-}
-
-interface RoomTaskGraphProjectionV1 {
-  readonly roomId: string;
-  readonly aggregateVersion: number;
-  readonly dagVersion: number;
-  readonly nodes: readonly RoomTaskNodeProjectionV1[];
-  readonly edges: readonly RoomTaskEdgeDefinitionV1[];
-  readonly readyNodeIds: readonly string[];
-  readonly criticalPathNodeIds: readonly string[];
-}
 
 /*
 FNXC:SessionRoomTaskDag 2026-07-17-21:22:
 Task 5.1 requires the PostgreSQL Room store to own a typed, versioned task DAG. Readiness is derived only from `requires` edges, critical-path weight comes from estimated duration, accepted nodes are immutable, and evidence invalidation never silently reopens downstream work. Reopen must be an explicit causal command, while waiting or failure on one branch must not suppress independent ready nodes.
 
-This RED contract names the smallest AsyncRoomStore seam without importing a nonexistent production symbol. Every test first proves the embedded PostgreSQL Room fixture is usable, then fails at the explicit runtime seam assertion until production supplies these two methods.
+The retained RED contract now imports the production AsyncRoomStore contracts
+directly so public signature or field drift is a compile-time failure.
 */
-interface RoomTaskGraphStoreApi {
-  mutateTaskGraph(
-    input: MutateRoomTaskGraphInputV1,
-    context: RoomCommandContext,
-  ): Promise<RoomTaskGraphProjectionV1>;
-  getTaskGraph(roomId: string): Promise<RoomTaskGraphProjectionV1 | null>;
-}
+type RoomTaskGraphStoreApi = Pick<AsyncRoomStore, "mutateTaskGraph" | "getTaskGraph">;
 
 interface EmbeddedTestContext {
   readonly dataDir: string;
@@ -181,30 +57,81 @@ interface RejectedMutationOptions {
   readonly expectedDagVersion?: number;
 }
 
+interface SelectResolutionState {
+  count: number;
+}
+
+function wrapSelectResolution<T extends object>(
+  value: T,
+  state: SelectResolutionState,
+  afterFirstSelect: () => Promise<void>,
+): T {
+  return new Proxy(value, {
+    get(target, property) {
+      const member = Reflect.get(target, property, target) as unknown;
+      if (property === "then" && typeof member === "function") {
+        return (
+          onFulfilled?: (result: unknown) => unknown,
+          onRejected?: (error: unknown) => unknown,
+        ) => (member as (
+          resolve: (result: unknown) => Promise<unknown>,
+          reject?: (error: unknown) => unknown,
+        ) => Promise<unknown>).call(
+          target,
+          async (result: unknown) => {
+            state.count += 1;
+            if (state.count === 1) await afterFirstSelect();
+            return onFulfilled ? onFulfilled(result) : result;
+          },
+          onRejected,
+        );
+      }
+      if (typeof member === "function") {
+        return (...args: unknown[]) => wrapSelectResolution(
+          (member as (...methodArgs: unknown[]) => object).apply(target, args),
+          state,
+          afterFirstSelect,
+        );
+      }
+      return member;
+    },
+  });
+}
+
+function taskGraphSnapshotLayer(
+  layer: AsyncDataLayer,
+  afterFirstSelect: () => Promise<void>,
+): AsyncDataLayer {
+  const state: SelectResolutionState = { count: 0 };
+  const wrapHandle = <T extends object>(handle: T): T => new Proxy(handle, {
+    get(target, property) {
+      const member = Reflect.get(target, property, target) as unknown;
+      if (property === "select" && typeof member === "function") {
+        return (...args: unknown[]) => wrapSelectResolution(
+          (member as (...methodArgs: unknown[]) => object).apply(target, args),
+          state,
+          afterFirstSelect,
+        );
+      }
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  return {
+    ...layer,
+    db: wrapHandle(layer.db),
+    transaction: <T>(
+      fn: (tx: DbTransaction) => Promise<T>,
+      options?: TransactionOptions,
+    ) => layer.transaction((tx) => fn(wrapHandle(tx)), options),
+  };
+}
+
 const PROJECT_ID = "project-room-task-dag";
 const BASE_TIME = "2026-07-17T13:22:00.000Z";
 let commandSequence = 0;
 
 function requireTaskGraphApi(store: AsyncRoomStore): RoomTaskGraphStoreApi {
-  const candidate = store as unknown as Partial<RoomTaskGraphStoreApi>;
-  const seamTypes = {
-    mutateTaskGraph: typeof candidate.mutateTaskGraph,
-    getTaskGraph: typeof candidate.getTaskGraph,
-  };
-  if (
-    typeof candidate.mutateTaskGraph !== "function"
-    || typeof candidate.getTaskGraph !== "function"
-  ) {
-    expect(
-      seamTypes,
-      "Missing target production seam: AsyncRoomStore.mutateTaskGraph(input, context) and AsyncRoomStore.getTaskGraph(roomId)",
-    ).toEqual({ mutateTaskGraph: "function", getTaskGraph: "function" });
-    throw new Error("Missing AsyncRoomStore task-DAG production seam");
-  }
-  return {
-    mutateTaskGraph: (input, context) => candidate.mutateTaskGraph!.call(store, input, context),
-    getTaskGraph: (roomId) => candidate.getTaskGraph!.call(store, roomId),
-  };
+  return store;
 }
 
 async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
@@ -227,14 +154,13 @@ async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
 
 function commandContext(roomId: string, label: string): RoomCommandContext {
   commandSequence += 1;
-  const second = String(commandSequence).padStart(2, "0");
   return {
     eventId: `event-${roomId}-${label}`,
     actorType: "controller",
     actorId: "room-controller-task-dag-test",
     correlationId: `correlation-${roomId}-${label}`,
     causationId: null,
-    occurredAt: `2026-07-17T13:22:${second}.000Z`,
+    occurredAt: new Date(Date.parse(BASE_TIME) + commandSequence * 1_000).toISOString(),
   };
 }
 
@@ -276,7 +202,7 @@ function taskEdge(
   id: string,
   fromNodeId: string,
   toNodeId: string,
-  kind: RoomTaskEdgeKind,
+  kind: RoomTaskEdgeKindV1,
 ): RoomTaskEdgeDefinitionV1 {
   return { id, fromNodeId, toNodeId, kind };
 }
@@ -378,6 +304,35 @@ afterAll(async () => {
 });
 
 describe("AsyncRoomStore PostgreSQL task DAG", () => {
+  it("reads one repeatable task-graph snapshot across a concurrent mutation", async () => {
+    const fixture = await createRoomTaskGraphFixture("consistent-snapshot");
+    const concurrentNode = taskNode("node-concurrent-snapshot", 1_000);
+    let committedGraph: RoomTaskGraphProjectionV1 | undefined;
+    const snapshotLayer = taskGraphSnapshotLayer(fixture.layer, async () => {
+      committedGraph = await mutateGraph(
+        fixture,
+        { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+        "commit-during-read",
+        [{ action: "add_node", node: concurrentNode }],
+      );
+    });
+    const snapshotStore = new AsyncRoomStore(snapshotLayer, { projectId: PROJECT_ID });
+
+    const observed = await requireTaskGraphApi(snapshotStore).getTaskGraph(fixture.roomId);
+
+    expect(observed).toEqual({
+      roomId: fixture.roomId,
+      aggregateVersion: fixture.aggregateVersion,
+      dagVersion: 0,
+      nodes: [],
+      edges: [],
+      readyNodeIds: [],
+      criticalPathNodeIds: [],
+    });
+    expect(committedGraph).toBeDefined();
+    await expect(requireTaskGraphApi(fixture.store).getTaskGraph(fixture.roomId)).resolves.toEqual(committedGraph);
+  });
+
   it("persists fully typed task nodes and requires/informs/invalidates edges", async () => {
     const fixture = await createRoomTaskGraphFixture("typed-records");
     const producer = taskNode("node-producer", 4_000, "producer");
@@ -388,17 +343,18 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
       taskEdge("edge-producer-observer", producer.id, observer.id, "informs"),
       taskEdge("edge-verifier-observer", verifier.id, observer.id, "invalidates"),
     ] as const;
+    const mutations = [
+      { action: "add_node" as const, node: producer },
+      { action: "add_node" as const, node: verifier },
+      { action: "add_node" as const, node: observer },
+      ...edges.map((edge) => ({ action: "add_edge" as const, edge })),
+    ];
 
     const graph = await mutateGraph(
       fixture,
       { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
       "seed-typed-records",
-      [
-        { action: "add_node", node: producer },
-        { action: "add_node", node: verifier },
-        { action: "add_node", node: observer },
-        ...edges.map((edge) => ({ action: "add_edge" as const, edge })),
-      ],
+      mutations,
     );
 
     expect(graph).toMatchObject({
@@ -419,6 +375,456 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
 
     const reopenedStore = new AsyncRoomStore(fixture.layer, { projectId: PROJECT_ID });
     await expect(requireTaskGraphApi(reopenedStore).getTaskGraph(fixture.roomId)).resolves.toEqual(graph);
+
+    const eventCountBeforeReplay = (await fixture.store.listEvents(fixture.roomId)).length;
+    await expect(mutateGraph(
+      fixture,
+      { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+      "seed-typed-records",
+      mutations,
+    )).resolves.toEqual(graph);
+    expect(await fixture.store.listEvents(fixture.roomId)).toHaveLength(eventCountBeforeReplay);
+  });
+
+  it("rejects fractional and extra-key task JSON objects with a typed error", async () => {
+    const fixture = await createRoomTaskGraphFixture("runtime-json-shape");
+    const graph = await requireTaskGraphApi(fixture.store).getTaskGraph(fixture.roomId);
+    expect(graph).not.toBeNull();
+    if (!graph) throw new Error("Expected an empty task graph for runtime JSON validation");
+    const base = taskNode("node-runtime-json-shape", 1_000);
+    const malformed = [
+      {
+        label: "fractional-estimated-duration",
+        node: {
+          ...base,
+          resourceHints: { ...base.resourceHints, estimatedDurationMs: 1.5 },
+        },
+      },
+      {
+        label: "extra-resource-hint-key",
+        node: {
+          ...base,
+          resourceHints: { ...base.resourceHints, extra: true },
+        } as unknown as RoomTaskNodeDefinitionV1,
+      },
+      {
+        label: "extra-authority-key",
+        node: {
+          ...base,
+          authorityScope: { ...base.authorityScope, extra: true },
+        } as unknown as RoomTaskNodeDefinitionV1,
+      },
+      {
+        label: "fractional-max-attempts",
+        node: {
+          ...base,
+          retryPolicy: { ...base.retryPolicy, maxAttempts: 1.5 },
+        },
+      },
+      {
+        label: "fractional-base-delay",
+        node: {
+          ...base,
+          retryPolicy: { ...base.retryPolicy, baseDelayMs: 0.5 },
+        },
+      },
+      {
+        label: "extra-retry-policy-key",
+        node: {
+          ...base,
+          retryPolicy: { ...base.retryPolicy, extra: true },
+        } as unknown as RoomTaskNodeDefinitionV1,
+      },
+    ] as const;
+
+    for (const { label, node } of malformed) {
+      await expectMutationRejectedAndUnchanged(
+        fixture,
+        graph,
+        label,
+        [{ action: "add_node", node }],
+        "task_graph_invalid_mutation",
+      );
+    }
+  });
+
+  it("rejects malformed, proxied, sparse, and unbounded runtime commands with one typed error", async () => {
+    const fixture = await createRoomTaskGraphFixture("runtime-command-shape");
+    const node = taskNode("node-runtime-command-shape", 1_000);
+    const graph = await mutateGraph(
+      fixture,
+      { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+      "seed-runtime-command-shape",
+      [{ action: "add_node", node }],
+    );
+    const api = requireTaskGraphApi(fixture.store);
+    let accessorArrayGetterCalls = 0;
+    const makeValidPair = (label: string) => {
+      const context = commandContext(fixture.roomId, label);
+      const input: MutateRoomTaskGraphInputV1 = {
+        roomId: fixture.roomId,
+        expectedAggregateVersion: graph.aggregateVersion,
+        expectedDagVersion: graph.dagVersion,
+        idempotencyKey: `task-graph:${fixture.roomId}:${label}`,
+        mutations: [{
+          action: "update_node",
+          nodeId: node.id,
+          expectedNodeVersion: findNode(graph, node.id).nodeVersion,
+          patch: { progressSignature: `progress:${label}` },
+          evidenceIds: [`evidence:${label}`],
+        }],
+        mutatedAt: context.occurredAt,
+      };
+      return { input, context };
+    };
+    const malformedCases: Array<{
+      readonly label: string;
+      readonly build: () => { readonly input: unknown; readonly context: unknown };
+    }> = [
+      { label: "null-input", build: () => ({ input: null, context: makeValidPair("null-input").context }) },
+      { label: "undefined-input", build: () => ({ input: undefined, context: makeValidPair("undefined-input").context }) },
+      { label: "primitive-input", build: () => ({ input: 1, context: makeValidPair("primitive-input").context }) },
+      { label: "array-input", build: () => ({ input: [], context: makeValidPair("array-input").context }) },
+      { label: "malformed-input", build: () => ({ input: {}, context: makeValidPair("malformed-input").context }) },
+      {
+        label: "proxied-input",
+        build: () => {
+          const pair = makeValidPair("proxied-input");
+          return {
+            input: new Proxy(pair.input, { get: () => { throw new TypeError("input proxy trap"); } }),
+            context: pair.context,
+          };
+        },
+      },
+      { label: "null-context", build: () => ({ input: makeValidPair("null-context").input, context: null }) },
+      { label: "undefined-context", build: () => ({ input: makeValidPair("undefined-context").input, context: undefined }) },
+      { label: "primitive-context", build: () => ({ input: makeValidPair("primitive-context").input, context: 1 }) },
+      { label: "malformed-context", build: () => ({ input: makeValidPair("malformed-context").input, context: {} }) },
+      {
+        label: "proxied-context",
+        build: () => {
+          const pair = makeValidPair("proxied-context");
+          return {
+            input: pair.input,
+            context: new Proxy(pair.context, { get: () => { throw new TypeError("context proxy trap"); } }),
+          };
+        },
+      },
+      {
+        label: "null-mutations",
+        build: () => {
+          const pair = makeValidPair("null-mutations");
+          return { input: { ...pair.input, mutations: null }, context: pair.context };
+        },
+      },
+      {
+        label: "undefined-mutations",
+        build: () => {
+          const pair = makeValidPair("undefined-mutations");
+          return { input: { ...pair.input, mutations: undefined }, context: pair.context };
+        },
+      },
+      {
+        label: "object-mutations",
+        build: () => {
+          const pair = makeValidPair("object-mutations");
+          return { input: { ...pair.input, mutations: {} }, context: pair.context };
+        },
+      },
+      {
+        label: "sparse-mutations",
+        build: () => {
+          const pair = makeValidPair("sparse-mutations");
+          return { input: { ...pair.input, mutations: new Array(1) }, context: pair.context };
+        },
+      },
+      {
+        label: "extra-key-mutations",
+        build: () => {
+          const pair = makeValidPair("extra-key-mutations");
+          const mutations = [...pair.input.mutations] as RoomTaskGraphMutationV1[] & { extra?: boolean };
+          mutations.extra = true;
+          return { input: { ...pair.input, mutations }, context: pair.context };
+        },
+      },
+      {
+        label: "accessor-evidence-ids",
+        build: () => {
+          const pair = makeValidPair("accessor-evidence-ids");
+          const evidenceIds = ["evidence-1"];
+          Object.defineProperty(evidenceIds, "0", {
+            enumerable: true,
+            configurable: true,
+            get: () => {
+              accessorArrayGetterCalls += 1;
+              return "evidence-1";
+            },
+          });
+          return {
+            input: {
+              ...pair.input,
+              mutations: [{ ...pair.input.mutations[0]!, evidenceIds }],
+            },
+            context: pair.context,
+          };
+        },
+      },
+      {
+        label: "symbol-key-mutations",
+        build: () => {
+          const pair = makeValidPair("symbol-key-mutations");
+          const mutations = [...pair.input.mutations];
+          Object.defineProperty(mutations, Symbol("hidden"), {
+            enumerable: true,
+            configurable: true,
+            value: true,
+          });
+          return { input: { ...pair.input, mutations }, context: pair.context };
+        },
+      },
+      {
+        label: "non-plain-mutations",
+        build: () => {
+          const pair = makeValidPair("non-plain-mutations");
+          class NonPlainMutationArray extends Array<RoomTaskGraphMutationV1> {}
+          const mutations = new NonPlainMutationArray(...pair.input.mutations);
+          return { input: { ...pair.input, mutations }, context: pair.context };
+        },
+      },
+      {
+        label: "prototype-pollution-patch",
+        build: () => {
+          const pair = makeValidPair("prototype-pollution-patch");
+          const patch = { progressSignature: "progress:prototype-pollution" };
+          Object.defineProperty(patch, "__proto__", {
+            enumerable: true,
+            configurable: true,
+            value: { objective: "inherited unaudited objective" },
+          });
+          return {
+            input: {
+              ...pair.input,
+              mutations: [{ ...pair.input.mutations[0]!, patch }],
+            },
+            context: pair.context,
+          };
+        },
+      },
+      {
+        label: "proxied-mutations",
+        build: () => {
+          const pair = makeValidPair("proxied-mutations");
+          return {
+            input: {
+              ...pair.input,
+              mutations: new Proxy([...pair.input.mutations], {
+                get: () => { throw new TypeError("mutations proxy trap"); },
+              }),
+            },
+            context: pair.context,
+          };
+        },
+      },
+      {
+        label: "proxied-mutation",
+        build: () => {
+          const pair = makeValidPair("proxied-mutation");
+          return {
+            input: {
+              ...pair.input,
+              mutations: [new Proxy(pair.input.mutations[0]!, {
+                get: () => { throw new TypeError("mutation proxy trap"); },
+              })],
+            },
+            context: pair.context,
+          };
+        },
+      },
+      {
+        label: "sparse-evidence-ids",
+        build: () => {
+          const pair = makeValidPair("sparse-evidence-ids");
+          return {
+            input: {
+              ...pair.input,
+              mutations: [{ ...pair.input.mutations[0]!, evidenceIds: new Array(1) }],
+            },
+            context: pair.context,
+          };
+        },
+      },
+      {
+        label: "unbounded-mutations",
+        build: () => {
+          const pair = makeValidPair("unbounded-mutations");
+          return {
+            input: {
+              ...pair.input,
+              mutations: Array.from({ length: 65 }, (_, index) => ({
+                action: "add_node",
+                node: taskNode(`node-unbounded-${index}`, 1),
+              })),
+            },
+            context: pair.context,
+          };
+        },
+      },
+    ];
+
+    for (const { label, build } of malformedCases) {
+      const before = await api.getTaskGraph(fixture.roomId);
+      const eventCountBefore = (await fixture.store.listEvents(fixture.roomId)).length;
+      const { input, context } = build();
+      let caught: unknown;
+      try {
+        await api.mutateTaskGraph(
+          input as MutateRoomTaskGraphInputV1,
+          context as RoomCommandContext,
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught, label).toBeInstanceOf(RoomStoreError);
+      expect(caught, label).toMatchObject({ code: "task_graph_invalid_mutation" });
+      expect(await api.getTaskGraph(fixture.roomId), label).toEqual(before);
+      expect(await fixture.store.listEvents(fixture.roomId), label).toHaveLength(eventCountBefore);
+    }
+    expect(accessorArrayGetterCalls).toBe(0);
+  });
+
+  it("persists hash-safe causal command audit and preserves its original replay event", async () => {
+    const fixture = await createRoomTaskGraphFixture("causal-command-audit");
+    const node = taskNode("node-causal-command-audit", 1_000);
+    let graph = await mutateGraph(
+      fixture,
+      { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+      "seed-causal-command-audit",
+      [{ action: "add_node", node }],
+    );
+    const updateReasonContent = "replace the private incident narrative";
+    const updateEvidenceIds = ["evidence:update:z", "evidence:update:a"];
+    const updateContext = commandContext(fixture.roomId, "audit-update-node");
+    const updateInput = {
+      roomId: fixture.roomId,
+      expectedAggregateVersion: graph.aggregateVersion,
+      expectedDagVersion: graph.dagVersion,
+      idempotencyKey: `task-graph:${fixture.roomId}:audit-update-node`,
+      mutations: [{
+        action: "update_node" as const,
+        nodeId: node.id,
+        expectedNodeVersion: findNode(graph, node.id).nodeVersion,
+        patch: {
+          objective: updateReasonContent,
+          progressSignature: "private progress narrative",
+        },
+        evidenceIds: updateEvidenceIds,
+      }],
+      mutatedAt: updateContext.occurredAt,
+    };
+    const updateProjection = await requireTaskGraphApi(fixture.store).mutateTaskGraph(
+      updateInput,
+      updateContext,
+    );
+    graph = updateProjection;
+
+    const acceptanceEvidenceId = "evidence:audit:accepted";
+    graph = await mutateGraph(fixture, graph, "audit-accept-node", [{
+      action: "transition_node",
+      nodeId: node.id,
+      expectedNodeVersion: findNode(graph, node.id).nodeVersion,
+      to: "accepted",
+      acceptanceEvidenceIds: [acceptanceEvidenceId],
+      progressSignature: "progress:audit:accepted",
+    }]);
+    const invalidatedByEvidenceId = "evidence:audit:invalidated";
+    const invalidationReason = "private invalidation narrative";
+    const invalidationContext = commandContext(fixture.roomId, "audit-invalidate-node");
+    graph = await requireTaskGraphApi(fixture.store).mutateTaskGraph({
+      roomId: fixture.roomId,
+      expectedAggregateVersion: graph.aggregateVersion,
+      expectedDagVersion: graph.dagVersion,
+      idempotencyKey: `task-graph:${fixture.roomId}:audit-invalidate-node`,
+      mutations: [{
+        action: "invalidate_acceptance_evidence",
+        nodeId: node.id,
+        expectedNodeVersion: findNode(graph, node.id).nodeVersion,
+        acceptanceEvidenceId,
+        invalidatedByEvidenceId,
+        reason: invalidationReason,
+      }],
+      mutatedAt: invalidationContext.occurredAt,
+    }, invalidationContext);
+    const reopenReason = "private reopen narrative";
+    const reopenContext = commandContext(fixture.roomId, "audit-reopen-node");
+    graph = await requireTaskGraphApi(fixture.store).mutateTaskGraph({
+      roomId: fixture.roomId,
+      expectedAggregateVersion: graph.aggregateVersion,
+      expectedDagVersion: graph.dagVersion,
+      idempotencyKey: `task-graph:${fixture.roomId}:audit-reopen-node`,
+      mutations: [{
+        action: "reopen_node",
+        nodeId: node.id,
+        expectedNodeVersion: findNode(graph, node.id).nodeVersion,
+        upstreamNodeId: node.id,
+        invalidatedByEvidenceId,
+        reason: reopenReason,
+      }],
+      mutatedAt: reopenContext.occurredAt,
+    }, reopenContext);
+
+    const eventsBeforeReplay = await fixture.store.listEvents(fixture.roomId);
+    const updateEvent = eventsBeforeReplay.find((event) => event.id === updateContext.eventId);
+    const invalidationEvent = eventsBeforeReplay.find((event) => event.id === invalidationContext.eventId);
+    const reopenEvent = eventsBeforeReplay.find((event) => event.id === reopenContext.eventId);
+    expect(updateEvent?.payload).toMatchObject({
+      commandAudit: {
+        version: 1,
+        mutationCount: 1,
+        mutations: [{
+          action: "update_node",
+          nodeId: node.id,
+          expectedNodeVersion: 0,
+          changedFields: ["objective", "progressSignature"],
+          evidenceIds: ["evidence:update:a", "evidence:update:z"],
+          patchHash: hashRoomValue(updateInput.mutations[0].patch),
+        }],
+      },
+    });
+    expect(invalidationEvent?.payload).toMatchObject({
+      commandAudit: {
+        version: 1,
+        mutationCount: 1,
+        mutations: [{
+          action: "invalidate_acceptance_evidence",
+          nodeId: node.id,
+          acceptanceEvidenceId,
+          invalidatedByEvidenceId,
+          reasonHash: hashRoomValue(invalidationReason),
+        }],
+      },
+    });
+    expect(reopenEvent?.payload).toMatchObject({
+      commandAudit: {
+        version: 1,
+        mutationCount: 1,
+        mutations: [{
+          action: "reopen_node",
+          nodeId: node.id,
+          upstreamNodeId: node.id,
+          invalidatedByEvidenceId,
+          reasonHash: hashRoomValue(reopenReason),
+        }],
+      },
+    });
+    expect(JSON.stringify(updateEvent?.payload.commandAudit)).not.toContain(updateReasonContent);
+    expect(JSON.stringify(updateEvent?.payload.commandAudit)).not.toContain("private progress narrative");
+    expect(JSON.stringify(invalidationEvent?.payload.commandAudit)).not.toContain(invalidationReason);
+    expect(JSON.stringify(reopenEvent?.payload.commandAudit)).not.toContain(reopenReason);
+
+    await expect(
+      requireTaskGraphApi(fixture.store).mutateTaskGraph(updateInput, updateContext),
+    ).resolves.toEqual(updateProjection);
+    expect(await fixture.store.listEvents(fixture.roomId)).toEqual(eventsBeforeReplay);
   });
 
   it("promotes a dependent node to ready only after every required predecessor is accepted", async () => {
@@ -459,6 +865,54 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
     expect(graph.readyNodeIds).toEqual([downstream.id]);
   });
 
+  it("fails closed when an unsatisfied requires edge targets active work", async () => {
+    const activeStates = [
+      "running",
+      "waiting_approval",
+      "rate_limited",
+      "retrying",
+    ] as const satisfies readonly RoomTaskNodeState[];
+
+    for (const activeState of activeStates) {
+      const fixture = await createRoomTaskGraphFixture(`active-requires-${activeState}`);
+      const upstream = taskNode(`node-active-upstream-${activeState}`, 1_000);
+      const target = taskNode(`node-active-target-${activeState}`, 1_000);
+      let graph = await mutateGraph(
+        fixture,
+        { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+        `seed-active-requires-${activeState}`,
+        [
+          { action: "add_node", node: upstream },
+          { action: "add_node", node: target },
+        ],
+      );
+      graph = await mutateGraph(fixture, graph, `enter-${activeState}`, [{
+        action: "transition_node",
+        nodeId: target.id,
+        expectedNodeVersion: findNode(graph, target.id).nodeVersion,
+        to: activeState,
+        acceptanceEvidenceIds: [],
+        progressSignature: `progress:${target.id}:${activeState}`,
+      }]);
+
+      await expectMutationRejectedAndUnchanged(
+        fixture,
+        graph,
+        `reject-active-requires-${activeState}`,
+        [{
+          action: "add_edge",
+          edge: taskEdge(
+            `edge-active-requires-${activeState}`,
+            upstream.id,
+            target.id,
+            "requires",
+          ),
+        }],
+        "task_graph_invalid_mutation",
+      );
+    }
+  });
+
   it("computes the critical path from requires edges and estimated duration", async () => {
     const fixture = await createRoomTaskGraphFixture("critical-path");
     const backend = taskNode("node-backend", 5_000);
@@ -490,6 +944,93 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
     );
 
     expect(graph.criticalPathNodeIds).toEqual([connector.id, integration.id]);
+  });
+
+  it("rejects an unsafe accumulated critical-path duration without partial writes", async () => {
+    const fixture = await createRoomTaskGraphFixture("critical-path-overflow");
+    const graph = await requireTaskGraphApi(fixture.store).getTaskGraph(fixture.roomId);
+    expect(graph).not.toBeNull();
+    if (!graph) throw new Error("Expected an empty graph for critical-path overflow validation");
+    const first = taskNode("node-critical-path-max", Number.MAX_SAFE_INTEGER);
+    const second = taskNode("node-critical-path-overflow", 1);
+
+    await expectMutationRejectedAndUnchanged(
+      fixture,
+      graph,
+      "reject-critical-path-overflow",
+      [
+        { action: "add_node", node: first },
+        { action: "add_node", node: second },
+        {
+          action: "add_edge",
+          edge: taskEdge("edge-critical-path-overflow", first.id, second.id, "requires"),
+        },
+      ],
+      "task_graph_critical_path_overflow",
+    );
+  });
+
+  it("rejects aggregate, DAG, and node version overflow before any graph write", async () => {
+    const aggregateFixture = await createRoomTaskGraphFixture("aggregate-version-overflow");
+    await aggregateFixture.layer.db
+      .update(operationalRooms)
+      .set({ aggregateVersion: Number.MAX_SAFE_INTEGER })
+      .where(eq(operationalRooms.id, aggregateFixture.roomId));
+    const aggregateGraph = await requireTaskGraphApi(aggregateFixture.store)
+      .getTaskGraph(aggregateFixture.roomId);
+    if (!aggregateGraph) throw new Error("Expected aggregate-overflow graph");
+    await expectMutationRejectedAndUnchanged(
+      aggregateFixture,
+      aggregateGraph,
+      "reject-aggregate-version-overflow",
+      [{ action: "add_node", node: taskNode("node-aggregate-overflow", 1) }],
+      "task_graph_version_overflow",
+    );
+
+    const dagFixture = await createRoomTaskGraphFixture("dag-version-overflow");
+    await dagFixture.layer.db
+      .update(operationalRooms)
+      .set({ taskGraphVersion: Number.MAX_SAFE_INTEGER })
+      .where(eq(operationalRooms.id, dagFixture.roomId));
+    const dagGraph = await requireTaskGraphApi(dagFixture.store).getTaskGraph(dagFixture.roomId);
+    if (!dagGraph) throw new Error("Expected DAG-overflow graph");
+    await expectMutationRejectedAndUnchanged(
+      dagFixture,
+      dagGraph,
+      "reject-dag-version-overflow",
+      [{ action: "add_node", node: taskNode("node-dag-overflow", 1) }],
+      "task_graph_version_overflow",
+    );
+
+    const nodeFixture = await createRoomTaskGraphFixture("node-version-overflow");
+    const node = taskNode("node-version-overflow", 1);
+    let nodeGraph = await mutateGraph(
+      nodeFixture,
+      { aggregateVersion: nodeFixture.aggregateVersion, dagVersion: 0 },
+      "seed-node-version-overflow",
+      [{ action: "add_node", node }],
+    );
+    await nodeFixture.layer.db
+      .update(roomTaskNodes)
+      .set({ nodeVersion: Number.MAX_SAFE_INTEGER })
+      .where(eq(roomTaskNodes.id, node.id));
+    const reloadedNodeGraph = await requireTaskGraphApi(nodeFixture.store)
+      .getTaskGraph(nodeFixture.roomId);
+    if (!reloadedNodeGraph) throw new Error("Expected node-overflow graph");
+    nodeGraph = reloadedNodeGraph;
+    await expectMutationRejectedAndUnchanged(
+      nodeFixture,
+      nodeGraph,
+      "reject-node-version-overflow",
+      [{
+        action: "update_node",
+        nodeId: node.id,
+        expectedNodeVersion: Number.MAX_SAFE_INTEGER,
+        patch: { progressSignature: "progress:node-version-overflow:next" },
+        evidenceIds: ["evidence:node-version-overflow"],
+      }],
+      "task_graph_version_overflow",
+    );
   });
 
   it("freezes an accepted node against ordinary definition mutations", async () => {
@@ -635,6 +1176,52 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
     expect(findNode(graph, independent.id).state).toBe("accepted");
   });
 
+  it("allows an invalidated accepted source to explicitly reopen itself", async () => {
+    const fixture = await createRoomTaskGraphFixture("source-self-reopen");
+    const source = taskNode("node-invalidated-source", 2_000);
+    const acceptedEvidenceId = "evidence:source:v1";
+    const invalidationEvidenceId = "evidence:source:v2-invalid";
+    let graph = await mutateGraph(
+      fixture,
+      { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+      "seed-source-self-reopen",
+      [{ action: "add_node", node: source }],
+    );
+    graph = await mutateGraph(fixture, graph, "accept-source-self-reopen", [{
+      action: "transition_node",
+      nodeId: source.id,
+      expectedNodeVersion: findNode(graph, source.id).nodeVersion,
+      to: "accepted",
+      acceptanceEvidenceIds: [acceptedEvidenceId],
+      progressSignature: "progress:source:accepted",
+    }]);
+    graph = await mutateGraph(fixture, graph, "invalidate-source-self-reopen", [{
+      action: "invalidate_acceptance_evidence",
+      nodeId: source.id,
+      expectedNodeVersion: findNode(graph, source.id).nodeVersion,
+      acceptanceEvidenceId: acceptedEvidenceId,
+      invalidatedByEvidenceId: invalidationEvidenceId,
+      reason: "the source evidence was superseded",
+    }]);
+
+    graph = await mutateGraph(fixture, graph, "reopen-source-itself", [{
+      action: "reopen_node",
+      nodeId: source.id,
+      expectedNodeVersion: findNode(graph, source.id).nodeVersion,
+      upstreamNodeId: source.id,
+      invalidatedByEvidenceId: invalidationEvidenceId,
+      reason: "the invalidated source must be recomputed",
+    }]);
+
+    expect(findNode(graph, source.id)).toMatchObject({
+      state: "ready",
+      acceptedAt: null,
+      acceptanceEvidenceIds: [],
+      invalidatedByEvidenceId: null,
+      reopenedByEvidenceId: invalidationEvidenceId,
+    });
+  });
+
   it("fails closed when a requires edge would create a cycle", async () => {
     const fixture = await createRoomTaskGraphFixture("cycle");
     const first = taskNode("node-cycle-first", 1_000);
@@ -661,6 +1248,40 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
         action: "add_edge",
         edge: taskEdge("edge-cycle-back", second.id, first.id, "requires"),
       }],
+      "task_graph_cycle",
+    );
+  });
+
+  it("includes informs and invalidates edges in the all-edge DAG cycle rule", async () => {
+    const fixture = await createRoomTaskGraphFixture("all-edge-cycle");
+    const graph = await requireTaskGraphApi(fixture.store).getTaskGraph(fixture.roomId);
+    expect(graph).not.toBeNull();
+    if (!graph) throw new Error("Expected an empty graph for all-edge cycle validation");
+    const first = taskNode("node-all-edge-first", 1_000);
+    const second = taskNode("node-all-edge-second", 1_000);
+    const third = taskNode("node-all-edge-third", 1_000);
+
+    await expectMutationRejectedAndUnchanged(
+      fixture,
+      graph,
+      "reject-all-edge-cycle",
+      [
+        { action: "add_node", node: first },
+        { action: "add_node", node: second },
+        { action: "add_node", node: third },
+        {
+          action: "add_edge",
+          edge: taskEdge("edge-all-edge-requires", first.id, second.id, "requires"),
+        },
+        {
+          action: "add_edge",
+          edge: taskEdge("edge-all-edge-informs", second.id, third.id, "informs"),
+        },
+        {
+          action: "add_edge",
+          edge: taskEdge("edge-all-edge-invalidates", third.id, first.id, "invalidates"),
+        },
+      ],
       "task_graph_cycle",
     );
   });
@@ -709,7 +1330,7 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
     );
   });
 
-  it("fails closed on stale DAG and node versions", async () => {
+  it("fails closed on stale aggregate, DAG, and node versions", async () => {
     const fixture = await createRoomTaskGraphFixture("version-conflict");
     const first = taskNode("node-version-first", 1_000);
     const graph = await mutateGraph(
@@ -719,6 +1340,14 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
       [{ action: "add_node", node: first }],
     );
 
+    await expectMutationRejectedAndUnchanged(
+      fixture,
+      graph,
+      "stale-aggregate-version",
+      [{ action: "add_node", node: taskNode("node-version-aggregate-stale", 1_000) }],
+      "aggregate_version_conflict",
+      { expectedAggregateVersion: graph.aggregateVersion - 1 },
+    );
     await expectMutationRejectedAndUnchanged(
       fixture,
       graph,

@@ -24,6 +24,7 @@ import {
   SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
   SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
   SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+  SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -174,6 +175,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -189,6 +191,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -664,6 +667,451 @@ describe("Session Room PostgreSQL migration", () => {
     }]);
   });
 
+  it("upgrades existing 0011 task rows into scoped typed DAG projections", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await context.connections!.migration.execute(sql.raw(`
+      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+      WHERE version = '${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}';
+
+      ALTER TABLE project.room_task_edges
+        DROP CONSTRAINT IF EXISTS room_task_edges_from_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_edges_to_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_edges_kind_check,
+        DROP CONSTRAINT IF EXISTS room_task_edges_self_check,
+        ADD CONSTRAINT room_task_edges_from_fkey
+          FOREIGN KEY (from_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE,
+        ADD CONSTRAINT room_task_edges_to_fkey
+          FOREIGN KEY (to_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE;
+
+      DROP INDEX IF EXISTS project.idx_room_task_edges_to;
+      CREATE INDEX idx_room_task_edges_to
+        ON project.room_task_edges(room_id, to_node_id);
+
+      ALTER TABLE project.room_task_nodes
+        DROP CONSTRAINT IF EXISTS room_task_nodes_parent_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_id_room_project_unique,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_node_version_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_progress_signature_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_projection_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_role_requirements_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_capability_requirements_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_resource_hints_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_authority_scope_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_retry_policy_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_evidence_ids_check,
+        DROP COLUMN IF EXISTS role_requirements,
+        DROP COLUMN IF EXISTS capability_requirements,
+        DROP COLUMN IF EXISTS resource_hints,
+        DROP COLUMN IF EXISTS authority_scope,
+        DROP COLUMN IF EXISTS retry_policy,
+        DROP COLUMN IF EXISTS acceptance_evidence_ids,
+        DROP COLUMN IF EXISTS reopened_by_evidence_id,
+        ALTER COLUMN progress_signature DROP NOT NULL;
+
+      DROP INDEX IF EXISTS project.idx_room_task_nodes_parent;
+      CREATE INDEX idx_room_task_nodes_parent
+        ON project.room_task_nodes(parent_node_id);
+
+      ALTER TABLE project.operational_rooms
+        DROP CONSTRAINT IF EXISTS operational_rooms_aggregate_version_check,
+        DROP CONSTRAINT IF EXISTS operational_rooms_task_graph_version_check,
+        DROP COLUMN IF EXISTS task_graph_version;
+
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-dag-upgrade', 'project-dag-upgrade', 'legacy DAG upgrade',
+        'implementation', 1, 'running',
+        '2026-07-18T04:00:00.000Z', '2026-07-18T04:00:00.000Z'
+      );
+
+      INSERT INTO project.room_task_nodes (
+        id, project_id, room_id, parent_node_id, objective, state,
+        input_refs, output_refs, required_gate_ids, progress_signature, node_version
+      ) VALUES
+        (
+          'node-dag-upgrade-a', 'project-dag-upgrade', 'room-dag-upgrade', NULL,
+          'legacy producer', 'ready', '["input:a"]'::jsonb, '["output:a"]'::jsonb,
+          '["gate:a"]'::jsonb, NULL, 0
+        ),
+        (
+          'node-dag-upgrade-b', 'project-dag-upgrade', 'room-dag-upgrade', NULL,
+          'legacy verifier', 'waiting_dependency', '["input:b"]'::jsonb, '["output:b"]'::jsonb,
+          '["gate:b"]'::jsonb, 'progress:b', 0
+        );
+
+      INSERT INTO project.room_task_edges (
+        id, project_id, room_id, from_node_id, to_node_id, kind, created_at
+      ) VALUES (
+        'edge-dag-upgrade', 'project-dag-upgrade', 'room-dag-upgrade',
+        'node-dag-upgrade-a', 'node-dag-upgrade-b', 'requires',
+        '2026-07-18T04:01:00.000Z'
+      );
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION]);
+
+    const rooms = (await context.connections!.migration.execute(sql`
+      SELECT task_graph_version::integer AS task_graph_version
+      FROM project.operational_rooms
+      WHERE id = 'room-dag-upgrade'
+    `)) as unknown as Array<{ task_graph_version: number }>;
+    expect(rooms).toEqual([{ task_graph_version: 0 }]);
+
+    const roomVersionConstraints = (await context.connections!.migration.execute(sql`
+      SELECT constraint_name
+      FROM information_schema.table_constraints
+      WHERE table_schema = 'project'
+        AND table_name = 'operational_rooms'
+        AND constraint_name IN (
+          'operational_rooms_aggregate_version_check',
+          'operational_rooms_task_graph_version_check'
+        )
+      ORDER BY constraint_name
+    `)) as unknown as Array<{ constraint_name: string }>;
+    expect(roomVersionConstraints.map((row) => row.constraint_name)).toEqual([
+      "operational_rooms_aggregate_version_check",
+      "operational_rooms_task_graph_version_check",
+    ]);
+
+    const nodes = (await context.connections!.migration.execute(sql`
+      SELECT
+        id,
+        role_requirements,
+        capability_requirements,
+        resource_hints,
+        authority_scope,
+        retry_policy,
+        progress_signature,
+        acceptance_evidence_ids,
+        reopened_by_evidence_id
+      FROM project.room_task_nodes
+      WHERE room_id = 'room-dag-upgrade'
+      ORDER BY id
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(nodes).toEqual([
+      {
+        id: "node-dag-upgrade-a",
+        role_requirements: [],
+        capability_requirements: [],
+        resource_hints: {
+          estimatedDurationMs: 0,
+          concurrencyClass: "serial",
+          preferredProviderIds: [],
+        },
+        authority_scope: { allowedActions: [], readPaths: [], writePaths: [] },
+        retry_policy: {
+          maxAttempts: 1,
+          backoff: "fixed",
+          baseDelayMs: 0,
+          recoveryActions: [],
+        },
+        progress_signature: "legacy:0011:node-dag-upgrade-a:v0",
+        acceptance_evidence_ids: [],
+        reopened_by_evidence_id: null,
+      },
+      {
+        id: "node-dag-upgrade-b",
+        role_requirements: [],
+        capability_requirements: [],
+        resource_hints: {
+          estimatedDurationMs: 0,
+          concurrencyClass: "serial",
+          preferredProviderIds: [],
+        },
+        authority_scope: { allowedActions: [], readPaths: [], writePaths: [] },
+        retry_policy: {
+          maxAttempts: 1,
+          backoff: "fixed",
+          baseDelayMs: 0,
+          recoveryActions: [],
+        },
+        progress_signature: "progress:b",
+        acceptance_evidence_ids: [],
+        reopened_by_evidence_id: null,
+      },
+    ]);
+
+    const edgeConstraints = (await context.connections!.migration.execute(sql`
+      SELECT constraint_name
+      FROM information_schema.table_constraints
+      WHERE table_schema = 'project'
+        AND table_name = 'room_task_edges'
+        AND constraint_name IN (
+          'room_task_edges_from_room_project_fkey',
+          'room_task_edges_to_room_project_fkey',
+          'room_task_edges_kind_check',
+          'room_task_edges_self_check'
+        )
+      ORDER BY constraint_name
+    `)) as unknown as Array<{ constraint_name: string }>;
+    expect(edgeConstraints.map((row) => row.constraint_name)).toEqual([
+      "room_task_edges_from_room_project_fkey",
+      "room_task_edges_kind_check",
+      "room_task_edges_self_check",
+      "room_task_edges_to_room_project_fkey",
+    ]);
+
+    const upgradedStore = new AsyncRoomStore(
+      createAsyncDataLayer(context.connections!, { projectId: "project-dag-upgrade" }),
+      { projectId: "project-dag-upgrade" },
+    );
+    await expect(upgradedStore.getTaskGraph("room-dag-upgrade")).resolves.toMatchObject({
+      roomId: "room-dag-upgrade",
+      dagVersion: 0,
+      nodes: [
+        expect.objectContaining({
+          id: "node-dag-upgrade-a",
+          progressSignature: "legacy:0011:node-dag-upgrade-a:v0",
+        }),
+        expect.objectContaining({ id: "node-dag-upgrade-b", progressSignature: "progress:b" }),
+      ],
+    });
+
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET resource_hints = '{"estimatedDurationMs":1.5,"concurrencyClass":"serial","preferredProviderIds":[]}'::jsonb
+      WHERE id = 'node-dag-upgrade-a'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET resource_hints = '{"estimatedDurationMs":1,"concurrencyClass":"serial","preferredProviderIds":[],"extra":true}'::jsonb
+      WHERE id = 'node-dag-upgrade-a'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET authority_scope = '{"allowedActions":[],"readPaths":[],"writePaths":[],"extra":true}'::jsonb
+      WHERE id = 'node-dag-upgrade-a'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET retry_policy = '{"maxAttempts":1.5,"backoff":"fixed","baseDelayMs":0,"recoveryActions":[]}'::jsonb
+      WHERE id = 'node-dag-upgrade-a'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET retry_policy = '{"maxAttempts":1,"backoff":"fixed","baseDelayMs":0.5,"recoveryActions":[]}'::jsonb
+      WHERE id = 'node-dag-upgrade-a'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_task_nodes
+      SET retry_policy = '{"maxAttempts":1,"backoff":"fixed","baseDelayMs":0,"recoveryActions":[],"extra":true}'::jsonb
+      WHERE id = 'node-dag-upgrade-a'
+    `))).rejects.toThrow();
+
+    await context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-dag-foreign', 'project-dag-upgrade', 'foreign Room',
+        'implementation', 1, 'running',
+        '2026-07-18T04:02:00.000Z', '2026-07-18T04:02:00.000Z'
+      );
+      INSERT INTO project.room_task_nodes (
+        id, project_id, room_id, objective, state, progress_signature
+      ) VALUES (
+        'node-dag-foreign', 'project-dag-upgrade', 'room-dag-foreign',
+        'foreign node', 'ready', 'progress:foreign'
+      );
+    `));
+    await expect(context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_task_edges (
+        id, project_id, room_id, from_node_id, to_node_id, kind, created_at
+      ) VALUES (
+        'edge-dag-cross-room', 'project-dag-upgrade', 'room-dag-upgrade',
+        'node-dag-upgrade-a', 'node-dag-foreign', 'requires',
+        '2026-07-18T04:03:00.000Z'
+      )
+    `))).rejects.toThrow();
+
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.operational_rooms
+      SET aggregate_version = -1
+      WHERE id = 'room-dag-upgrade'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.operational_rooms
+      SET aggregate_version = 9007199254740992
+      WHERE id = 'room-dag-upgrade'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.operational_rooms
+      SET aggregate_version = 9007199254740991
+      WHERE id = 'room-dag-upgrade'
+    `))).resolves.toBeDefined();
+  });
+
+  it("upgrades a legacy accepted node with deterministic hash-only acceptance evidence", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await context.connections!.migration.execute(sql.raw(`
+      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+      WHERE version = '${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}';
+
+      ALTER TABLE project.room_task_edges
+        DROP CONSTRAINT IF EXISTS room_task_edges_from_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_edges_to_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_edges_kind_check,
+        DROP CONSTRAINT IF EXISTS room_task_edges_self_check,
+        ADD CONSTRAINT room_task_edges_from_fkey
+          FOREIGN KEY (from_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE,
+        ADD CONSTRAINT room_task_edges_to_fkey
+          FOREIGN KEY (to_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE;
+
+      ALTER TABLE project.room_task_nodes
+        DROP CONSTRAINT IF EXISTS room_task_nodes_parent_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_id_room_project_unique,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_node_version_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_progress_signature_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_projection_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_role_requirements_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_capability_requirements_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_resource_hints_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_authority_scope_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_retry_policy_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_evidence_ids_check,
+        DROP COLUMN IF EXISTS role_requirements,
+        DROP COLUMN IF EXISTS capability_requirements,
+        DROP COLUMN IF EXISTS resource_hints,
+        DROP COLUMN IF EXISTS authority_scope,
+        DROP COLUMN IF EXISTS retry_policy,
+        DROP COLUMN IF EXISTS acceptance_evidence_ids,
+        DROP COLUMN IF EXISTS reopened_by_evidence_id,
+        ALTER COLUMN progress_signature DROP NOT NULL;
+
+      ALTER TABLE project.operational_rooms
+        DROP CONSTRAINT IF EXISTS operational_rooms_aggregate_version_check,
+        DROP CONSTRAINT IF EXISTS operational_rooms_task_graph_version_check,
+        DROP COLUMN IF EXISTS task_graph_version;
+
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-dag-accepted-legacy', 'project-dag-accepted-legacy',
+        'legacy accepted DAG', 'implementation', 1, 'running',
+        '2026-07-18T04:10:00.000Z', '2026-07-18T04:10:00.000Z'
+      );
+
+      INSERT INTO project.room_task_nodes (
+        id, project_id, room_id, objective, state, progress_signature,
+        node_version, accepted_at
+      ) VALUES (
+        'node-dag-accepted-legacy', 'project-dag-accepted-legacy',
+        'room-dag-accepted-legacy', 'legacy accepted node', 'accepted',
+        'progress:legacy-accepted', 1, '2026-07-18T04:09:00.000Z'
+      );
+    `));
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION]);
+    expect(await getAppliedMigrations(context.connections!.migration)).toContain(
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+    );
+
+    const nodes = (await context.connections!.migration.execute(sql`
+      SELECT
+        accepted_at,
+        acceptance_evidence_ids,
+        jsonb_build_array(format(
+          'legacy:0011:acceptance:md5:%s',
+          md5(jsonb_build_array(project_id, room_id, id, node_version, accepted_at)::text)
+        )) AS expected_acceptance_evidence_ids
+      FROM project.room_task_nodes
+      WHERE id = 'node-dag-accepted-legacy'
+    `)) as unknown as Array<{
+      accepted_at: string;
+      acceptance_evidence_ids: string[];
+      expected_acceptance_evidence_ids: string[];
+    }>;
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]).toMatchObject({
+      accepted_at: "2026-07-18T04:09:00.000Z",
+      acceptance_evidence_ids: nodes[0]!.expected_acceptance_evidence_ids,
+    });
+    const marker = nodes[0]!.acceptance_evidence_ids[0]!;
+    expect(marker).toMatch(/^legacy:0011:acceptance:md5:[0-9a-f]{32}$/);
+    expect(marker).not.toContain("project-dag-accepted-legacy");
+    expect(marker).not.toContain("room-dag-accepted-legacy");
+    expect(marker).not.toContain("node-dag-accepted-legacy");
+    expect(marker).not.toContain("legacy accepted node");
+    expect(marker).not.toContain("2026-07-18T04:09:00.000Z");
+  });
+
+  it("fails 0012 before registration when a legacy accepted node lacks accepted_at", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await context.connections!.migration.execute(sql.raw(`
+      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+      WHERE version = '${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}';
+
+      ALTER TABLE project.room_task_edges
+        DROP CONSTRAINT IF EXISTS room_task_edges_from_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_edges_to_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_edges_kind_check,
+        DROP CONSTRAINT IF EXISTS room_task_edges_self_check,
+        ADD CONSTRAINT room_task_edges_from_fkey
+          FOREIGN KEY (from_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE,
+        ADD CONSTRAINT room_task_edges_to_fkey
+          FOREIGN KEY (to_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE;
+
+      ALTER TABLE project.room_task_nodes
+        DROP CONSTRAINT IF EXISTS room_task_nodes_parent_room_project_fkey,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_id_room_project_unique,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_node_version_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_progress_signature_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_projection_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_role_requirements_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_capability_requirements_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_resource_hints_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_authority_scope_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_retry_policy_check,
+        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_evidence_ids_check,
+        DROP COLUMN IF EXISTS role_requirements,
+        DROP COLUMN IF EXISTS capability_requirements,
+        DROP COLUMN IF EXISTS resource_hints,
+        DROP COLUMN IF EXISTS authority_scope,
+        DROP COLUMN IF EXISTS retry_policy,
+        DROP COLUMN IF EXISTS acceptance_evidence_ids,
+        DROP COLUMN IF EXISTS reopened_by_evidence_id,
+        ALTER COLUMN progress_signature DROP NOT NULL;
+
+      ALTER TABLE project.operational_rooms
+        DROP CONSTRAINT IF EXISTS operational_rooms_aggregate_version_check,
+        DROP CONSTRAINT IF EXISTS operational_rooms_task_graph_version_check,
+        DROP COLUMN IF EXISTS task_graph_version;
+
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-dag-incomplete-accepted', 'project-dag-incomplete-accepted',
+        'incomplete legacy accepted DAG', 'implementation', 1, 'running',
+        '2026-07-18T04:20:00.000Z', '2026-07-18T04:20:00.000Z'
+      );
+
+      INSERT INTO project.room_task_nodes (
+        id, project_id, room_id, objective, state, progress_signature,
+        node_version, accepted_at
+      ) VALUES (
+        'node-dag-incomplete-accepted', 'project-dag-incomplete-accepted',
+        'room-dag-incomplete-accepted', 'incomplete legacy accepted node', 'accepted',
+        'progress:legacy-incomplete', 1, NULL
+      );
+    `));
+
+    await expect(
+      applySchemaBaseline(context.connections!.migration, { pluginHooks: [] }),
+    ).rejects.toThrow(/legacy accepted Room task nodes lack accepted_at/);
+    expect(await getAppliedMigrations(context.connections!.migration)).not.toContain(
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+    );
+  });
+
   it("upgrades an existing 0000 database without replaying the baseline", async () => {
     const context = await startEmbeddedDatabase();
     await context.connections!.migration.execute(sql.raw(`
@@ -690,6 +1138,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -726,6 +1175,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -781,6 +1231,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -863,6 +1314,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -1013,6 +1465,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable

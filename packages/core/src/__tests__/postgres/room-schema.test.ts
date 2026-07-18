@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { getTableConfig, PgDialect } from "drizzle-orm/pg-core";
 
 import {
   ROOM_PROJECT_TABLE_NAMES,
@@ -33,6 +34,63 @@ import {
   SCHEMA_MIGRATIONS,
   readSchemaMigrationSql,
 } from "../../postgres/schema-applier.js";
+
+const pgDialect = new PgDialect();
+
+function normalizeCheckSql(value: string): string {
+  return value
+    .replace(/"project"\."[^"]+"\."([^"]+)"/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function declarativeChecks(table: Parameters<typeof getTableConfig>[0]): Map<string, string> {
+  return new Map(
+    getTableConfig(table).checks.map((constraint) => [
+      constraint.name,
+      normalizeCheckSql(pgDialect.sqlToQuery(constraint.value).sql),
+    ]),
+  );
+}
+
+function migrationCheck(migrationSql: string, constraintName: string): string {
+  const marker = `ADD CONSTRAINT ${constraintName} CHECK (`;
+  const markerIndex = migrationSql.indexOf(marker);
+  if (markerIndex < 0) {
+    throw new Error(`Migration is missing CHECK constraint ${constraintName}`);
+  }
+
+  const expressionStart = markerIndex + marker.length;
+  let depth = 1;
+  let quote: "'" | '"' | undefined;
+
+  for (let cursor = expressionStart; cursor < migrationSql.length; cursor += 1) {
+    const character = migrationSql[cursor];
+    if (quote !== undefined) {
+      if (character === quote) {
+        if (migrationSql[cursor + 1] === quote) {
+          cursor += 1;
+        } else {
+          quote = undefined;
+        }
+      }
+      continue;
+    }
+
+    if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === "(") {
+      depth += 1;
+    } else if (character === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return normalizeCheckSql(migrationSql.slice(expressionStart, cursor));
+      }
+    }
+  }
+
+  throw new Error(`Migration CHECK constraint ${constraintName} is not balanced`);
+}
 
 describe("Session Room PostgreSQL schema", () => {
   it("defines the complete canonical project-schema table set", () => {
@@ -96,7 +154,7 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"]);
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"]);
     const roomSql = await readSchemaMigrationSql("0001");
     const ownershipSql = await readSchemaMigrationSql("0002");
     const outboxIdentitySql = await readSchemaMigrationSql("0003");
@@ -108,6 +166,7 @@ describe("Session Room PostgreSQL schema", () => {
     const membershipProductionInvariantsSql = await readSchemaMigrationSql("0009");
     const nativeSenderTakeoverSql = await readSchemaMigrationSql("0010");
     const messageRoutingSql = await readSchemaMigrationSql("0011");
+    const taskGraphCommandsSql = await readSchemaMigrationSql("0012");
 
     for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => ![
       "room_binding_ingestion_state",
@@ -145,6 +204,71 @@ describe("Session Room PostgreSQL schema", () => {
     expect(messageRoutingSql).toContain("target_seat_ids");
     expect(messageRoutingSql).toContain("idempotency_key");
     expect(messageRoutingSql).toContain("expected_aggregate_version");
+    expect(taskGraphCommandsSql).toContain("task_graph_version");
+    expect(taskGraphCommandsSql).toContain("role_requirements");
+    expect(taskGraphCommandsSql).toContain("acceptance_evidence_ids");
+    expect(taskGraphCommandsSql).toContain("room_task_edges_from_room_project_fkey");
+    expect(taskGraphCommandsSql).toContain("room_task_edges_kind_check");
+  });
+
+  it("models typed task-graph command projections on the existing Room tables", () => {
+    expect({
+      taskGraphVersion: operationalRooms.taskGraphVersion.name,
+      roleRequirements: roomTaskNodes.roleRequirements.name,
+      capabilityRequirements: roomTaskNodes.capabilityRequirements.name,
+      resourceHints: roomTaskNodes.resourceHints.name,
+      authorityScope: roomTaskNodes.authorityScope.name,
+      retryPolicy: roomTaskNodes.retryPolicy.name,
+      acceptanceEvidenceIds: roomTaskNodes.acceptanceEvidenceIds.name,
+      reopenedByEvidenceId: roomTaskNodes.reopenedByEvidenceId.name,
+    }).toEqual({
+      taskGraphVersion: "task_graph_version",
+      roleRequirements: "role_requirements",
+      capabilityRequirements: "capability_requirements",
+      resourceHints: "resource_hints",
+      authorityScope: "authority_scope",
+      retryPolicy: "retry_policy",
+      acceptanceEvidenceIds: "acceptance_evidence_ids",
+      reopenedByEvidenceId: "reopened_by_evidence_id",
+    });
+  });
+
+  it("keeps task-graph CHECK constraints aligned with migration 0012", async () => {
+    const migrationSql = await readSchemaMigrationSql("0012");
+    const roomChecks = declarativeChecks(operationalRooms);
+    const nodeChecks = declarativeChecks(roomTaskNodes);
+    const edgeChecks = declarativeChecks(roomTaskEdges);
+
+    expect(Object.fromEntries([
+      "operational_rooms_aggregate_version_check",
+      "operational_rooms_task_graph_version_check",
+    ].map((name) => [name, roomChecks.get(name)]))).toEqual({
+      operational_rooms_aggregate_version_check: "aggregate_version BETWEEN 0 AND 9007199254740991",
+      operational_rooms_task_graph_version_check: "task_graph_version BETWEEN 0 AND 9007199254740991",
+    });
+
+    for (const constraintName of [
+      "operational_rooms_aggregate_version_check",
+      "operational_rooms_task_graph_version_check",
+      "room_task_nodes_node_version_check",
+      "room_task_nodes_progress_signature_check",
+      "room_task_nodes_role_requirements_check",
+      "room_task_nodes_capability_requirements_check",
+      "room_task_nodes_resource_hints_check",
+      "room_task_nodes_authority_scope_check",
+      "room_task_nodes_retry_policy_check",
+      "room_task_nodes_acceptance_evidence_ids_check",
+      "room_task_nodes_acceptance_projection_check",
+      "room_task_edges_kind_check",
+      "room_task_edges_self_check",
+    ]) {
+      const checks = constraintName.startsWith("operational_rooms_")
+        ? roomChecks
+        : constraintName.startsWith("room_task_edges_")
+          ? edgeChecks
+          : nodeChecks;
+      expect(checks.get(constraintName), constraintName).toBe(migrationCheck(migrationSql, constraintName));
+    }
   });
 
   it("models durable routed-message targets and backward-compatible provenance", () => {

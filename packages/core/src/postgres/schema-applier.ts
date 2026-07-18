@@ -41,7 +41,7 @@ FNXC:MigrationStatusRuntimeRead 2026-07-20:
 SCHEMA_BASELINE_VERSION advances to 0030 for project-scoped runtime reads of
 the SQLite cutover ledger.
 */
-export const SCHEMA_BASELINE_VERSION = "0041";
+export const SCHEMA_BASELINE_VERSION = "0042";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -147,6 +147,7 @@ export const SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION = "0038";
 export const SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION = "0039";
 export const SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION = "0040";
 export const SCHEMA_ROOM_MESSAGE_ROUTING_VERSION = "0041";
+export const SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION = "0042";
 
 export const SCHEMA_MIGRATIONS = [
   { version: "0000", filename: "0000_initial.sql" },
@@ -161,6 +162,7 @@ export const SCHEMA_MIGRATIONS = [
   { version: SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION, filename: "0009_room_membership_production_invariants.sql" },
   { version: SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION, filename: "0010_room_native_sender_takeover.sql" },
   { version: SCHEMA_ROOM_MESSAGE_ROUTING_VERSION, filename: "0011_room_message_routing.sql" },
+  { version: SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION, filename: "0012_room_task_graph_commands.sql" },
 ] as const;
 
 export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];
@@ -479,6 +481,7 @@ export async function applySchemaBaseline(
     const sessionRoomMembershipProductionInvariantsAlreadyApplied = applied.includes(SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION);
     const sessionRoomNativeSenderTakeoverAlreadyApplied = applied.includes(SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION);
     const sessionRoomMessageRoutingAlreadyApplied = applied.includes(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION);
+    const sessionRoomTaskGraphCommandsAlreadyApplied = applied.includes(SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
 
@@ -1002,6 +1005,13 @@ export async function applySchemaBaseline(
       const migrationSql = await readFile(join(MIGRATIONS_DIR, "0011_room_message_routing.sql"), "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_MESSAGE_ROUTING_VERSION}) ON CONFLICT (version) DO NOTHING`);
+      schemaChanged = true;
+    }
+
+    if (!sessionRoomTaskGraphCommandsAlreadyApplied) {
+      const migrationSql = await readFile(join(MIGRATIONS_DIR, "0012_room_task_graph_commands.sql"), "utf8");
+      await tx.execute(sql.raw(migrationSql));
+      await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
     }
 

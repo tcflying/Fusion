@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isProxy } from "node:util/types";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import {
@@ -13,7 +14,7 @@ import {
   type RoomBindingReplacementV1,
   type TransitionRoomLifecycleInput,
 } from "./room-domain.js";
-import type { RoomLifecycleState } from "./room-contracts/storage.js";
+import type { RoomLifecycleState, RoomTaskNodeState } from "./room-contracts/storage.js";
 import {
   assertRoomLeaseFence,
   loadRoomLeaseById,
@@ -70,6 +71,7 @@ import {
   roomOutbox,
   roomOutboxAttempts,
   roomSeats,
+  roomTaskEdges,
   roomTaskNodes,
   roomTurns,
 } from "./postgres/schema/room.js";
@@ -293,7 +295,17 @@ export type RoomStoreErrorCode =
   | "inbox_payload_conflict"
   | "legacy_binding_not_found"
   | "legacy_binding_integrity_conflict"
-  | "legacy_binding_already_imported";
+  | "legacy_binding_already_imported"
+  | "dag_version_conflict"
+  | "task_node_version_conflict"
+  | "accepted_node_frozen"
+  | "reopen_requires_invalidated_upstream"
+  | "task_graph_cycle"
+  | "task_graph_self_edge"
+  | "task_graph_unknown_node"
+  | "task_graph_invalid_mutation"
+  | "task_graph_critical_path_overflow"
+  | "task_graph_version_overflow";
 
 export class RoomStoreError extends Error {
   readonly code: RoomStoreErrorCode;
@@ -588,6 +600,124 @@ export interface ApplyRoomMembershipChangesAtTurnBoundaryInput {
   readonly expectedAggregateVersion: number;
   readonly expectedMembershipVersion: number;
   readonly now: string;
+}
+
+export type RoomTaskEdgeKindV1 = "requires" | "informs" | "invalidates";
+
+export interface RoomTaskResourceHintsV1 {
+  readonly estimatedDurationMs: number;
+  readonly concurrencyClass: "serial" | "parallel";
+  readonly preferredProviderIds: readonly string[];
+}
+
+export interface RoomTaskAuthorityScopeV1 {
+  readonly allowedActions: readonly string[];
+  readonly readPaths: readonly string[];
+  readonly writePaths: readonly string[];
+}
+
+export interface RoomTaskRetryPolicyV1 {
+  readonly maxAttempts: number;
+  readonly backoff: "fixed" | "exponential";
+  readonly baseDelayMs: number;
+  readonly recoveryActions: readonly string[];
+}
+
+export interface RoomTaskNodeDefinitionV1 {
+  readonly id: string;
+  readonly parentNodeId: string | null;
+  readonly objective: string;
+  readonly inputRefs: readonly string[];
+  readonly outputRefs: readonly string[];
+  readonly roleRequirements: readonly string[];
+  readonly capabilityRequirements: readonly string[];
+  readonly resourceHints: RoomTaskResourceHintsV1;
+  readonly authorityScope: RoomTaskAuthorityScopeV1;
+  readonly acceptanceGateIds: readonly string[];
+  readonly retryPolicy: RoomTaskRetryPolicyV1;
+  readonly progressSignature: string;
+}
+
+export interface RoomTaskNodeProjectionV1 extends RoomTaskNodeDefinitionV1 {
+  readonly state: RoomTaskNodeState;
+  readonly nodeVersion: number;
+  readonly acceptedAt: string | null;
+  readonly acceptanceEvidenceIds: readonly string[];
+  readonly invalidatedByEvidenceId: string | null;
+  readonly reopenedByEvidenceId: string | null;
+}
+
+export interface RoomTaskEdgeDefinitionV1 {
+  readonly id: string;
+  readonly fromNodeId: string;
+  readonly toNodeId: string;
+  readonly kind: RoomTaskEdgeKindV1;
+}
+
+export type RoomTaskGraphMutationV1 =
+  | { readonly action: "add_node"; readonly node: RoomTaskNodeDefinitionV1 }
+  | { readonly action: "add_edge"; readonly edge: RoomTaskEdgeDefinitionV1 }
+  | {
+      readonly action: "update_node";
+      readonly nodeId: string;
+      readonly expectedNodeVersion: number;
+      readonly patch: Partial<Pick<
+        RoomTaskNodeDefinitionV1,
+        | "objective"
+        | "inputRefs"
+        | "outputRefs"
+        | "roleRequirements"
+        | "capabilityRequirements"
+        | "resourceHints"
+        | "authorityScope"
+        | "acceptanceGateIds"
+        | "retryPolicy"
+        | "progressSignature"
+      >>;
+      readonly evidenceIds: readonly string[];
+    }
+  | {
+      readonly action: "transition_node";
+      readonly nodeId: string;
+      readonly expectedNodeVersion: number;
+      readonly to: RoomTaskNodeState;
+      readonly acceptanceEvidenceIds: readonly string[];
+      readonly progressSignature: string;
+    }
+  | {
+      readonly action: "invalidate_acceptance_evidence";
+      readonly nodeId: string;
+      readonly expectedNodeVersion: number;
+      readonly acceptanceEvidenceId: string;
+      readonly invalidatedByEvidenceId: string;
+      readonly reason: string;
+    }
+  | {
+      readonly action: "reopen_node";
+      readonly nodeId: string;
+      readonly expectedNodeVersion: number;
+      readonly upstreamNodeId: string;
+      readonly invalidatedByEvidenceId: string;
+      readonly reason: string;
+    };
+
+export interface MutateRoomTaskGraphInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedDagVersion: number;
+  readonly idempotencyKey: string;
+  readonly mutations: readonly RoomTaskGraphMutationV1[];
+  readonly mutatedAt: string;
+}
+
+export interface RoomTaskGraphProjectionV1 {
+  readonly roomId: string;
+  readonly aggregateVersion: number;
+  readonly dagVersion: number;
+  readonly nodes: readonly RoomTaskNodeProjectionV1[];
+  readonly edges: readonly RoomTaskEdgeDefinitionV1[];
+  readonly readyNodeIds: readonly string[];
+  readonly criticalPathNodeIds: readonly string[];
 }
 
 /**
@@ -1156,6 +1286,206 @@ export class AsyncRoomStore {
 
   async getRoom(roomId: string): Promise<RoomAggregateV1 | undefined> {
     return loadRoomAggregateProjection(this.layer.db, this.projectId, roomId);
+  }
+
+  async getTaskGraph(roomId: string): Promise<RoomTaskGraphProjectionV1 | null> {
+    assertNonBlankTaskGraphString(roomId, "roomId");
+    return this.layer.transaction(
+      (tx) => loadRoomTaskGraphProjection(tx, this.projectId, roomId),
+      { isolationLevel: "repeatable read", accessMode: "read only" },
+    );
+  }
+
+  /**
+   * Commit one versioned task-graph command against the Room aggregate. The
+   * aggregate CAS, DAG CAS, node/edge projections, immutable event, and
+   * idempotency result share one PostgreSQL transaction.
+   *
+   * FNXC:SessionRoomTaskDag 2026-07-18-12:48:
+   * `requires` is the only readiness/critical-path edge. Accepted work stays
+   * frozen after evidence invalidation until a separate causal reopen command
+   * names the invalidated upstream evidence. Replays return the first event's
+   * projection even after later commands advance the live Room.
+   *
+   * FNXC:SessionRoomTaskDag 2026-07-18-13:58:
+   * Every committed graph command retains bounded normalized mutation audit.
+   * Evidence identities remain explicit, while mutable task content, progress
+   * text, and causal reasons are represented only by canonical SHA-256 hashes;
+   * an idempotent retry must keep returning the original immutable event. A
+   * critical path whose duration cannot be represented exactly is rejected
+   * before any projection or event write begins.
+   */
+  async mutateTaskGraph(
+    rawInput: MutateRoomTaskGraphInputV1,
+    rawContext: RoomCommandContext,
+  ): Promise<RoomTaskGraphProjectionV1> {
+    const { input, context } = normalizeTaskGraphRuntimeCommand(rawInput, rawContext);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedDagVersion: input.expectedDagVersion,
+      mutations: input.mutations,
+    });
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const roomRows = await tx
+        .select({ id: operationalRooms.id })
+        .from(operationalRooms)
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+        ))
+        .limit(1);
+      if (!roomRows[0]) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${input.roomId} does not exist in project ${this.projectId}`,
+        );
+      }
+
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "mutate_task_graph",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.mutatedAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "mutate_task_graph"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${input.idempotencyKey} has no committed task-graph event`,
+          );
+        }
+        return {
+          projection: await loadTaskGraphMutationResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            existing.resultEventId,
+          ),
+          event: null,
+        };
+      }
+
+      const [current, currentGraph] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        loadRoomTaskGraphProjection(tx, this.projectId, input.roomId),
+      ]);
+      if (!current || !currentGraph) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${input.roomId} disappeared during task-graph mutation`,
+        );
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Room ${input.roomId} expected aggregate version ${input.expectedAggregateVersion} but is ${current.room.aggregateVersion}`,
+          {
+            expected: input.expectedAggregateVersion,
+            actual: current.room.aggregateVersion,
+          },
+        );
+      }
+      if (currentGraph.dagVersion !== input.expectedDagVersion) {
+        throw new RoomStoreError(
+          "dag_version_conflict",
+          `Room ${input.roomId} expected DAG version ${input.expectedDagVersion} but is ${currentGraph.dagVersion}`,
+        );
+      }
+      if (isEarlierTimestamp(input.mutatedAt, current.room.updatedAt)) {
+        throw new RoomStoreError(
+          "task_graph_invalid_mutation",
+          `Task-graph mutation timestamp cannot precede Room ${input.roomId} updatedAt`,
+        );
+      }
+
+      const projection = applyTaskGraphMutations(currentGraph, input);
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: projection.aggregateVersion,
+          updatedAt: input.mutatedAt,
+        },
+      };
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion: projection.aggregateVersion,
+          taskGraphVersion: projection.dagVersion,
+          updatedAt: input.mutatedAt,
+        })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+          eq(operationalRooms.taskGraphVersion, input.expectedDagVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomStoreError(
+          "dag_version_conflict",
+          `Concurrent task-graph mutation rejected for Room ${input.roomId}`,
+        );
+      }
+
+      await persistRoomTaskGraphProjection(
+        tx,
+        this.projectId,
+        currentGraph,
+        projection,
+        input.mutatedAt,
+      );
+      const event = await insertRoomEvent(tx, next, "room_task_graph_mutated", context, {
+        projectionVersion: 1,
+        dagVersion: projection.dagVersion,
+        idempotencyKey: input.idempotencyKey,
+        mutationActions: input.mutations.map((mutation) => mutation.action),
+        commandAudit: buildTaskGraphCommandAudit(input.mutations),
+        projection,
+        projectionHash: hashRoomValue(projection),
+        mutatedAt: input.mutatedAt,
+      });
+      await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId));
+      return { projection, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.projection;
   }
 
   /**
@@ -5533,6 +5863,1571 @@ export async function loadRoomAggregateProjection(
     })),
     pendingMembershipChanges: membershipRows.map(rowToPendingMembershipChange),
   };
+}
+
+const ROOM_TASK_NODE_STATES = new Set<RoomTaskNodeState>([
+  "pending",
+  "ready",
+  "running",
+  "waiting_dependency",
+  "waiting_approval",
+  "rate_limited",
+  "retrying",
+  "accepted",
+  "blocked",
+  "failed",
+  "cancelled",
+]);
+
+const ROOM_TASK_EVENT_ACTOR_TYPES = new Set<RoomEventActorType>([
+  "human",
+  "controller",
+  "seat",
+  "system",
+  "evolution",
+]);
+const MAX_TASK_GRAPH_MUTATIONS_PER_COMMAND = 64;
+const MAX_TASK_GRAPH_RUNTIME_ARRAY_ENTRIES = 256;
+const MAX_TASK_GRAPH_RUNTIME_OBJECT_KEYS = 32;
+const MAX_TASK_GRAPH_RUNTIME_DEPTH = 16;
+const MAX_TASK_GRAPH_RUNTIME_VALUES = 4_096;
+const MAX_TASK_GRAPH_RUNTIME_STRING_CODE_UNITS = 262_144;
+
+const ROOM_TASK_ALLOWED_TRANSITIONS: Readonly<Record<RoomTaskNodeState, ReadonlySet<RoomTaskNodeState>>> = {
+  pending: new Set(["ready", "waiting_dependency", "cancelled"]),
+  ready: new Set([
+    "running",
+    "waiting_dependency",
+    "waiting_approval",
+    "rate_limited",
+    "retrying",
+    "accepted",
+    "blocked",
+    "failed",
+    "cancelled",
+  ]),
+  running: new Set([
+    "waiting_dependency",
+    "waiting_approval",
+    "rate_limited",
+    "retrying",
+    "accepted",
+    "blocked",
+    "failed",
+    "cancelled",
+  ]),
+  waiting_dependency: new Set(["ready", "waiting_approval", "blocked", "failed", "cancelled"]),
+  waiting_approval: new Set(["ready", "running", "blocked", "failed", "cancelled"]),
+  rate_limited: new Set(["ready", "retrying", "blocked", "failed", "cancelled"]),
+  retrying: new Set([
+    "ready",
+    "running",
+    "waiting_dependency",
+    "waiting_approval",
+    "rate_limited",
+    "accepted",
+    "blocked",
+    "failed",
+    "cancelled",
+  ]),
+  accepted: new Set(),
+  blocked: new Set(["retrying", "failed", "cancelled"]),
+  failed: new Set(["retrying", "cancelled"]),
+  cancelled: new Set(),
+};
+
+interface TaskGraphRuntimeBudget {
+  valueCount: number;
+  stringCodeUnits: number;
+}
+
+function normalizeTaskGraphRuntimeCommand(
+  rawInput: unknown,
+  rawContext: unknown,
+): { readonly input: MutateRoomTaskGraphInputV1; readonly context: RoomCommandContext } {
+  try {
+    const budget: TaskGraphRuntimeBudget = { valueCount: 0, stringCodeUnits: 0 };
+    const inputValue = cloneTaskGraphRuntimeValue(rawInput, "input", budget, new WeakSet(), 0);
+    const contextValue = cloneTaskGraphRuntimeValue(rawContext, "context", budget, new WeakSet(), 0);
+    if (!isRuntimeRecord(inputValue) || !isRuntimeRecord(contextValue)) {
+      throw new RoomStoreError(
+        "task_graph_invalid_mutation",
+        "Task-graph input and context must be plain objects",
+      );
+    }
+    const input = inputValue as unknown as MutateRoomTaskGraphInputV1;
+    const context = contextValue as unknown as RoomCommandContext;
+    validateTaskGraphCommand(input, context);
+    return { input, context };
+  } catch (error) {
+    if (error instanceof RoomStoreError) throw error;
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      "Task-graph input or context contains inaccessible or malformed runtime data",
+    );
+  }
+}
+
+function cloneTaskGraphRuntimeValue(
+  value: unknown,
+  label: string,
+  budget: TaskGraphRuntimeBudget,
+  ancestors: WeakSet<object>,
+  depth: number,
+): unknown {
+  budget.valueCount += 1;
+  if (budget.valueCount > MAX_TASK_GRAPH_RUNTIME_VALUES || depth > MAX_TASK_GRAPH_RUNTIME_DEPTH) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} exceeds the command shape limit`);
+  }
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    budget.stringCodeUnits += value.length;
+    if (budget.stringCodeUnits > MAX_TASK_GRAPH_RUNTIME_STRING_CODE_UNITS) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `${label} exceeds the command text limit`);
+    }
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `${label} must be a finite number`);
+    }
+    return value;
+  }
+  if (typeof value !== "object") {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} contains an unsupported value`);
+  }
+  if (isProxy(value)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must not contain a Proxy`);
+  }
+  if (ancestors.has(value)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must not contain a cycle`);
+  }
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) {
+        throw new RoomStoreError("task_graph_invalid_mutation", `${label} must be a plain array`);
+      }
+      if (value.length > MAX_TASK_GRAPH_RUNTIME_ARRAY_ENTRIES) {
+        throw new RoomStoreError("task_graph_invalid_mutation", `${label} exceeds the array limit`);
+      }
+      const ownKeys = Reflect.ownKeys(value);
+      if (
+        ownKeys.length !== value.length + 1
+        || ownKeys.some((key) =>
+          typeof key !== "string"
+          || (key !== "length" && !/^(0|[1-9]\d*)$/.test(key))
+          || (key !== "length" && Number(key) >= value.length))
+      ) {
+        throw new RoomStoreError("task_graph_invalid_mutation", `${label} must not contain extra array properties`);
+      }
+      const cloned: unknown[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (
+          !descriptor
+          || !Object.hasOwn(descriptor, "value")
+          || descriptor.enumerable !== true
+        ) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `${label} must contain only enumerable data entries and must not be sparse`,
+          );
+        }
+        cloned.push(cloneTaskGraphRuntimeValue(
+          descriptor.value,
+          `${label}[${index}]`,
+          budget,
+          ancestors,
+          depth + 1,
+        ));
+      }
+      return cloned;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `${label} must be a plain object`);
+    }
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.length > MAX_TASK_GRAPH_RUNTIME_OBJECT_KEYS
+      || ownKeys.some((key) => typeof key !== "string")
+    ) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `${label} exceeds the object shape limit`);
+    }
+    const cloned = Object.create(null) as Record<string, unknown>;
+    for (const key of ownKeys as string[]) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) {
+        throw new RoomStoreError(
+          "task_graph_invalid_mutation",
+          `${label}.${key} must be an enumerable data property`,
+        );
+      }
+      cloned[key] = cloneTaskGraphRuntimeValue(
+        descriptor.value,
+        `${label}.${key}`,
+        budget,
+        ancestors,
+        depth + 1,
+      );
+    }
+    return cloned;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function validateTaskGraphCommand(
+  input: MutateRoomTaskGraphInputV1,
+  context: RoomCommandContext,
+): void {
+  assertTaskGraphObjectKeys(input, [
+    "roomId",
+    "expectedAggregateVersion",
+    "expectedDagVersion",
+    "idempotencyKey",
+    "mutations",
+    "mutatedAt",
+  ], "input");
+  assertTaskGraphObjectKeys(context, context.eventId === undefined
+    ? ["actorType", "actorId", "correlationId", "causationId", "occurredAt"]
+    : ["eventId", "actorType", "actorId", "correlationId", "causationId", "occurredAt"], "context");
+  assertNonBlankTaskGraphString(input.roomId, "roomId");
+  assertNonBlankTaskGraphString(input.idempotencyKey, "idempotencyKey");
+  assertTaskGraphVersion(input.expectedAggregateVersion, "expectedAggregateVersion");
+  assertTaskGraphVersion(input.expectedDagVersion, "expectedDagVersion");
+  assertTaskGraphTimestamp(input.mutatedAt, "mutatedAt");
+  if (!ROOM_TASK_EVENT_ACTOR_TYPES.has(context.actorType)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", "context.actorType is unsupported");
+  }
+  if (context.eventId !== undefined) assertNonBlankTaskGraphString(context.eventId, "context.eventId");
+  assertNonBlankTaskGraphString(context.actorId, "context.actorId");
+  assertNonBlankTaskGraphString(context.correlationId, "context.correlationId");
+  assertNullableTaskGraphString(context.causationId, "context.causationId");
+  assertTaskGraphTimestamp(context.occurredAt, "context.occurredAt");
+  if (context.occurredAt !== input.mutatedAt) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      "Task-graph mutatedAt must equal the immutable Room event occurredAt",
+    );
+  }
+  if (!Array.isArray(input.mutations) || input.mutations.length === 0) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      "A task-graph command must contain at least one mutation",
+    );
+  }
+  if (input.mutations.length > MAX_TASK_GRAPH_MUTATIONS_PER_COMMAND) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      `A task-graph command may contain at most ${MAX_TASK_GRAPH_MUTATIONS_PER_COMMAND} mutations`,
+    );
+  }
+  for (const [index, mutation] of input.mutations.entries()) {
+    if (!isRuntimeRecord(mutation) || !isNonEmptyString(mutation.action)) {
+      throw new RoomStoreError(
+        "task_graph_invalid_mutation",
+        `mutations[${index}] must be a typed object`,
+      );
+    }
+  }
+}
+
+function applyTaskGraphMutations(
+  current: RoomTaskGraphProjectionV1,
+  input: MutateRoomTaskGraphInputV1,
+): RoomTaskGraphProjectionV1 {
+  const nextAggregateVersion = advanceTaskGraphVersion(
+    current.aggregateVersion,
+    "aggregateVersion",
+  );
+  const nextDagVersion = advanceTaskGraphVersion(current.dagVersion, "dagVersion");
+  const nodes = new Map(
+    current.nodes.map((node) => [node.id, cloneTaskGraphNode(node)] as const),
+  );
+  const edges = new Map(
+    current.edges.map((edge) => [edge.id, { ...edge }] as const),
+  );
+  const originalNodeIds = new Set(nodes.keys());
+  const directlyVersionedNodeIds = new Set<string>();
+
+  for (const rawMutation of input.mutations) {
+    if (!rawMutation || typeof rawMutation !== "object" || !("action" in rawMutation)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", "Task-graph mutation must be a typed object");
+    }
+    const mutation = rawMutation as RoomTaskGraphMutationV1;
+    switch (mutation.action) {
+      case "add_node": {
+        assertTaskGraphMutationKeys(mutation, ["action", "node"], "add_node");
+        const definition = normalizeTaskNodeDefinition(mutation.node, "add_node.node");
+        if (nodes.has(definition.id)) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task node ${definition.id} already exists`,
+          );
+        }
+        if (definition.parentNodeId) {
+          const parent = nodes.get(definition.parentNodeId);
+          if (!parent) {
+            throw new RoomStoreError(
+              "task_graph_unknown_node",
+              `Task node ${definition.id} references unknown parent ${definition.parentNodeId}`,
+            );
+          }
+          if (parent.state === "accepted") {
+            throw new RoomStoreError(
+              "accepted_node_frozen",
+              `Accepted parent node ${parent.id} cannot receive new child topology`,
+            );
+          }
+        }
+        nodes.set(definition.id, {
+          ...definition,
+          state: "pending",
+          nodeVersion: 0,
+          acceptedAt: null,
+          acceptanceEvidenceIds: [],
+          invalidatedByEvidenceId: null,
+          reopenedByEvidenceId: null,
+        });
+        break;
+      }
+      case "add_edge": {
+        assertTaskGraphMutationKeys(mutation, ["action", "edge"], "add_edge");
+        const edge = normalizeTaskEdgeDefinition(mutation.edge, "add_edge.edge");
+        if (edges.has(edge.id)) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task edge ${edge.id} already exists`,
+          );
+        }
+        const from = nodes.get(edge.fromNodeId);
+        const to = nodes.get(edge.toNodeId);
+        if (!from || !to) {
+          throw new RoomStoreError(
+            "task_graph_unknown_node",
+            `Task edge ${edge.id} references an unknown Room task node`,
+          );
+        }
+        if (edge.fromNodeId === edge.toNodeId) {
+          throw new RoomStoreError(
+            "task_graph_self_edge",
+            `Task edge ${edge.id} cannot reference the same node twice`,
+          );
+        }
+        if (from.state === "accepted" || to.state === "accepted") {
+          throw new RoomStoreError(
+            "accepted_node_frozen",
+            `Task edge ${edge.id} would change accepted-node topology`,
+          );
+        }
+        if ([...edges.values()].some((candidate) =>
+          candidate.fromNodeId === edge.fromNodeId
+          && candidate.toNodeId === edge.toNodeId
+          && candidate.kind === edge.kind
+        )) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task edge shape ${edge.fromNodeId}->${edge.toNodeId}:${edge.kind} already exists`,
+          );
+        }
+        if (
+          edge.kind === "requires"
+          && !["pending", "ready", "waiting_dependency"].includes(to.state)
+        ) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Unsatisfied requires edge ${edge.id} cannot target active task node ${to.id} in state ${to.state}`,
+          );
+        }
+        edges.set(edge.id, edge);
+        assertTaskGraphAcyclic(nodes, edges);
+        break;
+      }
+      case "update_node": {
+        assertTaskGraphMutationKeys(mutation, [
+          "action",
+          "nodeId",
+          "expectedNodeVersion",
+          "patch",
+          "evidenceIds",
+        ], "update_node");
+        const node = requireTaskGraphNode(nodes, mutation.nodeId);
+        assertTaskNodeVersion(node, mutation.expectedNodeVersion);
+        if (node.state === "accepted") {
+          throw new RoomStoreError(
+            "accepted_node_frozen",
+            `Accepted task node ${node.id} cannot be updated without causal reopen`,
+          );
+        }
+        const patch = asRecord(mutation.patch);
+        const patchKeys = Object.keys(patch);
+        const allowedPatchKeys = new Set([
+          "objective",
+          "inputRefs",
+          "outputRefs",
+          "roleRequirements",
+          "capabilityRequirements",
+          "resourceHints",
+          "authorityScope",
+          "acceptanceGateIds",
+          "retryPolicy",
+          "progressSignature",
+        ]);
+        if (patchKeys.length === 0 || patchKeys.some((key) => !allowedPatchKeys.has(key))) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task node ${node.id} update contains no supported patch`,
+          );
+        }
+        assertTaskGraphStringArray(mutation.evidenceIds, "update_node.evidenceIds", false);
+        const definition = normalizeTaskNodeDefinition({
+          id: node.id,
+          parentNodeId: node.parentNodeId,
+          objective: patch.objective ?? node.objective,
+          inputRefs: patch.inputRefs ?? node.inputRefs,
+          outputRefs: patch.outputRefs ?? node.outputRefs,
+          roleRequirements: patch.roleRequirements ?? node.roleRequirements,
+          capabilityRequirements: patch.capabilityRequirements ?? node.capabilityRequirements,
+          resourceHints: patch.resourceHints ?? node.resourceHints,
+          authorityScope: patch.authorityScope ?? node.authorityScope,
+          acceptanceGateIds: patch.acceptanceGateIds ?? node.acceptanceGateIds,
+          retryPolicy: patch.retryPolicy ?? node.retryPolicy,
+          progressSignature: patch.progressSignature ?? node.progressSignature,
+        }, `update_node:${node.id}`);
+        nodes.set(node.id, {
+          ...node,
+          ...definition,
+          nodeVersion: advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`),
+        });
+        directlyVersionedNodeIds.add(node.id);
+        break;
+      }
+      case "transition_node": {
+        assertTaskGraphMutationKeys(mutation, [
+          "action",
+          "nodeId",
+          "expectedNodeVersion",
+          "to",
+          "acceptanceEvidenceIds",
+          "progressSignature",
+        ], "transition_node");
+        const node = requireTaskGraphNode(nodes, mutation.nodeId);
+        assertTaskNodeVersion(node, mutation.expectedNodeVersion);
+        if (node.state === "accepted") {
+          throw new RoomStoreError(
+            "accepted_node_frozen",
+            `Accepted task node ${node.id} requires explicit causal reopen`,
+          );
+        }
+        if (!ROOM_TASK_NODE_STATES.has(mutation.to)) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task node ${node.id} has unsupported target state ${String(mutation.to)}`,
+          );
+        }
+        if (!ROOM_TASK_ALLOWED_TRANSITIONS[node.state].has(mutation.to)) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task node ${node.id} cannot transition from ${node.state} to ${mutation.to}`,
+          );
+        }
+        assertNonBlankTaskGraphString(mutation.progressSignature, "transition_node.progressSignature");
+        const evidenceIds = assertTaskGraphStringArray(
+          mutation.acceptanceEvidenceIds,
+          "transition_node.acceptanceEvidenceIds",
+          mutation.to !== "accepted",
+        );
+        if (mutation.to !== "accepted" && evidenceIds.length > 0) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Non-accepted task node ${node.id} cannot claim acceptance evidence`,
+          );
+        }
+        if (mutation.to === "accepted" && !taskNodeDependenciesSatisfied(node.id, nodes, edges)) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task node ${node.id} cannot be accepted before every required predecessor`,
+          );
+        }
+        nodes.set(node.id, {
+          ...node,
+          state: mutation.to,
+          nodeVersion: advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`),
+          progressSignature: mutation.progressSignature,
+          acceptedAt: mutation.to === "accepted" ? input.mutatedAt : null,
+          acceptanceEvidenceIds: mutation.to === "accepted" ? evidenceIds : [],
+          invalidatedByEvidenceId: null,
+        });
+        directlyVersionedNodeIds.add(node.id);
+        break;
+      }
+      case "invalidate_acceptance_evidence": {
+        assertTaskGraphMutationKeys(mutation, [
+          "action",
+          "nodeId",
+          "expectedNodeVersion",
+          "acceptanceEvidenceId",
+          "invalidatedByEvidenceId",
+          "reason",
+        ], "invalidate_acceptance_evidence");
+        const node = requireTaskGraphNode(nodes, mutation.nodeId);
+        assertTaskNodeVersion(node, mutation.expectedNodeVersion);
+        assertNonBlankTaskGraphString(mutation.acceptanceEvidenceId, "acceptanceEvidenceId");
+        assertNonBlankTaskGraphString(mutation.invalidatedByEvidenceId, "invalidatedByEvidenceId");
+        assertNonBlankTaskGraphString(mutation.reason, "invalidation.reason");
+        if (
+          node.state !== "accepted"
+          || !node.acceptanceEvidenceIds.includes(mutation.acceptanceEvidenceId)
+          || node.invalidatedByEvidenceId !== null
+        ) {
+          throw new RoomStoreError(
+            "task_graph_invalid_mutation",
+            `Task node ${node.id} has no active accepted evidence ${mutation.acceptanceEvidenceId} to invalidate`,
+          );
+        }
+        nodes.set(node.id, {
+          ...node,
+          nodeVersion: advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`),
+          invalidatedByEvidenceId: mutation.invalidatedByEvidenceId,
+        });
+        directlyVersionedNodeIds.add(node.id);
+        break;
+      }
+      case "reopen_node": {
+        assertTaskGraphMutationKeys(mutation, [
+          "action",
+          "nodeId",
+          "expectedNodeVersion",
+          "upstreamNodeId",
+          "invalidatedByEvidenceId",
+          "reason",
+        ], "reopen_node");
+        const node = requireTaskGraphNode(nodes, mutation.nodeId);
+        const upstream = requireTaskGraphNode(nodes, mutation.upstreamNodeId);
+        assertTaskNodeVersion(node, mutation.expectedNodeVersion);
+        assertNonBlankTaskGraphString(mutation.invalidatedByEvidenceId, "reopen.invalidatedByEvidenceId");
+        assertNonBlankTaskGraphString(mutation.reason, "reopen.reason");
+        if (
+          node.state !== "accepted"
+          || upstream.invalidatedByEvidenceId !== mutation.invalidatedByEvidenceId
+          || (upstream.id !== node.id && !hasRequiresPath(upstream.id, node.id, edges))
+        ) {
+          throw new RoomStoreError(
+            "reopen_requires_invalidated_upstream",
+            `Task node ${node.id} is not causally downstream of invalidated node ${upstream.id}`,
+          );
+        }
+        nodes.set(node.id, {
+          ...node,
+          state: "waiting_dependency",
+          nodeVersion: advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`),
+          acceptedAt: null,
+          acceptanceEvidenceIds: [],
+          invalidatedByEvidenceId: null,
+          reopenedByEvidenceId: mutation.invalidatedByEvidenceId,
+        });
+        directlyVersionedNodeIds.add(node.id);
+        break;
+      }
+      default:
+        throw new RoomStoreError(
+          "task_graph_invalid_mutation",
+          `Unsupported task-graph mutation action ${String((mutation as { action?: unknown }).action)}`,
+        );
+    }
+  }
+
+  assertTaskGraphIntegrity(nodes, edges, false);
+  deriveTaskDependencyStates(nodes, edges, originalNodeIds, directlyVersionedNodeIds);
+  assertTaskGraphIntegrity(nodes, edges, true);
+  return buildTaskGraphProjection(
+    current.roomId,
+    nextAggregateVersion,
+    nextDagVersion,
+    nodes,
+    edges,
+  );
+}
+
+function buildTaskGraphCommandAudit(
+  mutations: readonly RoomTaskGraphMutationV1[],
+): Readonly<Record<string, unknown>> {
+  return {
+    version: 1,
+    mutationCount: mutations.length,
+    mutations: mutations.map((mutation) => {
+      switch (mutation.action) {
+        case "add_node":
+          return {
+            action: mutation.action,
+            nodeId: mutation.node.id,
+            parentNodeId: mutation.node.parentNodeId,
+            definitionHash: hashRoomValue(mutation.node),
+          };
+        case "add_edge":
+          return {
+            action: mutation.action,
+            edgeId: mutation.edge.id,
+            fromNodeId: mutation.edge.fromNodeId,
+            toNodeId: mutation.edge.toNodeId,
+            kind: mutation.edge.kind,
+          };
+        case "update_node":
+          return {
+            action: mutation.action,
+            nodeId: mutation.nodeId,
+            expectedNodeVersion: mutation.expectedNodeVersion,
+            changedFields: Object.keys(mutation.patch).sort(compareRoomText),
+            evidenceIds: [...mutation.evidenceIds].sort(compareRoomText),
+            patchHash: hashRoomValue(mutation.patch),
+          };
+        case "transition_node":
+          return {
+            action: mutation.action,
+            nodeId: mutation.nodeId,
+            expectedNodeVersion: mutation.expectedNodeVersion,
+            to: mutation.to,
+            acceptanceEvidenceIds: [...mutation.acceptanceEvidenceIds].sort(compareRoomText),
+            progressSignatureHash: hashRoomValue(mutation.progressSignature),
+          };
+        case "invalidate_acceptance_evidence":
+          return {
+            action: mutation.action,
+            nodeId: mutation.nodeId,
+            expectedNodeVersion: mutation.expectedNodeVersion,
+            acceptanceEvidenceId: mutation.acceptanceEvidenceId,
+            invalidatedByEvidenceId: mutation.invalidatedByEvidenceId,
+            reasonHash: hashRoomValue(mutation.reason),
+          };
+        case "reopen_node":
+          return {
+            action: mutation.action,
+            nodeId: mutation.nodeId,
+            expectedNodeVersion: mutation.expectedNodeVersion,
+            upstreamNodeId: mutation.upstreamNodeId,
+            invalidatedByEvidenceId: mutation.invalidatedByEvidenceId,
+            reasonHash: hashRoomValue(mutation.reason),
+          };
+      }
+    }),
+  };
+}
+
+function deriveTaskDependencyStates(
+  nodes: Map<string, RoomTaskNodeProjectionV1>,
+  edges: ReadonlyMap<string, RoomTaskEdgeDefinitionV1>,
+  originalNodeIds: ReadonlySet<string>,
+  directlyVersionedNodeIds: ReadonlySet<string>,
+): void {
+  for (const nodeId of [...nodes.keys()].sort(compareRoomText)) {
+    const node = nodes.get(nodeId)!;
+    if (!["pending", "ready", "waiting_dependency"].includes(node.state)) continue;
+    const state: RoomTaskNodeState = taskNodeDependenciesSatisfied(node.id, nodes, edges)
+      ? "ready"
+      : "waiting_dependency";
+    if (state === node.state) continue;
+    nodes.set(node.id, {
+      ...node,
+      state,
+      nodeVersion: originalNodeIds.has(node.id) && !directlyVersionedNodeIds.has(node.id)
+        ? advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`)
+        : node.nodeVersion,
+    });
+  }
+}
+
+function taskNodeDependenciesSatisfied(
+  nodeId: string,
+  nodes: ReadonlyMap<string, RoomTaskNodeProjectionV1>,
+  edges: ReadonlyMap<string, RoomTaskEdgeDefinitionV1>,
+): boolean {
+  return [...edges.values()]
+    .filter((edge) => edge.kind === "requires" && edge.toNodeId === nodeId)
+    .every((edge) => {
+      const predecessor = nodes.get(edge.fromNodeId);
+      return predecessor?.state === "accepted" && predecessor.invalidatedByEvidenceId === null;
+    });
+}
+
+function hasRequiresPath(
+  fromNodeId: string,
+  toNodeId: string,
+  edges: ReadonlyMap<string, RoomTaskEdgeDefinitionV1>,
+): boolean {
+  const adjacency = new Map<string, string[]>();
+  for (const edge of edges.values()) {
+    if (edge.kind !== "requires") continue;
+    const targets = adjacency.get(edge.fromNodeId) ?? [];
+    targets.push(edge.toNodeId);
+    adjacency.set(edge.fromNodeId, targets);
+  }
+  const queue = [fromNodeId];
+  const visited = new Set<string>(queue);
+  for (let index = 0; index < queue.length; index += 1) {
+    const nodeId = queue[index]!;
+    for (const target of adjacency.get(nodeId) ?? []) {
+      if (target === toNodeId) return true;
+      if (!visited.has(target)) {
+        visited.add(target);
+        queue.push(target);
+      }
+    }
+  }
+  return false;
+}
+
+function assertTaskGraphIntegrity(
+  nodes: ReadonlyMap<string, RoomTaskNodeProjectionV1>,
+  edges: ReadonlyMap<string, RoomTaskEdgeDefinitionV1>,
+  verifyDerivedStates: boolean,
+): void {
+  const shapes = new Set<string>();
+  for (const edge of edges.values()) {
+    if (!nodes.has(edge.fromNodeId) || !nodes.has(edge.toNodeId)) {
+      throw new RoomStoreError(
+        "task_graph_unknown_node",
+        `Task edge ${edge.id} references an unknown node`,
+      );
+    }
+    if (edge.fromNodeId === edge.toNodeId) {
+      throw new RoomStoreError("task_graph_self_edge", `Task edge ${edge.id} is a self edge`);
+    }
+    const shape = `${edge.fromNodeId}\u0000${edge.toNodeId}\u0000${edge.kind}`;
+    if (shapes.has(shape)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `Duplicate task edge shape ${edge.id}`);
+    }
+    shapes.add(shape);
+  }
+  for (const node of nodes.values()) {
+    if (node.parentNodeId !== null && !nodes.has(node.parentNodeId)) {
+      throw new RoomStoreError(
+        "task_graph_unknown_node",
+        `Task node ${node.id} references unknown parent ${node.parentNodeId}`,
+      );
+    }
+    assertTaskNodeProjectionState(node);
+    if (verifyDerivedStates && ["pending", "ready", "waiting_dependency"].includes(node.state)) {
+      const expected = taskNodeDependenciesSatisfied(node.id, nodes, edges)
+        ? "ready"
+        : "waiting_dependency";
+      if (node.state !== expected) {
+        throw new RoomStoreError(
+          "task_graph_invalid_mutation",
+          `Task node ${node.id} has stale derived state ${node.state}; expected ${expected}`,
+        );
+      }
+    }
+  }
+  assertTaskGraphAcyclic(nodes, edges);
+  const parentPairs = [...nodes.values()]
+    .filter((node): node is RoomTaskNodeProjectionV1 & { parentNodeId: string } => node.parentNodeId !== null)
+    .map((node) => [node.parentNodeId, node.id] as const);
+  assertDirectedAcyclic([...nodes.keys()], parentPairs);
+}
+
+function assertTaskGraphAcyclic(
+  nodes: ReadonlyMap<string, RoomTaskNodeProjectionV1>,
+  edges: ReadonlyMap<string, RoomTaskEdgeDefinitionV1>,
+): void {
+  assertDirectedAcyclic(
+    [...nodes.keys()],
+    [...edges.values()].map((edge) => [edge.fromNodeId, edge.toNodeId] as const),
+  );
+}
+
+function assertDirectedAcyclic(
+  nodeIds: readonly string[],
+  pairs: readonly (readonly [string, string])[],
+): void {
+  const indegree = new Map<string, number>(nodeIds.map((nodeId) => [nodeId, 0]));
+  const adjacency = new Map<string, string[]>();
+  for (const [from, to] of pairs) {
+    indegree.set(to, (indegree.get(to) ?? 0) + 1);
+    const targets = adjacency.get(from) ?? [];
+    targets.push(to);
+    adjacency.set(from, targets);
+  }
+  const queue = [...indegree.entries()]
+    .filter(([, degree]) => degree === 0)
+    .map(([nodeId]) => nodeId)
+    .sort(compareRoomText);
+  let visited = 0;
+  for (let index = 0; index < queue.length; index += 1) {
+    const nodeId = queue[index]!;
+    visited += 1;
+    for (const target of [...(adjacency.get(nodeId) ?? [])].sort(compareRoomText)) {
+      const nextDegree = (indegree.get(target) ?? 0) - 1;
+      indegree.set(target, nextDegree);
+      if (nextDegree === 0) queue.push(target);
+    }
+  }
+  if (visited !== indegree.size) {
+    throw new RoomStoreError("task_graph_cycle", "Room task graph must remain acyclic");
+  }
+}
+
+async function loadRoomTaskGraphProjection(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+): Promise<RoomTaskGraphProjectionV1 | null> {
+  const roomRows = await handle
+    .select({
+      aggregateVersion: operationalRooms.aggregateVersion,
+      dagVersion: operationalRooms.taskGraphVersion,
+    })
+    .from(operationalRooms)
+    .where(and(
+      eq(operationalRooms.projectId, projectId),
+      eq(operationalRooms.id, roomId),
+    ))
+    .limit(1);
+  const room = roomRows[0];
+  if (!room) return null;
+  assertTaskGraphVersion(room.aggregateVersion, "persisted aggregateVersion");
+  assertTaskGraphVersion(room.dagVersion, "persisted dagVersion");
+
+  const [nodeRows, edgeRows] = await Promise.all([
+    handle
+      .select()
+      .from(roomTaskNodes)
+      .where(and(
+        eq(roomTaskNodes.projectId, projectId),
+        eq(roomTaskNodes.roomId, roomId),
+      ))
+      .orderBy(asc(roomTaskNodes.id)),
+    handle
+      .select()
+      .from(roomTaskEdges)
+      .where(and(
+        eq(roomTaskEdges.projectId, projectId),
+        eq(roomTaskEdges.roomId, roomId),
+      ))
+      .orderBy(asc(roomTaskEdges.id)),
+  ]);
+  const nodes = new Map<string, RoomTaskNodeProjectionV1>();
+  for (const row of nodeRows) {
+    const node = rowToRoomTaskNodeProjection(row);
+    if (nodes.has(node.id)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `Duplicate persisted task node ${node.id}`);
+    }
+    nodes.set(node.id, node);
+  }
+  const edges = new Map<string, RoomTaskEdgeDefinitionV1>();
+  for (const row of edgeRows) {
+    const edge = normalizeTaskEdgeDefinition({
+      id: row.id,
+      fromNodeId: row.fromNodeId,
+      toNodeId: row.toNodeId,
+      kind: row.kind,
+    }, `persisted edge ${row.id}`);
+    if (edges.has(edge.id)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `Duplicate persisted task edge ${edge.id}`);
+    }
+    edges.set(edge.id, edge);
+  }
+  assertTaskGraphIntegrity(nodes, edges, true);
+  return buildTaskGraphProjection(
+    roomId,
+    room.aggregateVersion,
+    room.dagVersion,
+    nodes,
+    edges,
+  );
+}
+
+async function persistRoomTaskGraphProjection(
+  tx: DbTransaction,
+  projectId: string,
+  current: RoomTaskGraphProjectionV1,
+  next: RoomTaskGraphProjectionV1,
+  mutatedAt: string,
+): Promise<void> {
+  const currentNodes = new Map(current.nodes.map((node) => [node.id, node] as const));
+  const nextNodes = new Map(next.nodes.map((node) => [node.id, node] as const));
+  const newNodes = next.nodes.filter((node) => !currentNodes.has(node.id));
+  const newNodeIds = newNodes.map((node) => node.id);
+  if (newNodeIds.length > 0) {
+    const collisions = await tx
+      .select({ id: roomTaskNodes.id })
+      .from(roomTaskNodes)
+      .where(inArray(roomTaskNodes.id, newNodeIds));
+    if (collisions.length > 0) {
+      throw new RoomStoreError(
+        "task_graph_invalid_mutation",
+        "A new task-node identity is already owned by another Room",
+      );
+    }
+    await tx.insert(roomTaskNodes).values(newNodes.map((node) => ({
+      id: node.id,
+      projectId,
+      roomId: next.roomId,
+      parentNodeId: node.parentNodeId,
+      objective: node.objective,
+      state: node.state,
+      assignedSeatIds: [],
+      inputRefs: [...node.inputRefs],
+      outputRefs: [...node.outputRefs],
+      roleRequirements: [...node.roleRequirements],
+      capabilityRequirements: [...node.capabilityRequirements],
+      resourceHints: node.resourceHints,
+      authorityScope: node.authorityScope,
+      requiredGateIds: [...node.acceptanceGateIds],
+      retryPolicy: node.retryPolicy,
+      progressSignature: node.progressSignature,
+      nodeVersion: node.nodeVersion,
+      acceptedAt: node.acceptedAt,
+      acceptanceEvidenceIds: [...node.acceptanceEvidenceIds],
+      invalidatedByEvidenceId: node.invalidatedByEvidenceId,
+      reopenedByEvidenceId: node.reopenedByEvidenceId,
+    })));
+  }
+
+  for (const previous of current.nodes) {
+    const node = nextNodes.get(previous.id);
+    if (!node) {
+      throw new RoomStoreError(
+        "task_graph_invalid_mutation",
+        `Task graph command attempted to erase node ${previous.id}`,
+      );
+    }
+    const updated = await tx
+      .update(roomTaskNodes)
+      .set({
+        parentNodeId: node.parentNodeId,
+        objective: node.objective,
+        state: node.state,
+        inputRefs: [...node.inputRefs],
+        outputRefs: [...node.outputRefs],
+        roleRequirements: [...node.roleRequirements],
+        capabilityRequirements: [...node.capabilityRequirements],
+        resourceHints: node.resourceHints,
+        authorityScope: node.authorityScope,
+        requiredGateIds: [...node.acceptanceGateIds],
+        retryPolicy: node.retryPolicy,
+        progressSignature: node.progressSignature,
+        nodeVersion: node.nodeVersion,
+        acceptedAt: node.acceptedAt,
+        acceptanceEvidenceIds: [...node.acceptanceEvidenceIds],
+        invalidatedByEvidenceId: node.invalidatedByEvidenceId,
+        reopenedByEvidenceId: node.reopenedByEvidenceId,
+      })
+      .where(and(
+        eq(roomTaskNodes.projectId, projectId),
+        eq(roomTaskNodes.roomId, next.roomId),
+        eq(roomTaskNodes.id, previous.id),
+        eq(roomTaskNodes.nodeVersion, previous.nodeVersion),
+      ))
+      .returning({ id: roomTaskNodes.id });
+    if (updated.length !== 1) {
+      throw new RoomStoreError(
+        "task_node_version_conflict",
+        `Concurrent task-node update rejected for ${previous.id}`,
+      );
+    }
+  }
+
+  const currentEdgeIds = new Set(current.edges.map((edge) => edge.id));
+  const newEdges = next.edges.filter((edge) => !currentEdgeIds.has(edge.id));
+  const newEdgeIds = newEdges.map((edge) => edge.id);
+  if (newEdgeIds.length > 0) {
+    const collisions = await tx
+      .select({ id: roomTaskEdges.id })
+      .from(roomTaskEdges)
+      .where(inArray(roomTaskEdges.id, newEdgeIds));
+    if (collisions.length > 0) {
+      throw new RoomStoreError(
+        "task_graph_invalid_mutation",
+        "A new task-edge identity is already owned by another Room",
+      );
+    }
+    await tx.insert(roomTaskEdges).values(newEdges.map((edge) => ({
+      id: edge.id,
+      projectId,
+      roomId: next.roomId,
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      kind: edge.kind,
+      createdAt: mutatedAt,
+    })));
+  }
+}
+
+async function loadTaskGraphMutationResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+): Promise<RoomTaskGraphProjectionV1> {
+  const rows = await handle
+    .select({
+      aggregateVersion: roomEvents.aggregateVersion,
+      eventType: roomEvents.eventType,
+      payload: roomEvents.payload,
+    })
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const row = rows[0];
+  if (!row || row.eventType !== "room_task_graph_mutated") {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Task-graph result event ${eventId} is missing or has the wrong type`,
+    );
+  }
+  const payload = asRecord(row.payload);
+  if (payload.projectionVersion !== 1 || !isNonEmptyString(payload.projectionHash)) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Task-graph result event ${eventId} has invalid projection metadata`,
+    );
+  }
+  if (hashRoomValue(payload.projection) !== payload.projectionHash) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Task-graph result event ${eventId} failed projection integrity validation`,
+    );
+  }
+  const projection = parseStoredTaskGraphProjection(payload.projection, `event ${eventId}`);
+  if (projection.roomId !== roomId || projection.aggregateVersion !== row.aggregateVersion) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Task-graph result event ${eventId} does not match its Room aggregate`,
+    );
+  }
+  return projection;
+}
+
+function buildTaskGraphProjection(
+  roomId: string,
+  aggregateVersion: number,
+  dagVersion: number,
+  nodes: ReadonlyMap<string, RoomTaskNodeProjectionV1>,
+  edges: ReadonlyMap<string, RoomTaskEdgeDefinitionV1>,
+): RoomTaskGraphProjectionV1 {
+  const sortedNodes = [...nodes.values()]
+    .map(cloneTaskGraphNode)
+    .sort((left, right) => compareRoomText(left.id, right.id));
+  const sortedEdges = [...edges.values()]
+    .map((edge) => ({ ...edge }))
+    .sort((left, right) => compareRoomText(left.id, right.id));
+  return {
+    roomId,
+    aggregateVersion,
+    dagVersion,
+    nodes: sortedNodes,
+    edges: sortedEdges,
+    readyNodeIds: sortedNodes
+      .filter((node) => node.state === "ready")
+      .map((node) => node.id),
+    criticalPathNodeIds: computeTaskGraphCriticalPath(sortedNodes, sortedEdges),
+  };
+}
+
+function computeTaskGraphCriticalPath(
+  nodes: readonly RoomTaskNodeProjectionV1[],
+  edges: readonly RoomTaskEdgeDefinitionV1[],
+): readonly string[] {
+  if (nodes.length === 0) return [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node] as const));
+  const requires = edges.filter((edge) => edge.kind === "requires");
+  const indegree = new Map<string, number>(nodes.map((node) => [node.id, 0]));
+  const adjacency = new Map<string, string[]>();
+  for (const edge of requires) {
+    indegree.set(edge.toNodeId, (indegree.get(edge.toNodeId) ?? 0) + 1);
+    const targets = adjacency.get(edge.fromNodeId) ?? [];
+    targets.push(edge.toNodeId);
+    adjacency.set(edge.fromNodeId, targets);
+  }
+  const queue = [...indegree.entries()]
+    .filter(([, degree]) => degree === 0)
+    .map(([nodeId]) => nodeId)
+    .sort(compareRoomText);
+  const weights = new Map<string, number>();
+  const paths = new Map<string, readonly string[]>();
+  for (const node of nodes) {
+    weights.set(node.id, node.resourceHints.estimatedDurationMs);
+    paths.set(node.id, [node.id]);
+  }
+  for (let index = 0; index < queue.length; index += 1) {
+    const nodeId = queue[index]!;
+    for (const target of [...(adjacency.get(nodeId) ?? [])].sort(compareRoomText)) {
+      const sourceWeight = weights.get(nodeId) ?? 0;
+      const targetDuration = nodeById.get(target)!.resourceHints.estimatedDurationMs;
+      if (sourceWeight > Number.MAX_SAFE_INTEGER - targetDuration) {
+        throw new RoomStoreError(
+          "task_graph_critical_path_overflow",
+          `Task critical path through ${nodeId}->${target} exceeds the safe duration range`,
+        );
+      }
+      const candidateWeight = sourceWeight + targetDuration;
+      const candidatePath = [...(paths.get(nodeId) ?? [nodeId]), target];
+      const currentWeight = weights.get(target) ?? 0;
+      const currentPath = paths.get(target) ?? [target];
+      if (
+        candidateWeight > currentWeight
+        || (candidateWeight === currentWeight && compareTaskGraphPaths(candidatePath, currentPath) < 0)
+      ) {
+        weights.set(target, candidateWeight);
+        paths.set(target, candidatePath);
+      }
+      const nextDegree = (indegree.get(target) ?? 0) - 1;
+      indegree.set(target, nextDegree);
+      if (nextDegree === 0) queue.push(target);
+    }
+  }
+  let bestNodeId = nodes[0]!.id;
+  for (const node of nodes.slice(1)) {
+    const bestWeight = weights.get(bestNodeId) ?? 0;
+    const candidateWeight = weights.get(node.id) ?? 0;
+    if (
+      candidateWeight > bestWeight
+      || (
+        candidateWeight === bestWeight
+        && compareTaskGraphPaths(paths.get(node.id) ?? [node.id], paths.get(bestNodeId) ?? [bestNodeId]) < 0
+      )
+    ) {
+      bestNodeId = node.id;
+    }
+  }
+  return paths.get(bestNodeId) ?? [bestNodeId];
+}
+
+function compareTaskGraphPaths(left: readonly string[], right: readonly string[]): number {
+  return compareRoomText(left.join("\u0000"), right.join("\u0000"));
+}
+
+function parseStoredTaskGraphProjection(value: unknown, label: string): RoomTaskGraphProjectionV1 {
+  const record = asRecord(value);
+  assertTaskGraphObjectKeys(record, [
+    "roomId",
+    "aggregateVersion",
+    "dagVersion",
+    "nodes",
+    "edges",
+    "readyNodeIds",
+    "criticalPathNodeIds",
+  ], label);
+  assertNonBlankTaskGraphString(record.roomId, `${label}.roomId`);
+  assertTaskGraphVersion(record.aggregateVersion, `${label}.aggregateVersion`);
+  assertTaskGraphVersion(record.dagVersion, `${label}.dagVersion`);
+  if (!Array.isArray(record.nodes) || !Array.isArray(record.edges)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must contain node and edge arrays`);
+  }
+  const nodes = new Map<string, RoomTaskNodeProjectionV1>();
+  for (const [index, rawNode] of record.nodes.entries()) {
+    const node = normalizeTaskNodeProjection(rawNode, `${label}.nodes[${index}]`);
+    if (nodes.has(node.id)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `${label} contains duplicate node ${node.id}`);
+    }
+    nodes.set(node.id, node);
+  }
+  const edges = new Map<string, RoomTaskEdgeDefinitionV1>();
+  for (const [index, rawEdge] of record.edges.entries()) {
+    const edge = normalizeTaskEdgeDefinition(rawEdge, `${label}.edges[${index}]`);
+    if (edges.has(edge.id)) {
+      throw new RoomStoreError("task_graph_invalid_mutation", `${label} contains duplicate edge ${edge.id}`);
+    }
+    edges.set(edge.id, edge);
+  }
+  const readyNodeIds = assertTaskGraphStringArray(record.readyNodeIds, `${label}.readyNodeIds`, true);
+  const criticalPathNodeIds = assertTaskGraphStringArray(
+    record.criticalPathNodeIds,
+    `${label}.criticalPathNodeIds`,
+    true,
+  );
+  assertTaskGraphIntegrity(nodes, edges, true);
+  const rebuilt = buildTaskGraphProjection(
+    record.roomId,
+    record.aggregateVersion,
+    record.dagVersion,
+    nodes,
+    edges,
+  );
+  const parsed = { ...rebuilt, readyNodeIds, criticalPathNodeIds };
+  if (hashRoomValue(parsed) !== hashRoomValue(rebuilt)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} contains stale derived graph fields`);
+  }
+  return rebuilt;
+}
+
+function rowToRoomTaskNodeProjection(
+  row: typeof roomTaskNodes.$inferSelect,
+): RoomTaskNodeProjectionV1 {
+  return normalizeTaskNodeProjection({
+    id: row.id,
+    parentNodeId: row.parentNodeId,
+    objective: row.objective,
+    inputRefs: row.inputRefs,
+    outputRefs: row.outputRefs,
+    roleRequirements: row.roleRequirements,
+    capabilityRequirements: row.capabilityRequirements,
+    resourceHints: row.resourceHints,
+    authorityScope: row.authorityScope,
+    acceptanceGateIds: row.requiredGateIds,
+    retryPolicy: row.retryPolicy,
+    progressSignature: row.progressSignature,
+    state: row.state,
+    nodeVersion: row.nodeVersion,
+    acceptedAt: row.acceptedAt,
+    acceptanceEvidenceIds: row.acceptanceEvidenceIds,
+    invalidatedByEvidenceId: row.invalidatedByEvidenceId,
+    reopenedByEvidenceId: row.reopenedByEvidenceId,
+  }, `persisted node ${row.id}`);
+}
+
+function normalizeTaskNodeProjection(value: unknown, label: string): RoomTaskNodeProjectionV1 {
+  const record = asRecord(value);
+  assertTaskGraphObjectKeys(record, [
+    "id",
+    "parentNodeId",
+    "objective",
+    "inputRefs",
+    "outputRefs",
+    "roleRequirements",
+    "capabilityRequirements",
+    "resourceHints",
+    "authorityScope",
+    "acceptanceGateIds",
+    "retryPolicy",
+    "progressSignature",
+    "state",
+    "nodeVersion",
+    "acceptedAt",
+    "acceptanceEvidenceIds",
+    "invalidatedByEvidenceId",
+    "reopenedByEvidenceId",
+  ], label);
+  const definition = normalizeTaskNodeDefinition({
+    id: record.id,
+    parentNodeId: record.parentNodeId,
+    objective: record.objective,
+    inputRefs: record.inputRefs,
+    outputRefs: record.outputRefs,
+    roleRequirements: record.roleRequirements,
+    capabilityRequirements: record.capabilityRequirements,
+    resourceHints: record.resourceHints,
+    authorityScope: record.authorityScope,
+    acceptanceGateIds: record.acceptanceGateIds,
+    retryPolicy: record.retryPolicy,
+    progressSignature: record.progressSignature,
+  }, label);
+  if (!ROOM_TASK_NODE_STATES.has(record.state as RoomTaskNodeState)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label}.state is unsupported`);
+  }
+  assertTaskGraphVersion(record.nodeVersion, `${label}.nodeVersion`);
+  const acceptedAt = assertNullableTaskGraphString(record.acceptedAt, `${label}.acceptedAt`);
+  if (acceptedAt !== null) assertTaskGraphTimestamp(acceptedAt, `${label}.acceptedAt`);
+  const node: RoomTaskNodeProjectionV1 = {
+    ...definition,
+    state: record.state as RoomTaskNodeState,
+    nodeVersion: record.nodeVersion,
+    acceptedAt,
+    acceptanceEvidenceIds: assertTaskGraphStringArray(
+      record.acceptanceEvidenceIds,
+      `${label}.acceptanceEvidenceIds`,
+      true,
+    ),
+    invalidatedByEvidenceId: assertNullableTaskGraphString(
+      record.invalidatedByEvidenceId,
+      `${label}.invalidatedByEvidenceId`,
+    ),
+    reopenedByEvidenceId: assertNullableTaskGraphString(
+      record.reopenedByEvidenceId,
+      `${label}.reopenedByEvidenceId`,
+    ),
+  };
+  assertTaskNodeProjectionState(node);
+  return node;
+}
+
+function normalizeTaskNodeDefinition(value: unknown, label: string): RoomTaskNodeDefinitionV1 {
+  const record = asRecord(value);
+  assertTaskGraphObjectKeys(record, [
+    "id",
+    "parentNodeId",
+    "objective",
+    "inputRefs",
+    "outputRefs",
+    "roleRequirements",
+    "capabilityRequirements",
+    "resourceHints",
+    "authorityScope",
+    "acceptanceGateIds",
+    "retryPolicy",
+    "progressSignature",
+  ], label);
+  assertNonBlankTaskGraphString(record.id, `${label}.id`);
+  assertNonBlankTaskGraphString(record.objective, `${label}.objective`);
+  assertNonBlankTaskGraphString(record.progressSignature, `${label}.progressSignature`);
+  const parentNodeId = assertNullableTaskGraphString(record.parentNodeId, `${label}.parentNodeId`);
+  const resourceHints = asRecord(record.resourceHints);
+  assertTaskGraphObjectKeys(resourceHints, [
+    "estimatedDurationMs",
+    "concurrencyClass",
+    "preferredProviderIds",
+  ], `${label}.resourceHints`);
+  assertTaskGraphVersion(resourceHints.estimatedDurationMs, `${label}.resourceHints.estimatedDurationMs`);
+  if (resourceHints.concurrencyClass !== "serial" && resourceHints.concurrencyClass !== "parallel") {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      `${label}.resourceHints.concurrencyClass is unsupported`,
+    );
+  }
+  const authorityScope = asRecord(record.authorityScope);
+  assertTaskGraphObjectKeys(authorityScope, ["allowedActions", "readPaths", "writePaths"], `${label}.authorityScope`);
+  const retryPolicy = asRecord(record.retryPolicy);
+  assertTaskGraphObjectKeys(retryPolicy, [
+    "maxAttempts",
+    "backoff",
+    "baseDelayMs",
+    "recoveryActions",
+  ], `${label}.retryPolicy`);
+  assertPositiveTaskGraphVersion(retryPolicy.maxAttempts, `${label}.retryPolicy.maxAttempts`);
+  assertTaskGraphVersion(retryPolicy.baseDelayMs, `${label}.retryPolicy.baseDelayMs`);
+  if (retryPolicy.backoff !== "fixed" && retryPolicy.backoff !== "exponential") {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label}.retryPolicy.backoff is unsupported`);
+  }
+  return {
+    id: record.id,
+    parentNodeId,
+    objective: record.objective,
+    inputRefs: assertTaskGraphStringArray(record.inputRefs, `${label}.inputRefs`, true),
+    outputRefs: assertTaskGraphStringArray(record.outputRefs, `${label}.outputRefs`, true),
+    roleRequirements: assertTaskGraphStringArray(
+      record.roleRequirements,
+      `${label}.roleRequirements`,
+      true,
+    ),
+    capabilityRequirements: assertTaskGraphStringArray(
+      record.capabilityRequirements,
+      `${label}.capabilityRequirements`,
+      true,
+    ),
+    resourceHints: {
+      estimatedDurationMs: resourceHints.estimatedDurationMs,
+      concurrencyClass: resourceHints.concurrencyClass,
+      preferredProviderIds: assertTaskGraphStringArray(
+        resourceHints.preferredProviderIds,
+        `${label}.resourceHints.preferredProviderIds`,
+        true,
+      ),
+    },
+    authorityScope: {
+      allowedActions: assertTaskGraphStringArray(
+        authorityScope.allowedActions,
+        `${label}.authorityScope.allowedActions`,
+        true,
+      ),
+      readPaths: assertTaskGraphStringArray(authorityScope.readPaths, `${label}.authorityScope.readPaths`, true),
+      writePaths: assertTaskGraphStringArray(authorityScope.writePaths, `${label}.authorityScope.writePaths`, true),
+    },
+    acceptanceGateIds: assertTaskGraphStringArray(
+      record.acceptanceGateIds,
+      `${label}.acceptanceGateIds`,
+      true,
+    ),
+    retryPolicy: {
+      maxAttempts: retryPolicy.maxAttempts,
+      backoff: retryPolicy.backoff,
+      baseDelayMs: retryPolicy.baseDelayMs,
+      recoveryActions: assertTaskGraphStringArray(
+        retryPolicy.recoveryActions,
+        `${label}.retryPolicy.recoveryActions`,
+        true,
+      ),
+    },
+    progressSignature: record.progressSignature,
+  };
+}
+
+function normalizeTaskEdgeDefinition(value: unknown, label: string): RoomTaskEdgeDefinitionV1 {
+  const record = asRecord(value);
+  assertTaskGraphObjectKeys(record, ["id", "fromNodeId", "toNodeId", "kind"], label);
+  assertNonBlankTaskGraphString(record.id, `${label}.id`);
+  assertNonBlankTaskGraphString(record.fromNodeId, `${label}.fromNodeId`);
+  assertNonBlankTaskGraphString(record.toNodeId, `${label}.toNodeId`);
+  if (record.kind !== "requires" && record.kind !== "informs" && record.kind !== "invalidates") {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label}.kind is unsupported`);
+  }
+  return {
+    id: record.id,
+    fromNodeId: record.fromNodeId,
+    toNodeId: record.toNodeId,
+    kind: record.kind,
+  };
+}
+
+function assertTaskNodeProjectionState(node: RoomTaskNodeProjectionV1): void {
+  if (node.state === "accepted") {
+    if (node.acceptedAt === null || node.acceptanceEvidenceIds.length === 0) {
+      throw new RoomStoreError(
+        "task_graph_invalid_mutation",
+        `Accepted task node ${node.id} must retain acceptance time and evidence`,
+      );
+    }
+    return;
+  }
+  if (
+    node.acceptedAt !== null
+    || node.acceptanceEvidenceIds.length > 0
+    || node.invalidatedByEvidenceId !== null
+  ) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      `Non-accepted task node ${node.id} contains stale acceptance projection`,
+    );
+  }
+}
+
+function cloneTaskGraphNode(node: RoomTaskNodeProjectionV1): RoomTaskNodeProjectionV1 {
+  return {
+    ...node,
+    inputRefs: [...node.inputRefs],
+    outputRefs: [...node.outputRefs],
+    roleRequirements: [...node.roleRequirements],
+    capabilityRequirements: [...node.capabilityRequirements],
+    resourceHints: {
+      ...node.resourceHints,
+      preferredProviderIds: [...node.resourceHints.preferredProviderIds],
+    },
+    authorityScope: {
+      allowedActions: [...node.authorityScope.allowedActions],
+      readPaths: [...node.authorityScope.readPaths],
+      writePaths: [...node.authorityScope.writePaths],
+    },
+    acceptanceGateIds: [...node.acceptanceGateIds],
+    retryPolicy: {
+      ...node.retryPolicy,
+      recoveryActions: [...node.retryPolicy.recoveryActions],
+    },
+    acceptanceEvidenceIds: [...node.acceptanceEvidenceIds],
+  };
+}
+
+function requireTaskGraphNode(
+  nodes: ReadonlyMap<string, RoomTaskNodeProjectionV1>,
+  nodeId: string,
+): RoomTaskNodeProjectionV1 {
+  assertNonBlankTaskGraphString(nodeId, "nodeId");
+  const node = nodes.get(nodeId);
+  if (!node) {
+    throw new RoomStoreError("task_graph_unknown_node", `Task node ${nodeId} does not exist`);
+  }
+  return node;
+}
+
+function assertTaskNodeVersion(node: RoomTaskNodeProjectionV1, expectedNodeVersion: number): void {
+  if (
+    !Number.isSafeInteger(expectedNodeVersion)
+    || expectedNodeVersion < 0
+    || node.nodeVersion !== expectedNodeVersion
+  ) {
+    throw new RoomStoreError(
+      "task_node_version_conflict",
+      `Task node ${node.id} expected version ${expectedNodeVersion} but is ${node.nodeVersion}`,
+    );
+  }
+}
+
+function assertTaskGraphMutationKeys(
+  mutation: object,
+  allowedKeys: readonly string[],
+  label: string,
+): void {
+  assertTaskGraphObjectKeys(asRecord(mutation), allowedKeys, label);
+}
+
+function assertTaskGraphObjectKeys(
+  record: object,
+  allowedKeys: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(record).sort(compareRoomText);
+  const expected = [...allowedKeys].sort(compareRoomText);
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      `${label} must contain exactly: ${expected.join(", ")}`,
+    );
+  }
+}
+
+function assertTaskGraphStringArray(
+  value: unknown,
+  label: string,
+  allowEmpty: boolean,
+): readonly string[] {
+  if (!Array.isArray(value)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must be an array`);
+  }
+  const strings = value.map((entry, index) => {
+    assertNonBlankTaskGraphString(entry, `${label}[${index}]`);
+    return entry;
+  });
+  if (!allowEmpty && strings.length === 0) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must not be empty`);
+  }
+  if (new Set(strings).size !== strings.length) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must contain unique values`);
+  }
+  return strings;
+}
+
+function assertNullableTaskGraphString(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  assertNonBlankTaskGraphString(value, label);
+  return value;
+}
+
+function assertNonBlankTaskGraphString(value: unknown, label: string): asserts value is string {
+  if (!isNonEmptyString(value)) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must be a non-empty string`);
+  }
+}
+
+function assertTaskGraphVersion(value: unknown, label: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      `${label} must be a non-negative safe integer`,
+    );
+  }
+}
+
+function advanceTaskGraphVersion(value: number, label: string): number {
+  assertTaskGraphVersion(value, label);
+  if (value === Number.MAX_SAFE_INTEGER) {
+    throw new RoomStoreError(
+      "task_graph_version_overflow",
+      `${label} cannot advance beyond Number.MAX_SAFE_INTEGER`,
+    );
+  }
+  return value + 1;
+}
+
+function assertPositiveTaskGraphVersion(value: unknown, label: string): asserts value is number {
+  assertTaskGraphVersion(value, label);
+  if (value === 0) {
+    throw new RoomStoreError("task_graph_invalid_mutation", `${label} must be greater than zero`);
+  }
+}
+
+function assertTaskGraphTimestamp(value: unknown, label: string): asserts value is string {
+  assertNonBlankTaskGraphString(value, label);
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    throw new RoomStoreError(
+      "task_graph_invalid_mutation",
+      `${label} must be a canonical UTC ISO timestamp`,
+    );
+  }
 }
 
 export async function loadRoomEvents(

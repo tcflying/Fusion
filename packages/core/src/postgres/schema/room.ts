@@ -39,6 +39,7 @@ export const operationalRooms = roomSchema.table("operational_rooms", {
   protocolPhaseId: text("protocol_phase_id"),
   lifecycleState: text("lifecycle_state").notNull(),
   aggregateVersion: bigint("aggregate_version", { mode: "number" }).notNull().default(0),
+  taskGraphVersion: bigint("task_graph_version", { mode: "number" }).notNull().default(0),
   membershipVersion: bigint("membership_version", { mode: "number" }).notNull().default(0),
   activeTurnId: text("active_turn_id"),
   completionContract: jsonb("completion_contract").notNull().default({}),
@@ -48,6 +49,8 @@ export const operationalRooms = roomSchema.table("operational_rooms", {
   unique("operational_rooms_id_project_unique").on(t.id, t.projectId),
   index("idx_operational_rooms_project_state").on(t.projectId, t.lifecycleState, t.updatedAt),
   check("operational_rooms_lifecycle_check", sql`${t.lifecycleState} IN ('draft','ready','running','paused','completed','completed_with_risks','partial','blocked','cancelled','failed','archived')`),
+  check("operational_rooms_aggregate_version_check", sql`${t.aggregateVersion} BETWEEN 0 AND 9007199254740991`),
+  check("operational_rooms_task_graph_version_check", sql`${t.taskGraphVersion} BETWEEN 0 AND 9007199254740991`),
 ]);
 
 export const roomSeats = roomSchema.table("room_seats", {
@@ -278,20 +281,139 @@ export const roomTaskNodes = roomSchema.table("room_task_nodes", {
   assignedSeatIds: jsonb("assigned_seat_ids").notNull().default([]),
   inputRefs: jsonb("input_refs").notNull().default([]),
   outputRefs: jsonb("output_refs").notNull().default([]),
+  roleRequirements: jsonb("role_requirements").notNull().default([]),
+  capabilityRequirements: jsonb("capability_requirements").notNull().default([]),
+  resourceHints: jsonb("resource_hints").notNull().default({
+    estimatedDurationMs: 0,
+    concurrencyClass: "serial",
+    preferredProviderIds: [],
+  }),
+  authorityScope: jsonb("authority_scope").notNull().default({
+    allowedActions: [],
+    readPaths: [],
+    writePaths: [],
+  }),
   requiredGateIds: jsonb("required_gate_ids").notNull().default([]),
-  progressSignature: text("progress_signature"),
+  retryPolicy: jsonb("retry_policy").notNull().default({
+    maxAttempts: 1,
+    backoff: "fixed",
+    baseDelayMs: 0,
+    recoveryActions: [],
+  }),
+  progressSignature: text("progress_signature").notNull(),
   nodeVersion: bigint("node_version", { mode: "number" }).notNull().default(0),
   acceptedAt: text("accepted_at"),
+  acceptanceEvidenceIds: jsonb("acceptance_evidence_ids").notNull().default([]),
   invalidatedByEvidenceId: text("invalidated_by_evidence_id"),
+  reopenedByEvidenceId: text("reopened_by_evidence_id"),
 }, (t) => [
   foreignKey({
     columns: [t.roomId, t.projectId],
     foreignColumns: [operationalRooms.id, operationalRooms.projectId],
     name: "room_task_nodes_room_project_fkey",
   }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.parentNodeId, t.roomId, t.projectId],
+    foreignColumns: [t.id, t.roomId, t.projectId],
+    name: "room_task_nodes_parent_room_project_fkey",
+  }),
+  unique("room_task_nodes_id_room_project_unique").on(t.id, t.roomId, t.projectId),
   index("idx_room_task_nodes_room_state").on(t.projectId, t.roomId, t.state),
-  index("idx_room_task_nodes_parent").on(t.parentNodeId),
+  index("idx_room_task_nodes_parent").on(t.projectId, t.roomId, t.parentNodeId),
   check("room_task_nodes_state_check", sql`${t.state} IN ('pending','ready','running','waiting_dependency','waiting_approval','rate_limited','retrying','accepted','blocked','failed','cancelled')`),
+  check("room_task_nodes_node_version_check", sql`${t.nodeVersion} BETWEEN 0 AND 9007199254740991`),
+  check("room_task_nodes_progress_signature_check", sql`btrim(${t.progressSignature}) <> ''`),
+  /*
+  FNXC:SessionRoomTaskDag 2026-07-18-14:25:
+  The declarative schema must preserve migration 0012's exact hostile-JSON
+  rejection rules so fresh schema generation cannot accept shapes that the
+  incremental migration rejects.
+  */
+  check("room_task_nodes_role_requirements_check", sql`
+    CASE WHEN jsonb_typeof(${t.roleRequirements}) = 'array'
+      THEN NOT jsonb_path_exists(${t.roleRequirements}, '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.roleRequirements})
+      ELSE false
+    END
+  `),
+  check("room_task_nodes_capability_requirements_check", sql`
+    CASE WHEN jsonb_typeof(${t.capabilityRequirements}) = 'array'
+      THEN NOT jsonb_path_exists(${t.capabilityRequirements}, '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.capabilityRequirements})
+      ELSE false
+    END
+  `),
+  check("room_task_nodes_resource_hints_check", sql`
+    jsonb_typeof(${t.resourceHints}) = 'object'
+    AND ${t.resourceHints} ?& ARRAY['estimatedDurationMs','concurrencyClass','preferredProviderIds']
+    AND ${t.resourceHints} - 'estimatedDurationMs' - 'concurrencyClass' - 'preferredProviderIds' = '{}'::jsonb
+    AND jsonb_typeof(${t.resourceHints}->'estimatedDurationMs') = 'number'
+    AND (${t.resourceHints}->>'estimatedDurationMs')::numeric BETWEEN 0 AND 9007199254740991
+    AND trunc((${t.resourceHints}->>'estimatedDurationMs')::numeric) = (${t.resourceHints}->>'estimatedDurationMs')::numeric
+    AND ${t.resourceHints}->>'concurrencyClass' IN ('serial','parallel')
+    AND CASE WHEN jsonb_typeof(${t.resourceHints}->'preferredProviderIds') = 'array'
+      THEN NOT jsonb_path_exists(${t.resourceHints}->'preferredProviderIds', '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.resourceHints}->'preferredProviderIds')
+      ELSE false
+    END
+  `),
+  check("room_task_nodes_authority_scope_check", sql`
+    jsonb_typeof(${t.authorityScope}) = 'object'
+    AND ${t.authorityScope} ?& ARRAY['allowedActions','readPaths','writePaths']
+    AND ${t.authorityScope} - 'allowedActions' - 'readPaths' - 'writePaths' = '{}'::jsonb
+    AND CASE WHEN jsonb_typeof(${t.authorityScope}->'allowedActions') = 'array'
+      THEN NOT jsonb_path_exists(${t.authorityScope}->'allowedActions', '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.authorityScope}->'allowedActions')
+      ELSE false
+    END
+    AND CASE WHEN jsonb_typeof(${t.authorityScope}->'readPaths') = 'array'
+      THEN NOT jsonb_path_exists(${t.authorityScope}->'readPaths', '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.authorityScope}->'readPaths')
+      ELSE false
+    END
+    AND CASE WHEN jsonb_typeof(${t.authorityScope}->'writePaths') = 'array'
+      THEN NOT jsonb_path_exists(${t.authorityScope}->'writePaths', '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.authorityScope}->'writePaths')
+      ELSE false
+    END
+  `),
+  check("room_task_nodes_retry_policy_check", sql`
+    jsonb_typeof(${t.retryPolicy}) = 'object'
+    AND ${t.retryPolicy} ?& ARRAY['maxAttempts','backoff','baseDelayMs','recoveryActions']
+    AND ${t.retryPolicy} - 'maxAttempts' - 'backoff' - 'baseDelayMs' - 'recoveryActions' = '{}'::jsonb
+    AND jsonb_typeof(${t.retryPolicy}->'maxAttempts') = 'number'
+    AND (${t.retryPolicy}->>'maxAttempts')::numeric BETWEEN 1 AND 9007199254740991
+    AND trunc((${t.retryPolicy}->>'maxAttempts')::numeric) = (${t.retryPolicy}->>'maxAttempts')::numeric
+    AND ${t.retryPolicy}->>'backoff' IN ('fixed','exponential')
+    AND jsonb_typeof(${t.retryPolicy}->'baseDelayMs') = 'number'
+    AND (${t.retryPolicy}->>'baseDelayMs')::numeric BETWEEN 0 AND 9007199254740991
+    AND trunc((${t.retryPolicy}->>'baseDelayMs')::numeric) = (${t.retryPolicy}->>'baseDelayMs')::numeric
+    AND CASE WHEN jsonb_typeof(${t.retryPolicy}->'recoveryActions') = 'array'
+      THEN NOT jsonb_path_exists(${t.retryPolicy}->'recoveryActions', '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.retryPolicy}->'recoveryActions')
+      ELSE false
+    END
+  `),
+  check("room_task_nodes_acceptance_evidence_ids_check", sql`
+    CASE WHEN jsonb_typeof(${t.acceptanceEvidenceIds}) = 'array'
+      THEN NOT jsonb_path_exists(${t.acceptanceEvidenceIds}, '$[*] ? (@.type() != "string" || @ like_regex "^\\\\s*$")')
+        AND project.room_jsonb_text_array_is_unique(${t.acceptanceEvidenceIds})
+      ELSE false
+    END
+  `),
+  check("room_task_nodes_acceptance_projection_check", sql`
+    CASE WHEN ${t.state} = 'accepted'
+      THEN ${t.acceptedAt} IS NOT NULL
+        AND btrim(${t.acceptedAt}) <> ''
+        AND CASE WHEN jsonb_typeof(${t.acceptanceEvidenceIds}) = 'array'
+          THEN jsonb_array_length(${t.acceptanceEvidenceIds}) > 0
+          ELSE false
+        END
+      ELSE ${t.acceptedAt} IS NULL
+        AND ${t.acceptanceEvidenceIds} = '[]'::jsonb
+        AND ${t.invalidatedByEvidenceId} IS NULL
+    END
+  `),
 ]);
 
 export const roomTaskEdges = roomSchema.table("room_task_edges", {
@@ -307,10 +429,20 @@ export const roomTaskEdges = roomSchema.table("room_task_edges", {
     foreignColumns: [operationalRooms.id, operationalRooms.projectId],
     name: "room_task_edges_room_project_fkey",
   }).onDelete("cascade"),
-  foreignKey({ columns: [t.fromNodeId], foreignColumns: [roomTaskNodes.id], name: "room_task_edges_from_fkey" }).onDelete("cascade"),
-  foreignKey({ columns: [t.toNodeId], foreignColumns: [roomTaskNodes.id], name: "room_task_edges_to_fkey" }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.fromNodeId, t.roomId, t.projectId],
+    foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
+    name: "room_task_edges_from_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.toNodeId, t.roomId, t.projectId],
+    foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
+    name: "room_task_edges_to_room_project_fkey",
+  }).onDelete("cascade"),
   unique("room_task_edges_shape_unique").on(t.roomId, t.fromNodeId, t.toNodeId, t.kind),
-  index("idx_room_task_edges_to").on(t.roomId, t.toNodeId),
+  index("idx_room_task_edges_to").on(t.projectId, t.roomId, t.toNodeId),
+  check("room_task_edges_kind_check", sql`${t.kind} IN ('requires','informs','invalidates')`),
+  check("room_task_edges_self_check", sql`${t.fromNodeId} <> ${t.toNodeId}`),
 ]);
 
 export const roomMessages = roomSchema.table("room_messages", {
