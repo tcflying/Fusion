@@ -232,6 +232,8 @@ interface RoomControllerFactoryContext {
   readonly projectId: string;
   readonly taskStore: unknown;
   readonly asyncLayer: unknown;
+  readonly roomStore: unknown;
+  readonly connectorRegistry: unknown;
 }
 
 type RoomControllerFactory = (context: RoomControllerFactoryContext) => RoomControllerLifecycle;
@@ -349,14 +351,18 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
       expect(roomControllerFactory.mock.invocationCallOrder[0]).toBeLessThan(
         roomController.start.mock.invocationCallOrder[0]!,
       );
-      expect(roomControllerFactory).toHaveBeenCalledWith({
+      expect(roomControllerFactory).toHaveBeenCalledWith(expect.objectContaining({
         projectId: "project-1",
         taskStore: mocks.currentStore,
         asyncLayer,
-      });
+        roomStore: expect.any(Object),
+        connectorRegistry: expect.any(Object),
+      }));
+      expect(engine.getRoomExistingSessionSpine()).not.toBeNull();
     } finally {
       await engine.stop();
     }
+    expect(engine.getRoomExistingSessionSpine()).toBeNull();
   });
 
   /*

@@ -104,6 +104,8 @@ import {
 } from "./room-controller.js";
 import { DurableRoomRecoveryWorker } from "./room-durable-recovery-worker.js";
 import { SessionConnectorRegistry } from "./session-connector-registry.js";
+import { RoomExistingSessionSpine } from "./room-existing-session-spine.js";
+import type { SessionConnectorIngestionLimits } from "./session-connector-ingestion.js";
 import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
 import type {
   ExternalTunnelInfo,
@@ -140,6 +142,8 @@ export interface RoomControllerFactoryContext {
   readonly projectId: string;
   readonly taskStore: TaskStore;
   readonly asyncLayer: AsyncDataLayer;
+  readonly roomStore: AsyncRoomStore;
+  readonly connectorRegistry: SessionConnectorRegistry;
 }
 
 export type RoomControllerFactory = (
@@ -426,6 +430,7 @@ export class ProjectEngine {
   private runtimeStarted = false;
   private roomController?: RoomControllerLifecycle;
   private roomRunAuditDispatcher?: RoomRunAuditDispatcherLifecycle;
+  private roomExistingSessionSpine?: RoomExistingSessionSpine;
   private stopInFlight: Promise<void> | null = null;
   private prMonitor?: PrMonitor;
   /**
@@ -693,6 +698,11 @@ export class ProjectEngine {
     return this.activeMergeTaskId;
   }
 
+  /** Backend-owned exact-existing-Session seam; available only while Room control is running. */
+  getRoomExistingSessionSpine(): RoomExistingSessionSpine | null {
+    return this.roomExistingSessionSpine ?? null;
+  }
+
   getActiveMergeStartedAtMs(): number | null {
     return this.activeMergeStartedAtMs;
   }
@@ -859,7 +869,7 @@ export class ProjectEngine {
         );
       } else {
         let roomSessionConnectorRegistry = this.options.roomSessionConnectorRegistry;
-        if (!this.options.roomControllerFactory && !roomSessionConnectorRegistry) {
+        if (!roomSessionConnectorRegistry) {
           roomSessionConnectorRegistry = new SessionConnectorRegistry();
           const pluginRunner = this.runtime.getPluginRunner?.();
           for (const registration of pluginRunner?.getPluginSessionConnectors() ?? []) {
@@ -884,8 +894,22 @@ export class ProjectEngine {
             }
           }
         }
+        const roomStore = new AsyncRoomStore(asyncLayer, { projectId: this.config.projectId });
+        const ingestionLimits: SessionConnectorIngestionLimits = {
+          historyPageSize: 100,
+          maxHistoryPagesPerReconciliation: 20,
+          maxEvents: 1_000,
+          maxStreamReconnects: 3,
+          maxDegradedPolls: 3,
+        };
+        this.roomExistingSessionSpine = new RoomExistingSessionSpine({
+          projectId: this.config.projectId,
+          roomStore,
+          connectorRegistry: roomSessionConnectorRegistry,
+          ingestionLimits,
+        });
         const roomControllerFactory = this.options.roomControllerFactory ?? ((context: RoomControllerFactoryContext) => {
-          const roomStore = new AsyncRoomStore(context.asyncLayer, { projectId: context.projectId });
+          const roomStore = context.roomStore;
           const leaseStore = new AsyncRoomLeaseStore(context.asyncLayer, { projectId: context.projectId });
           const checkpointStore = new AsyncRoomCheckpointStore(context.asyncLayer, { projectId: context.projectId });
           const hostId = hostname();
@@ -898,7 +922,7 @@ export class ProjectEngine {
             roomStore,
             leaseStore,
             checkpointStore,
-            registry: roomSessionConnectorRegistry!,
+            registry: context.connectorRegistry,
           });
           const auditDispatcherFactory = this.options.roomRunAuditDispatcherFactory
             ?? ((dispatcherContext: RoomRunAuditDispatcherFactoryContext) =>
@@ -931,6 +955,8 @@ export class ProjectEngine {
           projectId: this.config.projectId,
           taskStore: store,
           asyncLayer,
+          roomStore,
+          connectorRegistry: roomSessionConnectorRegistry,
         });
         this.roomController = roomController;
         try {
@@ -953,6 +979,7 @@ export class ProjectEngine {
           });
           this.roomRunAuditDispatcher = undefined;
           this.roomController = undefined;
+          this.roomExistingSessionSpine = undefined;
           throw error;
         }
       }
@@ -1439,6 +1466,7 @@ export class ProjectEngine {
     // rest of ProjectEngine shutdown.
     const roomController = this.roomController;
     this.roomController = undefined;
+    this.roomExistingSessionSpine = undefined;
     if (roomController) {
       try {
         await roomController.stop();

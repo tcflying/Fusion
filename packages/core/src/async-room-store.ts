@@ -3,6 +3,8 @@ import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import {
   RoomDomainError,
+  addRoomSeat,
+  attachRoomBinding,
   createRoomAggregate,
   transitionRoomLifecycle,
   type CreateRoomAggregateInput,
@@ -494,6 +496,19 @@ export interface ImportLegacyHappierBindingInput {
   readonly now: string;
 }
 
+export interface CreateRoomWithExistingBindingsInput {
+  readonly room: Omit<CreateRoomAggregateInput, "projectId" | "now">;
+  readonly participants: readonly {
+    readonly seat: {
+      readonly id: string;
+      readonly role: string;
+      readonly permissionScope: readonly string[];
+    };
+    readonly binding: RoomBindingReplacementV1;
+  }[];
+  readonly now: string;
+}
+
 export type RoomMembershipMutationV1 =
   | {
       readonly action: "add";
@@ -622,6 +637,202 @@ export class AsyncRoomStore {
       return { aggregate, event };
     });
     this.publishCommittedEvent(committed.event);
+    return committed.aggregate;
+  }
+
+  /**
+   * Atomically create a Room whose initial membership is already bound to two
+   * or more exact existing native Sessions. No observable Room is committed
+   * until every immutable identity reservation, seat, binding, and creation
+   * event succeeds.
+   *
+   * FNXC:SessionRoomExistingBindings 2026-07-18-10:25:
+   * Initial existing-Session creation uses one globally ordered advisory-lock
+   * set for the Room and every provider-native/Happier identity. A durable
+   * command hash replays the original creation projection after later Room
+   * mutations, while any changed input fails closed before another write.
+   */
+  async createRoomWithExistingBindings(
+    input: CreateRoomWithExistingBindingsInput,
+    context: RoomCommandContext,
+  ): Promise<RoomAggregateV1> {
+    if (input.participants.length < 2) {
+      throw new RoomDomainError(
+        "room_state_conflict",
+        "An existing-Session Room requires at least two initial participants",
+      );
+    }
+    const participants = input.participants
+      .map((participant) => ({
+        seat: {
+          ...participant.seat,
+          permissionScope: [...participant.seat.permissionScope],
+        },
+        binding: { ...participant.binding },
+      }));
+    validateInitialExistingParticipants(participants);
+
+    const base = createRoomAggregate({
+      ...input.room,
+      projectId: this.projectId,
+      now: input.now,
+    });
+    let validated = base;
+    for (const participant of participants) {
+      validated = addRoomSeat(validated, {
+        ...participant.seat,
+        expectedAggregateVersion: validated.room.aggregateVersion,
+        now: input.now,
+      });
+      validated = attachRoomBinding(validated, {
+        ...participant.binding,
+        seatId: participant.seat.id,
+        expectedAggregateVersion: validated.room.aggregateVersion,
+        now: input.now,
+      });
+    }
+    const aggregate: RoomAggregateV1 = {
+      ...validated,
+      room: base.room,
+      membershipVersion: 1,
+    };
+    // Retry identity is the immutable creation command, not the wall-clock used
+    // by the first successful projection. A later acknowledgement-loss retry
+    // must replay that original projection instead of conflicting on `now`.
+    const commandHash = hashRoomValue({
+      projectId: this.projectId,
+      room: input.room,
+      participants,
+    });
+    const idempotencyKey = "create-room-with-existing-bindings";
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomBindingIdentities(
+        tx,
+        participants.map((participant) => participant.binding),
+        [`fusion-room-create-v1:${this.projectId}:${aggregate.room.id}`],
+      );
+      const existing = await loadRoomAggregateProjection(
+        tx,
+        this.projectId,
+        aggregate.room.id,
+      );
+      if (existing) {
+        const idempotencyRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, aggregate.room.id),
+            eq(roomIdempotencyKeys.idempotencyKey, idempotencyKey),
+          ))
+          .limit(1);
+        const idempotency = idempotencyRows[0];
+        if (
+          !idempotency
+          || idempotency.commandType !== "create_room_with_existing_bindings"
+          || idempotency.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Operational Room ${aggregate.room.id} already exists with different initial Sessions`,
+          );
+        }
+        if (!idempotency.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Existing-Session Room ${aggregate.room.id} has no committed creation result`,
+          );
+        }
+        return {
+          aggregate: await loadInitialRoomCreationResult(
+            tx,
+            this.projectId,
+            aggregate.room.id,
+            idempotency.resultEventId,
+          ),
+          event: null,
+        };
+      }
+      for (const participant of participants) {
+        await assertRoomBindingIdentityAvailableAfterLock(tx, participant.binding);
+      }
+
+      await tx.insert(operationalRooms).values({
+        id: aggregate.room.id,
+        projectId: aggregate.room.projectId,
+        objective: aggregate.room.objective,
+        protocolId: aggregate.room.protocolId,
+        protocolVersion: aggregate.room.protocolVersion,
+        protocolPhaseId: null,
+        lifecycleState: aggregate.room.state,
+        aggregateVersion: aggregate.room.aggregateVersion,
+        membershipVersion: aggregate.membershipVersion,
+        activeTurnId: aggregate.activeTurnId,
+        completionContract: {},
+        createdAt: aggregate.room.createdAt,
+        updatedAt: aggregate.room.updatedAt,
+      });
+      await tx.insert(roomSeats).values(participants.map((participant) => ({
+        id: participant.seat.id,
+        projectId: this.projectId,
+        roomId: aggregate.room.id,
+        role: participant.seat.role,
+        roleVersion: 1,
+        roleHistory: [],
+        permissionScope: [...participant.seat.permissionScope],
+        state: "ready" as const,
+        activeBindingId: participant.binding.id,
+        createdAt: input.now,
+        updatedAt: input.now,
+      })));
+      await tx.insert(roomBindings).values(participants.map((participant) => ({
+        id: participant.binding.id,
+        projectId: this.projectId,
+        roomId: aggregate.room.id,
+        seatId: participant.seat.id,
+        generation: 1,
+        connectorId: participant.binding.connectorId,
+        providerId: participant.binding.providerId,
+        nativeSessionId: participant.binding.nativeSessionId,
+        happierSessionId: participant.binding.happierSessionId,
+        serverProfileId: participant.binding.serverProfileId,
+        machineId: participant.binding.machineId,
+        hostId: participant.binding.hostId,
+        state: "attached" as const,
+        attachedAt: input.now,
+        detachedAt: null,
+        replacedByBindingId: null,
+        replacementReason: null,
+      })));
+      const event = await insertRoomEvent(tx, aggregate, "room_created", context, {
+        projectionVersion: 1,
+        initialProjection: aggregate,
+        initialProjectionHash: hashRoomValue(aggregate),
+        objective: aggregate.room.objective,
+        lifecycleState: aggregate.room.state,
+        protocolId: aggregate.room.protocolId,
+        protocolVersion: aggregate.room.protocolVersion,
+        membershipVersion: aggregate.membershipVersion,
+        activeTurnId: aggregate.activeTurnId,
+        createdAt: aggregate.room.createdAt,
+        updatedAt: aggregate.room.updatedAt,
+        initialExistingSessionBindingIds: participants.map((participant) => participant.binding.id),
+      });
+      await tx.insert(roomIdempotencyKeys).values({
+        id: `room-idempotency-${randomUUID()}`,
+        projectId: this.projectId,
+        roomId: aggregate.room.id,
+        idempotencyKey,
+        commandType: "create_room_with_existing_bindings",
+        commandHash,
+        resultEventId: event.id,
+        createdAt: input.now,
+        expiresAt: null,
+      });
+      return { aggregate, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
     return committed.aggregate;
   }
 
@@ -3308,6 +3519,60 @@ export class AsyncRoomStore {
 
 type LoadedEnqueueMessageResult = Omit<EnqueueRoomMessageResult, "replayed">;
 
+async function loadInitialRoomCreationResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+): Promise<RoomAggregateV1> {
+  const eventRows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const event = eventRows[0];
+  if (!event || event.eventType !== "room_created" || Number(event.aggregateVersion) !== 0) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed existing-Session Room creation event ${eventId} no longer exists or has the wrong type`,
+    );
+  }
+  const payload = asRecord(event.payload);
+  const projectionHash = typeof payload.initialProjectionHash === "string"
+    ? payload.initialProjectionHash
+    : null;
+  if (!projectionHash || hashRoomValue(payload.initialProjection) !== projectionHash) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed existing-Session Room creation event ${eventId} has no valid initial projection evidence`,
+    );
+  }
+  let aggregate: RoomAggregateV1;
+  try {
+    aggregate = parseRoomAggregateProjection(payload.initialProjection);
+  } catch {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed existing-Session Room creation event ${eventId} has an invalid initial projection`,
+    );
+  }
+  if (
+    aggregate.room.projectId !== projectId
+    || aggregate.room.id !== roomId
+    || aggregate.room.aggregateVersion !== 0
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed existing-Session Room creation event ${eventId} projection identity does not match the event`,
+    );
+  }
+  return aggregate;
+}
+
 async function loadMembershipResult(
   handle: QueryHandle,
   projectId: string,
@@ -4683,6 +4948,77 @@ function validateMembershipBinding(binding: RoomBindingReplacementV1): void {
   }
 }
 
+function validateInitialExistingParticipants(
+  participants: CreateRoomWithExistingBindingsInput["participants"],
+): void {
+  const seatIds = new Set<string>();
+  const bindingIds = new Set<string>();
+  const nativeIdentities = new Set<string>();
+  const happierIdentities = new Set<string>();
+  for (const participant of participants) {
+    validateMembershipBinding(participant.binding);
+    for (const [field, value] of Object.entries({
+      happierSessionId: participant.binding.happierSessionId,
+      serverProfileId: participant.binding.serverProfileId,
+      machineId: participant.binding.machineId,
+    })) {
+      if (value !== null && !value.trim()) {
+        throw new RoomDomainError(
+          "binding_identity_conflict",
+          `Initial existing-Session binding ${field} must be null or non-empty`,
+        );
+      }
+    }
+    if (!participant.seat.id.trim() || !participant.seat.role.trim()) {
+      throw new RoomDomainError(
+        "seat_identity_conflict",
+        "Initial existing-Session seats require non-empty IDs and roles",
+      );
+    }
+    if (
+      participant.seat.permissionScope.some((permission) => !permission.trim())
+      || new Set(participant.seat.permissionScope).size !== participant.seat.permissionScope.length
+    ) {
+      throw new RoomDomainError(
+        "seat_identity_conflict",
+        `Initial Room seat ${participant.seat.id} permissions must be unique non-empty strings`,
+      );
+    }
+    if (seatIds.has(participant.seat.id)) {
+      throw new RoomDomainError(
+        "seat_identity_conflict",
+        `Initial Room seat ${participant.seat.id} is duplicated`,
+      );
+    }
+    if (bindingIds.has(participant.binding.id)) {
+      throw new RoomDomainError(
+        "binding_identity_conflict",
+        `Initial Room binding ${participant.binding.id} is duplicated`,
+      );
+    }
+    const nativeIdentity = `${participant.binding.providerId}\u0000${participant.binding.nativeSessionId}`;
+    if (nativeIdentities.has(nativeIdentity)) {
+      throw new RoomDomainError(
+        "binding_identity_conflict",
+        `Native Session ${participant.binding.providerId}:${participant.binding.nativeSessionId} is duplicated`,
+      );
+    }
+    const happierIdentity = participant.binding.happierSessionId
+      ? `${participant.binding.connectorId}\u0000${participant.binding.happierSessionId}`
+      : null;
+    if (happierIdentity && happierIdentities.has(happierIdentity)) {
+      throw new RoomDomainError(
+        "binding_identity_conflict",
+        `Happier Session ${participant.binding.happierSessionId} is duplicated`,
+      );
+    }
+    seatIds.add(participant.seat.id);
+    bindingIds.add(participant.binding.id);
+    nativeIdentities.add(nativeIdentity);
+    if (happierIdentity) happierIdentities.add(happierIdentity);
+  }
+}
+
 function assertMembershipVersions(
   aggregate: RoomAggregateV1,
   input: { readonly expectedAggregateVersion: number; readonly expectedMembershipVersion: number },
@@ -4771,8 +5107,14 @@ async function assertRoomBindingIdentityAvailable(
   tx: DbTransaction,
   binding: RoomBindingReplacementV1,
 ): Promise<void> {
-  await lockRoomBindingIdentity(tx, binding);
+  await lockRoomBindingIdentities(tx, [binding]);
+  await assertRoomBindingIdentityAvailableAfterLock(tx, binding);
+}
 
+async function assertRoomBindingIdentityAvailableAfterLock(
+  tx: DbTransaction,
+  binding: RoomBindingReplacementV1,
+): Promise<void> {
   const nativeRows = await tx
     .select({ id: roomBindings.id })
     .from(roomBindings)
@@ -4846,12 +5188,28 @@ async function lockRoomBindingIdentity(
     readonly happierSessionId?: string | null;
   },
 ): Promise<void> {
-  const lockKeys = [
-    `fusion-room-native-session-v2:${binding.providerId}:${binding.nativeSessionId}`,
-    ...(binding.happierSessionId
-      ? [`fusion-room-happier-session-v2:${binding.connectorId}:${binding.happierSessionId}`]
-      : []),
-  ].sort();
+  await lockRoomBindingIdentities(tx, [binding]);
+}
+
+async function lockRoomBindingIdentities(
+  tx: DbTransaction,
+  bindings: readonly {
+    readonly connectorId: string;
+    readonly providerId: string;
+    readonly nativeSessionId: string;
+    readonly happierSessionId?: string | null;
+  }[],
+  additionalLockKeys: readonly string[] = [],
+): Promise<void> {
+  const lockKeys = [...new Set([
+    ...additionalLockKeys,
+    ...bindings.flatMap((binding) => [
+      `fusion-room-native-session-v2:${binding.providerId}:${binding.nativeSessionId}`,
+      ...(binding.happierSessionId
+        ? [`fusion-room-happier-session-v2:${binding.connectorId}:${binding.happierSessionId}`]
+        : []),
+    ]),
+  ])].sort();
   for (const lockKey of lockKeys) {
     await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
   }
