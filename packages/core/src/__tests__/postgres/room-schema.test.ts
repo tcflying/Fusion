@@ -93,7 +93,7 @@ describe("Session Room PostgreSQL schema", () => {
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"]);
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"]);
     const roomSql = await readSchemaMigrationSql("0001");
     const ownershipSql = await readSchemaMigrationSql("0002");
     const outboxIdentitySql = await readSchemaMigrationSql("0003");
@@ -103,6 +103,7 @@ describe("Session Room PostgreSQL schema", () => {
     const roomRunAuditProjectScopeSql = await readSchemaMigrationSql("0007");
     const roomRunAuditOutboxSql = await readSchemaMigrationSql("0008");
     const membershipProductionInvariantsSql = await readSchemaMigrationSql("0009");
+    const nativeSenderTakeoverSql = await readSchemaMigrationSql("0010");
 
     for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => name !== "room_binding_ingestion_state")) {
       expect(roomSql).toContain(`project.${tableName}`);
@@ -128,5 +129,29 @@ describe("Session Room PostgreSQL schema", () => {
     expect(roomRunAuditOutboxSql).toContain("attempt_count");
     expect(membershipProductionInvariantsSql).toContain("reserved_native_session_id");
     expect(membershipProductionInvariantsSql).toContain("idx_room_bindings_active_native_session");
+    expect(nativeSenderTakeoverSql).toContain("project.room_binding_ingestion_state");
+    expect(nativeSenderTakeoverSql).toContain("takeover_id");
+    expect(nativeSenderTakeoverSql).toContain("blocked_outbox_ids");
+    expect(nativeSenderTakeoverSql).toContain("room_binding_ingestion_takeover_projection_check");
+  });
+
+  it("models the native IDE sender takeover projection on binding ingestion state", () => {
+    expect({
+      takeoverId: roomBindingIngestionState.takeoverId.name,
+      takeoverEpoch: roomBindingIngestionState.takeoverEpoch.name,
+      takeoverState: roomBindingIngestionState.takeoverState.name,
+      autoSenderLeaseEpoch: roomBindingIngestionState.autoSenderLeaseEpoch.name,
+      reconcileFromCursor: roomBindingIngestionState.reconcileFromCursor.name,
+      confirmedCursor: roomBindingIngestionState.confirmedCursor.name,
+      blockedOutboxIds: roomBindingIngestionState.blockedOutboxIds.name,
+    }).toEqual({
+      takeoverId: "takeover_id",
+      takeoverEpoch: "takeover_epoch",
+      takeoverState: "takeover_state",
+      autoSenderLeaseEpoch: "auto_sender_lease_epoch",
+      reconcileFromCursor: "reconcile_from_cursor",
+      confirmedCursor: "confirmed_cursor",
+      blockedOutboxIds: "blocked_outbox_ids",
+    });
   });
 });

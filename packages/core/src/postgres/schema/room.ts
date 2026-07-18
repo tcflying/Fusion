@@ -124,6 +124,17 @@ export const roomBindingIngestionState = roomSchema.table("room_binding_ingestio
   lastPayloadHash: text("last_payload_hash"),
   connectorStatus: text("connector_status"),
   nativeWriterDetected: boolean("native_writer_detected").notNull().default(false),
+  /*
+  FNXC:SessionRoomSenderTakeover 2026-07-18-07:05:
+  Native IDE writer detection must persist one complete, epoch-fenced sender takeover projection with its reconciliation cursors and uncertain outbox blockers. Historical ingestion rows remain a valid no-takeover projection instead of receiving fabricated lease or cursor state during upgrade.
+  */
+  takeoverId: text("takeover_id"),
+  takeoverEpoch: bigint("takeover_epoch", { mode: "number" }),
+  takeoverState: text("takeover_state"),
+  autoSenderLeaseEpoch: bigint("auto_sender_lease_epoch", { mode: "number" }),
+  reconcileFromCursor: text("reconcile_from_cursor"),
+  confirmedCursor: text("confirmed_cursor"),
+  blockedOutboxIds: jsonb("blocked_outbox_ids").notNull().default([]),
   gapExpectedCursor: text("gap_expected_cursor"),
   gapObservedCursor: text("gap_observed_cursor"),
   gapDetectedAt: text("gap_detected_at"),
@@ -140,6 +151,41 @@ export const roomBindingIngestionState = roomSchema.table("room_binding_ingestio
   index("idx_room_binding_ingestion_room_mode").on(t.projectId, t.roomId, t.mode),
   check("room_binding_ingestion_mode_check", sql`${t.mode} IN ('starting','streaming','polling','reconciling','degraded','stopped')`),
   check("room_binding_ingestion_status_check", sql`${t.connectorStatus} IS NULL OR ${t.connectorStatus} IN ('idle','running','waiting_input','paused','lost','unknown')`),
+  check("room_binding_ingestion_takeover_state_check", sql`${t.takeoverState} IS NULL OR ${t.takeoverState} IN ('reconciling','ready_for_transfer','human_active','releasing','automatic_resumed','blocked_delivery_uncertain')`),
+  check("room_binding_ingestion_takeover_epoch_check", sql`(${t.takeoverEpoch} IS NULL OR ${t.takeoverEpoch} BETWEEN 1 AND 9007199254740991) AND (${t.autoSenderLeaseEpoch} IS NULL OR ${t.autoSenderLeaseEpoch} BETWEEN 1 AND 9007199254740991)`),
+  check("room_binding_ingestion_blocked_outbox_ids_check", sql`jsonb_typeof(${t.blockedOutboxIds}) = 'array' AND NOT jsonb_path_exists(${t.blockedOutboxIds}, '$[*] ? (@.type() != "string" || @ like_regex "^\\s*$")') AND project.room_jsonb_text_array_is_unique(${t.blockedOutboxIds})`),
+  check("room_binding_ingestion_takeover_projection_check", sql`(
+    ${t.takeoverId} IS NULL
+    AND ${t.takeoverEpoch} IS NULL
+    AND ${t.takeoverState} IS NULL
+    AND ${t.autoSenderLeaseEpoch} IS NULL
+    AND ${t.reconcileFromCursor} IS NULL
+    AND ${t.confirmedCursor} IS NULL
+    AND ${t.blockedOutboxIds} = '[]'::jsonb
+  ) OR (
+    ${t.takeoverId} IS NOT NULL
+    AND btrim(${t.takeoverId}) <> ''
+    AND ${t.takeoverEpoch} IS NOT NULL
+    AND ${t.takeoverState} IS NOT NULL
+    AND ${t.autoSenderLeaseEpoch} IS NOT NULL
+    AND (
+      ${t.takeoverState} NOT IN ('reconciling','ready_for_transfer','human_active','releasing','automatic_resumed','blocked_delivery_uncertain')
+      OR ${t.takeoverState} IN ('reconciling','blocked_delivery_uncertain')
+      OR (${t.takeoverState} IN ('releasing','automatic_resumed') AND NOT ${t.nativeWriterDetected})
+      OR (${t.takeoverState} IN ('ready_for_transfer','human_active') AND ${t.nativeWriterDetected})
+    )
+    AND (${t.reconcileFromCursor} IS NULL OR btrim(${t.reconcileFromCursor}) <> '')
+    AND (${t.confirmedCursor} IS NULL OR btrim(${t.confirmedCursor}) <> '')
+  )`),
+  check("room_binding_ingestion_takeover_payload_check", sql`CASE ${t.takeoverState}
+    WHEN 'reconciling' THEN ${t.blockedOutboxIds} = '[]'::jsonb
+    WHEN 'ready_for_transfer' THEN ${t.confirmedCursor} IS NOT NULL AND ${t.blockedOutboxIds} = '[]'::jsonb
+    WHEN 'human_active' THEN ${t.confirmedCursor} IS NOT NULL AND ${t.blockedOutboxIds} = '[]'::jsonb
+    WHEN 'releasing' THEN ${t.blockedOutboxIds} = '[]'::jsonb
+    WHEN 'automatic_resumed' THEN ${t.confirmedCursor} IS NOT NULL AND ${t.blockedOutboxIds} = '[]'::jsonb
+    WHEN 'blocked_delivery_uncertain' THEN ${t.blockedOutboxIds} <> '[]'::jsonb
+    ELSE true
+  END`),
 ]);
 
 export const roomTurns = roomSchema.table("room_turns", {

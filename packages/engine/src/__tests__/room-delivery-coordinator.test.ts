@@ -3,6 +3,7 @@ import {
   SESSION_CONNECTOR_CAPABILITIES,
   buildRoomConnectorLocalMessageId,
   hashRoomValue,
+  type BeginRoomDeliveryAttemptInput,
   type RoomBindingRecordV1,
   type RoomOutboxRecordV1,
   type SessionConnectorCapabilitiesV1,
@@ -28,6 +29,15 @@ const IDENTITY: SessionConnectorIdentityV1 = {
   serverProfileId: "server-profile-1",
   machineId: "machine-1",
   hostId: "fusion-host-1",
+};
+const SENDER_FENCE: NonNullable<BeginRoomDeliveryAttemptInput["senderFence"]> = {
+  leaseId: "sender-lease-1",
+  roomId: "room-1",
+  kind: "sender",
+  resourceId: "binding-1",
+  holderId: "sender-worker-1",
+  hostId: "fusion-host-1",
+  expectedEpoch: 1,
 };
 
 function delivery(state: RoomOutboxRecordV1["state"] = "pending"): RoomOutboxRecordV1 {
@@ -60,7 +70,7 @@ class MemoryDeliveryStore implements RoomDeliveryCoordinatorStore {
   current: RoomOutboxRecordV1;
   readonly binding: RoomBindingRecordV1;
   crashOnComplete = false;
-  readonly beginCalls: unknown[] = [];
+  readonly beginCalls: BeginRoomDeliveryAttemptInput[] = [];
   readonly completeCalls: unknown[] = [];
   readonly reconciliationCalls: unknown[] = [];
 
@@ -269,6 +279,7 @@ describe("Room connector delivery reconciliation", () => {
       identity: IDENTITY,
       outboxId: "outbox-1",
       attemptId: "attempt-1",
+      senderFence: SENDER_FENCE,
       content: "Only this payload may be delivered.",
       reconciliationFromCursor: "cursor-before-send",
       now: NOW,
@@ -276,6 +287,8 @@ describe("Room connector delivery reconciliation", () => {
     })).rejects.toThrow("simulated crash");
     expect(fixture.sendCalls).toBe(1);
     expect(store.current.state).toBe("dispatching");
+    expect(store.beginCalls).toHaveLength(1);
+    expect(store.beginCalls[0]?.senderFence).toBe(SENDER_FENCE);
 
     store.crashOnComplete = false;
     const recovered = await reconcileAmbiguousRoomDelivery({
@@ -343,6 +356,7 @@ describe("Room connector delivery reconciliation", () => {
       identity: IDENTITY,
       outboxId: "outbox-1",
       attemptId: "attempt-transport-1",
+      senderFence: SENDER_FENCE,
       content: "Only this payload may be delivered.",
       reconciliationFromCursor: "cursor-before-send",
       now: NOW,
@@ -356,6 +370,7 @@ describe("Room connector delivery reconciliation", () => {
     });
     expect(fixture.sendCalls).toBe(1);
     expect(store.beginCalls).toHaveLength(1);
+    expect(store.beginCalls[0]?.senderFence).toBe(SENDER_FENCE);
     expect(store.completeCalls).toHaveLength(1);
   });
 
@@ -449,6 +464,7 @@ describe("Room connector delivery reconciliation", () => {
       },
       outboxId: "outbox-1",
       attemptId: "attempt-wrong-session",
+      senderFence: SENDER_FENCE,
       content: "Only this payload may be delivered.",
       reconciliationFromCursor: "cursor-before-send",
       now: NOW,
@@ -471,6 +487,7 @@ describe("Room connector delivery reconciliation", () => {
       },
       outboxId: "outbox-1",
       attemptId: "attempt-wrong-machine",
+      senderFence: SENDER_FENCE,
       content: "Only this payload may be delivered.",
       reconciliationFromCursor: "cursor-before-send",
       now: NOW,
@@ -493,6 +510,7 @@ describe("Room connector delivery reconciliation", () => {
       },
       outboxId: "outbox-1",
       attemptId: "attempt-missing-machine",
+      senderFence: SENDER_FENCE,
       content: "Only this payload may be delivered.",
       reconciliationFromCursor: "cursor-before-send",
       now: NOW,
@@ -517,6 +535,7 @@ describe("Room connector delivery reconciliation", () => {
       identity: IDENTITY,
       outboxId: "outbox-1",
       attemptId: "attempt-malformed-certification",
+      senderFence: SENDER_FENCE,
       content: "Only this payload may be delivered.",
       reconciliationFromCursor: "cursor-before-send",
       now: NOW,

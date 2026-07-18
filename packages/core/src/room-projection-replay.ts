@@ -278,6 +278,67 @@ function applyOneEvent(
       return validateMembershipChangeRequested(aggregate, event, payload);
     case "membership_change_activated":
       return validateMembershipChangeActivated(aggregate, event, payload);
+    case "sender_takeover_blocked_delivery_uncertain": {
+      assertExactKeys(payload, [
+        "projectionVersion",
+        "bindingId",
+        "takeoverId",
+        "takeoverEpoch",
+        "outboxIds",
+        "updatedAt",
+      ], `${event.id} payload`);
+      if (requireNonNegativeInteger(payload.projectionVersion, `${event.id} projectionVersion`) !== 1) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Sender takeover event ${event.id} requires projection version 1`,
+        );
+      }
+      requireTrimmedString(payload.bindingId, `${event.id} bindingId`);
+      requireTrimmedString(payload.takeoverId, `${event.id} takeoverId`);
+      requirePositiveInteger(payload.takeoverEpoch, `${event.id} takeoverEpoch`);
+      const outboxIds = requireArray(payload.outboxIds, `${event.id} outboxIds`);
+      if (
+        outboxIds.length === 0
+        || outboxIds.some((id) => typeof id !== "string" || id.trim().length === 0)
+        || new Set(outboxIds).size !== outboxIds.length
+      ) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Sender takeover event ${event.id} requires unique non-empty outbox IDs`,
+        );
+      }
+      const updatedAt = requireIsoTimestamp(payload.updatedAt, `${event.id} updatedAt`);
+      const occurredAt = requireIsoTimestamp(event.occurredAt, `${event.id} occurredAt`);
+      if (
+        new Date(Date.parse(updatedAt)).toISOString() !== updatedAt
+        || new Date(Date.parse(occurredAt)).toISOString() !== occurredAt
+      ) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Sender takeover event ${event.id} requires canonical UTC timestamps`,
+        );
+      }
+      if (Date.parse(occurredAt) > Date.parse(updatedAt)) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Sender takeover event ${event.id} cannot occur after its projection update`,
+        );
+      }
+      if (Date.parse(updatedAt) < Date.parse(aggregate.room.updatedAt)) {
+        throw new RoomProjectionReplayError(
+          "invalid_event_payload",
+          `Sender takeover event ${event.id} cannot move Room time backwards`,
+        );
+      }
+      return {
+        ...aggregate,
+        room: {
+          ...aggregate.room,
+          aggregateVersion: event.aggregateVersion,
+          updatedAt,
+        },
+      };
+    }
     default:
       throw new RoomProjectionReplayError(
         "unsupported_event",

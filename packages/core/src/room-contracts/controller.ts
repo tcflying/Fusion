@@ -38,6 +38,7 @@ export const ROOM_CONTROLLER_EVENT_TYPES = [
   "turn_checkpointed",
   "outbox_enqueued",
   "delivery_state_changed",
+  "sender_takeover_blocked_delivery_uncertain",
   "room_terminalized",
   "command_rejected",
 ] as const;

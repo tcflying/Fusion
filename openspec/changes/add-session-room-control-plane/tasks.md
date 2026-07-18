@@ -36,7 +36,7 @@
 - [x] 4.2 Implement the supervised `RoomController`/worker lifecycle and wire it into the existing project engine without creating a second scheduler process.
 - [x] 4.3 Implement participant add/remove/pause/replace and role changes at turn boundaries with immutable binding lineage.
 - [ ] 4.4 Implement routed operator messages to controller, all, group, or selected seats using structured authority envelopes and durable target records.
-- [ ] 4.5 Implement one-sender lease and native IDE takeover reconciliation so observation can be concurrent but provider writes cannot interleave.
+- [x] 4.5 Implement one-sender lease and native IDE takeover reconciliation so observation can be concurrent but provider writes cannot interleave.
 - [ ] 4.6 Complete the first real two-plus-existing-Session spine: Room creation, exact Happier attachment, targeted sends, response/event ingestion, persisted history, and same native identities.
 - [ ] 4.7 Inject crashes after command commit, after external send, before acknowledgement, and during takeover; prove recovery or visible uncertainty with no silent loss.
 - [x] 4.8 Add Room lifecycle/run-audit events and startup self-healing that preserve human pause, approval, and terminal-state invariants.

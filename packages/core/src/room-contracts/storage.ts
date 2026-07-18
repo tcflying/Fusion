@@ -211,6 +211,31 @@ export type RoomConnectorTranscriptSource = "event" | "history";
 export type RoomConnectorMessageRole = "user" | "assistant" | "tool" | "system" | "unknown";
 export type RoomConnectorStatus = "idle" | "running" | "waiting_input" | "paused" | "lost" | "unknown";
 
+export type NativeIdeSenderTakeoverState =
+  | "reconciling"
+  | "ready_for_transfer"
+  | "human_active"
+  | "releasing"
+  | "automatic_resumed"
+  | "blocked_delivery_uncertain";
+
+/**
+ * Durable projection used to fence Fusion's automatic sender while a native
+ * IDE is writing to the same Session.  The lease epoch and reconciliation
+ * cursors are persisted together so process restart cannot silently resume an
+ * obsolete sender or resend an ambiguous delivery.
+ */
+export interface NativeIdeSenderTakeoverProjectionV1 {
+  readonly takeoverId: string;
+  readonly takeoverEpoch: number;
+  readonly state: NativeIdeSenderTakeoverState;
+  readonly automaticSender: "paused" | "active";
+  readonly autoSenderLeaseEpoch: number;
+  readonly reconcileFromCursor: EventCursor | null;
+  readonly confirmedCursor: EventCursor | null;
+  readonly blockedOutboxIds: readonly string[];
+}
+
 export interface RoomConnectorTranscriptItemV1 {
   readonly nativeMessageId: string | null;
   readonly logicalMessageId: RoomMessageId | null;
@@ -231,6 +256,7 @@ export interface RoomConnectorIngestionStateV1 {
   readonly lastPayloadHash: ContentHash | null;
   readonly connectorStatus: RoomConnectorStatus | null;
   readonly nativeWriterDetected: boolean;
+  readonly senderTakeover: NativeIdeSenderTakeoverProjectionV1 | null;
   readonly gapExpectedCursor: EventCursor | null;
   readonly gapObservedCursor: EventCursor | null;
   readonly gapDetectedAt: IsoTimestamp | null;

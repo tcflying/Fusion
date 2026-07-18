@@ -14,6 +14,11 @@ import {
 import type { RoomLifecycleState } from "./room-contracts/storage.js";
 import {
   assertRoomLeaseFence,
+  loadRoomLeaseById,
+  lockRoomLeaseResourceWithinTransaction,
+  RoomLeaseFenceError,
+  transferRoomSenderLeaseWithinTransaction,
+  type AssertRoomLeaseFenceInput,
   type StoredRoomLeaseV1,
 } from "./async-room-lease-store.js";
 import type {
@@ -27,6 +32,7 @@ import type {
   RoomConnectorTranscriptSource,
   RoomEventRecordV1,
   RoomMessageRecordV1,
+  NativeIdeSenderTakeoverProjectionV1,
   RoomOutboxRecordV1,
 } from "./room-contracts/storage.js";
 import {
@@ -269,6 +275,8 @@ export type RoomStoreErrorCode =
   | "delivery_target_conflict"
   | "delivery_state_conflict"
   | "delivery_attempt_conflict"
+  | "sender_takeover_conflict"
+  | "resume_cursor_conflict"
   | "inbox_payload_conflict"
   | "legacy_binding_not_found"
   | "legacy_binding_integrity_conflict"
@@ -322,6 +330,47 @@ export interface BeginRoomDeliveryAttemptInput {
   readonly attemptId: string;
   readonly reconciliationFromCursor: string | null;
   readonly now: string;
+  /**
+   * Required once a binding has entered sender-lease management. Legacy rows
+   * with no sender lease history remain readable during rolling upgrades, but
+   * can never downgrade again after their first lease is created.
+   */
+  readonly senderFence?: Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" };
+}
+
+export interface TransferNativeIdeSenderLeaseInput {
+  readonly roomId: string;
+  readonly bindingId: string;
+  readonly takeoverId: string;
+  readonly expectedTakeoverEpoch: number;
+  readonly fromSenderFence: Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" };
+  readonly humanHolderId: string;
+  readonly hostId: string;
+  readonly now: string;
+  readonly expiresAt: string;
+}
+
+export interface TransferNativeIdeSenderLeaseResult {
+  readonly takeover: NativeIdeSenderTakeoverProjectionV1;
+  readonly senderLease: StoredRoomLeaseV1;
+}
+
+export interface ResumeAutomaticSenderAfterNativeIdeInput {
+  readonly roomId: string;
+  readonly bindingId: string;
+  readonly takeoverId: string;
+  readonly expectedTakeoverEpoch: number;
+  readonly confirmedCursor: string;
+  readonly fromHumanFence: Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" };
+  readonly automaticHolderId: string;
+  readonly hostId: string;
+  readonly now: string;
+  readonly expiresAt: string;
+}
+
+export interface ResumeAutomaticSenderAfterNativeIdeResult {
+  readonly takeover: NativeIdeSenderTakeoverProjectionV1;
+  readonly senderLease: StoredRoomLeaseV1;
 }
 
 export interface CompleteRoomDeliveryAttemptInput {
@@ -1903,6 +1952,115 @@ export class AsyncRoomStore {
           `Room outbox ${input.outboxId} cannot dispatch from state ${current.deliveryState}`,
         );
       }
+
+      let senderLease: StoredRoomLeaseV1 | null = null;
+      if (input.senderFence) {
+        await lockRoomConnectorIngestion(tx, this.projectId, current.bindingId);
+        await lockRoomLeaseResourceWithinTransaction(
+          tx,
+          this.projectId,
+          "sender",
+          input.senderFence.resourceId,
+        );
+        senderLease = await assertRoomLeaseFence(tx, this.projectId, {
+          ...input.senderFence,
+          now: input.now,
+        });
+        if (
+          senderLease.kind !== "sender"
+          || senderLease.roomId !== current.roomId
+          || senderLease.resourceId !== current.bindingId
+        ) {
+          throw new RoomLeaseFenceError(
+            `Sender lease ${senderLease.id} does not authorize outbox ${input.outboxId}`,
+            senderLease,
+          );
+        }
+      } else {
+        const leaseHistory = await tx
+          .select({ id: roomLeases.id })
+          .from(roomLeases)
+          .where(and(
+            eq(roomLeases.projectId, this.projectId),
+            eq(roomLeases.kind, "sender"),
+            eq(roomLeases.resourceId, current.bindingId),
+          ))
+          .orderBy(desc(roomLeases.epoch))
+          .limit(1);
+        if (leaseHistory.length > 0) {
+          throw new RoomLeaseFenceError(
+            `Sender-managed outbox ${input.outboxId} requires the exact active sender lease fence`,
+            null,
+          );
+        }
+      }
+
+      if (senderLease) {
+        const ingestion = await loadRoomConnectorIngestionState(
+          tx,
+          this.projectId,
+          current.roomId,
+          current.bindingId,
+        );
+        let takeover = ingestion.senderTakeover;
+        if (
+          takeover !== null
+          && (
+            takeover.state === "reconciling"
+            || (takeover.state === "automatic_resumed"
+              && senderLease.epoch > takeover.autoSenderLeaseEpoch)
+          )
+          && !ingestion.nativeWriterDetected
+          && takeover.confirmedCursor !== null
+          && takeover.confirmedCursor === ingestion.transcriptCursor
+          && input.reconciliationFromCursor === takeover.confirmedCursor
+        ) {
+          takeover = {
+            ...takeover,
+            state: "automatic_resumed",
+            automaticSender: "active",
+            autoSenderLeaseEpoch: senderLease.epoch,
+          };
+          const resumedState: RoomConnectorIngestionStateV1 = {
+            ...ingestion,
+            mode: ingestion.mode === "stopped" ? "stopped" : "streaming",
+            senderTakeover: takeover,
+            lastModeAt: ingestion.mode === "stopped"
+              ? ingestion.lastModeAt
+              : latestTimestamp(ingestion.lastModeAt, input.now),
+            updatedAt: latestTimestamp(ingestion.updatedAt, input.now),
+          };
+          await persistRoomConnectorIngestionState(
+            tx,
+            this.projectId,
+            resumedState,
+            resumedState.updatedAt!,
+          );
+        }
+        const senderMatchesTakeover = takeover === null
+          || (takeover.state === "human_active"
+            && senderLease.epoch === takeover.autoSenderLeaseEpoch + 1)
+          || (takeover.state === "automatic_resumed"
+            && senderLease.epoch === takeover.autoSenderLeaseEpoch);
+        if (
+          takeover !== null
+          && !senderMatchesTakeover
+        ) {
+          throw new RoomStoreError(
+            "sender_takeover_conflict",
+            `Sender takeover ${takeover.takeoverId} pauses provider writes for binding ${current.bindingId}`,
+          );
+        }
+        if (
+          senderLease.epoch > 1
+          && input.reconciliationFromCursor !== ingestion.transcriptCursor
+        ) {
+          throw new RoomStoreError(
+            "resume_cursor_conflict",
+            `Sender epoch ${senderLease.epoch} for outbox ${input.outboxId} must resume from confirmed cursor ${String(ingestion.transcriptCursor)}`,
+          );
+        }
+      }
       if (
         current.nextAttemptAt
         && Date.parse(current.nextAttemptAt) > Date.parse(input.now)
@@ -2049,6 +2207,13 @@ export class AsyncRoomStore {
           && currentRecord.nativeCursor === input.nativeCursor
           && currentRecord.reconciliationEvidenceRef === input.evidenceRef
         ) {
+          await refreshBlockedSenderTakeoverAfterDeliveryResolution(
+            tx,
+            this.projectId,
+            current.roomId,
+            current.bindingId,
+            input.now,
+          );
           return currentRecord;
         }
         throw new RoomStoreError(
@@ -2158,6 +2323,15 @@ export class AsyncRoomStore {
           errorCode: input.errorCode,
         },
       });
+      if (input.outcome === "confirmed") {
+        await refreshBlockedSenderTakeoverAfterDeliveryResolution(
+          tx,
+          this.projectId,
+          current.roomId,
+          current.bindingId,
+          input.now,
+        );
+      }
       return rowToOutboxRecord(updatedRow);
     });
   }
@@ -2319,6 +2493,15 @@ export class AsyncRoomStore {
           errorCode: input.errorCode,
         },
       });
+      if (nextState === "confirmed" || nextState === "rejected") {
+        await refreshBlockedSenderTakeoverAfterDeliveryResolution(
+          tx,
+          this.projectId,
+          current.roomId,
+          current.bindingId,
+          input.now,
+        );
+      }
       return rowToOutboxRecord(updatedRow);
     });
   }
@@ -2460,15 +2643,88 @@ export class AsyncRoomStore {
 
       const lastItem = input.items.length > 0 ? input.items[input.items.length - 1] : undefined;
       const updatedAt = latestTimestamp(current.updatedAt, input.receivedAt);
+      const currentTakeover = current.senderTakeover;
+      const takeoverCanReconcile = currentTakeover?.state === "reconciling"
+        || currentTakeover?.state === "blocked_delivery_uncertain"
+        || currentTakeover?.state === "releasing";
+      const completeHistoryCanConfirm = currentTakeover?.state === "releasing"
+        || (currentTakeover?.state === "reconciling" && !current.nativeWriterDetected)
+        || input.items.some((item) => item.role === "user");
+      const takeoverReconciled = takeoverCanReconcile
+        && input.source === "history"
+        && input.nextCursor !== null
+        && !input.truncated
+        && completeHistoryCanConfirm;
+      let reconciledAutomaticSenderLeaseEpoch: number | null = null;
+      if (
+        takeoverReconciled
+        && currentTakeover?.state === "reconciling"
+        && !current.nativeWriterDetected
+      ) {
+        await lockRoomLeaseResourceWithinTransaction(
+          tx,
+          this.projectId,
+          "sender",
+          input.bindingId,
+        );
+        const activeSenderRows = await tx
+          .select({ epoch: roomLeases.epoch, expiresAt: roomLeases.expiresAt })
+          .from(roomLeases)
+          .where(and(
+            eq(roomLeases.projectId, this.projectId),
+            eq(roomLeases.roomId, input.roomId),
+            eq(roomLeases.kind, "sender"),
+            eq(roomLeases.resourceId, input.bindingId),
+            isNull(roomLeases.releasedAt),
+          ))
+          .orderBy(desc(roomLeases.epoch))
+          .limit(1)
+          .for("update");
+        const activeSender = activeSenderRows[0];
+        if (
+          activeSender
+          && Date.parse(activeSender.expiresAt) > Date.parse(input.receivedAt)
+        ) {
+          reconciledAutomaticSenderLeaseEpoch = Number(activeSender.epoch);
+        }
+      }
+      const reconciledTakeoverState = currentTakeover?.state === "blocked_delivery_uncertain"
+        ? "blocked_delivery_uncertain" as const
+        : currentTakeover?.state === "releasing"
+          ? "releasing" as const
+          : currentTakeover?.state === "reconciling"
+              && !current.nativeWriterDetected
+              && reconciledAutomaticSenderLeaseEpoch !== null
+            ? "automatic_resumed" as const
+            : currentTakeover?.state === "reconciling" && !current.nativeWriterDetected
+              ? "reconciling" as const
+              : "ready_for_transfer" as const;
+      const reconciledTakeover = takeoverReconciled && currentTakeover
+        ? {
+            ...currentTakeover,
+            state: reconciledTakeoverState,
+            automaticSender: reconciledTakeoverState === "automatic_resumed"
+              ? "active" as const
+              : "paused" as const,
+            autoSenderLeaseEpoch: reconciledAutomaticSenderLeaseEpoch
+              ?? currentTakeover.autoSenderLeaseEpoch,
+            confirmedCursor: input.nextCursor,
+          }
+        : currentTakeover;
       const state: RoomConnectorIngestionStateV1 = {
         ...current,
-        mode: current.mode === "stopped" ? "stopped" : input.modeAfterCommit,
+        mode: current.mode === "stopped"
+          ? "stopped"
+          : reconciledTakeover?.state === "automatic_resumed"
+            ? "streaming"
+            : input.modeAfterCommit,
         transcriptCursor: input.nextCursor,
         lastNativeMessageId: lastItem?.nativeMessageId ?? current.lastNativeMessageId,
         lastPayloadHash: lastItem?.payloadHash ?? current.lastPayloadHash,
         gapExpectedCursor: null,
         gapObservedCursor: null,
         gapDetectedAt: null,
+        senderTakeover: reconciledTakeover,
         lastTranscriptAt: latestTimestamp(current.lastTranscriptAt, input.receivedAt),
         lastModeAt: current.mode === "stopped"
           ? current.lastModeAt
@@ -2490,7 +2746,9 @@ export class AsyncRoomStore {
   async recordConnectorStatus(
     input: RecordRoomConnectorStatusInput,
   ): Promise<RoomConnectorIngestionStateV1> {
-    return this.layer.transactionImmediate(async (tx) => {
+    assertCanonicalIsoTimestamp(input.occurredAt, "Connector status occurredAt");
+    let committedEvent: RoomEventRecordV1 | null = null;
+    const committedState = await this.layer.transactionImmediate(async (tx) => {
       await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
       await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
       const current = await loadRoomConnectorIngestionState(
@@ -2526,16 +2784,449 @@ export class AsyncRoomStore {
         return current;
       }
       const updatedAt = latestTimestamp(current.updatedAt, input.occurredAt);
+      let senderTakeover = current.senderTakeover;
+      let blockedOutboxIds: readonly string[] = [];
+      if (
+        !input.nativeWriterDetected
+        && senderTakeover?.state === "human_active"
+      ) {
+        senderTakeover = {
+          ...senderTakeover,
+          state: "releasing",
+          reconcileFromCursor: current.transcriptCursor,
+          confirmedCursor: null,
+        };
+      } else if (
+        !input.nativeWriterDetected
+        && senderTakeover !== null
+        && (
+          senderTakeover.state === "reconciling"
+          || senderTakeover.state === "ready_for_transfer"
+          || senderTakeover.state === "blocked_delivery_uncertain"
+        )
+      ) {
+        senderTakeover = {
+          ...senderTakeover,
+          state: senderTakeover.state === "blocked_delivery_uncertain"
+            ? "blocked_delivery_uncertain"
+            : "reconciling",
+          reconcileFromCursor: current.transcriptCursor,
+          confirmedCursor: null,
+        };
+      } else if (
+        input.nativeWriterDetected
+        && senderTakeover?.state === "releasing"
+      ) {
+        senderTakeover = {
+          ...senderTakeover,
+          state: "human_active",
+          reconcileFromCursor: current.transcriptCursor,
+          confirmedCursor: current.transcriptCursor,
+        };
+      }
+      if (
+        input.nativeWriterDetected
+        && (senderTakeover === null || senderTakeover.state === "automatic_resumed")
+      ) {
+        await lockRoomLeaseResourceWithinTransaction(
+          tx,
+          this.projectId,
+          "sender",
+          input.bindingId,
+        );
+        const activeSenderRows = await tx
+          .select({ epoch: roomLeases.epoch, expiresAt: roomLeases.expiresAt })
+          .from(roomLeases)
+          .where(and(
+            eq(roomLeases.projectId, this.projectId),
+            eq(roomLeases.roomId, input.roomId),
+            eq(roomLeases.kind, "sender"),
+            eq(roomLeases.resourceId, input.bindingId),
+            isNull(roomLeases.releasedAt),
+          ))
+          .orderBy(desc(roomLeases.epoch))
+          .limit(1)
+          .for("update");
+        const activeSender = activeSenderRows[0];
+        if (
+          !activeSender
+          || Date.parse(activeSender.expiresAt) <= Date.parse(input.occurredAt)
+        ) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Native writer detection for binding ${input.bindingId} requires an active automatic sender lease`,
+          );
+        }
+        blockedOutboxIds = (await tx
+          .select({ id: roomOutbox.id })
+          .from(roomOutbox)
+          .where(and(
+            eq(roomOutbox.projectId, this.projectId),
+            eq(roomOutbox.roomId, input.roomId),
+            eq(roomOutbox.bindingId, input.bindingId),
+            inArray(roomOutbox.deliveryState, ["dispatching", "delivery_uncertain"]),
+          ))
+          .orderBy(asc(roomOutbox.id)))
+          .map((row) => row.id);
+        senderTakeover = {
+          takeoverId: `native-writer:${input.statusCursor ?? input.occurredAt}`,
+          takeoverEpoch: (senderTakeover?.takeoverEpoch ?? 0) + 1,
+          state: blockedOutboxIds.length > 0
+            ? "blocked_delivery_uncertain"
+            : "reconciling",
+          automaticSender: "paused",
+          autoSenderLeaseEpoch: Number(activeSender.epoch),
+          reconcileFromCursor: current.transcriptCursor,
+          confirmedCursor: null,
+          blockedOutboxIds,
+        };
+      }
       const state: RoomConnectorIngestionStateV1 = {
         ...current,
+        mode: senderTakeover !== null
+          && senderTakeover.state !== "automatic_resumed"
+          && current.mode !== "stopped"
+          ? "reconciling"
+          : current.mode,
         statusCursor: input.statusCursor,
         connectorStatus: input.state,
         nativeWriterDetected: input.nativeWriterDetected,
+        senderTakeover,
         lastStatusAt: input.occurredAt,
+        lastModeAt: senderTakeover !== null
+          && senderTakeover.state !== "automatic_resumed"
+          && current.mode !== "stopped"
+          ? latestTimestamp(current.lastModeAt, input.occurredAt)
+          : current.lastModeAt,
         updatedAt,
       };
       await persistRoomConnectorIngestionState(tx, this.projectId, state, updatedAt);
+
+      if (blockedOutboxIds.length > 0 && senderTakeover !== null) {
+        const lockedRoomRows = await tx
+          .select({
+            aggregateVersion: operationalRooms.aggregateVersion,
+            updatedAt: operationalRooms.updatedAt,
+          })
+          .from(operationalRooms)
+          .where(and(
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.id, input.roomId),
+          ))
+          .limit(1)
+          .for("update");
+        const lockedRoom = lockedRoomRows[0];
+        if (!lockedRoom) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Operational Room ${input.roomId} disappeared during native writer takeover`,
+          );
+        }
+        const nextAggregateVersion = Number(lockedRoom.aggregateVersion) + 1;
+        const roomUpdatedAt = latestTimestamp(lockedRoom.updatedAt, input.occurredAt);
+        const advanced = await tx
+          .update(operationalRooms)
+          .set({ aggregateVersion: nextAggregateVersion, updatedAt: roomUpdatedAt })
+          .where(and(
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.id, input.roomId),
+            eq(operationalRooms.aggregateVersion, lockedRoom.aggregateVersion),
+          ))
+          .returning({ id: operationalRooms.id });
+        if (!advanced[0]) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Operational Room ${input.roomId} changed during native writer takeover`,
+          );
+        }
+        const aggregate = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+        if (!aggregate) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Operational Room ${input.roomId} could not be reloaded during native writer takeover`,
+          );
+        }
+        committedEvent = await insertRoomEvent(
+          tx,
+          aggregate,
+          "sender_takeover_blocked_delivery_uncertain",
+          {
+            eventId: `room-event-sender-takeover-blocked:${input.bindingId}:${senderTakeover.takeoverEpoch}`,
+            actorType: "system",
+            actorId: "room-connector-ingestion",
+            correlationId: senderTakeover.takeoverId,
+            causationId: null,
+            occurredAt: input.occurredAt,
+          },
+          {
+            projectionVersion: 1,
+            bindingId: input.bindingId,
+            takeoverId: senderTakeover.takeoverId,
+            takeoverEpoch: senderTakeover.takeoverEpoch,
+            outboxIds: blockedOutboxIds,
+            updatedAt: roomUpdatedAt,
+          },
+        );
+      }
       return state;
+    });
+    if (committedEvent) this.publishCommittedEvent(committedEvent);
+    return committedState;
+  }
+
+  async transferNativeIdeSenderLease(
+    input: TransferNativeIdeSenderLeaseInput,
+  ): Promise<TransferNativeIdeSenderLeaseResult> {
+    assertCanonicalIsoTimestamp(input.now, "Native IDE sender transfer now");
+    assertCanonicalIsoTimestamp(input.expiresAt, "Native IDE sender transfer expiresAt");
+    if (Date.parse(input.expiresAt) <= Date.parse(input.now)) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        "Native IDE sender transfer expiry must be after its transfer time",
+      );
+    }
+    if (
+      !input.takeoverId.trim()
+      || !input.humanHolderId.trim()
+      || !Number.isSafeInteger(input.expectedTakeoverEpoch)
+      || input.expectedTakeoverEpoch < 1
+    ) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        "Native IDE sender transfer requires a valid takeover identity, epoch, and human holder",
+      );
+    }
+    if (
+      input.fromSenderFence.kind !== "sender"
+      || input.fromSenderFence.roomId !== input.roomId
+      || input.fromSenderFence.resourceId !== input.bindingId
+      || input.fromSenderFence.hostId !== input.hostId
+    ) {
+      throw new RoomLeaseFenceError(
+        `Sender transfer fence does not authorize binding ${input.bindingId}`,
+        null,
+      );
+    }
+
+    return this.layer.transactionImmediate(async (tx) => {
+      await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
+      await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
+      const current = await loadRoomConnectorIngestionState(
+        tx,
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+      );
+      const takeover = current.senderTakeover;
+      if (
+        takeover === null
+        || takeover.takeoverId !== input.takeoverId
+        || takeover.takeoverEpoch !== input.expectedTakeoverEpoch
+      ) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Native IDE sender takeover ${input.takeoverId} does not match its durable projection`,
+        );
+      }
+      const replacementLeaseId = nativeIdeSenderLeaseId(
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+        input.takeoverId,
+        "human",
+      );
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, "sender", input.bindingId);
+      await assertPersistedRoomLeaseFenceIdentity(tx, this.projectId, input.fromSenderFence);
+      if (input.fromSenderFence.expectedEpoch !== takeover.autoSenderLeaseEpoch) {
+        throw new RoomLeaseFenceError(
+          `Native IDE sender takeover ${input.takeoverId} must transfer automatic epoch ${takeover.autoSenderLeaseEpoch}`,
+          null,
+        );
+      }
+      if (takeover.state === "human_active") {
+        const replayedLease = await loadRoomLeaseById(tx, this.projectId, replacementLeaseId);
+        if (
+          !replayedLease
+          || replayedLease.roomId !== input.roomId
+          || replayedLease.resourceId !== input.bindingId
+          || replayedLease.holderId !== input.humanHolderId
+          || replayedLease.hostId !== input.hostId
+          || replayedLease.epoch !== takeover.autoSenderLeaseEpoch + 1
+        ) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Native IDE sender takeover ${input.takeoverId} was already transferred with different authority`,
+          );
+        }
+        return { takeover, senderLease: replayedLease };
+      }
+      if (takeover.state !== "ready_for_transfer" || takeover.confirmedCursor === null) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Native IDE sender takeover ${input.takeoverId} is not ready for explicit transfer`,
+        );
+      }
+
+      const transferred = await transferRoomSenderLeaseWithinTransaction(
+        tx,
+        this.projectId,
+        {
+          fromFence: { ...input.fromSenderFence, now: input.now },
+          replacementLeaseId,
+          replacementHolderId: input.humanHolderId,
+          replacementHostId: input.hostId,
+          now: input.now,
+          expiresAt: input.expiresAt,
+        },
+      );
+      const transferredTakeover: NativeIdeSenderTakeoverProjectionV1 = {
+        ...takeover,
+        state: "human_active",
+      };
+      const state: RoomConnectorIngestionStateV1 = {
+        ...current,
+        senderTakeover: transferredTakeover,
+        updatedAt: latestTimestamp(current.updatedAt, input.now),
+      };
+      await persistRoomConnectorIngestionState(tx, this.projectId, state, state.updatedAt!);
+      return {
+        takeover: transferredTakeover,
+        senderLease: transferred.replacement,
+      };
+    });
+  }
+
+  async resumeAutomaticSenderAfterNativeIde(
+    input: ResumeAutomaticSenderAfterNativeIdeInput,
+  ): Promise<ResumeAutomaticSenderAfterNativeIdeResult> {
+    assertCanonicalIsoTimestamp(input.now, "Automatic sender resume now");
+    assertCanonicalIsoTimestamp(input.expiresAt, "Automatic sender resume expiresAt");
+    if (Date.parse(input.expiresAt) <= Date.parse(input.now)) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        "Automatic sender resume expiry must be after its resume time",
+      );
+    }
+    if (
+      !input.takeoverId.trim()
+      || !input.confirmedCursor.trim()
+      || !input.automaticHolderId.trim()
+      || !Number.isSafeInteger(input.expectedTakeoverEpoch)
+      || input.expectedTakeoverEpoch < 1
+    ) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        "Automatic sender resume requires a valid takeover, cursor, epoch, and holder",
+      );
+    }
+    if (
+      input.fromHumanFence.kind !== "sender"
+      || input.fromHumanFence.roomId !== input.roomId
+      || input.fromHumanFence.resourceId !== input.bindingId
+      || input.fromHumanFence.hostId !== input.hostId
+    ) {
+      throw new RoomLeaseFenceError(
+        `Automatic sender resume fence does not authorize binding ${input.bindingId}`,
+        null,
+      );
+    }
+
+    return this.layer.transactionImmediate(async (tx) => {
+      await lockRoomConnectorIngestion(tx, this.projectId, input.bindingId);
+      await requireRoomBinding(tx, this.projectId, input.roomId, input.bindingId);
+      const current = await loadRoomConnectorIngestionState(
+        tx,
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+      );
+      const takeover = current.senderTakeover;
+      if (
+        takeover === null
+        || takeover.takeoverId !== input.takeoverId
+        || takeover.takeoverEpoch !== input.expectedTakeoverEpoch
+      ) {
+        throw new RoomStoreError(
+          "resume_cursor_conflict",
+          `Automatic sender resume does not match takeover ${input.takeoverId} and its confirmed cursor`,
+        );
+      }
+      if (
+        (takeover.state !== "releasing" && takeover.state !== "automatic_resumed")
+        || takeover.confirmedCursor !== input.confirmedCursor
+      ) {
+        throw new RoomStoreError(
+          "resume_cursor_conflict",
+          `Automatic sender resume requires post-human reconciliation for takeover ${input.takeoverId}`,
+        );
+      }
+
+      const replacementLeaseId = nativeIdeSenderLeaseId(
+        this.projectId,
+        input.roomId,
+        input.bindingId,
+        input.takeoverId,
+        "automatic",
+      );
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, "sender", input.bindingId);
+      const expectedHumanEpoch = takeover.state === "automatic_resumed"
+        ? takeover.autoSenderLeaseEpoch - 1
+        : takeover.autoSenderLeaseEpoch + 1;
+      await assertPersistedRoomLeaseFenceIdentity(tx, this.projectId, input.fromHumanFence);
+      if (input.fromHumanFence.expectedEpoch !== expectedHumanEpoch) {
+        throw new RoomLeaseFenceError(
+          `Automatic sender resume for ${input.takeoverId} requires human epoch ${expectedHumanEpoch}`,
+          null,
+        );
+      }
+      if (takeover.state === "automatic_resumed") {
+        const replayedLease = await loadRoomLeaseById(tx, this.projectId, replacementLeaseId);
+        if (
+          !replayedLease
+          || replayedLease.roomId !== input.roomId
+          || replayedLease.resourceId !== input.bindingId
+          || replayedLease.holderId !== input.automaticHolderId
+          || replayedLease.hostId !== input.hostId
+          || replayedLease.epoch !== takeover.autoSenderLeaseEpoch
+        ) {
+          throw new RoomStoreError(
+            "delivery_state_conflict",
+            `Automatic sender resume for ${input.takeoverId} was already committed with different authority`,
+          );
+        }
+        return { takeover, senderLease: replayedLease };
+      }
+
+      const transferred = await transferRoomSenderLeaseWithinTransaction(
+        tx,
+        this.projectId,
+        {
+          fromFence: { ...input.fromHumanFence, now: input.now },
+          replacementLeaseId,
+          replacementHolderId: input.automaticHolderId,
+          replacementHostId: input.hostId,
+          now: input.now,
+          expiresAt: input.expiresAt,
+        },
+      );
+      const resumedTakeover: NativeIdeSenderTakeoverProjectionV1 = {
+        ...takeover,
+        state: "automatic_resumed",
+        automaticSender: "active",
+        autoSenderLeaseEpoch: transferred.replacement.epoch,
+      };
+      const state: RoomConnectorIngestionStateV1 = {
+        ...current,
+        mode: current.mode === "stopped" ? "stopped" : "streaming",
+        nativeWriterDetected: false,
+        senderTakeover: resumedTakeover,
+        lastModeAt: current.mode === "stopped"
+          ? current.lastModeAt
+          : latestTimestamp(current.lastModeAt, input.now),
+        updatedAt: latestTimestamp(current.updatedAt, input.now),
+      };
+      await persistRoomConnectorIngestionState(tx, this.projectId, state, state.updatedAt!);
+      return { takeover: resumedTakeover, senderLease: transferred.replacement };
     });
   }
 
@@ -3193,6 +3884,16 @@ function compareTimestamp(left: string, right: string): number {
   return left.localeCompare(right);
 }
 
+function assertCanonicalIsoTimestamp(value: string, label: string): void {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `${label} must be a canonical UTC ISO timestamp`,
+    );
+  }
+}
+
 async function requireRoomBinding(
   handle: QueryHandle,
   projectId: string,
@@ -3257,6 +3958,7 @@ async function loadRoomConnectorIngestionState(
       lastPayloadHash: null,
       connectorStatus: null,
       nativeWriterDetected: false,
+      senderTakeover: null,
       gapExpectedCursor: null,
       gapObservedCursor: null,
       gapDetectedAt: null,
@@ -3277,6 +3979,7 @@ async function loadRoomConnectorIngestionState(
     lastPayloadHash: row.lastPayloadHash,
     connectorStatus: row.connectorStatus as RoomConnectorStatus | null,
     nativeWriterDetected: row.nativeWriterDetected,
+    senderTakeover: rowToNativeIdeSenderTakeover(row),
     gapExpectedCursor: row.gapExpectedCursor,
     gapObservedCursor: row.gapObservedCursor,
     gapDetectedAt: row.gapDetectedAt,
@@ -3284,6 +3987,75 @@ async function loadRoomConnectorIngestionState(
     lastStatusAt: row.lastStatusAt,
     lastModeAt: row.lastModeAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+const NATIVE_IDE_SENDER_TAKEOVER_STATES = new Set<NativeIdeSenderTakeoverProjectionV1["state"]>([
+  "reconciling",
+  "ready_for_transfer",
+  "human_active",
+  "releasing",
+  "automatic_resumed",
+  "blocked_delivery_uncertain",
+]);
+
+function rowToNativeIdeSenderTakeover(
+  row: typeof roomBindingIngestionState.$inferSelect,
+): NativeIdeSenderTakeoverProjectionV1 | null {
+  const values = [
+    row.takeoverId,
+    row.takeoverEpoch,
+    row.takeoverState,
+    row.autoSenderLeaseEpoch,
+  ];
+  if (values.every((value) => value == null)) return null;
+  if (values.some((value) => value == null)) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `Binding ${row.bindingId} has a partially persisted sender takeover`,
+    );
+  }
+  const takeoverEpoch = Number(row.takeoverEpoch);
+  const autoSenderLeaseEpoch = Number(row.autoSenderLeaseEpoch);
+  const state = row.takeoverState as NativeIdeSenderTakeoverProjectionV1["state"];
+  const blockedOutboxIds = asStringArray(row.blockedOutboxIds);
+  const blockedOutboxPayloadIsExact = Array.isArray(row.blockedOutboxIds)
+    && blockedOutboxIds.length === row.blockedOutboxIds.length
+    && new Set(blockedOutboxIds).size === blockedOutboxIds.length;
+  const nativeWriterStateIsInvalid = state === "releasing" || state === "automatic_resumed"
+    ? row.nativeWriterDetected
+    : state === "ready_for_transfer" || state === "human_active"
+      ? !row.nativeWriterDetected
+      : false;
+  if (
+    typeof row.takeoverId !== "string"
+    || !row.takeoverId.trim()
+    || !Number.isSafeInteger(takeoverEpoch)
+    || takeoverEpoch < 1
+    || !Number.isSafeInteger(autoSenderLeaseEpoch)
+    || autoSenderLeaseEpoch < 1
+    || !NATIVE_IDE_SENDER_TAKEOVER_STATES.has(state)
+    || !blockedOutboxPayloadIsExact
+    || nativeWriterStateIsInvalid
+    || (state === "blocked_delivery_uncertain" && blockedOutboxIds.length === 0)
+    || (state !== "blocked_delivery_uncertain" && blockedOutboxIds.length > 0)
+    || ((state === "ready_for_transfer" || state === "human_active" || state === "automatic_resumed")
+      && row.confirmedCursor === null)
+  ) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `Binding ${row.bindingId} has an invalid sender takeover projection`,
+    );
+  }
+  return {
+    takeoverId: row.takeoverId,
+    takeoverEpoch,
+    state,
+    automaticSender: state === "automatic_resumed" ? "active" : "paused",
+    autoSenderLeaseEpoch,
+    reconcileFromCursor: row.reconcileFromCursor,
+    confirmedCursor: row.confirmedCursor,
+    blockedOutboxIds,
   };
 }
 
@@ -3304,6 +4076,13 @@ async function persistRoomConnectorIngestionState(
     lastPayloadHash: state.lastPayloadHash,
     connectorStatus: state.connectorStatus,
     nativeWriterDetected: state.nativeWriterDetected,
+    takeoverId: state.senderTakeover?.takeoverId ?? null,
+    takeoverEpoch: state.senderTakeover?.takeoverEpoch ?? null,
+    takeoverState: state.senderTakeover?.state ?? null,
+    autoSenderLeaseEpoch: state.senderTakeover?.autoSenderLeaseEpoch ?? null,
+    reconcileFromCursor: state.senderTakeover?.reconcileFromCursor ?? null,
+    confirmedCursor: state.senderTakeover?.confirmedCursor ?? null,
+    blockedOutboxIds: state.senderTakeover?.blockedOutboxIds ?? [],
     gapExpectedCursor: state.gapExpectedCursor,
     gapObservedCursor: state.gapObservedCursor,
     gapDetectedAt: state.gapDetectedAt,
@@ -3325,6 +4104,13 @@ async function persistRoomConnectorIngestionState(
         lastPayloadHash: values.lastPayloadHash,
         connectorStatus: values.connectorStatus,
         nativeWriterDetected: values.nativeWriterDetected,
+        takeoverId: values.takeoverId,
+        takeoverEpoch: values.takeoverEpoch,
+        takeoverState: values.takeoverState,
+        autoSenderLeaseEpoch: values.autoSenderLeaseEpoch,
+        reconcileFromCursor: values.reconcileFromCursor,
+        confirmedCursor: values.confirmedCursor,
+        blockedOutboxIds: values.blockedOutboxIds,
         gapExpectedCursor: values.gapExpectedCursor,
         gapObservedCursor: values.gapObservedCursor,
         gapDetectedAt: values.gapDetectedAt,
@@ -3334,6 +4120,54 @@ async function persistRoomConnectorIngestionState(
         updatedAt: values.updatedAt,
       },
     });
+}
+
+async function refreshBlockedSenderTakeoverAfterDeliveryResolution(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  bindingId: string,
+  now: string,
+): Promise<void> {
+  await lockRoomConnectorIngestion(tx, projectId, bindingId);
+  const current = await loadRoomConnectorIngestionState(tx, projectId, roomId, bindingId);
+  const takeover = current.senderTakeover;
+  if (takeover?.state !== "blocked_delivery_uncertain") return;
+
+  const unresolvedRows = takeover.blockedOutboxIds.length === 0
+    ? []
+    : await tx
+        .select({ id: roomOutbox.id })
+        .from(roomOutbox)
+        .where(and(
+          eq(roomOutbox.projectId, projectId),
+          eq(roomOutbox.roomId, roomId),
+          eq(roomOutbox.bindingId, bindingId),
+          inArray(roomOutbox.id, [...takeover.blockedOutboxIds]),
+          inArray(roomOutbox.deliveryState, ["dispatching", "delivery_uncertain"]),
+        ))
+        .orderBy(asc(roomOutbox.id));
+  const blockedOutboxIds = unresolvedRows.map((row) => row.id);
+  const nextTakeover: NativeIdeSenderTakeoverProjectionV1 = blockedOutboxIds.length > 0
+    ? { ...takeover, blockedOutboxIds }
+    : !current.nativeWriterDetected
+      ? takeover.confirmedCursor === null
+        ? { ...takeover, state: "reconciling", blockedOutboxIds: [] }
+        : {
+            ...takeover,
+            state: "automatic_resumed",
+            automaticSender: "active",
+            blockedOutboxIds: [],
+          }
+      : takeover.confirmedCursor === null
+        ? { ...takeover, state: "reconciling", blockedOutboxIds: [] }
+        : { ...takeover, state: "ready_for_transfer", blockedOutboxIds: [] };
+  const state: RoomConnectorIngestionStateV1 = {
+    ...current,
+    senderTakeover: nextTakeover,
+    updatedAt: latestTimestamp(current.updatedAt, now),
+  };
+  await persistRoomConnectorIngestionState(tx, projectId, state, state.updatedAt!);
 }
 
 function deliveryStateForOutcome(
@@ -3350,6 +4184,41 @@ function deliveryStateForOutcome(
     case "rejected":
       return "rejected";
   }
+}
+
+function nativeIdeSenderLeaseId(
+  projectId: string,
+  roomId: string,
+  bindingId: string,
+  takeoverId: string,
+  owner: "human" | "automatic",
+): string {
+  const digest = hashRoomValue({ projectId, roomId, bindingId, takeoverId, owner })
+    .replace(/^sha256:/u, "");
+  return `room-sender-${owner}-${digest}`;
+}
+
+async function assertPersistedRoomLeaseFenceIdentity(
+  tx: DbTransaction,
+  projectId: string,
+  fence: Omit<AssertRoomLeaseFenceInput, "now">,
+): Promise<StoredRoomLeaseV1> {
+  const persisted = await loadRoomLeaseById(tx, projectId, fence.leaseId);
+  if (
+    !persisted
+    || persisted.roomId !== fence.roomId
+    || persisted.kind !== fence.kind
+    || persisted.resourceId !== fence.resourceId
+    || persisted.holderId !== fence.holderId
+    || persisted.hostId !== fence.hostId
+    || persisted.epoch !== fence.expectedEpoch
+  ) {
+    throw new RoomLeaseFenceError(
+      `Lease ${fence.leaseId} does not match its persisted sender-fence identity`,
+      null,
+    );
+  }
+  return persisted;
 }
 
 function asRecord(value: unknown): Readonly<Record<string, unknown>> {

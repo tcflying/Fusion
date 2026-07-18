@@ -22,6 +22,7 @@ import {
   SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
   SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
   SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+  SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
   SCHEMA_ROOM_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
@@ -77,6 +78,70 @@ async function restorePreMembershipProductionInvariantState(
   );
 }
 
+async function restorePreNativeSenderTakeoverState(
+  context: EmbeddedTestContext,
+): Promise<void> {
+  await context.connections!.migration.execute(sql.raw(`
+    DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
+    WHERE version = '${SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION}';
+
+    ALTER TABLE project.room_binding_ingestion_state
+      DROP COLUMN IF EXISTS takeover_id,
+      DROP COLUMN IF EXISTS takeover_epoch,
+      DROP COLUMN IF EXISTS takeover_state,
+      DROP COLUMN IF EXISTS auto_sender_lease_epoch,
+      DROP COLUMN IF EXISTS reconcile_from_cursor,
+      DROP COLUMN IF EXISTS confirmed_cursor,
+      DROP COLUMN IF EXISTS blocked_outbox_ids;
+  `));
+}
+
+async function insertBindingIngestionFixture(
+  context: EmbeddedTestContext,
+  suffix: string,
+): Promise<{ roomId: string; seatId: string; bindingId: string }> {
+  const roomId = `room-schema-${suffix}`;
+  const seatId = `seat-schema-${suffix}`;
+  const bindingId = `binding-schema-${suffix}`;
+  await context.connections!.migration.execute(sql`
+    INSERT INTO project.operational_rooms (
+      id, project_id, objective, protocol_id, protocol_version,
+      lifecycle_state, created_at, updated_at
+    ) VALUES (
+      ${roomId}, 'project-schema-takeover', 'schema takeover fixture',
+      'implementation', 1, 'running',
+      '2026-07-18T06:59:00.000Z', '2026-07-18T06:59:00.000Z'
+    )
+  `);
+  await context.connections!.migration.execute(sql`
+    INSERT INTO project.room_seats (
+      id, project_id, room_id, role, state, created_at, updated_at
+    ) VALUES (
+      ${seatId}, 'project-schema-takeover', ${roomId}, 'producer', 'active',
+      '2026-07-18T06:59:00.000Z', '2026-07-18T06:59:00.000Z'
+    )
+  `);
+  await context.connections!.migration.execute(sql`
+    INSERT INTO project.room_bindings (
+      id, project_id, room_id, seat_id, generation, connector_id,
+      provider_id, native_session_id, host_id, state, attached_at
+    ) VALUES (
+      ${bindingId}, 'project-schema-takeover', ${roomId}, ${seatId}, 1,
+      'happier', 'codex', ${`native-schema-${suffix}`}, 'windows-host-schema',
+      'attached', '2026-07-18T06:59:00.000Z'
+    )
+  `);
+  await context.connections!.migration.execute(sql`
+    INSERT INTO project.room_binding_ingestion_state (
+      binding_id, project_id, room_id, mode, updated_at
+    ) VALUES (
+      ${bindingId}, 'project-schema-takeover', ${roomId}, 'streaming',
+      '2026-07-18T06:59:00.000Z'
+    )
+  `);
+  return { roomId, seatId, bindingId };
+}
+
 afterEach(async () => {
   while (contexts.length > 0) {
     const context = contexts.pop();
@@ -106,6 +171,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
     expect(result.baselineApplied).toBe(true);
     expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
@@ -119,6 +185,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
 
     const rows = (await context.connections!.migration.execute(sql`
@@ -258,6 +325,239 @@ describe("Session Room PostgreSQL migration", () => {
     });
   });
 
+  it("materializes durable native IDE sender takeover columns and enforces projection constraints", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    const fixture = await insertBindingIngestionFixture(context, "fresh-takeover");
+
+    const columns = (await context.connections!.migration.execute(sql`
+      SELECT column_name, data_type, is_nullable, column_default
+      FROM information_schema.columns
+      WHERE table_schema = 'project'
+        AND table_name = 'room_binding_ingestion_state'
+        AND column_name IN (
+          'takeover_id',
+          'takeover_epoch',
+          'takeover_state',
+          'auto_sender_lease_epoch',
+          'reconcile_from_cursor',
+          'confirmed_cursor',
+          'blocked_outbox_ids'
+        )
+      ORDER BY ordinal_position
+    `)) as unknown as Array<{
+      column_name: string;
+      data_type: string;
+      is_nullable: string;
+      column_default: string | null;
+    }>;
+    expect(columns).toEqual([
+      { column_name: "takeover_id", data_type: "text", is_nullable: "YES", column_default: null },
+      { column_name: "takeover_epoch", data_type: "bigint", is_nullable: "YES", column_default: null },
+      { column_name: "takeover_state", data_type: "text", is_nullable: "YES", column_default: null },
+      { column_name: "auto_sender_lease_epoch", data_type: "bigint", is_nullable: "YES", column_default: null },
+      { column_name: "reconcile_from_cursor", data_type: "text", is_nullable: "YES", column_default: null },
+      { column_name: "confirmed_cursor", data_type: "text", is_nullable: "YES", column_default: null },
+      { column_name: "blocked_outbox_ids", data_type: "jsonb", is_nullable: "NO", column_default: "'[]'::jsonb" },
+    ]);
+
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET takeover_id = 'partial-takeover'
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_projection_check" },
+    });
+
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET
+        native_writer_detected = true,
+        mode = 'reconciling',
+        takeover_id = 'native-writer:status-fresh-takeover',
+        takeover_epoch = 1,
+        takeover_state = 'reconciling',
+        auto_sender_lease_epoch = 4,
+        reconcile_from_cursor = 'cursor-before-takeover',
+        confirmed_cursor = NULL,
+        blocked_outbox_ids = '[]'::jsonb
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET native_writer_detected = false
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET
+        takeover_state = 'ready_for_transfer',
+        confirmed_cursor = 'cursor-ready-without-writer'
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_projection_check" },
+    });
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET native_writer_detected = true
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET takeover_epoch = 0
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_epoch_check" },
+    });
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET takeover_epoch = 9007199254740992
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_epoch_check" },
+    });
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET takeover_state = 'unknown'
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_state_check" },
+    });
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET blocked_outbox_ids = '[""]'::jsonb
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_blocked_outbox_ids_check" },
+    });
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET blocked_outbox_ids = '["outbox-duplicate","outbox-duplicate"]'::jsonb
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_blocked_outbox_ids_check" },
+    });
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET takeover_state = 'blocked_delivery_uncertain'
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_payload_check" },
+    });
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET takeover_state = 'ready_for_transfer'
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_payload_check" },
+    });
+
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET
+        takeover_state = 'blocked_delivery_uncertain',
+        blocked_outbox_ids = '["outbox-fresh-takeover"]'::jsonb
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+    const takeover = (await context.connections!.migration.execute(sql`
+      SELECT
+        takeover_id,
+        takeover_epoch,
+        takeover_state,
+        auto_sender_lease_epoch,
+        reconcile_from_cursor,
+        confirmed_cursor,
+        blocked_outbox_ids
+      FROM project.room_binding_ingestion_state
+      WHERE binding_id = ${fixture.bindingId}
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(takeover).toEqual([{
+      takeover_id: "native-writer:status-fresh-takeover",
+      takeover_epoch: "1",
+      takeover_state: "blocked_delivery_uncertain",
+      auto_sender_lease_epoch: "4",
+      reconcile_from_cursor: "cursor-before-takeover",
+      confirmed_cursor: null,
+      blocked_outbox_ids: ["outbox-fresh-takeover"],
+    }]);
+
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET native_writer_detected = false
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET
+        takeover_state = 'releasing',
+        confirmed_cursor = NULL,
+        blocked_outbox_ids = '[]'::jsonb
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET native_writer_detected = true
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_projection_check" },
+    });
+
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET
+        takeover_state = 'automatic_resumed',
+        auto_sender_lease_epoch = 6,
+        confirmed_cursor = 'cursor-after-human',
+        blocked_outbox_ids = '[]'::jsonb
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+    await expect(context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET native_writer_detected = true
+      WHERE binding_id = ${fixture.bindingId}
+    `)).rejects.toMatchObject({
+      cause: { code: "23514", constraint_name: "room_binding_ingestion_takeover_projection_check" },
+    });
+  });
+
+  it("upgrades existing ingestion rows to 0010 without fabricating takeover state", async () => {
+    const context = await startEmbeddedDatabase();
+    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await restorePreNativeSenderTakeoverState(context);
+    const fixture = await insertBindingIngestionFixture(context, "upgrade-0010");
+    await context.connections!.migration.execute(sql`
+      UPDATE project.room_binding_ingestion_state
+      SET native_writer_detected = true
+      WHERE binding_id = ${fixture.bindingId}
+    `);
+
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION]);
+    const rows = (await context.connections!.migration.execute(sql`
+      SELECT
+        takeover_id,
+        takeover_epoch,
+        takeover_state,
+        auto_sender_lease_epoch,
+        reconcile_from_cursor,
+        confirmed_cursor,
+        blocked_outbox_ids
+      FROM project.room_binding_ingestion_state
+      WHERE binding_id = ${fixture.bindingId}
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(rows).toEqual([{
+      takeover_id: null,
+      takeover_epoch: null,
+      takeover_state: null,
+      auto_sender_lease_epoch: null,
+      reconcile_from_cursor: null,
+      confirmed_cursor: null,
+      blocked_outbox_ids: [],
+    }]);
+  });
+
   it("upgrades an existing 0000 database without replaying the baseline", async () => {
     const context = await startEmbeddedDatabase();
     await context.connections!.migration.execute(sql.raw(`
@@ -282,6 +582,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
@@ -316,6 +617,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -369,6 +671,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
@@ -449,6 +752,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
@@ -597,6 +901,7 @@ describe("Session Room PostgreSQL migration", () => {
       SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
       SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
     ]);
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable

@@ -79,6 +79,20 @@ export interface AssertRoomLeaseFenceInput {
   readonly now: string;
 }
 
+export interface TransferRoomSenderLeaseInput {
+  readonly fromFence: AssertRoomLeaseFenceInput & { readonly kind: "sender" };
+  readonly replacementLeaseId: string;
+  readonly replacementHolderId: string;
+  readonly replacementHostId: string;
+  readonly now: string;
+  readonly expiresAt: string;
+}
+
+export interface TransferRoomSenderLeaseResult {
+  readonly previous: StoredRoomLeaseV1;
+  readonly replacement: StoredRoomLeaseV1;
+}
+
 export type MutateRoomLeaseResult =
   | { readonly ok: true; readonly lease: StoredRoomLeaseV1 }
   | {
@@ -149,7 +163,7 @@ export class AsyncRoomLeaseStore {
     validateRequiredLeaseFields(input);
 
     return this.layer.transactionImmediate(async (tx): Promise<AcquireRoomLeaseResult> => {
-      await lockLeaseResource(tx, this.projectId, input.kind, input.resourceId);
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, input.kind, input.resourceId);
       await validateLeaseResource(tx, this.projectId, input);
 
       const active = await findActiveLease(tx, this.projectId, input.kind, input.resourceId);
@@ -204,7 +218,7 @@ export class AsyncRoomLeaseStore {
     validateRequiredLeaseFields(input);
 
     return this.layer.transactionImmediate(async (tx): Promise<MutateRoomLeaseResult> => {
-      await lockLeaseResource(tx, this.projectId, input.kind, input.resourceId);
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, input.kind, input.resourceId);
       const current = await findActiveLease(tx, this.projectId, input.kind, input.resourceId);
       if (!current) {
         return {
@@ -248,7 +262,7 @@ export class AsyncRoomLeaseStore {
     validateRequiredLeaseFields(input);
 
     return this.layer.transactionImmediate(async (tx): Promise<MutateRoomLeaseResult> => {
-      await lockLeaseResource(tx, this.projectId, input.kind, input.resourceId);
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, input.kind, input.resourceId);
       const current = await findActiveLease(tx, this.projectId, input.kind, input.resourceId);
       if (!current) {
         return {
@@ -331,6 +345,83 @@ export async function assertRoomLeaseFence(
     );
   }
   return current;
+}
+
+export async function loadRoomLeaseById(
+  handle: QueryHandle,
+  projectId: string,
+  leaseId: string,
+): Promise<StoredRoomLeaseV1 | null> {
+  const rows = await handle
+    .select()
+    .from(roomLeases)
+    .where(and(eq(roomLeases.projectId, projectId), eq(roomLeases.id, leaseId)))
+    .limit(1);
+  return rows[0] ? rowToStoredLease(rows[0]) : null;
+}
+
+/**
+ * Transfers the single sender authority inside the caller's transaction.
+ * Keeping the advisory lock, stale-fence assertion, release, and replacement
+ * insert in one transaction prevents either the automatic worker or a native
+ * IDE from observing an authority gap and claiming the same binding.
+ */
+export async function transferRoomSenderLeaseWithinTransaction(
+  tx: DbTransaction,
+  projectId: string,
+  input: TransferRoomSenderLeaseInput,
+): Promise<TransferRoomSenderLeaseResult> {
+  const replacementInput: AcquireRoomLeaseInput = {
+    leaseId: input.replacementLeaseId,
+    roomId: input.fromFence.roomId,
+    kind: "sender",
+    resourceId: input.fromFence.resourceId,
+    holderId: input.replacementHolderId,
+    hostId: input.replacementHostId,
+    expectedEpoch: input.fromFence.expectedEpoch,
+    now: input.now,
+    expiresAt: input.expiresAt,
+  };
+  validateLeaseWindow(input.now, input.expiresAt);
+  validateRequiredLeaseFields(replacementInput);
+  if (input.fromFence.now !== input.now) {
+    throw new RoomLeaseStoreError(
+      "invalid_lease_request",
+      "Sender transfer fence and replacement must use the same authority timestamp",
+    );
+  }
+  if (input.fromFence.hostId !== input.replacementHostId) {
+    throw new RoomLeaseStoreError(
+      "lease_resource_conflict",
+      "Sender transfer cannot move a binding to a different host",
+    );
+  }
+
+  await lockRoomLeaseResourceWithinTransaction(tx, projectId, "sender", input.fromFence.resourceId);
+  await validateLeaseResource(tx, projectId, replacementInput);
+  const previous = await assertRoomLeaseFence(tx, projectId, input.fromFence);
+  ensureMonotonicLeaseTime(input.now, previous);
+
+  const released = await tx
+    .update(roomLeases)
+    .set({ releasedAt: input.now })
+    .where(activeFencePredicate(projectId, {
+      ...input.fromFence,
+      now: input.now,
+    }))
+    .returning();
+  if (!released[0]) {
+    throw new RoomLeaseFenceError(
+      `Sender lease ${previous.id} changed during atomic transfer`,
+      await findActiveLease(tx, projectId, "sender", input.fromFence.resourceId),
+    );
+  }
+
+  const replacement = await insertLease(tx, projectId, replacementInput, previous.epoch + 1);
+  return {
+    previous: rowToStoredLease(released[0]),
+    replacement,
+  };
 }
 
 async function validateLeaseResource(
@@ -416,7 +507,7 @@ async function insertLease(
   return rowToStoredLease(rows[0]);
 }
 
-async function lockLeaseResource(
+export async function lockRoomLeaseResourceWithinTransaction(
   tx: DbTransaction,
   projectId: string,
   kind: RoomLeaseKind,

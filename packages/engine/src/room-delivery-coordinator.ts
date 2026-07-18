@@ -27,12 +27,18 @@ export interface RoomDeliveryAuditIdentity {
   readonly taskId?: string;
 }
 
+/*
+FNXC:RoomDeliverySenderFence 2026-07-18-07:29:
+Every dispatch must carry the exact active sender lease fence into the durable
+claim so a stale or displaced sender cannot begin an external delivery.
+*/
 export interface DispatchRoomDeliveryInput {
   readonly store: RoomDeliveryCoordinatorStore;
   readonly registry: SessionConnectorRegistry;
   readonly identity: SessionConnectorIdentityV1;
   readonly outboxId: string;
   readonly attemptId: string;
+  readonly senderFence: NonNullable<BeginRoomDeliveryAttemptInput["senderFence"]>;
   readonly content: string;
   readonly reconciliationFromCursor: string | null;
   readonly now: string;
@@ -107,6 +113,7 @@ export async function dispatchRoomDelivery(
   const claimed = await input.store.beginDeliveryAttempt({
     outboxId: input.outboxId,
     attemptId: input.attemptId,
+    senderFence: input.senderFence,
     reconciliationFromCursor: input.reconciliationFromCursor,
     now: input.now,
   });
