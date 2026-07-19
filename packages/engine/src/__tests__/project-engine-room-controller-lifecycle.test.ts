@@ -21,6 +21,12 @@ const durableRoomRecoveryWorkerSeams = vi.hoisted(() => ({
   runRoom: vi.fn(async () => undefined),
 }));
 
+const roomGlobalConcurrencyRuntimeSeams = vi.hoisted(() => ({
+  capacityAdmission: null as Record<string, unknown> | null,
+  create: vi.fn(),
+  recoverDanglingClaims: vi.fn(),
+}));
+
 const pluginRunnerSeams = vi.hoisted(() => ({
   registrations: [] as Array<Record<string, unknown>>,
   createRuntimeContext: vi.fn(async () => ({ pluginId: "room-connector-plugin" })),
@@ -34,6 +40,10 @@ vi.mock("../room-durable-recovery-worker.js", () => ({
       durableRoomRecoveryWorkerSeams.constructorCalls.push(options);
     }
   },
+}));
+
+vi.mock("../room-global-concurrency-runtime.js", () => ({
+  createRoomGlobalConcurrencyRuntime: roomGlobalConcurrencyRuntimeSeams.create,
 }));
 
 vi.mock("../room-controller.js", async (importOriginal) => {
@@ -103,8 +113,31 @@ vi.mock("../room-controller.js", async (importOriginal) => {
   };
 });
 
+vi.mock("../merger-ai.js", () => ({
+  WorkspacePartialLandError: class WorkspacePartialLandError extends Error {},
+  WorkspaceRepoLandBusyError: class WorkspaceRepoLandBusyError extends Error {},
+  landWorkspaceTask: vi.fn(async () => undefined),
+  runAiMerge: vi.fn(async () => undefined),
+}));
+
+vi.mock("../research/provider-registry.js", () => ({
+  ResearchProviderRegistry: class MockResearchProviderRegistry {
+    getAvailableProviders(): string[] {
+      return [];
+    }
+
+    getProvider(): undefined {
+      return undefined;
+    }
+  },
+}));
+
 import { ProjectEngine, type ProjectEngineOptions } from "../project-engine.js";
 import { RoomControlPlaneLiveEventService } from "../room-control-plane-live-event-service.js";
+import type {
+  ProjectRoomCommandV1,
+  ProjectRoomTrustedPrincipalV1,
+} from "../project-room-command-gateway.js";
 
 const mocks = vi.hoisted(() => ({
   automationStoreInit: vi.fn(async () => undefined),
@@ -241,6 +274,33 @@ type RoomControllerFactory = (context: RoomControllerFactoryContext) => RoomCont
 
 const asyncLayer = { projectId: "project-1" };
 
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+const roomDashboardOperator: ProjectRoomTrustedPrincipalV1 = {
+  kind: "dashboard_operator",
+  principalId: "dashboard-operator-1",
+  authenticated: true,
+};
+
+function createInvalidExistingSessionRoomCommand(): ProjectRoomCommandV1 {
+  return {
+    type: "room.create-existing-session.v1",
+    projectId: "project-1",
+    commandId: "room-command-lifecycle-1",
+    input: {
+      room: { id: "room-command-lifecycle-1", projectId: "project-1" },
+      sessions: [],
+      roleAssignment: {},
+    } as never,
+  };
+}
+
 function createMockStore(): Record<string, unknown> {
   return {
     addTaskComment: vi.fn(async () => undefined),
@@ -319,6 +379,21 @@ beforeEach(() => {
   roomControllerSeams.passiveWorker.runRoom.mockClear();
   durableRoomRecoveryWorkerSeams.constructorCalls.length = 0;
   durableRoomRecoveryWorkerSeams.runRoom.mockClear();
+  roomGlobalConcurrencyRuntimeSeams.capacityAdmission = {
+    globalAccounting: { acquire: vi.fn(), release: vi.fn() },
+    slots: 1,
+    workClass: "normal",
+  };
+  roomGlobalConcurrencyRuntimeSeams.recoverDanglingClaims.mockResolvedValue({
+    action: "recovered",
+    recoveredClaimIds: [],
+    replayedClaimIds: [],
+    rejected: [],
+  });
+  roomGlobalConcurrencyRuntimeSeams.create.mockReturnValue({
+    capacityAdmission: roomGlobalConcurrencyRuntimeSeams.capacityAdmission,
+    recovery: { recoverDanglingClaims: roomGlobalConcurrencyRuntimeSeams.recoverDanglingClaims },
+  });
   roomAuditDispatcherSeams.start.mockClear();
   roomAuditDispatcherSeams.stop.mockClear();
   roomAuditDispatcherSeams.enqueue.mockClear();
@@ -332,6 +407,119 @@ ProjectEngine owns the RoomController backend lifecycle. It must start Room
 workers only after the project runtime has initialized their durable stores.
 */
 describe("ProjectEngine RoomController lifecycle integration", () => {
+  it("wires an explicitly verified global capacity runtime before default Room admission", async () => {
+    const engine = createEngine(undefined, {
+      roomGlobalConcurrencyVerifiedPolicy: {
+        controllerAdmission: { slots: 1, workClass: "normal" },
+        policy: {
+          reservations: { legacyTaskTriageSlots: 0, recoverySlots: 0, verifierSlots: 0 },
+          snapshotTtlMs: 30_000,
+          totalSlots: 2,
+        },
+        verificationId: "verified-policy-1",
+        verifiedAt: "2026-07-19T18:30:00.000Z",
+      } as never,
+    });
+
+    await engine.start();
+    try {
+      expect(roomGlobalConcurrencyRuntimeSeams.create).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: "project-1",
+        layer: asyncLayer,
+        taskStore: mocks.currentStore,
+      }));
+      expect(roomGlobalConcurrencyRuntimeSeams.recoverDanglingClaims).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: "project-1",
+      }));
+      expect(roomGlobalConcurrencyRuntimeSeams.recoverDanglingClaims.mock.invocationCallOrder[0]).toBeLessThan(
+        roomControllerSeams.startMocks.at(-1)!.mock.invocationCallOrder[0]!,
+      );
+      expect(roomControllerSeams.constructorCalls.at(-1)).toMatchObject({
+        capacityAdmission: roomGlobalConcurrencyRuntimeSeams.capacityAdmission,
+      });
+      expect(
+        Reflect.get(engine as object, "getRoomGlobalConcurrencyRuntime"),
+        "ProjectEngine must not expose Room capacity admission ports or global accounting through its public API",
+      ).toBeUndefined();
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("rejects a custom Room factory when verified global capacity policy is enabled", async () => {
+    const roomController = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+    };
+    const roomControllerFactory = vi.fn(() => roomController);
+    const engine = createEngine(roomControllerFactory, {
+      roomGlobalConcurrencyVerifiedPolicy: {
+        controllerAdmission: { slots: 1, workClass: "normal" },
+        policy: {
+          reservations: { legacyTaskTriageSlots: 0, recoverySlots: 0, verifierSlots: 0 },
+          snapshotTtlMs: 30_000,
+          totalSlots: 2,
+        },
+        verificationId: "verified-policy-custom-factory-1",
+        verifiedAt: "2026-07-19T18:30:00.000Z",
+      } as never,
+    });
+
+    try {
+      await expect(engine.start()).rejects.toThrow("custom roomControllerFactory");
+      expect(mocks.runtimeStart).not.toHaveBeenCalled();
+      expect(roomGlobalConcurrencyRuntimeSeams.create).not.toHaveBeenCalled();
+      expect(roomControllerFactory).not.toHaveBeenCalled();
+      expect(roomController.start).not.toHaveBeenCalled();
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("records a durable audit event before Room work when capacity recovery is held", async () => {
+    roomGlobalConcurrencyRuntimeSeams.recoverDanglingClaims.mockResolvedValueOnce({
+      action: "held",
+      recoveredClaimIds: [],
+      replayedClaimIds: [],
+      rejected: [{ claimId: "claim-unverified", reason: "snapshot_stale" }],
+    });
+    const engine = createEngine(undefined, {
+      roomGlobalConcurrencyVerifiedPolicy: {
+        controllerAdmission: { slots: 1, workClass: "normal" },
+        policy: {
+          reservations: { legacyTaskTriageSlots: 0, recoverySlots: 0, verifierSlots: 0 },
+          snapshotTtlMs: 30_000,
+          totalSlots: 2,
+        },
+        verificationId: "verified-policy-held-1",
+        verifiedAt: "2026-07-19T18:30:00.000Z",
+      } as never,
+    });
+
+    await engine.start();
+    try {
+      expect(roomAuditDispatcherSeams.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: "project-1",
+        agentId: "room-global-concurrency",
+        domain: "database",
+        mutationType: "room:global-concurrency-recovery-held",
+        target: "project-1",
+        metadata: { rejectedClaimCount: 1 },
+      }));
+      expect(roomAuditDispatcherSeams.start.mock.invocationCallOrder[0]).toBeLessThan(
+        roomAuditDispatcherSeams.enqueue.mock.invocationCallOrder[0]!,
+      );
+      expect(roomAuditDispatcherSeams.enqueue.mock.invocationCallOrder[0]).toBeLessThan(
+        roomControllerSeams.startMocks.at(-1)!.mock.invocationCallOrder[0]!,
+      );
+      expect(mocks.currentStore?.recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "room:global-concurrency-recovery-held",
+      }));
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("starts the RoomController after the project runtime starts", async () => {
     const roomController = {
       start: vi.fn(async () => undefined),
@@ -339,6 +527,12 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
     };
     const roomControllerFactory = vi.fn(() => roomController);
     const engine = createEngine(roomControllerFactory);
+
+    const command = createInvalidExistingSessionRoomCommand();
+    expect("getRoomExistingSessionSpine" in engine).toBe(false);
+    await expect(engine.executeProjectRoomCommand(command, roomDashboardOperator)).rejects.toMatchObject({
+      code: "PROJECT_ROOM_COMMAND_ENGINE_UNAVAILABLE",
+    });
 
     await engine.start();
     try {
@@ -359,11 +553,72 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
         roomStore: expect.any(Object),
         connectorRegistry: expect.any(Object),
       }));
-      expect(engine.getRoomExistingSessionSpine()).not.toBeNull();
+      await expect(engine.executeProjectRoomCommand(command, roomDashboardOperator)).rejects.toMatchObject({
+        code: "ROOM_EXISTING_SESSION_INVALID_REQUEST",
+      });
     } finally {
       await engine.stop();
     }
-    expect(engine.getRoomExistingSessionSpine()).toBeNull();
+    await expect(engine.executeProjectRoomCommand(command, roomDashboardOperator)).rejects.toMatchObject({
+      code: "PROJECT_ROOM_COMMAND_ENGINE_UNAVAILABLE",
+    });
+  });
+
+  it("cancels a runtime start that is pending when stop begins before a Room controller can be created", async () => {
+    const runtimeStartGate = deferred();
+    mocks.runtimeStart.mockImplementationOnce(async () => runtimeStartGate.promise);
+    const roomController = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+    };
+    const roomControllerFactory = vi.fn(() => roomController);
+    const engine = createEngine(roomControllerFactory);
+
+    try {
+      const starting = engine.start();
+      expect(mocks.runtimeStart).toHaveBeenCalledTimes(1);
+
+      const stopping = engine.stop();
+      runtimeStartGate.resolve();
+      await Promise.all([starting, stopping]);
+
+      expect(roomControllerFactory).not.toHaveBeenCalled();
+      expect(roomController.start).not.toHaveBeenCalled();
+      expect(mocks.runtimeStop).toHaveBeenCalledTimes(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("waits for an in-flight Room controller start before stopping that controller", async () => {
+    const controllerStartEntered = deferred();
+    const releaseControllerStart = deferred();
+    const roomController = {
+      start: vi.fn(async () => {
+        controllerStartEntered.resolve();
+        await releaseControllerStart.promise;
+      }),
+      stop: vi.fn(async () => undefined),
+    };
+    const engine = createEngine(vi.fn(() => roomController));
+
+    try {
+      const starting = engine.start();
+      await controllerStartEntered.promise;
+
+      const stopping = engine.stop();
+      await Promise.resolve();
+      await Promise.resolve();
+      const controllerStopBeganWhileStartWasInFlight = roomController.stop.mock.calls.length > 0;
+      releaseControllerStart.resolve();
+      await Promise.all([starting, stopping]);
+
+      expect(roomController.start).toHaveBeenCalledTimes(1);
+      expect(roomController.stop).toHaveBeenCalledTimes(1);
+      expect(controllerStopBeganWhileStartWasInFlight).toBe(false);
+    } finally {
+      await engine.stop();
+    }
   });
 
   /*
@@ -388,6 +643,31 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
     expect(roomController.stop.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.runtimeStop.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("clears recurring engine timers after the Room lifecycle stops", async () => {
+    vi.useFakeTimers();
+    const engine = createEngine();
+
+    try {
+      await engine.start();
+      await engine.stop();
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await engine.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("exposes the project-bound Room read service only while the Room control plane is running", async () => {
+    const engine = createEngine();
+
+    expect(engine.getRoomControlPlaneReadService()).toBeUndefined();
+    await engine.start();
+    expect(engine.getRoomControlPlaneReadService()).toBeDefined();
+    await engine.stop();
+    expect(engine.getRoomControlPlaneReadService()).toBeUndefined();
   });
 
   it("starts one canonical live-event service after the Room store and clears it during stop", async () => {
@@ -588,6 +868,81 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
         "Task 4.7 requires the default RoomController worker to be recovery-capable in production",
       ).not.toBe(roomControllerSeams.passiveWorker);
       expect(durableRoomRecoveryWorkerSeams.constructorCalls).toHaveLength(1);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("passes explicitly configured immutable evidence workflows into the default fenced controller", async () => {
+    const workflows = {
+      arbitration: { arbitrate: vi.fn(async () => ({ status: "withheld" as const })) },
+      synthesis: { synthesize: vi.fn(async () => ({ status: "withheld" as const })) },
+    };
+    const workflowFactory = vi.fn(() => workflows);
+    const engine = createEngine(undefined, { roomEvidenceWorkflowsFactory: workflowFactory });
+
+    await engine.start();
+    try {
+      expect(workflowFactory).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: "project-1",
+        roomStore: expect.any(Object),
+        workerId: expect.any(String),
+        hostId: expect.any(String),
+      }));
+      expect(roomControllerSeams.constructorCalls.at(-1)?.evidenceWorkflows).toBe(workflows);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("wires the durable dependency dispatcher into the production controller", async () => {
+    const engine = createEngine();
+
+    await engine.start();
+    try {
+      const constructed = roomControllerSeams.constructorCalls.at(-1);
+      expect(
+        constructed?.taskDispatcher,
+        "Task 5.7 requires production RoomController startup to dispatch durable DAG intent before recovery",
+      ).toEqual(expect.objectContaining({
+        dispatchReadyTasks: expect.any(Function),
+      }));
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("does not attach durable task dispatch to an unqualified custom Room worker", async () => {
+    const customWorker = { runRoom: vi.fn(async () => undefined) };
+    const engine = createEngine(undefined, { roomWorker: customWorker });
+
+    await engine.start();
+    try {
+      const constructed = roomControllerSeams.constructorCalls.at(-1);
+      expect(constructed?.worker).toBe(customWorker);
+      expect(
+        constructed?.taskDispatcher,
+        "A custom worker must explicitly opt in before ProjectEngine gives it durable task intent to deliver",
+      ).toBeUndefined();
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("attaches durable task dispatch when a custom Room worker explicitly supports it", async () => {
+    const customWorker = {
+      supportsDurableTaskDispatch: true,
+      runRoom: vi.fn(async () => undefined),
+    };
+    const engine = createEngine(undefined, { roomWorker: customWorker });
+
+    await engine.start();
+    try {
+      const constructed = roomControllerSeams.constructorCalls.at(-1);
+      expect(constructed?.worker).toBe(customWorker);
+      expect(constructed?.taskDispatcher).toEqual(expect.objectContaining({
+        dispatchReadyTasks: expect.any(Function),
+      }));
     } finally {
       await engine.stop();
     }

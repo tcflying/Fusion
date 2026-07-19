@@ -100,12 +100,29 @@ import {
 } from "./postgres-migration-notice.js";
 import {
   RoomController,
+  type RoomControllerEvidenceWorkflowsV1,
   type RoomWorker,
 } from "./room-controller.js";
 import { DurableRoomRecoveryWorker } from "./room-durable-recovery-worker.js";
+import { RoomDependencyDispatchCoordinator } from "./room-dependency-dispatch-coordinator.js";
+import { RoomSemanticControllerInboxProcessor } from "./room-semantic-controller-inbox-processor.js";
+import type { RoomTaskRecoveryActionConsumer } from "./room-task-recovery-action-processor.js";
+import {
+  ProjectRoomCommandGateway,
+  type ProjectRoomCommandResultV1,
+  type ProjectRoomCommandV1,
+  type ProjectRoomTrustedPrincipalV1,
+} from "./project-room-command-gateway.js";
 import { SessionConnectorRegistry } from "./session-connector-registry.js";
 import { RoomExistingSessionSpine } from "./room-existing-session-spine.js";
+import { RoomControlPlaneReadService } from "./room-control-plane-read-service.js";
 import { RoomControlPlaneLiveEventService } from "./room-control-plane-live-event-service.js";
+import {
+  createRoomGlobalConcurrencyRuntime,
+  type RoomGlobalConcurrencyRuntimeV1,
+  type RoomGlobalConcurrencyVerifiedPolicyV1,
+} from "./room-global-concurrency-runtime.js";
+import { ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION } from "./room-global-concurrency-accounting.js";
 import type { SessionConnectorIngestionLimits } from "./session-connector-ingestion.js";
 import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
 import type {
@@ -150,6 +167,15 @@ export interface RoomControllerFactoryContext {
 export type RoomControllerFactory = (
   context: RoomControllerFactoryContext,
 ) => RoomControllerLifecycle;
+
+export interface RoomEvidenceWorkflowsFactoryContext extends RoomControllerFactoryContext {
+  readonly workerId: string;
+  readonly hostId: string;
+}
+
+export type RoomEvidenceWorkflowsFactory = (
+  context: RoomEvidenceWorkflowsFactoryContext,
+) => RoomControllerEvidenceWorkflowsV1 | undefined;
 
 export interface RoomRunAuditDispatcherFactoryContext extends RoomControllerFactoryContext {
   readonly roomStore: AsyncRoomStore;
@@ -400,10 +426,23 @@ export interface ProjectEngineOptions {
    * is explicitly true, and a project-bound AsyncDataLayer is available.
    */
   roomControllerFactory?: RoomControllerFactory;
+  /**
+   * FNXC:RoomGlobalConcurrency 2026-07-19:
+   * Explicitly verified project capacity policy for the durable Room controller.
+   * Omitting it keeps Room admission unconfigured; ProjectEngine never invents
+   * a global slot count, reservations, or provider telemetry.
+   */
+  roomGlobalConcurrencyVerifiedPolicy?: RoomGlobalConcurrencyVerifiedPolicyV1;
+  roomEvidenceWorkflowsFactory?: RoomEvidenceWorkflowsFactory;
   /** Test/host seam for durable Room lifecycle audit delivery. */
   roomRunAuditDispatcherFactory?: RoomRunAuditDispatcherFactory;
   /** Worker implementation delegated to the default RoomController. */
   roomWorker?: RoomWorker;
+  /**
+   * Backend-local handoff for the default recovery worker. It may acknowledge
+   * only a durable controller-plan or approval receipt, never a provider call.
+   */
+  roomTaskRecoveryActionConsumer?: RoomTaskRecoveryActionConsumer;
   /** Project-scoped connector registry consumed by the durable Room recovery worker. */
   roomSessionConnectorRegistry?: SessionConnectorRegistry;
 }
@@ -432,7 +471,18 @@ export class ProjectEngine {
   private roomController?: RoomControllerLifecycle;
   private roomRunAuditDispatcher?: RoomRunAuditDispatcherLifecycle;
   private roomExistingSessionSpine?: RoomExistingSessionSpine;
+  private roomControlPlaneReadService?: RoomControlPlaneReadService;
   private roomControlPlaneLiveEventService?: RoomControlPlaneLiveEventService;
+  private roomGlobalConcurrencyRuntime?: RoomGlobalConcurrencyRuntimeV1;
+  private readonly projectRoomCommandGateway: ProjectRoomCommandGateway;
+  /*
+   * FNXC:SessionRoomController 2026-07-19-19:08:
+   * A stop racing an asynchronous start must cancel that generation and await
+   * its settlement. Otherwise a late Room controller start can outlive the
+   * shutdown that was supposed to own and stop it.
+   */
+  private startInFlight: Promise<void> | null = null;
+  private lifecycleGeneration = 0;
   private stopInFlight: Promise<void> | null = null;
   private prMonitor?: PrMonitor;
   /**
@@ -659,6 +709,15 @@ export class ProjectEngine {
       ...(options.prNodeGithubOps ? { prNodeGithubOps: options.prNodeGithubOps } : {}),
     };
     this.runtime = new InProcessRuntime(runtimeConfig, centralCore);
+    this.projectRoomCommandGateway = new ProjectRoomCommandGateway({
+      projectId: this.config.projectId,
+      resolveSpine: () => {
+        if (!this.started || this.starting || this.shuttingDown) {
+          return null;
+        }
+        return this.roomExistingSessionSpine ?? null;
+      },
+    });
     // Let the runtime's SelfHealingManager re-enqueue tasks directly into our
     // auto-merge queue when it clears a stale `merging` status, instead of
     // relying on the 15s polling sweep to eventually catch them.
@@ -700,9 +759,15 @@ export class ProjectEngine {
     return this.activeMergeTaskId;
   }
 
-  /** Backend-owned exact-existing-Session seam; available only while Room control is running. */
-  getRoomExistingSessionSpine(): RoomExistingSessionSpine | null {
-    return this.roomExistingSessionSpine ?? null;
+  /**
+   * Executes a project-scoped Room write through the Engine-owned authority
+   * boundary. Callers cannot retain or invoke the raw Existing-Session spine.
+   */
+  async executeProjectRoomCommand(
+    command: ProjectRoomCommandV1,
+    trustedPrincipal: ProjectRoomTrustedPrincipalV1,
+  ): Promise<ProjectRoomCommandResultV1> {
+    return this.projectRoomCommandGateway.execute(command, trustedPrincipal);
   }
 
   getActiveMergeStartedAtMs(): number | null {
@@ -818,29 +883,62 @@ export class ProjectEngine {
    * Start the engine: initialize the runtime and all auxiliary subsystems.
    */
   async start(): Promise<void> {
-    if (this.started || this.starting) {
+    if (this.startInFlight) {
+      return this.startInFlight;
+    }
+    if (this.started || this.starting || this.stopInFlight || this.shuttingDown) {
       return;
     }
 
-    /*
-    FNXC:EngineShutdown 2026-07-17-16:35:
-    stop() is a hard lifecycle boundary: public merge requests must remain
-    rejected after it settles. Reset the shutdown guard only when a subsequent
-    start begins a new lifecycle, never at the end of stop().
-    */
-    this.shuttingDown = false;
+    const startGeneration = ++this.lifecycleGeneration;
+    const operation = this.startOnce(startGeneration);
+    this.startInFlight = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.startInFlight === operation) {
+        this.startInFlight = null;
+      }
+    }
+  }
+
+  private isStartGenerationCurrent(startGeneration: number): boolean {
+    return this.lifecycleGeneration === startGeneration && !this.shuttingDown;
+  }
+
+  /*
+   * FNXC:RoomGlobalConcurrency 2026-07-19-19:08:
+   * Verified global capacity policy is enforceable only through the default
+   * controller wiring. A custom factory could omit its admission and audit
+   * ports, so reject that configuration instead of silently degrading it.
+   */
+  private assertVerifiedRoomPolicyUsesDefaultController(): void {
+    if (
+      this.options.roomGlobalConcurrencyVerifiedPolicy !== undefined
+      && this.options.roomControllerFactory !== undefined
+    ) {
+      throw new Error(
+        "ProjectEngine rejects a custom roomControllerFactory when roomGlobalConcurrencyVerifiedPolicy is configured, because it could bypass verified capacity admission and audit enforcement",
+      );
+    }
+  }
+
+  private async startOnce(startGeneration: number): Promise<void> {
     this.starting = true;
     try {
+      this.assertVerifiedRoomPolicyUsesDefaultController();
 
-    // 1. Start the core runtime (TaskStore, Scheduler, Executor, Triage, etc.)
-    await this.runtime.start();
-    this.runtimeStarted = true;
+      // 1. Start the core runtime (TaskStore, Scheduler, Executor, Triage, etc.)
+      await this.runtime.start();
+      this.runtimeStarted = true;
+      if (!this.isStartGenerationCurrent(startGeneration)) return;
 
     await deliverPostgresMigrationNoticeIfNeeded({
       messageStore: this.runtime.getMessageStore(),
       version: this.options.cliPackageVersion,
       log: runtimeLog,
     });
+    if (!this.isStartGenerationCurrent(startGeneration)) return;
 
     const store = this.runtime.getTaskStore();
     const cwd = this.config.workingDirectory;
@@ -858,6 +956,7 @@ export class ProjectEngine {
         : undefined,
       log: runtimeLog,
     });
+    if (!this.isStartGenerationCurrent(startGeneration)) return;
 
     // FNXC:SessionRoomController 2026-07-17-21:15:
     // The existing ProjectEngine is the sole process lifecycle owner. Room
@@ -877,10 +976,12 @@ export class ProjectEngine {
           for (const registration of pluginRunner?.getPluginSessionConnectors() ?? []) {
             try {
               const pluginContext = await pluginRunner!.createRuntimeContext(registration.pluginId);
+              if (!this.isStartGenerationCurrent(startGeneration)) return;
               if (!pluginContext) {
                 throw new Error(`Plugin ${registration.pluginId} has no runtime context`);
               }
               const connector = await registration.sessionConnector.factory(pluginContext);
+              if (!this.isStartGenerationCurrent(startGeneration)) return;
               if (connector.id !== registration.sessionConnector.metadata.connectorId) {
                 throw new Error(
                   `Session Connector factory returned ${connector.id}; expected ${registration.sessionConnector.metadata.connectorId}`,
@@ -896,7 +997,12 @@ export class ProjectEngine {
             }
           }
         }
+        if (!this.isStartGenerationCurrent(startGeneration)) return;
         const roomStore = new AsyncRoomStore(asyncLayer, { projectId: this.config.projectId });
+        this.roomControlPlaneReadService = new RoomControlPlaneReadService({
+          projectId: this.config.projectId,
+          roomStore,
+        });
         this.roomControlPlaneLiveEventService = new RoomControlPlaneLiveEventService({
           projectId: this.config.projectId,
           roomStore,
@@ -914,13 +1020,23 @@ export class ProjectEngine {
           connectorRegistry: roomSessionConnectorRegistry,
           ingestionLimits,
         });
+        const roomGlobalConcurrencyRuntime = this.options.roomGlobalConcurrencyVerifiedPolicy === undefined
+          ? undefined
+          : createRoomGlobalConcurrencyRuntime({
+            projectId: this.config.projectId,
+            layer: asyncLayer,
+            taskStore: store,
+            verifiedPolicy: this.options.roomGlobalConcurrencyVerifiedPolicy,
+          });
+        this.roomGlobalConcurrencyRuntime = roomGlobalConcurrencyRuntime;
         const roomControllerFactory = this.options.roomControllerFactory ?? ((context: RoomControllerFactoryContext) => {
           const roomStore = context.roomStore;
           const leaseStore = new AsyncRoomLeaseStore(context.asyncLayer, { projectId: context.projectId });
           const checkpointStore = new AsyncRoomCheckpointStore(context.asyncLayer, { projectId: context.projectId });
           const hostId = hostname();
           const workerId = `${hostId}:${process.pid}:${randomUUID()}`;
-          const worker = this.options.roomWorker ?? new DurableRoomRecoveryWorker({
+          const customRoomWorker = this.options.roomWorker;
+          const worker = customRoomWorker ?? new DurableRoomRecoveryWorker({
             projectId: context.projectId,
             workerId,
             hostId,
@@ -929,6 +1045,33 @@ export class ProjectEngine {
             leaseStore,
             checkpointStore,
             registry: context.connectorRegistry,
+            ...(this.options.roomTaskRecoveryActionConsumer
+              ? { taskRecoveryActionConsumer: this.options.roomTaskRecoveryActionConsumer }
+              : {}),
+          });
+          const taskDispatcher = !customRoomWorker || customRoomWorker.supportsDurableTaskDispatch === true
+            ? new RoomDependencyDispatchCoordinator({
+              projectId: context.projectId,
+              workerId,
+              hostId,
+              store: roomStore,
+            })
+            : undefined;
+          const evidenceWorkflows = this.options.roomEvidenceWorkflowsFactory?.({
+            ...context,
+            roomStore,
+            workerId,
+            hostId,
+          });
+          // FNXC:SessionRoomSemanticRouting 2026-07-19:
+          // ProjectEngine remains the only controller lifecycle owner. This
+          // inbox processor consumes already-durable controller actions under
+          // the same Room-worker fence as task dispatch; it deliberately has
+          // no connector/provider dependency and cannot create a second loop.
+          const semanticControllerInboxProcessor = new RoomSemanticControllerInboxProcessor({
+            workerId,
+            hostId,
+            store: roomStore,
           });
           const auditDispatcherFactory = this.options.roomRunAuditDispatcherFactory
             ?? ((dispatcherContext: RoomRunAuditDispatcherFactoryContext) =>
@@ -952,6 +1095,12 @@ export class ProjectEngine {
             leaseStore,
             checkpointStore,
             worker,
+            taskDispatcher,
+            semanticControllerInboxProcessor,
+            ...(evidenceWorkflows ? { evidenceWorkflows } : {}),
+            ...(roomGlobalConcurrencyRuntime
+              ? { capacityAdmission: roomGlobalConcurrencyRuntime.capacityAdmission }
+              : {}),
             recordRunAuditEvent: async (event) => {
               await auditDispatcher.enqueue(event);
             },
@@ -966,9 +1115,53 @@ export class ProjectEngine {
         });
         this.roomController = roomController;
         try {
+          let roomGlobalConcurrencyRecovery:
+            | Awaited<ReturnType<RoomGlobalConcurrencyRuntimeV1["recovery"]["recoverDanglingClaims"]>>
+            | undefined;
+          let roomGlobalConcurrencyRecoveryOperationId: string | undefined;
+          let roomGlobalConcurrencyRecoveryAt: string | undefined;
+          if (roomGlobalConcurrencyRuntime) {
+            roomGlobalConcurrencyRecoveryAt = new Date().toISOString();
+            roomGlobalConcurrencyRecoveryOperationId = `room-global-concurrency-recovery:${this.config.projectId}:${randomUUID()}`;
+            roomGlobalConcurrencyRecovery = await roomGlobalConcurrencyRuntime.recovery.recoverDanglingClaims({
+              contractVersion: ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION,
+              projectId: this.config.projectId,
+              recoveryOperationId: roomGlobalConcurrencyRecoveryOperationId,
+              recovererId: `project-engine:${hostname()}:${process.pid}`,
+              asOf: roomGlobalConcurrencyRecoveryAt,
+            });
+            if (!this.isStartGenerationCurrent(startGeneration)) return;
+            if (roomGlobalConcurrencyRecovery.action === "held") {
+              runtimeLog.warn(
+                `Room global concurrency recovery is held for ${this.config.projectId}; Room admission remains fail-closed until a fresh capacity snapshot is available`,
+              );
+            }
+          }
           this.roomControlPlaneLiveEventService.start();
           await this.roomRunAuditDispatcher?.start();
+          if (!this.isStartGenerationCurrent(startGeneration)) return;
+          if (
+            roomGlobalConcurrencyRecovery?.action === "held"
+            && roomGlobalConcurrencyRecoveryOperationId !== undefined
+            && roomGlobalConcurrencyRecoveryAt !== undefined
+          ) {
+            await this.roomRunAuditDispatcher?.enqueue({
+              id: `room-global-concurrency-recovery-held:${roomGlobalConcurrencyRecoveryOperationId}`,
+              timestamp: roomGlobalConcurrencyRecoveryAt,
+              projectId: this.config.projectId,
+              agentId: "room-global-concurrency",
+              runId: roomGlobalConcurrencyRecoveryOperationId,
+              domain: "database",
+              mutationType: "room:global-concurrency-recovery-held",
+              target: this.config.projectId,
+              metadata: {
+                rejectedClaimCount: roomGlobalConcurrencyRecovery.rejected.length,
+              },
+            });
+          }
+          if (!this.isStartGenerationCurrent(startGeneration)) return;
           await roomController.start();
+          if (!this.isStartGenerationCurrent(startGeneration)) return;
         } catch (error) {
           try {
             this.roomControlPlaneLiveEventService?.stop();
@@ -996,11 +1189,15 @@ export class ProjectEngine {
           this.roomRunAuditDispatcher = undefined;
           this.roomController = undefined;
           this.roomExistingSessionSpine = undefined;
+          this.roomControlPlaneReadService = undefined;
           this.roomControlPlaneLiveEventService = undefined;
+          this.roomGlobalConcurrencyRuntime = undefined;
           throw error;
         }
       }
     }
+
+    if (!this.isStartGenerationCurrent(startGeneration)) return;
 
     /*
      * FNXC:BackendFlip 2026-06-26-15:30:
@@ -1249,6 +1446,7 @@ export class ProjectEngine {
     const statusClearT0 = Date.now();
     await this.clearStaleMergingStatuses(store);
     runtimeLog.log(`ProjectEngine stale merging status clear: ${Date.now() - statusClearT0}ms`);
+    if (!this.isStartGenerationCurrent(startGeneration)) return;
 
     // 7–9. Deferred: notifiers/OAuth (ordered), automation syncs, merge enqueue
     const deferredGeneration = this.startupGeneration;
@@ -1266,20 +1464,23 @@ export class ProjectEngine {
     void this.runStaleAutostashSweep(store, "startup");
     this.scheduleStaleAutostashSweep(store);
 
+    if (!this.isStartGenerationCurrent(startGeneration)) return;
     this.started = true;
     this.starting = false;
     runtimeLog.log(
       `ProjectEngine started for ${this.config.projectId} (critical path ${Date.now() - engineStartT0}ms; deferred work in background)`,
     );
     } catch (error) {
-      try {
-        await this.stop();
-      } catch (cleanupError) {
-        runtimeLog.warn(
-          `ProjectEngine startup rollback failed for ${this.config.projectId}: ${
-            cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
-          }`,
-        );
+      if (!this.stopInFlight) {
+        try {
+          await this.beginStop(null);
+        } catch (cleanupError) {
+          runtimeLog.warn(
+            `ProjectEngine startup rollback failed for ${this.config.projectId}: ${
+              cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }`,
+          );
+        }
       }
       throw error;
     }
@@ -1455,9 +1656,21 @@ export class ProjectEngine {
    * promptly without continuing git/verification work after shutdown starts.
    */
   async stop(): Promise<void> {
+    return this.beginStop(this.startInFlight);
+  }
+
+  private beginStop(startToAwait: Promise<void> | null): Promise<void> {
     if (this.stopInFlight) return this.stopInFlight;
+
+    this.lifecycleGeneration += 1;
+    this.shuttingDown = true;
     const operation = Promise.resolve()
-      .then(() => this.stopOnce())
+      .then(async () => {
+        if (startToAwait) {
+          await startToAwait.catch(() => undefined);
+        }
+        await this.stopOnce();
+      })
       .finally(() => {
         if (this.stopInFlight === operation) this.stopInFlight = null;
       });
@@ -1473,6 +1686,7 @@ export class ProjectEngine {
     started yet — prevents unhandled post-stop side effects on fast recycle.
     */
     if (!this.started && !this.starting && !this.runtimeStarted && !this.roomController && !this.roomControlPlaneLiveEventService) {
+      this.shuttingDown = false;
       return;
     }
     this.shuttingDown = true;
@@ -1498,6 +1712,8 @@ export class ProjectEngine {
     const roomController = this.roomController;
     this.roomController = undefined;
     this.roomExistingSessionSpine = undefined;
+    this.roomControlPlaneReadService = undefined;
+    this.roomGlobalConcurrencyRuntime = undefined;
     if (roomController) {
       try {
         await roomController.stop();
@@ -1684,6 +1900,10 @@ export class ProjectEngine {
   /** Get the TaskStore. Throws if not started. */
   getTaskStore(): TaskStore {
     return this.runtime.getTaskStore();
+  }
+
+  getRoomControlPlaneReadService(): RoomControlPlaneReadService | undefined {
+    return this.roomControlPlaneReadService;
   }
 
   getRoomControlPlaneLiveEventService(): RoomControlPlaneLiveEventService | undefined {
