@@ -26,8 +26,9 @@ import {
   reconcileClaudeCliPaths,
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
+  createPostgresRoomRbacRegistry,
 } from "@fusion/core";
-import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
+import type { AutomationRunResult, RoomRbacRegistry, ScheduledTask } from "@fusion/core";
 import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
@@ -190,6 +191,39 @@ export interface DaemonOptions {
   noAutoRegister?: boolean;
   /** Preferred primary project (id or name). */
   project?: string;
+}
+
+const ROOM_CONTROL_PLANE_PUBLIC_ORIGIN_ENV = "FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN";
+const ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP_ENV = "FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP";
+
+/*
+FNXC:RoomControlPlaneDaemonRbac 2026-07-19-19:52:
+The daemon bearer authenticates the daemon transport only and must never become a Room actor.
+Room routes are enabled only when an operator explicitly configures a public browser origin and
+every eligible already-started project exposes a durable PostgreSQL Room RBAC registry. Freeze
+those registries at daemon composition time: an untrusted HTTP request may read its registry but
+must never start, create, or select a ProjectEngine as part of authorization.
+*/
+function createDaemonRoomControlPlaneRbacOptions(
+  engineManager: Pick<ProjectEngineManager, "getEngine">,
+  projectIds: readonly string[],
+): Parameters<typeof createServer>[1]["roomControlPlaneRbac"] | undefined {
+  const publicOrigin = process.env[ROOM_CONTROL_PLANE_PUBLIC_ORIGIN_ENV]?.trim();
+  if (!publicOrigin) return undefined;
+
+  const registries = new Map<string, RoomRbacRegistry>();
+  for (const projectId of projectIds) {
+    const layer = engineManager.getEngine(projectId)?.getTaskStore().getAsyncLayer();
+    if (!layer) continue;
+    registries.set(projectId, createPostgresRoomRbacRegistry(layer));
+  }
+  if (registries.size === 0) return undefined;
+
+  return {
+    publicOrigin,
+    allowLoopbackHttp: process.env[ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP_ENV] === "1",
+    resolveRegistry: ({ projectId }) => registries.get(projectId),
+  };
 }
 
 export async function runDaemon(opts: DaemonOptions = {}) {
@@ -827,6 +861,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     logDiagnostics(daemonDbHealthCheck ?? undefined);
   }, DIAGNOSTIC_INTERVAL_MS).unref?.();
 
+  const roomControlPlaneRbac = createDaemonRoomControlPlaneRbacOptions(
+    engineManager,
+    projects.map((project) => project.id),
+  );
+
   const app = createServer(store, {
     engine: primaryEngine,
     engineManager,
@@ -922,6 +961,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       }
     },
     headless: true,
+    ...(roomControlPlaneRbac ? { roomControlPlaneRbac } : {}),
     daemon: { token: daemonToken },
     skillsAdapter,
     https: loadTlsCredentialsFromEnv(),

@@ -50,6 +50,9 @@ const mocks = vi.hoisted(() => {
   const pluginLoaderInstances: any[] = [];
   const projectEngineInstances: any[] = [];
   const listenCalls: ListenCall[] = [];
+  const roomRbacAsyncLayer = { projectId: "project-1" };
+  const roomRbacRegistry = { source: "durable-room-rbac-registry" };
+  const createPostgresRoomRbacRegistry = vi.fn(() => roomRbacRegistry);
 
   // GlobalSettingsStore mock
   let globalSettingsData: Record<string, unknown> = {};
@@ -103,6 +106,7 @@ const mocks = vi.hoisted(() => {
       }),
       emit: emitter.emit.bind(emitter),
       getActiveMergingTask: vi.fn().mockReturnValue(undefined),
+      getAsyncLayer: vi.fn(() => roomRbacAsyncLayer),
     };
   }
 
@@ -483,6 +487,9 @@ const mocks = vi.hoisted(() => {
     pluginLoaderInstances,
     projectEngineInstances,
     listenCalls,
+    roomRbacAsyncLayer,
+    roomRbacRegistry,
+    createPostgresRoomRbacRegistry,
     globalSettingsStoreInstance,
     globalSettingsData,
     taskStoreCtor,
@@ -569,6 +576,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
     };
   }),
   getTaskMergeBlocker: vi.fn().mockReturnValue(null),
+  createPostgresRoomRbacRegistry: mocks.createPostgresRoomRbacRegistry,
   syncInsightExtractionAutomation: mocks.syncInsightExtractionAutomationMock,
   INSIGHT_EXTRACTION_SCHEDULE_NAME: "Memory Insight Extraction",
   processAndAuditInsightExtraction: mocks.processAndAuditInsightExtractionMock,
@@ -591,8 +599,6 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
   getProjectSettingsPath: vi.fn().mockReturnValue("/tmp/project/.fusion/settings.json"),
   loadTlsCredentialsFromEnv: vi.fn().mockReturnValue(undefined),
   refreshAllCustomProviderModels: mocks.refreshAllCustomProviderModels,
-  // FNXC:CliTests 2026-07-13-09:40: Missing dashboard barrel exports added for mock completeness (scripts/check-mock-completeness.mjs gate).
-  registerGithubTrackingHook: vi.fn(),
 }));
 
 vi.mock("@fusion/engine", async (importOriginal) => {
@@ -778,6 +784,8 @@ describe("runDaemon", () => {
   });
   const originalCwd = process.cwd;
   const originalExit = process.exit;
+  const originalRoomControlPlanePublicOrigin = process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+  const originalRoomControlPlaneAllowLoopbackHttp = process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP;
 
   let signalHandlers: Record<"SIGINT" | "SIGTERM", Array<() => void>>;
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -796,6 +804,8 @@ describe("runDaemon", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.reset();
+    delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+    delete process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP;
 
     signalHandlers = { SIGINT: [], SIGTERM: [] };
 
@@ -821,6 +831,16 @@ describe("runDaemon", () => {
     processOnSpy.mockRestore();
     process.cwd = originalCwd;
     process.exit = originalExit;
+    if (originalRoomControlPlanePublicOrigin === undefined) {
+      delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+    } else {
+      process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN = originalRoomControlPlanePublicOrigin;
+    }
+    if (originalRoomControlPlaneAllowLoopbackHttp === undefined) {
+      delete process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP;
+    } else {
+      process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP = originalRoomControlPlaneAllowLoopbackHttp;
+    }
   });
 
   it("initializes stores, starts engine services, and creates a headless server with daemon auth", async () => {
@@ -1071,6 +1091,50 @@ describe("runDaemon", () => {
     expect(mocks.cronRunnerInstances[0].stop).toHaveBeenCalledTimes(1);
     expect(listenCall.server.close).toHaveBeenCalledTimes(1);
     expect(mocks.taskStores[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mount a dead Room authorizer when the daemon lacks an explicit durable RBAC configuration", async () => {
+    await runDaemon({ token: "fn_no_room_rbac_config" });
+
+    const serverOptions = mocks.createServerMock.mock.calls.at(-1)![1] as {
+      roomControlPlaneAuthorizeProject?: unknown;
+      roomControlPlaneRbac?: unknown;
+    };
+    expect(serverOptions.roomControlPlaneAuthorizeProject).toBeUndefined();
+    expect(serverOptions.roomControlPlaneRbac).toBeUndefined();
+
+    await triggerSignal("SIGINT");
+  });
+
+  it("injects a durable registry resolver only with an explicit public origin and never promotes the daemon bearer to a Room principal", async () => {
+    process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN = "https://dashboard.example";
+    const token = "fn_room_durable_registry";
+    try {
+      await runDaemon({ token });
+
+      const serverOptions = mocks.createServerMock.mock.calls.at(-1)![1] as {
+        roomControlPlaneAuthorizeProject?: unknown;
+        roomControlPlaneRbac?: {
+          publicOrigin?: unknown;
+          allowLoopbackHttp?: unknown;
+          resolveRegistry?: (input: { projectId: string; request: unknown }) => unknown;
+        };
+      };
+      expect(serverOptions.roomControlPlaneAuthorizeProject).toBeUndefined();
+      expect(serverOptions.roomControlPlaneRbac).toMatchObject({
+        publicOrigin: "https://dashboard.example",
+        allowLoopbackHttp: false,
+      });
+      expect(await serverOptions.roomControlPlaneRbac?.resolveRegistry?.({ projectId: "project-1", request: {} }))
+        .toBe(mocks.roomRbacRegistry);
+      expect(await serverOptions.roomControlPlaneRbac?.resolveRegistry?.({ projectId: "untrusted-project", request: {} }))
+        .toBeUndefined();
+      expect(mocks.createPostgresRoomRbacRegistry).toHaveBeenCalledWith(mocks.roomRbacAsyncLayer);
+
+      await triggerSignal("SIGINT");
+    } finally {
+      delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+    }
   });
 
   it("enables HybridExecutor with env override and shuts down before engine stop", async () => {

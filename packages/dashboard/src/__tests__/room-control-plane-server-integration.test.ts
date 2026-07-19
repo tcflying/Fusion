@@ -12,16 +12,23 @@ import type {
   RoomTaskGraphProjectionV1,
   TaskStore,
 } from "@fusion/core";
+import {
+  ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+  createInMemoryRoomRbacRegistry,
+  createTrustedRoomDeviceCredential,
+} from "@fusion/core";
 import { RoomControlPlaneReadService } from "@fusion/engine";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as serverModule from "../server.js";
 import { createServer, type RoomControlPlaneProjectAuthorizer } from "../server.js";
+import { DEFAULT_ROOM_CONTROL_PLANE_TRUSTED_DEVICE_COOKIE_NAME } from "../room-control-plane-rbac-authorizer.js";
 import { request } from "../test-request.js";
 
 const PROJECT_ID = "project-room-server";
 const ROOM_ID = "room-server-1";
 const UPDATED_AT = "2026-07-19T08:00:00.000Z";
 const DAEMON_TOKEN = "daemon-room-control-plane-token";
+const ROOM_RBAC_PUBLIC_ORIGIN = "http://127.0.0.1";
 
 class MockSocket extends PassThrough {
   public writable = true;
@@ -54,7 +61,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_500): Promise<voi
   }
 }
 
-async function openSseStream(app: express.Express, path: string) {
+async function openSseStream(app: express.Express, path: string, headers: Record<string, string> = {}) {
   const socket = new MockSocket();
   const req = new http.IncomingMessage(socket as unknown as Socket);
   const res = new http.ServerResponse(req);
@@ -62,7 +69,7 @@ async function openSseStream(app: express.Express, path: string) {
   req.method = "GET";
   req.url = path;
   req.httpVersion = "1.1";
-  req.headers = { host: "127.0.0.1" };
+  req.headers = { host: "127.0.0.1", ...headers };
   res.assignSocket(socket as unknown as Socket);
   const originalWrite = res.write.bind(res);
   res.write = ((chunk: string | Buffer, encoding?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
@@ -80,6 +87,9 @@ async function openSseStream(app: express.Express, path: string) {
     headers: res.getHeaders(),
     readText(): string {
       return Buffer.concat(chunks).toString("utf8");
+    },
+    isEnded(): boolean {
+      return res.writableEnded;
     },
     close(): void {
       req.emit("close");
@@ -125,8 +135,14 @@ function roomEnvelope(cursor: string) {
 
 function createLiveEventService() {
   let listener: ((notification: unknown) => void) | undefined;
+  let terminationListener: ((signal: unknown) => void) | undefined;
   const unsubscribe = vi.fn(() => {
     listener = undefined;
+  });
+  const activate = vi.fn(() => true);
+  const subscription = Object.assign(unsubscribe, { activate });
+  const unsubscribeTermination = vi.fn(() => {
+    terminationListener = undefined;
   });
   const reconnect = vi.fn(async () => ({
     ok: true,
@@ -141,11 +157,15 @@ function createLiveEventService() {
   }));
   const subscribe = vi.fn((_scope: unknown, candidate: (notification: unknown) => void) => {
     listener = candidate;
-    return unsubscribe;
+    return subscription;
+  });
+  const subscribeTermination = vi.fn((_scope: unknown, candidate: (signal: unknown) => void) => {
+    terminationListener = candidate;
+    return unsubscribeTermination;
   });
   return {
-    service: { reconnect, subscribe },
-    calls: { reconnect, subscribe, unsubscribe },
+    service: { reconnect, subscribe, subscribeTermination },
+    calls: { reconnect, subscribe, subscribeTermination, unsubscribe, unsubscribeTermination, activate },
     emit(cursor: string): void {
       listener?.({
         contractVersion: 1,
@@ -154,6 +174,27 @@ function createLiveEventService() {
         envelope: roomEnvelope(cursor),
         connection: { state: "connected", reason: null, changedAt: "2026-07-19T18:30:00.000Z" },
         alerts: [],
+      });
+    },
+    stop(): void {
+      terminationListener?.({
+        contractVersion: 1,
+        type: "room_live_event_terminated",
+        reason: "service_stopped",
+        scope: { projectId: PROJECT_ID, roomId: ROOM_ID },
+        connection: {
+          state: "disconnected",
+          reason: "engine_live_service_stopped",
+          changedAt: "2026-07-19T18:30:00.000Z",
+        },
+        alerts: [{
+          code: "stream_disconnected",
+          severity: "critical",
+          scope: { projectId: PROJECT_ID, roomId: ROOM_ID },
+          cursor: null,
+          expectedStreamSequence: null,
+          observedStreamSequence: null,
+        }],
       });
     },
   };
@@ -288,6 +329,55 @@ function createEngineManager(engine: ReturnType<typeof createProjectEngine>["eng
   };
 }
 
+async function createProjectOperatorRbac() {
+  const registry = createInMemoryRoomRbacRegistry();
+  const credential = createTrustedRoomDeviceCredential();
+  const requestedAt = new Date();
+  await registry.issueTrustedDeviceSession({
+    contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+    projectId: PROJECT_ID,
+    sessionId: "server-rbac-session",
+    principalId: "server-rbac-operator",
+    deviceId: "server-rbac-device",
+    credential,
+    issuedAt: new Date(requestedAt.getTime() - 60_000).toISOString(),
+    expiresAt: new Date(requestedAt.getTime() + 60 * 60_000).toISOString(),
+    idempotencyKey: "server-rbac-session",
+  });
+  await registry.grantRole({
+    contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+    projectId: PROJECT_ID,
+    grantId: "server-rbac-operator-grant",
+    principalId: "server-rbac-operator",
+    role: "operator",
+    roomId: null,
+    grantedAt: requestedAt.toISOString(),
+    expectedAuthorizationVersion: 0,
+    idempotencyKey: "server-rbac-operator-grant",
+  });
+  return { registry, credential };
+}
+
+function roomRbacOptions(
+  resolveRegistry: NonNullable<Parameters<typeof createServer>[1]>["roomControlPlaneRbac"] extends infer Options
+    ? Options extends { readonly resolveRegistry: infer Resolver } ? Resolver : never
+    : never,
+) {
+  return {
+    resolveRegistry,
+    publicOrigin: ROOM_RBAC_PUBLIC_ORIGIN,
+    allowLoopbackHttp: true,
+  };
+}
+
+function trustedDeviceHeaders(credential: string): Record<string, string> {
+  return {
+    cookie: `${DEFAULT_ROOM_CONTROL_PLANE_TRUSTED_DEVICE_COOKIE_NAME}=${credential}`,
+    origin: ROOM_RBAC_PUBLIC_ORIGIN,
+    "sec-fetch-site": "same-origin",
+  };
+}
+
 function createDaemonAuthorizationInput(
   store: TaskStore,
   input: Readonly<{ readonly authorization?: string; readonly queryToken?: string }>,
@@ -314,7 +404,7 @@ describe("Room control-plane server wiring", () => {
     store = new MemoryStore() as unknown as TaskStore;
   });
 
-  it("creates a daemon Room authorizer that accepts only its configured bearer token", async () => {
+  it("treats a daemon bearer only as transport authentication and never as a Room principal", async () => {
     const factory = (serverModule as {
       readonly createDaemonRoomControlPlaneAuthorizer?: (daemonToken: string) => RoomControlPlaneProjectAuthorizer;
     }).createDaemonRoomControlPlaneAuthorizer;
@@ -323,20 +413,20 @@ describe("Room control-plane server wiring", () => {
     if (typeof factory !== "function") return;
 
     const authorize = factory(DAEMON_TOKEN);
-    const headerAccepted = await authorize(createDaemonAuthorizationInput(store, {
+    const headerTransportAuthenticated = await authorize(createDaemonAuthorizationInput(store, {
       authorization: `Bearer ${DAEMON_TOKEN}`,
     }));
-    const eventSourceAccepted = await authorize(createDaemonAuthorizationInput(store, {
+    const eventSourceTransportAuthenticated = await authorize(createDaemonAuthorizationInput(store, {
       queryToken: DAEMON_TOKEN,
     }));
     const rejected = await authorize(createDaemonAuthorizationInput(store, {
       authorization: "Bearer wrong-daemon-token",
     }));
 
-    expect(headerAccepted).toEqual({ allowed: true, actorId: "fusion-daemon-operator" });
-    expect(eventSourceAccepted).toEqual({ allowed: true, actorId: "fusion-daemon-operator" });
+    expect(headerTransportAuthenticated).toEqual({ allowed: false, reason: "trusted-device-principal-required" });
+    expect(eventSourceTransportAuthenticated).toEqual({ allowed: false, reason: "trusted-device-principal-required" });
     expect(rejected).toEqual({ allowed: false, reason: "daemon-token-required" });
-    expect(JSON.stringify(headerAccepted)).not.toContain(DAEMON_TOKEN);
+    expect(JSON.stringify(headerTransportAuthenticated)).not.toContain(DAEMON_TOKEN);
   });
 
   it("mounts canonical ProjectEngine list and get reads after explicit project authorization", async () => {
@@ -376,7 +466,7 @@ describe("Room control-plane server wiring", () => {
     expect(serviceCalls.getTaskGraph).toHaveBeenCalledWith(ROOM_ID);
   });
 
-  it("mounts authenticated canonical Room SSE through the Engine live-event getter and cleans up on disconnect", async () => {
+  it("mounts authenticated canonical Room SSE through the Engine live-event getter and terminates when its subscription closes", async () => {
     const { service } = createReadService();
     const live = createLiveEventService();
     const { engine } = createProjectEngine(store, service, live.service);
@@ -401,16 +491,25 @@ describe("Room control-plane server wiring", () => {
       resource: "room",
       access: "read",
     }));
-    expect(live.calls.subscribe).toHaveBeenCalledWith({ projectId: PROJECT_ID, roomId: ROOM_ID }, expect.any(Function));
+    expect(live.calls.subscribe).toHaveBeenCalledWith({
+      projectId: PROJECT_ID,
+      roomId: ROOM_ID,
+      holdUntilReplayWatermark: true,
+      afterCursor: null,
+    }, expect.any(Function));
     expect(live.calls.reconnect).toHaveBeenCalledWith({
       projectId: PROJECT_ID,
       roomId: ROOM_ID,
       afterCursor: null,
       limit: 128,
     });
+    expect(live.calls.activate).toHaveBeenCalledWith("1");
 
     live.emit("2");
     await waitFor(() => stream.readText().includes("id: 2\nevent: room.event"));
+    live.stop();
+    await waitFor(() => stream.isEnded());
+    expect(stream.readText()).toContain('"reason":"engine_live_service_stopped"');
     stream.close();
     await waitFor(() => live.calls.unsubscribe.mock.calls.length === 1);
   });
@@ -454,6 +553,92 @@ describe("Room control-plane server wiring", () => {
 
     expect(response.status).toBe(404);
     expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
+  });
+
+  it("does not start an untrusted project Engine when durable RBAC denies before project context resolution", async () => {
+    const onProjectAccessed = vi.fn();
+    const manager = {
+      getEngine: vi.fn(() => undefined),
+      onProjectAccessed,
+    } as never;
+    const app = createServer(store, {
+      engineManager: manager,
+      roomControlPlaneRbac: roomRbacOptions(async () => createInMemoryRoomRbacRegistry()),
+    });
+
+    const response = await request(app, "GET", `/api/rooms?projectId=${PROJECT_ID}`);
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_PROJECT_ACCESS_DENIED" } });
+    expect(onProjectAccessed).not.toHaveBeenCalled();
+  });
+
+  it("requires daemon transport auth plus the explicit durable RBAC resolver before any Engine port access", async () => {
+    const { service, calls: serviceCalls } = createReadService();
+    const live = createLiveEventService();
+    const { engine, calls: engineCalls } = createProjectEngine(store, service, live.service);
+    const { manager, calls: managerCalls } = createEngineManager(engine);
+    const { registry, credential } = await createProjectOperatorRbac();
+    const legacyAuthorizer = vi.fn<RoomControlPlaneProjectAuthorizer>(async () => ({
+      allowed: false,
+      reason: "legacy callback must not replace explicit durable RBAC",
+    }));
+    const resolveRegistry = vi.fn(async ({ projectId }: { projectId: string }) => (
+      projectId === PROJECT_ID ? registry : undefined
+    ));
+    const app = createServer(store, {
+      engineManager: manager,
+      roomControlPlaneAuthorizeProject: legacyAuthorizer,
+      roomControlPlaneRbac: roomRbacOptions(resolveRegistry),
+      daemon: { token: DAEMON_TOKEN },
+    });
+
+    const forged = await request(
+      app,
+      "GET",
+      `/api/rooms?projectId=${PROJECT_ID}&fn_token=${credential}`,
+      undefined,
+      { authorization: `Bearer ${DAEMON_TOKEN}`, "x-room-principal-id": "forged-owner" },
+    );
+    expect(forged.status).toBe(403);
+    expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
+    expect(managerCalls.getEngine).not.toHaveBeenCalled();
+    expect(legacyAuthorizer).not.toHaveBeenCalled();
+
+    const unauthenticated = await request(app, "GET", `/api/rooms?projectId=${PROJECT_ID}`);
+    expect(unauthenticated.status).toBe(401);
+    expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
+    expect(managerCalls.getEngine).not.toHaveBeenCalled();
+
+    const trustedTransportHeaders = {
+      ...trustedDeviceHeaders(credential),
+      authorization: `Bearer ${DAEMON_TOKEN}`,
+    };
+    const list = await request(app, "GET", `/api/rooms?projectId=${PROJECT_ID}`, undefined, trustedTransportHeaders);
+    expect(list.status).toBe(200);
+    expect(list.body).toEqual({ rooms: [roomSummary()], nextCursor: null });
+    expect(serviceCalls.listRoomSummaries).toHaveBeenCalledOnce();
+    expect(legacyAuthorizer).not.toHaveBeenCalled();
+
+    const deniedStream = await openSseStream(
+      app,
+      `/api/rooms/${ROOM_ID}/events?projectId=${PROJECT_ID}&fn_token=${credential}`,
+      { authorization: `Bearer ${DAEMON_TOKEN}` },
+    );
+    expect(deniedStream.status).toBe(403);
+    expect(live.calls.subscribe).not.toHaveBeenCalled();
+
+    const stream = await openSseStream(
+      app,
+      `/api/rooms/${ROOM_ID}/events?projectId=${PROJECT_ID}`,
+      trustedTransportHeaders,
+    );
+    expect(stream.status).toBe(200);
+    expect(stream.readText()).toContain("id: 1\nevent: room.event");
+    expect(live.calls.subscribe).toHaveBeenCalledOnce();
+    expect(resolveRegistry).toHaveBeenCalledTimes(2);
+    stream.close();
+    await waitFor(() => live.calls.unsubscribe.mock.calls.length === 1);
   });
 
   it("keeps unsupported Room resource and mutation operations unavailable", async () => {
