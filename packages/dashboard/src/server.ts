@@ -19,6 +19,11 @@ import type {
 import { AgentStore, ChatStore, queryRunAuditEvents, setRunningAgentCountSource } from "@fusion/core";
 import type { AuthStorageLike, ModelRegistryLike } from "./routes.js";
 import { createApiRoutes } from "./routes.js";
+import {
+  createRoomControlPlaneEngineRouteDependencies,
+  type RoomControlPlaneEngineRouteDependenciesOptions,
+} from "./room-control-plane-engine-route-dependencies.js";
+import type { RoomControlPlaneRouteDependencies } from "./routes/register-room-control-plane-routes.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
 import { rateLimit, RATE_LIMITS } from "./rate-limit.js";
 import { ApiError, sendErrorResponse } from "./api-error.js";
@@ -235,6 +240,9 @@ export async function resolveScopedStore(
   return resolveStoreForProjectId(projectId ?? launchProjectId, store, options);
 }
 
+export type RoomControlPlaneProjectAuthorizer =
+  RoomControlPlaneEngineRouteDependenciesOptions["authorizeProject"];
+
 export interface ServerOptions {
   /** Optional ProjectEngine — when provided, subsystems (onMerge, automationStore,
    *  missionAutopilot, missionExecutionLoop, heartbeatMonitor) are derived from it.
@@ -244,6 +252,12 @@ export interface ServerOptions {
   /** ProjectEngineManager for uniform multi-project engine lifecycle.
    *  When provided, the server can resolve per-project engines for route handlers. */
   engineManager?: import("@fusion/engine").ProjectEngineManager;
+  /**
+   * Explicit project-scoped authorization for the Engine-backed Room read
+   * surface. Supplying an Engine or daemon bearer token alone never mounts
+   * these routes; the callback is invoked for every Room request.
+   */
+  roomControlPlaneAuthorizeProject?: RoomControlPlaneProjectAuthorizer;
   /** Optional HybridExecutor orchestration context for multi-project runtime plumbing. */
   hybridExecutor?: import("@fusion/engine").HybridExecutor;
   /**
@@ -548,6 +562,20 @@ export interface ServerOptions {
     getRecent(limit?: number): SystemLogEntry[];
     subscribe(listener: (entry: SystemLogEntry) => void): () => void;
   };
+}
+
+function createServerRoomControlPlaneRouteDependencies(
+  options?: ServerOptions,
+): RoomControlPlaneRouteDependencies | undefined {
+  const authorizeProject = options?.roomControlPlaneAuthorizeProject;
+  if (typeof authorizeProject !== "function") {
+    return undefined;
+  }
+
+  return createRoomControlPlaneEngineRouteDependencies({
+    authorizeProject,
+    resolveProjectEngine: ({ projectId }) => options?.engineManager?.getEngine(projectId),
+  });
 }
 
 /** System panel log entry shape (mirrors the CLI log sink's ring buffer). */
@@ -2091,8 +2119,10 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   });
 
   // REST API
+  const roomControlPlaneRouteDependencies = createServerRoomControlPlaneRouteDependencies(options);
   const apiRouter = createApiRoutes(store, {
     ...options,
+    ...(roomControlPlaneRouteDependencies ? { roomControlPlaneRouteDependencies } : {}),
     runtimeLogger,
     aiSessionStore: aiSessionStore as AiSessionStore,
     chatStore,

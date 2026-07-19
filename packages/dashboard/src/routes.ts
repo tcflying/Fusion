@@ -52,10 +52,8 @@ import {
   type RoomControlPlaneRouteDependencies,
 } from "./routes/register-room-control-plane-routes.js";
 
-declare module "./server.js" {
-  interface ServerOptions {
-    readonly roomControlPlaneRouteDependencies?: RoomControlPlaneRouteDependencies;
-  }
+export interface ApiRoutesOptions extends ServerOptions {
+  readonly roomControlPlaneRouteDependencies?: RoomControlPlaneRouteDependencies;
 }
 
 import { registerSettingsMemoryRoutes } from "./routes/register-settings-memory-routes.js";
@@ -887,7 +885,7 @@ function replayBufferedSSE(
  * downstream consumers (`resolveDiffBase`, `__resetBatchImportRateLimiter`,
  * `__setCreateFnAgentForRefine`, `AuthStorageLike`, `ModelRegistryLike`).
  */
-export function createApiRoutes(store: TaskStore, options?: ServerOptions): Router {
+export function createApiRoutes(store: TaskStore, options?: ApiRoutesOptions): Router {
   const {
     router,
     runtimeLogger,
