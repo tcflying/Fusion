@@ -47,6 +47,17 @@ import { registerWorkflowRoutes } from "./routes/register-workflow-routes.js";
 import { registerPlanningSubtaskRoutes } from "./routes/register-planning-subtask-routes.js";
 import { registerChatRoutes } from "./routes/register-chat-routes.js";
 import { registerChatRoomRoutes } from "./routes/register-chat-room-routes.js";
+import {
+  registerRoomControlPlaneRoutes,
+  type RoomControlPlaneRouteDependencies,
+} from "./routes/register-room-control-plane-routes.js";
+
+declare module "./server.js" {
+  interface ServerOptions {
+    readonly roomControlPlaneRouteDependencies?: RoomControlPlaneRouteDependencies;
+  }
+}
+
 import { registerSettingsMemoryRoutes } from "./routes/register-settings-memory-routes.js";
 import { registerSecretsRoutes } from "./routes/register-secrets-routes.js";
 import { registerMessagingScriptRoutes } from "./routes/register-messaging-scripts.js";
@@ -978,6 +989,11 @@ export function createApiRoutes(store: TaskStore, options?: ServerOptions): Rout
     upload,
   }));
   registrarMounter.mount("registerChatRoomRoutes", () => registerChatRoomRoutes(routeContext, { upload }));
+  registrarMounter.mount("registerRoomControlPlaneRoutes", () => {
+    if (options?.roomControlPlaneRouteDependencies) {
+      registerRoomControlPlaneRoutes(routeContext, options.roomControlPlaneRouteDependencies);
+    }
+  });
   registrarMounter.mount("registerMessagingScriptRoutes", () => registerMessagingScriptRoutes(routeContext));
   registrarMounter.mount("registerGitGitHubRoutes", () => registerGitGitHubRoutes(routeContext));
   registrarMounter.mount("registerGitLabRoutes", () => registerGitLabRoutes(routeContext));
