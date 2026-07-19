@@ -11,7 +11,7 @@ import {
 describe("Room evaluation profiles", () => {
   it("exports the versioned profiles through the canonical Core surface", () => {
     expect(Core.getRoomEvaluationProfile("creative_work")).toMatchObject({
-      id: "room-evaluation/creative-work/v1",
+      id: "room-evaluation:creative-work:v1",
       domain: "creative_work",
       preservesSharedEvidenceAndDissentContract: true,
     });
@@ -43,6 +43,7 @@ describe("Room evaluation profiles", () => {
           reviewerMustDifferFromProducer: true,
         },
       });
+      expect(profile.id).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u);
       expect(profile.independentReview.minimumAcceptingReviews).toBeGreaterThanOrEqual(1);
       expect(profile.requiredEvidenceKinds.length).toBeGreaterThan(0);
       expect(profile.hardGates.length).toBeGreaterThan(0);

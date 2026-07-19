@@ -86,7 +86,7 @@ const MODEL_SELF_REPORT_POLICY: RoomEvaluationModelSelfReportPolicyV1 = {
 
 const PROFILE_BY_DOMAIN: Readonly<Record<RoomEvaluationDomain, RoomEvaluationProfileV1>> = deepFreeze({
   code: profile({
-    id: "room-evaluation/code/v1",
+    id: "room-evaluation:code:v1",
     domain: "code",
     requiredEvidenceKinds: ["user_constraint", "source", "schema", "test", "runtime", "review"],
     evidenceRequirements: [
@@ -112,7 +112,7 @@ const PROFILE_BY_DOMAIN: Readonly<Record<RoomEvaluationDomain, RoomEvaluationPro
     recommendedConfidenceDimensions: ALL_CONFIDENCE_DIMENSIONS,
   }),
   diagnosis: profile({
-    id: "room-evaluation/diagnosis/v1",
+    id: "room-evaluation:diagnosis:v1",
     domain: "diagnosis",
     requiredEvidenceKinds: ["user_constraint", "source", "runtime", "test", "review"],
     evidenceRequirements: [
@@ -137,7 +137,7 @@ const PROFILE_BY_DOMAIN: Readonly<Record<RoomEvaluationDomain, RoomEvaluationPro
     recommendedConfidenceDimensions: ALL_CONFIDENCE_DIMENSIONS,
   }),
   research: profile({
-    id: "room-evaluation/research/v1",
+    id: "room-evaluation:research:v1",
     domain: "research",
     requiredEvidenceKinds: ["user_constraint", "source", "artifact", "review"],
     evidenceRequirements: [
@@ -161,7 +161,7 @@ const PROFILE_BY_DOMAIN: Readonly<Record<RoomEvaluationDomain, RoomEvaluationPro
     recommendedConfidenceDimensions: ALL_CONFIDENCE_DIMENSIONS,
   }),
   documents: profile({
-    id: "room-evaluation/documents/v1",
+    id: "room-evaluation:documents:v1",
     domain: "documents",
     requiredEvidenceKinds: ["user_constraint", "source", "schema", "artifact", "review"],
     evidenceRequirements: [
@@ -186,7 +186,7 @@ const PROFILE_BY_DOMAIN: Readonly<Record<RoomEvaluationDomain, RoomEvaluationPro
     recommendedConfidenceDimensions: ALL_CONFIDENCE_DIMENSIONS,
   }),
   creative_work: profile({
-    id: "room-evaluation/creative-work/v1",
+    id: "room-evaluation:creative-work:v1",
     domain: "creative_work",
     requiredEvidenceKinds: ["user_constraint", "source", "artifact", "review"],
     evidenceRequirements: [
@@ -209,7 +209,7 @@ const PROFILE_BY_DOMAIN: Readonly<Record<RoomEvaluationDomain, RoomEvaluationPro
     recommendedConfidenceDimensions: ALL_CONFIDENCE_DIMENSIONS,
   }),
   external_automation: profile({
-    id: "room-evaluation/external-automation/v1",
+    id: "room-evaluation:external-automation:v1",
     domain: "external_automation",
     requiredEvidenceKinds: ["user_constraint", "policy", "source", "test", "runtime", "artifact", "review"],
     evidenceRequirements: [
