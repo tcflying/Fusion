@@ -11,6 +11,13 @@ import {
   type SessionConnectorIdentityV1,
   type SessionConnectorV1,
 } from "@fusion/core";
+import {
+  abandonAdmittedRoomProviderBackpressure,
+  admitRoomProviderBackpressureConnectorSend,
+  sendWithAdmittedRoomProviderBackpressure,
+  type RoomProviderBackpressureSendGateV1,
+  type RoomProviderBackpressureSendPermitV1,
+} from "./room-provider-backpressure-send-boundary.js";
 import { SessionConnectorRegistry } from "./session-connector-registry.js";
 
 export interface RoomDeliveryCoordinatorStore {
@@ -46,6 +53,11 @@ export interface DispatchRoomDeliveryInput {
   readonly signal?: AbortSignal;
   readonly assertAuthority?: () => Promise<void>;
   readonly audit: RoomDeliveryAuditIdentity;
+  /**
+   * Optional until a caller can supply the complete Core-backed provider scope,
+   * telemetry, policy, and durable reservation contract for this exact send.
+   */
+  readonly providerBackpressure?: RoomProviderBackpressureSendGateV1;
 }
 
 export interface ReconcileAmbiguousRoomDeliveryInput {
@@ -117,14 +129,42 @@ export async function dispatchRoomDelivery(
     requiredHostId: binding.hostId,
   });
 
-  const claimNow = await assertOperationAuthority(input);
-  const claimed = await input.store.beginDeliveryAttempt({
-    outboxId: input.outboxId,
-    attemptId: input.attemptId,
-    senderFence: input.senderFence,
-    reconciliationFromCursor: input.reconciliationFromCursor,
-    now: claimNow,
-  });
+  let providerPermit: RoomProviderBackpressureSendPermitV1 | null = null;
+  let providerAdmissionAt: string | null = null;
+  if (input.providerBackpressure) {
+    providerAdmissionAt = operationTime(input);
+    const preflight = await admitRoomProviderBackpressureConnectorSend({
+      gate: input.providerBackpressure,
+      request: {
+        contractVersion: 1,
+        delivery,
+        binding,
+        identity: input.identity,
+        attemptId: input.attemptId,
+        senderFence: input.senderFence,
+        asOf: providerAdmissionAt,
+      },
+    });
+    if (preflight.action === "defer") return delivery;
+    providerPermit = preflight.permit;
+  }
+
+  let claimed: RoomOutboxRecordV1;
+  try {
+    const claimNow = await assertOperationAuthority(input);
+    claimed = await input.store.beginDeliveryAttempt({
+      outboxId: input.outboxId,
+      attemptId: input.attemptId,
+      senderFence: input.senderFence,
+      reconciliationFromCursor: input.reconciliationFromCursor,
+      now: claimNow,
+    });
+  } catch (error) {
+    if (providerPermit && providerAdmissionAt) {
+      await abandonAdmittedRoomProviderBackpressure(providerPermit, providerAdmissionAt).catch(() => undefined);
+    }
+    throw error;
+  }
 
   let result: Awaited<ReturnType<SessionConnectorV1["send"]>>;
   await assertOperationAuthority(input);
@@ -135,7 +175,7 @@ export async function dispatchRoomDelivery(
     operation and durably persist any late receipt; AbortSignal only fences the
     pre-send boundary and subsequent work.
     */
-    result = await connector.send({
+    const sendRequest = {
       contractVersion: 1,
       bindingId: claimed.bindingId,
       identity: input.identity,
@@ -144,7 +184,14 @@ export async function dispatchRoomDelivery(
       idempotencyKey: claimed.idempotencyKey,
       content: input.content,
       contentHash: claimed.payloadHash,
-    });
+    } as const;
+    result = providerPermit === null
+      ? await connector.send(sendRequest)
+      : await sendWithAdmittedRoomProviderBackpressure({
+          permit: providerPermit,
+          completedAt: () => operationTime(input),
+          send: () => connector.send(sendRequest),
+        });
   } catch {
     if (input.signal?.aborted) throw abortError();
     return input.store.completeDeliveryAttempt({

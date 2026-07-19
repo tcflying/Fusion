@@ -14,6 +14,7 @@ import {
   dispatchRoomDelivery,
   reconcileAmbiguousRoomDelivery,
 } from "./room-delivery-coordinator.js";
+import type { RoomProviderBackpressureSendGateV1 } from "./room-provider-backpressure-send-boundary.js";
 import type { RoomWorker, RoomWorkerRunInput } from "./room-controller.js";
 import type { SessionConnectorRegistry } from "./session-connector-registry.js";
 
@@ -37,6 +38,11 @@ export interface DurableRoomRecoveryWorkerOptions {
   readonly senderLeaseDurationMs?: number;
   readonly historyPageSize?: number;
   readonly maxHistoryPages?: number;
+  /**
+   * A Core-backed exact provider admission gate. This worker forwards it only;
+   * it never derives provider account/model/node scope or telemetry itself.
+   */
+  readonly providerBackpressureSendGate?: RoomProviderBackpressureSendGateV1;
 }
 
 /**
@@ -99,6 +105,7 @@ export class DurableRoomRecoveryWorker implements RoomWorker {
             dispatch: (delivery) => dispatchRoomDelivery({
               ...delivery,
               registry: this.options.registry,
+              providerBackpressure: this.options.providerBackpressureSendGate,
             }),
             reconcile: (delivery) => reconcileAmbiguousRoomDelivery({
               ...delivery,
