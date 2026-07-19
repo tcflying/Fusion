@@ -912,6 +912,43 @@ describe("embedded-lifecycle: startup race only joins on a lock collision", () =
 });
 
 describe("embedded-lifecycle: join-path database verify is best-effort", () => {
+  it("restarts an initialized cluster when postmaster.pid records a dead process", async () => {
+    const dataDir = makeDataDir();
+    const first = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+    await first.start();
+    const previousPort = first.getPort()!;
+    await first.stop();
+    const stalePid = 2_147_000_000;
+    expect(__embeddedLifecycleTestHooks.isProcessRunning(stalePid)).toBe(false);
+    writeFileSync(
+      join(dataDir, "postmaster.pid"),
+      [String(stalePid), dataDir, String(Date.now()), String(previousPort), "", "localhost", "ready"].join("\n") + "\n",
+    );
+
+    const restarted = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+    tracked.push({ lifecycle: restarted, dataDir });
+    await restarted.start();
+
+    expect(restarted.isRunning()).toBe(true);
+    const sql = postgres(restarted.getConnectionUrl(), { max: 1 });
+    try {
+      const rows = await sql`SELECT current_database() AS db`;
+      expect(rows[0].db).toBe("fusion");
+    } finally {
+      await sql.end({ timeout: 5 });
+    }
+  });
+
+  it("ensureDatabase is idempotent: re-starting and ensuring the same DB does not error", async () => {
+    const dataDir = makeDataDir();
+    const lifecycle = new EmbeddedPostgresLifecycle(baseOptions(dataDir));
+    tracked.push({ lifecycle, dataDir });
+
+    await lifecycle.start();
+    await lifecycle.ensureDatabase();
+    await lifecycle.ensureDatabase();
+  });
+
   it("still resolves optimistically when the joined instance is unreachable", async () => {
     const dataDir = makeDataDir();
     writeFileSync(join(dataDir, "PG_VERSION"), "15\n");

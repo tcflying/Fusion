@@ -1001,21 +1001,29 @@ function isDuplicateDatabaseError(error: unknown): boolean {
 }
 
 function isAlreadyRunning(dataDir: string): { port: number; database: string } | null {
-  // Check in-process registry first
   const cached = runningInstances.get(dataDir);
-  if (cached) return cached;
+  const postmaster = readPostmasterPidSnapshot(dataDir);
+  const ownsExpectedDataDir = postmaster !== null
+    && normalizeIdentityPath(postmaster.dataDir) === normalizeIdentityPath(dataDir);
+  const postmasterIsLive = postmaster !== null
+    && ownsExpectedDataDir
+    && isProcessRunning(postmaster.pid);
 
-  // Check postmaster.pid — another process (or a prior call) may have started PG
-  if (!existsSync(join(dataDir, "postmaster.pid"))) return null;
+  if (cached && postmasterIsLive) return cached;
+  if (cached) runningInstances.delete(dataDir);
+  if (!postmaster || !ownsExpectedDataDir) return null;
 
-  // Read the port from postmaster.pid
+  if (!postmasterIsLive) {
+    try {
+      unlinkSync(join(dataDir, "postmaster.pid"));
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
   const port = readPortFromPostmasterPid(dataDir);
-  if (!port) return null;
-
-  // Probe: can we connect to this port?
-  // We return the port optimistically — the connection layer will fail fast
-  // if the port is stale (postmaster.pid left over from a crash).
-  return { port, database: "fusion" };
+  return port ? { port, database: "fusion" } : null;
 }
 
 /**
