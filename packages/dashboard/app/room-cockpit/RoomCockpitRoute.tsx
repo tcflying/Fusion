@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Workflow } from "lucide-react";
 import type { RoomCockpitProjectionV1 as EngineRoomCockpitProjectionV1 } from "@fusion/engine";
+import { withTokenHeader } from "../auth";
 import { ViewHeader } from "../components/ViewHeader";
 import {
   RoomCockpitView,
@@ -12,6 +13,11 @@ import {
   type RoomCockpitTaskStateV1,
   type RoomCockpitViewStateV1,
 } from "./RoomCockpitView";
+import {
+  connectRoomCockpitLiveEvents,
+  getRoomCockpitBrowserEventSourceFactory,
+  type RoomCockpitEventSourceFactory,
+} from "./roomCockpitLiveEvents";
 
 export type RoomCockpitProjectionV1 = EngineRoomCockpitProjectionV1;
 
@@ -22,12 +28,20 @@ export interface RoomCockpitRouteProps {
   readonly initialRoomId?: string;
   readonly onClose: () => void;
   readonly fetchProjection?: RoomCockpitProjectionFetcher;
+  readonly eventSourceFactory?: RoomCockpitEventSourceFactory;
 }
 
 interface RoomCockpitRouteSnapshot {
   readonly state: RoomCockpitViewStateV1;
   readonly projection?: RoomCockpitProjectionV1;
   readonly detail: string;
+}
+
+interface RoomCockpitLiveStreamState {
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly state: "connecting" | "connected" | "unavailable";
+  readonly unavailableDetail?: string;
 }
 
 const ROOM_TASK_STATES = new Set<RoomCockpitTaskStateV1>([
@@ -290,26 +304,34 @@ function initialSnapshot(projectId: string | undefined, roomId: string | null): 
  * an absent, unavailable, or malformed backend explicit instead of synthesizing
  * tasks, capacity, confidence, or operator actions from dashboard state.
  */
-export function RoomCockpitRoute({ projectId, initialRoomId, onClose, fetchProjection = globalThis.fetch }: RoomCockpitRouteProps) {
+export function RoomCockpitRoute({
+  projectId,
+  initialRoomId,
+  onClose,
+  fetchProjection = globalThis.fetch,
+  eventSourceFactory,
+}: RoomCockpitRouteProps) {
   const normalizedInitialRoomId = normalizeRoomId(initialRoomId);
   const [draftRoomId, setDraftRoomId] = useState(normalizedInitialRoomId ?? "");
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(normalizedInitialRoomId);
   const [snapshot, setSnapshot] = useState<RoomCockpitRouteSnapshot>(() => initialSnapshot(projectId, normalizedInitialRoomId));
   const requestEpochRef = useRef(0);
+  const liveStreamEpochRef = useRef(0);
+  const liveStreamStateRef = useRef<RoomCockpitLiveStreamState | null>(null);
 
-  const loadRoom = useCallback(async (roomId: string | null) => {
+  const loadRoom = useCallback(async (roomId: string | null, loadingDetail = "Loading the verified Room projection.") => {
     const requestEpoch = ++requestEpochRef.current;
     if (!projectId || !roomId) {
       setSnapshot(initialSnapshot(projectId, roomId));
       return;
     }
 
-    setSnapshot({ state: "loading", detail: "Loading the verified Room projection." });
+    setSnapshot({ state: "loading", detail: loadingDetail });
     const query = new URLSearchParams({ projectId });
     const path = `/api/rooms/${encodeURIComponent(roomId)}?${query.toString()}`;
 
     try {
-      const response = await fetchProjection(path, { headers: { accept: "application/json" } });
+      const response = await fetchProjection(path, { headers: withTokenHeader({ accept: "application/json" }) });
       const payload = await readResponsePayload(response);
       if (requestEpoch !== requestEpochRef.current) return;
 
@@ -350,6 +372,19 @@ export function RoomCockpitRoute({ projectId, initialRoomId, onClose, fetchProje
         });
         return;
       }
+      const liveStreamState = liveStreamStateRef.current;
+      if (
+        liveStreamState?.projectId === projectId
+        && liveStreamState.roomId === roomId
+        && liveStreamState.state === "unavailable"
+      ) {
+        setSnapshot({
+          state: "degraded",
+          detail: liveStreamState.unavailableDetail
+            ?? "Room live-event delivery is unavailable. The canonical projection is withheld until the cursor reconnects and is reconciled.",
+        });
+        return;
+      }
       setSnapshot({ state: "ready", projection: candidate, detail: "Verified Room projection loaded." });
     } catch (error) {
       if (requestEpoch !== requestEpochRef.current) return;
@@ -366,6 +401,76 @@ export function RoomCockpitRoute({ projectId, initialRoomId, onClose, fetchProje
       requestEpochRef.current += 1;
     };
   }, [loadRoom, selectedRoomId]);
+
+  useEffect(() => {
+    const roomId = selectedRoomId;
+    const streamEpoch = ++liveStreamEpochRef.current;
+    if (!projectId || !roomId) {
+      liveStreamStateRef.current = null;
+      return () => {
+        if (liveStreamEpochRef.current === streamEpoch) liveStreamEpochRef.current += 1;
+      };
+    }
+
+    const isCurrentStream = () => liveStreamEpochRef.current === streamEpoch;
+    liveStreamStateRef.current = { projectId, roomId, state: "connecting" };
+    const sourceFactory = eventSourceFactory ?? getRoomCockpitBrowserEventSourceFactory();
+    if (!sourceFactory) {
+      const unavailableDetail = "This browser cannot open the authenticated Room live-event stream. The cockpit withholds stale health and capacity until a canonical projection can be reconciled.";
+      liveStreamStateRef.current = { projectId, roomId, state: "unavailable", unavailableDetail };
+      requestEpochRef.current += 1;
+      setSnapshot({
+        state: "degraded",
+        detail: unavailableDetail,
+      });
+      return () => {
+        if (liveStreamEpochRef.current === streamEpoch) {
+          liveStreamEpochRef.current += 1;
+          liveStreamStateRef.current = null;
+        }
+      };
+    }
+
+    const connection = connectRoomCockpitLiveEvents({
+      scope: { projectId, roomId },
+      eventSourceFactory: sourceFactory,
+      onOpen: ({ reconnected, cursor }) => {
+        if (!isCurrentStream()) return;
+        liveStreamStateRef.current = { projectId, roomId, state: "connected" };
+        if (!reconnected) return;
+        void loadRoom(roomId, `Reconciling canonical Room event cursor ${cursor ?? "from the durable ledger"}.`);
+      },
+      onReconnecting: ({ attempt, cursor }) => {
+        if (!isCurrentStream()) return;
+        const unavailableDetail = `Room live-event stream is unavailable or reconnecting (attempt ${attempt}, cursor ${cursor ?? "not established"}). It may be disconnected, disabled, or returning HTTP 503. The last projection is withheld until canonical cursor reconciliation succeeds.`;
+        liveStreamStateRef.current = { projectId, roomId, state: "unavailable", unavailableDetail };
+        requestEpochRef.current += 1;
+        setSnapshot({
+          state: "degraded",
+          detail: unavailableDetail,
+        });
+      },
+      onEvent: ({ cursor, reconciliationRequired }) => {
+        if (!isCurrentStream()) return;
+        if (reconciliationRequired) {
+          requestEpochRef.current += 1;
+          setSnapshot({
+            state: "degraded",
+            detail: `Room event cursor ${cursor} requires durable reconciliation. Health and capacity remain withheld until a fresh canonical projection is read.`,
+          });
+        }
+        void loadRoom(roomId, `Reconciling canonical Room event cursor ${cursor}.`);
+      },
+    });
+
+    return () => {
+      if (liveStreamEpochRef.current === streamEpoch) {
+        liveStreamEpochRef.current += 1;
+        liveStreamStateRef.current = null;
+      }
+      connection.close();
+    };
+  }, [eventSourceFactory, loadRoom, projectId, selectedRoomId]);
 
   const handleSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
