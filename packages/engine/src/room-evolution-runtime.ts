@@ -15,6 +15,7 @@ import {
   type RoomEvolutionCanaryLedgerAdapterDependenciesV1,
 } from "./room-evolution-canary-ledger-adapter.js";
 import {
+  ROOM_EVOLUTION_CANARY_ROLLBACK_COORDINATOR_CONTRACT_VERSION,
   RoomEvolutionCanaryRollbackCoordinator,
   type EvaluateAndRollbackRoomEvolutionCanaryInputV1,
   type RoomEvolutionCanaryRollbackCoordinatorDependenciesV1,
@@ -388,7 +389,7 @@ export class RoomEvolutionRuntime {
     if (promotionResult.value.status !== "committed") {
       return withheld("promotion_decision", `promotion_${promotionResult.value.status}`);
     }
-    if (promotionResult.value.decision.outcome !== "promoted" || promotionResult.value.decision.runtimeAction !== "promote_candidate") {
+    if (promotionResult.value.decision.outcome !== "promoted") {
       return freeze({
         status: "promotion_not_executed" as const,
         candidate: materializedCandidate,
@@ -396,6 +397,9 @@ export class RoomEvolutionRuntime {
         decisionId: promotionResult.value.decision.id,
         decisionOutcome: promotionResult.value.decision.outcome,
       });
+    }
+    if (promotionResult.value.decision.runtimeAction !== "promote_candidate") {
+      return withheld("promotion_decision", "promotion_runtime_action_mismatch");
     }
 
     const promotionCommandRequest = buildPromotionCommandRequest(
@@ -623,7 +627,7 @@ function validateEvaluationResult(
   expected: RoomEvolutionRuntimeIndependentEvaluationRequestV1,
 ): string | null {
   if (!isRecord(value) || value.contractVersion !== ROOM_EVOLUTION_RUNTIME_CONTRACT_VERSION) return "evaluation_contract_invalid";
-  if (!sameScopeProject(value.scope, expected.candidate.scope)) return "evaluation_scope_project_mismatch";
+  if (!sameScope(value.scope, expected.candidate.scope)) return "evaluation_scope_mismatch";
   if (value.candidateId !== expected.candidate.candidateId
     || value.candidateVersionId !== expected.candidate.candidateVersionId
     || value.candidateArtifactHash !== expected.candidate.candidateArtifactHash
@@ -636,21 +640,21 @@ function validateEvaluationResult(
     return "independent_evaluator_required";
   }
   if (!isIdentifier(value.evaluatorBindingId) || !isEvidence(value.evidence)) return "evaluation_evidence_invalid";
-  if (!isRecord(value.canary) || !isRecord(value.promotion)) return "evaluation_components_missing";
-  const canary = value.canary as EvaluateAndRollbackRoomEvolutionCanaryInputV1;
-  if (!sameScopeProject(canary.scope, expected.candidate.scope)
+  if (!isCanaryRollbackInput(value.canary)) return "canary_evaluation_unbound";
+  const canary = value.canary;
+  if (!sameScope(canary.scope, expected.candidate.scope)
     || canary.canaryId !== expected.canary.canaryId
     || canary.candidateProducerActorId !== expected.candidate.candidateProducerActorId
     || canary.decisionActorId !== value.evaluatorActorId
     || !sameValue(canary.evidence, value.evidence)
-    || !isRecord(canary.evaluation)
-    || hashRoomValue(canary.evaluation.allocation) !== expected.canary.allocationHash
+    || !matchesHash(canary.evaluation.allocation, expected.canary.allocationHash)
     || canary.evaluation.allocation.candidateVersionId !== expected.candidate.candidateVersionId
     || canary.evaluation.allocation.candidateHash !== expected.candidate.candidateArtifactHash) {
     return "canary_evaluation_unbound";
   }
-  const promotion = value.promotion as RequestRoomEvolutionPromotionCommitV1;
-  if (!sameCommand(promotion.command, expected.command) || !isRecord(promotion.evaluation)) return "promotion_evaluation_unbound";
+  if (!isPromotionCommitRequest(value.promotion)) return "promotion_evaluation_unbound";
+  const promotion = value.promotion;
+  if (!sameCommand(promotion.command, expected.command)) return "promotion_evaluation_unbound";
   const promotionEvaluation = promotion.evaluation;
   if (!isRecord(promotionEvaluation.proposal)
     || promotionEvaluation.proposal.candidateHash !== expected.candidate.candidateArtifactHash
@@ -759,8 +763,12 @@ function sameCommand(left: unknown, right: RoomEvolutionRuntimeCommandIdentityV1
     && left.causationId === right.causationId;
 }
 
-function sameScopeProject(value: unknown, expected: RoomEvolutionLedgerScope): boolean {
-  return isRecord(value) && value.projectId === expected.projectId;
+function sameScope(value: unknown, expected: RoomEvolutionLedgerScope): value is RoomEvolutionLedgerScope {
+  return isRecord(value)
+    && value.projectId === expected.projectId
+    && value.roomId === expected.roomId
+    && value.scopeKind === expected.scopeKind
+    && value.scopeKey === expected.scopeKey;
 }
 
 function cloneCommand(value: RoomEvolutionRuntimeCommandIdentityV1): RoomEvolutionRuntimeCommandIdentityV1 {
@@ -801,9 +809,104 @@ function isEvidence(value: unknown): value is readonly RoomEvolutionEvidenceRefV
   });
 }
 
+function isCanaryRollbackInput(value: unknown): value is EvaluateAndRollbackRoomEvolutionCanaryInputV1 {
+  return isRecord(value)
+    && value.contractVersion === ROOM_EVOLUTION_CANARY_ROLLBACK_COORDINATOR_CONTRACT_VERSION
+    && isScope(value.scope)
+    && isIdentifier(value.experimentId)
+    && isIdentifier(value.canaryId)
+    && isIdentifier(value.promotionDecisionId)
+    && isIdentifier(value.rollbackId)
+    && isIdentifier(value.candidateProducerActorId)
+    && isIdentifier(value.decisionActorId)
+    && value.candidateProducerActorId !== value.decisionActorId
+    && (value.riskClass === "low" || value.riskClass === "moderate" || value.riskClass === "high" || value.riskClass === "critical")
+    && (value.authorityTier === "automatic_pre_authorized" || value.authorityTier === "independent" || value.authorityTier === "human")
+    && (value.approvalRequestId === null || isIdentifier(value.approvalRequestId))
+    && isRecord(value.authorizationEvidence)
+    && isEvidence(value.evidence)
+    && isCanaryEvaluation(value.evaluation);
+}
+
+function isCanaryEvaluation(value: unknown): boolean {
+  return isRecord(value)
+    && value.contractVersion === ROOM_EVOLUTION_RUNTIME_CONTRACT_VERSION
+    && isRecord(value.allocation)
+    && isIdentifier(value.allocation.id)
+    && isIdentifier(value.allocation.projectId)
+    && isIdentifier(value.allocation.candidateVersionId)
+    && isHash(value.allocation.candidateHash)
+    && isIdentifier(value.allocation.rollbackTargetVersionId)
+    && Array.isArray(value.allocation.roomIds)
+    && value.allocation.roomIds.every(isIdentifier)
+    && isTimestamp(value.evaluatedAt)
+    && Array.isArray(value.roomOutcomes);
+}
+
+function isPromotionCommitRequest(value: unknown): value is RequestRoomEvolutionPromotionCommitV1 {
+  return isRecord(value)
+    && hasExactKeys(value, ["command", "decisionId", "evaluation"])
+    && isCommand(value.command)
+    && isIdentifier(value.decisionId)
+    && isPromotionEvaluation(value.evaluation);
+}
+
+function isPromotionEvaluation(value: unknown): boolean {
+  return isRecord(value)
+    && value.contractVersion === ROOM_EVOLUTION_RUNTIME_CONTRACT_VERSION
+    && isRecord(value.proposal)
+    && isIdentifier(value.proposal.id)
+    && isHash(value.proposal.candidateHash)
+    && Array.isArray(value.proposal.proposerBindingIds)
+    && value.proposal.proposerBindingIds.every(isIdentifier)
+    && isTimestamp(value.proposal.requestedAt)
+    && Array.isArray(value.requiredHardGateIds)
+    && value.requiredHardGateIds.every(isIdentifier)
+    && Array.isArray(value.hardGateResults)
+    && value.hardGateResults.every(isPromotionHardGateResult)
+    && Array.isArray(value.risks)
+    && (value.canary === null || isPromotionCanaryEvidence(value.canary))
+    && isTimestamp(value.evaluatedAt);
+}
+
+function isPromotionHardGateResult(value: unknown): boolean {
+  return isRecord(value)
+    && isIdentifier(value.gateId)
+    && (value.status === "passed" || value.status === "failed")
+    && Array.isArray(value.evaluatorBindingIds)
+    && value.evaluatorBindingIds.every(isIdentifier)
+    && isHash(value.evidenceHash);
+}
+
+function isPromotionCanaryEvidence(value: unknown): boolean {
+  return isRecord(value)
+    && value.source === "durable_room_evolution_canary_ledger"
+    && isIdentifier(value.canaryId)
+    && isHash(value.candidateHash)
+    && isTimestamp(value.completedAt)
+    && Array.isArray(value.evaluatorBindingIds)
+    && value.evaluatorBindingIds.every(isIdentifier);
+}
+
+function isScope(value: unknown): value is RoomEvolutionLedgerScope {
+  return isRecord(value)
+    && isIdentifier(value.projectId)
+    && (value.roomId === null || isIdentifier(value.roomId))
+    && (value.scopeKind === "project" || value.scopeKind === "room")
+    && isIdentifier(value.scopeKey);
+}
+
 function sameValue(left: unknown, right: unknown): boolean {
   try {
     return hashRoomValue(left) === hashRoomValue(right);
+  } catch {
+    return false;
+  }
+}
+
+function matchesHash(value: unknown, expected: string): boolean {
+  try {
+    return hashRoomValue(value) === expected;
   } catch {
     return false;
   }

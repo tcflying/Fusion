@@ -19,6 +19,7 @@ import {
 import {
   RoomEvolutionRuntime,
   type RoomEvolutionRuntimeDependenciesV1,
+  type RoomEvolutionRuntimeIndependentEvaluationResultV1,
   type RunRoomEvolutionRuntimeInputV1,
 } from "../room-evolution-runtime.js";
 
@@ -776,6 +777,36 @@ describe("RoomEvolutionRuntime", () => {
       status: "withheld",
       stage: "independent_evaluation",
       reason: "evaluation_lineage_mismatch",
+    });
+    expect(harnessed.calls).toContain("evaluator");
+    expect(harnessed.calls).not.toContain("promotion-ledger");
+    expect(harnessed.calls).not.toContain("promotion-command");
+    expect(harnessed.calls).not.toContain("rollback-command");
+  });
+
+  it("withholds malformed evaluator promotion evidence before canary execution or promotion", async () => {
+    const harnessed = harness();
+    const originalEvaluate = harnessed.dependencies.evaluator.evaluate;
+    harnessed.dependencies.evaluator.evaluate = vi.fn(async (request) => {
+      const evaluated = await originalEvaluate(request);
+      return {
+        ...evaluated,
+        promotion: {
+          ...evaluated.promotion,
+          evaluation: {
+            ...evaluated.promotion.evaluation,
+            hardGateResults: [null],
+          },
+        },
+      } as unknown as RoomEvolutionRuntimeIndependentEvaluationResultV1;
+    });
+
+    const result = await new RoomEvolutionRuntime(harnessed.dependencies).continueFromDurableCandidate(harnessed.continuation);
+
+    expect(result).toEqual({
+      status: "withheld",
+      stage: "independent_evaluation",
+      reason: "promotion_evaluation_unbound",
     });
     expect(harnessed.calls).toContain("evaluator");
     expect(harnessed.calls).not.toContain("promotion-ledger");
