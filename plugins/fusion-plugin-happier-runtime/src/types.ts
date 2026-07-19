@@ -25,6 +25,21 @@ export const HAPPIER_BACKENDS = ["codex", "claude", "opencode"] as const;
 
 export type HappierBackend = (typeof HAPPIER_BACKENDS)[number];
 
+/**
+ * FNXC:HappierOfficialMcpBridge 2026-07-19-19:29:
+ * A Direct UI operator records the exact already-existing Happier session that
+ * represents a native provider session. Fusion never derives this mapping from
+ * a `codex://`, `claude://`, or `opencode://` URI; writes additionally require
+ * recorded manual takeover evidence from that UI.
+ */
+export interface HappierSessionBinding {
+  readonly canonicalSessionUri: string;
+  readonly happierSessionId: string;
+  readonly serverProfileId: string;
+  readonly machineId: string;
+  readonly takeoverConfirmedAt?: string;
+}
+
 export interface HappierCliSettings {
   executable?: string;
   entrypoint?: string;
@@ -35,6 +50,7 @@ export interface HappierCliSettings {
   webappUrl?: string;
   profile?: string;
   backend?: HappierBackend;
+  happierSessionBindings?: readonly HappierSessionBinding[];
   timeoutMs?: number;
   maxOutputBytes?: number;
 }

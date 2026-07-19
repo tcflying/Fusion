@@ -7,6 +7,7 @@ import {
   type HappierBackend,
   type HappierCliInvocation,
   type HappierCliSettings,
+  type HappierSessionBinding,
   type HappierDirectSessionEnsureResult,
   type HappierDirectSessionEvent,
   type HappierDirectSessionSource,
@@ -119,6 +120,9 @@ export function resolveHappierCliSettings(
     && HAPPIER_BACKENDS.includes(settings.backend as HappierBackend)
     ? settings.backend as HappierBackend
     : undefined;
+  const happierSessionBindings = Array.isArray(settings?.happierSessionBindings)
+    ? settings.happierSessionBindings as readonly HappierSessionBinding[]
+    : undefined;
 
   return {
     executable,
@@ -132,6 +136,7 @@ export function resolveHappierCliSettings(
     webappUrl: nonEmptyString(settings?.webappUrl) ?? nonEmptyString(process.env.HAPPIER_WEBAPP_URL),
     profile: nonEmptyString(settings?.profile) ?? nonEmptyString(process.env.HAPPIER_PROFILE),
     ...(backend ? { backend } : {}),
+    ...(happierSessionBindings ? { happierSessionBindings } : {}),
     timeoutMs: positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     maxOutputBytes: Math.max(
       1,
@@ -809,6 +814,12 @@ function directSessionString(data: HappierJsonRecord, field: string): string {
   return value;
 }
 
+/**
+ * FNXC:HappierOfficialMcpBridge 2026-07-19-19:29:
+ * This argv shape is retained only for an explicitly invoked local extension.
+ * It is not a public Happier CLI contract and the Fusion Session Connector
+ * never selects it; normal routing uses `happier mcp serve` instead.
+ */
 export async function ensureHappierDirectSession(input: {
   uri: string;
   machineId?: string;
@@ -841,6 +852,7 @@ export async function ensureHappierDirectSession(input: {
   };
 }
 
+/** Legacy local-extension probe. It is intentionally absent from production routing. */
 export async function getHappierDirectSessionCapabilities(
   settings?: HappierCliSettings,
   signal?: AbortSignal,

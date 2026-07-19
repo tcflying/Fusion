@@ -14,7 +14,7 @@
   "sessionConnector": {
     "connectorId": "happier",
     "name": "Happier Session Connector",
-    "description": "Official Happier CLI-backed native Session connector",
+    "description": "Official Happier MCP-backed connector for manually bound Sessions",
     "version": "0.2.73"
   }
 }

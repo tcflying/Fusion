@@ -8,6 +8,14 @@ import type {
   SessionConnectorCapabilityState,
 } from "@fusion/core";
 
+/**
+ * FNXC:HappierOfficialMcpBridge 2026-07-19-19:29:
+ * The historical direct-session argv adapter is a local extension, not a
+ * documented Happier public surface. Keep its hashes only for opt-in forensic
+ * compatibility; production connector routing must use external MCP instead.
+ */
+export const HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE = "local_extension_unattested" as const;
+
 export const HAPPIER_DIRECT_SESSION_SOURCE_REVISION = "f07b7317cd4c7f0cfa762189dc68d16750a48182";
 export const HAPPIER_DIRECT_SESSION_PROVIDER_IDS = ["codex", "claude", "opencode"] as const;
 
@@ -32,8 +40,8 @@ export const HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST = {
   contractVersion: 1,
   manifestVersion: "2026-07-17.1",
   reviewedSourceRevision: HAPPIER_DIRECT_SESSION_SOURCE_REVISION,
-  publicCommands: ["capabilities", "ensure", "read-after", "events"],
-  sourceBinding: "ensure_does_not_export_normalized_source",
+  publicCommands: [],
+  sourceBinding: HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE,
   providers: {
     codex: {
       canonicalUri: "codex://threads/<native-session-id>",
@@ -251,7 +259,7 @@ export async function verifyHappierDirectSessionRuntimeBuild(
 
 export type HappierDirectSessionProviderId = (typeof HAPPIER_DIRECT_SESSION_PROVIDER_IDS)[number];
 export type HappierDirectSessionUpstreamSurface =
-  | "public_direct_session_cli"
+  | "local_extension_unattested"
   | "generic_session_cli"
   | "provider_internal"
   | "none";
@@ -318,9 +326,9 @@ function providerRow(
       "unverified",
       "pending_provider_certification",
       null,
-      "public_direct_session_cli",
+      "local_extension_unattested",
       [DIRECT_SESSION_CONTRACT, DIRECT_SESSION_ENSURE, providerOps, FUSION_CLI_ADAPTER, FUSION_CONNECTOR],
-      "Exact source-level attachment exists, but current-build live provider certification remains Task 12.1.",
+      "The argv adapter is a local extension and is never selected by normal Fusion routing.",
     ),
     create: source(
       "unavailable",
@@ -342,19 +350,19 @@ function providerRow(
       "unverified",
       "source_unverified",
       null,
-      "public_direct_session_cli",
+      "local_extension_unattested",
       [DIRECT_SESSION_COMMAND, providerOps, FUSION_CLI_ADAPTER, FUSION_CONNECTOR],
-      "Bounded read-after exists, but ensure does not export the normalized provider source needed to retain source affinity.",
+      "Legacy local-extension transcript access is not an official Happier bridge surface.",
     ),
     events: source(
       "unverified",
       "source_unverified",
       null,
-      "public_direct_session_cli",
+      "local_extension_unattested",
       [DIRECT_SESSION_COMMAND, providerOps, FUSION_CLI_ADAPTER, FUSION_CONNECTOR],
       statusSemantics === "activity_poll_with_busy_signal"
-        ? "Polling maps OpenCode busy, but the connector cannot yet retain the normalized source returned during discovery."
-        : "Polling has no native running signal and the connector cannot yet retain the normalized discovery source.",
+        ? "Legacy local-extension polling remains unattested and disabled in normal routing."
+        : "Legacy local-extension polling remains unattested and disabled in normal routing.",
     ),
     send: source(
       "unverified",
@@ -397,16 +405,16 @@ function providerRow(
       "Typed runtime health is wired, but it is not yet certified per concrete provider Session binding.",
     ),
     deepLinks: source(
-      "verified",
+      "unverified",
+      "source_unverified",
       null,
-      `direct-session-open-url-${providerId}`,
-      "public_direct_session_cli",
+      "local_extension_unattested",
       [DIRECT_SESSION_CONTRACT, FUSION_CLI_ADAPTER, FUSION_CONNECTOR],
       nativeDeepLink === "certified"
-        ? "Happier and native Codex links are certified as distinct identities."
+        ? "Legacy link metadata is not a certified official bridge surface."
         : nativeDeepLink === "canonical_uri_only"
-          ? "The Happier link is certified; the Codex URI shape is known but native Windows opening is not certified."
-          : "The Happier link is certified; this provider's native IDE link intentionally remains null.",
+          ? "The URI shape is historical local-extension metadata, not a certified official bridge surface."
+          : "This provider has no certified native link from the official bridge.",
     ),
   });
   return Object.freeze({

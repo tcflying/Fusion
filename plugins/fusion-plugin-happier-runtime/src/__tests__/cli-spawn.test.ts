@@ -34,6 +34,7 @@ import {
   HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST,
 } from "../happier-direct-session-capabilities.js";
 import type { HappierCliSettings } from "../types.js";
+import * as packageEntrypoint from "../index.js";
 
 const CREATE_SUCCESS =
   '{"v":1,"ok":true,"kind":"session_create","data":{"session":{"id":" sess_integration_create_123 ","tag":"MyTag","title":"My Title","active":true},"created":true}}';
@@ -55,45 +56,19 @@ const DIRECT_STATUS_EVENT =
   '{"v":1,"ok":true,"kind":"direct_session_status_delta","data":{"eventType":"status","machineId":"machine-1","providerId":"codex","remoteSessionId":"remote-1","sessionId":"session-1","source":{"kind":"codexHome","home":"user"},"isRunning":true,"lastActivityAtMs":1752729001000,"observedAtMs":1752729001500}}';
 
 /*
-FNXC:HappierManifestContract 2026-07-17-19:53:
-This literal mirrors Happier apps/cli/src/cli/commands/directSession/capabilities.ts rather than spreading Fusion's manifest into the fake upstream response. Equality proves the two repositories agree on the declared manifest and file-hash review boundary; it does not certify every executable behavior, unlisted source drift, or a live provider.
+FNXC:HappierOfficialMcpBridge 2026-07-19-19:29:
+The direct-session argv probe is only a legacy local-extension fixture. It is
+not treated as official Happier capability evidence or as production routing.
 */
-const UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE = {
-  contractVersion: 1,
-  manifestVersion: "2026-07-17.1",
-  reviewedSourceRevision: "f07b7317cd4c7f0cfa762189dc68d16750a48182",
-  publicCommands: ["capabilities", "ensure", "read-after", "events"],
-  sourceBinding: "ensure_does_not_export_normalized_source",
-  providers: {
-    codex: {
-      canonicalUri: "codex://threads/<native-session-id>",
-      transcript: "bounded_polling",
-      runningSignal: "unavailable",
-      takeover: "provider_internal_only",
-    },
-    claude: {
-      canonicalUri: "claude://sessions/<native-session-id>",
-      transcript: "bounded_polling",
-      runningSignal: "unavailable",
-      takeover: "provider_internal_only",
-    },
-    opencode: {
-      canonicalUri: "opencode://sessions/<native-session-id>",
-      transcript: "bounded_polling",
-      runningSignal: "busy",
-      takeover: "provider_internal_only",
-    },
-  },
-} as const;
-const UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE =
-  "sha256:f6675f1e96e156a3e0b8bad8bb28e8e8f94f769164647a636ba6713929d65200";
+const LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE = HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST;
+const LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE = HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT;
 const DIRECT_CAPABILITIES_SUCCESS = JSON.stringify({
   v: 1,
   ok: true,
   kind: "direct_session_capabilities",
   data: {
-    ...UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE,
-    fingerprint: UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE,
+    ...LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE,
+    fingerprint: LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE,
     cliVersion: "0.2.10",
   },
 });
@@ -393,10 +368,10 @@ describe("Happier JSON process boundary", () => {
 });
 
 describe("Happier session wrappers", () => {
-  it("reads the Direct Session manifest attestation with exact shell-free argv", async () => {
-    expect(UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE)
+  it("keeps the local-extension manifest probe isolated with exact shell-free argv", async () => {
+    expect(LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE)
       .toEqual(HAPPIER_DIRECT_SESSION_RUNTIME_MANIFEST);
-    expect(UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE)
+    expect(LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE)
       .toBe(HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT);
 
     const fake = fakeChild();
@@ -406,8 +381,8 @@ describe("Happier session wrappers", () => {
     fake.close(0);
 
     await expect(promise).resolves.toEqual({
-      ...UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE,
-      fingerprint: UPSTREAM_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE,
+      ...LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_MANIFEST_FIXTURE,
+      fingerprint: LOCAL_HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT_FIXTURE,
       cliVersion: "0.2.10",
     });
     expect(mockSpawn).toHaveBeenCalledWith(
@@ -428,7 +403,7 @@ describe("Happier session wrappers", () => {
     expect(mockSpawn).not.toHaveBeenCalled();
   });
 
-  it("ensures a direct session with exact shell-free argv and stack settings", async () => {
+  it("retains the direct-session argv only as an explicit local-extension call", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
     const uri = "happier://direct/session?provider=codex&name=$(whoami)";
@@ -568,7 +543,7 @@ describe("Happier session wrappers", () => {
     },
   );
 
-  it("reads the official Direct Session transcript from a nullable startup cursor", async () => {
+  it("reads a legacy local Direct Session transcript from a nullable startup cursor", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
     const promise = readHappierDirectSessionTranscript({
@@ -652,7 +627,7 @@ describe("Happier session wrappers", () => {
     ]);
   });
 
-  it("streams bounded official Direct Session NDJSON and terminates on iterator return", async () => {
+  it("streams bounded legacy local Direct Session NDJSON and terminates on iterator return", async () => {
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
     const stream = followHappierDirectSessionTranscriptEvents({
@@ -973,10 +948,14 @@ describe("Happier session wrappers", () => {
 });
 
 describe("package entrypoint", () => {
-  it("exports the Task 1 contract from src/index.ts", async () => {
-    const entry = await import("../index.js");
-    expect(entry.createHappierSession).toBeTypeOf("function");
-    expect(entry.ensureHappierDirectSession).toBeTypeOf("function");
-    expect(entry.invokeHappierJson).toBeTypeOf("function");
+  /*
+   * FNXC:HappierMcp 2026-07-19-19:52:
+   * Entry exports are a module-load contract, not a per-test performance gate.
+   * Keep this import at module scope so parallel Vite transforms cannot mask it.
+   */
+  it("exports the Task 1 contract from src/index.ts", () => {
+    expect(packageEntrypoint.createHappierSession).toBeTypeOf("function");
+    expect(packageEntrypoint.ensureHappierDirectSession).toBeTypeOf("function");
+    expect(packageEntrypoint.invokeHappierJson).toBeTypeOf("function");
   }, 15_000);
 });

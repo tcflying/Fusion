@@ -1,21 +1,20 @@
 import {
   hashRoomValue,
   SESSION_CONNECTOR_CAPABILITIES,
-  SESSION_CONNECTOR_HISTORY_PAGE_LIMIT,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorCapabilityCertificationV1,
+  type SessionConnectorCapabilityName,
   type SessionConnectorCapabilityReasonCode,
   type SessionConnectorControlRequestV1,
   type SessionConnectorControlResultV1,
   type SessionConnectorCreateRequestV1,
-  type SessionConnectorDeepLinksV1,
   type SessionConnectorDeepLinksRequestV1,
+  type SessionConnectorDeepLinksV1,
   type SessionConnectorEnsureExistingRequestV1,
   type SessionConnectorEnsureExistingResultV1,
   type SessionConnectorEventV1,
-  type SessionConnectorHealthV1,
   type SessionConnectorHealthReasonCode,
-  type SessionConnectorHistoryItemV1,
+  type SessionConnectorHealthV1,
   type SessionConnectorHistoryPageV1,
   type SessionConnectorHistoryRequestV1,
   type SessionConnectorIdentityV1,
@@ -28,50 +27,43 @@ import {
 
 import {
   buildHappierSessionOpenUrl,
-  ensureHappierDirectSession,
-  followHappierDirectSessionTranscriptEvents,
-  getHappierDirectSessionCapabilities,
-  getHappierSessionStatus,
-  readHappierDirectSessionTranscript,
   resolveHappierCliSettings,
-  sendHappierMessage,
 } from "./cli-spawn.js";
-import { probeHappierRuntime } from "./probe.js";
+import { HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE } from "./happier-direct-session-capabilities.js";
 import {
-  HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX,
-  HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
-  HAPPIER_DIRECT_SESSION_PROVIDER_IDS,
-  HAPPIER_DIRECT_SESSION_SOURCE_REVISION,
-  isCertifiedHappierDirectSessionRuntimeManifest,
-  isHappierDirectSessionProviderId,
-  verifyHappierDirectSessionRuntimeBuild,
-} from "./happier-direct-session-capabilities.js";
+  HAPPIER_OFFICIAL_MCP_TOOLS,
+  openHappierMcpClient,
+  type HappierMcpClient,
+  type HappierMcpClientFactory,
+  type HappierMcpToolResult,
+} from "./happier-mcp-client.js";
+import { probeHappierRuntime } from "./probe.js";
 import {
   HappierCliError,
   type HappierBackend,
   type HappierCliSettings,
-  type HappierDirectSessionStatusDelta,
-  type HappierDirectSessionTranscriptDelta,
-  type HappierSessionStatusResult,
+  type HappierJsonRecord,
+  type HappierSessionBinding,
 } from "./types.js";
+import {
+  HAPPIER_OFFICIAL_MCP_SOURCE_REVISION,
+  HAPPIER_SESSION_CONNECTOR_ID,
+  HAPPIER_SESSION_CONNECTOR_VERSION,
+} from "./session-connector-contract.js";
 
-export const HAPPIER_SESSION_CONNECTOR_ID = "happier";
-export const HAPPIER_SESSION_CONNECTOR_VERSION = "0.2.73";
-export * from "./happier-direct-session-capabilities.js";
+export {
+  HAPPIER_OFFICIAL_MCP_SOURCE_REVISION,
+  HAPPIER_SESSION_CONNECTOR_ID,
+  HAPPIER_SESSION_CONNECTOR_VERSION,
+} from "./session-connector-contract.js";
 
-const DIRECT_MESSAGE_CURSOR_PREFIX = "happier-direct-message-v1:";
 const DEFAULT_SEND_TIMEOUT_SECONDS = 300;
-const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000;
-const MAX_RATE_LIMIT_COOLDOWN_MS = 604_800_000;
+const HAPPIER_BINDING_REQUIRED = "happier_session_binding_required";
+const HAPPIER_MCP_CAPABILITY_REQUIRED = "official_mcp_capability_required";
+const HAPPIER_TAKEOVER_REQUIRED = "happier_direct_ui_takeover_required";
 
 export interface HappierSessionConnectorDependencies {
-  readonly ensureDirectSession: typeof ensureHappierDirectSession;
-  readonly getSessionStatus: typeof getHappierSessionStatus;
-  readonly readDirectTranscript: typeof readHappierDirectSessionTranscript;
-  readonly followDirectTranscriptEvents: typeof followHappierDirectSessionTranscriptEvents;
-  readonly getDirectSessionCapabilities: typeof getHappierDirectSessionCapabilities;
-  readonly verifyRuntimeBuild: typeof verifyHappierDirectSessionRuntimeBuild;
-  readonly sendMessage: typeof sendHappierMessage;
+  readonly openMcpClient: HappierMcpClientFactory;
   readonly probeRuntime: typeof probeHappierRuntime;
 }
 
@@ -80,47 +72,783 @@ export interface HappierSessionConnectorOptions {
   readonly version?: string;
   readonly sourceRevision?: string;
   readonly sendTimeoutSeconds?: number;
-  readonly rateLimitCooldownMs?: number;
   readonly now?: () => string;
   readonly dependencies?: Partial<HappierSessionConnectorDependencies>;
 }
 
+type CanonicalSession = Readonly<{
+  canonicalSessionUri: string;
+  providerId: HappierBackend;
+  nativeSessionId: string;
+}>;
+
+type PersistedBinding = CanonicalSession & Readonly<{
+  happierSessionId: string;
+  serverProfileId: string;
+  machineId: string;
+  takeoverConfirmedAt: string | null;
+}>;
+
+type BoundIdentity = Readonly<{
+  providerId: HappierBackend;
+  nativeSessionId: string;
+  happierSessionId: string;
+  serverProfileId: string;
+  machineId: string;
+}>;
+
 const defaultDependencies: HappierSessionConnectorDependencies = {
-  ensureDirectSession: ensureHappierDirectSession,
-  getSessionStatus: getHappierSessionStatus,
-  readDirectTranscript: readHappierDirectSessionTranscript,
-  followDirectTranscriptEvents: followHappierDirectSessionTranscriptEvents,
-  getDirectSessionCapabilities: getHappierDirectSessionCapabilities,
-  verifyRuntimeBuild: verifyHappierDirectSessionRuntimeBuild,
-  sendMessage: sendHappierMessage,
+  openMcpClient: openHappierMcpClient,
   probeRuntime: probeHappierRuntime,
 };
 
-function unavailableCertification(reasonCode: SessionConnectorCapabilityReasonCode) {
-  return {
-    state: "unavailable" as const,
-    evidenceRef: null,
-    reasonCode,
-    lastVerifiedAt: null,
-  };
+function isRecord(value: unknown): value is HappierJsonRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function unverifiedCertification(reasonCode: SessionConnectorCapabilityReasonCode) {
-  return {
-    state: "unverified" as const,
-    evidenceRef: null,
-    reasonCode,
-    lastVerifiedAt: null,
-  };
+function nonEmptyString(value: unknown, maximum = 2_000): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > maximum || /[\u0000-\u001f\u007f]/u.test(trimmed)) return undefined;
+  return trimmed;
 }
 
-function verifiedCertification(evidenceRef: string, verifiedAt: string) {
-  return {
-    state: "verified" as const,
-    evidenceRef,
-    reasonCode: null,
-    lastVerifiedAt: verifiedAt,
-  };
+function failure<T>(
+  code: "unavailable" | "unverified" | "degraded" | "invalid_request" | "authentication_required" | "not_found" | "ambiguous" | "host_unavailable" | "rate_limited" | "conflict" | "transport" | "delivery_uncertain" | "internal",
+  message: string,
+  retryable: boolean,
+  safeDetails?: Readonly<Record<string, unknown>>,
+): SessionConnectorResultV1<T> {
+  return { ok: false, error: { code, message, retryable, ...(safeDetails ? { safeDetails } : {}) } };
+}
+
+function unavailableCertification(reasonCode: SessionConnectorCapabilityReasonCode): SessionConnectorCapabilityCertificationV1 {
+  return { state: "unavailable", evidenceRef: null, reasonCode, lastVerifiedAt: null };
+}
+
+function unverifiedCertification(reasonCode: SessionConnectorCapabilityReasonCode): SessionConnectorCapabilityCertificationV1 {
+  return { state: "unverified", evidenceRef: null, reasonCode, lastVerifiedAt: null };
+}
+
+function verifiedCertification(evidenceRef: string, verifiedAt: string): SessionConnectorCapabilityCertificationV1 {
+  return { state: "verified", evidenceRef, reasonCode: null, lastVerifiedAt: verifiedAt };
+}
+
+function unsupportedOperation<T>(operation: string): SessionConnectorResultV1<T> {
+  return failure(
+    "unavailable",
+    `Happier MCP does not expose a certified ${operation} operation for provider-native sessions`,
+    false,
+    {
+      bridge: "official_mcp_stdio",
+      localExtensionState: HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE,
+    },
+  );
+}
+
+function bindingRequired<T>(operation: string): SessionConnectorResultV1<T> {
+  return failure(
+    "unavailable",
+    `A persisted Happier Session binding is required before Fusion can ${operation}. In Direct UI, bind the existing Codex, Claude, or OpenCode session to its Happier session id.`,
+    false,
+    {
+      bindingState: HAPPIER_BINDING_REQUIRED,
+      bridge: "official_mcp_stdio",
+      localExtensionState: HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE,
+    },
+  );
+}
+
+function mcpCapabilityRequired<T>(missingTools: readonly string[]): SessionConnectorResultV1<T> {
+  return failure(
+    "unavailable",
+    "The official Happier MCP server does not expose the required Session control tool. Update or enable the Happier MCP external surface, then bind the session again in Direct UI.",
+    false,
+    {
+      bindingState: HAPPIER_MCP_CAPABILITY_REQUIRED,
+      bridge: "official_mcp_stdio",
+      missingTools: [...missingTools].sort(),
+      localExtensionState: HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE,
+    },
+  );
+}
+
+function takeoverRequired<T>(): SessionConnectorResultV1<T> {
+  return failure(
+    "unavailable",
+    "Direct UI Take over is required before Fusion can write to this Happier Session.",
+    false,
+    {
+      bindingState: HAPPIER_TAKEOVER_REQUIRED,
+      bridge: "official_mcp_stdio",
+    },
+  );
+}
+
+function parseCanonicalSessionUri(value: string): CanonicalSession | null {
+  try {
+    const uri = new URL(value);
+    const providerId = uri.protocol.slice(0, -1);
+    if (providerId !== "codex" && providerId !== "claude" && providerId !== "opencode") return null;
+    const expectedHost = providerId === "codex" ? "threads" : "sessions";
+    if (
+      uri.hostname !== expectedHost
+      || uri.username
+      || uri.password
+      || uri.port
+      || uri.search
+      || uri.hash
+    ) return null;
+    const path = uri.pathname.replace(/^\/+/u, "");
+    const nativeSessionId = nonEmptyString(decodeURIComponent(path));
+    if (!nativeSessionId || nativeSessionId.includes("/")) return null;
+    return {
+      canonicalSessionUri: `${providerId}://${expectedHost}/${encodeURIComponent(nativeSessionId)}`,
+      providerId,
+      nativeSessionId,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parsePersistedBinding(value: unknown): PersistedBinding | null {
+  if (!isRecord(value)) return null;
+  const canonical = typeof value.canonicalSessionUri === "string"
+    ? parseCanonicalSessionUri(value.canonicalSessionUri)
+    : null;
+  const happierSessionId = nonEmptyString(value.happierSessionId, 512);
+  const serverProfileId = nonEmptyString(value.serverProfileId, 512);
+  const machineId = nonEmptyString(value.machineId, 512);
+  if (!canonical || !happierSessionId || !serverProfileId || !machineId) return null;
+  const takeoverConfirmedAt = value.takeoverConfirmedAt === undefined
+    ? null
+    : nonEmptyString(value.takeoverConfirmedAt, 128);
+  if (takeoverConfirmedAt === undefined) return null;
+  if (takeoverConfirmedAt !== null && !Number.isFinite(Date.parse(takeoverConfirmedAt))) return null;
+  return { ...canonical, happierSessionId, serverProfileId, machineId, takeoverConfirmedAt };
+}
+
+function mcpResultRecord(result: HappierMcpToolResult, operation: string): HappierJsonRecord {
+  if (result.isError === true) {
+    throw new HappierCliError("session", `Happier MCP ${operation} reported an error`);
+  }
+  if (isRecord(result.structuredContent)) return result.structuredContent;
+  if (Array.isArray(result.content)) {
+    for (const item of result.content) {
+      if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+      try {
+        const parsed: unknown = JSON.parse(item.text);
+        if (isRecord(parsed)) return parsed;
+      } catch {
+        // Continue to the next textual content item; no transcript text is surfaced.
+      }
+    }
+  }
+  throw new HappierCliError("protocol", `Happier MCP ${operation} returned no structured result`);
+}
+
+function sessionIdFromRecord(record: HappierJsonRecord): string | undefined {
+  return nonEmptyString(record.sessionId, 512)
+    ?? (isRecord(record.session) ? nonEmptyString(record.session.id, 512) : undefined)
+    ?? nonEmptyString(record.id, 512);
+}
+
+function statusState(record: HappierJsonRecord): SessionConnectorStatusV1["state"] {
+  const session = isRecord(record.session) ? record.session : record;
+  const agentState = isRecord(record.agentState) ? record.agentState : undefined;
+  const raw = nonEmptyString(agentState?.status)
+    ?? nonEmptyString(agentState?.state)
+    ?? nonEmptyString(session.status)
+    ?? nonEmptyString(session.state);
+  switch (raw?.toLowerCase()) {
+    case "waiting":
+    case "waitingoninput":
+    case "awaiting_input":
+    case "waiting_input":
+      return "waiting_input";
+    case "running":
+    case "active":
+    case "busy":
+    case "starting":
+    case "recovering":
+      return "running";
+    case "paused":
+    case "blocked":
+      return "paused";
+    case "failed":
+    case "error":
+    case "lost":
+    case "unavailable":
+      return "lost";
+    default:
+      return session.active === true ? "idle" : session.active === false ? "lost" : "unknown";
+  }
+}
+
+function isoTimestamp(value: unknown): string | null {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function statusLastActivity(record: HappierJsonRecord): string | null {
+  const session = isRecord(record.session) ? record.session : record;
+  const agentState = isRecord(record.agentState) ? record.agentState : undefined;
+  for (const value of [
+    session.lastActivityAt,
+    session.updatedAt,
+    agentState?.lastActivityAt,
+    agentState?.updatedAt,
+    record.lastActivityAt,
+    record.updatedAt,
+  ]) {
+    const parsed = isoTimestamp(value);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function sessionListContains(record: HappierJsonRecord, expectedSessionId: string): boolean {
+  const sessions = Array.isArray(record.sessions) ? record.sessions : [];
+  return sessions.some((candidate) => isRecord(candidate) && sessionIdFromRecord(candidate) === expectedSessionId);
+}
+
+function missingTools(available: ReadonlySet<string>, required: readonly string[]): string[] {
+  return required.filter((tool) => !available.has(tool));
+}
+
+function validatedToolNames(tools: readonly { name: string }[]): Set<string> {
+  return new Set(tools.map((tool) => tool.name));
+}
+
+function mapMcpFailure<T>(error: unknown): SessionConnectorResultV1<T> {
+  if (!(error instanceof HappierCliError)) {
+    return failure("internal", "Happier MCP connector operation failed", false);
+  }
+  const details = { bridge: "official_mcp_stdio", category: error.code };
+  if (error.code === "authentication") {
+    return failure("authentication_required", "Happier authentication is required", false, details);
+  }
+  if (error.code === "session") {
+    return failure("not_found", "The bound Happier Session was not found", false, details);
+  }
+  if (error.code === "timeout") {
+    return failure("transport", "Happier MCP request timed out", true, details);
+  }
+  if (error.code === "process" || error.code === "server" || error.code === "daemon" || error.code === "backend") {
+    return failure("transport", "Happier MCP transport is unavailable", true, details);
+  }
+  return failure("degraded", "Happier MCP returned an invalid response", false, details);
+}
+
+function toolEvidence(required: readonly string[]): string {
+  return `happier-mcp:tool-discovery:${[...required].sort().join("+")}`;
+}
+
+/**
+ * Provider-neutral bridge for already-bound Happier sessions.
+ *
+ * FNXC:HappierOfficialMcpBridge 2026-07-19-19:29:
+ * Normal Fusion routing never invokes the local `direct-session ensure --uri`
+ * extension. A manually persisted Happier session id is validated through
+ * documented MCP tools, and writes require Direct UI Take over evidence. Tool
+ * discovery proves MCP availability only; it is not same-native-session E2E.
+ */
+export class HappierSessionConnector implements SessionConnectorV1 {
+  readonly contractVersion = 1 as const;
+  readonly id = HAPPIER_SESSION_CONNECTOR_ID;
+  readonly version: string;
+
+  private readonly settings: ReturnType<typeof resolveHappierCliSettings>;
+  private readonly sourceRevision: string;
+  private readonly sendTimeoutSeconds: number;
+  private readonly now: () => string;
+  private readonly dependencies: HappierSessionConnectorDependencies;
+
+  constructor(options: HappierSessionConnectorOptions = {}) {
+    this.settings = resolveHappierCliSettings(options.settings);
+    this.version = options.version?.trim() || HAPPIER_SESSION_CONNECTOR_VERSION;
+    this.sourceRevision = options.sourceRevision?.trim() || HAPPIER_OFFICIAL_MCP_SOURCE_REVISION;
+    this.sendTimeoutSeconds = options.sendTimeoutSeconds ?? DEFAULT_SEND_TIMEOUT_SECONDS;
+    if (!Number.isInteger(this.sendTimeoutSeconds) || this.sendTimeoutSeconds < 1 || this.sendTimeoutSeconds > 3_600) {
+      throw new Error("Happier Session Connector sendTimeoutSeconds must be an integer from 1 through 3600");
+    }
+    this.now = options.now ?? (() => new Date().toISOString());
+    this.dependencies = { ...defaultDependencies, ...(options.dependencies ?? {}) };
+  }
+
+  async getCapabilities(identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
+    const verifiedAt = this.now();
+    const binding = identity ? this.bindingForIdentity(identity) : null;
+    if (!binding) return this.capabilitiesFromTools(new Set<string>(), identity, verifiedAt);
+    let client: HappierMcpClient | undefined;
+    let available = new Set<string>();
+    try {
+      client = await this.dependencies.openMcpClient({ settings: this.settings, sessionId: binding.happierSessionId });
+      available = validatedToolNames(await client.listTools());
+    } catch {
+      // The capability result below remains fail-closed with no claimed MCP tools.
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
+    return this.capabilitiesFromTools(available, identity, verifiedAt);
+  }
+
+  async ensureExisting(
+    input: SessionConnectorEnsureExistingRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorEnsureExistingResultV1>> {
+    const requiredHostId = nonEmptyString(input.requiredHostId);
+    if (
+      input.contractVersion !== 1
+      || !nonEmptyString(input.canonicalSessionUri)
+      || !nonEmptyString(input.idempotencyKey)
+      || !requiredHostId
+    ) {
+      return failure("invalid_request", "A canonical Session URI, host identity, and idempotency key are required", false);
+    }
+    const canonical = parseCanonicalSessionUri(input.canonicalSessionUri);
+    if (!canonical) {
+      return failure("invalid_request", "The canonical native Session URI is invalid", false);
+    }
+    const binding = this.bindingForCanonicalSession(canonical);
+    if (!binding) return bindingRequired("attach this native Session");
+    if (input.requiredMachineId && binding.machineId !== input.requiredMachineId) {
+      return failure("conflict", "The persisted Happier binding belongs to another machine", false);
+    }
+    if (!this.settings.activeServerId?.trim()) {
+      return failure("degraded", "The Happier active server profile is not pinned", false);
+    }
+    if (binding.serverProfileId !== this.settings.activeServerId) {
+      return failure("conflict", "The persisted Happier binding belongs to another server profile", false);
+    }
+    const identity: SessionConnectorIdentityV1 = {
+      connectorId: this.id,
+      providerId: binding.providerId,
+      nativeSessionId: binding.nativeSessionId,
+      happierSessionId: binding.happierSessionId,
+      serverProfileId: binding.serverProfileId,
+      machineId: binding.machineId,
+      hostId: requiredHostId,
+    };
+    return this.withOfficialMcp(
+      binding.happierSessionId,
+      [HAPPIER_OFFICIAL_MCP_TOOLS.list, HAPPIER_OFFICIAL_MCP_TOOLS.status],
+      async (client, available) => {
+        const listed = mcpResultRecord(
+          await client.callTool({ name: HAPPIER_OFFICIAL_MCP_TOOLS.list, arguments: {} }),
+          HAPPIER_OFFICIAL_MCP_TOOLS.list,
+        );
+        if (!sessionListContains(listed, binding.happierSessionId)) {
+          throw new HappierCliError("session", "The persisted Happier Session is absent from the official MCP session list");
+        }
+        const status = mcpResultRecord(
+          await client.callTool({
+            name: HAPPIER_OFFICIAL_MCP_TOOLS.status,
+            arguments: { sessionId: binding.happierSessionId },
+          }),
+          HAPPIER_OFFICIAL_MCP_TOOLS.status,
+        );
+        if (sessionIdFromRecord(status) !== binding.happierSessionId) {
+          throw new HappierCliError("session", "Happier MCP status returned a different session id");
+        }
+        return {
+          identity,
+          createdLink: false,
+          providerTurnStarted: false,
+          attachedAt: this.now(),
+          capabilities: this.capabilitiesFromTools(available, identity, this.now()),
+        };
+      },
+    );
+  }
+
+  async create(
+    _input: SessionConnectorCreateRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorIdentityV1>> {
+    return unsupportedOperation("provider-native create");
+  }
+
+  async getStatus(
+    identity: SessionConnectorIdentityV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorStatusV1>> {
+    const target = this.validateBoundIdentity(identity, "read status");
+    if (!target.ok) return target;
+    return this.withOfficialMcp(
+      target.value.happierSessionId,
+      [HAPPIER_OFFICIAL_MCP_TOOLS.status],
+      async (client) => {
+        const status = mcpResultRecord(
+          await client.callTool({
+            name: HAPPIER_OFFICIAL_MCP_TOOLS.status,
+            arguments: { sessionId: target.value.happierSessionId },
+          }),
+          HAPPIER_OFFICIAL_MCP_TOOLS.status,
+        );
+        if (sessionIdFromRecord(status) !== target.value.happierSessionId) {
+          throw new HappierCliError("session", "Happier MCP status returned a different session id");
+        }
+        return {
+          identity,
+          state: statusState(status),
+          lastActivityAt: statusLastActivity(status),
+          connectorCursor: nonEmptyString(status.cursor, 512) ?? null,
+          // MCP session status does not prove which native UI authored a turn.
+          nativeWriterDetected: false,
+        };
+      },
+    );
+  }
+
+  async readHistory(
+    _input: SessionConnectorHistoryRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorHistoryPageV1>> {
+    return unsupportedOperation("provider-native history");
+  }
+
+  async subscribeEvents(
+    _identity: SessionConnectorIdentityV1,
+  ): Promise<SessionConnectorResultV1<AsyncIterable<SessionConnectorEventV1>>> {
+    return unsupportedOperation("provider-native events");
+  }
+
+  async send(
+    input: SessionConnectorSendRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>> {
+    const target = this.validateBoundIdentity(input.identity, "send a message");
+    if (!target.ok) return target;
+    if (
+      input.contractVersion !== 1
+      || !nonEmptyString(input.bindingId)
+      || !nonEmptyString(input.logicalMessageId)
+      || !nonEmptyString(input.idempotencyKey)
+      || !nonEmptyString(input.localMessageId, 128)
+      || !/^[A-Za-z0-9._:-]+$/u.test(input.localMessageId)
+      || !nonEmptyString(input.content, 100_000)
+      || input.contentHash !== hashRoomValue(input.content)
+    ) {
+      return failure("invalid_request", "Happier send requires valid identity, idempotency, content, and content hash", false);
+    }
+    if (!this.hasManualTakeover(input.identity)) return takeoverRequired();
+    return this.withOfficialMcp(
+      target.value.happierSessionId,
+      [HAPPIER_OFFICIAL_MCP_TOOLS.send, HAPPIER_OFFICIAL_MCP_TOOLS.wait],
+      async (client) => {
+        mcpResultRecord(
+          await client.callTool({
+            name: HAPPIER_OFFICIAL_MCP_TOOLS.send,
+            arguments: {
+              sessionId: target.value.happierSessionId,
+              message: input.content,
+              wait: false,
+              timeoutSeconds: this.sendTimeoutSeconds,
+            },
+          }),
+          HAPPIER_OFFICIAL_MCP_TOOLS.send,
+        );
+        mcpResultRecord(
+          await client.callTool({
+            name: HAPPIER_OFFICIAL_MCP_TOOLS.wait,
+            arguments: {
+              sessionId: target.value.happierSessionId,
+              timeoutSeconds: this.sendTimeoutSeconds,
+            },
+          }),
+          HAPPIER_OFFICIAL_MCP_TOOLS.wait,
+        );
+        return {
+          outcome: "confirmed" as const,
+          connectorAcknowledgementId: input.localMessageId,
+          nativeMessageId: null,
+          cursor: null,
+          acceptedAt: this.now(),
+        };
+      },
+    );
+  }
+
+  async interrupt(
+    input: SessionConnectorControlRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>> {
+    const target = this.validateBoundIdentity(input.identity, "stop a session");
+    if (!target.ok) return target;
+    if (input.contractVersion !== 1 || !nonEmptyString(input.idempotencyKey) || !nonEmptyString(input.reason, 2_000)) {
+      return failure("invalid_request", "Happier stop requires an identity, idempotency key, and reason", false);
+    }
+    if (!this.hasManualTakeover(input.identity)) return takeoverRequired();
+    return this.withOfficialMcp(
+      target.value.happierSessionId,
+      [HAPPIER_OFFICIAL_MCP_TOOLS.stop],
+      async (client) => {
+        mcpResultRecord(
+          await client.callTool({
+            name: HAPPIER_OFFICIAL_MCP_TOOLS.stop,
+            arguments: { sessionId: target.value.happierSessionId },
+          }),
+          HAPPIER_OFFICIAL_MCP_TOOLS.stop,
+        );
+        return { state: "accepted" as const, connectorAcknowledgementId: input.idempotencyKey };
+      },
+    );
+  }
+
+  async resume(
+    _input: SessionConnectorControlRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>> {
+    return unsupportedOperation("resume");
+  }
+
+  async takeover(
+    _input: SessionConnectorControlRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>> {
+    return failure(
+      "unavailable",
+      "Happier MCP does not provide programmatic Direct UI Take over. Take over manually in Direct UI, then persist takeover confirmation before Fusion writes.",
+      false,
+      { bindingState: HAPPIER_TAKEOVER_REQUIRED, bridge: "official_mcp_stdio" },
+    );
+  }
+
+  async getHealth(hostId: string): Promise<SessionConnectorHealthV1> {
+    const capabilityMatrix = await this.getCapabilities();
+    const capabilities = Object.fromEntries(
+      SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, capabilityMatrix.capabilities[name].state]),
+    ) as SessionConnectorHealthV1["capabilities"];
+    const checkedAt = this.now();
+    const host = nonEmptyString(hostId) ? "reachable" as const : "unavailable" as const;
+    try {
+      const health = await this.dependencies.probeRuntime(this.settings);
+      const reasonCodes = typedHealthReasonCodes(health.details);
+      const authentication = health.authenticated
+        ? "authenticated" as const
+        : reasonCodes.includes("authentication_required")
+          ? "required" as const
+          : "unknown" as const;
+      const daemon = health.daemon
+        ? "running" as const
+        : reasonCodes.includes("daemon_stopped")
+          ? "stopped" as const
+          : "unknown" as const;
+      const server = health.serverState === "reachable"
+        ? "reachable" as const
+        : health.serverState === "unreachable"
+          ? "unreachable" as const
+          : "unknown" as const;
+      const backend = health.backend ? "ready" as const : "unavailable" as const;
+      const state = host !== "reachable"
+        ? "host_unavailable" as const
+        : authentication === "required"
+          ? "authentication_required" as const
+          : health.ready && server === "reachable" && backend === "ready"
+            ? "healthy" as const
+            : "degraded" as const;
+      return {
+        connectorId: this.id,
+        hostId,
+        state,
+        checkedAt,
+        authentication,
+        daemon,
+        server,
+        backend,
+        rateLimit: "unknown",
+        host,
+        capabilities,
+        reasonCodes: host === "reachable" ? reasonCodes : [...new Set([...reasonCodes, "host_unavailable" as const])],
+        retryAfterMs: null,
+      };
+    } catch {
+      return {
+        connectorId: this.id,
+        hostId,
+        state: host === "reachable" ? "unavailable" : "host_unavailable",
+        checkedAt,
+        authentication: "unknown",
+        daemon: "unknown",
+        server: "unknown",
+        backend: "unknown",
+        rateLimit: "unknown",
+        host,
+        capabilities,
+        reasonCodes: host === "reachable" ? ["probe_failed"] : ["probe_failed", "host_unavailable"],
+        retryAfterMs: null,
+      };
+    }
+  }
+
+  async getDeepLinks(
+    input: SessionConnectorDeepLinksRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorDeepLinksV1>> {
+    if (input.contractVersion !== 1 || !nonEmptyString(input.bindingId) || !nonEmptyString(input.identity.hostId)) {
+      return failure("invalid_request", "Room binding and host identities are required for deep links", false);
+    }
+    const target = this.validateBoundIdentity(input.identity, "open a Happier session");
+    if (!target.ok) return target;
+    if (!this.settings.webappUrl?.trim()) {
+      return failure("degraded", "The current Happier web origin is unavailable", false);
+    }
+    try {
+      return {
+        ok: true,
+        value: {
+          contractVersion: 1,
+          bindingId: input.bindingId,
+          connectorId: input.identity.connectorId,
+          providerId: input.identity.providerId,
+          nativeSessionId: input.identity.nativeSessionId,
+          happierSessionId: input.identity.happierSessionId,
+          serverProfileId: input.identity.serverProfileId,
+          machineId: input.identity.machineId,
+          hostId: input.identity.hostId,
+          happierUrl: buildHappierSessionOpenUrl(
+            this.settings.webappUrl,
+            target.value.serverProfileId,
+            target.value.happierSessionId,
+          ),
+          // The adapter deliberately does not certify provider-native deep links.
+          nativeSessionUrl: null,
+        },
+      };
+    } catch {
+      return failure("degraded", "The current Happier web origin cannot build a safe Session link", false);
+    }
+  }
+
+  private async withOfficialMcp<T>(
+    sessionId: string,
+    requiredTools: readonly string[],
+    operation: (client: HappierMcpClient, available: ReadonlySet<string>) => Promise<T>,
+  ): Promise<SessionConnectorResultV1<T>> {
+    let client: HappierMcpClient | undefined;
+    try {
+      client = await this.dependencies.openMcpClient({ settings: this.settings, sessionId });
+      const available = validatedToolNames(await client.listTools());
+      const missing = missingTools(available, requiredTools);
+      if (missing.length > 0) return mcpCapabilityRequired(missing);
+      return { ok: true, value: await operation(client, available) };
+    } catch (error) {
+      return mapMcpFailure(error);
+    } finally {
+      await client?.close().catch(() => undefined);
+    }
+  }
+
+  private capabilitiesFromTools(
+    available: ReadonlySet<string>,
+    identity: SessionConnectorIdentityV1 | undefined,
+    verifiedAt: string,
+  ): SessionConnectorCapabilitiesV1 {
+    const hasBinding = identity
+      ? this.bindingForIdentity(identity) !== null
+      : this.persistedBindings().length > 0;
+    const writeAuthorized = identity
+      ? this.hasManualTakeover(identity)
+      : this.persistedBindings().some((binding) => binding.takeoverConfirmedAt !== null);
+    const capability = (name: SessionConnectorCapabilityName): SessionConnectorCapabilityCertificationV1 => {
+      const requirements: Partial<Record<SessionConnectorCapabilityName, readonly string[]>> = {
+        ensureExisting: [HAPPIER_OFFICIAL_MCP_TOOLS.list, HAPPIER_OFFICIAL_MCP_TOOLS.status],
+        status: [HAPPIER_OFFICIAL_MCP_TOOLS.status],
+        send: [HAPPIER_OFFICIAL_MCP_TOOLS.send, HAPPIER_OFFICIAL_MCP_TOOLS.wait],
+        interrupt: [HAPPIER_OFFICIAL_MCP_TOOLS.stop],
+      };
+      const required = requirements[name];
+      if (!required) {
+        return name === "history" || name === "events" || name === "create" || name === "resume" || name === "takeover"
+          ? unavailableCertification("operation_unavailable")
+          : unverifiedCertification("source_unverified");
+      }
+      if (!hasBinding) return unavailableCertification("operation_unavailable");
+      if ((name === "send" || name === "interrupt") && !writeAuthorized) {
+        return unavailableCertification("operation_unavailable");
+      }
+      if (missingTools(available, required).length > 0) return unavailableCertification("operation_unavailable");
+      // This is an MCP tool-advertisement proof only, never provider-native E2E.
+      return verifiedCertification(toolEvidence(required), verifiedAt);
+    };
+    return {
+      contractVersion: 1,
+      connectorId: this.id,
+      connectorVersion: this.version,
+      sourceRevision: this.sourceRevision,
+      verifiedAt,
+      capabilities: Object.fromEntries(
+        SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, capability(name)]),
+      ) as SessionConnectorCapabilitiesV1["capabilities"],
+    };
+  }
+
+  private persistedBindings(): readonly PersistedBinding[] {
+    const bindings = this.settings.happierSessionBindings ?? [];
+    const parsed = bindings.map(parsePersistedBinding).filter((binding): binding is PersistedBinding => binding !== null);
+    const seen = new Set<string>();
+    return parsed.filter((binding) => {
+      const key = `${binding.canonicalSessionUri}\u0000${binding.happierSessionId}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  private bindingForCanonicalSession(canonical: CanonicalSession): PersistedBinding | null {
+    const matches = this.persistedBindings().filter((binding) => binding.canonicalSessionUri === canonical.canonicalSessionUri);
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  private bindingForIdentity(identity: SessionConnectorIdentityV1): PersistedBinding | null {
+    const canonical = parseCanonicalSessionUri(
+      `${identity.providerId === "codex" ? "codex://threads" : identity.providerId === "claude" ? "claude://sessions" : identity.providerId === "opencode" ? "opencode://sessions" : "invalid://invalid"}/${encodeURIComponent(identity.nativeSessionId)}`,
+    );
+    if (!canonical || !identity.happierSessionId || !identity.serverProfileId || !identity.machineId) return null;
+    const matches = this.persistedBindings().filter((binding) =>
+      binding.canonicalSessionUri === canonical.canonicalSessionUri
+      && binding.happierSessionId === identity.happierSessionId
+      && binding.serverProfileId === identity.serverProfileId
+      && binding.machineId === identity.machineId,
+    );
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  private hasManualTakeover(identity: SessionConnectorIdentityV1): boolean {
+    const binding = this.bindingForIdentity(identity);
+    return binding !== null && binding.takeoverConfirmedAt !== null;
+  }
+
+  private validateBoundIdentity(
+    identity: SessionConnectorIdentityV1,
+    operation: string,
+  ): SessionConnectorResultV1<BoundIdentity> {
+    if (identity.connectorId !== this.id) {
+      return failure("conflict", "Session identity belongs to a different connector", false);
+    }
+    if (identity.providerId !== "codex" && identity.providerId !== "claude" && identity.providerId !== "opencode") {
+      return failure("invalid_request", "The persisted native Session provider is unsupported", false);
+    }
+    const nativeSessionId = nonEmptyString(identity.nativeSessionId, 512);
+    const happierSessionId = nonEmptyString(identity.happierSessionId, 512);
+    const serverProfileId = nonEmptyString(identity.serverProfileId, 512);
+    const machineId = nonEmptyString(identity.machineId, 512);
+    if (!nativeSessionId || !happierSessionId || !serverProfileId || !machineId) {
+      return bindingRequired(operation);
+    }
+    const binding = this.bindingForIdentity(identity);
+    if (!binding) return bindingRequired(operation);
+    if (!this.settings.activeServerId?.trim()) {
+      return failure("degraded", "The Happier active server profile is not pinned", false);
+    }
+    if (binding.serverProfileId !== this.settings.activeServerId) {
+      return failure("conflict", "The Happier server profile does not match the immutable Session binding", false);
+    }
+    return {
+      ok: true,
+      value: {
+        providerId: binding.providerId,
+        nativeSessionId: binding.nativeSessionId,
+        happierSessionId: binding.happierSessionId,
+        serverProfileId: binding.serverProfileId,
+        machineId: binding.machineId,
+      },
+    };
+  }
 }
 
 const HAPPIER_HEALTH_REASON_MAP: Readonly<Record<string, SessionConnectorHealthReasonCode>> = {
@@ -142,973 +870,11 @@ const HAPPIER_HEALTH_REASON_MAP: Readonly<Record<string, SessionConnectorHealthR
 };
 
 function typedHealthReasonCodes(details: readonly unknown[]): SessionConnectorHealthReasonCode[] {
-  const codes = details.flatMap((detail) =>
+  return [...new Set(details.flatMap((detail) =>
     typeof detail === "string" && HAPPIER_HEALTH_REASON_MAP[detail]
       ? [HAPPIER_HEALTH_REASON_MAP[detail]]
       : [],
-  );
-  return [...new Set(codes)];
+  ))];
 }
 
-function failure<T>(
-  code: Parameters<typeof connectorError>[0],
-  message: string,
-  retryable: boolean,
-  safeDetails?: Readonly<Record<string, unknown>>,
-): SessionConnectorResultV1<T> {
-  return { ok: false, error: connectorError(code, message, retryable, safeDetails) };
-}
-
-function connectorError(
-  code: "unavailable" | "unverified" | "degraded" | "invalid_request" | "authentication_required" | "not_found" | "ambiguous" | "host_unavailable" | "rate_limited" | "conflict" | "transport" | "delivery_uncertain" | "internal",
-  message: string,
-  retryable: boolean,
-  safeDetails?: Readonly<Record<string, unknown>>,
-) {
-  return { code, message, retryable, ...(safeDetails ? { safeDetails } : {}) } as const;
-}
-
-const HAPPIER_SAFE_OFFICIAL_CODES = new Set([
-  "not_authenticated",
-  "authentication_required",
-  "auth_required",
-  "unauthorized",
-  "forbidden",
-  "invalid_token",
-  "token_expired",
-  "server_unreachable",
-  "server_unavailable",
-  "connection_failed",
-  "network_error",
-  "daemon_unavailable",
-  "daemon_not_running",
-  "backend_unavailable",
-  "backend_not_found",
-  "provider_unavailable",
-  "model_unavailable",
-  "session_not_found",
-  "session_archived",
-  "session_unavailable",
-  "invalid_session",
-  "session_create_failed",
-  "session_send_failed",
-  "candidate_not_found",
-  "candidate_ambiguous",
-  "machine_mismatch",
-  "invalid_uri",
-  "rate_limited",
-  "rate_limit",
-  "quota_exceeded",
-  "too_many_requests",
-]);
-
-const HAPPIER_RATE_LIMIT_OFFICIAL_CODES = new Set([
-  "rate_limited",
-  "rate_limit",
-  "quota_exceeded",
-  "too_many_requests",
-]);
-
-function normalizedSafeOfficialCode(error: HappierCliError): string | undefined {
-  if (typeof error.officialCode !== "string" || error.officialCode.length > 64) return undefined;
-  const normalized = error.officialCode.trim().toLowerCase().replace(/[-\s]+/gu, "_");
-  return HAPPIER_SAFE_OFFICIAL_CODES.has(normalized) ? normalized : undefined;
-}
-
-function safeCliDetails(error: HappierCliError): Readonly<Record<string, unknown>> {
-  const officialCode = normalizedSafeOfficialCode(error);
-  return {
-    source: "happier_cli",
-    category: error.code,
-    ...(officialCode ? { officialCode } : {}),
-  };
-}
-
-function mapReadFailure<T>(error: unknown): SessionConnectorResultV1<T> {
-  if (!(error instanceof HappierCliError)) {
-    return failure("internal", "Happier connector operation failed", false);
-  }
-  const details = safeCliDetails(error);
-  const officialCode = normalizedSafeOfficialCode(error);
-  if (error.code === "authentication") {
-    return failure("authentication_required", "Happier authentication is required", false, details);
-  }
-  if (officialCode === "session_not_found" || officialCode === "candidate_not_found") {
-    return failure("not_found", "The requested native Session was not found", false, details);
-  }
-  if (officialCode === "candidate_ambiguous") {
-    return failure("ambiguous", "The requested native Session was ambiguous", false, details);
-  }
-  if (officialCode === "machine_mismatch") {
-    return failure("conflict", "The requested Session belongs to another machine", false, details);
-  }
-  if (officialCode === "invalid_uri") {
-    return failure("invalid_request", "The native Session URI is invalid", false, details);
-  }
-  if (officialCode && HAPPIER_RATE_LIMIT_OFFICIAL_CODES.has(officialCode)) {
-    return failure("rate_limited", "Happier rate limited the connector operation", true, details);
-  }
-  if (error.code === "daemon" || error.code === "backend") {
-    return failure("unavailable", "The Happier daemon or provider backend is unavailable", true, details);
-  }
-  if (error.code === "timeout" || error.code === "server" || error.code === "process") {
-    return failure("transport", "Happier connector transport failed", true, details);
-  }
-  if (error.code === "session") {
-    return failure("not_found", "The Happier Session is unavailable", false, details);
-  }
-  return failure("degraded", "Happier returned an invalid connector response", false, details);
-}
-
-function validateIdentity(
-  identity: SessionConnectorIdentityV1,
-  activeServerId: string | undefined,
-): SessionConnectorResultV1<string> {
-  if (identity.connectorId !== HAPPIER_SESSION_CONNECTOR_ID) {
-    return failure("conflict", "Session identity belongs to a different connector", false);
-  }
-  if (!identity.machineId?.trim()) {
-    return failure("invalid_request", "A Happier machine identity is required", false);
-  }
-  if (!identity.happierSessionId?.trim()) {
-    return failure("invalid_request", "A Happier Session identity is required", false);
-  }
-  if (!activeServerId?.trim()) {
-    return failure("degraded", "The Happier active server profile is not pinned", false);
-  }
-  if (identity.serverProfileId?.trim() !== activeServerId) {
-    return failure("conflict", "The Happier server profile does not match the immutable Session binding", false);
-  }
-  return { ok: true, value: identity.happierSessionId };
-}
-
-function readStatusValue(value: unknown): string | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  for (const key of ["status", "state"] as const) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-  }
-  return undefined;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function statusState(result: HappierSessionStatusResult): SessionConnectorStatusV1["state"] {
-  const session = result.session;
-  const agentState = asRecord(result.agentState);
-  const raw = (readStatusValue(agentState) ?? readStatusValue(session))?.toLowerCase();
-  if (raw === "waiting" || raw === "waitingoninput" || raw === "awaiting_input" || raw === "waiting_input") {
-    return "waiting_input";
-  }
-  if (raw === "running" || raw === "active" || raw === "busy" || raw === "starting" || raw === "recovering") {
-    return "running";
-  }
-  if (raw === "paused" || raw === "blocked") return "paused";
-  if (raw === "failed" || raw === "error" || raw === "lost" || raw === "unavailable") return "lost";
-  if (agentState?.controlledByUser === true) return "waiting_input";
-  if (typeof agentState?.pendingRequestsCount === "number" && agentState.pendingRequestsCount > 0) return "running";
-  if (session.active === false) return "lost";
-  if (session.active === true) return "idle";
-  return "unknown";
-}
-
-function isoTimestamp(value: unknown): string | null {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    const date = new Date(value);
-    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const date = new Date(value);
-    return Number.isFinite(date.getTime()) ? date.toISOString() : null;
-  }
-  return null;
-}
-
-function statusLastActivity(result: HappierSessionStatusResult): string | null {
-  const agentState = asRecord(result.agentState);
-  for (const value of [
-    result.session.lastActivityAt,
-    result.session.updatedAt,
-    agentState?.lastActivityAt,
-    agentState?.updatedAt,
-    result.lastActivityAt,
-    result.updatedAt,
-  ]) {
-    const parsed = isoTimestamp(value);
-    if (parsed) return parsed;
-  }
-  return null;
-}
-
-function historyRole(value: unknown): SessionConnectorHistoryItemV1["role"] {
-  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
-  if (normalized === "user" || normalized === "human") return "user";
-  if (normalized === "assistant" || normalized === "agent" || normalized === "ai") return "assistant";
-  if (normalized === "tool" || normalized === "function") return "tool";
-  if (normalized === "system") return "system";
-  return "unknown";
-}
-
-function historyCursor(identity: SessionConnectorIdentityV1, nativeMessageId: string): string {
-  return `${DIRECT_MESSAGE_CURSOR_PREFIX}${hashRoomValue({
-    connectorId: identity.connectorId,
-    providerId: identity.providerId,
-    nativeSessionId: identity.nativeSessionId,
-    happierSessionId: identity.happierSessionId,
-    serverProfileId: identity.serverProfileId,
-    machineId: identity.machineId,
-    nativeMessageId,
-  })}`;
-}
-
-type DirectIdentity = Readonly<{
-  providerId: HappierBackend;
-  remoteSessionId: string;
-  sessionId: string;
-  machineId: string;
-}>;
-
-function validateDirectIdentity(
-  identity: SessionConnectorIdentityV1,
-  activeServerId: string | undefined,
-): SessionConnectorResultV1<DirectIdentity> {
-  const linked = validateIdentity(identity, activeServerId);
-  if (!linked.ok) return linked;
-  if (
-    identity.providerId !== "codex"
-    && identity.providerId !== "claude"
-    && identity.providerId !== "opencode"
-  ) {
-    return failure("invalid_request", "The Happier Direct Session provider is unsupported", false);
-  }
-  if (!identity.nativeSessionId.trim() || !identity.machineId?.trim()) {
-    return failure("invalid_request", "Provider-native and machine identities are required", false);
-  }
-  return {
-    ok: true,
-    value: {
-      providerId: identity.providerId,
-      remoteSessionId: identity.nativeSessionId,
-      sessionId: linked.value,
-      machineId: identity.machineId,
-    },
-  };
-}
-
-function mapDirectTranscript(
-  identity: SessionConnectorIdentityV1,
-  delta: HappierDirectSessionTranscriptDelta,
-): SessionConnectorResultV1<readonly SessionConnectorHistoryItemV1[]> {
-  const nativeIds = new Set<string>();
-  const cursors = new Set<string>();
-  const items: SessionConnectorHistoryItemV1[] = [];
-  for (let index = 0; index < delta.items.length; index += 1) {
-    const row = delta.items[index]!;
-    if (nativeIds.has(row.id)) {
-      return failure("degraded", "Happier Direct history contained duplicate native messages", false);
-    }
-    const occurredAt = isoTimestamp(row.createdAtMs);
-    if (!occurredAt) {
-      return failure("degraded", "Happier Direct history contained an invalid timestamp", false);
-    }
-    const raw = asRecord(row.raw);
-    if (!raw) {
-      return failure("degraded", "Happier Direct history contained an invalid raw record", false);
-    }
-    const cursor = index === delta.items.length - 1 && delta.nextCursor
-      ? delta.nextCursor
-      : historyCursor(identity, row.id);
-    if (cursors.has(cursor)) {
-      return failure("degraded", "Happier Direct history contained duplicate message cursors", false);
-    }
-    nativeIds.add(row.id);
-    cursors.add(cursor);
-    items.push({
-      nativeMessageId: row.id,
-      logicalMessageId: typeof row.localId === "string" && row.localId.trim() ? row.localId : null,
-      role: historyRole(raw.role ?? raw.type),
-      contentHash: hashRoomValue(raw),
-      occurredAt,
-      cursor,
-    });
-  }
-  if (items.length > 0 && delta.nextCursor === null) {
-    return failure("degraded", "Happier Direct history did not provide a complete cursor", false);
-  }
-  return { ok: true, value: items };
-}
-
-function mapDirectStatusEvent(
-  identity: SessionConnectorIdentityV1,
-  delta: HappierDirectSessionStatusDelta,
-): SessionConnectorEventV1 {
-  const lastActivityAt = isoTimestamp(delta.lastActivityAtMs);
-  const eventHash = hashRoomValue({
-    identity,
-    isRunning: delta.isRunning,
-    lastActivityAtMs: delta.lastActivityAtMs,
-    observedAtMs: delta.observedAtMs,
-  });
-  const cursor = `happier-direct-status-v1:${delta.observedAtMs}:${eventHash}`;
-  return {
-    connectorEventId: cursor,
-    identity,
-    eventType: "status",
-    cursor,
-    occurredAt: new Date(delta.observedAtMs).toISOString(),
-    payload: {
-      type: "status",
-      state: delta.isRunning ? "running" : "idle",
-      lastActivityAt,
-      connectorCursor: null,
-      // Activity proves provider process state, not whether a human IDE authored it.
-      nativeWriterDetected: false,
-    },
-  };
-}
-
-function isDirectStatusDelta(
-  delta: HappierDirectSessionTranscriptDelta | HappierDirectSessionStatusDelta,
-): delta is HappierDirectSessionStatusDelta {
-  return "eventType" in delta && delta.eventType === "status";
-}
-
-function unavailableResult<T>(operation: string): SessionConnectorResultV1<T> {
-  return failure(
-    "unavailable",
-    `Happier connector ${operation} is not available on a reviewed public surface`,
-    false,
-  );
-}
-
-function certifiedNativeSessionUrl(identity: SessionConnectorIdentityV1): string | null {
-  if (
-    !isHappierDirectSessionProviderId(identity.providerId)
-    || HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[identity.providerId].nativeDeepLink !== "certified"
-    || identity.providerId !== "codex"
-  ) return null;
-  return `codex://threads/${encodeURIComponent(identity.nativeSessionId)}`;
-}
-
-/**
- * Provider-neutral adapter over the reviewed, shell-free Happier JSON CLI.
- *
- * FNXC:HappierSessionConnector 2026-07-17-05:12:
- * The provider's `remoteSessionId`, Happier's linked `sessionId`, server,
- * machine, and Fusion host are distinct immutable identities. Content crosses
- * only the send boundary; history projections retain hashes and cursors, and
- * capability states remain fail-closed until provider-specific certification.
- */
-export class HappierSessionConnector implements SessionConnectorV1 {
-  readonly contractVersion = 1 as const;
-  readonly id = HAPPIER_SESSION_CONNECTOR_ID;
-  readonly version: string;
-
-  private readonly settings: HappierCliSettings;
-  private readonly sourceRevision: string;
-  private readonly sendTimeoutSeconds: number;
-  private readonly rateLimitCooldownMs: number;
-  private readonly now: () => string;
-  private readonly dependencies: HappierSessionConnectorDependencies;
-  private readonly transcriptCursors = new Map<string, string | null>();
-  private rateLimitedUntilMs: number | null = null;
-
-  constructor(options: HappierSessionConnectorOptions = {}) {
-    this.settings = resolveHappierCliSettings(options.settings);
-    this.version = options.version?.trim() || HAPPIER_SESSION_CONNECTOR_VERSION;
-    this.sourceRevision = options.sourceRevision?.trim() || HAPPIER_DIRECT_SESSION_SOURCE_REVISION;
-    this.sendTimeoutSeconds = options.sendTimeoutSeconds ?? DEFAULT_SEND_TIMEOUT_SECONDS;
-    if (!Number.isInteger(this.sendTimeoutSeconds) || this.sendTimeoutSeconds <= 0) {
-      throw new Error("Happier Session Connector sendTimeoutSeconds must be a positive integer");
-    }
-    this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS;
-    if (
-      !Number.isSafeInteger(this.rateLimitCooldownMs)
-      || this.rateLimitCooldownMs <= 0
-      || this.rateLimitCooldownMs > MAX_RATE_LIMIT_COOLDOWN_MS
-    ) {
-      throw new Error("Happier Session Connector rateLimitCooldownMs must be an integer from 1 through 604800000");
-    }
-    this.now = options.now ?? (() => new Date().toISOString());
-    this.dependencies = { ...defaultDependencies, ...(options.dependencies ?? {}) };
-  }
-
-  async getCapabilities(identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
-    const verifiedAt = this.now();
-    const activeServerId = this.settings.activeServerId?.trim();
-    const profileMatches = Boolean(activeServerId)
-      && (identity === undefined || identity.serverProfileId === activeServerId);
-    let runtimeManifestCertified = false;
-    let runtimeBuildEvidenceRef: string | null = null;
-    try {
-      const observedManifest = await this.dependencies.getDirectSessionCapabilities(this.settings, undefined);
-      const manifestMatches = isCertifiedHappierDirectSessionRuntimeManifest(
-        observedManifest,
-        this.sourceRevision,
-      );
-      if (manifestMatches) {
-        const runtimeBuild = await this.dependencies.verifyRuntimeBuild(
-          observedManifest,
-          this.settings.entrypoint,
-        );
-        runtimeManifestCertified = runtimeBuild.ok;
-        if (runtimeBuild.ok) runtimeBuildEvidenceRef = runtimeBuild.launchDigest;
-      }
-    } catch {
-      // Old, drifted, or unavailable executables remain source_unverified.
-    }
-    const providerRows = identity === undefined
-      ? HAPPIER_DIRECT_SESSION_PROVIDER_IDS.map((providerId) => HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[providerId])
-      : isHappierDirectSessionProviderId(identity.providerId)
-        ? [HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[identity.providerId]]
-        : [];
-    const providerScope = identity === undefined ? "codex+claude+opencode" : identity.providerId;
-
-    const certificationFor = (
-      capability: (typeof SESSION_CONNECTOR_CAPABILITIES)[number],
-    ): SessionConnectorCapabilityCertificationV1 => {
-      const auditedEntries = providerRows.map((row) => row.capabilities[capability]);
-      const universallyUnavailable = HAPPIER_DIRECT_SESSION_PROVIDER_IDS.every(
-        (providerId) => HAPPIER_DIRECT_SESSION_CAPABILITY_MATRIX[providerId].capabilities[capability].connectorState === "unavailable",
-      );
-      if (auditedEntries.length === 0) {
-        return universallyUnavailable
-          ? unavailableCertification("operation_unavailable")
-          : unverifiedCertification("source_unverified");
-      }
-
-      const first = auditedEntries[0]!;
-      const statesMatch = auditedEntries.every((entry) => entry.connectorState === first.connectorState);
-      if (!statesMatch) return unverifiedCertification("pending_provider_certification");
-      if (first.connectorState === "unavailable") {
-        return unavailableCertification(first.reasonCode ?? "operation_unavailable");
-      }
-      if (first.connectorState !== "verified") {
-        return unverifiedCertification(first.reasonCode ?? "pending_provider_certification");
-      }
-      if (identity === undefined && capability !== "deepLinks") {
-        return unverifiedCertification("pending_provider_certification");
-      }
-      if (!runtimeManifestCertified) return unverifiedCertification("source_unverified");
-      if ((capability === "history" || capability === "events" || capability === "deepLinks") && !profileMatches) {
-        return {
-          state: "degraded",
-          evidenceRef: null,
-          reasonCode: "server_profile_mismatch",
-          lastVerifiedAt: null,
-        };
-      }
-      if (capability === "deepLinks") {
-        try {
-          if (!this.settings.webappUrl?.trim()) throw new Error("missing webapp origin");
-          buildHappierSessionOpenUrl(this.settings.webappUrl, activeServerId!, "capability-probe");
-        } catch {
-          return {
-            state: "degraded",
-            evidenceRef: null,
-            reasonCode: "runtime_degraded",
-            lastVerifiedAt: null,
-          };
-        }
-      }
-      const evidenceKey = auditedEntries.length === 1
-        ? first.evidenceKey
-        : `provider-matrix-${capability}`;
-      if (!evidenceKey) return unverifiedCertification("source_unverified");
-      return verifiedCertification(
-        `happier-runtime:${HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT}:local-build=${runtimeBuildEvidenceRef}:reviewed-source=${this.sourceRevision}:provider=${identity === undefined ? "all" : providerScope}:${evidenceKey}`,
-        verifiedAt,
-      );
-    };
-
-    const capabilities = Object.fromEntries(
-      SESSION_CONNECTOR_CAPABILITIES.map((capability) => [capability, certificationFor(capability)]),
-    ) as SessionConnectorCapabilitiesV1["capabilities"];
-    return {
-      contractVersion: 1,
-      connectorId: this.id,
-      connectorVersion: this.version,
-      sourceRevision: this.sourceRevision,
-      verifiedAt,
-      capabilities,
-    };
-  }
-
-  async ensureExisting(
-    input: SessionConnectorEnsureExistingRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorEnsureExistingResultV1>> {
-    if (
-      input.contractVersion !== 1
-      || !input.canonicalSessionUri.trim()
-      || !input.idempotencyKey.trim()
-      || !input.requiredHostId?.trim()
-    ) {
-      return failure(
-        "invalid_request",
-        "A canonical Session URI, host identity, and idempotency key are required",
-        false,
-      );
-    }
-    let requestedProviderId: string;
-    let requestedNativeSessionId: string;
-    try {
-      const uri = new URL(input.canonicalSessionUri);
-      requestedProviderId = uri.protocol.slice(0, -1);
-      requestedNativeSessionId = decodeURIComponent(uri.pathname.slice(1));
-      if (!requestedProviderId || !requestedNativeSessionId) throw new Error("invalid URI identity");
-    } catch {
-      return failure("invalid_request", "The canonical native Session URI is invalid", false);
-    }
-
-    try {
-      const ensured = await this.dependencies.ensureDirectSession({
-        uri: input.canonicalSessionUri,
-        ...(input.requiredMachineId ? { machineId: input.requiredMachineId } : {}),
-        settings: this.settings,
-      });
-      if (
-        ensured.providerId !== requestedProviderId
-        || ensured.remoteSessionId !== requestedNativeSessionId
-      ) {
-        return failure("conflict", "Happier returned a different provider-native Session identity", false);
-      }
-      if (input.requiredMachineId && ensured.machineId !== input.requiredMachineId) {
-        return failure("conflict", "Happier linked the Session on a different machine", false);
-      }
-      if (!this.settings.activeServerId) {
-        return failure("degraded", "The Happier active server profile is not pinned", false);
-      }
-      if (ensured.serverId !== this.settings.activeServerId) {
-        return failure("conflict", "Happier linked the Session on a different server profile", false);
-      }
-      const identity: SessionConnectorIdentityV1 = {
-        connectorId: this.id,
-        providerId: ensured.providerId,
-        nativeSessionId: ensured.remoteSessionId,
-        happierSessionId: ensured.sessionId,
-        serverProfileId: ensured.serverId,
-        machineId: ensured.machineId,
-        hostId: input.requiredHostId.trim(),
-      };
-      return {
-        ok: true,
-        value: {
-          identity,
-          createdLink: ensured.created,
-          providerTurnStarted: false,
-          attachedAt: this.now(),
-          capabilities: await this.getCapabilities(identity),
-        },
-      };
-    } catch (error) {
-      return this.mapOperationalFailure(error);
-    }
-  }
-
-  async create(
-    _input: SessionConnectorCreateRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorIdentityV1>> {
-    return unavailableResult("create");
-  }
-
-  async getStatus(
-    identity: SessionConnectorIdentityV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorStatusV1>> {
-    const target = validateIdentity(identity, this.settings.activeServerId);
-    if (!target.ok) return target;
-    try {
-      const result = await this.dependencies.getSessionStatus(target.value, this.settings, undefined);
-      const agentState = asRecord(result.agentState);
-      const cursor = typeof result.cursor === "string" && result.cursor.trim()
-        ? result.cursor
-        : typeof agentState?.cursor === "string" && agentState.cursor.trim()
-          ? agentState.cursor
-          : null;
-      return {
-        ok: true,
-        value: {
-          identity,
-          state: statusState(result),
-          lastActivityAt: statusLastActivity(result),
-          connectorCursor: cursor,
-          nativeWriterDetected: agentState?.controlledByUser === true,
-        },
-      };
-    } catch (error) {
-      return this.mapOperationalFailure(error);
-    }
-  }
-
-  async readHistory(
-    input: SessionConnectorHistoryRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorHistoryPageV1>> {
-    const target = validateDirectIdentity(input.identity, this.settings.activeServerId);
-    if (!target.ok) return target;
-    if (input.contractVersion !== 1 || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > SESSION_CONNECTOR_HISTORY_PAGE_LIMIT) {
-      return failure("invalid_request", "History limit must be an integer from 1 through 250", false);
-    }
-    try {
-      const result = await this.dependencies.readDirectTranscript(
-        {
-          ...target.value,
-          afterCursor: input.afterCursor,
-          limit: input.limit,
-        },
-        this.settings,
-        undefined,
-      );
-      const mapped = mapDirectTranscript(input.identity, result);
-      if (!mapped.ok) return mapped;
-      const completeThroughCursor = result.nextCursor ?? result.fromCursor;
-      this.transcriptCursors.set(this.identityKey(input.identity), completeThroughCursor);
-      return {
-        ok: true,
-        value: {
-          items: mapped.value,
-          nextCursor: result.nextCursor,
-          completeThroughCursor,
-          truncated: result.truncated,
-        },
-      };
-    } catch (error) {
-      return this.mapOperationalFailure(error);
-    }
-  }
-
-  async subscribeEvents(
-    identity: SessionConnectorIdentityV1,
-  ): Promise<SessionConnectorResultV1<AsyncIterable<SessionConnectorEventV1>>> {
-    const target = validateDirectIdentity(identity, this.settings.activeServerId);
-    if (!target.ok) return target;
-    try {
-      const rawEvents = this.dependencies.followDirectTranscriptEvents(
-        {
-          ...target.value,
-          afterCursor: this.transcriptCursors.get(this.identityKey(identity)) ?? null,
-          limit: SESSION_CONNECTOR_HISTORY_PAGE_LIMIT,
-        },
-        this.settings,
-        undefined,
-      );
-      const transcriptCursorKey = this.identityKey(identity);
-      const transcriptCursors = this.transcriptCursors;
-      const now = this.now;
-      return {
-        ok: true,
-        value: {
-          async *[Symbol.asyncIterator](): AsyncIterator<SessionConnectorEventV1> {
-            for await (const delta of rawEvents) {
-              if (isDirectStatusDelta(delta)) {
-                yield mapDirectStatusEvent(identity, delta);
-                continue;
-              }
-              const mapped = mapDirectTranscript(identity, delta);
-              if (!mapped.ok) {
-                throw new HappierCliError("protocol", mapped.error.message);
-              }
-              const completeThroughCursor = delta.nextCursor ?? delta.fromCursor;
-              if (completeThroughCursor !== null) {
-                transcriptCursors.set(transcriptCursorKey, completeThroughCursor);
-              }
-              const occurredAt = mapped.value.at(-1)?.occurredAt ?? now();
-              const eventHash = hashRoomValue({
-                identity,
-                fromCursor: delta.fromCursor,
-                nextCursor: delta.nextCursor,
-                nativeMessageIds: mapped.value.map((item) => item.nativeMessageId),
-              });
-              yield {
-                connectorEventId: `happier-direct-transcript-v1:${eventHash}`,
-                identity,
-                eventType: "message",
-                cursor: delta.nextCursor ?? delta.fromCursor ?? `happier-direct-event-v1:${eventHash}`,
-                occurredAt,
-                payload: {
-                  type: "transcript_delta",
-                  fromCursor: delta.fromCursor,
-                  nextCursor: delta.nextCursor,
-                  completeThroughCursor,
-                  truncated: delta.truncated,
-                  items: mapped.value,
-                },
-              };
-            }
-          },
-        },
-      };
-    } catch (error) {
-      return this.mapOperationalFailure(error);
-    }
-  }
-
-  async send(
-    input: SessionConnectorSendRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>> {
-    const target = validateIdentity(input.identity, this.settings.activeServerId);
-    if (!target.ok) return target;
-    if (
-      input.contractVersion !== 1
-      || !input.bindingId.trim()
-      || !input.logicalMessageId.trim()
-      || !input.localMessageId.trim()
-      || input.localMessageId.length > 128
-      || !/^[A-Za-z0-9._:-]+$/u.test(input.localMessageId)
-      || !input.idempotencyKey.trim()
-      || !input.content.trim()
-      || input.contentHash !== hashRoomValue(input.content)
-    ) {
-      return failure("invalid_request", "Happier send requires valid identity, idempotency, content, and content hash", false);
-    }
-    const localId = input.localMessageId;
-    try {
-      const result = await this.dependencies.sendMessage({
-        sessionId: target.value,
-        message: input.content,
-        localId,
-        timeoutSeconds: this.sendTimeoutSeconds,
-      }, this.settings, undefined);
-      return {
-        ok: true,
-        value: {
-          outcome: "accepted",
-          connectorAcknowledgementId: result.localId ?? localId,
-          nativeMessageId: null,
-          cursor: null,
-          acceptedAt: this.now(),
-        },
-      };
-    } catch (error) {
-      const mapped = this.mapOperationalFailure<SessionConnectorSendReceiptV1>(error);
-      if (!mapped.ok && mapped.error.code === "rate_limited") return mapped;
-      if (
-        error instanceof HappierCliError
-        && (error.code === "timeout"
-          || error.code === "server"
-          || error.code === "process"
-          || error.code === "protocol"
-          || error.code === "invalid-json"
-          || error.code === "output-limit")
-      ) {
-        return {
-          ok: true,
-          value: {
-            outcome: "delivery_uncertain",
-            connectorAcknowledgementId: null,
-            nativeMessageId: null,
-            cursor: null,
-            acceptedAt: null,
-          },
-        };
-      }
-      return mapped;
-    }
-  }
-
-  async interrupt(
-    _input: SessionConnectorControlRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>> {
-    return unavailableResult("interrupt");
-  }
-
-  async resume(
-    _input: SessionConnectorControlRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>> {
-    return unavailableResult("resume");
-  }
-
-  async takeover(
-    _input: SessionConnectorControlRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorControlResultV1>> {
-    return unavailableResult("takeover");
-  }
-
-  async getHealth(hostId: string): Promise<SessionConnectorHealthV1> {
-    const capabilityMatrix = await this.getCapabilities();
-    const capabilities = Object.fromEntries(
-      SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, capabilityMatrix.capabilities[name].state]),
-    ) as SessionConnectorHealthV1["capabilities"];
-    const host = hostId.trim() ? "reachable" as const : "unavailable" as const;
-    try {
-      const health = await this.dependencies.probeRuntime(this.settings);
-      const checkedAt = this.now();
-      let retryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
-      const configuredBackend = this.settings.backend;
-      const backendMismatch = Boolean(configuredBackend)
-        && health.backendId !== configuredBackend;
-      const mappedReasonCodes = typedHealthReasonCodes(health.details);
-      if (backendMismatch && !mappedReasonCodes.includes("backend_unavailable")) {
-        mappedReasonCodes.push("backend_unavailable");
-      }
-      if (mappedReasonCodes.includes("rate_limited") && retryAfterMs === null) {
-        this.observeRateLimit(checkedAt);
-        retryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
-      }
-      const rateLimitedReasonCodes = retryAfterMs === null
-        ? mappedReasonCodes
-        : [...new Set([...mappedReasonCodes, "rate_limited" as const])];
-      const reasonCodes = host === "reachable"
-        ? rateLimitedReasonCodes
-        : [...new Set([...rateLimitedReasonCodes, "host_unavailable" as const])];
-      const authentication = health.authenticated
-        ? "authenticated" as const
-        : reasonCodes.includes("authentication_required")
-          ? "required" as const
-          : "unknown" as const;
-      const daemon = health.daemon
-        ? "running" as const
-        : reasonCodes.includes("daemon_stopped")
-          ? "stopped" as const
-          : "unknown" as const;
-      const server = health.serverState === "reachable"
-        ? "reachable" as const
-        : health.serverState === "unreachable"
-          ? "unreachable" as const
-          : "unknown" as const;
-      const backend = health.backend && !backendMismatch
-        ? "ready" as const
-        : reasonCodes.some((code) => code.startsWith("backend_"))
-          ? "unavailable" as const
-          : "unknown" as const;
-      const rateLimit = reasonCodes.includes("rate_limited")
-        ? "limited" as const
-        : health.ready
-          ? "clear" as const
-          : "unknown" as const;
-      const state = host !== "reachable"
-        ? "host_unavailable" as const
-        : rateLimit === "limited"
-          ? "rate_limited" as const
-          : server === "unreachable" || !health.discovered || !health.executable
-            ? "unavailable" as const
-            : authentication === "required"
-              ? "authentication_required" as const
-              : health.ready && backend === "ready"
-                ? "healthy" as const
-                : "degraded" as const;
-      return {
-        connectorId: this.id,
-        hostId,
-        state,
-        checkedAt,
-        authentication,
-        daemon,
-        server,
-        backend,
-        rateLimit,
-        host,
-        capabilities,
-        reasonCodes,
-        retryAfterMs,
-      };
-    } catch (error) {
-      const checkedAt = this.now();
-      this.mapOperationalFailure(error);
-      const failureRetryAfterMs = this.activeRateLimitRetryAfterMs(checkedAt);
-      const reasonCodes: SessionConnectorHealthReasonCode[] = ["probe_failed"];
-      if (failureRetryAfterMs !== null) reasonCodes.push("rate_limited");
-      if (host !== "reachable") reasonCodes.push("host_unavailable");
-      return {
-        connectorId: this.id,
-        hostId,
-        state: host !== "reachable"
-          ? "host_unavailable"
-          : failureRetryAfterMs !== null
-            ? "rate_limited"
-            : "unavailable",
-        checkedAt,
-        authentication: "unknown",
-        daemon: "unknown",
-        server: "unknown",
-        backend: "unknown",
-        rateLimit: failureRetryAfterMs === null ? "unknown" : "limited",
-        host,
-        capabilities,
-        reasonCodes,
-        retryAfterMs: failureRetryAfterMs,
-      };
-    }
-  }
-
-  private mapOperationalFailure<T>(error: unknown): SessionConnectorResultV1<T> {
-    const result = mapReadFailure<T>(error);
-    if (!result.ok && result.error.code === "rate_limited") {
-      this.observeRateLimit(this.now());
-    }
-    return result;
-  }
-
-  private observeRateLimit(observedAt: string): void {
-    const observedAtMs = Date.parse(observedAt);
-    if (!Number.isFinite(observedAtMs)) return;
-    this.rateLimitedUntilMs = Math.max(
-      this.rateLimitedUntilMs ?? 0,
-      observedAtMs + this.rateLimitCooldownMs,
-    );
-  }
-
-  private activeRateLimitRetryAfterMs(checkedAt: string): number | null {
-    if (this.rateLimitedUntilMs === null) return null;
-    const checkedAtMs = Date.parse(checkedAt);
-    if (!Number.isFinite(checkedAtMs)) return this.rateLimitCooldownMs;
-    const remainingMs = this.rateLimitedUntilMs - checkedAtMs;
-    if (remainingMs <= 0) {
-      this.rateLimitedUntilMs = null;
-      return null;
-    }
-    return Math.min(remainingMs, MAX_RATE_LIMIT_COOLDOWN_MS);
-  }
-
-  private identityKey(identity: SessionConnectorIdentityV1): string {
-    return hashRoomValue({
-      connectorId: identity.connectorId,
-      providerId: identity.providerId,
-      nativeSessionId: identity.nativeSessionId,
-      happierSessionId: identity.happierSessionId,
-      serverProfileId: identity.serverProfileId,
-      machineId: identity.machineId,
-      hostId: identity.hostId,
-    });
-  }
-
-  async getDeepLinks(
-    input: SessionConnectorDeepLinksRequestV1,
-  ): Promise<SessionConnectorResultV1<SessionConnectorDeepLinksV1>> {
-    if (input.contractVersion !== 1 || !input.bindingId.trim() || !input.identity.hostId.trim()) {
-      return failure("invalid_request", "Room binding and host identities are required for deep links", false);
-    }
-    const target = validateDirectIdentity(input.identity, this.settings.activeServerId);
-    if (!target.ok) return target;
-    if (!this.settings.webappUrl?.trim() || !input.identity.serverProfileId) {
-      return failure("degraded", "The current Happier web origin or server profile is unavailable", false);
-    }
-    try {
-      return {
-        ok: true,
-        value: {
-          contractVersion: 1,
-          bindingId: input.bindingId,
-          connectorId: input.identity.connectorId,
-          providerId: input.identity.providerId,
-          nativeSessionId: input.identity.nativeSessionId,
-          happierSessionId: input.identity.happierSessionId,
-          serverProfileId: input.identity.serverProfileId,
-          machineId: input.identity.machineId,
-          hostId: input.identity.hostId,
-          happierUrl: buildHappierSessionOpenUrl(
-            this.settings.webappUrl,
-            input.identity.serverProfileId,
-            target.value.sessionId,
-          ),
-          nativeSessionUrl: certifiedNativeSessionUrl(input.identity),
-        },
-      };
-    } catch {
-      return failure("degraded", "The current Happier web origin cannot build a certified link", false);
-    }
-  }
-}
+export { HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE } from "./happier-direct-session-capabilities.js";

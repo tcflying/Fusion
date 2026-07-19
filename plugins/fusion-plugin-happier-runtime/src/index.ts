@@ -9,8 +9,8 @@ import { resolveHappierCliSettings } from "./cli-spawn.js";
 import {
   HAPPIER_SESSION_CONNECTOR_ID,
   HAPPIER_SESSION_CONNECTOR_VERSION,
-  HappierSessionConnector,
-} from "./session-connector.js";
+} from "./session-connector-contract.js";
+import { HappierSessionConnector } from "./session-connector-facade.js";
 import { definePlugin } from "@fusion/plugin-sdk";
 import type {
   FusionPlugin,
@@ -38,7 +38,7 @@ export const happierRuntimeFactory: PluginRuntimeFactory = async (ctx) =>
 export const happierSessionConnectorMetadata: PluginSessionConnectorManifestMetadata = {
   connectorId: HAPPIER_SESSION_CONNECTOR_ID,
   name: "Happier Session Connector",
-  description: "Connects exact native Sessions through the official Happier JSON CLI",
+  description: "Connects manually bound Happier Sessions through official MCP stdio",
   version: HAPPIER_SESSION_CONNECTOR_VERSION,
 };
 
@@ -93,8 +93,19 @@ export default plugin;
 export { ensureHappierDirectSession } from "./cli-spawn.js";
 export type { HappierDirectSessionEnsureResult } from "./types.js";
 export * from "./cli-spawn.js";
+export * from "./happier-mcp-client.js";
 export * from "./operations.js";
 export * from "./probe.js";
 export * from "./types.js";
 export { HappierRecoveryError, HappierRuntimeAdapter } from "./runtime-adapter.js";
-export * from "./session-connector.js";
+export {
+  HAPPIER_OFFICIAL_MCP_SOURCE_REVISION,
+  HAPPIER_SESSION_CONNECTOR_ID,
+  HAPPIER_SESSION_CONNECTOR_VERSION,
+} from "./session-connector-contract.js";
+export { HappierSessionConnector } from "./session-connector-facade.js";
+export type {
+  HappierSessionConnectorDependencies,
+  HappierSessionConnectorOptions,
+} from "./session-connector.js";
+export { HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE } from "./happier-direct-session-capabilities.js";
