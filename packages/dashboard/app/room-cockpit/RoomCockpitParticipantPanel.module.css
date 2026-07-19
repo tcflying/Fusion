@@ -1,0 +1,312 @@
+.panel {
+  --participant-bg: #081014;
+  --participant-surface: #0d1a1d;
+  --participant-raised: #112328;
+  --participant-line: #2a4a4f;
+  --participant-hot-line: #74c6cb;
+  --participant-ink: #e5f4ec;
+  --participant-muted: #9ab4ae;
+  --participant-signal: #d8ff5e;
+  --participant-caution: #f6bd4d;
+  --participant-danger: #ff7058;
+  --participant-stable: #6ee7c8;
+  position: relative;
+  isolation: isolate;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--participant-ink);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, #0f2a2b 68%, transparent), transparent 47%),
+    var(--participant-bg);
+  border: 1px solid color-mix(in srgb, var(--participant-line) 76%, transparent);
+  font-family: "IBM Plex Mono", "Cascadia Mono", "JetBrains Mono", monospace;
+}
+
+.panel::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  content: "";
+  pointer-events: none;
+  opacity: 0.45;
+  background-image:
+    linear-gradient(90deg, color-mix(in srgb, var(--participant-line) 25%, transparent) 1px, transparent 1px),
+    linear-gradient(0deg, color-mix(in srgb, var(--participant-line) 16%, transparent) 1px, transparent 1px);
+  background-size: 30px 30px;
+  mask-image: linear-gradient(to bottom, #000000, transparent 88%);
+}
+
+.panelHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+  padding: 17px 18px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--participant-line) 72%, transparent);
+}
+
+.eyebrow,
+.cardKicker,
+.field dt,
+.contextHeading > span {
+  color: var(--participant-signal);
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.panelHeading h2,
+.cardHeader h3 {
+  margin-top: 5px;
+  color: var(--participant-ink);
+  font-size: 0.98rem;
+  letter-spacing: -0.035em;
+  line-height: 1.28;
+}
+
+.recordCount {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  color: var(--participant-muted);
+  border: 1px solid color-mix(in srgb, var(--participant-line) 75%, transparent);
+  font-size: 0.64rem;
+  letter-spacing: 0.04em;
+}
+
+.staticState {
+  margin: 0;
+  padding: 24px 18px;
+  color: var(--participant-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.participantList {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: 1px;
+  margin: 0;
+  padding: 1px;
+  list-style: none;
+  background: color-mix(in srgb, var(--participant-line) 86%, transparent);
+}
+
+.cardItem {
+  min-width: 0;
+}
+
+.participantCard {
+  position: relative;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  height: 100%;
+  padding: 16px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--participant-surface) 95%, #000000 5%);
+}
+
+.participantCard::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  content: "";
+  background: var(--participant-stable);
+}
+
+.participantCard[data-heartbeat="stale"]::before,
+.participantCard[data-heartbeat="recovering"]::before {
+  background: var(--participant-caution);
+}
+
+.participantCard[data-heartbeat="lost"]::before {
+  background: var(--participant-danger);
+}
+
+.participantCard[data-heartbeat="unknown"]::before {
+  background: var(--participant-muted);
+}
+
+.cardHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.cardHeader h3 {
+  overflow-wrap: anywhere;
+}
+
+.seatReadout {
+  display: block;
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  color: var(--participant-muted);
+  font-size: 0.69rem;
+  line-height: 1.4;
+}
+
+.heartbeatBadge {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  color: var(--participant-stable);
+  background: color-mix(in srgb, var(--participant-stable) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--participant-stable) 42%, transparent);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.heartbeatBadge[data-heartbeat="stale"],
+.heartbeatBadge[data-heartbeat="recovering"] {
+  color: var(--participant-caution);
+  background: color-mix(in srgb, var(--participant-caution) 10%, transparent);
+  border-color: color-mix(in srgb, var(--participant-caution) 42%, transparent);
+}
+
+.heartbeatBadge[data-heartbeat="lost"] {
+  color: var(--participant-danger);
+  background: color-mix(in srgb, var(--participant-danger) 10%, transparent);
+  border-color: color-mix(in srgb, var(--participant-danger) 42%, transparent);
+}
+
+.heartbeatBadge[data-heartbeat="unknown"] {
+  color: var(--participant-muted);
+  background: color-mix(in srgb, var(--participant-muted) 10%, transparent);
+  border-color: color-mix(in srgb, var(--participant-muted) 42%, transparent);
+}
+
+.identityLedger,
+.telemetryLedger {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  background: color-mix(in srgb, var(--participant-line) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--participant-line) 58%, transparent);
+}
+
+.identityLedger {
+  grid-template-columns: 1fr;
+}
+
+.field {
+  min-width: 0;
+  padding: 9px 10px;
+  background: color-mix(in srgb, var(--participant-raised) 88%, #000000 12%);
+}
+
+.field dt {
+  color: var(--participant-muted);
+  font-size: 0.57rem;
+}
+
+.field dd {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--participant-ink);
+  font-size: 0.7rem;
+  line-height: 1.42;
+}
+
+.contextBlock {
+  display: grid;
+  gap: 8px;
+  padding: 11px;
+  background: color-mix(in srgb, var(--participant-raised) 78%, #000000 22%);
+  border: 1px solid color-mix(in srgb, var(--participant-hot-line) 34%, var(--participant-line));
+}
+
+.contextHeading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.contextHeading > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--participant-ink);
+  font-size: 0.71rem;
+  line-height: 1.35;
+  text-align: right;
+}
+
+.contextMeter {
+  width: 100%;
+  height: 5px;
+  appearance: none;
+  accent-color: var(--participant-signal);
+}
+
+.contextMeter::-webkit-meter-bar {
+  background: color-mix(in srgb, var(--participant-line) 66%, transparent);
+  border: 0;
+  border-radius: 0;
+}
+
+.contextMeter::-webkit-meter-optimum-value,
+.contextMeter::-webkit-meter-suboptimum-value,
+.contextMeter::-webkit-meter-even-less-good-value {
+  background: var(--participant-signal);
+  border-radius: 0;
+}
+
+.contextUnavailable {
+  color: var(--participant-muted);
+  font-size: 0.68rem;
+}
+
+@media (max-width: 768px) {
+  .participantList {
+    grid-template-columns: 1fr;
+  }
+
+  .panelHeading,
+  .cardHeader,
+  .contextHeading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .recordCount,
+  .heartbeatBadge {
+    align-self: flex-start;
+  }
+
+  .contextHeading > strong {
+    text-align: left;
+  }
+}
+
+@media (max-width: 460px) {
+  .panelHeading,
+  .participantCard {
+    padding: 14px;
+  }
+
+  .telemetryLedger {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel *,
+  .panel *::before,
+  .panel *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
