@@ -33,6 +33,7 @@ function createPort(overrides: Partial<RoomControlPlaneRoutePort> = {}) {
       getRoomProjection,
       listResource,
       mutate,
+      openRoomEventCursor: vi.fn() as RoomControlPlaneRoutePort["openRoomEventCursor"],
       ...overrides,
     } satisfies RoomControlPlaneRoutePort,
     calls: { listRooms, getRoomProjection, listResource, mutate },

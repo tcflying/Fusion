@@ -36,10 +36,11 @@ function createReadService(): ReadService {
   };
 }
 
-function createEngine(projectId: string, service: unknown): RoomControlPlaneProjectEngine {
+function createEngine(projectId: string, service: unknown, liveEventService: unknown = undefined): RoomControlPlaneProjectEngine {
   return {
     getProjectId: () => projectId,
     getRoomControlPlaneReadService: () => service,
+    getRoomControlPlaneLiveEventService: () => liveEventService,
     executeProjectRoomCommand: async () => {
       throw new Error("Unexpected Room command");
     },
@@ -430,5 +431,75 @@ describe("Room control-plane Engine route dependencies", () => {
 
     expect(response.status).toBe(503);
     expect(response.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_MUTATION_RESPONSE_INVALID" } });
+  });
+
+  it("uses the project Engine canonical live service for the event cursor and never substitutes read state", async () => {
+    const service = createReadService();
+    const unsubscribe = vi.fn();
+    const reconnect = vi.fn(async () => ({
+      ok: true,
+      outcome: "reconciliation_required",
+      scope: { projectId: PROJECT_ID, roomId: ROOM_ID },
+      replaySource: null,
+      events: [],
+      nextCursor: null,
+      hasMore: false,
+      connection: { state: "unknown", reason: "internal secret", changedAt: null },
+      alerts: [],
+    }));
+    const subscribe = vi.fn(() => unsubscribe);
+    const { app } = createApp({
+      resolveProjectEngine: () => createEngine(PROJECT_ID, service, { reconnect, subscribe }),
+    });
+
+    const response = await request(app, "GET", `/api/rooms/${ROOM_ID}/events?projectId=${PROJECT_ID}`);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_EVENT_RECONCILIATION_REQUIRED" } });
+    expect(JSON.stringify(response.body)).not.toContain("internal secret");
+    expect(subscribe).toHaveBeenCalledWith({ projectId: PROJECT_ID, roomId: ROOM_ID }, expect.any(Function));
+    expect(reconnect).toHaveBeenCalledWith({
+      projectId: PROJECT_ID,
+      roomId: ROOM_ID,
+      afterCursor: null,
+      limit: 128,
+    });
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(service.getRoomProjection).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for an unavailable live event service without changing existing Room reads", async () => {
+    const service = createReadService();
+    const { app } = createApp({ resolveProjectEngine: () => createEngine(PROJECT_ID, service) });
+
+    const response = await request(app, "GET", `/api/rooms/${ROOM_ID}/events?projectId=${PROJECT_ID}`);
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_LIVE_EVENT_SERVICE_UNAVAILABLE" } });
+    expect(service.getRoomProjection).not.toHaveBeenCalled();
+  });
+
+  it("rechecks Engine project identity before opening a Room event cursor", async () => {
+    const service = createReadService();
+    const getProjectId = vi.fn()
+      .mockReturnValueOnce(PROJECT_ID)
+      .mockReturnValueOnce(OTHER_PROJECT_ID);
+    const liveService = {
+      reconnect: vi.fn(),
+      subscribe: vi.fn(),
+    };
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service, liveService),
+        getProjectId,
+      }),
+    });
+
+    const response = await request(app, "GET", `/api/rooms/${ROOM_ID}/events?projectId=${PROJECT_ID}`);
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_ENGINE_PROJECT_MISMATCH" } });
+    expect(liveService.subscribe).not.toHaveBeenCalled();
+    expect(liveService.reconnect).not.toHaveBeenCalled();
   });
 });

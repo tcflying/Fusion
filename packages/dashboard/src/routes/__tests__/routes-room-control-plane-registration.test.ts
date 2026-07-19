@@ -30,6 +30,7 @@ function createRoutePort() {
     getRoomProjection: vi.fn(async () => null),
     listResource: vi.fn(async () => ({ items: [], nextCursor: null })),
     mutate: vi.fn(async () => ({ accepted: true as const, aggregateVersion: 1 })),
+    openRoomEventCursor: vi.fn() as RoomControlPlaneRoutePort["openRoomEventCursor"],
   } satisfies RoomControlPlaneRoutePort;
   return { port, listRooms };
 }
