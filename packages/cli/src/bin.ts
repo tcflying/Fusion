@@ -114,46 +114,72 @@ function loadLocalEnv(): void {
 
 loadLocalEnv();
 
+/*
+FNXC:CliCommandIsolation 2026-07-19-20:57:
+Source-worktree `fn init` and `fn project` commands must dispatch without
+resolving dashboard routes or optional runtime-plugin build artifacts. Keep a
+command module loader inside the invoked handler so non-dashboard commands do
+not inherit the dashboard build graph.
+*/
+function lazyCommandModule<TModule extends object>(
+  loadModule: () => Promise<TModule>,
+): TModule {
+  return new Proxy({} as TModule, {
+    get(_target, property: string | symbol) {
+      if (typeof property !== "string") {
+        return undefined;
+      }
+
+      return async (...args: unknown[]) => {
+        const commandModule = await loadModule() as Record<string, unknown>;
+        const commandHandler = commandModule[property];
+        if (typeof commandHandler !== "function") {
+          throw new TypeError(`Command handler "${property}" is not a function`);
+        }
+        return commandHandler(...args);
+      };
+    },
+  });
+}
+
 // Command handlers are loaded lazily so --help can return immediately
 // without importing the full command graph.
-async function loadCommandHandlers() {
-  const { runDashboard } = await import("./commands/dashboard.js");
-  const { runServe } = await import("./commands/serve.js");
-  const { runDaemon } = await import("./commands/daemon.js");
-  const { runDesktop } = await import("./commands/desktop.js");
-  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = await import("./commands/task.js");
-  const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = await import("./commands/pr.js");
-  const { runSettingsShow, runSettingsSet } = await import("./commands/settings.js");
-  const { runSettingsExport } = await import("./commands/settings-export.js");
-  const { runSettingsImport } = await import("./commands/settings-import.js");
-  const { runMcpList, runMcpAdd, runMcpEdit, runMcpRemove, runMcpEnable, runMcpDisable, runMcpImport, runMcpExport, runMcpValidate } = await import("./commands/mcp.js");
-  const { runWorkflowValidate } = await import("./commands/workflow.js");
-  const { runGitStatus, runGitFetch, runGitPull, runGitPush } = await import("./commands/git.js");
-  const { runBranchGroupList, runBranchGroupShow, runBranchGroupPromote, runBranchGroupAbandon } = await import("./commands/branch-group.js");
-  const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = await import("./commands/backup.js");
-  const { runDbVacuum, runDbMigrate } = await import("./commands/db.js");
-  const { runMemoryBackupCreate, runMemoryBackupList, runMemoryBackupRestore } = await import("./commands/memory-backup.js");
-  const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice, runMissionLinkGoal, runMissionUnlinkGoal, runMissionGoals } = await import("./commands/mission.js");
-  const { runGoalsList, runGoalsCreate, runGoalsArchive, runGoalsCitations } = await import("./commands/goals.js");
-  const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = await import("./commands/project.js");
-  const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = await import("./commands/node.js");
-  const { runInit } = await import("./commands/init.js");
-  const { runOnboard } = await import("./commands/onboard.js");
-  const { runAgentStop, runAgentStart } = await import("./commands/agent.js");
-  const { runAgentImport } = await import("./commands/agent-import.js");
-  const { runAgentExport } = await import("./commands/agent-export.js");
-  const { runOrgExport } = await import("./commands/org-export.js");
-  const { runOrgImport } = await import("./commands/org-import.js");
-  const { runMessageInbox, runMessageOutbox, runMessageSend, runMessageRead, runMessageDelete, runAgentMailbox } = await import("./commands/message.js");
-  const { runChatInteractive, parseChatCliArgs } = await import("./commands/chat.js");
-  const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable, runPluginSetupStatus, runPluginSetup, runPluginAvailable, runPluginSettings, runPluginRescan } = await import("./commands/plugin.js");
-  const { runPluginCreate, runPluginNew } = await import("./commands/plugin-scaffold.js");
-  const { runPluginDev } = await import("./commands/plugin-dev.js");
-  const { runPluginPublish } = await import("./commands/plugin-publish.js");
-  const { runSkillsSearch, runSkillsInstall } = await import("./commands/skills.js");
-  const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
-  const { runExperimentFinalize } = await import("./commands/experiment-finalize.js");
-  const { runUpdate } = await import("./commands/update.js");
+function loadCommandHandlers() {
+  const { runDashboard } = lazyCommandModule(() => import("./commands/dashboard.js"));
+  const { runServe } = lazyCommandModule(() => import("./commands/serve.js"));
+  const { runDaemon } = lazyCommandModule(() => import("./commands/daemon.js"));
+  const { runDesktop } = lazyCommandModule(() => import("./commands/desktop.js"));
+  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = lazyCommandModule(() => import("./commands/task.js"));
+  const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = lazyCommandModule(() => import("./commands/pr.js"));
+  const { runSettingsShow, runSettingsSet } = lazyCommandModule(() => import("./commands/settings.js"));
+  const { runSettingsExport } = lazyCommandModule(() => import("./commands/settings-export.js"));
+  const { runSettingsImport } = lazyCommandModule(() => import("./commands/settings-import.js"));
+  const { runMcpList, runMcpAdd, runMcpEdit, runMcpRemove, runMcpEnable, runMcpDisable, runMcpImport, runMcpExport, runMcpValidate } = lazyCommandModule(() => import("./commands/mcp.js"));
+  const { runWorkflowValidate } = lazyCommandModule(() => import("./commands/workflow.js"));
+  const { runGitStatus, runGitFetch, runGitPull, runGitPush } = lazyCommandModule(() => import("./commands/git.js"));
+  const { runBranchGroupList, runBranchGroupShow, runBranchGroupPromote, runBranchGroupAbandon } = lazyCommandModule(() => import("./commands/branch-group.js"));
+  const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = lazyCommandModule(() => import("./commands/backup.js"));
+  const { runDbVacuum, runDbMigrate } = lazyCommandModule(() => import("./commands/db.js"));
+  const { runMemoryBackupCreate, runMemoryBackupList, runMemoryBackupRestore } = lazyCommandModule(() => import("./commands/memory-backup.js"));
+  const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice, runMissionLinkGoal, runMissionUnlinkGoal, runMissionGoals } = lazyCommandModule(() => import("./commands/mission.js"));
+  const { runGoalsList, runGoalsCreate, runGoalsArchive, runGoalsCitations } = lazyCommandModule(() => import("./commands/goals.js"));
+  const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = lazyCommandModule(() => import("./commands/project.js"));
+  const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = lazyCommandModule(() => import("./commands/node.js"));
+  const { runInit } = lazyCommandModule(() => import("./commands/init.js"));
+  const { runOnboard } = lazyCommandModule(() => import("./commands/onboard.js"));
+  const { runAgentStop, runAgentStart } = lazyCommandModule(() => import("./commands/agent.js"));
+  const { runAgentImport } = lazyCommandModule(() => import("./commands/agent-import.js"));
+  const { runAgentExport } = lazyCommandModule(() => import("./commands/agent-export.js"));
+  const { runMessageInbox, runMessageOutbox, runMessageSend, runMessageRead, runMessageDelete, runAgentMailbox } = lazyCommandModule(() => import("./commands/message.js"));
+  const { runChatInteractive } = lazyCommandModule(() => import("./commands/chat.js"));
+  const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable, runPluginSetupStatus, runPluginSetup, runPluginAvailable, runPluginSettings, runPluginRescan } = lazyCommandModule(() => import("./commands/plugin.js"));
+  const { runPluginCreate, runPluginNew } = lazyCommandModule(() => import("./commands/plugin-scaffold.js"));
+  const { runPluginDev } = lazyCommandModule(() => import("./commands/plugin-dev.js"));
+  const { runPluginPublish } = lazyCommandModule(() => import("./commands/plugin-publish.js"));
+  const { runSkillsSearch, runSkillsInstall } = lazyCommandModule(() => import("./commands/skills.js"));
+  const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = lazyCommandModule(() => import("./commands/research.js"));
+  const { runExperimentFinalize } = lazyCommandModule(() => import("./commands/experiment-finalize.js"));
+  const { runUpdate } = lazyCommandModule(() => import("./commands/update.js"));
 
   return {
     runDashboard,
@@ -291,7 +317,6 @@ async function loadCommandHandlers() {
     runExperimentFinalize,
     runUpdate,
     runChatInteractive,
-    parseChatCliArgs,
   };
 }
 
@@ -818,8 +843,7 @@ async function main() {
     runExperimentFinalize,
     runUpdate,
     runChatInteractive,
-    parseChatCliArgs,
-  } = await loadCommandHandlers();
+  } = loadCommandHandlers();
 
   try {
     switch (command) {
@@ -2113,20 +2137,38 @@ async function main() {
       }
 
       case "chat": {
-        const parsed = parseChatCliArgs(args.slice(1));
-        if ("error" in parsed) {
-          console.error(parsed.error);
+        const usage = "Usage: fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>]";
+        const agentId = args[1];
+        if (!agentId) {
+          console.error(usage);
           process.exit(1);
         }
 
-        const input = parsed.contentArg ? Readable.from(parsed.contentArg) : process.stdin;
-        const code = await runChatInteractive(parsed.agentId, {
+        const pollIdx = args.indexOf("--poll-ms");
+        const pollMs = pollIdx !== -1 && pollIdx + 1 < args.length
+          ? Number.parseInt(args[pollIdx + 1] ?? "", 10)
+          : undefined;
+
+        if (pollIdx !== -1 && (!Number.isFinite(pollMs) || (pollMs ?? 0) <= 0)) {
+          console.error(usage);
+          process.exit(1);
+        }
+
+        const filteredArgs = args.slice(2).filter((arg, idx, arr) => {
+          if (arg === "--once" || arg === "--non-interactive" || arg === "--poll-ms") return false;
+          if (idx > 0 && arr[idx - 1] === "--poll-ms") return false;
+          return true;
+        });
+        const contentArg = filteredArgs.join(" ").trim();
+        const once = args.includes("--once") || contentArg.length > 0;
+        const nonInteractive = args.includes("--non-interactive") || contentArg.length > 0;
+        const input = contentArg ? Readable.from(contentArg) : process.stdin;
+
+        const code = await runChatInteractive(agentId, {
           project: projectName,
-          once: parsed.once,
-          nonInteractive: parsed.nonInteractive,
-          pollIntervalMs: parsed.pollIntervalMs,
-          replyTimeoutMs: parsed.replyTimeoutMs,
-          conversationId: parsed.conversationId,
+          once,
+          nonInteractive,
+          pollIntervalMs: pollMs,
           input,
         });
         process.exit(code);
