@@ -41,7 +41,7 @@ FNXC:MigrationStatusRuntimeRead 2026-07-20:
 SCHEMA_BASELINE_VERSION advances to 0030 for project-scoped runtime reads of
 the SQLite cutover ledger.
 */
-export const SCHEMA_BASELINE_VERSION = "0043";
+export const SCHEMA_BASELINE_VERSION = "0057";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -149,6 +149,46 @@ export const SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION = "0040";
 export const SCHEMA_ROOM_MESSAGE_ROUTING_VERSION = "0041";
 export const SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION = "0042";
 export const SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION = "0043";
+export const SCHEMA_ROOM_TASK_DISPATCH_DELIVERY_LINK_VERSION = "0044";
+export const SCHEMA_ROOM_ROLE_ASSIGNMENT_VERSION = "0045";
+export const SCHEMA_ROOM_SEMANTIC_ROUTING_VERSION = "0046";
+/**
+ * FNXC:SessionRoomProgressRecovery 2026-07-19-06:14:
+ * Registers only the durable observation/recovery persistence foundation for
+ * Task 5.8. Detection, scheduling, execution, and policy mutation remain
+ * separate future commands and are not implied by applying this migration.
+ */
+export const SCHEMA_ROOM_TASK_PROGRESS_RECOVERY_VERSION = "0047";
+export const SCHEMA_ROOM_PHASE_GATE_EVIDENCE_VERSION = "0048";
+export const SCHEMA_ROOM_TASK_RECOVERY_PLAN_VERSION = "0049";
+/**
+ * FNXC:RoomCapabilityRegistry 2026-07-19-10:01:
+ * Registers the durable current-registry projection independently from
+ * capability routing or scheduling, which remain later OpenSpec 6.x work.
+ */
+export const SCHEMA_ROOM_CAPABILITY_REGISTRY_VERSION = "0050";
+export const SCHEMA_ROOM_BLIND_REVIEW_REGISTRY_VERSION = "0051";
+export const SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION = "0052";
+/**
+ * FNXC:RoomGlobalConcurrency 2026-07-19-16:39:
+ * Register the durable global-concurrency tables in the ordered applier so
+ * fresh databases and upgrades share the same fenced admission state.
+ */
+export const SCHEMA_ROOM_GLOBAL_CONCURRENCY_VERSION = "0053";
+/**
+ * FNXC:RoomProviderBackpressure 2026-07-19-17:25:
+ * Apply the durable provider/account/model/connector/node lease and circuit
+ * state before any Engine admission adapter may enforce provider pressure.
+ */
+export const SCHEMA_ROOM_PROVIDER_BACKPRESSURE_VERSION = "0054";
+/**
+ * FNXC:RoomRbacRegistry 2026-07-19-18:05:
+ * Registers only project-scoped trusted-device digest sessions and role grants.
+ * Dashboard bootstrap, pairing, and HTTP identity middleware remain separate.
+ */
+export const SCHEMA_ROOM_RBAC_REGISTRY_VERSION = "0055";
+export const SCHEMA_ROOM_EVENT_REPLAY_PAGING_VERSION = "0056";
+export const SCHEMA_ROOM_EVOLUTION_TRUST_RECEIPTS_VERSION = "0057";
 
 export const SCHEMA_MIGRATIONS = [
   { version: "0000", filename: "0000_initial.sql" },
@@ -165,6 +205,20 @@ export const SCHEMA_MIGRATIONS = [
   { version: SCHEMA_ROOM_MESSAGE_ROUTING_VERSION, filename: "0011_room_message_routing.sql" },
   { version: SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION, filename: "0012_room_task_graph_commands.sql" },
   { version: SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION, filename: "0013_room_task_topology_lineage.sql" },
+  { version: SCHEMA_ROOM_TASK_DISPATCH_DELIVERY_LINK_VERSION, filename: "0014_room_task_dispatch_delivery_link.sql" },
+  { version: SCHEMA_ROOM_ROLE_ASSIGNMENT_VERSION, filename: "0015_room_role_assignment.sql" },
+  { version: SCHEMA_ROOM_SEMANTIC_ROUTING_VERSION, filename: "0016_room_semantic_routing.sql" },
+  { version: SCHEMA_ROOM_TASK_PROGRESS_RECOVERY_VERSION, filename: "0017_room_task_progress_recovery.sql" },
+  { version: SCHEMA_ROOM_PHASE_GATE_EVIDENCE_VERSION, filename: "0018_room_phase_gate_evidence.sql" },
+  { version: SCHEMA_ROOM_TASK_RECOVERY_PLAN_VERSION, filename: "0019_room_task_recovery_plans.sql" },
+  { version: SCHEMA_ROOM_CAPABILITY_REGISTRY_VERSION, filename: "0020_room_capability_registry.sql" },
+  { version: SCHEMA_ROOM_BLIND_REVIEW_REGISTRY_VERSION, filename: "0021_room_blind_review_registry.sql" },
+  { version: SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION, filename: "0022_room_evolution_controller.sql" },
+  { version: SCHEMA_ROOM_GLOBAL_CONCURRENCY_VERSION, filename: "0023_room_global_concurrency.sql" },
+  { version: SCHEMA_ROOM_PROVIDER_BACKPRESSURE_VERSION, filename: "0024_room_provider_backpressure.sql" },
+  { version: SCHEMA_ROOM_RBAC_REGISTRY_VERSION, filename: "0025_room_rbac_registry.sql" },
+  { version: SCHEMA_ROOM_EVENT_REPLAY_PAGING_VERSION, filename: "0026_room_event_replay_paging.sql" },
+  { version: SCHEMA_ROOM_EVOLUTION_TRUST_RECEIPTS_VERSION, filename: "0027_room_evolution_trust_receipts.sql" },
 ] as const;
 
 export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];

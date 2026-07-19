@@ -2098,6 +2098,8 @@ export {
 export * from "./room-contracts/index.js";
 export * from "./room-protocol-schema.js";
 export * from "./room-protocol-definitions.js";
+export * from "./async-room-evolution-ledger.js";
+export * from "./async-room-evolution-ledger-postgres.js";
 export * from "./room-domain.js";
 export * from "./room-integrity.js";
 export * from "./room-authority.js";
@@ -2489,6 +2491,7 @@ export {
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
   SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+  SCHEMA_ROOM_EVOLUTION_TRUST_RECEIPTS_VERSION,
   SCHEMA_ROOM_VERSION,
   // FNXC:BackendFlip 2026-06-26-14:30:
   // Runtime startup factory (cutover milestone). Production construction sites

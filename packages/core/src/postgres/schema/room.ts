@@ -16,18 +16,27 @@ import {
   integer,
   jsonb,
   pgSchema,
+  primaryKey,
   text,
   unique,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { PROJECT_SCHEMA } from "./_shared.js";
+import { approvalRequests } from "./approval-requests.js";
 
 const roomSchema = pgSchema(PROJECT_SCHEMA);
 
 const scopedRoomColumns = () => ({
   projectId: text("project_id").notNull(),
   roomId: text("room_id").notNull(),
+});
+
+const evolutionScopeColumns = () => ({
+  projectId: text("project_id").notNull(),
+  roomId: text("room_id"),
+  scopeKind: text("scope_kind").notNull(),
+  scopeKey: text("scope_key").notNull(),
 });
 
 export const operationalRooms = roomSchema.table("operational_rooms", {
@@ -269,7 +278,1015 @@ export const roomEvents = roomSchema.table("room_events", {
   unique("room_events_cursor_unique").on(t.cursor),
   index("idx_room_events_project_room_time").on(t.projectId, t.roomId, t.occurredAt, t.id),
   index("idx_room_events_project_cursor").on(t.projectId, t.cursor),
+  index("idx_room_events_project_room_cursor").on(t.projectId, t.roomId, t.cursor),
   index("idx_room_events_correlation").on(t.correlationId),
+]);
+
+/*
+FNXC:RoomCapabilityRegistry 2026-07-19-10:01:
+The current capability registry is a project-and-Room-scoped projection of
+immutable Room events. It retains the accepted registry hash and worker fence
+so stale workers and forged snapshots cannot silently replace a durable view.
+*/
+export const roomCapabilityRegistryProjections = roomSchema.table("room_capability_registry_projections", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  registryId: text("registry_id").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  aggregateVersion: bigint("aggregate_version", { mode: "number" }).notNull(),
+  registry: jsonb("registry").notNull(),
+  registryIntegrityHash: text("registry_integrity_hash").notNull(),
+  sourceEventId: text("source_event_id").notNull(),
+  workerLeaseId: text("worker_lease_id").notNull(),
+  workerHolderId: text("worker_holder_id").notNull(),
+  workerHostId: text("worker_host_id").notNull(),
+  workerLeaseEpoch: bigint("worker_lease_epoch", { mode: "number" }).notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_capability_registry_projections_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.sourceEventId],
+    foreignColumns: [roomEvents.id],
+    name: "room_capability_registry_projections_source_event_fkey",
+  }).onDelete("restrict"),
+  unique("room_capability_registry_projections_room_project_unique").on(t.projectId, t.roomId),
+  unique("room_capability_registry_projections_source_event_unique").on(t.sourceEventId),
+  index("idx_room_capability_registry_projections_project_room").on(t.projectId, t.roomId),
+  check("room_capability_registry_projections_revision_check", sql`${t.revision} BETWEEN 1 AND 9007199254740991`),
+  check("room_capability_registry_projections_aggregate_version_check", sql`${t.aggregateVersion} BETWEEN 1 AND 9007199254740991`),
+  check("room_capability_registry_projections_worker_epoch_check", sql`${t.workerLeaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_capability_registry_projections_registry_shape_check", sql`jsonb_typeof(${t.registry}) = 'object'`),
+  check("room_capability_registry_projections_hash_matches_registry_check", sql`${t.registryIntegrityHash} = (${t.registry} ->> 'integrityHash')`),
+  check("room_capability_registry_projections_nonblank_check", sql`
+    btrim(${t.registryId}) <> ''
+    AND btrim(${t.registryIntegrityHash}) <> ''
+    AND btrim(${t.sourceEventId}) <> ''
+    AND btrim(${t.workerLeaseId}) <> ''
+    AND btrim(${t.workerHolderId}) <> ''
+    AND btrim(${t.workerHostId}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+    AND btrim(${t.updatedAt}) <> ''
+  `),
+]);
+
+export const roomBlindReviewRegistries = roomSchema.table("room_blind_review_registries", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  reviewRoundId: text("review_round_id").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  commandHash: text("command_hash").notNull(),
+  mappingIntegrityHash: text("mapping_integrity_hash").notNull(),
+  sealedMapping: jsonb("sealed_mapping").notNull(),
+  reviewPack: jsonb("review_pack").notNull(),
+  sealedAt: text("sealed_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_blind_review_registries_room_project_fkey",
+  }).onDelete("cascade"),
+  unique("room_blind_review_registries_scope_review_unique").on(t.projectId, t.roomId, t.reviewRoundId),
+  unique("room_blind_review_registries_scope_idempotency_unique").on(t.projectId, t.roomId, t.idempotencyKey),
+  index("idx_room_blind_review_registries_project_room").on(t.projectId, t.roomId, t.sealedAt),
+  check("room_blind_review_registries_mapping_shape_check", sql`jsonb_typeof(${t.sealedMapping}) = 'object'`),
+  check("room_blind_review_registries_pack_shape_check", sql`jsonb_typeof(${t.reviewPack}) = 'object'`),
+  check("room_blind_review_registries_sealed_hash_commit_check", sql`COALESCE(
+    ${t.mappingIntegrityHash} = (${t.sealedMapping} ->> 'integrityHash')
+    AND ${t.commandHash} = (${t.sealedMapping} ->> 'commandHash')
+    AND ${t.reviewRoundId} = (${t.sealedMapping} ->> 'reviewRoundId')
+    AND ${t.reviewRoundId} = (${t.reviewPack} ->> 'reviewRoundId')
+    AND (${t.reviewPack} ->> 'purpose') = 'blind_review_only',
+    FALSE
+  )`),
+  check("room_blind_review_registries_expiry_check", sql`${t.expiresAt} > ${t.sealedAt}`),
+  check("room_blind_review_registries_hashes_check", sql`
+    ${t.commandHash} ~ '^sha256:[a-f0-9]{64}$'
+    AND ${t.mappingIntegrityHash} ~ '^sha256:[a-f0-9]{64}$'
+  `),
+  check("room_blind_review_registries_nonblank_check", sql`
+    btrim(${t.reviewRoundId}) <> ''
+    AND btrim(${t.idempotencyKey}) <> ''
+    AND btrim(${t.sealedAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+  `),
+]);
+
+/*
+FNXC:RoomEvolutionController 2026-07-19-13:21:
+Controlled evolution is one append-only, project-schema ledger rather than a
+parallel control product. Each hypothesis, isolated candidate, evaluation,
+canary, decision, and rollback retains its scoped evidence and version lineage
+so no producer can turn a self-report into an in-place production mutation.
+*/
+export const roomEvolutionHypotheses = roomSchema.table("room_evolution_hypotheses", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  revision: integer("revision").notNull(),
+  state: text("state").notNull(),
+  sourceSignalKinds: jsonb("source_signal_kinds").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  declaredScope: jsonb("declared_scope").notNull(),
+  riskClass: text("risk_class").notNull(),
+  expectedMechanism: text("expected_mechanism").notNull(),
+  affectedDomains: jsonb("affected_domains").notNull(),
+  createdByActorId: text("created_by_actor_id").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_hypotheses_room_project_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_hypotheses_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_hypotheses_scope_revision_unique").on(t.projectId, t.scopeKey, t.revision),
+  index("idx_room_evolution_hypotheses_scope_state").on(t.projectId, t.scopeKey, t.state, t.createdAt),
+  check("room_evolution_hypotheses_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_hypotheses_revision_check", sql`${t.revision} BETWEEN 1 AND 2147483647`),
+  check("room_evolution_hypotheses_state_check", sql`${t.state} IN ('proposed','experimenting','promoted','rejected','rolled_back','inconclusive')`),
+  check("room_evolution_hypotheses_signal_shape_check", sql`jsonb_typeof(${t.sourceSignalKinds}) = 'array'`),
+  check("room_evolution_hypotheses_evidence_shape_check", sql`jsonb_typeof(${t.evidence}) = 'array'`),
+  check("room_evolution_hypotheses_declared_scope_check", sql`jsonb_typeof(${t.declaredScope}) = 'array'`),
+  check("room_evolution_hypotheses_domains_shape_check", sql`jsonb_typeof(${t.affectedDomains}) = 'array'`),
+  check("room_evolution_hypotheses_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_hypotheses_risk_check", sql`${t.riskClass} IN ('low','moderate','high','critical')`),
+  check("room_evolution_hypotheses_nonblank_check", sql`
+    btrim(${t.expectedMechanism}) <> ''
+    AND btrim(${t.createdByActorId}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+/* FNXC:RoomEvolutionTrustReceipts 2026-07-19: identity/role/binding evidence is
+append-only and points at the actual Room binding generation, not an actor string. */
+export const roomEvolutionTrustedBindings = roomSchema.table("room_evolution_trusted_bindings", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  actorId: text("actor_id").notNull(),
+  purpose: text("purpose").notNull(),
+  subjectRoomId: text("subject_room_id").notNull(),
+  roomBindingId: text("room_binding_id").notNull(),
+  roomBindingGeneration: integer("room_binding_generation").notNull(),
+  roleId: text("role_id").notNull(),
+  roleVersion: integer("role_version").notNull(),
+  bindingVersion: integer("binding_version").notNull(),
+  issuedByPrincipalId: text("issued_by_principal_id").notNull(),
+  issuerGrantId: text("issuer_grant_id").notNull(),
+  issuedAt: text("issued_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  integrityHash: text("integrity_hash").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_trusted_bindings_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.subjectRoomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_trusted_bindings_subject_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.roomBindingId, t.subjectRoomId, t.projectId],
+    foreignColumns: [roomBindings.id, roomBindings.roomId, roomBindings.projectId],
+    name: "room_evolution_trusted_bindings_binding_room_project_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_trusted_bindings_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_trusted_bindings_version_scope_unique")
+    .on(t.id, t.projectId, t.scopeKey, t.bindingVersion),
+  unique("room_evolution_trusted_bindings_identity_version_unique")
+    .on(t.projectId, t.scopeKey, t.roomBindingId, t.roomBindingGeneration, t.purpose, t.bindingVersion),
+  index("idx_room_evolution_trusted_bindings_scope").on(t.projectId, t.scopeKey, t.purpose, t.expiresAt),
+  check("room_evolution_trusted_bindings_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND ${t.roomId} = ${t.subjectRoomId}
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_trusted_bindings_purpose_check", sql`${t.purpose} IN ('candidate_producer','independent_evaluator')`),
+  check("room_evolution_trusted_bindings_version_check", sql`
+    ${t.roomBindingGeneration} BETWEEN 1 AND 2147483647
+    AND ${t.roleVersion} BETWEEN 1 AND 2147483647
+    AND ${t.bindingVersion} BETWEEN 1 AND 2147483647
+  `),
+  check("room_evolution_trusted_bindings_hash_check", sql`${t.integrityHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_trusted_bindings_window_check", sql`${t.expiresAt}::timestamptz > ${t.issuedAt}::timestamptz`),
+]);
+
+export const roomEvolutionTrustedBindingRevocations = roomSchema.table("room_evolution_trusted_binding_revocations", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  trustedBindingId: text("trusted_binding_id").notNull(),
+  revokedByPrincipalId: text("revoked_by_principal_id").notNull(),
+  revokerGrantId: text("revoker_grant_id").notNull(),
+  reason: text("reason").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  revokedAt: text("revoked_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_trusted_binding_revocations_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.trustedBindingId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionTrustedBindings.id, roomEvolutionTrustedBindings.projectId, roomEvolutionTrustedBindings.scopeKey],
+    name: "room_evolution_trusted_binding_revocations_binding_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_trusted_binding_revocations_binding_scope_unique")
+    .on(t.projectId, t.scopeKey, t.trustedBindingId),
+  check("room_evolution_trusted_binding_revocations_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (${t.scopeKind} = 'room' AND ${t.roomId} IS NOT NULL AND ${t.scopeKey} = ('room:' || ${t.roomId}))
+    )
+  )`),
+  check("room_evolution_trusted_binding_revocations_payload_check", sql`jsonb_typeof(${t.evidence}) = 'array'`),
+  check("room_evolution_trusted_binding_revocations_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+]);
+
+export const roomEvolutionCandidateVersions = roomSchema.table("room_evolution_candidate_versions", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  hypothesisId: text("hypothesis_id").notNull(),
+  versionNumber: integer("version_number").notNull(),
+  candidateKind: text("candidate_kind").notNull(),
+  baseRevision: text("base_revision").notNull(),
+  candidateRef: text("candidate_ref").notNull(),
+  isolationKind: text("isolation_kind").notNull(),
+  isolationRef: text("isolation_ref").notNull(),
+  immutableInput: jsonb("immutable_input").notNull(),
+  inputHash: text("input_hash").notNull(),
+  candidateHash: text("candidate_hash"),
+  producedByActorId: text("produced_by_actor_id").notNull(),
+  producerBindingId: text("producer_binding_id"),
+  producerBindingVersion: integer("producer_binding_version"),
+  baseCandidateVersionId: text("base_candidate_version_id"),
+  rollbackTargetCandidateVersionId: text("rollback_target_candidate_version_id"),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_candidates_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.hypothesisId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionHypotheses.id, roomEvolutionHypotheses.projectId, roomEvolutionHypotheses.scopeKey],
+    name: "room_evolution_candidates_hypothesis_scope_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.baseCandidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [t.id, t.projectId, t.scopeKey],
+    name: "room_evolution_candidates_base_scope_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.rollbackTargetCandidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [t.id, t.projectId, t.scopeKey],
+    name: "room_evolution_candidates_rollback_scope_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.producerBindingId, t.projectId, t.scopeKey, t.producerBindingVersion],
+    foreignColumns: [
+      roomEvolutionTrustedBindings.id,
+      roomEvolutionTrustedBindings.projectId,
+      roomEvolutionTrustedBindings.scopeKey,
+      roomEvolutionTrustedBindings.bindingVersion,
+    ],
+    name: "room_evolution_candidates_producer_binding_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_candidates_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_candidates_hypothesis_version_unique").on(t.projectId, t.scopeKey, t.hypothesisId, t.versionNumber),
+  index("idx_room_evolution_candidates_scope_created").on(t.projectId, t.scopeKey, t.createdAt),
+  check("room_evolution_candidates_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_candidates_version_check", sql`${t.versionNumber} BETWEEN 1 AND 2147483647`),
+  check("room_evolution_candidates_verified_shape_check", sql`
+    (${t.candidateHash} IS NULL AND ${t.producerBindingId} IS NULL AND ${t.producerBindingVersion} IS NULL)
+    OR (
+      ${t.candidateHash} ~ '^sha256:[a-f0-9]{64}$'
+      AND ${t.producerBindingId} IS NOT NULL
+      AND ${t.producerBindingVersion} BETWEEN 1 AND 2147483647
+    )
+  `),
+  check("room_evolution_candidates_kind_check", sql`${t.candidateKind} IN ('prompt','skill','context','task_decomposition','protocol','role_assignment','model_routing','retry_concurrency','connector_adapter','evaluation_rule','source_code')`),
+  check("room_evolution_candidates_isolation_check", sql`${t.isolationKind} IN ('branch','worktree','versioned_policy_store')`),
+  check("room_evolution_candidates_source_isolation_check", sql`${t.candidateKind} <> 'source_code' OR ${t.isolationKind} IN ('branch','worktree')`),
+  check("room_evolution_candidates_input_shape_check", sql`jsonb_typeof(${t.immutableInput}) = 'object'`),
+  check("room_evolution_candidates_hash_check", sql`${t.inputHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_candidates_lineage_check", sql`
+    ${t.id} <> COALESCE(${t.baseCandidateVersionId}, '')
+    AND ${t.id} <> COALESCE(${t.rollbackTargetCandidateVersionId}, '')
+    AND (${t.versionNumber} = 1 OR ${t.baseCandidateVersionId} IS NOT NULL)
+  `),
+  check("room_evolution_candidates_nonblank_check", sql`
+    btrim(${t.baseRevision}) <> ''
+    AND btrim(${t.candidateRef}) <> ''
+    AND btrim(${t.baseRevision}) <> btrim(${t.candidateRef})
+    AND btrim(${t.isolationRef}) <> ''
+    AND btrim(${t.producedByActorId}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionExperiments = roomSchema.table("room_evolution_experiments", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  hypothesisId: text("hypothesis_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  state: text("state").notNull(),
+  inputSnapshotHash: text("input_snapshot_hash").notNull(),
+  authorizationEvidence: jsonb("authorization_evidence").notNull(),
+  authorizationHash: text("authorization_hash").notNull(),
+  capacityPool: text("capacity_pool").notNull(),
+  createdByActorId: text("created_by_actor_id").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_experiments_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.hypothesisId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionHypotheses.id, roomEvolutionHypotheses.projectId, roomEvolutionHypotheses.scopeKey],
+    name: "room_evolution_experiments_hypothesis_scope_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_experiments_candidate_scope_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_experiments_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  index("idx_room_evolution_experiments_scope_state").on(t.projectId, t.scopeKey, t.state, t.createdAt),
+  check("room_evolution_experiments_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_experiments_state_check", sql`${t.state} IN ('planned','running','completed','failed','cancelled','inconclusive')`),
+  check("room_evolution_experiments_pool_check", sql`${t.capacityPool} IN ('evolution_low_priority','evolution_paused')`),
+  check("room_evolution_experiments_authorization_shape_check", sql`jsonb_typeof(${t.authorizationEvidence}) = 'object'`),
+  check("room_evolution_experiments_hashes_check", sql`
+    ${t.inputSnapshotHash} ~ '^sha256:[a-f0-9]{64}$'
+    AND ${t.authorizationHash} ~ '^sha256:[a-f0-9]{64}$'
+  `),
+  check("room_evolution_experiments_nonblank_check", sql`
+    btrim(${t.createdByActorId}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionBenchmarkCases = roomSchema.table("room_evolution_benchmark_cases", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  domain: text("domain").notNull(),
+  caseKind: text("case_kind").notNull(),
+  containsPrivateRoomData: boolean("contains_private_room_data").notNull(),
+  sourceAuthorizationId: text("source_authorization_id"),
+  authorizationEvidence: jsonb("authorization_evidence").notNull(),
+  casePayload: jsonb("case_payload").notNull(),
+  expectedOutcome: jsonb("expected_outcome").notNull(),
+  contentHash: text("content_hash").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_benchmarks_room_project_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_benchmarks_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  index("idx_room_evolution_benchmarks_scope_domain").on(t.projectId, t.scopeKey, t.domain, t.caseKind, t.createdAt),
+  check("room_evolution_benchmarks_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_benchmarks_case_kind_check", sql`${t.caseKind} IN ('golden','rolling_authorized','adversarial','historical_replay')`),
+  check("room_evolution_benchmarks_private_data_check", sql`
+    NOT ${t.containsPrivateRoomData}
+    OR (
+      ${t.sourceAuthorizationId} IS NOT NULL
+      AND btrim(${t.sourceAuthorizationId}) <> ''
+      AND jsonb_typeof(${t.authorizationEvidence}) = 'object'
+      AND ${t.authorizationEvidence} <> '{}'::jsonb
+    )
+  `),
+  check("room_evolution_benchmarks_payload_shape_check", sql`
+    jsonb_typeof(${t.authorizationEvidence}) = 'object'
+    AND jsonb_typeof(${t.casePayload}) = 'object'
+    AND jsonb_typeof(${t.expectedOutcome}) = 'object'
+  `),
+  check("room_evolution_benchmarks_hash_check", sql`${t.contentHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_benchmarks_nonblank_check", sql`
+    btrim(${t.domain}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionBenchmarkResults = roomSchema.table("room_evolution_benchmark_results", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  experimentId: text("experiment_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  benchmarkCaseId: text("benchmark_case_id").notNull(),
+  evaluatorActorId: text("evaluator_actor_id").notNull(),
+  evaluatorKind: text("evaluator_kind").notNull(),
+  outcome: text("outcome").notNull(),
+  metrics: jsonb("metrics").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  completedAt: text("completed_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_benchmark_results_room_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.experimentId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExperiments.id, roomEvolutionExperiments.projectId, roomEvolutionExperiments.scopeKey],
+    name: "room_evolution_benchmark_results_experiment_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_benchmark_results_candidate_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.benchmarkCaseId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionBenchmarkCases.id, roomEvolutionBenchmarkCases.projectId, roomEvolutionBenchmarkCases.scopeKey],
+    name: "room_evolution_benchmark_results_case_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_benchmark_results_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_benchmark_results_run_unique").on(t.projectId, t.scopeKey, t.experimentId, t.candidateVersionId, t.benchmarkCaseId, t.evaluatorActorId),
+  index("idx_room_evolution_benchmark_results_scope").on(t.projectId, t.scopeKey, t.experimentId, t.completedAt),
+  check("room_evolution_benchmark_results_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_benchmark_results_evaluator_check", sql`${t.evaluatorKind} IN ('deterministic','independent_reviewer','producer_self_report')`),
+  check("room_evolution_benchmark_results_outcome_check", sql`${t.outcome} IN ('passed','failed','error','inconclusive')`),
+  check("room_evolution_benchmark_results_payload_shape_check", sql`
+    jsonb_typeof(${t.metrics}) = 'object'
+    AND jsonb_typeof(${t.evidence}) = 'array'
+  `),
+  check("room_evolution_benchmark_results_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_benchmark_results_nonblank_check", sql`
+    btrim(${t.evaluatorActorId}) <> ''
+    AND btrim(${t.completedAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionGateResults = roomSchema.table("room_evolution_gate_results", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  experimentId: text("experiment_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  benchmarkResultId: text("benchmark_result_id"),
+  gateName: text("gate_name").notNull(),
+  gateClass: text("gate_class").notNull(),
+  outcome: text("outcome").notNull(),
+  evaluatorActorId: text("evaluator_actor_id").notNull(),
+  evaluatorKind: text("evaluator_kind").notNull(),
+  candidateProducerActorId: text("candidate_producer_actor_id").notNull(),
+  candidateHash: text("candidate_hash"),
+  candidateBindingId: text("candidate_binding_id"),
+  candidateBindingVersion: integer("candidate_binding_version"),
+  evaluatorBindingId: text("evaluator_binding_id"),
+  evaluatorBindingVersion: integer("evaluator_binding_version"),
+  evaluationArtifactHash: text("evaluation_artifact_hash"),
+  metrics: jsonb("metrics").notNull(),
+  metricsHash: text("metrics_hash"),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  promotionEligible: boolean("promotion_eligible").notNull(),
+  completedAt: text("completed_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_gate_results_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.experimentId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExperiments.id, roomEvolutionExperiments.projectId, roomEvolutionExperiments.scopeKey],
+    name: "room_evolution_gate_results_experiment_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_gate_results_candidate_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.benchmarkResultId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionBenchmarkResults.id, roomEvolutionBenchmarkResults.projectId, roomEvolutionBenchmarkResults.scopeKey],
+    name: "room_evolution_gate_results_benchmark_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateBindingId, t.projectId, t.scopeKey, t.candidateBindingVersion],
+    foreignColumns: [
+      roomEvolutionTrustedBindings.id,
+      roomEvolutionTrustedBindings.projectId,
+      roomEvolutionTrustedBindings.scopeKey,
+      roomEvolutionTrustedBindings.bindingVersion,
+    ],
+    name: "room_evolution_gate_results_candidate_binding_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.evaluatorBindingId, t.projectId, t.scopeKey, t.evaluatorBindingVersion],
+    foreignColumns: [
+      roomEvolutionTrustedBindings.id,
+      roomEvolutionTrustedBindings.projectId,
+      roomEvolutionTrustedBindings.scopeKey,
+      roomEvolutionTrustedBindings.bindingVersion,
+    ],
+    name: "room_evolution_gate_results_evaluator_binding_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_gate_results_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_gate_results_identity_unique").on(t.projectId, t.scopeKey, t.experimentId, t.candidateVersionId, t.gateName, t.evaluatorActorId),
+  index("idx_room_evolution_gate_results_scope").on(t.projectId, t.scopeKey, t.experimentId, t.gateClass, t.completedAt),
+  check("room_evolution_gate_results_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_gate_results_class_check", sql`${t.gateClass} IN ('hard','optimization')`),
+  check("room_evolution_gate_results_outcome_check", sql`${t.outcome} IN ('passed','failed','error','not_run')`),
+  check("room_evolution_gate_results_evaluator_check", sql`${t.evaluatorKind} IN ('deterministic','independent_reviewer','producer_self_report')`),
+  check("room_evolution_gate_results_verified_shape_check", sql`
+    ${t.promotionEligible} = false
+    OR (
+      ${t.candidateHash} ~ '^sha256:[a-f0-9]{64}$'
+      AND ${t.candidateBindingId} IS NOT NULL
+      AND ${t.candidateBindingVersion} BETWEEN 1 AND 2147483647
+      AND ${t.evaluatorBindingId} IS NOT NULL
+      AND ${t.evaluatorBindingVersion} BETWEEN 1 AND 2147483647
+      AND ${t.evaluationArtifactHash} ~ '^sha256:[a-f0-9]{64}$'
+      AND ${t.metricsHash} ~ '^sha256:[a-f0-9]{64}$'
+    )
+  `),
+  check("room_evolution_gate_results_payload_shape_check", sql`
+    jsonb_typeof(${t.metrics}) = 'object'
+    AND jsonb_typeof(${t.evidence}) = 'array'
+  `),
+  check("room_evolution_gate_results_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_gate_results_independence_check", sql`
+    NOT ${t.promotionEligible}
+    OR (
+      ${t.outcome} = 'passed'
+      AND ${t.evaluatorKind} IN ('deterministic','independent_reviewer')
+      AND ${t.evaluatorActorId} <> ${t.candidateProducerActorId}
+    )
+  `),
+  check("room_evolution_gate_results_nonblank_check", sql`
+    btrim(${t.gateName}) <> ''
+    AND btrim(${t.evaluatorActorId}) <> ''
+    AND btrim(${t.candidateProducerActorId}) <> ''
+    AND btrim(${t.completedAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionCanaries = roomSchema.table("room_evolution_canaries", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  experimentId: text("experiment_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  allocationVersion: integer("allocation_version").notNull(),
+  allocation: jsonb("allocation").notNull(),
+  successCriteria: jsonb("success_criteria").notNull(),
+  failureCriteria: jsonb("failure_criteria").notNull(),
+  state: text("state").notNull(),
+  rollbackTargetCandidateVersionId: text("rollback_target_candidate_version_id").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_canaries_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.experimentId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExperiments.id, roomEvolutionExperiments.projectId, roomEvolutionExperiments.scopeKey],
+    name: "room_evolution_canaries_experiment_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_canaries_candidate_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.rollbackTargetCandidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_canaries_rollback_target_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_canaries_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_canaries_allocation_unique").on(t.projectId, t.scopeKey, t.candidateVersionId, t.allocationVersion),
+  index("idx_room_evolution_canaries_scope_state").on(t.projectId, t.scopeKey, t.state, t.createdAt),
+  check("room_evolution_canaries_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_canaries_allocation_version_check", sql`${t.allocationVersion} BETWEEN 1 AND 2147483647`),
+  check("room_evolution_canaries_state_check", sql`${t.state} IN ('planned','running','paused','succeeded','failed','rolled_back','cancelled')`),
+  check("room_evolution_canaries_payload_shape_check", sql`
+    jsonb_typeof(${t.allocation}) = 'object'
+    AND jsonb_typeof(${t.successCriteria}) = 'object'
+    AND jsonb_typeof(${t.failureCriteria}) = 'object'
+  `),
+  check("room_evolution_canaries_lineage_check", sql`${t.candidateVersionId} <> ${t.rollbackTargetCandidateVersionId}`),
+  check("room_evolution_canaries_nonblank_check", sql`btrim(${t.createdAt}) <> ''`),
+]);
+
+export const roomEvolutionCanaryObservations = roomSchema.table("room_evolution_canary_observations", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  canaryId: text("canary_id").notNull(),
+  metricName: text("metric_name").notNull(),
+  metricValue: jsonb("metric_value").notNull(),
+  threshold: jsonb("threshold").notNull(),
+  breached: boolean("breached").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  observedAt: text("observed_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_canary_observations_room_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.canaryId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCanaries.id, roomEvolutionCanaries.projectId, roomEvolutionCanaries.scopeKey],
+    name: "room_evolution_canary_observations_canary_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_canary_observations_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  index("idx_room_evolution_canary_observations_scope").on(t.projectId, t.scopeKey, t.canaryId, t.observedAt),
+  check("room_evolution_canary_observations_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_canary_observations_payload_check", sql`
+    jsonb_typeof(${t.metricValue}) = 'object'
+    AND jsonb_typeof(${t.threshold}) = 'object'
+    AND jsonb_typeof(${t.evidence}) = 'array'
+  `),
+  check("room_evolution_canary_observations_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_canary_observations_nonblank_check", sql`
+    btrim(${t.metricName}) <> ''
+    AND btrim(${t.observedAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionCanarySuccessOutcomes = roomSchema.table("room_evolution_canary_success_outcomes", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  canaryId: text("canary_id").notNull(),
+  experimentId: text("experiment_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  candidateHash: text("candidate_hash").notNull(),
+  candidateBindingId: text("candidate_binding_id").notNull(),
+  candidateBindingVersion: integer("candidate_binding_version").notNull(),
+  evaluatorBindingId: text("evaluator_binding_id").notNull(),
+  evaluatorBindingVersion: integer("evaluator_binding_version").notNull(),
+  gateResultIds: jsonb("gate_result_ids").notNull(),
+  allocationHash: text("allocation_hash").notNull(),
+  artifactHash: text("artifact_hash").notNull(),
+  metrics: jsonb("metrics").notNull(),
+  metricsHash: text("metrics_hash").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  completedAt: text("completed_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_canary_success_outcomes_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.canaryId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCanaries.id, roomEvolutionCanaries.projectId, roomEvolutionCanaries.scopeKey],
+    name: "room_evolution_canary_success_outcomes_canary_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.experimentId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExperiments.id, roomEvolutionExperiments.projectId, roomEvolutionExperiments.scopeKey],
+    name: "room_evolution_canary_success_outcomes_experiment_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_canary_success_outcomes_candidate_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateBindingId, t.projectId, t.scopeKey, t.candidateBindingVersion],
+    foreignColumns: [
+      roomEvolutionTrustedBindings.id,
+      roomEvolutionTrustedBindings.projectId,
+      roomEvolutionTrustedBindings.scopeKey,
+      roomEvolutionTrustedBindings.bindingVersion,
+    ],
+    name: "room_evolution_canary_success_outcomes_candidate_binding_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.evaluatorBindingId, t.projectId, t.scopeKey, t.evaluatorBindingVersion],
+    foreignColumns: [
+      roomEvolutionTrustedBindings.id,
+      roomEvolutionTrustedBindings.projectId,
+      roomEvolutionTrustedBindings.scopeKey,
+      roomEvolutionTrustedBindings.bindingVersion,
+    ],
+    name: "room_evolution_canary_success_outcomes_evaluator_binding_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_canary_success_outcomes_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_canary_success_outcomes_canary_unique").on(t.projectId, t.scopeKey, t.canaryId),
+  index("idx_room_evolution_canary_success_outcomes_scope").on(t.projectId, t.scopeKey, t.completedAt),
+  check("room_evolution_canary_success_outcomes_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (${t.scopeKind} = 'room' AND ${t.roomId} IS NOT NULL AND ${t.scopeKey} = ('room:' || ${t.roomId}))
+    )
+  )`),
+  check("room_evolution_canary_success_outcomes_payload_check", sql`
+    jsonb_typeof(${t.gateResultIds}) = 'array'
+    AND jsonb_array_length(${t.gateResultIds}) > 0
+    AND jsonb_typeof(${t.metrics}) = 'object'
+    AND jsonb_typeof(${t.evidence}) = 'array'
+  `),
+  check("room_evolution_canary_success_outcomes_hash_check", sql`
+    ${t.candidateHash} ~ '^sha256:[a-f0-9]{64}$'
+    AND ${t.allocationHash} ~ '^sha256:[a-f0-9]{64}$'
+    AND ${t.artifactHash} ~ '^sha256:[a-f0-9]{64}$'
+    AND ${t.metricsHash} ~ '^sha256:[a-f0-9]{64}$'
+    AND ${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'
+  `),
+]);
+
+export const roomEvolutionPromotionDecisions = roomSchema.table("room_evolution_promotion_decisions", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  experimentId: text("experiment_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  canaryId: text("canary_id"),
+  canarySuccessOutcomeId: text("canary_success_outcome_id"),
+  candidateHash: text("candidate_hash"),
+  decisionBindingId: text("decision_binding_id"),
+  decisionBindingVersion: integer("decision_binding_version"),
+  decision: text("decision").notNull(),
+  riskClass: text("risk_class").notNull(),
+  authorityTier: text("authority_tier").notNull(),
+  candidateProducerActorId: text("candidate_producer_actor_id").notNull(),
+  decisionActorId: text("decision_actor_id").notNull(),
+  approvalRequestId: text("approval_request_id"),
+  authorizationEvidence: jsonb("authorization_evidence").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  rollbackTargetCandidateVersionId: text("rollback_target_candidate_version_id"),
+  decidedAt: text("decided_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_promotions_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.experimentId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExperiments.id, roomEvolutionExperiments.projectId, roomEvolutionExperiments.scopeKey],
+    name: "room_evolution_promotions_experiment_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_promotions_candidate_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.canaryId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCanaries.id, roomEvolutionCanaries.projectId, roomEvolutionCanaries.scopeKey],
+    name: "room_evolution_promotions_canary_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.canarySuccessOutcomeId, t.projectId, t.scopeKey],
+    foreignColumns: [
+      roomEvolutionCanarySuccessOutcomes.id,
+      roomEvolutionCanarySuccessOutcomes.projectId,
+      roomEvolutionCanarySuccessOutcomes.scopeKey,
+    ],
+    name: "room_evolution_promotions_success_outcome_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.decisionBindingId, t.projectId, t.scopeKey, t.decisionBindingVersion],
+    foreignColumns: [
+      roomEvolutionTrustedBindings.id,
+      roomEvolutionTrustedBindings.projectId,
+      roomEvolutionTrustedBindings.scopeKey,
+      roomEvolutionTrustedBindings.bindingVersion,
+    ],
+    name: "room_evolution_promotions_decision_binding_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.rollbackTargetCandidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_promotions_rollback_target_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.approvalRequestId],
+    foreignColumns: [approvalRequests.id],
+    name: "room_evolution_promotions_approval_request_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_promotions_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_promotions_candidate_decision_unique").on(t.projectId, t.scopeKey, t.experimentId, t.candidateVersionId, t.decidedAt),
+  index("idx_room_evolution_promotions_scope_decision").on(t.projectId, t.scopeKey, t.decision, t.decidedAt),
+  check("room_evolution_promotions_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_promotions_verified_shape_check", sql`
+    ${t.decision} <> 'promoted'
+    OR (
+      ${t.canarySuccessOutcomeId} IS NOT NULL
+      AND ${t.candidateHash} ~ '^sha256:[a-f0-9]{64}$'
+      AND ${t.decisionBindingId} IS NOT NULL
+      AND ${t.decisionBindingVersion} BETWEEN 1 AND 2147483647
+      AND ${t.canaryId} IS NOT NULL
+      AND ${t.rollbackTargetCandidateVersionId} IS NOT NULL
+    )
+  `),
+  check("room_evolution_promotions_decision_check", sql`${t.decision} IN ('promoted','rejected','inconclusive','rollback_required')`),
+  check("room_evolution_promotions_risk_check", sql`${t.riskClass} IN ('low','moderate','high','critical')`),
+  check("room_evolution_promotions_authority_check", sql`${t.authorityTier} IN ('automatic_pre_authorized','independent','human')`),
+  check("room_evolution_promotions_payload_shape_check", sql`
+    jsonb_typeof(${t.authorizationEvidence}) = 'object'
+    AND jsonb_typeof(${t.evidence}) = 'array'
+  `),
+  check("room_evolution_promotions_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_promotions_no_self_accept_check", sql`
+    ${t.decision} <> 'promoted'
+    OR ${t.decisionActorId} <> ${t.candidateProducerActorId}
+  `),
+  check("room_evolution_promotions_canary_check", sql`
+    ${t.decision} <> 'promoted'
+    OR (${t.canaryId} IS NOT NULL AND ${t.rollbackTargetCandidateVersionId} IS NOT NULL)
+  `),
+  check("room_evolution_promotions_high_risk_check", sql`
+    ${t.riskClass} NOT IN ('high','critical')
+    OR (${t.authorityTier} = 'human' AND ${t.approvalRequestId} IS NOT NULL)
+  `),
+  check("room_evolution_promotions_nonblank_check", sql`
+    btrim(${t.candidateProducerActorId}) <> ''
+    AND btrim(${t.decisionActorId}) <> ''
+    AND btrim(${t.decidedAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionRollbacks = roomSchema.table("room_evolution_rollbacks", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  promotionDecisionId: text("promotion_decision_id").notNull(),
+  canaryId: text("canary_id").notNull(),
+  fromCandidateVersionId: text("from_candidate_version_id").notNull(),
+  toCandidateVersionId: text("to_candidate_version_id").notNull(),
+  triggerKind: text("trigger_kind").notNull(),
+  reason: text("reason").notNull(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  executedAt: text("executed_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_rollbacks_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.promotionDecisionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionPromotionDecisions.id, roomEvolutionPromotionDecisions.projectId, roomEvolutionPromotionDecisions.scopeKey],
+    name: "room_evolution_rollbacks_promotion_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.canaryId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCanaries.id, roomEvolutionCanaries.projectId, roomEvolutionCanaries.scopeKey],
+    name: "room_evolution_rollbacks_canary_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.fromCandidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_rollbacks_from_candidate_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.toCandidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_rollbacks_to_candidate_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_rollbacks_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  index("idx_room_evolution_rollbacks_scope_time").on(t.projectId, t.scopeKey, t.executedAt),
+  check("room_evolution_rollbacks_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_rollbacks_trigger_check", sql`${t.triggerKind} IN ('automatic','operator')`),
+  check("room_evolution_rollbacks_payload_shape_check", sql`jsonb_typeof(${t.evidence}) = 'array'`),
+  check("room_evolution_rollbacks_hash_check", sql`${t.evidenceHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_rollbacks_lineage_check", sql`${t.fromCandidateVersionId} <> ${t.toCandidateVersionId}`),
+  check("room_evolution_rollbacks_nonblank_check", sql`
+    btrim(${t.reason}) <> ''
+    AND btrim(${t.executedAt}) <> ''
+  `),
 ]);
 
 export const roomTaskNodes = roomSchema.table("room_task_nodes", {
@@ -480,6 +1497,150 @@ export const roomTaskNodes = roomSchema.table("room_task_nodes", {
   `),
 ]);
 
+/*
+FNXC:SessionRoomRoleAssignment 2026-07-19-02:24:
+Capability-aware role selection is a durable Room control-plane decision, not
+a transient coordinator preference. Keep each canonical snapshot, user lock or
+forbid, and producer lineage versioned so a restart or later dispatch claim
+can prove exactly why one concrete Session binding was eligible.
+*/
+export const roomRoleAssignments = roomSchema.table("room_role_assignments", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  aggregateVersion: bigint("aggregate_version", { mode: "number" }).notNull(),
+  state: text("state").notNull(),
+  protocolId: text("protocol_id").notNull(),
+  protocolVersion: integer("protocol_version").notNull(),
+  phaseId: text("phase_id").notNull(),
+  capabilitySnapshot: jsonb("capability_snapshot").notNull(),
+  constraints: jsonb("constraints").notNull(),
+  assignment: jsonb("assignment").notNull(),
+  authoritativeProducerBindingIds: jsonb("authoritative_producer_binding_ids").notNull().default([]),
+  createdAt: text("created_at").notNull(),
+  supersededAt: text("superseded_at"),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_role_assignments_room_project_fkey",
+  }).onDelete("cascade"),
+  unique("room_role_assignments_room_revision_unique").on(t.roomId, t.revision),
+  uniqueIndex("room_role_assignments_active_room_unique")
+    .on(t.projectId, t.roomId)
+    .where(sql`${t.state} = 'active'`),
+  index("idx_room_role_assignments_project_room_state")
+    .on(t.projectId, t.roomId, t.state, t.revision),
+  check("room_role_assignments_state_check", sql`${t.state} IN ('active','superseded')`),
+  check("room_role_assignments_revision_check", sql`${t.revision} BETWEEN 1 AND 9007199254740991`),
+  check("room_role_assignments_aggregate_version_check", sql`${t.aggregateVersion} BETWEEN 1 AND 9007199254740991`),
+  check("room_role_assignments_protocol_version_check", sql`${t.protocolVersion} BETWEEN 1 AND 2147483647`),
+  check("room_role_assignments_phase_id_check", sql`btrim(${t.phaseId}) <> ''`),
+  check("room_role_assignments_snapshot_shape_check", sql`jsonb_typeof(${t.capabilitySnapshot}) = 'object'`),
+  check("room_role_assignments_constraints_shape_check", sql`jsonb_typeof(${t.constraints}) = 'object'`),
+  check("room_role_assignments_assignment_shape_check", sql`jsonb_typeof(${t.assignment}) = 'object'`),
+  check("room_role_assignments_producer_shape_check", sql`jsonb_typeof(${t.authoritativeProducerBindingIds}) = 'array'`),
+  check("room_role_assignments_state_time_check", sql`(
+    ${t.state} = 'active' AND ${t.supersededAt} IS NULL
+  ) OR (
+    ${t.state} = 'superseded' AND ${t.supersededAt} IS NOT NULL
+  )`),
+]);
+
+/*
+FNXC:RoomPhaseGateEvidence 2026-07-18-08:41:
+Phase advancement must consume immutable, independently checkable proof rather
+than a command-provided list of passed gate ids. Keep the full canonical
+evidence record and the producer-lineage snapshot together so an event replay
+can re-evaluate exactly the proof that authorized a phase transition.
+*/
+export const roomPhaseGateEvidence = roomSchema.table("room_phase_gate_evidence", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  evidence: jsonb("evidence").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  producerLineage: jsonb("producer_lineage").notNull(),
+  evidenceNotBefore: text("evidence_not_before").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_phase_gate_evidence_room_project_fkey",
+  }).onDelete("cascade"),
+  uniqueIndex("room_phase_gate_evidence_source_unique")
+    .on(t.projectId, t.roomId, sql`(${t.evidence}->'source'->>'recordId')`),
+  index("idx_room_phase_gate_evidence_room_created")
+    .on(t.projectId, t.roomId, t.createdAt, t.id),
+  check("room_phase_gate_evidence_evidence_shape_check", sql`jsonb_typeof(${t.evidence}) = 'object'`),
+  check("room_phase_gate_evidence_lineage_shape_check", sql`jsonb_typeof(${t.producerLineage}) = 'object'`),
+  check("room_phase_gate_evidence_nonblank_check", sql`
+    btrim(${t.id}) <> ''
+    AND btrim(${t.evidenceHash}) <> ''
+    AND btrim(${t.evidenceNotBefore}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+/*
+FNXC:SessionRoomSemanticRouting 2026-07-19-03:18:
+The controller-owned semantic/evidence/decision state is versioned separately
+from peer messages. A peer can only echo the current state; it cannot create
+or advance authority merely by supplying matching-looking hashes.
+*/
+export const roomSemanticStates = roomSchema.table("room_semantic_states", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  turnId: text("turn_id").notNull(),
+  nodeId: text("node_id").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  state: text("state").notNull(),
+  protocolId: text("protocol_id").notNull(),
+  protocolVersion: integer("protocol_version").notNull(),
+  phaseId: text("phase_id").notNull(),
+  semanticHash: text("semantic_hash").notNull(),
+  evidenceStateHash: text("evidence_state_hash").notNull(),
+  decisionStateHash: text("decision_state_hash").notNull(),
+  stateFingerprint: text("state_fingerprint").notNull(),
+  createdAt: text("created_at").notNull(),
+  supersededAt: text("superseded_at"),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_semantic_states_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.nodeId, t.roomId, t.projectId],
+    foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
+    name: "room_semantic_states_node_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({ columns: [t.turnId], foreignColumns: [roomTurns.id], name: "room_semantic_states_turn_fkey" }).onDelete("cascade"),
+  unique("room_semantic_states_id_room_project_unique").on(t.id, t.roomId, t.projectId),
+  unique("room_semantic_states_turn_node_revision_unique").on(t.turnId, t.nodeId, t.revision),
+  uniqueIndex("room_semantic_states_active_turn_node_unique")
+    .on(t.projectId, t.roomId, t.turnId, t.nodeId)
+    .where(sql`${t.state} = 'active'`),
+  index("idx_room_semantic_states_project_room_turn_node")
+    .on(t.projectId, t.roomId, t.turnId, t.nodeId, t.state, t.revision),
+  check("room_semantic_states_state_check", sql`${t.state} IN ('active','superseded')`),
+  check("room_semantic_states_revision_check", sql`${t.revision} BETWEEN 1 AND 9007199254740991`),
+  check("room_semantic_states_protocol_version_check", sql`${t.protocolVersion} BETWEEN 1 AND 2147483647`),
+  check("room_semantic_states_nonblank_check", sql`
+    btrim(${t.protocolId}) <> ''
+    AND btrim(${t.phaseId}) <> ''
+    AND btrim(${t.semanticHash}) <> ''
+    AND btrim(${t.evidenceStateHash}) <> ''
+    AND btrim(${t.decisionStateHash}) <> ''
+    AND btrim(${t.stateFingerprint}) <> ''
+  `),
+  check("room_semantic_states_state_time_check", sql`(
+    ${t.state} = 'active' AND ${t.supersededAt} IS NULL
+  ) OR (
+    ${t.state} = 'superseded' AND ${t.supersededAt} IS NOT NULL
+  )`),
+]);
+
 export const roomTaskEdges = roomSchema.table("room_task_edges", {
   id: text("id").primaryKey(),
   ...scopedRoomColumns(),
@@ -578,6 +1739,391 @@ export const roomMessages = roomSchema.table("room_messages", {
 ]);
 
 /*
+FNXC:SessionRoomSemanticRouting 2026-07-19-03:18:
+room_messages remains the transport-neutral body and delivery ledger. This
+companion keeps the complete typed protocol envelope plus resolved response
+obligations so replay and a restarted controller do not infer semantics from
+untyped chat content.
+*/
+export const roomProtocolMessages = roomSchema.table("room_protocol_messages", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  protocolMessageId: text("protocol_message_id").notNull(),
+  turnId: text("turn_id").notNull(),
+  nodeId: text("node_id").notNull(),
+  protocolId: text("protocol_id").notNull(),
+  protocolVersion: integer("protocol_version").notNull(),
+  phaseId: text("phase_id").notNull(),
+  channelId: text("channel_id").notNull(),
+  issuedAt: text("issued_at").notNull(),
+  originSeatId: text("origin_seat_id").notNull(),
+  originBindingId: text("origin_binding_id").notNull(),
+  originRoleId: text("origin_role_id").notNull(),
+  semanticHash: text("semantic_hash").notNull(),
+  evidenceStateHash: text("evidence_state_hash").notNull(),
+  decisionStateHash: text("decision_state_hash").notNull(),
+  semanticStateId: text("semantic_state_id").notNull(),
+  semanticStateRevision: bigint("semantic_state_revision", { mode: "number" }).notNull(),
+  semanticStateFingerprint: text("semantic_state_fingerprint").notNull(),
+  semanticLoopFingerprint: text("semantic_loop_fingerprint").notNull(),
+  protocolTarget: jsonb("protocol_target").notNull(),
+  referenceBundle: jsonb("reference_bundle").notNull(),
+  routeOutcome: text("route_outcome").notNull(),
+  recipientController: boolean("recipient_controller").notNull(),
+  recipientSeatIds: jsonb("recipient_seat_ids").notNull().default([]),
+  requiredControllerResponse: boolean("required_controller_response").notNull(),
+  requiredResponderSeatIds: jsonb("required_responder_seat_ids").notNull().default([]),
+  audit: jsonb("audit").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.id, t.roomId, t.projectId],
+    foreignColumns: [roomMessages.id, roomMessages.roomId, roomMessages.projectId],
+    name: "room_protocol_messages_message_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.semanticStateId, t.roomId, t.projectId],
+    foreignColumns: [roomSemanticStates.id, roomSemanticStates.roomId, roomSemanticStates.projectId],
+    name: "room_protocol_messages_semantic_state_room_project_fkey",
+  }).onDelete("restrict"),
+  unique("room_protocol_messages_room_protocol_message_unique")
+    .on(t.projectId, t.roomId, t.protocolMessageId),
+  index("idx_room_protocol_messages_turn_node_time")
+    .on(t.projectId, t.roomId, t.turnId, t.nodeId, t.createdAt, t.id),
+  check("room_protocol_messages_protocol_version_check", sql`${t.protocolVersion} BETWEEN 1 AND 2147483647`),
+  check("room_protocol_messages_semantic_state_revision_check", sql`${t.semanticStateRevision} BETWEEN 1 AND 9007199254740991`),
+  check("room_protocol_messages_semantic_loop_fingerprint_check", sql`btrim(${t.semanticLoopFingerprint}) <> ''`),
+  check("room_protocol_messages_route_outcome_check", sql`${t.routeOutcome} IN ('route','loop_break')`),
+  check("room_protocol_messages_json_shape_check", sql`
+    jsonb_typeof(${t.protocolTarget}) = 'object'
+    AND jsonb_typeof(${t.referenceBundle}) = 'object'
+    AND jsonb_typeof(${t.recipientSeatIds}) = 'array'
+    AND jsonb_typeof(${t.requiredResponderSeatIds}) = 'array'
+    AND jsonb_typeof(${t.audit}) = 'object'
+  `),
+]);
+
+/*
+FNXC:SessionRoomSemanticRouting 2026-07-19-03:18:
+One unchanged semantic state may escalate to the controller once. The unique
+fingerprint prevents a failed participant from converting a blocked loop into
+an unbounded stream of duplicated help requests after retries or restarts.
+*/
+export const roomSemanticLoopBreaks = roomSchema.table("room_semantic_loop_breaks", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  turnId: text("turn_id").notNull(),
+  nodeId: text("node_id").notNull(),
+  semanticStateFingerprint: text("semantic_state_fingerprint").notNull(),
+  sourceMessageId: text("source_message_id").notNull(),
+  escalationMessageId: text("escalation_message_id").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_semantic_loop_breaks_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({ columns: [t.sourceMessageId], foreignColumns: [roomMessages.id], name: "room_semantic_loop_breaks_source_message_fkey" }).onDelete("cascade"),
+  foreignKey({ columns: [t.escalationMessageId], foreignColumns: [roomMessages.id], name: "room_semantic_loop_breaks_escalation_message_fkey" }).onDelete("cascade"),
+  unique("room_semantic_loop_breaks_state_unique")
+    .on(t.projectId, t.roomId, t.turnId, t.nodeId, t.semanticStateFingerprint),
+  index("idx_room_semantic_loop_breaks_room_node").on(t.projectId, t.roomId, t.turnId, t.nodeId, t.createdAt),
+  check("room_semantic_loop_breaks_nonblank_check", sql`
+    btrim(${t.semanticStateFingerprint}) <> ''
+    AND btrim(${t.sourceMessageId}) <> ''
+    AND btrim(${t.escalationMessageId}) <> ''
+  `),
+]);
+
+/*
+FNXC:SessionRoomSemanticRouting 2026-07-19-03:26:
+Controller-directed semantic work is a durable, fenced inbox rather than an
+in-process callback. Recovery can reclaim an expired action after a controller
+crash without duplicating the originating protocol message or provider send.
+*/
+export const roomSemanticControllerInbox = roomSchema.table("room_semantic_controller_inbox", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  messageId: text("message_id").notNull(),
+  protocolMessageId: text("protocol_message_id"),
+  actionKind: text("action_kind").notNull(),
+  reasonCode: text("reason_code"),
+  payload: jsonb("payload").notNull(),
+  state: text("state").notNull(),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  claimToken: text("claim_token"),
+  claimExpiresAt: text("claim_expires_at"),
+  claimedBy: text("claimed_by"),
+  processedAt: text("processed_at"),
+  lastErrorCode: text("last_error_code"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_semantic_controller_inbox_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({ columns: [t.messageId], foreignColumns: [roomMessages.id], name: "room_semantic_controller_inbox_message_fkey" }).onDelete("cascade"),
+  unique("room_semantic_controller_inbox_message_action_unique")
+    .on(t.projectId, t.roomId, t.messageId, t.actionKind),
+  index("idx_room_semantic_controller_inbox_claim")
+    .on(t.projectId, t.roomId, t.state, t.claimExpiresAt, t.createdAt),
+  check("room_semantic_controller_inbox_action_kind_check", sql`${t.actionKind} IN ('semantic_message','semantic_loop_break')`),
+  check("room_semantic_controller_inbox_state_check", sql`${t.state} IN ('pending','claimed','processed')`),
+  check("room_semantic_controller_inbox_attempt_check", sql`${t.attemptCount} BETWEEN 0 AND 9007199254740991`),
+  check("room_semantic_controller_inbox_payload_shape_check", sql`jsonb_typeof(${t.payload}) = 'object'`),
+  check("room_semantic_controller_inbox_claim_shape_check", sql`(
+    ${t.state} = 'pending'
+    AND ${t.claimToken} IS NULL
+    AND ${t.claimExpiresAt} IS NULL
+    AND ${t.claimedBy} IS NULL
+    AND ${t.processedAt} IS NULL
+  ) OR (
+    ${t.state} = 'claimed'
+    AND ${t.claimToken} IS NOT NULL
+    AND ${t.claimExpiresAt} IS NOT NULL
+    AND ${t.claimedBy} IS NOT NULL
+    AND ${t.processedAt} IS NULL
+  ) OR (
+    ${t.state} = 'processed'
+    AND ${t.claimToken} IS NULL
+    AND ${t.claimExpiresAt} IS NULL
+    AND ${t.claimedBy} IS NULL
+    AND ${t.processedAt} IS NOT NULL
+  )`),
+]);
+
+/*
+FNXC:SessionRoomProgressRecovery 2026-07-19-06:14:
+Task 5.8 needs one immutable, per-round observation record that freezes the
+semantic, evidence, artifact, test, and resolved-dissent inputs used for a
+later no-progress decision. This persistence layer deliberately does not
+detect no-progress or advance a recovery ladder by itself.
+*/
+export const roomTaskProgressObservations = roomSchema.table("room_task_progress_observations", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  nodeId: text("node_id").notNull(),
+  nodeVersion: bigint("node_version", { mode: "number" }).notNull(),
+  turnId: text("turn_id").notNull(),
+  phaseId: text("phase_id").notNull(),
+  roundId: text("round_id").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  progressSignature: text("progress_signature").notNull(),
+  semanticHash: text("semantic_hash").notNull(),
+  evidenceHash: text("evidence_hash").notNull(),
+  artifactHash: text("artifact_hash").notNull(),
+  testHash: text("test_hash").notNull(),
+  resolvedDissentHash: text("resolved_dissent_hash").notNull(),
+  origin: jsonb("origin").notNull(),
+  observedAt: text("observed_at").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_task_progress_observations_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.nodeId, t.roomId, t.projectId],
+    foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
+    name: "room_task_progress_observations_node_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.turnId],
+    foreignColumns: [roomTurns.id],
+    name: "room_task_progress_observations_turn_fkey",
+  }).onDelete("cascade"),
+  unique("room_task_progress_observations_id_lineage_unique")
+    .on(t.id, t.nodeId, t.nodeVersion, t.roomId, t.projectId),
+  unique("room_task_progress_observations_round_unique")
+    .on(t.projectId, t.roomId, t.nodeId, t.nodeVersion, t.turnId, t.phaseId, t.roundId),
+  unique("room_task_progress_observations_idempotency_unique")
+    .on(t.projectId, t.roomId, t.idempotencyKey),
+  index("idx_room_task_progress_observations_node_time")
+    .on(t.projectId, t.roomId, t.nodeId, t.nodeVersion, t.turnId, t.phaseId, t.observedAt, t.id),
+  check("room_task_progress_observations_node_version_check", sql`${t.nodeVersion} BETWEEN 0 AND 9007199254740991`),
+  check("room_task_progress_observations_origin_shape_check", sql`jsonb_typeof(${t.origin}) = 'object'`),
+  check("room_task_progress_observations_nonblank_check", sql`
+    btrim(${t.nodeId}) <> ''
+    AND btrim(${t.turnId}) <> ''
+    AND btrim(${t.phaseId}) <> ''
+    AND btrim(${t.roundId}) <> ''
+    AND btrim(${t.idempotencyKey}) <> ''
+    AND btrim(${t.progressSignature}) <> ''
+    AND btrim(${t.semanticHash}) <> ''
+    AND btrim(${t.evidenceHash}) <> ''
+    AND btrim(${t.artifactHash}) <> ''
+    AND btrim(${t.testHash}) <> ''
+    AND btrim(${t.resolvedDissentHash}) <> ''
+    AND btrim(${t.observedAt}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+/*
+FNXC:SessionRoomProgressRecovery 2026-07-19-06:14:
+Every chosen recovery step retains its exact triggering observation and frozen
+action/policy snapshots. A future worker may only claim the queue through a
+fence-aware command; this table intentionally supplies no executor, detector,
+or policy promotion behavior on its own.
+*/
+export const roomTaskRecoveryActions = roomSchema.table("room_task_recovery_actions", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  nodeId: text("node_id").notNull(),
+  nodeVersion: bigint("node_version", { mode: "number" }).notNull(),
+  observationId: text("observation_id").notNull(),
+  actionId: text("action_id").notNull(),
+  actionSnapshot: jsonb("action_snapshot").notNull(),
+  policySnapshot: jsonb("policy_snapshot").notNull(),
+  state: text("state").notNull(),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  claimToken: text("claim_token"),
+  claimExpiresAt: text("claim_expires_at"),
+  claimedByWorkerId: text("claimed_by_worker_id"),
+  claimedAt: text("claimed_at"),
+  nextEligibleAt: text("next_eligible_at").notNull(),
+  resultPayload: jsonb("result_payload"),
+  lastErrorCode: text("last_error_code"),
+  operatorApprovalId: text("operator_approval_id"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  processedAt: text("processed_at"),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_task_recovery_actions_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.nodeId, t.roomId, t.projectId],
+    foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
+    name: "room_task_recovery_actions_node_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.observationId, t.nodeId, t.nodeVersion, t.roomId, t.projectId],
+    foreignColumns: [
+      roomTaskProgressObservations.id,
+      roomTaskProgressObservations.nodeId,
+      roomTaskProgressObservations.nodeVersion,
+      roomTaskProgressObservations.roomId,
+      roomTaskProgressObservations.projectId,
+    ],
+    name: "room_task_recovery_actions_observation_lineage_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.operatorApprovalId],
+    foreignColumns: [approvalRequests.id],
+    name: "room_task_recovery_actions_operator_approval_fkey",
+  }).onDelete("restrict"),
+  unique("room_task_recovery_actions_observation_action_unique")
+    .on(t.projectId, t.roomId, t.observationId, t.actionId),
+  unique("room_task_recovery_actions_identity_room_project_unique")
+    .on(t.id, t.roomId, t.projectId),
+  index("idx_room_task_recovery_actions_claim")
+    .on(t.projectId, t.roomId, t.state, t.nextEligibleAt, t.claimExpiresAt, t.createdAt),
+  index("idx_room_task_recovery_actions_node")
+    .on(t.projectId, t.roomId, t.nodeId, t.nodeVersion, t.createdAt, t.id),
+  index("idx_room_task_recovery_actions_operator_approval")
+    .on(t.operatorApprovalId),
+  check("room_task_recovery_actions_node_version_check", sql`${t.nodeVersion} BETWEEN 0 AND 9007199254740991`),
+  check("room_task_recovery_actions_state_check", sql`${t.state} IN ('pending','claimed','processed')`),
+  check("room_task_recovery_actions_attempt_check", sql`${t.attemptCount} BETWEEN 0 AND 9007199254740991`),
+  check("room_task_recovery_actions_action_snapshot_shape_check", sql`jsonb_typeof(${t.actionSnapshot}) = 'object'`),
+  check("room_task_recovery_actions_policy_snapshot_shape_check", sql`jsonb_typeof(${t.policySnapshot}) = 'object'`),
+  check("room_task_recovery_actions_result_shape_check", sql`${t.resultPayload} IS NULL OR jsonb_typeof(${t.resultPayload}) = 'object'`),
+  check("room_task_recovery_actions_nonblank_check", sql`
+    btrim(${t.nodeId}) <> ''
+    AND btrim(${t.observationId}) <> ''
+    AND btrim(${t.actionId}) <> ''
+    AND btrim(${t.nextEligibleAt}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+    AND btrim(${t.updatedAt}) <> ''
+    AND (${t.lastErrorCode} IS NULL OR btrim(${t.lastErrorCode}) <> '')
+    AND (${t.operatorApprovalId} IS NULL OR btrim(${t.operatorApprovalId}) <> '')
+  `),
+  check("room_task_recovery_actions_claim_shape_check", sql`(
+    ${t.state} = 'pending'
+    AND ${t.claimToken} IS NULL
+    AND ${t.claimExpiresAt} IS NULL
+    AND ${t.claimedByWorkerId} IS NULL
+    AND ${t.claimedAt} IS NULL
+    AND ${t.processedAt} IS NULL
+    AND ${t.resultPayload} IS NULL
+  ) OR (
+    ${t.state} = 'claimed'
+    AND ${t.claimToken} IS NOT NULL
+    AND btrim(${t.claimToken}) <> ''
+    AND ${t.claimExpiresAt} IS NOT NULL
+    AND btrim(${t.claimExpiresAt}) <> ''
+    AND ${t.claimedByWorkerId} IS NOT NULL
+    AND btrim(${t.claimedByWorkerId}) <> ''
+    AND ${t.claimedAt} IS NOT NULL
+    AND btrim(${t.claimedAt}) <> ''
+    AND ${t.processedAt} IS NULL
+    AND ${t.resultPayload} IS NULL
+  ) OR (
+    ${t.state} = 'processed'
+    AND ${t.claimToken} IS NULL
+    AND ${t.claimExpiresAt} IS NULL
+    AND ${t.claimedByWorkerId} IS NULL
+    AND ${t.claimedAt} IS NULL
+    AND ${t.processedAt} IS NOT NULL
+    AND btrim(${t.processedAt}) <> ''
+    AND ${t.resultPayload} IS NOT NULL
+  )`),
+]);
+
+/*
+FNXC:SessionRoomRecoveryPlan 2026-07-19:
+A no-progress action is not considered executed merely because a worker saw it.
+This immutable, project-scoped handoff is the durable controller-plan or
+operator-escalation receipt. Its source action remains separately fenced and
+is retained verbatim, so a later controller can inspect the exact bounded
+recovery directive without re-reading mutable provider state.
+*/
+export const roomTaskRecoveryPlans = roomSchema.table("room_task_recovery_plans", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  recoveryActionId: text("recovery_action_id").notNull(),
+  executionMode: text("execution_mode").notNull(),
+  actionSnapshot: jsonb("action_snapshot").notNull(),
+  actionSnapshotHash: text("action_snapshot_hash").notNull(),
+  resultReceipt: jsonb("result_receipt").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_task_recovery_plans_room_project_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.recoveryActionId, t.roomId, t.projectId],
+    foreignColumns: [
+      roomTaskRecoveryActions.id,
+      roomTaskRecoveryActions.roomId,
+      roomTaskRecoveryActions.projectId,
+    ],
+    name: "room_task_recovery_plans_action_room_project_fkey",
+  }).onDelete("cascade"),
+  unique("room_task_recovery_plans_action_room_project_unique")
+    .on(t.recoveryActionId, t.roomId, t.projectId),
+  index("idx_room_task_recovery_plans_room_created")
+    .on(t.projectId, t.roomId, t.createdAt, t.id),
+  check("room_task_recovery_plans_execution_mode_check", sql`${t.executionMode} IN ('controller_plan','operator_approval')`),
+  check("room_task_recovery_plans_action_snapshot_shape_check", sql`jsonb_typeof(${t.actionSnapshot}) = 'object'`),
+  check("room_task_recovery_plans_result_receipt_shape_check", sql`jsonb_typeof(${t.resultReceipt}) = 'object'`),
+  check("room_task_recovery_plans_nonblank_check", sql`
+    btrim(${t.recoveryActionId}) <> ''
+    AND btrim(${t.actionSnapshotHash}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+  `),
+]);
+
+/*
 FNXC:SessionRoomMessageRouting 2026-07-18-11:26:
 Routed operator messages must freeze their resolved controller/seat targets and active binding lineage at command commit. The selector remains on room_messages for backward-compatible reads, while these ordered target rows prevent later membership changes from rewriting delivery history.
 */
@@ -632,6 +2178,9 @@ export const roomOutbox = roomSchema.table("room_outbox", {
   nativeCursor: text("native_cursor"),
   reconciliationFromCursor: text("reconciliation_from_cursor"),
   reconciliationEvidenceRef: text("reconciliation_evidence_ref"),
+  /** Present only for the atomic ready-to-running task-dispatch outbox. */
+  dispatchTaskNodeId: text("dispatch_task_node_id"),
+  dispatchClaimNodeVersion: bigint("dispatch_claim_node_version", { mode: "number" }),
   attemptCount: integer("attempt_count").notNull().default(0),
   lastErrorCode: text("last_error_code"),
   nextAttemptAt: text("next_attempt_at"),
@@ -645,10 +2194,23 @@ export const roomOutbox = roomSchema.table("room_outbox", {
   }).onDelete("cascade"),
   foreignKey({ columns: [t.messageId], foreignColumns: [roomMessages.id], name: "room_outbox_message_fkey" }).onDelete("cascade"),
   foreignKey({ columns: [t.bindingId], foreignColumns: [roomBindings.id], name: "room_outbox_binding_fkey" }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.dispatchTaskNodeId, t.roomId, t.projectId],
+    foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
+    name: "room_outbox_dispatch_task_node_room_project_fkey",
+  }).onDelete("restrict"),
   uniqueIndex("idx_room_outbox_logical_message").on(t.bindingId, t.logicalMessageId),
   uniqueIndex("idx_room_outbox_local_message").on(t.bindingId, t.localMessageId),
   index("idx_room_outbox_dispatch").on(t.projectId, t.deliveryState, t.nextAttemptAt),
+  index("idx_room_outbox_dispatch_task").on(t.projectId, t.roomId, t.dispatchTaskNodeId),
   check("room_outbox_delivery_state_check", sql`${t.deliveryState} IN ('pending','dispatching','confirmed','delivery_uncertain','rejected','cancelled')`),
+  check("room_outbox_dispatch_task_claim_check", sql`(
+    (${t.dispatchTaskNodeId} IS NULL AND ${t.dispatchClaimNodeVersion} IS NULL)
+    OR (
+      ${t.dispatchTaskNodeId} IS NOT NULL
+      AND ${t.dispatchClaimNodeVersion} BETWEEN 1 AND 9007199254740991
+    )
+  )`),
 ]);
 
 export const roomOutboxAttempts = roomSchema.table("room_outbox_attempts", {
@@ -988,6 +2550,84 @@ export const roomAlerts = roomSchema.table("room_alerts", {
   index("idx_room_alerts_project_state").on(t.projectId, t.state, t.severity, t.openedAt),
 ]);
 
+export const roomGlobalConcurrencyState = roomSchema.table("room_global_concurrency_state", {
+  id: text("id").primaryKey(),
+  revision: bigint("revision", { mode: "number" }).notNull().default(0),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  check("room_global_concurrency_state_id_check", sql`${t.id} = 'room-global-concurrency-v1'`),
+  check("room_global_concurrency_state_revision_check", sql`${t.revision} BETWEEN 0 AND 9007199254740991`),
+  check("room_global_concurrency_state_updated_at_check", sql`btrim(${t.updatedAt}) <> ''`),
+]);
+
+export const roomGlobalConcurrencyClaims = roomSchema.table("room_global_concurrency_claims", {
+  id: text("id").primaryKey(),
+  ...scopedRoomColumns(),
+  workClass: text("work_class").notNull(),
+  slots: integer("slots").notNull(),
+  holderId: text("holder_id").notNull(),
+  leaseId: text("lease_id").notNull(),
+  fence: bigint("fence", { mode: "number" }).notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  releasedAt: text("released_at"),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_global_concurrency_claims_room_project_fkey",
+  }).onDelete("cascade"),
+  unique("room_global_concurrency_claims_id_project_unique").on(t.id, t.projectId),
+  index("idx_room_global_concurrency_claims_active")
+    .on(t.projectId, t.workClass, t.expiresAt, t.id)
+    .where(sql`${t.releasedAt} IS NULL`),
+  index("idx_room_global_concurrency_claims_expiry")
+    .on(t.expiresAt, t.id)
+    .where(sql`${t.releasedAt} IS NULL`),
+  check("room_global_concurrency_claims_work_class_check", sql`${t.workClass} IN ('normal','verifier','recovery')`),
+  check("room_global_concurrency_claims_slots_check", sql`${t.slots} BETWEEN 1 AND 2147483647`),
+  check("room_global_concurrency_claims_fence_check", sql`${t.fence} BETWEEN 1 AND 9007199254740991`),
+  check("room_global_concurrency_claims_window_check", sql`${t.expiresAt} > ${t.acquiredAt}`),
+  check("room_global_concurrency_claims_nonblank_check", sql`
+    btrim(${t.id}) <> ''
+    AND btrim(${t.projectId}) <> ''
+    AND btrim(${t.roomId}) <> ''
+    AND btrim(${t.holderId}) <> ''
+    AND btrim(${t.leaseId}) <> ''
+    AND btrim(${t.acquiredAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+    AND (${t.releasedAt} IS NULL OR btrim(${t.releasedAt}) <> '')
+  `),
+]);
+
+export const roomGlobalConcurrencyOperations = roomSchema.table("room_global_concurrency_operations", {
+  projectId: text("project_id").notNull(),
+  commandKind: text("command_kind").notNull(),
+  operationKey: text("operation_key").notNull(),
+  claimId: text("claim_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  action: text("action").notNull(),
+  fence: bigint("fence", { mode: "number" }).notNull(),
+  occurredAt: text("occurred_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.commandKind, t.operationKey], name: "room_global_concurrency_operations_primary" }),
+  foreignKey({
+    columns: [t.claimId, t.projectId],
+    foreignColumns: [roomGlobalConcurrencyClaims.id, roomGlobalConcurrencyClaims.projectId],
+    name: "room_global_concurrency_operations_claim_project_fkey",
+  }).onDelete("cascade"),
+  index("idx_room_global_concurrency_operations_claim").on(t.projectId, t.claimId, t.commandKind, t.occurredAt),
+  check("room_global_concurrency_operations_kind_check", sql`${t.commandKind} IN ('acquire','release','recover_dangling')`),
+  check("room_global_concurrency_operations_action_check", sql`${t.action} IN ('acquired','released','recovered')`),
+  check("room_global_concurrency_operations_fence_check", sql`${t.fence} BETWEEN 1 AND 9007199254740991`),
+  check("room_global_concurrency_operations_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_global_concurrency_operations_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.operationKey}) <> ''
+    AND btrim(${t.claimId}) <> ''
+    AND btrim(${t.occurredAt}) <> ''
+  `),
+]);
 
 export const roomProviderBackpressureStates = roomSchema.table("room_provider_backpressure_states", {
   projectId: text("project_id").notNull(),
@@ -1117,43 +2757,106 @@ export const roomProviderBackpressureOperations = roomSchema.table("room_provide
   check("room_provider_backpressure_operations_kind_check", sql`${t.operationKind} IN ('dispatch','success','failure')`),
   check("room_provider_backpressure_operations_action_check", sql`${t.action} IN ('admit','hold','recorded')`),
   check("room_provider_backpressure_operations_revision_check", sql`${t.stateRevision} BETWEEN 0 AND 9007199254740991`),
-  check("room_provider_backpressure_operations_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}
-  "operational_rooms",
-  "room_seats",
-  "room_bindings",
-  "room_binding_ingestion_state",
-  "room_turns",
-  "room_membership_changes",
-  "room_events",
-  "room_task_nodes",
-  "room_task_edges",
-  "room_messages",
-  "room_message_targets",
-  "room_outbox",
-  "room_outbox_attempts",
-  "room_inbox_receipts",
-  "room_idempotency_keys",
-  "room_leases",
-  "room_checkpoints",
-  "room_artifacts",
-  "room_evidence",
-  "room_candidates",
-  "room_reviews",
-  "room_dissents",
-  "room_gate_results",
-  "room_promotions",
-  "room_confidence_snapshots",
-  "room_alerts",
-  "room_provider_backpressure_states",
-  "room_provider_backpressure_reservations",
-  "room_provider_backpressure_operations",
-] as const;
-`),
+  check("room_provider_backpressure_operations_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
   check("room_provider_backpressure_operations_nonblank_check", sql`
     btrim(${t.projectId}) <> ''
     AND btrim(${t.scopeKey}) <> ''
     AND btrim(${t.requestId}) <> ''
     AND btrim(${t.reason}) <> ''
+    AND btrim(${t.occurredAt}) <> ''
+  `),
+]);
+
+export const roomRbacAuthorizationStates = roomSchema.table("room_rbac_authorization_states", {
+  projectId: text("project_id").primaryKey(),
+  authorizationVersion: bigint("authorization_version", { mode: "number" }).notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  check("room_rbac_authorization_states_version_check", sql`${t.authorizationVersion} BETWEEN 1 AND 9007199254740991`),
+  check("room_rbac_authorization_states_nonblank_check", sql`btrim(${t.projectId}) <> '' AND btrim(${t.updatedAt}) <> ''`),
+]);
+
+export const roomTrustedDeviceSessions = roomSchema.table("room_trusted_device_sessions", {
+  projectId: text("project_id").notNull(),
+  sessionId: text("session_id").notNull(),
+  credentialDigest: text("credential_digest").notNull(),
+  principalId: text("principal_id").notNull(),
+  deviceId: text("device_id").notNull(),
+  issuedAt: text("issued_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  revokedAt: text("revoked_at"),
+  sessionVersion: bigint("session_version", { mode: "number" }).notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.sessionId], name: "room_trusted_device_sessions_primary" }),
+  unique("room_trusted_device_sessions_credential_digest_unique").on(t.credentialDigest),
+  index("idx_room_trusted_device_sessions_principal").on(t.projectId, t.principalId, t.deviceId, t.expiresAt),
+  index("idx_room_trusted_device_sessions_active").on(t.projectId, t.expiresAt, t.sessionId).where(sql`${t.revokedAt} IS NULL`),
+  check("room_trusted_device_sessions_digest_check", sql`${t.credentialDigest} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_trusted_device_sessions_version_check", sql`${t.sessionVersion} BETWEEN 1 AND 9007199254740991`),
+  check("room_trusted_device_sessions_window_check", sql`${t.expiresAt} > ${t.issuedAt}`),
+  check("room_trusted_device_sessions_revoke_check", sql`${t.revokedAt} IS NULL OR ${t.revokedAt} >= ${t.issuedAt}`),
+  check("room_trusted_device_sessions_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.sessionId}) <> ''
+    AND btrim(${t.principalId}) <> ''
+    AND btrim(${t.deviceId}) <> ''
+    AND btrim(${t.issuedAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+    AND (${t.revokedAt} IS NULL OR btrim(${t.revokedAt}) <> '')
+  `),
+]);
+
+export const roomRbacGrants = roomSchema.table("room_rbac_grants", {
+  projectId: text("project_id").notNull(),
+  grantId: text("grant_id").notNull(),
+  principalId: text("principal_id").notNull(),
+  role: text("role").notNull(),
+  roomId: text("room_id"),
+  grantedAt: text("granted_at").notNull(),
+  revokedAt: text("revoked_at"),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.grantId], name: "room_rbac_grants_primary" }),
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_rbac_grants_room_project_fkey",
+  }).onDelete("cascade"),
+  index("idx_room_rbac_grants_snapshot").on(t.projectId, t.principalId, t.roomId, t.grantedAt).where(sql`${t.revokedAt} IS NULL`),
+  check("room_rbac_grants_role_check", sql`${t.role} IN ('owner','admin','operator','observer','auditor')`),
+  check("room_rbac_grants_revoke_check", sql`${t.revokedAt} IS NULL OR ${t.revokedAt} >= ${t.grantedAt}`),
+  check("room_rbac_grants_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.grantId}) <> ''
+    AND btrim(${t.principalId}) <> ''
+    AND btrim(${t.grantedAt}) <> ''
+    AND (${t.roomId} IS NULL OR btrim(${t.roomId}) <> '')
+    AND (${t.revokedAt} IS NULL OR btrim(${t.revokedAt}) <> '')
+  `),
+]);
+
+export const roomRbacRegistryOperations = roomSchema.table("room_rbac_registry_operations", {
+  projectId: text("project_id").notNull(),
+  commandKind: text("command_kind").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestHash: text("request_hash").notNull(),
+  entityType: text("entity_type").notNull(),
+  entityId: text("entity_id").notNull(),
+  authorizationVersion: bigint("authorization_version", { mode: "number" }),
+  sessionVersion: bigint("session_version", { mode: "number" }),
+  occurredAt: text("occurred_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.commandKind, t.idempotencyKey], name: "room_rbac_registry_operations_primary" }),
+  index("idx_room_rbac_registry_operations_entity").on(t.projectId, t.entityType, t.entityId, t.occurredAt),
+  check("room_rbac_registry_operations_kind_check", sql`${t.commandKind} IN ('issue_trusted_device_session','revoke_trusted_device_session','grant_role','revoke_role_grant')`),
+  check("room_rbac_registry_operations_entity_check", sql`${t.entityType} IN ('trusted_device_session','role_grant')`),
+  check("room_rbac_registry_operations_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_rbac_registry_operations_authorization_version_check", sql`${t.authorizationVersion} IS NULL OR ${t.authorizationVersion} BETWEEN 1 AND 9007199254740991`),
+  check("room_rbac_registry_operations_session_version_check", sql`${t.sessionVersion} IS NULL OR ${t.sessionVersion} BETWEEN 1 AND 9007199254740991`),
+  check("room_rbac_registry_operations_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.commandKind}) <> ''
+    AND btrim(${t.idempotencyKey}) <> ''
+    AND btrim(${t.entityId}) <> ''
     AND btrim(${t.occurredAt}) <> ''
   `),
 ]);
@@ -1166,6 +2869,21 @@ export const ROOM_PROJECT_TABLE_NAMES = [
   "room_turns",
   "room_membership_changes",
   "room_events",
+  "room_capability_registry_projections",
+  "room_blind_review_registries",
+  "room_evolution_hypotheses",
+  "room_evolution_trusted_bindings",
+  "room_evolution_trusted_binding_revocations",
+  "room_evolution_candidate_versions",
+  "room_evolution_experiments",
+  "room_evolution_benchmark_cases",
+  "room_evolution_benchmark_results",
+  "room_evolution_gate_results",
+  "room_evolution_canaries",
+  "room_evolution_canary_observations",
+  "room_evolution_canary_success_outcomes",
+  "room_evolution_promotion_decisions",
+  "room_evolution_rollbacks",
   "room_task_nodes",
   "room_task_edges",
   "room_messages",
@@ -1185,4 +2903,14 @@ export const ROOM_PROJECT_TABLE_NAMES = [
   "room_promotions",
   "room_confidence_snapshots",
   "room_alerts",
+  "room_global_concurrency_state",
+  "room_global_concurrency_claims",
+  "room_global_concurrency_operations",
+  "room_provider_backpressure_states",
+  "room_provider_backpressure_reservations",
+  "room_provider_backpressure_operations",
+  "room_rbac_authorization_states",
+  "room_trusted_device_sessions",
+  "room_rbac_grants",
+  "room_rbac_registry_operations",
 ] as const;
