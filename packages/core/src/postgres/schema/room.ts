@@ -988,6 +988,176 @@ export const roomAlerts = roomSchema.table("room_alerts", {
   index("idx_room_alerts_project_state").on(t.projectId, t.state, t.severity, t.openedAt),
 ]);
 
+
+export const roomProviderBackpressureStates = roomSchema.table("room_provider_backpressure_states", {
+  projectId: text("project_id").notNull(),
+  scopeKey: text("scope_key").notNull(),
+  providerId: text("provider_id").notNull(),
+  accountId: text("account_id").notNull(),
+  modelId: text("model_id").notNull(),
+  connectorId: text("connector_id").notNull(),
+  nodeId: text("node_id").notNull(),
+  circuitState: text("circuit_state").notNull(),
+  consecutiveFailures: bigint("consecutive_failures", { mode: "number" }).notNull().default(0),
+  retryAttempt: bigint("retry_attempt", { mode: "number" }).notNull().default(0),
+  retryNotBefore: text("retry_not_before"),
+  openUntil: text("open_until"),
+  revision: bigint("revision", { mode: "number" }).notNull().default(0),
+  lastUpdatedAt: text("last_updated_at").notNull(),
+}, (t) => [
+  primaryKey({
+    columns: [t.projectId, t.scopeKey],
+    name: "room_provider_backpressure_states_primary",
+  }),
+  unique("room_provider_backpressure_states_scope_unique")
+    .on(t.projectId, t.providerId, t.accountId, t.modelId, t.connectorId, t.nodeId),
+  index("idx_room_provider_backpressure_states_provider")
+    .on(t.projectId, t.providerId, t.accountId, t.modelId, t.connectorId, t.nodeId),
+  check("room_provider_backpressure_states_circuit_check", sql`${t.circuitState} IN ('closed','open','half_open')`),
+  check("room_provider_backpressure_states_failure_check", sql`${t.consecutiveFailures} BETWEEN 0 AND 9007199254740991`),
+  check("room_provider_backpressure_states_retry_check", sql`${t.retryAttempt} BETWEEN 0 AND 9007199254740991`),
+  check("room_provider_backpressure_states_revision_check", sql`${t.revision} BETWEEN 0 AND 9007199254740991`),
+  check("room_provider_backpressure_states_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.scopeKey}) <> ''
+    AND btrim(${t.providerId}) <> ''
+    AND btrim(${t.accountId}) <> ''
+    AND btrim(${t.modelId}) <> ''
+    AND btrim(${t.connectorId}) <> ''
+    AND btrim(${t.nodeId}) <> ''
+    AND btrim(${t.lastUpdatedAt}) <> ''
+    AND (${t.retryNotBefore} IS NULL OR btrim(${t.retryNotBefore}) <> '')
+    AND (${t.openUntil} IS NULL OR btrim(${t.openUntil}) <> '')
+  `),
+]);
+
+export const roomProviderBackpressureReservations = roomSchema.table("room_provider_backpressure_reservations", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  scopeKey: text("scope_key").notNull(),
+  roomId: text("room_id").notNull(),
+  requestId: text("request_id").notNull(),
+  claimId: text("claim_id").notNull(),
+  leaseId: text("lease_id").notNull(),
+  leaseEpoch: bigint("lease_epoch", { mode: "number" }).notNull(),
+  expectedAggregateVersion: bigint("expected_aggregate_version", { mode: "number" }).notNull(),
+  workClass: text("work_class").notNull(),
+  isHalfOpenProbe: boolean("is_half_open_probe").notNull().default(false),
+  circuitOpenMs: integer("circuit_open_ms").notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  releasedAt: text("released_at"),
+  releaseOutcome: text("release_outcome"),
+}, (t) => [
+  foreignKey({
+    columns: [t.projectId, t.scopeKey],
+    foreignColumns: [roomProviderBackpressureStates.projectId, roomProviderBackpressureStates.scopeKey],
+    name: "room_provider_backpressure_reservations_state_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_provider_backpressure_reservations_room_project_fkey",
+  }).onDelete("cascade"),
+  unique("room_provider_backpressure_reservations_id_project_unique").on(t.id, t.projectId),
+  unique("room_provider_backpressure_reservations_request_unique").on(t.projectId, t.requestId),
+  index("idx_room_provider_backpressure_reservations_active")
+    .on(t.projectId, t.scopeKey, t.expiresAt, t.id)
+    .where(sql`${t.releasedAt} IS NULL`),
+  index("idx_room_provider_backpressure_reservations_room")
+    .on(t.projectId, t.roomId, t.leaseId, t.leaseEpoch, t.id),
+  check("room_provider_backpressure_reservations_work_class_check", sql`${t.workClass} IN ('normal','verifier','recovery')`),
+  check("room_provider_backpressure_reservations_epoch_check", sql`${t.leaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_provider_backpressure_reservations_version_check", sql`${t.expectedAggregateVersion} BETWEEN 0 AND 9007199254740991`),
+  check("room_provider_backpressure_reservations_circuit_open_ms_check", sql`${t.circuitOpenMs} BETWEEN 1 AND 2147483647`),
+  check("room_provider_backpressure_reservations_window_check", sql`${t.expiresAt} > ${t.acquiredAt}`),
+  check("room_provider_backpressure_reservations_release_outcome_check", sql`${t.releaseOutcome} IS NULL OR ${t.releaseOutcome} IN ('worker_completed','worker_failed','controller_stop','room_not_runnable','lease_lost','recovery_withheld','semantic_inbox_stopped','renew_guard_lost','provider_backpressure','pre_start_authority_lost','start_audit_failed','unknown','expired')`),
+  check("room_provider_backpressure_reservations_nonblank_check", sql`
+    btrim(${t.id}) <> ''
+    AND btrim(${t.projectId}) <> ''
+    AND btrim(${t.scopeKey}) <> ''
+    AND btrim(${t.roomId}) <> ''
+    AND btrim(${t.requestId}) <> ''
+    AND btrim(${t.claimId}) <> ''
+    AND btrim(${t.leaseId}) <> ''
+    AND btrim(${t.acquiredAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+    AND (${t.releasedAt} IS NULL OR btrim(${t.releasedAt}) <> '')
+  `),
+]);
+
+export const roomProviderBackpressureOperations = roomSchema.table("room_provider_backpressure_operations", {
+  projectId: text("project_id").notNull(),
+  scopeKey: text("scope_key").notNull(),
+  requestId: text("request_id").notNull(),
+  operationKind: text("operation_kind").notNull(),
+  requestHash: text("request_hash").notNull(),
+  action: text("action").notNull(),
+  reason: text("reason").notNull(),
+  stateRevision: bigint("state_revision", { mode: "number" }).notNull(),
+  reservationId: text("reservation_id"),
+  occurredAt: text("occurred_at").notNull(),
+}, (t) => [
+  primaryKey({
+    columns: [t.projectId, t.scopeKey, t.requestId, t.operationKind],
+    name: "room_provider_backpressure_operations_primary",
+  }),
+  foreignKey({
+    columns: [t.projectId, t.scopeKey],
+    foreignColumns: [roomProviderBackpressureStates.projectId, roomProviderBackpressureStates.scopeKey],
+    name: "room_provider_backpressure_operations_state_fkey",
+  }).onDelete("cascade"),
+  foreignKey({
+    columns: [t.reservationId, t.projectId],
+    foreignColumns: [roomProviderBackpressureReservations.id, roomProviderBackpressureReservations.projectId],
+    name: "room_provider_backpressure_operations_reservation_project_fkey",
+  }).onDelete("cascade"),
+  index("idx_room_provider_backpressure_operations_reservation")
+    .on(t.projectId, t.reservationId, t.occurredAt),
+  check("room_provider_backpressure_operations_kind_check", sql`${t.operationKind} IN ('dispatch','success','failure')`),
+  check("room_provider_backpressure_operations_action_check", sql`${t.action} IN ('admit','hold','recorded')`),
+  check("room_provider_backpressure_operations_revision_check", sql`${t.stateRevision} BETWEEN 0 AND 9007199254740991`),
+  check("room_provider_backpressure_operations_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}
+  "operational_rooms",
+  "room_seats",
+  "room_bindings",
+  "room_binding_ingestion_state",
+  "room_turns",
+  "room_membership_changes",
+  "room_events",
+  "room_task_nodes",
+  "room_task_edges",
+  "room_messages",
+  "room_message_targets",
+  "room_outbox",
+  "room_outbox_attempts",
+  "room_inbox_receipts",
+  "room_idempotency_keys",
+  "room_leases",
+  "room_checkpoints",
+  "room_artifacts",
+  "room_evidence",
+  "room_candidates",
+  "room_reviews",
+  "room_dissents",
+  "room_gate_results",
+  "room_promotions",
+  "room_confidence_snapshots",
+  "room_alerts",
+  "room_provider_backpressure_states",
+  "room_provider_backpressure_reservations",
+  "room_provider_backpressure_operations",
+] as const;
+`),
+  check("room_provider_backpressure_operations_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.scopeKey}) <> ''
+    AND btrim(${t.requestId}) <> ''
+    AND btrim(${t.reason}) <> ''
+    AND btrim(${t.occurredAt}) <> ''
+  `),
+]);
+
 export const ROOM_PROJECT_TABLE_NAMES = [
   "operational_rooms",
   "room_seats",

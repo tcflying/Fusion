@@ -1,4 +1,20 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import {
+  ROOM_COCKPIT_COMPOSER_TARGET_MODES,
+  RoomCockpitComposer,
+  type RoomCockpitComposerDraftV1,
+  type RoomCockpitComposerGroupV1,
+  type RoomCockpitComposerParticipantV1,
+  type RoomCockpitComposerSubmitResultV1,
+  type RoomCockpitComposerTargetModeV1,
+} from "./RoomCockpitComposer";
+import {
+  RoomCockpitAlertPanel,
+  type RoomCockpitAlertActionCallbackResultV1,
+  type RoomCockpitAlertActionRequestV1,
+} from "./RoomCockpitAlertPanel";
+import { RoomCockpitEvidencePanel } from "./RoomCockpitEvidencePanel";
+import { RoomCockpitParticipantPanel } from "./RoomCockpitParticipantPanel";
 import styles from "./RoomCockpitView.module.css";
 
 export const ROOM_COCKPIT_TASK_STATES = [
@@ -42,20 +58,71 @@ export interface RoomCockpitConfidenceV1 {
   readonly dimensions: readonly RoomCockpitConfidenceDimensionV1[];
 }
 
-export interface RoomCockpitCapacityV1 {
+export type RoomCockpitCapacityStructuralFieldV1 =
+  | "theoreticalSlots"
+  | "configuredSlots"
+  | "activeSlots"
+  | "queueDepth"
+  | "utilizationRatio";
+
+export type RoomCockpitCapacityObservedFieldV1 =
+  | "reservedVerifierSlots"
+  | "reservedRecoverySlots"
+  | "throughputPerMinute"
+  | "idleReasons";
+
+export interface RoomCockpitCapacityTelemetryUnavailableV1 {
+  readonly availability: "unavailable";
+  readonly detail: string;
+  readonly structuralFields: readonly RoomCockpitCapacityStructuralFieldV1[];
+  readonly observedFields: readonly RoomCockpitCapacityObservedFieldV1[];
+}
+
+export interface RoomCockpitCapacityTelemetryAvailableV1 {
+  readonly availability: "available";
+  readonly detail: string;
+  readonly source: "persistent_runtime_telemetry";
+  readonly observedAt: string;
+  readonly structuralFields: readonly RoomCockpitCapacityStructuralFieldV1[];
+  readonly observedFields: readonly RoomCockpitCapacityObservedFieldV1[];
+}
+
+export type RoomCockpitCapacityTelemetryV1 =
+  | RoomCockpitCapacityTelemetryUnavailableV1
+  | RoomCockpitCapacityTelemetryAvailableV1;
+
+interface RoomCockpitCapacityStructuralV1 {
   readonly theoreticalSlots: number;
   readonly configuredSlots: number;
   readonly activeSlots: number;
   readonly queueDepth: number;
+  readonly utilizationRatio: number;
+}
+
+export interface RoomCockpitIdleReasonV1 {
+  readonly reason: string;
+  readonly slots: number;
+}
+
+export interface RoomCockpitCapacityWithoutRuntimeTelemetryV1 extends RoomCockpitCapacityStructuralV1 {
+  readonly telemetry: RoomCockpitCapacityTelemetryUnavailableV1;
+  readonly reservedVerifierSlots: null;
+  readonly reservedRecoverySlots: null;
+  readonly throughputPerMinute: null;
+  readonly idleReasons: null;
+}
+
+export interface RoomCockpitCapacityWithRuntimeTelemetryV1 extends RoomCockpitCapacityStructuralV1 {
+  readonly telemetry: RoomCockpitCapacityTelemetryAvailableV1;
   readonly reservedVerifierSlots: number;
   readonly reservedRecoverySlots: number;
-  readonly utilizationRatio: number;
   readonly throughputPerMinute: number;
-  readonly idleReasons: readonly {
-    readonly reason: string;
-    readonly slots: number;
-  }[];
+  readonly idleReasons: readonly RoomCockpitIdleReasonV1[];
 }
+
+export type RoomCockpitCapacityV1 =
+  | RoomCockpitCapacityWithoutRuntimeTelemetryV1
+  | RoomCockpitCapacityWithRuntimeTelemetryV1;
 
 export interface RoomCockpitTaskNodeV1 {
   readonly id: string;
@@ -99,6 +166,15 @@ export interface RoomCockpitAlertV1 {
   readonly actions: readonly RoomCockpitAlertActionV1[];
 }
 
+export interface RoomCockpitComposerSurfaceV1 {
+  readonly participants: readonly RoomCockpitComposerParticipantV1[];
+  readonly controllerSeatId?: string;
+  readonly groups?: readonly RoomCockpitComposerGroupV1[];
+  readonly initialTargetMode?: RoomCockpitComposerTargetModeV1;
+  readonly initialGroupId?: string;
+  readonly initialSelectedSeatIds?: readonly string[];
+}
+
 export interface RoomCockpitProjectionV1 {
   readonly roomId: string;
   readonly objective: string;
@@ -111,14 +187,23 @@ export interface RoomCockpitProjectionV1 {
   readonly tasks: readonly RoomCockpitTaskNodeV1[];
   readonly edges: readonly RoomCockpitTaskEdgeV1[];
   readonly alerts: readonly RoomCockpitAlertV1[];
+  /** Raw projection feeds are validated again by their dedicated cockpit surfaces. */
+  readonly participants?: readonly unknown[];
+  readonly evidence?: unknown;
+  readonly composer?: RoomCockpitComposerSurfaceV1;
+  readonly actionableAlerts?: readonly unknown[];
 }
 
 export interface RoomCockpitViewCallbacksV1 {
   readonly onRefresh?: () => void;
   readonly onRequestAccess?: () => void;
   readonly onSelectTask?: (task: RoomCockpitTaskNodeV1) => void;
-  readonly onSelectAlert?: (alert: RoomCockpitAlertV1) => void;
-  readonly onInvokeAlertAction?: (alert: RoomCockpitAlertV1, action: RoomCockpitAlertActionV1) => void;
+  readonly onGuardedComposerSubmit?: (
+    draft: RoomCockpitComposerDraftV1,
+  ) => Promise<RoomCockpitComposerSubmitResultV1> | RoomCockpitComposerSubmitResultV1;
+  readonly onGuardedAlertAction?: (
+    request: RoomCockpitAlertActionRequestV1,
+  ) => Promise<RoomCockpitAlertActionCallbackResultV1> | RoomCockpitAlertActionCallbackResultV1;
 }
 
 export interface RoomCockpitViewProps {
@@ -163,13 +248,6 @@ const confidenceLabels: Record<RoomCockpitConfidenceBandV1, string> = {
   medium: "medium",
   low: "low",
   unknown: "unknown",
-};
-
-const alertSeverityLabels: Record<RoomCockpitAlertV1["severity"], string> = {
-  info: "info",
-  warning: "warning",
-  severe: "severe",
-  critical: "critical",
 };
 
 /**
@@ -242,6 +320,30 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
   const cockpitStyle: RoomCockpitStyle = {
     "--room-cockpit-columns": String(Math.max(taskColumns.length, 1)),
   };
+  const composer = parseRoomCockpitComposerSurface(projection.composer);
+  const observedCapacity = getObservedCapacityTelemetry(projection.capacity);
+  const capacityTelemetryState = observedCapacity !== null
+    ? "available"
+    : projection.capacity.telemetry.availability === "unavailable"
+      ? "unavailable"
+      : "withheld";
+  const capacityTelemetryDetail = observedCapacity !== null
+    ? capacityTelemetryDetailOrFallback(
+      observedCapacity.telemetry.detail,
+      "Persistent runtime telemetry is available for this Room.",
+    )
+    : projection.capacity.telemetry.availability === "unavailable"
+      ? capacityTelemetryDetailOrFallback(
+        projection.capacity.telemetry.detail,
+        "The Room projection marked persistent runtime capacity telemetry unavailable.",
+      )
+      : "Observed capacity telemetry was withheld because the available payload did not satisfy the telemetry boundary.";
+
+  const composerUnavailableReason = projection.composer === undefined
+    ? "No verified composer targeting data has been projected for this Room."
+    : composer === null
+      ? "Composer target data was withheld because it does not satisfy the guarded composer boundary."
+      : "No guarded draft delivery callback is connected for this Room.";
 
   return (
     <main className={styles.root} data-state={state} aria-label={`Room cockpit for ${projection.roomId}`}>
@@ -296,7 +398,9 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
         <SignalReadout
           label="Capacity"
           value={`${projection.capacity.activeSlots} / ${projection.capacity.configuredSlots} active slots`}
-          detail={`${projection.capacity.queueDepth} queued · ${formatThroughput(projection.capacity.throughputPerMinute)}`}
+          detail={observedCapacity !== null
+            ? `${projection.capacity.queueDepth} queued · ${formatThroughput(observedCapacity.throughputPerMinute)}`
+            : `${projection.capacity.queueDepth} queued · capacity telemetry ${capacityTelemetryState}`}
           meterLabel="Active configured capacity"
           meterValue={activeRatio}
           tone="capacity"
@@ -405,68 +509,158 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
               <p className={styles.panelKicker}>Dispatch envelope</p>
               <h2 id="room-cockpit-capacity-title">Capacity ledger</h2>
             </div>
-            <span className={styles.capacityRate}>{formatPercent(projection.capacity.utilizationRatio)} utilized</span>
+            <span className={styles.capacityRate}>{formatPercent(projection.capacity.utilizationRatio)} structural</span>
           </div>
+          <section
+            className={styles.capacityTelemetryState}
+            data-availability={capacityTelemetryState}
+            aria-label={`Runtime capacity telemetry ${capacityTelemetryState}`}
+            role="status"
+          >
+            <p className={styles.capacityTelemetryKicker}>Runtime observation / {capacityTelemetryState}</p>
+            <strong>{observedCapacity !== null
+              ? "Observed runtime capacity"
+              : capacityTelemetryState === "unavailable"
+                ? "Runtime capacity telemetry unavailable"
+                : "Observed capacity telemetry withheld"}
+            </strong>
+            <p>{capacityTelemetryDetail}</p>
+            {observedCapacity !== null ? (
+              <dl className={styles.capacityTelemetryFacts}>
+                <div><dt>Source</dt><dd>Persistent runtime telemetry</dd></div>
+                <div><dt>Observed at</dt><dd>{observedCapacity.telemetry.observedAt}</dd></div>
+              </dl>
+            ) : null}
+          </section>
           <dl className={styles.capacityList}>
             <div><dt>Theoretical</dt><dd>{projection.capacity.theoreticalSlots}</dd></div>
             <div><dt>Configured</dt><dd>{projection.capacity.configuredSlots}</dd></div>
-            <div><dt>Verifier reserve</dt><dd>{projection.capacity.reservedVerifierSlots}</dd></div>
-            <div><dt>Recovery reserve</dt><dd>{projection.capacity.reservedRecoverySlots}</dd></div>
+            <div><dt>Verifier reserve</dt><dd>{observedCapacity?.reservedVerifierSlots ?? "Unavailable"}</dd></div>
+            <div><dt>Recovery reserve</dt><dd>{observedCapacity?.reservedRecoverySlots ?? "Unavailable"}</dd></div>
           </dl>
           <ul className={styles.idleReasons}>
-            {projection.capacity.idleReasons.length > 0 ? projection.capacity.idleReasons.map((reason) => (
-              <li key={`${reason.reason}-${reason.slots}`}><strong>{reason.slots}</strong> {reason.reason.replaceAll("_", " ")}</li>
-            )) : <li>No unassigned capacity reported.</li>}
+            {observedCapacity === null ? <li className={styles.capacityUnavailableItem}>Idle-capacity reasons are unavailable.</li>
+              : observedCapacity.idleReasons.length > 0 ? observedCapacity.idleReasons.map((reason) => (
+                <li key={`${reason.reason}-${reason.slots}`}><strong>{reason.slots}</strong> {reason.reason.replaceAll("_", " ")}</li>
+              )) : <li>No observed idle-capacity reasons were reported.</li>}
           </ul>
         </section>
 
-        <section className={styles.alertPanel} aria-labelledby="room-cockpit-alerts-title">
-          <div className={styles.panelHeading}>
-            <div>
-              <p className={styles.panelKicker}>Operator attention</p>
-              <h2 id="room-cockpit-alerts-title">Alerts</h2>
-            </div>
-            <span className={styles.panelCounter}>{projection.alerts.filter((alert) => alert.state !== "resolved").length} open</span>
-          </div>
-          <ul className={styles.alertList}>
-            {projection.alerts.length > 0 ? projection.alerts.map((alert) => (
-              <li key={alert.id} data-severity={alert.severity}>
-                <button
-                  type="button"
-                  className={styles.alertInspect}
-                  aria-label={`Inspect ${alertSeverityLabels[alert.severity]} alert: ${alert.rootCause}`}
-                  onClick={() => callbacks?.onSelectAlert?.(alert)}
-                >
-                  <span className={styles.alertSeverity}>{alertSeverityLabels[alert.severity]}</span>
-                  <strong>{alert.rootCause}</strong>
-                  <span>{alert.impact}</span>
-                </button>
-                <div className={styles.alertEvidence}>
-                  <span>{alert.evidenceIds.length} evidence reference{alert.evidenceIds.length === 1 ? "" : "s"}</span>
-                  {alert.nextRetryAt ? <span>Next retry {formatTimestamp(alert.nextRetryAt)}</span> : null}
-                </div>
-                {alert.attemptedRecovery.length > 0 ? <p className={styles.recoveryTrace}>Attempted: {alert.attemptedRecovery.join(" · ")}</p> : null}
-                {alert.actions.length > 0 ? (
-                  <div className={styles.alertActions}>
-                    {alert.actions.map((action) => (
-                      <button
-                        type="button"
-                        className={styles.alertAction}
-                        data-confirmation={action.requiresConfirmation ? "required" : "not-required"}
-                        onClick={() => callbacks?.onInvokeAlertAction?.(alert, action)}
-                      >
-                        {action.label}
-                        {action.requiresConfirmation ? <span>confirmation required</span> : null}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </li>
-            )) : <li className={styles.alertEmpty}>No Room alerts are currently projected.</li>}
-          </ul>
-        </section>
+        <RoomCockpitAlertPanel
+          alerts={projection.actionableAlerts}
+          onAction={callbacks?.onGuardedAlertAction}
+        />
+      </div>
+
+      <div className={styles.supplementalGrid}>
+        <div className={styles.participantSurface}>
+          <RoomCockpitParticipantPanel participants={projection.participants} />
+        </div>
+        <RoomCockpitEvidencePanel evidence={projection.evidence} />
+      </div>
+
+      <div className={styles.composerSurface}>
+        {composer !== null && callbacks?.onGuardedComposerSubmit ? (
+          <RoomCockpitComposer {...composer} onGuardedSubmit={callbacks.onGuardedComposerSubmit} />
+        ) : <RoomCockpitComposerUnavailable reason={composerUnavailableReason} />}
       </div>
     </main>
+  );
+}
+
+/**
+ * FNXC:RoomCockpitWiring 2026-07-19-16:50:
+ * The cockpit can render standalone participant, evidence, alert, and composer
+ * surfaces only from caller-supplied projections. Do not derive identities,
+ * targets, evidence, or a delivery callback from the legacy summary projection:
+ * absent or malformed data stays visibly unavailable/withheld, and the composer
+ * never mounts without an external guarded-delivery boundary.
+ */
+function parseRoomCockpitComposerSurface(value: unknown): RoomCockpitComposerSurfaceV1 | null {
+  if (!isRecord(value) || !Array.isArray(value.participants)) return null;
+  if (value.controllerSeatId !== undefined && typeof value.controllerSeatId !== "string") return null;
+  if (value.groups !== undefined && !Array.isArray(value.groups)) return null;
+  if (value.initialGroupId !== undefined && typeof value.initialGroupId !== "string") return null;
+  if (
+    value.initialSelectedSeatIds !== undefined
+    && (!Array.isArray(value.initialSelectedSeatIds) || !value.initialSelectedSeatIds.every((seatId) => typeof seatId === "string"))
+  ) return null;
+  if (
+    value.initialTargetMode !== undefined
+    && (!isComposerTargetMode(value.initialTargetMode))
+  ) return null;
+
+  return {
+    participants: value.participants as readonly RoomCockpitComposerParticipantV1[],
+    ...(typeof value.controllerSeatId === "string" ? { controllerSeatId: value.controllerSeatId } : {}),
+    ...(Array.isArray(value.groups) ? { groups: value.groups as readonly RoomCockpitComposerGroupV1[] } : {}),
+    ...(isComposerTargetMode(value.initialTargetMode) ? { initialTargetMode: value.initialTargetMode } : {}),
+    ...(typeof value.initialGroupId === "string" ? { initialGroupId: value.initialGroupId } : {}),
+    ...(Array.isArray(value.initialSelectedSeatIds)
+      ? { initialSelectedSeatIds: value.initialSelectedSeatIds as readonly string[] }
+      : {}),
+  };
+}
+
+function isComposerTargetMode(value: unknown): value is RoomCockpitComposerTargetModeV1 {
+  return typeof value === "string"
+    && (ROOM_COCKPIT_COMPOSER_TARGET_MODES as readonly string[]).includes(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * FNXC:RoomCockpitCapacityTelemetry 2026-07-19-17:00:
+ * Observed capacity is not inferred from the structural projection. The Engine
+ * discriminant is the authority: only a complete `available` runtime-telemetry
+ * payload reaches observed reserve, throughput, or idle-reason readouts.
+ */
+function getObservedCapacityTelemetry(
+  capacity: RoomCockpitCapacityV1,
+): RoomCockpitCapacityWithRuntimeTelemetryV1 | null {
+  return hasObservedCapacityTelemetry(capacity) ? capacity : null;
+}
+
+function hasObservedCapacityTelemetry(
+  capacity: RoomCockpitCapacityV1,
+): capacity is RoomCockpitCapacityWithRuntimeTelemetryV1 {
+  if (capacity.telemetry.availability !== "available") return false;
+  if (
+    capacity.telemetry.source !== "persistent_runtime_telemetry"
+    || typeof capacity.telemetry.observedAt !== "string"
+    || !isFiniteNumber(capacity.reservedVerifierSlots)
+    || !isFiniteNumber(capacity.reservedRecoverySlots)
+    || !isFiniteNumber(capacity.throughputPerMinute)
+    || !Array.isArray(capacity.idleReasons)
+    || !capacity.idleReasons.every(isCapacityIdleReason)
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function isCapacityIdleReason(value: unknown): value is RoomCockpitIdleReasonV1 {
+  return isRecord(value) && typeof value.reason === "string" && isFiniteNumber(value.slots);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function capacityTelemetryDetailOrFallback(detail: unknown, fallback: string): string {
+  return typeof detail === "string" && detail.trim().length > 0 ? detail : fallback;
+}
+
+function RoomCockpitComposerUnavailable({ reason }: { readonly reason: string }) {
+  return (
+    <section className={styles.composerUnavailable} aria-labelledby="room-cockpit-composer-unavailable-title" role="status">
+      <p className={styles.composerUnavailableKicker}>Guarded handoff / unavailable</p>
+      <h2 id="room-cockpit-composer-unavailable-title">Draft composer unavailable</h2>
+      <p>{reason}</p>
+    </section>
   );
 }
 
@@ -625,10 +819,5 @@ function formatPercent(value: number): string {
 }
 
 function formatThroughput(value: number): string {
-  return `${Number.isFinite(value) ? value.toFixed(1) : "0.0"} / min`;
-}
-
-function formatTimestamp(value: string): string {
-  const timestamp = new Date(value);
-  return Number.isNaN(timestamp.getTime()) ? value : timestamp.toLocaleString();
+  return `${value.toFixed(1)} / min`;
 }
