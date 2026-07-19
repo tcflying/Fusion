@@ -1,0 +1,334 @@
+.composer {
+  --composer-bg: #081014;
+  --composer-surface: #0d1a1d;
+  --composer-raised: #112328;
+  --composer-line: #2a4a4f;
+  --composer-hot-line: #74c6cb;
+  --composer-ink: #e5f4ec;
+  --composer-muted: #9ab4ae;
+  --composer-signal: #d8ff5e;
+  --composer-danger: #ffab91;
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  padding: clamp(16px, 2.4vw, 24px);
+  color: var(--composer-ink);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, #0f2a2b 68%, transparent), transparent 47%),
+    var(--composer-bg);
+  border: 1px solid color-mix(in srgb, var(--composer-line) 76%, transparent);
+  font-family: "IBM Plex Mono", "Cascadia Mono", "JetBrains Mono", monospace;
+}
+
+.header,
+.actions,
+.modeGrid,
+.participantSelection li label {
+  display: flex;
+  align-items: flex-start;
+}
+
+.header {
+  justify-content: space-between;
+  gap: 18px;
+  padding-bottom: 15px;
+  border-bottom: 1px solid color-mix(in srgb, var(--composer-line) 72%, transparent);
+}
+
+.eyebrow,
+.targetReadout span,
+.targetModes legend,
+.groupControl > span,
+.messageControl > span,
+.participantSelection legend {
+  margin: 0;
+  color: var(--composer-signal);
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.header h2 {
+  margin: 5px 0 0;
+  font-size: clamp(1.05rem, 2vw, 1.34rem);
+  letter-spacing: -0.045em;
+  line-height: 1.22;
+}
+
+.targetReadout {
+  display: grid;
+  gap: 5px;
+  min-width: min(100%, 18rem);
+  margin: 0;
+  padding: 10px 12px;
+  background: color-mix(in srgb, var(--composer-raised) 78%, transparent);
+  border-left: 3px solid var(--composer-signal);
+}
+
+.targetReadout strong {
+  overflow-wrap: anywhere;
+  color: var(--composer-ink);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.guardNotice,
+.validation,
+.actions > span,
+.emptySelection,
+.result {
+  margin: 0;
+  color: var(--composer-muted);
+  font-size: 0.76rem;
+  line-height: 1.58;
+}
+
+.guardNotice {
+  padding: 11px 12px;
+  background: color-mix(in srgb, var(--composer-surface) 92%, transparent);
+  border-left: 2px solid var(--composer-hot-line);
+}
+
+.form {
+  display: grid;
+  gap: 15px;
+}
+
+.targetModes,
+.participantSelection {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.modeGrid {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.modeOption {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 10px;
+  color: var(--composer-muted);
+  font-size: 0.76rem;
+  line-height: 1.25;
+  cursor: pointer;
+  background: var(--composer-surface);
+  border: 1px solid color-mix(in srgb, var(--composer-line) 78%, transparent);
+}
+
+.modeOption[data-active="true"] {
+  color: var(--composer-ink);
+  background: var(--composer-raised);
+  border-color: var(--composer-hot-line);
+}
+
+.modeOption:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.modeOption input,
+.participantSelection input {
+  accent-color: var(--composer-signal);
+}
+
+.groupControl,
+.messageControl {
+  display: grid;
+  gap: 8px;
+}
+
+.groupControl select,
+.messageControl textarea {
+  width: 100%;
+  min-width: 0;
+  color: var(--composer-ink);
+  font: inherit;
+  font-size: 0.78rem;
+  line-height: 1.5;
+  background: var(--composer-surface);
+  border: 1px solid color-mix(in srgb, var(--composer-line) 82%, transparent);
+  border-radius: 0;
+}
+
+.groupControl select {
+  min-height: 40px;
+  padding: 8px 10px;
+}
+
+.messageControl textarea {
+  min-height: 128px;
+  padding: 11px 12px;
+  resize: vertical;
+}
+
+.groupControl select:focus-visible,
+.messageControl textarea:focus-visible,
+.modeOption:has(input:focus-visible),
+.participantSelection label:has(input:focus-visible),
+.actions button:focus-visible {
+  outline: 2px solid var(--composer-signal);
+  outline-offset: 3px;
+}
+
+.participantSelection {
+  padding: 12px;
+  background: color-mix(in srgb, var(--composer-surface) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--composer-line) 76%, transparent);
+}
+
+.participantSelection ul {
+  display: grid;
+  gap: 7px;
+  max-height: 17rem;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.participantSelection li label {
+  gap: 9px;
+  min-width: 0;
+  padding: 9px 10px;
+  color: var(--composer-ink);
+  font-size: 0.76rem;
+  cursor: pointer;
+  background: var(--composer-raised);
+  border-left: 2px solid transparent;
+}
+
+.participantSelection li label:has(input:checked) {
+  border-left-color: var(--composer-signal);
+}
+
+.participantSelection li span,
+.participantSelection li code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.participantSelection li code {
+  margin-left: auto;
+  color: var(--composer-muted);
+  font-size: 0.67rem;
+}
+
+.validation {
+  min-height: 1.6em;
+  color: var(--composer-muted);
+}
+
+.validation[role="alert"] {
+  color: var(--composer-danger);
+}
+
+.actions {
+  justify-content: space-between;
+  gap: 13px;
+  padding-top: 13px;
+  border-top: 1px solid color-mix(in srgb, var(--composer-line) 68%, transparent);
+}
+
+.actions button {
+  min-height: 40px;
+  padding: 9px 14px;
+  color: #0b1516;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  background: var(--composer-signal);
+  border: 1px solid var(--composer-signal);
+  border-radius: 0;
+}
+
+.actions button:hover:not(:disabled) {
+  color: var(--composer-ink);
+  background: transparent;
+}
+
+.actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.46;
+}
+
+.actions > span {
+  max-width: 29rem;
+  text-align: right;
+}
+
+.result {
+  padding: 11px 12px;
+  color: var(--composer-ink);
+  background: color-mix(in srgb, var(--composer-raised) 82%, transparent);
+  border-left: 3px solid var(--composer-hot-line);
+}
+
+.result[data-state="withheld"],
+.result[data-state="failed"] {
+  border-left-color: var(--composer-danger);
+}
+
+@media (max-width: 680px) {
+  .composer {
+    gap: 13px;
+    padding: 14px;
+  }
+
+  .header,
+  .actions {
+    flex-direction: column;
+  }
+
+  .targetReadout {
+    width: 100%;
+  }
+
+  .actions > span {
+    max-width: none;
+    text-align: left;
+  }
+}
+
+@media (max-width: 460px) {
+  .modeGrid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .modeOption {
+    min-width: 0;
+  }
+
+  .participantSelection li label {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .participantSelection li code {
+    grid-column: 2;
+    margin-left: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer *,
+  .composer *::before,
+  .composer *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
