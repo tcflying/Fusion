@@ -40,7 +40,30 @@ function createEngine(projectId: string, service: unknown): RoomControlPlaneProj
   return {
     getProjectId: () => projectId,
     getRoomControlPlaneReadService: () => service,
+    executeProjectRoomCommand: async () => {
+      throw new Error("Unexpected Room command");
+    },
   } as unknown as RoomControlPlaneProjectEngine;
+}
+
+function operatorMessagePayload(overrides: Readonly<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    seatId: "seat-1",
+    intent: "instruction",
+    content: "Review the verified candidate before the next Room decision.",
+    authorityEnvelope: { envelope: "provided-by-caller" },
+    ...overrides,
+  };
+}
+
+function operatorActionRequestBody(overrides: Readonly<Record<string, unknown>> = {}): string {
+  return JSON.stringify({
+    expectedAggregateVersion: 3,
+    commandId: "route-command-1",
+    action: "send_to_seat",
+    payload: operatorMessagePayload(),
+    ...overrides,
+  });
 }
 
 function createApp(input: {
@@ -196,5 +219,216 @@ describe("Room control-plane Engine route dependencies", () => {
     expect(mutation.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_MUTATION_UNSUPPORTED" } });
     expect(service.listRooms).not.toHaveBeenCalled();
     expect(service.getRoomProjection).not.toHaveBeenCalled();
+  });
+
+  it("routes only the canonical operator send-to-seat command and returns the Engine event version", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn(async () => ({
+      type: "room.send-to-seat.v1",
+      projectId: PROJECT_ID,
+      commandId: "route-command-1",
+      actor: { kind: "dashboard_operator", principalId: "operator-1" },
+      value: { event: { aggregateVersion: 11 } },
+    }));
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody(),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ accepted: true, aggregateVersion: 11 });
+    expect(executeProjectRoomCommand).toHaveBeenCalledWith({
+      type: "room.send-to-seat.v1",
+      projectId: PROJECT_ID,
+      commandId: "route-command-1",
+      input: {
+        roomId: ROOM_ID,
+        seatId: "seat-1",
+        expectedAggregateVersion: 3,
+        commandId: "route-command-1",
+        idempotencyKey: "route-command-1",
+        correlationId: "route-command-1",
+        intent: "instruction",
+        content: "Review the verified candidate before the next Room decision.",
+        authorityEnvelope: { envelope: "provided-by-caller" },
+      },
+    }, {
+      kind: "dashboard_operator",
+      principalId: "operator-1",
+      authenticated: true,
+    });
+  });
+
+  it("rejects a Room operator action without the externally routed commandId", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn();
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody({ commandId: undefined }),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_OPERATOR_ACTION_INVALID" } });
+    expect(executeProjectRoomCommand).not.toHaveBeenCalled();
+  });
+
+  it("rejects payload attempts to override identity or command correlation fields", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn();
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody({
+        payload: operatorMessagePayload({
+          actorId: "payload-actor",
+          principal: { kind: "controller" },
+          commandId: "payload-command",
+          idempotencyKey: "payload-idempotency",
+          correlationId: "payload-correlation",
+        }),
+      }),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_OPERATOR_ACTION_INVALID" } });
+    expect(executeProjectRoomCommand).not.toHaveBeenCalled();
+  });
+
+  it("rejects a cross-project Engine before it can execute a Room operator action", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn();
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(OTHER_PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody(),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_ENGINE_PROJECT_MISMATCH" } });
+    expect(executeProjectRoomCommand).not.toHaveBeenCalled();
+  });
+
+  it("denies an unauthorized Room operator action before resolving an Engine", async () => {
+    const service = createReadService();
+    const { app, resolveProjectEngine } = createApp({
+      authorizeProject: vi.fn(async () => ({ allowed: false as const, reason: "observer" })),
+      resolveProjectEngine: () => createEngine(PROJECT_ID, service),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody(),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_PROJECT_ACCESS_DENIED" } });
+    expect(resolveProjectEngine).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when no project Engine is available for a Room operator action", async () => {
+    const { app } = createApp({ resolveProjectEngine: () => undefined });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody(),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_PROJECT_ENGINE_UNAVAILABLE" } });
+  });
+
+  it("keeps every other Room operator action explicitly unsupported", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn();
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody({ action: "broadcast" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(501);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_MUTATION_UNSUPPORTED" } });
+    expect(executeProjectRoomCommand).not.toHaveBeenCalled();
+  });
+
+  it("fails closed instead of inferring an aggregate version from an invalid Engine result", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn(async () => ({
+      type: "room.send-to-seat.v1",
+      projectId: PROJECT_ID,
+      commandId: "route-command-1",
+      actor: { kind: "dashboard_operator", principalId: "operator-1" },
+      value: { event: { aggregateVersion: "4" } },
+    }));
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      operatorActionRequestBody(),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_CONTROL_PLANE_MUTATION_RESPONSE_INVALID" } });
   });
 });

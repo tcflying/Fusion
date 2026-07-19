@@ -1,4 +1,9 @@
 import type { Request } from "express";
+import {
+  ROOM_AUTHORITY_CONTRACT_BOUNDS,
+  type RoomAuthorityEnvelopeV1,
+  type RoomMessageIntent,
+} from "@fusion/core";
 import type { ProjectEngine } from "@fusion/engine";
 import { ApiError } from "./api-error.js";
 import type {
@@ -17,12 +22,19 @@ import type { ProjectContext } from "./routes/types.js";
 
 export type RoomControlPlaneProjectEngine = Pick<
   ProjectEngine,
-  "getProjectId" | "getRoomControlPlaneReadService"
+  "getProjectId" | "getRoomControlPlaneReadService" | "executeProjectRoomCommand"
 >;
 
 type RoomControlPlaneReadService = NonNullable<
   ReturnType<RoomControlPlaneProjectEngine["getRoomControlPlaneReadService"]>
 >;
+type RoomControlPlaneOperatorMessageCommand = Extract<
+  Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
+  { readonly type: "room.send-to-seat.v1" }
+>;
+type RoomControlPlaneTrustedPrincipal = Parameters<
+  RoomControlPlaneProjectEngine["executeProjectRoomCommand"]
+>[1];
 
 export interface RoomControlPlaneEngineResolverInput {
   readonly request: Request;
@@ -43,6 +55,22 @@ export interface RoomControlPlaneEngineRouteDependenciesOptions {
 }
 
 type ReadServiceLike = Pick<RoomControlPlaneReadService, "listRooms" | "getRoomProjection">;
+type ResolvedEngineReadService = {
+  readonly engine: RoomControlPlaneProjectEngine;
+  readonly service: ReadServiceLike;
+};
+
+const ROOM_MESSAGE_INTENTS = [
+  "instruction",
+  "proposal",
+  "question",
+  "critique",
+  "challenge",
+  "verdict",
+  "handoff",
+  "help_request",
+] as const satisfies readonly RoomMessageIntent[];
+const OPERATOR_MESSAGE_PAYLOAD_KEYS = ["seatId", "intent", "content", "authorityEnvelope"] as const;
 
 function isNonEmptyIdentifier(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 256;
@@ -53,9 +81,11 @@ function isProjectEngine(value: unknown): value is RoomControlPlaneProjectEngine
   const candidate = value as {
     getProjectId?: unknown;
     getRoomControlPlaneReadService?: unknown;
+    executeProjectRoomCommand?: unknown;
   };
   return typeof candidate.getProjectId === "function"
-    && typeof candidate.getRoomControlPlaneReadService === "function";
+    && typeof candidate.getRoomControlPlaneReadService === "function"
+    && typeof candidate.executeProjectRoomCommand === "function";
 }
 
 function isReadService(value: unknown): value is ReadServiceLike {
@@ -84,7 +114,7 @@ function assertPortProject(projectId: string, expectedProjectId: string): void {
 async function resolveReadService(
   resolver: RoomControlPlaneEngineResolver,
   input: RoomControlPlaneEngineResolverInput,
-): Promise<ReadServiceLike> {
+): Promise<ResolvedEngineReadService> {
   let candidate: RoomControlPlaneProjectEngine | null | undefined;
   try {
     candidate = await resolver(input);
@@ -153,7 +183,7 @@ async function resolveReadService(
       input.projectId,
     );
   }
-  return service;
+  return { engine: candidate, service };
 }
 
 function unsupportedResourceRead(input: RoomControlPlaneResourceReadInputV1): never {
@@ -176,7 +206,143 @@ function unsupportedMutation(input: RoomControlPlaneMutationInputV1): never {
   });
 }
 
-function createReadOnlyPort(projectId: string, service: ReadServiceLike): RoomControlPlaneRoutePort {
+function invalidOperatorMessageMutation(input: RoomControlPlaneMutationInputV1, message: string): never {
+  throw new ApiError(400, message, {
+    code: "ROOM_CONTROL_PLANE_OPERATOR_ACTION_INVALID",
+    projectId: input.projectId,
+    roomId: input.roomId,
+  });
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactOperatorMessagePayloadKeys(value: Readonly<Record<string, unknown>>): boolean {
+  const keys = Object.keys(value);
+  return keys.length === OPERATOR_MESSAGE_PAYLOAD_KEYS.length
+    && OPERATOR_MESSAGE_PAYLOAD_KEYS.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function isRoomMessageIntent(value: unknown): value is RoomMessageIntent {
+  return typeof value === "string" && (ROOM_MESSAGE_INTENTS as readonly string[]).includes(value);
+}
+
+function isBoundedOperatorMessageContent(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= ROOM_AUTHORITY_CONTRACT_BOUNDS.maxContentLength;
+}
+
+/*
+FNXC:RoomControlPlaneEngineRoute 2026-07-19-17:20:
+Dashboard exposes exactly one Room write: a project-scoped operator send to one seat.
+The route-derived room, command, and actor identities are authoritative; payloads cannot
+replace them or provide idempotency/correlation values. Keep the authority envelope opaque
+and unchanged so Core/Engine remain its sole validator, signer, and scope enforcer.
+Success is acknowledged only from the Engine's canonical event aggregateVersion.
+*/
+function createOperatorMessageCommand(input: RoomControlPlaneMutationInputV1): RoomControlPlaneOperatorMessageCommand {
+  if (!isNonEmptyIdentifier(input.roomId)) {
+    return invalidOperatorMessageMutation(input, "Room operator actions require a non-empty routed roomId.");
+  }
+  if (!isNonEmptyIdentifier(input.commandId)) {
+    return invalidOperatorMessageMutation(input, "Room operator actions require a non-empty routed commandId.");
+  }
+  if (!isNonEmptyIdentifier(input.actorId)) {
+    return invalidOperatorMessageMutation(input, "Room operator actions require an authorized operator identity.");
+  }
+  if (!isRecord(input.payload) || !hasExactOperatorMessagePayloadKeys(input.payload)) {
+    return invalidOperatorMessageMutation(
+      input,
+      "Room operator message payloads may contain only seatId, intent, content, and authorityEnvelope.",
+    );
+  }
+
+  const { seatId, intent, content, authorityEnvelope } = input.payload;
+  if (!isNonEmptyIdentifier(seatId) || !isRoomMessageIntent(intent) || !isBoundedOperatorMessageContent(content)) {
+    return invalidOperatorMessageMutation(input, "Room operator message payload is invalid.");
+  }
+  if (!isRecord(authorityEnvelope)) {
+    return invalidOperatorMessageMutation(input, "Room operator messages require an authorityEnvelope object.");
+  }
+
+  return {
+    type: "room.send-to-seat.v1",
+    projectId: input.projectId,
+    commandId: input.commandId,
+    input: {
+      roomId: input.roomId,
+      seatId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      commandId: input.commandId,
+      idempotencyKey: input.commandId,
+      correlationId: input.commandId,
+      intent,
+      content,
+      authorityEnvelope: authorityEnvelope as unknown as RoomAuthorityEnvelopeV1,
+    },
+  };
+}
+
+function canonicalAggregateVersion(
+  value: unknown,
+  input: RoomControlPlaneMutationInputV1,
+): number {
+  const result = isRecord(value) ? value : null;
+  const resultValue = result
+    && result.type === "room.send-to-seat.v1"
+    && result.projectId === input.projectId
+    && result.commandId === input.commandId
+    && isRecord(result.value)
+    ? result.value
+    : null;
+  const event = resultValue && isRecord(resultValue.event) ? resultValue.event : null;
+  const aggregateVersion = event?.aggregateVersion;
+  if (
+    typeof aggregateVersion !== "number"
+    || !Number.isInteger(aggregateVersion)
+    || aggregateVersion < 0
+  ) {
+    throw unavailable(
+      "ROOM_CONTROL_PLANE_MUTATION_RESPONSE_INVALID",
+      "The project Engine returned an invalid Room operator action result.",
+      input.projectId,
+    );
+  }
+  return aggregateVersion;
+}
+
+async function mutateOperatorMessage(
+  engine: RoomControlPlaneProjectEngine,
+  input: RoomControlPlaneMutationInputV1,
+): Promise<RoomControlPlaneMutationResultV1> {
+  const command = createOperatorMessageCommand(input);
+  const trustedPrincipal: RoomControlPlaneTrustedPrincipal = {
+    kind: "dashboard_operator",
+    principalId: input.actorId,
+    authenticated: true,
+  };
+
+  let result: unknown;
+  try {
+    result = await engine.executeProjectRoomCommand(command, trustedPrincipal);
+  } catch (_error) {
+    throw unavailable(
+      "ROOM_PROJECT_ENGINE_UNAVAILABLE",
+      "The project Engine is unavailable for Room control-plane mutations.",
+      input.projectId,
+    );
+  }
+
+  return { accepted: true, aggregateVersion: canonicalAggregateVersion(result, input) };
+}
+
+function createEngineBackedPort(
+  projectId: string,
+  engine: RoomControlPlaneProjectEngine,
+  service: ReadServiceLike,
+): RoomControlPlaneRoutePort {
   return {
     async listRooms(input: RoomControlPlaneListRoomsInputV1): Promise<RoomControlPlanePageV1> {
       assertPortProject(input.projectId, projectId);
@@ -192,6 +358,9 @@ function createReadOnlyPort(projectId: string, service: ReadServiceLike): RoomCo
     },
     async mutate(input: RoomControlPlaneMutationInputV1): Promise<RoomControlPlaneMutationResultV1> {
       assertPortProject(input.projectId, projectId);
+      if (input.resource === "room" && input.operation === "operator_action" && input.action === "send_to_seat") {
+        return await mutateOperatorMessage(engine, input);
+      }
       return unsupportedMutation(input);
     },
   };
@@ -215,8 +384,8 @@ export function createRoomControlPlaneEngineRouteDependencies(
           code: "ROOM_CONTROL_PLANE_PORT_PROJECT_SCOPE_INVALID",
         });
       }
-      const service = await resolveReadService(options.resolveProjectEngine, input);
-      return createReadOnlyPort(input.projectId, service);
+      const { engine, service } = await resolveReadService(options.resolveProjectEngine, input);
+      return createEngineBackedPort(input.projectId, engine, service);
     },
   };
 }
