@@ -17,6 +17,7 @@ import {
   connectRoomCockpitLiveEvents,
   getRoomCockpitBrowserEventSourceFactory,
   type RoomCockpitEventSourceFactory,
+  type RoomCockpitLiveAlertV1,
 } from "./roomCockpitLiveEvents";
 
 export type RoomCockpitProjectionV1 = EngineRoomCockpitProjectionV1;
@@ -42,6 +43,7 @@ interface RoomCockpitLiveStreamState {
   readonly roomId: string;
   readonly state: "connecting" | "connected" | "unavailable";
   readonly unavailableDetail?: string;
+  readonly unavailableSource?: "server_health" | "transport";
 }
 
 const ROOM_TASK_STATES = new Set<RoomCockpitTaskStateV1>([
@@ -297,6 +299,16 @@ function initialSnapshot(projectId: string | undefined, roomId: string | null): 
   };
 }
 
+function getServerConnectionUnavailableDetail(state: string, cursor: string | null): string {
+  const cursorDetail = cursor === null ? "before a canonical cursor was established" : `at canonical cursor ${cursor}`;
+  return `Room live-event server reports live-event state ${state} ${cursorDetail}. Health and capacity remain withheld until a scoped connected report and fresh durable projection reconcile.`;
+}
+
+function getServerAlertUnavailableDetail(alert: RoomCockpitLiveAlertV1): string {
+  const cursorDetail = alert.cursor === null ? "without a canonical cursor" : `at canonical cursor ${alert.cursor}`;
+  return `Room live-event alert ${alert.code} was reported ${cursorDetail}. Health and capacity remain withheld until a scoped connected report and fresh durable projection reconcile.`;
+}
+
 /**
  * FNXC:RoomCockpitRoute 2026-07-19-23:32:
  * The first cockpit entry is deliberately projection-only. It accepts only a
@@ -413,16 +425,28 @@ export function RoomCockpitRoute({
     }
 
     const isCurrentStream = () => liveStreamEpochRef.current === streamEpoch;
-    liveStreamStateRef.current = { projectId, roomId, state: "connecting" };
-    const sourceFactory = eventSourceFactory ?? getRoomCockpitBrowserEventSourceFactory();
-    if (!sourceFactory) {
-      const unavailableDetail = "This browser cannot open the authenticated Room live-event stream. The cockpit withholds stale health and capacity until a canonical projection can be reconciled.";
-      liveStreamStateRef.current = { projectId, roomId, state: "unavailable", unavailableDetail };
+    const markLiveStreamUnavailable = (
+      unavailableDetail: string,
+      unavailableSource: "server_health" | "transport",
+    ): void => {
+      liveStreamStateRef.current = {
+        projectId,
+        roomId,
+        state: "unavailable",
+        unavailableDetail,
+        unavailableSource,
+      };
       requestEpochRef.current += 1;
       setSnapshot({
         state: "degraded",
         detail: unavailableDetail,
       });
+    };
+    liveStreamStateRef.current = { projectId, roomId, state: "connecting" };
+    const sourceFactory = eventSourceFactory ?? getRoomCockpitBrowserEventSourceFactory();
+    if (!sourceFactory) {
+      const unavailableDetail = "This browser cannot open the authenticated Room live-event stream. The cockpit withholds stale health and capacity until a canonical projection can be reconciled.";
+      markLiveStreamUnavailable(unavailableDetail, "transport");
       return () => {
         if (liveStreamEpochRef.current === streamEpoch) {
           liveStreamEpochRef.current += 1;
@@ -434,30 +458,59 @@ export function RoomCockpitRoute({
     const connection = connectRoomCockpitLiveEvents({
       scope: { projectId, roomId },
       eventSourceFactory: sourceFactory,
-      onOpen: ({ reconnected, cursor }) => {
-        if (!isCurrentStream()) return;
-        liveStreamStateRef.current = { projectId, roomId, state: "connected" };
-        if (!reconnected) return;
-        void loadRoom(roomId, `Reconciling canonical Room event cursor ${cursor ?? "from the durable ledger"}.`);
-      },
       onReconnecting: ({ attempt, cursor }) => {
         if (!isCurrentStream()) return;
+        const currentState = liveStreamStateRef.current;
+        /*
+        FNXC:RoomCockpitLiveHealth 2026-07-19-20:00:
+        A transport close after a scoped server health failure is not new health
+        evidence. Keep the server's degraded/disconnected/alert receipt visible
+        until the replacement stream reports connected and a durable projection
+        refresh completes; otherwise a generic reconnect message can hide why
+        progress is frozen.
+        */
+        if (
+          currentState?.projectId === projectId
+          && currentState.roomId === roomId
+          && currentState.state === "unavailable"
+          && currentState.unavailableSource === "server_health"
+        ) return;
         const unavailableDetail = `Room live-event stream is unavailable or reconnecting (attempt ${attempt}, cursor ${cursor ?? "not established"}). It may be disconnected, disabled, or returning HTTP 503. The last projection is withheld until canonical cursor reconciliation succeeds.`;
-        liveStreamStateRef.current = { projectId, roomId, state: "unavailable", unavailableDetail };
-        requestEpochRef.current += 1;
-        setSnapshot({
-          state: "degraded",
-          detail: unavailableDetail,
-        });
+        markLiveStreamUnavailable(unavailableDetail, "transport");
+      },
+      /*
+      FNXC:RoomCockpitLiveHealth 2026-07-19-19:36:
+      `onopen` establishes only SSE transport and must never erase a server
+      degraded, disconnected, unknown, or alert state. Restore the Cockpit only
+      after the scoped server contract says connected and a durable read succeeds.
+      */
+      onConnection: ({ cursor, connection: serverConnection, alerts }) => {
+        if (!isCurrentStream()) return;
+        if (serverConnection.state !== "connected") {
+          markLiveStreamUnavailable(getServerConnectionUnavailableDetail(serverConnection.state, cursor), "server_health");
+          return;
+        }
+        const alert = alerts[0];
+        if (alert) {
+          markLiveStreamUnavailable(getServerAlertUnavailableDetail(alert), "server_health");
+          return;
+        }
+        liveStreamStateRef.current = { projectId, roomId, state: "connected" };
+        void loadRoom(roomId, `Reconciling canonical Room event cursor ${cursor ?? "from the durable ledger"}.`);
+      },
+      onAlert: ({ alerts }) => {
+        if (!isCurrentStream()) return;
+        const alert = alerts[0];
+        if (!alert) return;
+        markLiveStreamUnavailable(getServerAlertUnavailableDetail(alert), "server_health");
       },
       onEvent: ({ cursor, reconciliationRequired }) => {
         if (!isCurrentStream()) return;
         if (reconciliationRequired) {
-          requestEpochRef.current += 1;
-          setSnapshot({
-            state: "degraded",
-            detail: `Room event cursor ${cursor} requires durable reconciliation. Health and capacity remain withheld until a fresh canonical projection is read.`,
-          });
+          markLiveStreamUnavailable(
+            `Room event cursor ${cursor} requires durable reconciliation. Health and capacity remain withheld until a fresh canonical projection is read.`,
+            "server_health",
+          );
         }
         void loadRoom(roomId, `Reconciling canonical Room event cursor ${cursor}.`);
       },

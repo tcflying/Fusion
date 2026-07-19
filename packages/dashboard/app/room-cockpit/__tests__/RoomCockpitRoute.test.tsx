@@ -1,6 +1,4 @@
 import { useState } from "react";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -146,6 +144,27 @@ class ControlledRoomEventSource implements RoomCockpitEventSourceV1 {
       listener(event);
     }
   }
+
+  emitReplayContinuation(payload: unknown): void {
+    const event = { data: JSON.stringify(payload) } as MessageEvent;
+    for (const listener of this.listeners.get("room.replay.continue") ?? []) {
+      listener(event);
+    }
+  }
+
+  emitConnection(payload: unknown): void {
+    const event = { data: JSON.stringify(payload) } as MessageEvent;
+    for (const listener of this.listeners.get("room.connection") ?? []) {
+      listener(event);
+    }
+  }
+
+  emitAlert(payload: unknown): void {
+    const event = { data: JSON.stringify(payload) } as MessageEvent;
+    for (const listener of this.listeners.get("room.alert") ?? []) {
+      listener(event);
+    }
+  }
 }
 
 function roomEvent(cursor: string, overrides: {
@@ -164,6 +183,62 @@ function roomEvent(cursor: string, overrides: {
       connection: { state: "degraded" },
       alerts: [{ code: "canonical_replay_failed" }],
     } : {}),
+  };
+}
+
+function roomConnection(
+  state: "connected" | "degraded" | "disconnected" | "unknown",
+  overrides: {
+    readonly projectId?: string;
+    readonly roomId?: string;
+    readonly cursor?: string | null;
+    readonly reason?: string | null;
+    readonly includeReason?: boolean;
+    readonly alerts?: readonly unknown[];
+  } = {},
+) {
+  return {
+    contractVersion: 1,
+    type: "room_connection",
+    scope: {
+      projectId: overrides.projectId ?? "project-live",
+      roomId: overrides.roomId ?? "room-live",
+    },
+    cursor: overrides.cursor ?? null,
+    connection: {
+      state,
+      ...(overrides.includeReason === false ? {} : { reason: overrides.reason ?? null }),
+      changedAt: "2026-07-19T19:30:00.000Z",
+    },
+    alerts: overrides.alerts ?? [],
+  };
+}
+
+function roomAlert(code: string, overrides: {
+  readonly projectId?: string;
+  readonly roomId?: string;
+  readonly alertProjectId?: string;
+  readonly alertRoomId?: string;
+  readonly cursor?: string | null;
+  readonly severity?: "warning" | "critical";
+} = {}) {
+  const projectId = overrides.projectId ?? "project-live";
+  const roomId = overrides.roomId ?? "room-live";
+  return {
+    contractVersion: 1,
+    type: "room_alert",
+    scope: { projectId, roomId },
+    alerts: [{
+      code,
+      severity: overrides.severity ?? "critical",
+      scope: {
+        projectId: overrides.alertProjectId ?? projectId,
+        roomId: overrides.alertRoomId ?? roomId,
+      },
+      cursor: overrides.cursor ?? null,
+      expectedStreamSequence: null,
+      observedStreamSequence: null,
+    }],
   };
 }
 
@@ -323,6 +398,264 @@ describe("RoomCockpitRoute", () => {
     expect(fetchProjection).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps Cockpit degraded for server degraded, disconnected, and alert reports even if the EventSource opens", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    await act(async () => {
+      sources[0]?.open();
+      sources[0]?.emitConnection(roomConnection("degraded", { cursor: "7", reason: "canonical_replay_pending" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state degraded/i);
+
+    await act(async () => {
+      sources[0]?.open();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state degraded/i);
+
+    await act(async () => {
+      sources[0]?.emitConnection(roomConnection("disconnected", { reason: "engine_live_service_stopped" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state disconnected/i);
+
+    await act(async () => {
+      sources[0]?.emitAlert(roomAlert("stream_disconnected", { cursor: "7" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/Room live-event alert stream_disconnected/i);
+    expect(fetchProjection).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts the ordinary server connection frame without a terminal reason", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    await act(async () => {
+      sources[0]?.open();
+      sources[0]?.emitConnection(roomConnection("connected", { cursor: "0", includeReason: false }));
+    });
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+  });
+
+  it("ignores malformed and cross-scope server live-health frames", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    const invalidTimestampConnection = roomConnection("degraded");
+    const invalidSequenceAlert = roomAlert("stream_disconnected");
+    await act(async () => {
+      sources[0]?.emitConnection(roomConnection("degraded", { projectId: "other-project" }));
+      sources[0]?.emitConnection({
+        ...roomConnection("degraded"),
+        cursor: "01",
+      });
+      sources[0]?.emitConnection({
+        ...invalidTimestampConnection,
+        connection: { ...invalidTimestampConnection.connection, changedAt: "not-a-timestamp" },
+      });
+      sources[0]?.emitAlert(roomAlert("stream_disconnected", { projectId: "other-project" }));
+      sources[0]?.emitAlert(roomAlert("stream_disconnected", { alertRoomId: "other-room" }));
+      sources[0]?.emitAlert({
+        ...roomAlert("stream_disconnected"),
+        alerts: [{
+          ...roomAlert("stream_disconnected").alerts[0],
+          cursor: "invalid-cursor",
+        }],
+      });
+      sources[0]?.emitAlert({
+        ...invalidSequenceAlert,
+        alerts: [{ ...invalidSequenceAlert.alerts[0], expectedStreamSequence: 0 }],
+      });
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    expect(fetchProjection).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats zero as a canonical live-health cursor instead of accepting stale progress", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    await act(async () => {
+      sources[0]?.open();
+      sources[0]?.emitConnection(roomConnection("degraded", { cursor: "0" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state degraded/i);
+
+    await act(async () => {
+      sources[0]?.emitAlert(roomAlert("stream_disconnected", { cursor: "0" }));
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/Room live-event alert stream_disconnected/i);
+    expect(fetchProjection).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores Cockpit only after a scoped connected server report and durable projection refresh", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    await act(async () => {
+      sources[0]?.emitConnection(roomConnection("degraded", { cursor: "11" }));
+      sources[0]?.open();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state degraded/i);
+    expect(fetchProjection).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      sources[0]?.emitConnection(roomConnection("connected", { cursor: "11" }));
+    });
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("continues a bounded canonical replay without marking the cockpit unavailable and closes the replacement stream on pagehide", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await act(async () => {
+      sources[0]?.open();
+      sources[0]?.emitRoomEvent(roomEvent("17"), "17");
+    });
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      sources[0]?.emitReplayContinuation({
+        contractVersion: 1,
+        type: "room_replay_continue",
+        scope: { projectId: "other-project", roomId: "room-live" },
+        cursor: "17",
+      });
+      sources[0]?.emitReplayContinuation({
+        contractVersion: 1,
+        type: "room_replay_continue",
+        scope: { projectId: "project-live", roomId: "room-live" },
+        cursor: "16",
+      });
+      sources[0]?.emitReplayContinuation({
+        contractVersion: 1,
+        type: "room_replay_continue",
+        scope: { projectId: "project-live", roomId: "room-live" },
+        cursor: "not-a-cursor",
+      });
+    });
+
+    expect(sources).toHaveLength(1);
+    expect(sources[0]?.close).not.toHaveBeenCalled();
+
+    /*
+    FNXC:RoomCockpitReplay 2026-07-19-18:22:
+    A bounded canonical replay ends deliberately. Its matching continuation is
+    not a transport failure, so the cockpit must immediately resume from the
+    consumed cursor without withholding the current canonical projection.
+    */
+    await act(async () => {
+      sources[0]?.emitReplayContinuation({
+        contractVersion: 1,
+        type: "room_replay_continue",
+        scope: { projectId: "project-live", roomId: "room-live" },
+        cursor: "17",
+      });
+    });
+
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[0]?.close).toHaveBeenCalledTimes(1);
+    expect(sources[1]?.url).toBe("/api/rooms/room-live/events?projectId=project-live&cursor=17");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+
+    await act(async () => {
+      window.dispatchEvent(new Event("pagehide"));
+      sources[1]?.emitReplayContinuation({
+        contractVersion: 1,
+        type: "room_replay_continue",
+        scope: { projectId: "project-live", roomId: "room-live" },
+        cursor: "17",
+      });
+    });
+
+    expect(sources[1]?.close).toHaveBeenCalledTimes(1);
+    expect(sources).toHaveLength(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("ignores cross-scope live events and tears down an obsolete stream before a project switch", async () => {
     const sources: ControlledRoomEventSource[] = [];
     const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
@@ -424,8 +757,53 @@ describe("RoomCockpitRoute", () => {
     vi.useRealTimers();
     await act(async () => {
       sources[1]?.open();
+      sources[1]?.emitConnection(roomConnection("connected", { cursor: "11" }));
     });
     await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(3));
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+  });
+
+  it("keeps the cockpit unavailable across a closed server stream until the replacement stream reports connected and refreshes", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    vi.useFakeTimers();
+    act(() => {
+      sources[0]?.open();
+      sources[0]?.emitConnection(roomConnection("disconnected", { reason: "engine_live_service_stopped" }));
+      sources[0]?.fail();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state disconnected/i);
+
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(sources).toHaveLength(2);
+    expect(sources[1]?.url).toBe("/api/rooms/room-live/events?projectId=project-live");
+
+    vi.useRealTimers();
+    act(() => {
+      sources[1]?.open();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state disconnected/i);
+
+    act(() => {
+      sources[1]?.emitConnection(roomConnection("connected", { cursor: null }));
+    });
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
     expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
   });
 
@@ -456,7 +834,11 @@ describe("RoomCockpitRoute", () => {
   });
 
   it("keeps normal task and chat routing in MainContent instead of creating a synthetic TaskView", () => {
-    const appSource = readFileSync(resolve(process.cwd(), "app", "App.tsx"), "utf8");
+    const appSource = Object.values(import.meta.glob("../../App.tsx", {
+      eager: true,
+      import: "default",
+      query: "?raw",
+    }))[0] as string;
 
     expect(appSource).toContain("const _RoomCockpitRoute = lazy");
     expect(appSource).toContain("{roomCockpitOpen ? (");
