@@ -133,6 +133,13 @@ const InsightsView = lazy(() => import("./components/InsightsView").then((m) => 
 const ResearchView = lazy(() => import("./components/ResearchView").then((m) => ({ default: m.ResearchView })));
 const EvalsView = lazy(() => import("./components/EvalsView").then((m) => ({ default: m.EvalsView })));
 const ChatView = lazy(() => import("./components/ChatView").then((m) => ({ default: m.ChatView })));
+/*
+FNXC:RoomCockpitNavigation 2026-07-19-23:35:
+Room operations must stay an optional, independently loaded surface until a
+verified control-plane projection is wired. Keeping its chunk lazy prevents an
+unavailable Room backend from changing startup, task, or chat navigation.
+*/
+const _RoomCockpitRoute = lazy(() => import("./room-cockpit/RoomCockpitRoute").then((m) => ({ default: m.RoomCockpitRoute })));
 
 const SkillsView = lazy(() => import("./components/SkillsView").then((m) => ({ default: m.SkillsView })));
 const MemoryView = lazy(() => import("./components/MemoryView").then((m) => ({ default: m.MemoryView })));
@@ -158,6 +165,28 @@ FNXC:Settings 2026-06-22-00:00:
 SettingsView is the embedded main-content presentation of the SettingsModal chunk. It REUSES the already-documented SettingsModal lazy chunk (mounted in AppModals), so it uses the leading-underscore convention to stay out of the curated "Lazy-Loaded Heavy Views" inventory and avoid double-counting.
 */
 const _SettingsView = lazy(() => import("./components/SettingsModal").then((m) => ({ default: m.SettingsView })));
+
+export interface RoomCockpitNavigationEntryProps {
+  readonly available: boolean;
+  readonly selected: boolean;
+  readonly onSelect: () => void;
+}
+
+export function RoomCockpitNavigationEntry({ available, selected, onSelect }: RoomCockpitNavigationEntryProps) {
+  if (!available) return null;
+  return (
+    <nav className="header-actions" aria-label="Room control-plane navigation" data-testid="room-cockpit-navigation">
+      <button
+        type="button"
+        className={`btn btn-sm btn-secondary${selected ? " active" : ""}`}
+        aria-pressed={selected}
+        onClick={onSelect}
+      >
+        Room cockpit
+      </button>
+    </nav>
+  );
+}
 
 // Warm lazy chunks during browser idle so first navigation to each view is
 // instant. Each chunk is ~10–80 kB; total prefetch finishes well under a
@@ -427,6 +456,23 @@ function AppInner() {
     setThemeMode,
   });
 
+  const [roomCockpitOpen, setRoomCockpitOpen] = useState(false);
+  const roomCockpitNavigationAvailable = viewMode === "project" && !!currentProject && !isMobile;
+  const closeRoomCockpit = useCallback(() => {
+    setRoomCockpitOpen(false);
+  }, []);
+  const openRoomCockpit = useCallback(() => {
+    if (roomCockpitNavigationAvailable) {
+      setRoomCockpitOpen(true);
+    }
+  }, [roomCockpitNavigationAvailable]);
+
+  useEffect(() => {
+    if (!roomCockpitNavigationAvailable) {
+      setRoomCockpitOpen(false);
+    }
+  }, [roomCockpitNavigationAvailable]);
+
   useEffect(() => {
     recordActivity({ kind: "view", label: String(viewMode) });
   }, [viewMode]);
@@ -461,6 +507,8 @@ function AppInner() {
   FN-8069 makes Settings and Command Center shortcuts true toggles. Retain the exact view-revert callback pushed to navigation history so a shortcut can remove that identity-matched entry and restore the captured prior view for shortcut and Header/MobileNavBar opens alike; the callback deletes itself for shortcut close and Browser Back paths (Runfusion/Fusion#2118).
   */
   const handleTaskViewChange = useCallback((newView: TaskView) => {
+    // FNXC:RoomCockpitNavigation 2026-07-19-23:35: Task/chat controls remain authoritative; choosing any existing view dismisses the optional cockpit without changing the selected TaskView contract.
+    setRoomCockpitOpen(false);
     if (newView === "missions") {
       setMissionResumeSessionId(undefined);
       setMissionTargetId(undefined);
@@ -1794,6 +1842,11 @@ function AppInner() {
       />
       <DashboardBanners {...dashboardBannersProps} />
       <div className="dashboard-project-stack" data-testid="dashboard-project-stack">
+      <RoomCockpitNavigationEntry
+        available={roomCockpitNavigationAvailable}
+        selected={roomCockpitOpen}
+        onSelect={openRoomCockpit}
+      />
       <div className={`dashboard-project-shell${sidebarActive ? " dashboard-project-shell--with-sidebar" : ""}${rightDockActive ? " dashboard-project-shell--with-right-dock" : ""}`} data-testid="dashboard-project-shell">
         {sidebarActive && (
           <LeftSidebarNav
@@ -1828,7 +1881,11 @@ function AppInner() {
         <div
           className={`project-content${executorFooterVisible && (!isMobile || !mobileKeyboardOpen) ? " project-content--with-footer" : ""}${isMobile && !mobileKeyboardOpen ? " project-content--with-mobile-nav" : ""}`}
         >
-          <MainContent {...mainContentProps} />
+          {roomCockpitOpen ? (
+            <Suspense fallback={null}>
+              <_RoomCockpitRoute projectId={currentProject?.id} onClose={closeRoomCockpit} />
+            </Suspense>
+          ) : <MainContent {...mainContentProps} />}
         </div>
         {rightDock.dock}
       </div>
