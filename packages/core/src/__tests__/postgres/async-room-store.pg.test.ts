@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AsyncRoomStore } from "../../async-room-store.js";
+import { AsyncRoomStore, MAX_ROOM_EVENT_LIST_LIMIT } from "../../async-room-store.js";
 import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
 import { createAsyncDataLayer } from "../../postgres/data-layer.js";
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
@@ -181,6 +181,79 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
     expect(events.map((event) => event.aggregateVersion)).toEqual([0, 1]);
     expect(events.every((event) => Number(event.cursor) > 0)).toBe(true);
     expect(notifiedVersions).toEqual([0, 1]);
+  });
+
+  it("bounds canonical Room event reads in database order after a durable cursor", async () => {
+    const context = await startEmbeddedDatabase();
+    const layer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
+    const store = new AsyncRoomStore(layer);
+    const created = await store.createRoom(
+      {
+        id: "room-bounded-events-1",
+        projectId: "project-1",
+        objective: "Replay only the requested canonical event page",
+        protocolId: "implementation",
+        protocolVersion: 1,
+        now: "2026-07-19T18:00:00.000Z",
+      },
+      {
+        eventId: "event-bounded-events-created",
+        actorType: "human",
+        actorId: "operator-bounded-events",
+        correlationId: "correlation-bounded-events-created",
+        causationId: null,
+        occurredAt: "2026-07-19T18:00:00.000Z",
+      },
+    );
+    await store.transitionLifecycle(
+      created.room.id,
+      {
+        to: "ready",
+        expectedAggregateVersion: 0,
+        now: "2026-07-19T18:01:00.000Z",
+      },
+      {
+        eventId: "event-bounded-events-ready",
+        actorType: "controller",
+        actorId: "controller-bounded-events",
+        correlationId: "correlation-bounded-events-ready",
+        causationId: "event-bounded-events-created",
+        occurredAt: "2026-07-19T18:01:00.000Z",
+      },
+    );
+    await store.transitionLifecycle(
+      created.room.id,
+      {
+        to: "running",
+        expectedAggregateVersion: 1,
+        now: "2026-07-19T18:02:00.000Z",
+      },
+      {
+        eventId: "event-bounded-events-running",
+        actorType: "controller",
+        actorId: "controller-bounded-events",
+        correlationId: "correlation-bounded-events-running",
+        causationId: "event-bounded-events-ready",
+        occurredAt: "2026-07-19T18:02:00.000Z",
+      },
+    );
+
+    const firstPage = await store.listEvents(created.room.id, undefined, { limit: 2 });
+    expect(firstPage).toHaveLength(2);
+    expect(firstPage.map((event) => event.aggregateVersion)).toEqual([0, 1]);
+    expect(Number(firstPage[0]?.cursor)).toBeLessThan(Number(firstPage[1]?.cursor));
+
+    const afterCursor = firstPage[1]?.cursor;
+    if (!afterCursor) throw new Error("Bounded canonical replay did not return a cursor");
+    const secondPage = await store.listEvents(created.room.id, afterCursor, { limit: 1 });
+    expect(secondPage).toHaveLength(1);
+    expect(secondPage.map((event) => event.aggregateVersion)).toEqual([2]);
+    expect(Number(secondPage[0]?.cursor)).toBeGreaterThan(Number(afterCursor));
+
+    await expect(store.listEvents(created.room.id, undefined, { limit: 0 }))
+      .rejects.toMatchObject({ code: "room_event_list_invalid" });
+    await expect(store.listEvents(created.room.id, undefined, { limit: MAX_ROOM_EVENT_LIST_LIMIT + 1 }))
+      .rejects.toMatchObject({ code: "room_event_list_invalid" });
   });
 
   it("deduplicates concurrent commands and never blindly retries uncertain delivery", async () => {

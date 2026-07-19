@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isProxy } from "node:util/types";
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 
 import {
   RoomDomainError,
@@ -280,9 +280,16 @@ export interface AsyncRoomStoreOptions {
   readonly onNotificationError?: (error: unknown, event: RoomEventRecordV1) => void;
 }
 
+export const MAX_ROOM_EVENT_LIST_LIMIT = 1_000;
+
+export interface ListRoomEventsOptionsV1 {
+  readonly limit: number;
+}
+
 export type RoomStoreErrorCode =
   | "idempotency_conflict"
   | "idempotency_result_missing"
+  | "room_event_list_invalid"
   | "routing_command_invalid"
   | "routing_target_not_found"
   | "routing_group_not_found"
@@ -316,6 +323,38 @@ export class RoomStoreError extends Error {
     this.name = "RoomStoreError";
     this.code = code;
   }
+}
+
+function normalizeRoomEventListLimit(options: unknown): number | undefined {
+  if (options === undefined) return undefined;
+  const ownKeys = options !== null && typeof options === "object"
+    ? Reflect.ownKeys(options)
+    : [];
+  if (
+    options === null
+    || typeof options !== "object"
+    || Array.isArray(options)
+    || Object.getPrototypeOf(options) !== Object.prototype
+    || ownKeys.length !== 1
+    || ownKeys[0] !== "limit"
+  ) {
+    throw new RoomStoreError(
+      "room_event_list_invalid",
+      "Room event list options must be a plain object containing only limit",
+    );
+  }
+  const limit = (options as { readonly limit?: unknown }).limit;
+  if (
+    !Number.isSafeInteger(limit)
+    || limit < 1
+    || limit > MAX_ROOM_EVENT_LIST_LIMIT
+  ) {
+    throw new RoomStoreError(
+      "room_event_list_invalid",
+      `Room event list limit must be an integer between 1 and ${MAX_ROOM_EVENT_LIST_LIMIT}`,
+    );
+  }
+  return limit;
 }
 
 export interface EnqueueRoomMessageInput {
@@ -2362,8 +2401,12 @@ export class AsyncRoomStore {
     return rows[0] ? rowToBindingRecord(rows[0]) : null;
   }
 
-  async listEvents(roomId: string, afterCursor?: string): Promise<RoomEventRecordV1[]> {
-    return loadRoomEvents(this.layer.db, this.projectId, roomId, afterCursor);
+  async listEvents(
+    roomId: string,
+    afterCursor?: string,
+    options?: ListRoomEventsOptionsV1,
+  ): Promise<RoomEventRecordV1[]> {
+    return loadRoomEvents(this.layer.db, this.projectId, roomId, afterCursor, options);
   }
 
   async getRoutedMessage(messageId: string): Promise<StoredRoutedOperatorMessageV1 | null> {
@@ -8553,19 +8596,26 @@ export async function loadRoomEvents(
   projectId: string,
   roomId: string,
   afterCursor?: string,
+  options?: ListRoomEventsOptionsV1,
 ): Promise<RoomEventRecordV1[]> {
   const cursor = afterCursor === undefined ? undefined : Number(afterCursor);
   if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
     throw new Error(`Invalid Room event cursor: ${afterCursor}`);
   }
-  const rows = await handle
+  const limit = normalizeRoomEventListLimit(options);
+  const query = handle
     .select()
     .from(roomEvents)
-    .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.roomId, roomId)))
+    .where(cursor === undefined
+      ? and(eq(roomEvents.projectId, projectId), eq(roomEvents.roomId, roomId))
+      : and(
+        eq(roomEvents.projectId, projectId),
+        eq(roomEvents.roomId, roomId),
+        gt(roomEvents.cursor, cursor),
+      ))
     .orderBy(asc(roomEvents.cursor));
-  return rows
-    .filter((row) => cursor === undefined || Number(row.cursor) > cursor)
-    .map(rowToRoomEvent);
+  const rows = limit === undefined ? await query : await query.limit(limit);
+  return rows.map(rowToRoomEvent);
 }
 
 async function insertRoomEvent(

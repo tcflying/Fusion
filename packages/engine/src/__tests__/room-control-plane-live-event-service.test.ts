@@ -35,14 +35,21 @@ function roomEvent(
 }
 
 function createStore(
-  replay: (roomId: string, afterCursor?: string) => Promise<readonly RoomEventRecordV1[]> = async () => [],
+  replay: (
+    roomId: string,
+    afterCursor?: string,
+    options?: { readonly limit?: number },
+  ) => Promise<readonly RoomEventRecordV1[]> = async () => [],
 ) {
   const listeners = new Set<StoreListener>();
   const subscribe = vi.fn((listener: StoreListener) => {
     listeners.add(listener);
     return () => listeners.delete(listener);
   });
-  const listEvents = vi.fn(replay);
+  const listEvents = vi.fn(async (roomId: string, afterCursor?: string, options?: { readonly limit?: number }) => {
+    const events = await replay(roomId, afterCursor, options);
+    return options?.limit === undefined ? events : events.slice(0, options.limit);
+  });
 
   return {
     store: { subscribe, listEvents } as unknown as AsyncRoomStore,
@@ -80,7 +87,7 @@ describe("RoomControlPlaneLiveEventService", () => {
 
     const result = await service.reconnect(reconnect(null, 9));
 
-    expect(fixture.calls.listEvents).toHaveBeenCalledWith(ROOM_ID, undefined);
+    expect(fixture.calls.listEvents).toHaveBeenCalledWith(ROOM_ID, undefined, { limit: 2 });
     expect(result).toMatchObject({
       ok: true,
       outcome: "replayed",
@@ -125,10 +132,31 @@ describe("RoomControlPlaneLiveEventService", () => {
 
     const result = await service.reconnect(reconnect(null));
 
-    expect(fixture.calls.listEvents).toHaveBeenCalledWith(ROOM_ID, undefined);
+    expect(fixture.calls.listEvents).toHaveBeenCalledWith(ROOM_ID, undefined, { limit: 128 });
     expect(result).toMatchObject({ ok: true, outcome: "replayed", replaySource: "canonical_port" });
     if (!result.ok) throw new Error("Expected durable replay after a notification hint");
     expect(result.events.map((event) => event.cursor)).toEqual(["1", "2"]);
+  });
+
+  it("passes a capped old cursor replay limit into the durable store instead of slicing a full history", async () => {
+    const fixture = createStore(async (roomId, afterCursor, options) => {
+      expect(roomId).toBe(ROOM_ID);
+      expect(afterCursor).toBe("7");
+      expect(options).toEqual({ limit: 2 });
+      return [roomEvent("8"), roomEvent("9")];
+    });
+    const service = new RoomControlPlaneLiveEventService({
+      projectId: PROJECT_ID,
+      roomStore: fixture.store,
+      maxBufferedEvents: 2,
+      maxReplayEvents: 2,
+    });
+
+    const result = await service.reconnect(reconnect("7", 99));
+
+    expect(fixture.calls.listEvents).toHaveBeenCalledTimes(1);
+    expect(fixture.calls.listEvents).toHaveBeenCalledWith(ROOM_ID, "7", { limit: 2 });
+    expect(result).toMatchObject({ ok: true, outcome: "replayed", nextCursor: "9", hasMore: true });
   });
 
   it("keeps listener failures isolated, allows listener unsubscription, and stops delivery idempotently", async () => {

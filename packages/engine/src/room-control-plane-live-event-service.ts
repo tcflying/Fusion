@@ -92,7 +92,7 @@ function immutableSnapshot<T>(value: T): T {
  * `AsyncRoomStore.subscribe()` is a post-commit, process-local latency hint;
  * it can be absent across a restart and must never be treated as the durable
  * Room ledger. Every reconnect is backed by the coordinator's canonical replay
- * port, which reads `AsyncRoomStore.listEvents(roomId, afterCursor)` and makes
+ * port, which reads `AsyncRoomStore.listEvents(roomId, afterCursor, { limit })` and makes
  * replay failure or disorder visible as reconciliation alerts instead of
  * turning a notification cache into authority.
  */
@@ -185,8 +185,9 @@ export class RoomControlPlaneLiveEventService {
     if (!Number.isSafeInteger(input.limit) || input.limit <= 0) {
       throw new Error("Room canonical replay port requires a safe positive limit");
     }
-    const events = await this.roomStore.listEvents(scope.roomId, input.afterCursor ?? undefined);
-    return events.slice(0, input.limit);
+    return this.roomStore.listEvents(scope.roomId, input.afterCursor ?? undefined, {
+      limit: input.limit,
+    });
   }
 
   private handleCommittedEvent(event: RoomEventRecordV1): void {
