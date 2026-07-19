@@ -104,6 +104,7 @@ vi.mock("../room-controller.js", async (importOriginal) => {
 });
 
 import { ProjectEngine, type ProjectEngineOptions } from "../project-engine.js";
+import { RoomControlPlaneLiveEventService } from "../room-control-plane-live-event-service.js";
 
 const mocks = vi.hoisted(() => ({
   automationStoreInit: vi.fn(async () => undefined),
@@ -387,6 +388,100 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
     expect(roomController.stop.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.runtimeStop.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("starts one canonical live-event service after the Room store and clears it during stop", async () => {
+    const start = vi.spyOn(RoomControlPlaneLiveEventService.prototype, "start");
+    const stop = vi.spyOn(RoomControlPlaneLiveEventService.prototype, "stop");
+    const engine = createEngine();
+
+    try {
+      expect(engine.getRoomControlPlaneLiveEventService()).toBeUndefined();
+
+      await engine.start();
+
+      const service = engine.getRoomControlPlaneLiveEventService();
+      expect(service).toBeInstanceOf(RoomControlPlaneLiveEventService);
+      expect(start).toHaveBeenCalledTimes(1);
+
+      await engine.start();
+      expect(engine.getRoomControlPlaneLiveEventService()).toBe(service);
+      expect(start).toHaveBeenCalledTimes(1);
+
+      await engine.stop();
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(engine.getRoomControlPlaneLiveEventService()).toBeUndefined();
+    } finally {
+      await engine.stop();
+      start.mockRestore();
+      stop.mockRestore();
+    }
+  });
+
+  it("does not expose a live-event service when the feature is disabled", async () => {
+    const start = vi.spyOn(RoomControlPlaneLiveEventService.prototype, "start");
+    const getSettings = (mocks.currentStore as {
+      getSettings: ReturnType<typeof vi.fn>;
+    }).getSettings;
+    getSettings.mockResolvedValueOnce({
+      autoMerge: false,
+      enginePaused: false,
+      globalPause: false,
+      experimentalFeatures: {},
+      maintenanceIntervalMs: 900_000,
+      pollIntervalMs: 15_000,
+    });
+    const engine = createEngine();
+
+    try {
+      await engine.start();
+      expect(start).not.toHaveBeenCalled();
+      expect(engine.getRoomControlPlaneLiveEventService()).toBeUndefined();
+    } finally {
+      await engine.stop();
+      start.mockRestore();
+    }
+  });
+
+  it("fails closed without a live-event service when Room async initialization is unavailable", async () => {
+    const start = vi.spyOn(RoomControlPlaneLiveEventService.prototype, "start");
+    const getAsyncLayer = (mocks.currentStore as {
+      getAsyncLayer: ReturnType<typeof vi.fn>;
+    }).getAsyncLayer;
+    getAsyncLayer.mockReturnValueOnce(undefined);
+    const engine = createEngine();
+
+    try {
+      await engine.start();
+      expect(start).not.toHaveBeenCalled();
+      expect(engine.getRoomControlPlaneLiveEventService()).toBeUndefined();
+    } finally {
+      await engine.stop();
+      start.mockRestore();
+    }
+  });
+
+  it("stops and hides the live-event service when Room controller startup fails", async () => {
+    const start = vi.spyOn(RoomControlPlaneLiveEventService.prototype, "start");
+    const stop = vi.spyOn(RoomControlPlaneLiveEventService.prototype, "stop");
+    const roomController = {
+      start: vi.fn(async () => {
+        throw new Error("room startup failed");
+      }),
+      stop: vi.fn(async () => undefined),
+    };
+    const engine = createEngine(vi.fn(() => roomController));
+
+    try {
+      await expect(engine.start()).rejects.toThrow("room startup failed");
+      expect(start).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(engine.getRoomControlPlaneLiveEventService()).toBeUndefined();
+    } finally {
+      await engine.stop();
+      start.mockRestore();
+      stop.mockRestore();
+    }
   });
 
   it("rolls back the RoomController and runtime when Room startup fails", async () => {

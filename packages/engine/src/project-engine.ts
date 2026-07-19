@@ -105,6 +105,7 @@ import {
 import { DurableRoomRecoveryWorker } from "./room-durable-recovery-worker.js";
 import { SessionConnectorRegistry } from "./session-connector-registry.js";
 import { RoomExistingSessionSpine } from "./room-existing-session-spine.js";
+import { RoomControlPlaneLiveEventService } from "./room-control-plane-live-event-service.js";
 import type { SessionConnectorIngestionLimits } from "./session-connector-ingestion.js";
 import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
 import type {
@@ -431,6 +432,7 @@ export class ProjectEngine {
   private roomController?: RoomControllerLifecycle;
   private roomRunAuditDispatcher?: RoomRunAuditDispatcherLifecycle;
   private roomExistingSessionSpine?: RoomExistingSessionSpine;
+  private roomControlPlaneLiveEventService?: RoomControlPlaneLiveEventService;
   private stopInFlight: Promise<void> | null = null;
   private prMonitor?: PrMonitor;
   /**
@@ -895,6 +897,10 @@ export class ProjectEngine {
           }
         }
         const roomStore = new AsyncRoomStore(asyncLayer, { projectId: this.config.projectId });
+        this.roomControlPlaneLiveEventService = new RoomControlPlaneLiveEventService({
+          projectId: this.config.projectId,
+          roomStore,
+        });
         const ingestionLimits: SessionConnectorIngestionLimits = {
           historyPageSize: 100,
           maxHistoryPagesPerReconciliation: 20,
@@ -960,9 +966,19 @@ export class ProjectEngine {
         });
         this.roomController = roomController;
         try {
+          this.roomControlPlaneLiveEventService.start();
           await this.roomRunAuditDispatcher?.start();
           await roomController.start();
         } catch (error) {
+          try {
+            this.roomControlPlaneLiveEventService?.stop();
+          } catch (stopError) {
+            runtimeLog.warn(
+              `Session Room live-event service cleanup failed for ${this.config.projectId}: ${
+                stopError instanceof Error ? stopError.message : String(stopError)
+              }`,
+            );
+          }
           await Promise.resolve(roomController.stop()).catch((stopError: unknown) => {
             runtimeLog.warn(
               `Session Room controller cleanup failed for ${this.config.projectId}: ${
@@ -980,6 +996,7 @@ export class ProjectEngine {
           this.roomRunAuditDispatcher = undefined;
           this.roomController = undefined;
           this.roomExistingSessionSpine = undefined;
+          this.roomControlPlaneLiveEventService = undefined;
           throw error;
         }
       }
@@ -1455,7 +1472,7 @@ export class ProjectEngine {
     sync, merge enqueue) observes the flag even if start() has not flipped
     started yet — prevents unhandled post-stop side effects on fast recycle.
     */
-    if (!this.started && !this.starting && !this.runtimeStarted && !this.roomController) {
+    if (!this.started && !this.starting && !this.runtimeStarted && !this.roomController && !this.roomControlPlaneLiveEventService) {
       return;
     }
     this.shuttingDown = true;
@@ -1464,6 +1481,20 @@ export class ProjectEngine {
     // Stop the backend-owned Room supervisor before the runtime closes its
     // TaskStore/AsyncDataLayer. A RoomController failure must not strand the
     // rest of ProjectEngine shutdown.
+    const roomControlPlaneLiveEventService = this.roomControlPlaneLiveEventService;
+    this.roomControlPlaneLiveEventService = undefined;
+    if (roomControlPlaneLiveEventService) {
+      try {
+        roomControlPlaneLiveEventService.stop();
+      } catch (error) {
+        runtimeLog.warn(
+          `Session Room live-event service shutdown failed for ${this.config.projectId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
     const roomController = this.roomController;
     this.roomController = undefined;
     this.roomExistingSessionSpine = undefined;
@@ -1653,6 +1684,10 @@ export class ProjectEngine {
   /** Get the TaskStore. Throws if not started. */
   getTaskStore(): TaskStore {
     return this.runtime.getTaskStore();
+  }
+
+  getRoomControlPlaneLiveEventService(): RoomControlPlaneLiveEventService | undefined {
+    return this.roomControlPlaneLiveEventService;
   }
 
   /** Get the AgentStore (if initialized). Returns undefined before start(). */
