@@ -44,14 +44,29 @@ function legacyExtensionDependencies(): LegacyExtensionSpies {
 function officialMcpClient() {
   const callTool = vi.fn(async (input: { name: string; arguments?: Record<string, unknown> }) => {
     if (input.name === "session_list") {
-      return { structuredContent: { sessions: [{ id: IDENTITY.happierSessionId }] } };
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ok: true,
+            result: { sessions: [{ id: IDENTITY.happierSessionId }] },
+          }),
+        }],
+      };
     }
     if (input.name === "session_status_get") {
       return {
-        structuredContent: {
-          session: { id: IDENTITY.happierSessionId, active: true, updatedAt: "2026-07-19T19:29:00.000Z" },
-          agentState: { status: "waitingOnInput" },
-        },
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            ok: true,
+            result: {
+              ok: true,
+              session: { id: IDENTITY.happierSessionId, active: true, updatedAt: "2026-07-19T19:29:00.000Z" },
+              agentState: { status: "waitingOnInput" },
+            },
+          }),
+        }],
       };
     }
     throw new Error(`unexpected MCP tool ${input.name}`);

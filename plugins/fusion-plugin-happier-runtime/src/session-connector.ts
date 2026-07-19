@@ -230,9 +230,21 @@ function parsePersistedBinding(value: unknown): PersistedBinding | null {
 }
 
 function mcpResultRecord(result: HappierMcpToolResult, operation: string): HappierJsonRecord {
-  if (result.isError === true) {
-    throw new HappierCliError("session", `Happier MCP ${operation} reported an error`);
-  }
+  const record = extractMcpResultRecord(result, operation);
+  if (result.isError === true) throwMcpActionFailure(record, operation);
+  return unwrapMcpActionResult(record, operation);
+}
+
+/*
+FNXC:HappierOfficialMcpEnvelope 2026-07-19-20:31:
+Happier's external MCP server delegates action-backed tools through its action
+executor. The public `content` JSON is therefore `{ ok, result }`, and the
+actual session service may itself return a `{ ok, ... }` record. Normalize
+those documented envelopes here, while retaining direct structured results for
+future official MCP releases. Never treat a wrapped action failure as a valid
+session response.
+*/
+function extractMcpResultRecord(result: HappierMcpToolResult, operation: string): HappierJsonRecord {
   if (isRecord(result.structuredContent)) return result.structuredContent;
   if (Array.isArray(result.content)) {
     for (const item of result.content) {
@@ -246,6 +258,66 @@ function mcpResultRecord(result: HappierMcpToolResult, operation: string): Happi
     }
   }
   throw new HappierCliError("protocol", `Happier MCP ${operation} returned no structured result`);
+}
+
+function unwrapMcpActionResult(value: HappierJsonRecord, operation: string): HappierJsonRecord {
+  let current = value;
+  for (let depth = 0; depth < 2; depth += 1) {
+    if (current.ok === false) throwMcpActionFailure(current, operation);
+    if (current.ok !== true || !isRecord(current.result)) return current;
+    current = current.result;
+  }
+  if (current.ok === false) throwMcpActionFailure(current, operation);
+  return current;
+}
+
+function throwMcpActionFailure(value: HappierJsonRecord, operation: string): never {
+  const officialCode = nonEmptyString(value.errorCode, 128)
+    ?? nonEmptyString(value.code, 128)
+    ?? "mcp_action_failed";
+  throw new HappierCliError(
+    mapMcpOfficialErrorCode(officialCode),
+    `Happier MCP ${operation} failed: ${officialCode}`,
+    undefined,
+    officialCode,
+  );
+}
+
+function mapMcpOfficialErrorCode(officialCode: string): HappierCliError["code"] {
+  switch (officialCode.toLowerCase().replace(/[-\s]/g, "_")) {
+    case "not_authenticated":
+    case "authentication_required":
+    case "auth_required":
+    case "unauthorized":
+    case "forbidden":
+    case "invalid_token":
+    case "token_expired":
+      return "authentication";
+    case "timeout":
+    case "timed_out":
+      return "timeout";
+    case "server_unreachable":
+    case "server_unavailable":
+    case "connection_failed":
+    case "network_error":
+      return "server";
+    case "daemon_unavailable":
+    case "daemon_not_running":
+      return "daemon";
+    case "backend_unavailable":
+    case "backend_not_found":
+    case "provider_unavailable":
+    case "model_unavailable":
+      return "backend";
+    case "session_not_found":
+    case "session_id_ambiguous":
+    case "session_archived":
+    case "session_unavailable":
+    case "invalid_session":
+      return "session";
+    default:
+      return "protocol";
+  }
 }
 
 function sessionIdFromRecord(record: HappierJsonRecord): string | undefined {
@@ -310,7 +382,11 @@ function statusLastActivity(record: HappierJsonRecord): string | null {
 }
 
 function sessionListContains(record: HappierJsonRecord, expectedSessionId: string): boolean {
-  const sessions = Array.isArray(record.sessions) ? record.sessions : [];
+  const sessions = Array.isArray(record.sessions)
+    ? record.sessions
+    : isRecord(record.data) && Array.isArray(record.data.sessions)
+      ? record.data.sessions
+      : [];
   return sessions.some((candidate) => isRecord(candidate) && sessionIdFromRecord(candidate) === expectedSessionId);
 }
 
