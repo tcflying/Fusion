@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { z } from "zod";
 import { ApiError } from "../api-error.js";
+import { serializeRoomControlPlaneTrustedDeviceSetCookie } from "../room-control-plane-rbac-authorizer.js";
 import type { ApiRoutesContext, ProjectContext } from "./types.js";
 
 export const ROOM_CONTROL_PLANE_RESOURCES = [
@@ -37,6 +38,28 @@ export type RoomControlPlaneAuthorizationDecision =
     readonly allowed: false;
     readonly reason?: string;
   };
+
+export interface RoomControlPlaneTrustedDeviceSessionIssueInputV1 {
+  readonly request: Request;
+  readonly projectId: string;
+  readonly principalId: string;
+  readonly deviceId: string;
+}
+
+export interface RoomControlPlaneTrustedDeviceSessionRevokeInputV1 {
+  readonly request: Request;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly expectedSessionVersion: number;
+}
+
+export interface RoomControlPlaneTrustedDeviceSessionIssuer {
+  issueTrustedDeviceSession(input: RoomControlPlaneTrustedDeviceSessionIssueInputV1): Promise<Readonly<{ credential: string; sessionId: string; principalId: string; deviceId: string; expiresAt: string }>>;
+  revokeTrustedDeviceSession(input: RoomControlPlaneTrustedDeviceSessionRevokeInputV1): Promise<Readonly<{ sessionId: string; revokedAt: string | null; sessionVersion: number }>>;
+}
+
+export type RoomControlPlaneProjectAuthorizer = (input: RoomControlPlaneAuthorizationInput) => Promise<RoomControlPlaneAuthorizationDecision>;
+export type RoomControlPlaneProjectAuthorizerWithPairing = RoomControlPlaneProjectAuthorizer & Partial<RoomControlPlaneTrustedDeviceSessionIssuer>;
 
 export interface RoomControlPlanePageV1 {
   readonly items: readonly unknown[];
@@ -172,7 +195,7 @@ export interface RoomControlPlaneRoutePort {
 }
 
 export interface RoomControlPlaneRouteDependencies {
-  authorizeProject(input: RoomControlPlaneAuthorizationInput): Promise<RoomControlPlaneAuthorizationDecision>;
+  authorizeProject: RoomControlPlaneProjectAuthorizerWithPairing;
   resolvePort(input: {
     readonly request: Request;
     readonly projectId: string;
@@ -208,6 +231,8 @@ const mutationBodySchema = z.object({
 }).strict();
 const actionBodySchema = mutationBodySchema.extend({ action: actionSchema }).strict();
 const createRoomBodySchema = mutationBodySchema.extend({ expectedAggregateVersion: z.literal(0) }).strict();
+const trustedDeviceIssueBodySchema = z.object({ projectId: identifierSchema, principalId: identifierSchema, deviceId: identifierSchema }).strict();
+const trustedDeviceRevokeBodySchema = z.object({ projectId: identifierSchema, expectedSessionVersion: z.number().int().positive() }).strict();
 
 type RoomRouteScope = {
   readonly projectId: string;
@@ -645,6 +670,31 @@ export function registerRoomControlPlaneRoutes(
   context: ApiRoutesContext,
   dependencies: RoomControlPlaneRouteDependencies,
 ): void {
+  if (typeof dependencies.authorizeProject.issueTrustedDeviceSession === "function") {
+    context.router.post("/rooms/device-sessions", async (req, res) => {
+      try {
+        const body = parseOrThrow(trustedDeviceIssueBodySchema, req.body);
+        const session = await dependencies.authorizeProject.issueTrustedDeviceSession({ request: req, ...body });
+        res.setHeader("Set-Cookie", serializeRoomControlPlaneTrustedDeviceSetCookie(session.credential));
+        res.status(201).json({ session: { sessionId: session.sessionId, principalId: session.principalId, deviceId: session.deviceId, expiresAt: session.expiresAt } });
+      } catch (error) {
+        rethrowRouteError(context, error);
+      }
+    });
+  }
+  if (typeof dependencies.authorizeProject.revokeTrustedDeviceSession === "function") {
+    context.router.delete("/rooms/device-sessions/:sessionId", async (req, res) => {
+      try {
+        const params = parseOrThrow(z.object({ sessionId: identifierSchema }).strict(), req.params);
+        const body = parseOrThrow(trustedDeviceRevokeBodySchema, req.body);
+        const session = await dependencies.authorizeProject.revokeTrustedDeviceSession({ request: req, projectId: body.projectId, sessionId: params.sessionId, expectedSessionVersion: body.expectedSessionVersion });
+        res.status(200).json({ session });
+      } catch (error) {
+        rethrowRouteError(context, error);
+      }
+    });
+  }
+
   context.router.get("/rooms", async (req, res) => {
     try {
       const query = parseOrThrow(listQuerySchema, req.query);

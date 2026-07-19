@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import type { Request } from "express";
 import {
   ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
   RoomRbacPolicy,
+  createTrustedRoomDeviceCredential,
   decideRoomRbacProjectAuthorization,
   toRoomRbacDecisionInput,
   toRoomRbacProjectDecisionInput,
@@ -13,6 +15,7 @@ import type {
   RoomControlPlaneAuthorizationInput,
   RoomControlPlaneResource,
   RoomControlPlaneRouteDependencies,
+  RoomControlPlaneTrustedDeviceSessionIssuer,
 } from "./routes/register-room-control-plane-routes.js";
 
 export const DEFAULT_ROOM_CONTROL_PLANE_TRUSTED_DEVICE_COOKIE_NAME = "__Host-fusion-room-device";
@@ -47,6 +50,7 @@ type ResolvedRbacRequest =
 const OPAQUE_CREDENTIAL_PATTERN = /^[A-Za-z0-9_-]{43,}$/u;
 const COOKIE_PAIR_PATTERN = /^[\t ]*([!#$%&'*+\-.^_`|~0-9A-Za-z]+)=([^;\t ]*)[\t ]*$/u;
 const AUDIT_RESOURCES = new Set<RoomControlPlaneResource>(["evidence", "alerts", "replay"]);
+const TRUSTED_DEVICE_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 
 /*
 FNXC:RoomControlPlaneRbac 2026-07-19-19:43:
@@ -104,20 +108,33 @@ function resolveConfiguredPublicOrigin(value: unknown, allowLoopbackHttp: boolea
   throw new TypeError("Room control-plane trusted-device public origin must use HTTPS unless explicit loopback HTTP development is enabled.");
 }
 
-function hasSameOriginCookieRequest(request: Request, publicOrigin: URL): boolean {
-  const origin = readSingleHeader(request, "origin");
-  const fetchSite = readSingleHeader(request, "sec-fetch-site");
+function hasExpectedTargetOrigin(request: Request, publicOrigin: URL): boolean {
   const host = readSingleHeader(request, "host");
-  return isNonEmptyString(origin)
-    && origin === publicOrigin.origin
-    && fetchSite === "same-origin"
-    && isNonEmptyString(host)
+  return isNonEmptyString(host)
     && host.toLowerCase() === publicOrigin.host.toLowerCase()
     && requestProtocol(request) === publicOrigin.protocol;
 }
 
-function readTrustedDeviceCookie(request: Request, publicOrigin: URL): string | null {
-  if (!hasSameOriginCookieRequest(request, publicOrigin)) return null;
+function hasMutationSameOriginProof(request: Request, publicOrigin: URL): boolean {
+  const origin = readSingleHeader(request, "origin");
+  const fetchSite = readSingleHeader(request, "sec-fetch-site");
+  return isNonEmptyString(origin)
+    && origin === publicOrigin.origin
+    && fetchSite === "same-origin"
+    && hasExpectedTargetOrigin(request, publicOrigin);
+}
+
+function readTrustedDeviceCookie(
+  request: Request,
+  publicOrigin: URL,
+  requireMutationSameOriginProof: boolean,
+): string | null {
+  if (!hasExpectedTargetOrigin(request, publicOrigin)) return null;
+  if (requireMutationSameOriginProof && !hasMutationSameOriginProof(request, publicOrigin)) return null;
+  const origin = readSingleHeader(request, "origin");
+  if (origin !== undefined && origin !== publicOrigin.origin) return null;
+  const fetchSite = readSingleHeader(request, "sec-fetch-site");
+  if (fetchSite !== undefined && fetchSite !== "same-origin") return null;
   const rawCookie = readSingleHeader(request, "cookie");
   if (typeof rawCookie !== "string" || rawCookie.length === 0 || rawCookie.length > 4_096) return null;
   let credential: string | null = null;
@@ -190,9 +207,15 @@ function hasRegistryReadMethods(value: unknown): value is RoomRbacRegistry {
     && typeof candidate.readAuthorizedSnapshot === "function";
 }
 
+function hasRegistryPairingMethods(value: unknown): value is RoomRbacRegistry {
+  if (!hasRegistryReadMethods(value)) return false;
+  return typeof value.issueTrustedDeviceSession === "function"
+    && typeof value.revokeTrustedDeviceSession === "function";
+}
+
 async function resolveRegistry(
   resolver: RoomControlPlaneRbacRegistryResolver,
-  input: RoomControlPlaneAuthorizationInput,
+  input: RoomControlPlaneRbacRegistryResolverInput,
 ): Promise<RoomRbacRegistry | null> {
   try {
     const registry = await resolver({ request: input.request, projectId: input.projectId });
@@ -216,14 +239,56 @@ export function createRoomControlPlaneRbacAuthorizer(
   }
   const publicOrigin = resolveConfiguredPublicOrigin(options.publicOrigin, options.allowLoopbackHttp === true);
 
-  return async (input): Promise<RoomControlPlaneAuthorizationDecision> => {
-    const credential = readTrustedDeviceCookie(input.request, publicOrigin);
+  const issueTrustedDeviceSession: RoomControlPlaneTrustedDeviceSessionIssuer["issueTrustedDeviceSession"] = async (input) => {
+    const registry = await resolveRegistry(options.resolveRegistry, input);
+    if (!hasRegistryPairingMethods(registry)) throw new Error("Room control-plane trusted-device registry is unavailable.");
+    const issuedAt = new Date();
+    const expiresAt = new Date(issuedAt.getTime() + TRUSTED_DEVICE_SESSION_TTL_MS);
+    const credential = createTrustedRoomDeviceCredential();
+    const result = await registry.issueTrustedDeviceSession({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: input.projectId,
+      sessionId: randomUUID(),
+      principalId: input.principalId,
+      deviceId: input.deviceId,
+      credential,
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      idempotencyKey: randomUUID(),
+    });
+    return {
+      credential,
+      sessionId: result.session.sessionId,
+      principalId: result.session.principalId,
+      deviceId: result.session.deviceId,
+      expiresAt: result.session.expiresAt,
+    };
+  };
+  const revokeTrustedDeviceSession: RoomControlPlaneTrustedDeviceSessionIssuer["revokeTrustedDeviceSession"] = async (input) => {
+    const registry = await resolveRegistry(options.resolveRegistry, input);
+    if (!hasRegistryPairingMethods(registry)) throw new Error("Room control-plane trusted-device registry is unavailable.");
+    const result = await registry.revokeTrustedDeviceSession({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: input.projectId,
+      sessionId: input.sessionId,
+      expectedSessionVersion: input.expectedSessionVersion,
+      revokedAt: new Date().toISOString(),
+      idempotencyKey: randomUUID(),
+    });
+    return {
+      sessionId: result.session.sessionId,
+      revokedAt: result.session.revokedAt,
+      sessionVersion: result.session.sessionVersion,
+    };
+  };
+  const authorizeProject: RoomControlPlaneRouteDependencies["authorizeProject"] = async (input): Promise<RoomControlPlaneAuthorizationDecision> => {
+    const credential = readTrustedDeviceCookie(input.request, publicOrigin, input.access === "write");
     if (credential === null) return denied("trusted-device-cookie-required");
     const request = resolveRbacRequest(input);
     if (request === null) {
       return denied(input.operation === "operator_action" ? "rbac-room-action-unrecognized" : "rbac-request-unrecognized");
     }
-    const registry = await resolveRegistry(options.resolveRegistry, input);
+    const registry = await resolveRegistry(options.resolveRegistry, { request: input.request, projectId: input.projectId });
     if (registry === null) return denied("rbac-registry-unavailable");
     const requestedAt = new Date().toISOString();
 
@@ -281,4 +346,7 @@ export function createRoomControlPlaneRbacAuthorizer(
       return denied("rbac-registry-unavailable");
     }
   };
+  authorizeProject.issueTrustedDeviceSession = issueTrustedDeviceSession;
+  authorizeProject.revokeTrustedDeviceSession = revokeTrustedDeviceSession;
+  return authorizeProject;
 }

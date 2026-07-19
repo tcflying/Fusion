@@ -145,7 +145,7 @@ describe("Room control-plane RBAC authorizer", () => {
     );
   });
 
-  it("requires explicit same-origin fetch metadata and allows HTTP only through the explicit loopback switch", async () => {
+  it("allows Origin-less Room reads while still rejecting mismatched fetch metadata and HTTP outside the explicit loopback switch", async () => {
     const registry = createInMemoryRoomRbacRegistry();
     const { credential } = await issueSession(registry);
     await grant(registry, { grantId: "same-origin-operator", role: "operator", roomId: null });
@@ -159,7 +159,7 @@ describe("Room control-plane RBAC authorizer", () => {
         host: "dashboard.example",
         "sec-fetch-site": "same-origin",
       },
-    }))).resolves.toEqual({ allowed: false, reason: "trusted-device-cookie-required" });
+    }))).resolves.toMatchObject({ allowed: true, actorId: "trusted-dashboard-principal" });
     await expect(authorize(authorizationInput({
       roomId: null,
       operation: "list",
@@ -168,7 +168,7 @@ describe("Room control-plane RBAC authorizer", () => {
         host: "dashboard.example",
         origin: PUBLIC_ORIGIN,
       },
-    }))).resolves.toEqual({ allowed: false, reason: "trusted-device-cookie-required" });
+    }))).resolves.toMatchObject({ allowed: true, actorId: "trusted-dashboard-principal" });
     expect(() => createRoomControlPlaneRbacAuthorizer({
       resolveRegistry: async () => registry,
       publicOrigin: "http://127.0.0.1:4545",
@@ -234,6 +234,78 @@ describe("Room control-plane RBAC authorizer", () => {
 
     expect(decision).toEqual({ allowed: false, reason: "trusted-device-cookie-required" });
     expect(resolverCalls).toBe(0);
+  });
+
+  it("accepts a same-origin Room read without an Origin header but keeps a mutation Origin-bound", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    const trustedDevice = await issueSession(registry);
+    await grant(registry, { grantId: "owner-without-origin", role: "owner", roomId: null });
+    const authorize = authorizerFor(registry);
+
+    await expect(authorize(authorizationInput({
+      roomId: null,
+      operation: "list",
+      headers: {
+        cookie: `${DEFAULT_ROOM_CONTROL_PLANE_TRUSTED_DEVICE_COOKIE_NAME}=${trustedDevice.credential}`,
+        host: "dashboard.example",
+      },
+    }))).resolves.toMatchObject({ allowed: true, actorId: trustedDevice.principalId });
+
+    await expect(authorize(authorizationInput({
+      roomId: null,
+      operation: "create",
+      headers: {
+        cookie: `${DEFAULT_ROOM_CONTROL_PLANE_TRUSTED_DEVICE_COOKIE_NAME}=${trustedDevice.credential}`,
+        host: "dashboard.example",
+      },
+    }))).resolves.toEqual({ allowed: false, reason: "trusted-device-cookie-required" });
+  });
+
+  it("exposes a durable trusted-device issuer without treating its daemon bearer as a Room principal", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    await grant(registry, { grantId: "issued-device-owner", role: "owner", roomId: null, principalId: "pairing-principal" });
+    const authorize = authorizerFor(registry);
+
+    const issued = await authorize.issueTrustedDeviceSession?.({
+      request: authorizationInput().request,
+      projectId: PROJECT_A,
+      principalId: "pairing-principal",
+      deviceId: "pairing-device",
+    });
+
+    expect(issued).toMatchObject({ principalId: "pairing-principal", deviceId: "pairing-device" });
+    expect(issued?.credential).toMatch(/^[A-Za-z0-9_-]{43,}$/u);
+    await expect(authorize(authorizationInput({
+      roomId: null,
+      operation: "list",
+      headers: cookie(issued?.credential ?? ""),
+    }))).resolves.toMatchObject({ allowed: true, actorId: "pairing-principal" });
+  });
+
+  it("revokes a durable trusted-device session so its Cookie cannot authorize a later Room read", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    await grant(registry, { grantId: "revoked-device-owner", role: "owner", roomId: null, principalId: "revoked-principal" });
+    const authorize = authorizerFor(registry);
+    const issued = await authorize.issueTrustedDeviceSession?.({
+      request: authorizationInput().request,
+      projectId: PROJECT_A,
+      principalId: "revoked-principal",
+      deviceId: "revoked-device",
+    });
+
+    const revoked = await authorize.revokeTrustedDeviceSession?.({
+      request: authorizationInput().request,
+      projectId: PROJECT_A,
+      sessionId: issued?.sessionId ?? "missing-session",
+      expectedSessionVersion: 1,
+    });
+
+    expect(revoked).toMatchObject({ sessionId: issued?.sessionId, sessionVersion: 2 });
+    await expect(authorize(authorizationInput({
+      roomId: null,
+      operation: "list",
+      headers: cookie(issued?.credential ?? ""),
+    }))).resolves.toEqual({ allowed: false, reason: "rbac-project-snapshot-denied" });
   });
 
   it("fails closed for cross-project credentials and room-only grants on project list/create", async () => {
