@@ -1,17 +1,78 @@
-import type {
-  BeginRoomDeliveryAttemptInput,
-  RoomBindingRecordV1,
-  RoomOutboxRecordV1,
-  RoomProviderBackpressureControllerResultV1,
-  RoomProviderBackpressurePolicyV1,
-  RoomProviderBackpressureScopeV1,
-  RoomProviderBackpressureTelemetryV1,
-  SessionConnectorIdentityV1,
-  SessionConnectorResultV1,
-  SessionConnectorSendReceiptV1,
+import {
+  hashRoomValue,
+  type BeginRoomDeliveryAttemptInput,
+  type RoomBindingRecordV1,
+  type RoomOutboxRecordV1,
+  type RoomProviderBackpressureControllerResultV1,
+  type RoomProviderBackpressurePolicyV1,
+  type RoomProviderBackpressureScopeV1,
+  type RoomProviderBackpressureTelemetryV1,
+  type SessionConnectorIdentityV1,
+  type SessionConnectorResultV1,
+  type SessionConnectorSendReceiptV1,
 } from "@fusion/core";
 
 export const ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION = 1 as const;
+
+export interface RoomProviderBackpressureSendRequestBindingV1 {
+  readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
+  readonly delivery: Readonly<Pick<
+    RoomOutboxRecordV1,
+    "id" | "roomId" | "logicalMessageId" | "localMessageId" | "bindingId" | "idempotencyKey" | "payloadHash"
+  >>;
+  readonly binding: Readonly<Pick<
+    RoomBindingRecordV1,
+    "id" | "roomId" | "seatId" | "generation" | "connectorId" | "providerId"
+    | "nativeSessionId" | "happierSessionId" | "serverProfileId" | "machineId" | "hostId"
+  >>;
+  readonly identity: Readonly<SessionConnectorIdentityV1>;
+  readonly attemptId: string;
+  readonly senderFence: NonNullable<BeginRoomDeliveryAttemptInput["senderFence"]>;
+  readonly deadline: string;
+}
+
+export function createRoomProviderBackpressureSendRequestBinding(
+  input: Pick<
+    RoomProviderBackpressureSendGateRequestV1,
+    "delivery" | "binding" | "identity" | "attemptId" | "senderFence" | "deadline"
+  >,
+): RoomProviderBackpressureSendRequestBindingV1 {
+  return Object.freeze({
+    contractVersion: ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION,
+    delivery: Object.freeze({
+      id: input.delivery.id,
+      roomId: input.delivery.roomId,
+      logicalMessageId: input.delivery.logicalMessageId,
+      localMessageId: input.delivery.localMessageId,
+      bindingId: input.delivery.bindingId,
+      idempotencyKey: input.delivery.idempotencyKey,
+      payloadHash: input.delivery.payloadHash,
+    }),
+    binding: Object.freeze({
+      id: input.binding.id,
+      roomId: input.binding.roomId,
+      seatId: input.binding.seatId,
+      generation: input.binding.generation,
+      connectorId: input.binding.connectorId,
+      providerId: input.binding.providerId,
+      nativeSessionId: input.binding.nativeSessionId,
+      happierSessionId: input.binding.happierSessionId,
+      serverProfileId: input.binding.serverProfileId,
+      machineId: input.binding.machineId,
+      hostId: input.binding.hostId,
+    }),
+    identity: Object.freeze({ ...input.identity }),
+    attemptId: input.attemptId,
+    senderFence: Object.freeze({ ...input.senderFence }),
+    deadline: input.deadline,
+  });
+}
+
+export function hashRoomProviderBackpressureSendRequestBinding(
+  binding: RoomProviderBackpressureSendRequestBindingV1,
+): string {
+  return hashRoomValue(binding);
+}
 
 export interface RoomProviderBackpressureSendGateRequestV1 {
   readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
@@ -21,6 +82,12 @@ export interface RoomProviderBackpressureSendGateRequestV1 {
   readonly attemptId: string;
   readonly senderFence: NonNullable<BeginRoomDeliveryAttemptInput["senderFence"]>;
   readonly asOf: string;
+  /** Immutable admission deadline. A gate receives an abort signal at this deadline. */
+  readonly deadline: string;
+  /** Aborts on dispatch cancellation or the immutable admission deadline. */
+  readonly signal: AbortSignal;
+  readonly requestBinding: RoomProviderBackpressureSendRequestBindingV1;
+  readonly requestHash: string;
 }
 
 /**
@@ -60,6 +127,11 @@ export interface RoomProviderBackpressureSendPermitV1 {
   readonly reservationId: string;
   /** Stable request identity used by the durable provider-admission owner. */
   readonly requestId: string;
+  /** Exact immutable delivery/binding/identity/attempt/fence binding of this reservation. */
+  readonly requestBinding: RoomProviderBackpressureSendRequestBindingV1;
+  readonly requestHash: string;
+  /** The reservation cannot authorize a send at or after this instant. */
+  readonly expiresAt: string;
   readonly authority: RoomProviderBackpressureSendAuthorityV1;
   complete(input: RoomProviderBackpressureSendCompletionV1): Promise<void>;
 }
@@ -74,6 +146,8 @@ export type RoomProviderBackpressureSendGateResultV1 =
       readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
       readonly action: "defer";
       readonly reason: string;
+      /** Advisory only until a Core outbox defer transition persists it. */
+      readonly retryAfterMs?: number | null;
     };
 
 /**
@@ -93,7 +167,31 @@ export type RoomProviderBackpressureSendPreflightV1 =
   | {
       readonly action: "defer";
       readonly reason: string;
+      readonly retryAfterMs: number | null;
     };
+
+export class RoomProviderBackpressureGateTimeoutError extends Error {
+  constructor(readonly deadline: string) {
+    super("Room provider gate exceeded its admission deadline");
+    this.name = "RoomProviderBackpressureGateTimeoutError";
+  }
+}
+
+export class RoomProviderBackpressurePreSendWithheldError extends Error {
+  constructor(readonly reason: string) {
+    super(`Room provider permit was withheld before connector send: ${reason}`);
+    this.name = "RoomProviderBackpressurePreSendWithheldError";
+  }
+}
+
+export class RoomProviderBackpressureCompletionUnconfirmedError extends Error {
+  constructor(
+    readonly connectorResult: SessionConnectorResultV1<SessionConnectorSendReceiptV1> | null,
+  ) {
+    super("Room provider reservation completion could not be confirmed");
+    this.name = "RoomProviderBackpressureCompletionUnconfirmedError";
+  }
+}
 
 /*
 FNXC:RoomProviderBackpressureSendBoundary 2026-07-19-18:59:
@@ -111,8 +209,11 @@ export async function admitRoomProviderBackpressureConnectorSend(
 ): Promise<RoomProviderBackpressureSendPreflightV1> {
   let raw: unknown;
   try {
-    raw = await input.gate.admit(input.request);
-  } catch {
+    raw = await raceProviderGateAdmission(input.gate, input.request);
+  } catch (error) {
+    if (error instanceof RoomProviderBackpressureGateTimeoutError) {
+      return deferred("provider_gate_timeout");
+    }
     return deferred("provider_gate_unavailable");
   }
 
@@ -120,9 +221,12 @@ export async function admitRoomProviderBackpressureConnectorSend(
     return deferred("provider_gate_invalid_response");
   }
   if (raw.action === "defer") {
-    return canonicalString(raw.reason)
-      ? deferred(raw.reason)
-      : deferred("provider_gate_invalid_response");
+    if (!canonicalString(raw.reason)) return deferred("provider_gate_invalid_response");
+    const retryAfterMs = raw.retryAfterMs ?? null;
+    if (!nullableNonNegativeSafeInteger(retryAfterMs)) {
+      return deferred("provider_gate_invalid_response");
+    }
+    return deferred(raw.reason, retryAfterMs);
   }
   if (raw.action !== "admit" || !isRecord(raw.permit)) {
     return deferred("provider_gate_invalid_response");
@@ -131,40 +235,84 @@ export async function admitRoomProviderBackpressureConnectorSend(
   const permit = raw.permit as unknown as RoomProviderBackpressureSendPermitV1;
   const invalidReason = invalidPermitReason(permit, input.request);
   if (invalidReason !== null) {
-    await settleIfPresent(permit, {
-      kind: "not_started",
-      completedAt: input.request.asOf,
-    });
+    /*
+    FNXC:RoomProviderBackpressureSendBoundary 2026-07-19-20:10:
+    An invalid permit can be a replay for another delivery. Never call its
+    completion endpoint, because that could mutate an unrelated reservation.
+    */
     return deferred(invalidReason);
   }
   return Object.freeze({ action: "admit", permit });
 }
 
+export function revalidateAdmittedRoomProviderBackpressureConnectorSend(
+  input: {
+    readonly permit: RoomProviderBackpressureSendPermitV1;
+    readonly request: RoomProviderBackpressureSendGateRequestV1;
+    readonly asOf: string;
+  },
+): RoomProviderBackpressureSendPreflightV1 {
+  const request = Object.freeze({ ...input.request, asOf: input.asOf });
+  const invalidReason = invalidPermitReason(input.permit, request);
+  return invalidReason === null
+    ? Object.freeze({ action: "admit", permit: input.permit })
+    : deferred(invalidReason);
+}
+
 export async function sendWithAdmittedRoomProviderBackpressure(
   input: {
     readonly permit: RoomProviderBackpressureSendPermitV1;
+    readonly request: RoomProviderBackpressureSendGateRequestV1;
     readonly completedAt: () => string;
     readonly send: () => Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>>;
   },
 ): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>> {
+  /*
+  FNXC:RoomProviderBackpressureSendBoundary 2026-07-19-20:06:
+  A permit is only an authorization for its exact immutable delivery request and
+  finite telemetry/lease window. Recheck it at the last possible boundary before
+  connector.send(), because a slow admission must never turn stale telemetry or
+  an expired reservation into an external provider side effect.
+  */
+  const revalidated = revalidateAdmittedRoomProviderBackpressureConnectorSend({
+    permit: input.permit,
+    request: input.request,
+    asOf: input.completedAt(),
+  });
+  if (revalidated.action === "defer") {
+    await settleIfPresent(input.permit, {
+      kind: "not_started",
+      completedAt: input.completedAt(),
+    });
+    throw new RoomProviderBackpressurePreSendWithheldError(revalidated.reason);
+  }
+
   let result: SessionConnectorResultV1<SessionConnectorSendReceiptV1>;
   try {
     result = await input.send();
   } catch (error) {
-    await settleIfPresent(input.permit, {
-      kind: "connector_exception",
-      completedAt: input.completedAt(),
-    });
+    try {
+      await input.permit.complete(Object.freeze({
+        kind: "connector_exception",
+        completedAt: input.completedAt(),
+      }));
+    } catch {
+      throw new RoomProviderBackpressureCompletionUnconfirmedError(null);
+    }
     throw error;
   }
 
-  await input.permit.complete(Object.freeze({
-    kind: "connector_result",
-    completedAt: input.completedAt(),
-    outcome: result.ok ? result.value.outcome : "error",
-    connectorErrorCode: result.ok ? null : result.error.code,
-    retryAfterMs: result.ok ? null : result.error.retryAfterMs ?? null,
-  }));
+  try {
+    await input.permit.complete(Object.freeze({
+      kind: "connector_result",
+      completedAt: input.completedAt(),
+      outcome: result.ok ? result.value.outcome : "error",
+      connectorErrorCode: result.ok ? null : result.error.code,
+      retryAfterMs: result.ok ? null : result.error.retryAfterMs ?? null,
+    }));
+  } catch {
+    throw new RoomProviderBackpressureCompletionUnconfirmedError(result);
+  }
   return result;
 }
 
@@ -183,11 +331,25 @@ function invalidPermitReason(
     permit.contractVersion !== ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION
     || !canonicalString(permit.reservationId)
     || !canonicalString(permit.requestId)
+    || !canonicalString(permit.requestHash)
+    || !canonicalTimestamp(permit.expiresAt)
     || typeof permit.complete !== "function"
     || !canonicalTimestamp(request.asOf)
+    || !canonicalTimestamp(request.deadline)
+    || !isAbortSignal(request.signal)
   ) {
     return "provider_gate_invalid_response";
   }
+  const asOf = Date.parse(request.asOf);
+  const deadline = Date.parse(request.deadline);
+  if (request.signal.aborted) {
+    return request.signal.reason instanceof RoomProviderBackpressureGateTimeoutError
+      ? "provider_gate_timeout"
+      : "provider_gate_aborted";
+  }
+  if (asOf >= deadline) return "provider_gate_timeout";
+  if (Date.parse(permit.expiresAt) <= asOf) return "provider_permit_expired";
+  if (!hasMatchingRequestBinding(permit, request)) return "provider_permit_request_mismatch";
 
   const authority = permit.authority;
   if (!isRecord(authority) || !isScope(authority.scope)) return "provider_scope_incomplete";
@@ -205,13 +367,29 @@ function invalidPermitReason(
   if (!isPolicy(authority.policy)) return "provider_policy_invalid";
 
   const observedAt = Date.parse(authority.telemetry.observedAt);
-  const asOf = Date.parse(request.asOf);
   if (asOf < observedAt || asOf - observedAt > authority.policy.telemetryTtlMs) {
     return "provider_telemetry_stale";
   }
   return isAdmittedDecision(authority.decision, authority.scope)
     ? null
     : "provider_decision_invalid";
+}
+
+function hasMatchingRequestBinding(
+  permit: RoomProviderBackpressureSendPermitV1,
+  request: RoomProviderBackpressureSendGateRequestV1,
+): boolean {
+  if (!isRecord(permit.requestBinding) || !isRecord(request.requestBinding)) return false;
+  try {
+    const expected = createRoomProviderBackpressureSendRequestBinding(request);
+    const expectedHash = hashRoomProviderBackpressureSendRequestBinding(expected);
+    return request.requestHash === expectedHash
+      && hashRoomValue(request.requestBinding) === expectedHash
+      && permit.requestHash === expectedHash
+      && hashRoomValue(permit.requestBinding) === expectedHash;
+  } catch {
+    return false;
+  }
 }
 
 function isAdmittedDecision(
@@ -286,8 +464,43 @@ async function settleIfPresent(
   }
 }
 
-function deferred(reason: string): RoomProviderBackpressureSendPreflightV1 {
-  return Object.freeze({ action: "defer", reason });
+function deferred(
+  reason: string,
+  retryAfterMs: number | null = null,
+): RoomProviderBackpressureSendPreflightV1 {
+  return Object.freeze({ action: "defer", reason, retryAfterMs });
+}
+
+function raceProviderGateAdmission(
+  gate: RoomProviderBackpressureSendGateV1,
+  request: RoomProviderBackpressureSendGateRequestV1,
+): Promise<RoomProviderBackpressureSendGateResultV1> {
+  if (request.signal.aborted) {
+    return Promise.reject(request.signal.reason ?? new RoomProviderBackpressureGateTimeoutError(request.deadline));
+  }
+  return new Promise<RoomProviderBackpressureSendGateResultV1>((resolve, reject) => {
+    const cleanup = () => request.signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(request.signal.reason ?? new RoomProviderBackpressureGateTimeoutError(request.deadline));
+    };
+    request.signal.addEventListener("abort", onAbort, { once: true });
+    let operation: Promise<RoomProviderBackpressureSendGateResultV1>;
+    try {
+      operation = gate.admit(request);
+    } catch (error) {
+      cleanup();
+      reject(error);
+      return;
+    }
+    operation.then((result) => {
+      cleanup();
+      resolve(result);
+    }, (error: unknown) => {
+      cleanup();
+      reject(error);
+    });
+  });
 }
 
 function sameScope(value: unknown, scope: RoomProviderBackpressureScopeV1): boolean {
@@ -317,6 +530,14 @@ function canonicalTimestamp(value: unknown): value is string {
   return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
 }
 
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as AbortSignal).aborted === "boolean"
+    && typeof (value as AbortSignal).addEventListener === "function"
+    && typeof (value as AbortSignal).removeEventListener === "function";
+}
+
 function nonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
@@ -325,7 +546,7 @@ function positiveSafeInteger(value: unknown): value is number {
   return nonNegativeSafeInteger(value) && value > 0;
 }
 
-function nullableNonNegativeSafeInteger(value: unknown): boolean {
+function nullableNonNegativeSafeInteger(value: unknown): value is number | null {
   return value === null || nonNegativeSafeInteger(value);
 }
 

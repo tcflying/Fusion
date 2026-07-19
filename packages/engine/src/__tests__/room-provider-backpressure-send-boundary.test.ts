@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   SESSION_CONNECTOR_CAPABILITIES,
@@ -65,6 +65,7 @@ class MemoryDeliveryStore implements RoomDeliveryCoordinatorStore {
     replacedByBindingId: null,
   };
   readonly beginCalls: BeginRoomDeliveryAttemptInput[] = [];
+  readonly completeCalls: CompleteRoomDeliveryAttemptInput[] = [];
 
   async getDelivery(outboxId: string): Promise<RoomOutboxRecordV1 | null> {
     return outboxId === this.current.id ? this.current : null;
@@ -87,6 +88,7 @@ class MemoryDeliveryStore implements RoomDeliveryCoordinatorStore {
   }
 
   async completeDeliveryAttempt(input: CompleteRoomDeliveryAttemptInput): Promise<RoomOutboxRecordV1> {
+    this.completeCalls.push(input);
     this.current = {
       ...this.current,
       state: input.outcome === "confirmed" ? "confirmed" : "delivery_uncertain",
@@ -276,7 +278,31 @@ function authority(overrides: {
   };
 }
 
-function gate(admittedAuthority: unknown): {
+function permitFor(
+  request: Record<string, unknown>,
+  admittedAuthority: unknown,
+  overrides: Record<string, unknown> = {},
+): unknown {
+  return {
+    contractVersion: 1,
+    reservationId: "reservation-1",
+    requestId: "room-provider-capacity:claim-1",
+    requestHash: request.requestHash,
+    requestBinding: request.requestBinding,
+    expiresAt: "2026-07-19T10:01:00.000Z",
+    authority: admittedAuthority,
+    ...overrides,
+  };
+}
+
+function gate(
+  admittedAuthority: unknown,
+  options: {
+    readonly onAdmit?: (request: Record<string, unknown>) => void;
+    readonly permitOverrides?: Record<string, unknown>;
+    readonly onComplete?: (completion: { readonly kind: string }) => Promise<void>;
+  } = {},
+): {
   readonly admitCalls: () => number;
   readonly completionKinds: () => readonly string[];
   readonly admit: () => Promise<unknown>;
@@ -286,18 +312,17 @@ function gate(admittedAuthority: unknown): {
   return {
     admitCalls: () => calls,
     completionKinds: () => completions,
-    admit: async () => {
+    admit: async (request: Record<string, unknown>) => {
       calls += 1;
+      options.onAdmit?.(request);
       return {
         contractVersion: 1,
         action: "admit",
         permit: {
-          contractVersion: 1,
-          reservationId: "reservation-1",
-          requestId: "room-provider-capacity:claim-1",
-          authority: admittedAuthority,
+          ...permitFor(request, admittedAuthority, options.permitOverrides),
           complete: async (completion: { readonly kind: string }) => {
             completions.push(completion.kind);
+            await options.onComplete?.(completion);
           },
         },
       };
@@ -309,6 +334,7 @@ function dispatchInput(
   store: MemoryDeliveryStore,
   registry: SessionConnectorRegistry,
   providerBackpressure: unknown,
+  overrides: Readonly<Record<string, unknown>> = {},
 ): Parameters<typeof dispatchRoomDelivery>[0] {
   return {
     store,
@@ -322,6 +348,7 @@ function dispatchInput(
     now: NOW,
     audit: { runId: "run-1", agentId: "worker-1" },
     providerBackpressure,
+    ...overrides,
   } as unknown as Parameters<typeof dispatchRoomDelivery>[0];
 }
 
@@ -364,5 +391,125 @@ describe("Room provider-backpressure send boundary", () => {
     expect(providerBackpressure.admitCalls()).toBe(1);
     expect(store.beginCalls).toHaveLength(0);
     expect(fixture.sendCalls()).toBe(0);
+  });
+
+  it("times out a slow provider gate with a bounded abort signal before claiming or sending", async () => {
+    vi.useFakeTimers();
+    let resolveGate: ((value: unknown) => void) | null = null;
+    let observedRequest: Record<string, unknown> | null = null;
+    const providerBackpressure = {
+      admit: async (request: Record<string, unknown>) => {
+        observedRequest = request;
+        return new Promise<unknown>((resolve) => {
+          resolveGate = resolve;
+        });
+      },
+    };
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture();
+    const delivery = dispatchRoomDelivery(dispatchInput(store, fixture.registry, providerBackpressure, {
+      providerBackpressureDeadlineMs: 1,
+    }));
+    let settled = false;
+    void delivery.then(() => {
+      settled = true;
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      await expect(delivery).resolves.toMatchObject({ state: "pending" });
+      expect(observedRequest).toMatchObject({
+        deadline: "2026-07-19T10:00:00.001Z",
+        signal: expect.any(AbortSignal),
+      });
+      expect((observedRequest?.signal as AbortSignal | undefined)?.aborted).toBe(true);
+      expect(store.beginCalls).toHaveLength(0);
+      expect(fixture.sendCalls()).toBe(0);
+    } finally {
+      resolveGate?.({
+        contractVersion: 1,
+        action: "admit",
+        permit: observedRequest ? permitFor(observedRequest, authority()) : {},
+      });
+      await delivery.catch(() => undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it("withholds a claimed delivery when telemetry becomes stale immediately before connector.send", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture();
+    const originalBegin = store.beginDeliveryAttempt.bind(store);
+    let postClaim = false;
+    store.beginDeliveryAttempt = async (input) => {
+      const claimed = await originalBegin(input);
+      postClaim = true;
+      return claimed;
+    };
+    const providerBackpressure = gate(authority());
+
+    await expect(dispatchRoomDelivery(dispatchInput(store, fixture.registry, providerBackpressure, {
+      currentTime: () => postClaim ? "2026-07-19T10:00:31.000Z" : NOW,
+      providerBackpressureDeadlineMs: 60_000,
+    }))).resolves.toMatchObject({ state: "delivery_uncertain" });
+
+    expect(store.beginCalls).toHaveLength(1);
+    expect(fixture.sendCalls()).toBe(0);
+    expect(store.completeCalls).toEqual([
+      expect.objectContaining({ errorCode: "provider_telemetry_stale", outcome: "delivery_uncertain" }),
+    ]);
+  });
+
+  it("rejects a replayed permit whose immutable request binding does not match the delivery", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture();
+    const providerBackpressure = gate(authority(), {
+      permitOverrides: { requestHash: "replayed-request-hash" },
+    });
+
+    await expect(dispatchRoomDelivery(dispatchInput(store, fixture.registry, providerBackpressure)))
+      .resolves.toMatchObject({ state: "pending" });
+
+    expect(store.beginCalls).toHaveLength(0);
+    expect(fixture.sendCalls()).toBe(0);
+  });
+
+  it("rejects an expired permit before beginning an external send", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture();
+    const providerBackpressure = gate(authority(), {
+      permitOverrides: { expiresAt: "2026-07-19T09:59:59.999Z" },
+    });
+
+    await expect(dispatchRoomDelivery(dispatchInput(store, fixture.registry, providerBackpressure)))
+      .resolves.toMatchObject({ state: "pending" });
+
+    expect(store.beginCalls).toHaveLength(0);
+    expect(fixture.sendCalls()).toBe(0);
+  });
+
+  it("records provider completion as unconfirmed after one accepted send and never resends it", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture();
+    const providerBackpressure = gate(authority(), {
+      onComplete: async (completion) => {
+        if (completion.kind === "connector_result") {
+          throw new Error("provider completion write failed");
+        }
+      },
+    });
+    const input = dispatchInput(store, fixture.registry, providerBackpressure);
+
+    await expect(dispatchRoomDelivery(input)).resolves.toMatchObject({ state: "delivery_uncertain" });
+    await expect(dispatchRoomDelivery(input)).rejects.toMatchObject({ code: "delivery_state_conflict" });
+
+    expect(fixture.sendCalls()).toBe(1);
+    expect(store.completeCalls).toEqual([
+      expect.objectContaining({
+        errorCode: "provider_completion_unconfirmed",
+        outcome: "delivery_uncertain",
+      }),
+    ]);
   });
 });

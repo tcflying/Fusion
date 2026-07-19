@@ -14,11 +14,21 @@ import {
 import {
   abandonAdmittedRoomProviderBackpressure,
   admitRoomProviderBackpressureConnectorSend,
+  createRoomProviderBackpressureSendRequestBinding,
+  hashRoomProviderBackpressureSendRequestBinding,
+  revalidateAdmittedRoomProviderBackpressureConnectorSend,
+  RoomProviderBackpressureCompletionUnconfirmedError,
+  RoomProviderBackpressureGateTimeoutError,
+  RoomProviderBackpressurePreSendWithheldError,
   sendWithAdmittedRoomProviderBackpressure,
   type RoomProviderBackpressureSendGateV1,
+  type RoomProviderBackpressureSendGateRequestV1,
   type RoomProviderBackpressureSendPermitV1,
 } from "./room-provider-backpressure-send-boundary.js";
 import { SessionConnectorRegistry } from "./session-connector-registry.js";
+
+const DEFAULT_PROVIDER_BACKPRESSURE_GATE_DEADLINE_MS = 10_000;
+const MAX_PROVIDER_BACKPRESSURE_GATE_DEADLINE_MS = 60_000;
 
 export interface RoomDeliveryCoordinatorStore {
   getDelivery(outboxId: string): Promise<RoomOutboxRecordV1 | null>;
@@ -53,11 +63,15 @@ export interface DispatchRoomDeliveryInput {
   readonly signal?: AbortSignal;
   readonly assertAuthority?: () => Promise<void>;
   readonly audit: RoomDeliveryAuditIdentity;
-  /**
-   * Optional until a caller can supply the complete Core-backed provider scope,
-   * telemetry, policy, and durable reservation contract for this exact send.
-   */
+  /*
+  FNXC:RoomProviderBackpressureSendBoundary 2026-07-19-20:06:
+  Provider enforcement remains opt-in until ProjectEngine can supply a complete
+  Core-backed account/model/node authority and durable defer transition. Missing
+  injection is visible integration debt, not evidence that provider limits are
+  enforced; when injected, every admission gets a bounded deadline and signal.
+  */
   readonly providerBackpressure?: RoomProviderBackpressureSendGateV1;
+  readonly providerBackpressureDeadlineMs?: number;
 }
 
 export interface ReconcileAmbiguousRoomDeliveryInput {
@@ -130,12 +144,13 @@ export async function dispatchRoomDelivery(
   });
 
   let providerPermit: RoomProviderBackpressureSendPermitV1 | null = null;
+  let providerRequest: RoomProviderBackpressureSendGateRequestV1 | null = null;
   let providerAdmissionAt: string | null = null;
   if (input.providerBackpressure) {
     providerAdmissionAt = operationTime(input);
-    const preflight = await admitRoomProviderBackpressureConnectorSend({
-      gate: input.providerBackpressure,
-      request: {
+    const gateDeadline = createProviderBackpressureGateDeadline(input, providerAdmissionAt);
+    try {
+      const requestBase = {
         contractVersion: 1,
         delivery,
         binding,
@@ -143,10 +158,37 @@ export async function dispatchRoomDelivery(
         attemptId: input.attemptId,
         senderFence: input.senderFence,
         asOf: providerAdmissionAt,
-      },
-    });
-    if (preflight.action === "defer") return delivery;
-    providerPermit = preflight.permit;
+        deadline: gateDeadline.deadline,
+        signal: gateDeadline.signal,
+      } as const;
+      const requestBinding = createRoomProviderBackpressureSendRequestBinding(requestBase);
+      providerRequest = Object.freeze({
+        ...requestBase,
+        requestBinding,
+        requestHash: hashRoomProviderBackpressureSendRequestBinding(requestBinding),
+      });
+      const preflight = await admitRoomProviderBackpressureConnectorSend({
+        gate: input.providerBackpressure,
+        request: providerRequest,
+      });
+      throwIfAborted(input.signal);
+      if (preflight.action === "defer") return delivery;
+
+      const revalidatedAt = await assertOperationAuthority(input);
+      const revalidated = revalidateAdmittedRoomProviderBackpressureConnectorSend({
+        permit: preflight.permit,
+        request: providerRequest,
+        asOf: revalidatedAt,
+      });
+      if (revalidated.action === "defer") {
+        await abandonAdmittedRoomProviderBackpressure(preflight.permit, revalidatedAt).catch(() => undefined);
+        return delivery;
+      }
+      providerPermit = revalidated.permit;
+      providerAdmissionAt = revalidatedAt;
+    } finally {
+      gateDeadline.dispose();
+    }
   }
 
   let claimed: RoomOutboxRecordV1;
@@ -185,14 +227,54 @@ export async function dispatchRoomDelivery(
       content: input.content,
       contentHash: claimed.payloadHash,
     } as const;
-    result = providerPermit === null
-      ? await connector.send(sendRequest)
-      : await sendWithAdmittedRoomProviderBackpressure({
-          permit: providerPermit,
-          completedAt: () => operationTime(input),
-          send: () => connector.send(sendRequest),
-        });
-  } catch {
+    if (providerPermit === null) {
+      result = await connector.send(sendRequest);
+    } else {
+      if (providerRequest === null) {
+        throw new RoomDeliveryCoordinatorError(
+          "delivery_state_conflict",
+          "Room provider permit is missing its immutable request binding",
+        );
+      }
+      result = await sendWithAdmittedRoomProviderBackpressure({
+        permit: providerPermit,
+        request: providerRequest,
+        completedAt: () => operationTime(input),
+        send: () => connector.send(sendRequest),
+      });
+    }
+  } catch (error) {
+    if (error instanceof RoomProviderBackpressureCompletionUnconfirmedError) {
+      const receipt = error.connectorResult?.ok ? error.connectorResult.value : null;
+      return input.store.completeDeliveryAttempt({
+        outboxId: input.outboxId,
+        attemptId: input.attemptId,
+        senderFence: input.senderFence,
+        outcome: "delivery_uncertain",
+        connectorAcknowledgementId: receipt?.connectorAcknowledgementId ?? null,
+        nativeMessageId: receipt?.nativeMessageId ?? null,
+        nativeCursor: receipt?.cursor ?? null,
+        errorCode: "provider_completion_unconfirmed",
+        nextAttemptAt: null,
+        now: operationTime(input),
+        audit: input.audit,
+      });
+    }
+    if (error instanceof RoomProviderBackpressurePreSendWithheldError) {
+      return input.store.completeDeliveryAttempt({
+        outboxId: input.outboxId,
+        attemptId: input.attemptId,
+        senderFence: input.senderFence,
+        outcome: "delivery_uncertain",
+        connectorAcknowledgementId: null,
+        nativeMessageId: null,
+        nativeCursor: null,
+        errorCode: providerErrorCode(error.reason),
+        nextAttemptAt: null,
+        now: operationTime(input),
+        audit: input.audit,
+      });
+    }
     if (input.signal?.aborted) throw abortError();
     return input.store.completeDeliveryAttempt({
       outboxId: input.outboxId,
@@ -416,6 +498,44 @@ function operationTime(input: ControlledConnectorOperation): string {
     );
   }
   return now;
+}
+
+function createProviderBackpressureGateDeadline(
+  input: DispatchRoomDeliveryInput,
+  asOf: string,
+): { readonly deadline: string; readonly signal: AbortSignal; dispose(): void } {
+  const timeoutMs = input.providerBackpressureDeadlineMs ?? DEFAULT_PROVIDER_BACKPRESSURE_GATE_DEADLINE_MS;
+  if (
+    !Number.isSafeInteger(timeoutMs)
+    || timeoutMs <= 0
+    || timeoutMs > MAX_PROVIDER_BACKPRESSURE_GATE_DEADLINE_MS
+  ) {
+    throw new RoomDeliveryCoordinatorError(
+      "delivery_state_conflict",
+      `Room provider gate deadline must be a positive integer no greater than ${MAX_PROVIDER_BACKPRESSURE_GATE_DEADLINE_MS}`,
+    );
+  }
+  const deadline = new Date(Date.parse(asOf) + timeoutMs).toISOString();
+  const controller = new AbortController();
+  const onOuterAbort = () => {
+    controller.abort((input.signal as AbortSignal & { readonly reason?: unknown } | undefined)?.reason);
+  };
+  input.signal?.addEventListener("abort", onOuterAbort, { once: true });
+  const timeout = setTimeout(() => {
+    controller.abort(new RoomProviderBackpressureGateTimeoutError(deadline));
+  }, timeoutMs);
+  return {
+    deadline,
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      input.signal?.removeEventListener("abort", onOuterAbort);
+    },
+  };
+}
+
+function providerErrorCode(reason: string): string {
+  return reason.startsWith("provider_") ? reason : `provider_${reason}`;
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
