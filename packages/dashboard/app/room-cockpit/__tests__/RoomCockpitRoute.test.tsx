@@ -11,7 +11,7 @@ import {
   type RoomCockpitProjectionV1,
 } from "../RoomCockpitRoute";
 
-const projection: RoomCockpitProjectionV1 = {
+const projection = {
   roomId: "room-live",
   objective: "Move only verified work through the Room control plane.",
   phase: "evidence review",
@@ -24,6 +24,25 @@ const projection: RoomCockpitProjectionV1 = {
     dimensions: [{ name: "evidence", band: "high", rationale: "Independent receipts match." }],
   },
   capacity: {
+    telemetry: {
+      availability: "available",
+      detail: "Persistent runtime telemetry was sampled for this Room.",
+      source: "persistent_runtime_telemetry",
+      observedAt: "2026-07-19T08:56:00.000Z",
+      structuralFields: [
+        "theoreticalSlots",
+        "configuredSlots",
+        "activeSlots",
+        "queueDepth",
+        "utilizationRatio",
+      ],
+      observedFields: [
+        "reservedVerifierSlots",
+        "reservedRecoverySlots",
+        "throughputPerMinute",
+        "idleReasons",
+      ],
+    },
     theoreticalSlots: 8,
     configuredSlots: 6,
     activeSlots: 4,
@@ -52,7 +71,35 @@ const projection: RoomCockpitProjectionV1 = {
   }],
   edges: [],
   alerts: [],
-};
+} satisfies RoomCockpitProjectionV1;
+
+const unavailableTelemetryProjection = {
+  ...projection,
+  capacity: {
+    ...projection.capacity,
+    telemetry: {
+      availability: "unavailable",
+      detail: "No persistent runtime telemetry is available from the canonical Room aggregate.",
+      structuralFields: [
+        "theoreticalSlots",
+        "configuredSlots",
+        "activeSlots",
+        "queueDepth",
+        "utilizationRatio",
+      ],
+      observedFields: [
+        "reservedVerifierSlots",
+        "reservedRecoverySlots",
+        "throughputPerMinute",
+        "idleReasons",
+      ],
+    },
+    reservedVerifierSlots: null,
+    reservedRecoverySlots: null,
+    throughputPerMinute: null,
+    idleReasons: null,
+  },
+} satisfies RoomCockpitProjectionV1;
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -67,6 +114,58 @@ function NavigationHarness({ available = true }: { readonly available?: boolean 
 }
 
 describe("RoomCockpitRoute", () => {
+  it("accepts a capacity projection whose unavailable telemetry keeps observations null", () => {
+    expect(isRoomCockpitProjection(unavailableTelemetryProjection)).toBe(true);
+  });
+
+  it("rejects legacy capacity payloads that omit the telemetry discriminator", () => {
+    const { telemetry: _telemetry, ...legacyCapacity } = projection.capacity;
+
+    expect(isRoomCockpitProjection({ ...projection, capacity: legacyCapacity })).toBe(false);
+  });
+
+  it("rejects capacity observations that conflict with the telemetry availability", () => {
+    expect(isRoomCockpitProjection({
+      ...unavailableTelemetryProjection,
+      capacity: {
+        ...unavailableTelemetryProjection.capacity,
+        reservedVerifierSlots: 1,
+      },
+    })).toBe(false);
+
+    expect(isRoomCockpitProjection({
+      ...projection,
+      capacity: {
+        ...projection.capacity,
+        throughputPerMinute: null,
+      },
+    })).toBe(false);
+  });
+
+  it("rejects telemetry metadata that does not match the current capacity contract", () => {
+    expect(isRoomCockpitProjection({
+      ...projection,
+      capacity: {
+        ...projection.capacity,
+        telemetry: {
+          ...projection.capacity.telemetry,
+          source: "legacy_telemetry",
+        },
+      },
+    })).toBe(false);
+
+    expect(isRoomCockpitProjection({
+      ...unavailableTelemetryProjection,
+      capacity: {
+        ...unavailableTelemetryProjection.capacity,
+        telemetry: {
+          ...unavailableTelemetryProjection.capacity.telemetry,
+          observedFields: ["reservedVerifierSlots"],
+        },
+      },
+    })).toBe(false);
+  });
+
   it("keeps the lazy desktop entry visible, keyboard-selectable, and absent from mobile navigation", async () => {
     const user = userEvent.setup();
     const { rerender } = render(<NavigationHarness />);

@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Workflow } from "lucide-react";
+import type { RoomCockpitProjectionV1 as EngineRoomCockpitProjectionV1 } from "@fusion/engine";
 import { ViewHeader } from "../components/ViewHeader";
 import {
   RoomCockpitView,
   type RoomCockpitAlertV1,
   type RoomCockpitConfidenceBandV1,
   type RoomCockpitHealthStateV1,
-  type RoomCockpitProjectionV1,
   type RoomCockpitTaskEdgeV1,
   type RoomCockpitTaskNodeV1,
   type RoomCockpitTaskStateV1,
   type RoomCockpitViewStateV1,
 } from "./RoomCockpitView";
+
+export type RoomCockpitProjectionV1 = EngineRoomCockpitProjectionV1;
 
 export type RoomCockpitProjectionFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -56,6 +58,23 @@ const ROOM_CONFIDENCE_BANDS = new Set<RoomCockpitConfidenceBandV1>([
   "unknown",
 ]);
 
+const CAPACITY_STRUCTURAL_FIELDS = [
+  "theoreticalSlots",
+  "configuredSlots",
+  "activeSlots",
+  "queueDepth",
+  "utilizationRatio",
+] as const;
+
+const CAPACITY_OBSERVED_FIELDS = [
+  "reservedVerifierSlots",
+  "reservedRecoverySlots",
+  "throughputPerMinute",
+  "idleReasons",
+] as const;
+
+type RoomCockpitCapacityTelemetryV1 = RoomCockpitProjectionV1["capacity"]["telemetry"];
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -76,8 +95,71 @@ function isNonNegativeNumber(value: unknown): value is number {
   return isFiniteNumber(value) && value >= 0;
 }
 
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && isNonNegativeNumber(value);
+}
+
 function isStringArray(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isExpectedFieldList(value: unknown, expected: readonly string[]): value is readonly string[] {
+  return Array.isArray(value)
+    && value.length === expected.length
+    && value.every((field, index) => field === expected[index]);
+}
+
+function isRoomCockpitCapacityTelemetry(value: unknown): value is RoomCockpitCapacityTelemetryV1 {
+  if (!isRecord(value)
+    || !isNonEmptyString(value.detail)
+    || !isExpectedFieldList(value.structuralFields, CAPACITY_STRUCTURAL_FIELDS)
+    || !isExpectedFieldList(value.observedFields, CAPACITY_OBSERVED_FIELDS)) {
+    return false;
+  }
+
+  if (value.availability === "unavailable") {
+    return value.source === undefined && value.observedAt === undefined;
+  }
+
+  return value.availability === "available"
+    && value.source === "persistent_runtime_telemetry"
+    && isNonEmptyString(value.observedAt);
+}
+
+/**
+ * FNXC:RoomCockpitRoute 2026-07-19-16:56:
+ * Capacity structural values are always derivable, but reservations, throughput,
+ * and idle reasons are real only when persistent runtime telemetry says available.
+ * Require the Engine discriminator and retain unavailable observations as null so
+ * the route never fabricates zero capacity or an empty idle-reason collection.
+ */
+function isRoomCockpitCapacity(value: unknown): boolean {
+  if (!isRecord(value)
+    || !isNonNegativeNumber(value.theoreticalSlots)
+    || !isNonNegativeNumber(value.configuredSlots)
+    || !isNonNegativeNumber(value.activeSlots)
+    || !isNonNegativeNumber(value.queueDepth)
+    || !isNonNegativeNumber(value.utilizationRatio)) {
+    return false;
+  }
+
+  const telemetry = value.telemetry;
+  if (!isRoomCockpitCapacityTelemetry(telemetry)) return false;
+
+  if (telemetry.availability === "unavailable") {
+    return value.reservedVerifierSlots === null
+      && value.reservedRecoverySlots === null
+      && value.throughputPerMinute === null
+      && value.idleReasons === null;
+  }
+
+  return isNonNegativeNumber(value.reservedVerifierSlots)
+    && isNonNegativeNumber(value.reservedRecoverySlots)
+    && isNonNegativeNumber(value.throughputPerMinute)
+    && Array.isArray(value.idleReasons)
+    && value.idleReasons.every((reason) => isRecord(reason)
+      && isNonEmptyString(reason.reason)
+      && isNonNegativeNumber(reason.slots));
 }
 
 function isRoomCockpitTask(value: unknown): value is RoomCockpitTaskNodeV1 {
@@ -87,8 +169,7 @@ function isRoomCockpitTask(value: unknown): value is RoomCockpitTaskNodeV1 {
     && isStringOrNull(value.ownerSeatId)
     && isStringArray(value.dependencyNodeIds)
     && typeof value.critical === "boolean"
-    && Number.isInteger(value.attempt)
-    && value.attempt >= 0
+    && isNonNegativeInteger(value.attempt)
     && isStringOrNull(value.progressSignature)
     && isStringArray(value.inputs)
     && isStringArray(value.outputs)
@@ -144,19 +225,7 @@ export function isRoomCockpitProjection(value: unknown): value is RoomCockpitPro
       && isNonEmptyString(dimension.name)
       && ROOM_CONFIDENCE_BANDS.has(dimension.band as RoomCockpitConfidenceBandV1)
       && isNonEmptyString(dimension.rationale))
-    || !isRecord(value.capacity)
-    || !isNonNegativeNumber(value.capacity.theoreticalSlots)
-    || !isNonNegativeNumber(value.capacity.configuredSlots)
-    || !isNonNegativeNumber(value.capacity.activeSlots)
-    || !isNonNegativeNumber(value.capacity.queueDepth)
-    || !isNonNegativeNumber(value.capacity.reservedVerifierSlots)
-    || !isNonNegativeNumber(value.capacity.reservedRecoverySlots)
-    || !isNonNegativeNumber(value.capacity.utilizationRatio)
-    || !isNonNegativeNumber(value.capacity.throughputPerMinute)
-    || !Array.isArray(value.capacity.idleReasons)
-    || !value.capacity.idleReasons.every((reason) => isRecord(reason)
-      && isNonEmptyString(reason.reason)
-      && isNonNegativeNumber(reason.slots))
+    || !isRoomCockpitCapacity(value.capacity)
     || !Array.isArray(value.tasks)
     || !value.tasks.every(isRoomCockpitTask)
     || !Array.isArray(value.edges)
