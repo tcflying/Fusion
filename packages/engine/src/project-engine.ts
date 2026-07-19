@@ -122,6 +122,15 @@ import {
   type RoomGlobalConcurrencyRuntimeV1,
   type RoomGlobalConcurrencyVerifiedPolicyV1,
 } from "./room-global-concurrency-runtime.js";
+import {
+  createRoomProviderBackpressureDeliveryGate,
+  ROOM_PROVIDER_BACKPRESSURE_DELIVERY_GATE_DEFAULT_RETRY_AFTER_MS,
+  type CreateRoomProviderBackpressureDeliveryGateInputV1,
+} from "./room-provider-backpressure-delivery-gate.js";
+import {
+  ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION,
+  type RoomProviderBackpressureSendGateV1,
+} from "./room-provider-backpressure-send-boundary.js";
 import { ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION } from "./room-global-concurrency-accounting.js";
 import type { SessionConnectorIngestionLimits } from "./session-connector-ingestion.js";
 import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
@@ -184,6 +193,37 @@ export interface RoomRunAuditDispatcherFactoryContext extends RoomControllerFact
 export type RoomRunAuditDispatcherFactory = (
   context: RoomRunAuditDispatcherFactoryContext,
 ) => RoomRunAuditDispatcherLifecycle;
+
+export interface RoomProviderBackpressureVerifiedFactoryContext {
+  readonly projectId: string;
+  readonly asyncLayer: AsyncDataLayer;
+  readonly roomStore: AsyncRoomStore;
+  readonly workerId: string;
+  readonly hostId: string;
+}
+
+export type RoomProviderBackpressureVerifiedFactory = (
+  context: RoomProviderBackpressureVerifiedFactoryContext,
+) => CreateRoomProviderBackpressureDeliveryGateInputV1;
+
+/*
+FNXC:RoomProviderBackpressureComposition 2026-07-19-21:33:
+The default durable Room worker must never send to a provider merely because an
+operator has not yet supplied verified Core ports, a trusted capability snapshot,
+and a fenced worker-authority resolver. Install a concrete deferral gate instead
+of omitting the boundary: it preserves the normal durable outbox retry path while
+making the missing source visible and preventing a fabricated admission.
+*/
+function createUnconfiguredRoomProviderBackpressureSendGate(): RoomProviderBackpressureSendGateV1 {
+  return Object.freeze({
+    admit: async () => Object.freeze({
+      contractVersion: ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION,
+      action: "defer" as const,
+      reason: "provider_durable_read_unavailable",
+      retryAfterMs: ROOM_PROVIDER_BACKPRESSURE_DELIVERY_GATE_DEFAULT_RETRY_AFTER_MS,
+    }),
+  });
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -436,6 +476,14 @@ export interface ProjectEngineOptions {
   roomEvidenceWorkflowsFactory?: RoomEvidenceWorkflowsFactory;
   /** Test/host seam for durable Room lifecycle audit delivery. */
   roomRunAuditDispatcherFactory?: RoomRunAuditDispatcherFactory;
+  /**
+   * FNXC:RoomProviderBackpressureComposition 2026-07-19-21:29:
+   * Provider admission is enabled only from a host-supplied, verified source
+   * for Core ports, capability telemetry, and the exact Room-worker fence.
+   * ProjectEngine never guesses provider scope from a connector or creates an
+   * untrusted fallback; enabling this seam requires the default worker path.
+   */
+  roomProviderBackpressureVerifiedFactory?: RoomProviderBackpressureVerifiedFactory;
   /** Worker implementation delegated to the default RoomController. */
   roomWorker?: RoomWorker;
   /**
@@ -923,10 +971,25 @@ export class ProjectEngine {
     }
   }
 
+  private assertVerifiedRoomProviderBackpressureUsesDefaultWorker(): void {
+    if (this.options.roomProviderBackpressureVerifiedFactory === undefined) return;
+    if (this.options.roomControllerFactory !== undefined) {
+      throw new Error(
+        "ProjectEngine rejects a custom roomControllerFactory when roomProviderBackpressureVerifiedFactory is configured, because it could bypass verified provider admission and durable defer enforcement",
+      );
+    }
+    if (this.options.roomWorker !== undefined) {
+      throw new Error(
+        "ProjectEngine rejects a custom roomWorker when roomProviderBackpressureVerifiedFactory is configured, because it could bypass verified provider admission and durable defer enforcement",
+      );
+    }
+  }
+
   private async startOnce(startGeneration: number): Promise<void> {
     this.starting = true;
     try {
       this.assertVerifiedRoomPolicyUsesDefaultController();
+      this.assertVerifiedRoomProviderBackpressureUsesDefaultWorker();
 
       // 1. Start the core runtime (TaskStore, Scheduler, Executor, Triage, etc.)
       await this.runtime.start();
@@ -966,7 +1029,7 @@ export class ProjectEngine {
       const asyncLayer = store.getAsyncLayer();
       if (!asyncLayer) {
         runtimeLog.warn(
-          `Session Room control plane is enabled for ${this.config.projectId}, but no AsyncDataLayer is available; Room workers remain stopped`,
+          `Session Room control plane is enabled for ${this.config.projectId}, but no durable AsyncDataLayer/Core store is available; Provider delivery is blocked because no durable Core store is available; Room workers remain stopped`,
         );
       } else {
         let roomSessionConnectorRegistry = this.options.roomSessionConnectorRegistry;
@@ -1036,6 +1099,22 @@ export class ProjectEngine {
           const hostId = hostname();
           const workerId = `${hostId}:${process.pid}:${randomUUID()}`;
           const customRoomWorker = this.options.roomWorker;
+          const providerBackpressureSendGate = this.options.roomProviderBackpressureVerifiedFactory === undefined
+            ? createUnconfiguredRoomProviderBackpressureSendGate()
+            : createRoomProviderBackpressureDeliveryGate(
+              this.options.roomProviderBackpressureVerifiedFactory({
+                projectId: context.projectId,
+                asyncLayer: context.asyncLayer,
+                roomStore,
+                workerId,
+                hostId,
+              }),
+            );
+          if (this.options.roomProviderBackpressureVerifiedFactory === undefined) {
+            runtimeLog.warn(
+              `Room provider delivery for ${context.projectId} has no verified durable admission source; every provider send is deferred until one is configured`,
+            );
+          }
           const worker = customRoomWorker ?? new DurableRoomRecoveryWorker({
             projectId: context.projectId,
             workerId,
@@ -1045,6 +1124,7 @@ export class ProjectEngine {
             leaseStore,
             checkpointStore,
             registry: context.connectorRegistry,
+            providerBackpressureSendGate,
             ...(this.options.roomTaskRecoveryActionConsumer
               ? { taskRecoveryActionConsumer: this.options.roomTaskRecoveryActionConsumer }
               : {}),

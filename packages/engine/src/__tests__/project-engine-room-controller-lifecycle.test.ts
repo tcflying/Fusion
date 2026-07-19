@@ -134,6 +134,7 @@ vi.mock("../research/provider-registry.js", () => ({
 
 import { ProjectEngine, type ProjectEngineOptions } from "../project-engine.js";
 import { RoomControlPlaneLiveEventService } from "../room-control-plane-live-event-service.js";
+import { runtimeLog } from "../logger.js";
 import type {
   ProjectRoomCommandV1,
   ProjectRoomTrustedPrincipalV1,
@@ -407,6 +408,143 @@ ProjectEngine owns the RoomController backend lifecycle. It must start Room
 workers only after the project runtime has initialized their durable stores.
 */
 describe("ProjectEngine RoomController lifecycle integration", () => {
+  it("constructs provider send enforcement only from an explicit verified host factory", async () => {
+    const corePorts = {
+      read: vi.fn(),
+      commit: vi.fn(),
+      renew: vi.fn(),
+      release: vi.fn(),
+    };
+    const trustedAdmissionSnapshot = { read: vi.fn() };
+    const roomWorkerAuthority = { resolve: vi.fn() };
+    const roomProviderBackpressureVerifiedFactory = vi.fn(() => ({
+      corePorts,
+      trustedAdmissionSnapshot,
+      roomWorkerAuthority,
+    }));
+    const engine = createEngine(undefined, {
+      roomProviderBackpressureVerifiedFactory,
+    } as Partial<ProjectEngineOptions>);
+
+    await engine.start();
+    try {
+      expect(roomProviderBackpressureVerifiedFactory).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: "project-1",
+        asyncLayer,
+        roomStore: expect.any(Object),
+        workerId: expect.any(String),
+        hostId: expect.any(String),
+      }));
+      expect(durableRoomRecoveryWorkerSeams.constructorCalls.at(-1)).toEqual(expect.objectContaining({
+        providerBackpressureSendGate: expect.objectContaining({
+          admit: expect.any(Function),
+        }),
+      }));
+      expect(corePorts.read).not.toHaveBeenCalled();
+      expect(trustedAdmissionSnapshot.read).not.toHaveBeenCalled();
+      expect(roomWorkerAuthority.resolve).not.toHaveBeenCalled();
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("installs a fail-closed provider gate when no verified durable admission source is configured", async () => {
+    const engine = createEngine();
+
+    await engine.start();
+    try {
+      const workerOptions = durableRoomRecoveryWorkerSeams.constructorCalls.at(-1) as {
+        providerBackpressureSendGate?: {
+          admit(input: unknown): Promise<unknown>;
+        };
+      } | undefined;
+      const providerBackpressureSendGate = workerOptions?.providerBackpressureSendGate;
+
+      expect(providerBackpressureSendGate).toEqual(expect.objectContaining({
+        admit: expect.any(Function),
+      }));
+      await expect(providerBackpressureSendGate!.admit({})).resolves.toEqual({
+        contractVersion: 1,
+        action: "defer",
+        reason: "provider_durable_read_unavailable",
+        retryAfterMs: 1_000,
+      });
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("withholds provider delivery when the Room durable Core store is unavailable", async () => {
+    const roomProviderBackpressureVerifiedFactory = vi.fn(() => ({
+      corePorts: { read: vi.fn(), commit: vi.fn(), renew: vi.fn(), release: vi.fn() },
+      trustedAdmissionSnapshot: { read: vi.fn() },
+      roomWorkerAuthority: { resolve: vi.fn() },
+    }));
+    (mocks.currentStore as Record<string, unknown>).getAsyncLayer = vi.fn(() => null);
+    const warning = vi.spyOn(runtimeLog, "warn").mockImplementation(() => undefined);
+    const engine = createEngine(undefined, {
+      roomProviderBackpressureVerifiedFactory,
+    } as Partial<ProjectEngineOptions>);
+
+    try {
+      await engine.start();
+      expect(roomProviderBackpressureVerifiedFactory).not.toHaveBeenCalled();
+      expect(durableRoomRecoveryWorkerSeams.constructorCalls).toHaveLength(0);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining(
+        "Provider delivery is blocked because no durable Core store is available",
+      ));
+    } finally {
+      warning.mockRestore();
+      await engine.stop();
+    }
+  });
+
+  it("rejects a custom Room worker when verified provider enforcement would otherwise be bypassed", async () => {
+    const roomProviderBackpressureVerifiedFactory = vi.fn(() => ({
+      corePorts: { read: vi.fn(), commit: vi.fn(), renew: vi.fn(), release: vi.fn() },
+      trustedAdmissionSnapshot: { read: vi.fn() },
+      roomWorkerAuthority: { resolve: vi.fn() },
+    }));
+    const engine = createEngine(undefined, {
+      roomWorker: { runRoom: vi.fn(async () => undefined) },
+      roomProviderBackpressureVerifiedFactory,
+    } as Partial<ProjectEngineOptions>);
+
+    try {
+      await expect(engine.start()).rejects.toThrow("custom roomWorker");
+      expect(mocks.runtimeStart).not.toHaveBeenCalled();
+      expect(roomProviderBackpressureVerifiedFactory).not.toHaveBeenCalled();
+      expect(durableRoomRecoveryWorkerSeams.constructorCalls).toHaveLength(0);
+    } finally {
+      await engine.stop();
+    }
+  });
+
+  it("rejects a custom Room controller when verified provider enforcement would otherwise be bypassed", async () => {
+    const roomProviderBackpressureVerifiedFactory = vi.fn(() => ({
+      corePorts: { read: vi.fn(), commit: vi.fn(), renew: vi.fn(), release: vi.fn() },
+      trustedAdmissionSnapshot: { read: vi.fn() },
+      roomWorkerAuthority: { resolve: vi.fn() },
+    }));
+    const roomController = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+    };
+    const roomControllerFactory = vi.fn(() => roomController);
+    const engine = createEngine(roomControllerFactory, {
+      roomProviderBackpressureVerifiedFactory,
+    } as Partial<ProjectEngineOptions>);
+
+    try {
+      await expect(engine.start()).rejects.toThrow("custom roomControllerFactory");
+      expect(mocks.runtimeStart).not.toHaveBeenCalled();
+      expect(roomProviderBackpressureVerifiedFactory).not.toHaveBeenCalled();
+      expect(roomControllerFactory).not.toHaveBeenCalled();
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("wires an explicitly verified global capacity runtime before default Room admission", async () => {
     const engine = createEngine(undefined, {
       roomGlobalConcurrencyVerifiedPolicy: {
