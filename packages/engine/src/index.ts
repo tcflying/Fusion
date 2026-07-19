@@ -991,6 +991,7 @@ export {
   type RoomWorker,
   type RoomWorkerRunInput,
 } from "./room-controller.js";
+export * from "./room-global-concurrency-runtime.js";
 export {
   RoomRunAuditDispatcher,
   type RoomRunAuditDispatcherOptions,
