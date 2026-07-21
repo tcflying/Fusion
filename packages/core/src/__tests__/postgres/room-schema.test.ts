@@ -12,6 +12,22 @@ import {
   roomConfidenceSnapshots,
   roomDissents,
   roomEvents,
+  roomCapabilityRegistryProjections,
+  roomBlindReviewRegistries,
+  roomEvolutionHypotheses,
+  roomEvolutionLegacyProvenanceQuarantines,
+  roomEvolutionTrustedBindings,
+  roomEvolutionTrustedBindingRevocations,
+  roomEvolutionCandidateVersions,
+  roomEvolutionExperiments,
+  roomEvolutionBenchmarkCases,
+  roomEvolutionBenchmarkResults,
+  roomEvolutionGateResults,
+  roomEvolutionCanaries,
+  roomEvolutionCanaryObservations,
+  roomEvolutionCanarySuccessOutcomes,
+  roomEvolutionPromotionDecisions,
+  roomEvolutionRollbacks,
   roomEvidence,
   roomGateResults,
   roomIdempotencyKeys,
@@ -23,15 +39,39 @@ import {
   roomOutbox,
   roomOutboxAttempts,
   roomPromotions,
+  roomProviderBackpressureStates,
+  roomProviderBackpressureReservations,
+  roomProviderAdmissionTimeoutTombstones,
+  roomProviderBackpressureOperations,
+  roomRbacAuthorizationStates,
   roomReviews,
   roomSeats,
   roomTaskEdges,
   roomTaskNodes,
   roomTurns,
   roomArtifacts,
+  roomGlobalConcurrencyState,
+  roomGlobalConcurrencyClaims,
+  roomGlobalConcurrencyOperations,
+  roomTrustedDeviceSessions,
+  roomRbacGrants,
+  roomRbacRegistryOperations,
 } from "../../postgres/schema/room.js";
 import {
   SCHEMA_MIGRATIONS,
+  SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+  SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+  SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+  SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+  SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
+  SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+  SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+  SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
+  SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
+  SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
+  SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
+  SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
+  SCHEMA_ROOM_VERSION,
   readSchemaMigrationSql,
 } from "../../postgres/schema-applier.js";
 
@@ -102,6 +142,22 @@ describe("Session Room PostgreSQL schema", () => {
       "room_turns",
       "room_membership_changes",
       "room_events",
+      "room_capability_registry_projections",
+      "room_blind_review_registries",
+      "room_evolution_hypotheses",
+      "room_evolution_legacy_provenance_quarantines",
+      "room_evolution_trusted_bindings",
+      "room_evolution_trusted_binding_revocations",
+      "room_evolution_candidate_versions",
+      "room_evolution_experiments",
+      "room_evolution_benchmark_cases",
+      "room_evolution_benchmark_results",
+      "room_evolution_gate_results",
+      "room_evolution_canaries",
+      "room_evolution_canary_observations",
+      "room_evolution_canary_success_outcomes",
+      "room_evolution_promotion_decisions",
+      "room_evolution_rollbacks",
       "room_task_nodes",
       "room_task_edges",
       "room_messages",
@@ -121,6 +177,17 @@ describe("Session Room PostgreSQL schema", () => {
       "room_promotions",
       "room_confidence_snapshots",
       "room_alerts",
+      "room_global_concurrency_state",
+      "room_global_concurrency_claims",
+      "room_global_concurrency_operations",
+      "room_provider_backpressure_states",
+      "room_provider_backpressure_reservations",
+      "room_provider_admission_timeout_tombstones",
+      "room_provider_backpressure_operations",
+      "room_rbac_authorization_states",
+      "room_trusted_device_sessions",
+      "room_rbac_grants",
+      "room_rbac_registry_operations",
     ]);
 
     expect([
@@ -131,6 +198,22 @@ describe("Session Room PostgreSQL schema", () => {
       roomTurns,
       roomMembershipChanges,
       roomEvents,
+      roomCapabilityRegistryProjections,
+      roomBlindReviewRegistries,
+      roomEvolutionHypotheses,
+      roomEvolutionLegacyProvenanceQuarantines,
+      roomEvolutionTrustedBindings,
+      roomEvolutionTrustedBindingRevocations,
+      roomEvolutionCandidateVersions,
+      roomEvolutionExperiments,
+      roomEvolutionBenchmarkCases,
+      roomEvolutionBenchmarkResults,
+      roomEvolutionGateResults,
+      roomEvolutionCanaries,
+      roomEvolutionCanaryObservations,
+      roomEvolutionCanarySuccessOutcomes,
+      roomEvolutionPromotionDecisions,
+      roomEvolutionRollbacks,
       roomTaskNodes,
       roomTaskEdges,
       roomMessages,
@@ -150,29 +233,66 @@ describe("Session Room PostgreSQL schema", () => {
       roomPromotions,
       roomConfidenceSnapshots,
       roomAlerts,
+      roomGlobalConcurrencyState,
+      roomGlobalConcurrencyClaims,
+      roomGlobalConcurrencyOperations,
+      roomProviderBackpressureStates,
+      roomProviderBackpressureReservations,
+      roomProviderAdmissionTimeoutTombstones,
+      roomProviderBackpressureOperations,
+      roomRbacAuthorizationStates,
+      roomTrustedDeviceSessions,
+      roomRbacGrants,
+      roomRbacRegistryOperations,
     ]).not.toContain(undefined);
   });
 
   it("registers an ordered incremental migration after the baseline", async () => {
-    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(["0000", "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"]);
-    const roomSql = await readSchemaMigrationSql("0001");
-    const ownershipSql = await readSchemaMigrationSql("0002");
-    const outboxIdentitySql = await readSchemaMigrationSql("0003");
-    const connectorIngestionSql = await readSchemaMigrationSql("0004");
-    const deliveryReconciliationSql = await readSchemaMigrationSql("0005");
-    const membershipFutureSeatsSql = await readSchemaMigrationSql("0006");
-    const roomRunAuditProjectScopeSql = await readSchemaMigrationSql("0007");
-    const roomRunAuditOutboxSql = await readSchemaMigrationSql("0008");
-    const membershipProductionInvariantsSql = await readSchemaMigrationSql("0009");
-    const nativeSenderTakeoverSql = await readSchemaMigrationSql("0010");
-    const messageRoutingSql = await readSchemaMigrationSql("0011");
-    const taskGraphCommandsSql = await readSchemaMigrationSql("0012");
-    const taskTopologyLineageSql = await readSchemaMigrationSql("0013");
+    expect(SCHEMA_MIGRATIONS.map((migration) => migration.version)).toEqual(
+      Array.from({ length: 75 }, (_, index) => String(index).padStart(4, "0")),
+    );
+    const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
+    const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
+    const outboxIdentitySql = await readSchemaMigrationSql(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
+    const connectorIngestionSql = await readSchemaMigrationSql(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION);
+    const deliveryReconciliationSql = await readSchemaMigrationSql(SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION);
+    const membershipFutureSeatsSql = await readSchemaMigrationSql(SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION);
+    const roomRunAuditProjectScopeSql = await readSchemaMigrationSql(SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION);
+    const roomRunAuditOutboxSql = await readSchemaMigrationSql(SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION);
+    const membershipProductionInvariantsSql = await readSchemaMigrationSql(SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION);
+    const nativeSenderTakeoverSql = await readSchemaMigrationSql(SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION);
+    const messageRoutingSql = await readSchemaMigrationSql(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION);
+    const taskGraphCommandsSql = await readSchemaMigrationSql(SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION);
+    const taskTopologyLineageSql = await readSchemaMigrationSql(SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION);
 
-    for (const tableName of ROOM_PROJECT_TABLE_NAMES.filter((name) => ![
-      "room_binding_ingestion_state",
-      "room_message_targets",
-    ].includes(name))) {
+    const baseRoomTableNames = [
+      "operational_rooms",
+      "room_seats",
+      "room_bindings",
+      "room_turns",
+      "room_membership_changes",
+      "room_events",
+      "room_task_nodes",
+      "room_task_edges",
+      "room_messages",
+      "room_outbox",
+      "room_outbox_attempts",
+      "room_inbox_receipts",
+      "room_idempotency_keys",
+      "room_leases",
+      "room_checkpoints",
+      "room_artifacts",
+      "room_evidence",
+      "room_candidates",
+      "room_reviews",
+      "room_dissents",
+      "room_gate_results",
+      "room_promotions",
+      "room_confidence_snapshots",
+      "room_alerts",
+    ];
+
+    for (const tableName of baseRoomTableNames) {
       expect(roomSql).toContain(`project.${tableName}`);
     }
     expect(roomSql).toContain("UNIQUE (room_id, aggregate_version)");
@@ -190,7 +310,7 @@ describe("Session Room PostgreSQL schema", () => {
     expect(roomRunAuditProjectScopeSql).toContain("run_audit_events");
     expect(roomRunAuditProjectScopeSql).toContain("project_id");
     expect(roomRunAuditProjectScopeSql).toContain("metadata->>'projectId'");
-    expect(roomRunAuditProjectScopeSql).toContain("WHERE project_id IS NULL");
+    expect(roomRunAuditProjectScopeSql).toContain("WHERE (project_id IS NULL");
     expect(roomRunAuditOutboxSql).toContain("run_audit_outbox");
     expect(roomRunAuditOutboxSql).toContain("claim_expires_at");
     expect(roomRunAuditOutboxSql).toContain("attempt_count");
@@ -252,8 +372,8 @@ describe("Session Room PostgreSQL schema", () => {
     });
   });
 
-  it("keeps topology-lineage CHECK constraints aligned with migration 0013", async () => {
-    const migrationSql = await readSchemaMigrationSql("0013");
+  it("keeps topology-lineage CHECK constraints aligned with the canonical Room migration", async () => {
+    const migrationSql = await readSchemaMigrationSql(SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION);
     const nodeChecks = declarativeChecks(roomTaskNodes);
     const edgeChecks = declarativeChecks(roomTaskEdges);
 
@@ -288,8 +408,8 @@ describe("Session Room PostgreSQL schema", () => {
     expect(derivedLineageCheck).toMatch(/\) IS TRUE$/);
   });
 
-  it("keeps task-graph CHECK constraints aligned with migration 0012", async () => {
-    const migrationSql = await readSchemaMigrationSql("0012");
+  it("keeps task-graph CHECK constraints aligned with the canonical Room migration", async () => {
+    const migrationSql = await readSchemaMigrationSql(SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION);
     const roomChecks = declarativeChecks(operationalRooms);
     const nodeChecks = declarativeChecks(roomTaskNodes);
     const edgeChecks = declarativeChecks(roomTaskEdges);

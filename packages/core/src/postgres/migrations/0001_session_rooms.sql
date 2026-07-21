@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS project.room_turns (
     FOREIGN KEY (room_id, project_id)
     REFERENCES project.operational_rooms(id, project_id) ON DELETE CASCADE,
   CONSTRAINT room_turns_room_sequence_unique UNIQUE (room_id, sequence),
+  CONSTRAINT room_turns_id_room_project_unique UNIQUE (id, room_id, project_id),
   CONSTRAINT room_turns_state_check CHECK (
     state IN ('pending','running','waiting','checkpointed','completed','cancelled','uncertain')
   )
@@ -145,6 +146,7 @@ CREATE TABLE IF NOT EXISTS project.room_events (
     FOREIGN KEY (room_id, project_id)
     REFERENCES project.operational_rooms(id, project_id) ON DELETE CASCADE,
   CONSTRAINT room_events_room_aggregate_version_unique UNIQUE (room_id, aggregate_version),
+  CONSTRAINT room_events_id_project_unique UNIQUE (project_id, id),
   CONSTRAINT room_events_cursor_unique UNIQUE (cursor)
 );
 CREATE INDEX IF NOT EXISTS idx_room_events_project_room_time
@@ -255,6 +257,8 @@ CREATE TABLE IF NOT EXISTS project.room_outbox (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_room_outbox_logical_message
   ON project.room_outbox(binding_id, logical_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS room_outbox_id_project_unique
+  ON project.room_outbox(project_id, id);
 CREATE INDEX IF NOT EXISTS idx_room_outbox_dispatch
   ON project.room_outbox(project_id, delivery_state, next_attempt_at);
 

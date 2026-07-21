@@ -2139,7 +2139,8 @@ export const importTranslationCache = projectSchema.table("import_translation_ca
 ]);
 
 export const approvalRequests = projectSchema.table("approval_requests", {
-  id: text("id").primaryKey(),
+  id: text("id").notNull(),
+  projectId: text("project_id").notNull().default(""),
   status: text("status").notNull(),
   requesterActorId: text("requester_actor_id").notNull(),
   requesterActorType: text("requester_actor_type").notNull(),
@@ -2158,6 +2159,7 @@ export const approvalRequests = projectSchema.table("approval_requests", {
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
+  primaryKey({ columns: [t.projectId, t.id] }),
   index("idxApprovalRequestsStatusCreatedAt").on(t.status, t.createdAt),
   index("idxApprovalRequestsRequesterCreatedAt").on(t.requesterActorId, t.createdAt),
   index("idxApprovalRequestsTaskCreatedAt").on(t.taskId, t.createdAt),

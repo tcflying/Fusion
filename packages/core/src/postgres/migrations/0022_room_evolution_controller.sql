@@ -580,8 +580,8 @@ CREATE TABLE project.room_evolution_promotion_decisions (
     REFERENCES project.room_evolution_candidate_versions(id, project_id, scope_key)
     ON DELETE RESTRICT,
   CONSTRAINT room_evolution_promotions_approval_request_fkey
-    FOREIGN KEY (approval_request_id)
-    REFERENCES project.approval_requests(id)
+    FOREIGN KEY (project_id, approval_request_id)
+    REFERENCES project.approval_requests(project_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT room_evolution_promotions_id_scope_unique
     UNIQUE (id, project_id, scope_key),

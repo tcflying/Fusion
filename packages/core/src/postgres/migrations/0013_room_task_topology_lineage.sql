@@ -20,6 +20,10 @@ SET origin = '{"kind":"created"}'::jsonb
 WHERE origin IS NULL;
 
 ALTER TABLE project.room_task_nodes
+  DROP CONSTRAINT IF EXISTS room_task_nodes_origin_check,
+  DROP CONSTRAINT IF EXISTS room_task_nodes_terminal_lineage_check;
+
+ALTER TABLE project.room_task_nodes
   ALTER COLUMN origin SET DEFAULT '{"kind":"created"}'::jsonb,
   ALTER COLUMN origin SET NOT NULL,
   ADD CONSTRAINT room_task_nodes_origin_check CHECK (
@@ -87,6 +91,10 @@ SET created_by_operation_id = NULL
 WHERE derived_from_edge_ids = '[]'::jsonb;
 
 ALTER TABLE project.room_task_edges
+  DROP CONSTRAINT IF EXISTS room_task_edges_retirement_check,
+  DROP CONSTRAINT IF EXISTS room_task_edges_derived_lineage_check;
+
+ALTER TABLE project.room_task_edges
   ALTER COLUMN derived_from_edge_ids SET DEFAULT '[]'::jsonb,
   ALTER COLUMN derived_from_edge_ids SET NOT NULL,
   ADD CONSTRAINT room_task_edges_retirement_check CHECK (
@@ -124,6 +132,8 @@ ALTER TABLE project.room_task_edges
 
 ALTER TABLE project.room_task_edges
   DROP CONSTRAINT IF EXISTS room_task_edges_shape_unique;
+
+DROP INDEX IF EXISTS room_task_edges_active_shape_unique;
 
 CREATE UNIQUE INDEX room_task_edges_active_shape_unique
   ON project.room_task_edges(project_id, room_id, from_node_id, to_node_id, kind)

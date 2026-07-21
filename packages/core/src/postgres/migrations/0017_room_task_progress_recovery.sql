@@ -31,8 +31,8 @@ CREATE TABLE IF NOT EXISTS project.room_task_progress_observations (
     REFERENCES project.room_task_nodes(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_task_progress_observations_turn_fkey
-    FOREIGN KEY (turn_id)
-    REFERENCES project.room_turns(id)
+    FOREIGN KEY (turn_id, room_id, project_id)
+    REFERENCES project.room_turns(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_task_progress_observations_id_lineage_unique
     UNIQUE (id, node_id, node_version, room_id, project_id),
@@ -110,8 +110,8 @@ CREATE TABLE IF NOT EXISTS project.room_task_recovery_actions (
     REFERENCES project.room_task_progress_observations(id, node_id, node_version, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_task_recovery_actions_operator_approval_fkey
-    FOREIGN KEY (operator_approval_id)
-    REFERENCES project.approval_requests(id)
+    FOREIGN KEY (project_id, operator_approval_id)
+    REFERENCES project.approval_requests(project_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT room_task_recovery_actions_observation_action_unique
     UNIQUE (project_id, room_id, observation_id, action_id),

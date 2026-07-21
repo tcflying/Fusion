@@ -21,8 +21,8 @@ CREATE TABLE project.room_provider_admission_recovery_receipts (
     FOREIGN KEY (room_id, project_id)
     REFERENCES project.operational_rooms(id, project_id) ON DELETE RESTRICT,
   CONSTRAINT room_provider_admission_recovery_receipt_outbox_fkey
-    FOREIGN KEY (outbox_id)
-    REFERENCES project.room_outbox(id) ON DELETE RESTRICT,
+    FOREIGN KEY (project_id, outbox_id)
+    REFERENCES project.room_outbox(project_id, id) ON DELETE RESTRICT,
   CONSTRAINT room_provider_admission_recovery_receipt_id_project_unique
     UNIQUE (id, project_id),
   CONSTRAINT room_provider_admission_recovery_receipt_gate_attempt_unique

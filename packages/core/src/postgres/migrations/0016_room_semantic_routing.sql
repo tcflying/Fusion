@@ -28,8 +28,8 @@ CREATE TABLE IF NOT EXISTS project.room_semantic_states (
     REFERENCES project.room_task_nodes(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_states_turn_fkey
-    FOREIGN KEY (turn_id)
-    REFERENCES project.room_turns(id)
+    FOREIGN KEY (turn_id, room_id, project_id)
+    REFERENCES project.room_turns(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_states_id_room_project_unique
     UNIQUE (id, room_id, project_id),
@@ -141,12 +141,12 @@ CREATE TABLE IF NOT EXISTS project.room_semantic_loop_breaks (
     REFERENCES project.operational_rooms(id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_loop_breaks_source_message_fkey
-    FOREIGN KEY (source_message_id)
-    REFERENCES project.room_messages(id)
+    FOREIGN KEY (source_message_id, room_id, project_id)
+    REFERENCES project.room_messages(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_loop_breaks_escalation_message_fkey
-    FOREIGN KEY (escalation_message_id)
-    REFERENCES project.room_messages(id)
+    FOREIGN KEY (escalation_message_id, room_id, project_id)
+    REFERENCES project.room_messages(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_loop_breaks_state_unique
     UNIQUE (project_id, room_id, turn_id, node_id, semantic_state_fingerprint),
@@ -184,8 +184,8 @@ CREATE TABLE IF NOT EXISTS project.room_semantic_controller_inbox (
     REFERENCES project.operational_rooms(id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_controller_inbox_message_fkey
-    FOREIGN KEY (message_id)
-    REFERENCES project.room_messages(id)
+    FOREIGN KEY (message_id, room_id, project_id)
+    REFERENCES project.room_messages(id, room_id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_semantic_controller_inbox_message_action_unique
     UNIQUE (project_id, room_id, message_id, action_kind),

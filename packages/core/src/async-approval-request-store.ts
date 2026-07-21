@@ -181,6 +181,7 @@ export async function createApprovalRequest(
   await layer.transactionImmediate(async (tx) => {
     await tx.insert(schema.project.approvalRequests).values({
       id: request.id,
+      projectId,
       status: request.status,
       requesterActorId: request.requester.actorId,
       requesterActorType: request.requester.actorType,

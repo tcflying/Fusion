@@ -15109,7 +15109,7 @@ async function persistRoomConnectorIngestionState(
     .insert(roomBindingIngestionState)
     .values(values)
     .onConflictDoUpdate({
-      target: roomBindingIngestionState.bindingId,
+      target: [roomBindingIngestionState.projectId, roomBindingIngestionState.bindingId],
       set: {
         mode: values.mode,
         transcriptCursor: values.transcriptCursor,

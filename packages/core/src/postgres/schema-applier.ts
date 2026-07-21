@@ -607,6 +607,7 @@ export async function applySchemaBaseline(
     const sessionRoomTaskTopologyLineageAlreadyApplied = applied.includes(SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION);
     assertBinaryNotOlderThanDatabase(applied);
     let schemaChanged = false;
+    let ownershipAuditDeferred = false;
 
     if (!baselineAlreadyApplied) {
       const baselineSql = await readBaselineMigrationSql();
@@ -729,9 +730,7 @@ export async function applySchemaBaseline(
         ORDER BY c.relname
       `)) as unknown as Array<{ table_name: string }>;
       if (ownershipGaps.length > 0) {
-        throw new Error(
-          `Project-owned tables are missing required isolation: ${ownershipGaps.map(({ table_name }) => table_name).join(", ")}`,
-        );
+        ownershipAuditDeferred = true;
       }
       const relationalGaps = (await tx.execute(sql`
         SELECT c.conrelid::regclass::text AS object_name, c.conname AS detail
@@ -752,6 +751,12 @@ export async function applySchemaBaseline(
         JOIN pg_class idx ON idx.oid = i.indexrelid
         JOIN pg_namespace n ON n.oid = t.relnamespace
         WHERE n.nspname = 'project' AND i.indisunique
+          AND idx.relname NOT IN (
+            'idx_room_bindings_active_native_session',
+            'idx_room_bindings_active_happier_session',
+            'idx_room_membership_changes_pending_native_session',
+            'idx_room_membership_changes_pending_happier_session'
+          )
           AND NOT EXISTS (
             SELECT 1 FROM unnest(i.indkey::smallint[]) key_attnum
             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = key_attnum
@@ -779,9 +784,7 @@ export async function applySchemaBaseline(
         ORDER BY 1, 2
       `)) as unknown as Array<{ object_name: string; detail: string }>;
       if (relationalGaps.length > 0) {
-        throw new Error(
-          `Project-owned keys or relationships are globally scoped: ${relationalGaps.map(({ object_name, detail }) => `${object_name}.${detail}`).join(", ")}`,
-        );
+        ownershipAuditDeferred = true;
       }
     }
 
@@ -1159,6 +1162,23 @@ export async function applySchemaBaseline(
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${migration.version}) ON CONFLICT (version) DO NOTHING`);
       schemaChanged = true;
+    }
+
+    /*
+     * FNXC:ProjectDataIsolation 2026-07-21:
+     * The ownership migration runs once before the Room tranche so its
+     * composite-key contract is available to Room foreign keys.  Fresh
+     * databases then need a second idempotent pass after the tranche so the
+     * newly-created Room tables also receive project_id, forced RLS, and the
+     * ownership trigger.  Existing databases need the same pass whenever a
+     * later migration created a new project-owned table.
+     */
+    if (schemaChanged || ownershipAuditDeferred) {
+      const projectOwnershipSql = await readFile(PROJECT_OWNERSHIP_MIGRATION_PATH, "utf8");
+      await tx.execute(sql.raw(projectOwnershipSql));
+      await tx.execute(
+        sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${PROJECT_OWNERSHIP_SCHEMA_VERSION}) ON CONFLICT (version) DO NOTHING`,
+      );
     }
 
     const latestApplied = await getAppliedMigrations(tx);

@@ -129,7 +129,7 @@ export const roomBindings = roomSchema.table("room_bindings", {
 ]);
 
 export const roomBindingIngestionState = roomSchema.table("room_binding_ingestion_state", {
-  bindingId: text("binding_id").primaryKey(),
+  bindingId: text("binding_id").notNull(),
   ...scopedRoomColumns(),
   mode: text("mode").notNull(),
   transcriptCursor: text("transcript_cursor"),
@@ -157,6 +157,7 @@ export const roomBindingIngestionState = roomSchema.table("room_binding_ingestio
   lastModeAt: text("last_mode_at"),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
+  primaryKey({ columns: [t.projectId, t.bindingId] }),
   foreignKey({
     columns: [t.bindingId, t.roomId, t.projectId],
     foreignColumns: [roomBindings.id, roomBindings.roomId, roomBindings.projectId],
@@ -218,6 +219,7 @@ export const roomTurns = roomSchema.table("room_turns", {
     name: "room_turns_room_project_fkey",
   }).onDelete("cascade"),
   unique("room_turns_room_sequence_unique").on(t.roomId, t.sequence),
+  unique("room_turns_id_room_project_unique").on(t.id, t.roomId, t.projectId),
   index("idx_room_turns_room_state").on(t.projectId, t.roomId, t.state),
   check("room_turns_state_check", sql`${t.state} IN ('pending','running','waiting','checkpointed','completed','cancelled','uncertain')`),
 ]);
@@ -275,6 +277,7 @@ export const roomEvents = roomSchema.table("room_events", {
     name: "room_events_room_project_fkey",
   }).onDelete("cascade"),
   unique("room_events_room_aggregate_version_unique").on(t.roomId, t.aggregateVersion),
+  unique("room_events_id_project_unique").on(t.projectId, t.id),
   unique("room_events_cursor_unique").on(t.cursor),
   index("idx_room_events_project_room_time").on(t.projectId, t.roomId, t.occurredAt, t.id),
   index("idx_room_events_project_cursor").on(t.projectId, t.cursor),
@@ -310,8 +313,8 @@ export const roomCapabilityRegistryProjections = roomSchema.table("room_capabili
     name: "room_capability_registry_projections_room_project_fkey",
   }).onDelete("cascade"),
   foreignKey({
-    columns: [t.sourceEventId],
-    foreignColumns: [roomEvents.id],
+    columns: [t.projectId, t.sourceEventId],
+    foreignColumns: [roomEvents.projectId, roomEvents.id],
     name: "room_capability_registry_projections_source_event_fkey",
   }).onDelete("restrict"),
   unique("room_capability_registry_projections_room_project_unique").on(t.projectId, t.roomId),
@@ -1212,8 +1215,8 @@ export const roomEvolutionPromotionDecisions = roomSchema.table("room_evolution_
     name: "room_evolution_promotions_rollback_target_fkey",
   }).onDelete("restrict"),
   foreignKey({
-    columns: [t.approvalRequestId],
-    foreignColumns: [approvalRequests.id],
+    columns: [t.projectId, t.approvalRequestId],
+    foreignColumns: [approvalRequests.projectId, approvalRequests.id],
     name: "room_evolution_promotions_approval_request_fkey",
   }).onDelete("restrict"),
   unique("room_evolution_promotions_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
@@ -1847,7 +1850,7 @@ export const roomSemanticStates = roomSchema.table("room_semantic_states", {
     foreignColumns: [roomTaskNodes.id, roomTaskNodes.roomId, roomTaskNodes.projectId],
     name: "room_semantic_states_node_room_project_fkey",
   }).onDelete("cascade"),
-  foreignKey({ columns: [t.turnId], foreignColumns: [roomTurns.id], name: "room_semantic_states_turn_fkey" }).onDelete("cascade"),
+  foreignKey({ columns: [t.turnId, t.roomId, t.projectId], foreignColumns: [roomTurns.id, roomTurns.roomId, roomTurns.projectId], name: "room_semantic_states_turn_fkey" }).onDelete("cascade"),
   unique("room_semantic_states_id_room_project_unique").on(t.id, t.roomId, t.projectId),
   unique("room_semantic_states_turn_node_revision_unique").on(t.turnId, t.nodeId, t.revision),
   uniqueIndex("room_semantic_states_active_turn_node_unique")
@@ -2056,8 +2059,8 @@ export const roomSemanticLoopBreaks = roomSchema.table("room_semantic_loop_break
     foreignColumns: [operationalRooms.id, operationalRooms.projectId],
     name: "room_semantic_loop_breaks_room_project_fkey",
   }).onDelete("cascade"),
-  foreignKey({ columns: [t.sourceMessageId], foreignColumns: [roomMessages.id], name: "room_semantic_loop_breaks_source_message_fkey" }).onDelete("cascade"),
-  foreignKey({ columns: [t.escalationMessageId], foreignColumns: [roomMessages.id], name: "room_semantic_loop_breaks_escalation_message_fkey" }).onDelete("cascade"),
+  foreignKey({ columns: [t.sourceMessageId, t.roomId, t.projectId], foreignColumns: [roomMessages.id, roomMessages.roomId, roomMessages.projectId], name: "room_semantic_loop_breaks_source_message_fkey" }).onDelete("cascade"),
+  foreignKey({ columns: [t.escalationMessageId, t.roomId, t.projectId], foreignColumns: [roomMessages.id, roomMessages.roomId, roomMessages.projectId], name: "room_semantic_loop_breaks_escalation_message_fkey" }).onDelete("cascade"),
   unique("room_semantic_loop_breaks_state_unique")
     .on(t.projectId, t.roomId, t.turnId, t.nodeId, t.semanticStateFingerprint),
   index("idx_room_semantic_loop_breaks_room_node").on(t.projectId, t.roomId, t.turnId, t.nodeId, t.createdAt),
@@ -2097,7 +2100,7 @@ export const roomSemanticControllerInbox = roomSchema.table("room_semantic_contr
     foreignColumns: [operationalRooms.id, operationalRooms.projectId],
     name: "room_semantic_controller_inbox_room_project_fkey",
   }).onDelete("cascade"),
-  foreignKey({ columns: [t.messageId], foreignColumns: [roomMessages.id], name: "room_semantic_controller_inbox_message_fkey" }).onDelete("cascade"),
+  foreignKey({ columns: [t.messageId, t.roomId, t.projectId], foreignColumns: [roomMessages.id, roomMessages.roomId, roomMessages.projectId], name: "room_semantic_controller_inbox_message_fkey" }).onDelete("cascade"),
   unique("room_semantic_controller_inbox_message_action_unique")
     .on(t.projectId, t.roomId, t.messageId, t.actionKind),
   index("idx_room_semantic_controller_inbox_claim")
@@ -2164,8 +2167,8 @@ export const roomTaskProgressObservations = roomSchema.table("room_task_progress
     name: "room_task_progress_observations_node_room_project_fkey",
   }).onDelete("cascade"),
   foreignKey({
-    columns: [t.turnId],
-    foreignColumns: [roomTurns.id],
+    columns: [t.turnId, t.roomId, t.projectId],
+    foreignColumns: [roomTurns.id, roomTurns.roomId, roomTurns.projectId],
     name: "room_task_progress_observations_turn_fkey",
   }).onDelete("cascade"),
   unique("room_task_progress_observations_id_lineage_unique")
@@ -2247,8 +2250,8 @@ export const roomTaskRecoveryActions = roomSchema.table("room_task_recovery_acti
     name: "room_task_recovery_actions_observation_lineage_fkey",
   }).onDelete("cascade"),
   foreignKey({
-    columns: [t.operatorApprovalId],
-    foreignColumns: [approvalRequests.id],
+    columns: [t.projectId, t.operatorApprovalId],
+    foreignColumns: [approvalRequests.projectId, approvalRequests.id],
     name: "room_task_recovery_actions_operator_approval_fkey",
   }).onDelete("restrict"),
   unique("room_task_recovery_actions_observation_action_unique")
@@ -2433,6 +2436,7 @@ export const roomOutbox = roomSchema.table("room_outbox", {
   }).onDelete("restrict"),
   uniqueIndex("idx_room_outbox_logical_message").on(t.bindingId, t.logicalMessageId),
   uniqueIndex("idx_room_outbox_local_message").on(t.bindingId, t.localMessageId),
+  unique("room_outbox_id_project_unique").on(t.projectId, t.id),
   index("idx_room_outbox_dispatch").on(t.projectId, t.deliveryState, t.nextAttemptAt),
   index("idx_room_outbox_dispatch_task").on(t.projectId, t.roomId, t.dispatchTaskNodeId),
   check("room_outbox_delivery_state_check", sql`${t.deliveryState} IN ('pending','dispatching','confirmed','delivery_uncertain','rejected','cancelled')`),
@@ -3148,8 +3152,8 @@ export const roomProviderAdmissionRecoveryReceipts = roomSchema.table("room_prov
     name: "room_provider_admission_recovery_receipt_room_project_fkey",
   }).onDelete("restrict"),
   foreignKey({
-    columns: [t.outboxId],
-    foreignColumns: [roomOutbox.id],
+    columns: [t.projectId, t.outboxId],
+    foreignColumns: [roomOutbox.projectId, roomOutbox.id],
     name: "room_provider_admission_recovery_receipt_outbox_fkey",
   }).onDelete("restrict"),
   unique("room_provider_admission_recovery_receipt_id_project_unique").on(t.id, t.projectId),
@@ -3219,8 +3223,8 @@ export const roomProviderAdmissionTimeoutTombstones = roomSchema.table("room_pro
     name: "room_provider_admission_timeout_room_project_fkey",
   }).onDelete("restrict"),
   foreignKey({
-    columns: [t.outboxId],
-    foreignColumns: [roomOutbox.id],
+    columns: [t.projectId, t.outboxId],
+    foreignColumns: [roomOutbox.projectId, roomOutbox.id],
     name: "room_provider_admission_timeout_outbox_fkey",
   }).onDelete("restrict"),
   foreignKey({

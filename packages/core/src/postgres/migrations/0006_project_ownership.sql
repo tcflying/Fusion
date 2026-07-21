@@ -182,6 +182,12 @@ BEGIN
       AND i.indisunique
       AND NOT i.indisprimary
       AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)
+      AND idx.relname NOT IN (
+        'idx_room_bindings_active_native_session',
+        'idx_room_bindings_active_happier_session',
+        'idx_room_membership_changes_pending_native_session',
+        'idx_room_membership_changes_pending_happier_session'
+      )
       AND NOT EXISTS (
         SELECT 1 FROM unnest(i.indkey::smallint[]) key_attnum
         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = key_attnum

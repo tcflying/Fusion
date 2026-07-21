@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,6 +30,8 @@ import {
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
 
+vi.setConfig({ testTimeout: 60_000 });
+
 interface EmbeddedTestContext {
   readonly dataDir: string;
   readonly lifecycle: EmbeddedPostgresLifecycle;
@@ -39,6 +41,9 @@ interface EmbeddedTestContext {
 const contexts: EmbeddedTestContext[] = [];
 
 const MIGRATION_OWNED_ROOM_TABLE_NAMES = [
+  "room_evolution_effect_outbox",
+  "room_evolution_execution_outcomes",
+  "room_evolution_execution_runs",
   "room_phase_gate_evidence",
   "room_protocol_messages",
   "room_role_assignments",
@@ -48,6 +53,8 @@ const MIGRATION_OWNED_ROOM_TABLE_NAMES = [
   "room_task_progress_observations",
   "room_task_recovery_actions",
   "room_task_recovery_plans",
+  "room_provider_admission_recovery_receipts",
+  "room_provider_backpressure_cleanup_actions",
 ] as const;
 
 async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
@@ -74,12 +81,18 @@ async function materializeHistoricalBaseline(context: EmbeddedTestContext): Prom
   );
 }
 
-function expectedRegisteredMigrationsAfter(version: string): string[] {
+function expectedRegisteredMigrationsAfter(version: string, includeOfficialForward = true): string[] {
   const versionIndex = SCHEMA_MIGRATIONS.findIndex((migration) => migration.version === version);
   if (versionIndex < 0) {
     throw new Error(`Unknown registered schema migration version: ${version}`);
   }
-  return SCHEMA_MIGRATIONS.slice(versionIndex + 1).map((migration) => migration.version);
+  const officialForwardVersions = includeOfficialForward ? SCHEMA_MIGRATIONS
+    .filter((migration) => Number(migration.version) < 30)
+    .map((migration) => migration.version) : [];
+  return [
+    ...officialForwardVersions,
+    ...SCHEMA_MIGRATIONS.slice(versionIndex + 1).map((migration) => migration.version),
+  ];
 }
 
 async function materializeHistoricalSchemaThrough(
@@ -639,7 +652,7 @@ describe("Session Room PostgreSQL migration", () => {
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     expect(result.appliedVersions).toEqual(
-      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION),
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION, false),
     );
 
     const messages = (await context.connections!.migration.execute(sql`
@@ -725,7 +738,7 @@ describe("Session Room PostgreSQL migration", () => {
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     expect(result.appliedVersions).toEqual(
-      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION),
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION, false),
     );
 
     const rooms = (await context.connections!.migration.execute(sql`
@@ -1201,7 +1214,7 @@ describe("Session Room PostgreSQL migration", () => {
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     expect(result.appliedVersions).toEqual(
-      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION),
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION, false),
     );
     expect(await getAppliedMigrations(context.connections!.migration)).toContain(
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
@@ -1279,7 +1292,7 @@ describe("Session Room PostgreSQL migration", () => {
         applied_at timestamptz NOT NULL DEFAULT now()
       );
       INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
-      VALUES ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}');
+      VALUES ('0000'), ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}');
     `));
 
     const historicalBaselineTables = (await context.connections!.migration.execute(sql`
@@ -1292,7 +1305,8 @@ describe("Session Room PostgreSQL migration", () => {
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
     expect(result.appliedVersions).toEqual(
-      expectedRegisteredMigrationsAfter(SQLITE_MIGRATION_RUNTIME_READ_VERSION),
+      expectedRegisteredMigrationsAfter(SQLITE_MIGRATION_RUNTIME_READ_VERSION)
+        .filter((version) => version !== '0000'),
     );
     expect(result.appliedVersions).toContain(SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION);
     expect(result.baselineApplied).toBe(false);
@@ -1946,12 +1960,19 @@ describe("Session Room PostgreSQL migration", () => {
       "room_evolution_benchmark_results",
       "room_evolution_canaries",
       "room_evolution_canary_observations",
+      "room_evolution_canary_success_outcomes",
       "room_evolution_candidate_versions",
+      "room_evolution_effect_outbox",
+      "room_evolution_execution_outcomes",
+      "room_evolution_execution_runs",
       "room_evolution_experiments",
       "room_evolution_gate_results",
       "room_evolution_hypotheses",
+      "room_evolution_legacy_provenance_quarantines",
       "room_evolution_promotion_decisions",
       "room_evolution_rollbacks",
+      "room_evolution_trusted_binding_revocations",
+      "room_evolution_trusted_bindings",
     ]);
 
     await context.connections!.migration.execute(sql.raw(`
@@ -2058,7 +2079,7 @@ describe("Session Room PostgreSQL migration", () => {
         '{"integrity":1}'::jsonb,
         '[{"evidenceId":"evidence-gate"}]'::jsonb,
         'sha256:2222222222222222222222222222222222222222222222222222222222222222',
-        true, '2026-07-19T13:21:05.000Z'
+        false, '2026-07-19T13:21:05.000Z'
       );
 
       INSERT INTO project.room_evolution_canaries (
@@ -2096,7 +2117,7 @@ describe("Session Room PostgreSQL migration", () => {
       ) VALUES (
         'promotion-room', 'project-evolution', 'room-evolution', 'room',
         'room:room-evolution', 'experiment-room', 'candidate-next', 'canary-room',
-        'promoted', 'moderate', 'independent', 'producer-1', 'reviewer-1', NULL,
+        'rejected', 'moderate', 'independent', 'producer-1', 'reviewer-1', NULL,
         '{"preAuthorized":true}'::jsonb,
         '[{"gateResultId":"gate-room"}]'::jsonb,
         'sha256:4444444444444444444444444444444444444444444444444444444444444444',

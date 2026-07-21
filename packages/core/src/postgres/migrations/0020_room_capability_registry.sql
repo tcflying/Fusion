@@ -24,8 +24,8 @@ CREATE TABLE project.room_capability_registry_projections (
     REFERENCES project.operational_rooms(id, project_id)
     ON DELETE CASCADE,
   CONSTRAINT room_capability_registry_projections_source_event_fkey
-    FOREIGN KEY (source_event_id)
-    REFERENCES project.room_events(id)
+    FOREIGN KEY (project_id, source_event_id)
+    REFERENCES project.room_events(project_id, id)
     ON DELETE RESTRICT,
   CONSTRAINT room_capability_registry_projections_room_project_unique
     UNIQUE (project_id, room_id),

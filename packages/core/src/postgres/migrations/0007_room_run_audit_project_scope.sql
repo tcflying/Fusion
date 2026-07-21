@@ -18,7 +18,7 @@ BEGIN
 
   UPDATE project.run_audit_events
   SET project_id = metadata->>'projectId'
-  WHERE project_id IS NULL
+  WHERE (project_id IS NULL OR project_id = '__legacy_unscoped__')
     AND jsonb_typeof(metadata) = 'object'
     AND jsonb_typeof(metadata->'projectId') = 'string';
 
@@ -29,7 +29,7 @@ BEGIN
     UPDATE project.run_audit_events AS audit
     SET project_id = task.project_id
     FROM project.tasks AS task
-    WHERE audit.project_id IS NULL
+    WHERE (audit.project_id IS NULL OR audit.project_id = '__legacy_unscoped__')
       AND audit.task_id = task.id
       AND task.project_id IS NOT NULL;
   END IF;
@@ -38,7 +38,7 @@ BEGIN
     UPDATE project.run_audit_events AS audit
     SET project_id = task.project_id
     FROM project.archived_tasks AS task
-    WHERE audit.project_id IS NULL
+    WHERE (audit.project_id IS NULL OR audit.project_id = '__legacy_unscoped__')
       AND audit.task_id = task.id
       AND task.project_id IS NOT NULL;
   END IF;
