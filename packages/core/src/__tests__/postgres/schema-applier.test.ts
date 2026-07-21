@@ -32,6 +32,7 @@ import {
   applySchemaBaseline,
   getAppliedMigrations,
   SCHEMA_BASELINE_VERSION,
+  SCHEMA_MIGRATIONS,
   WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_VERSION,
   assertBinaryNotOlderThanDatabase,
   StaleBinarySchemaError,
@@ -231,11 +232,16 @@ describe("schema-applier: migration wiring integrity", () => {
   const migrationFiles = readdirSync(migrationsDir)
     .filter((f) => /^\d{4}_.*\.sql$/.test(f))
     .sort();
+  const registeredNumericVersions = SCHEMA_MIGRATIONS
+    .map((migration) => migration.version)
+    .filter((version) => /^\d+$/.test(version))
+    .sort((left, right) => Number(left) - Number(right));
 
-  it("advances SCHEMA_BASELINE_VERSION to the highest-numbered migration file", () => {
-    const highest = migrationFiles[migrationFiles.length - 1]!.slice(0, 4);
-    // A new column that ships a migration file must also bump the baseline marker
-    // (else the "all markers recorded" fast-path and upgrade bookkeeping drift).
+  it("advances SCHEMA_BASELINE_VERSION to the highest registered schema marker", () => {
+    const highest = registeredNumericVersions[registeredNumericVersions.length - 1]!;
+    // Room migrations retain their source filenames while using a disjoint
+    // bookkeeping namespace. The executable marker, not the filename prefix,
+    // is therefore the stale-binary and upgrade authority.
     expect(SCHEMA_BASELINE_VERSION).toBe(highest);
   });
 

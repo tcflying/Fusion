@@ -8,9 +8,9 @@ import {
 
 describe("Room event replay paging schema migration", () => {
   it("registers the canonical Room cursor index after the RBAC registry migration", async () => {
-    expect(SCHEMA_ROOM_EVENT_REPLAY_PAGING_VERSION).toBe("0026");
-    expect(SCHEMA_MIGRATIONS.at(-1)).toEqual({
-      version: "0026",
+    expect(SCHEMA_ROOM_EVENT_REPLAY_PAGING_VERSION).toBe("0056");
+    expect(SCHEMA_MIGRATIONS.find((migration) => migration.version === SCHEMA_ROOM_EVENT_REPLAY_PAGING_VERSION)).toEqual({
+      version: "0056",
       filename: "0026_room_event_replay_paging.sql",
     });
     await expect(readSchemaMigrationSql(SCHEMA_ROOM_EVENT_REPLAY_PAGING_VERSION)).resolves.toContain(

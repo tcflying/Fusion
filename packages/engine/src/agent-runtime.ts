@@ -15,7 +15,7 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { CliSessionStore } from "@fusion/core";
+import { AsyncCliSessionStore, CliSessionStore } from "@fusion/core";
 import type {
   CliSessionPurpose,
   PermanentAgentGatingContext,
@@ -72,24 +72,6 @@ function resolveHappierCliSessionId(input: {
   purpose: CliSessionPurpose;
 }): string {
   return `cli-happier-${input.purpose}-${createHash("sha256").update(input.sessionKey).digest("hex").slice(0, 24)}`;
-}
-
-export function resolveTaskHappierCliSessionId(input: {
-  taskId: string;
-  purpose: "execute";
-}): string {
-  return resolveHappierCliSessionId({
-    sessionKey: `executor:${input.taskId}:primary`,
-    purpose: input.purpose,
-  });
-}
-
-function resolveHappierCliSessionId(input: {
-  sessionKey: string;
-  purpose: CliSessionPurpose;
-}): string {
-  const digest = createHash("sha256").update(input.sessionKey).digest("hex").slice(0, 24);
-  return `cli-happier-${input.purpose}-${digest}`;
 }
 
 export function resolveTaskHappierCliSessionId(input: {
@@ -159,15 +141,15 @@ export async function createTaskStoreNativeSessionBinding(options: {
 
   const layer = options.taskStore.getAsyncLayer();
   if (!layer) throw new Error("Happier runtime requires the TaskStore PostgreSQL AsyncDataLayer");
-  const store = await CliSessionStore.create(layer, layer.projectId || options.taskStore.getFusionDir());
+  const store = new AsyncCliSessionStore(layer);
   const sessionId = resolveHappierCliSessionId({
     sessionKey: options.sessionKey,
     purpose: options.purpose,
   });
   const projectId = layer.projectId || options.taskStore.getFusionDir();
-  const existing = store.getSession(sessionId);
+  let existing = await store.getSession(sessionId);
   if (!existing) {
-    store.createSession({
+    existing = await store.createSession({
       id: sessionId,
       taskId: options.taskId ?? null,
       purpose: options.purpose,
@@ -175,7 +157,6 @@ export async function createTaskStoreNativeSessionBinding(options: {
       adapterId: "happier",
       worktreePath: options.worktreePath ?? null,
     });
-    await store.flush();
   } else if (
     existing.adapterId !== "happier"
     || existing.purpose !== options.purpose
@@ -185,11 +166,27 @@ export async function createTaskStoreNativeSessionBinding(options: {
     throw new Error(`CLI session ${sessionId} does not match the requested Happier runtime owner`);
   }
 
-  return createCliSessionNativeSessionBinding({
-    store,
-    sessionId,
-    bindingKey: `${options.taskStore.getFusionDir()}:${sessionId}`,
-  });
+  return {
+    key: `${options.taskStore.getFusionDir()}:${sessionId}`,
+    nativeSessionId: existing.nativeSessionId,
+    refreshNativeSessionId: async () => {
+      const current = await store.getSession(sessionId);
+      if (!current) throw new Error(`CLI session not found: ${sessionId}`);
+      return current.nativeSessionId;
+    },
+    claimNativeSessionId: async (candidate: string) => {
+      const result = await store.claimNativeSessionId(sessionId, candidate);
+      if (!result) throw new Error(`CLI session not found: ${sessionId}`);
+      return result;
+    },
+    persistNativeSessionId: async (nativeSessionId: string) => {
+      const result = await store.claimNativeSessionId(sessionId, nativeSessionId);
+      if (!result) throw new Error(`CLI session not found: ${sessionId}`);
+      if (result.nativeSessionId !== nativeSessionId) {
+        throw new Error(`CLI session ${sessionId} already belongs to native session ${result.nativeSessionId}`);
+      }
+    },
+  };
 }
 
 export function normalizeAgentRuntimeMcpServers(

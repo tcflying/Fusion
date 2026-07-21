@@ -6,8 +6,8 @@ precedence while residual inline routes are reduced by a separate ratchet.
 */
 
 export const CREATE_API_ROUTES_REGISTRAR_MOUNT_SEQUENCE = [
-  "registerSettingsMemoryRoutes", "registerSecretsRoutes", "registerTaskWorkflowRoutes", "registerWorkflowRoutes",
-  "registerPlanningSubtaskRoutes", "registerChatRoutes", "registerChatRoomRoutes", "registerMessagingScriptRoutes",
+  "registerSettingsMemoryRoutes", "registerSecretsRoutes", "registerTaskWorkflowRoutes", "registerHappierDirectSessionRoutes", "registerWorkflowRoutes",
+  "registerPlanningSubtaskRoutes", "registerChatRoutes", "registerChatRoomRoutes", "registerRoomControlPlaneRoutes", "registerMessagingScriptRoutes",
   "registerGitGitHubRoutes", "registerGitLabRoutes", "registerFilesTerminalWorkspaceRoutes", "registerAgentsProjectsNodesRoutes",
   "registerPluginsAutomationRoutes", "registerApprovalRoutes", "registerWorktrunkRoutes", "registerConfigMcpPiSettingsRoutes", "registerSystemMaintenanceRoutes", "registerModelRoutes",
   "registerCustomProviderRoutes", "registerAuthRoutes", "registerRuntimeProviderRoutes", "registerFnBinaryRoutes",

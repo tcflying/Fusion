@@ -1000,6 +1000,40 @@ function isDuplicateDatabaseError(error: unknown): boolean {
   return code === "23505" && constraint === "pg_database_datname_index";
 }
 
+type PostmasterPidSnapshot = Readonly<{
+  pid: number;
+  dataDir: string;
+  startMarker: string;
+}>;
+
+function normalizeIdentityPath(value: string): string {
+  const normalized = value.trim().replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[a-z]:\//i.test(normalized) || process.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function readPostmasterPidSnapshot(dataDir: string): PostmasterPidSnapshot | null {
+  try {
+    const lines = readFileSync(join(dataDir, "postmaster.pid"), "utf-8").split("\n");
+    const pid = Number.parseInt(lines[0]?.trim() ?? "", 10);
+    const recordedDataDir = lines[1]?.trim() ?? "";
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !recordedDataDir) return null;
+    return { pid, dataDir: recordedDataDir, startMarker: lines[2]?.trim() ?? "" };
+  } catch {
+    return null;
+  }
+}
+
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException | null)?.code !== "ESRCH";
+  }
+}
+
 function isAlreadyRunning(dataDir: string): { port: number; database: string } | null {
   const cached = runningInstances.get(dataDir);
   const postmaster = readPostmasterPidSnapshot(dataDir);

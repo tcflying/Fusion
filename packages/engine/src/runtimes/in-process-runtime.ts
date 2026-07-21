@@ -904,14 +904,16 @@ export class InProcessRuntime
       // 5a-cli. Initialize the CLI Agent Executor runtime (behind the
       // `cliAgentExecutor` experimental flag). Reuses the project's existing core
       // Database; predicates feed the self-healing + stuck-task seams below.
-      if (isExperimentalFeatureEnabled(settings, "cliAgentExecutor") && !this.taskStore.isBackendMode()) {
-        // FNXC:RuntimeSatelliteAsync 2026-06-24-14:00:
-        // CLI Agent Executor runtime requires the sync SQLite Database; skip in
-        // backend mode (the feature is experimental and not yet ported to async).
+      const cliAgentLayer = this.taskStore.getAsyncLayer();
+      if (isExperimentalFeatureEnabled(settings, "cliAgentExecutor") && cliAgentLayer) {
+        // FNXC:CliAgentPostgres 2026-07-21:
+        // The official runtime owns its session cache through the project's
+        // PostgreSQL AsyncDataLayer. Do not reopen or route through the retired
+        // synchronous SQLite constructor.
         try {
-          this.cliAgentRuntime = createCliAgentRuntime({
+          this.cliAgentRuntime = await createCliAgentRuntime({
             fusionDir: this.taskStore.getFusionDir(),
-            db: this.taskStore.getDatabase(),
+            asyncLayer: cliAgentLayer,
             projectId: this.config.projectId,
             hookEndpointUrl: this.resolveCliAgentHookEndpointUrl(),
             onNotification: (info) => {
@@ -1103,11 +1105,8 @@ export class InProcessRuntime
         // ChatStore now supports dual-path: in backend mode it uses the
         // AsyncDataLayer; in SQLite mode it uses the sync Database.
         const chatLayer = this.taskStore.getAsyncLayer();
-        this.chatStore ??= new ChatStore(
-          this.taskStore.getFusionDir(),
-          chatLayer ? null : this.taskStore.getDatabase(),
-          { asyncLayer: chatLayer },
-        );
+        if (!chatLayer) throw new Error("HeartbeatMonitor requires the TaskStore PostgreSQL AsyncDataLayer");
+        this.chatStore ??= new ChatStore(chatLayer);
         this.heartbeatMonitor = new HeartbeatMonitor({
           store: this.agentStore,
           agentStore: this.agentStore, // enables per-agent config resolution
@@ -1325,11 +1324,8 @@ export class InProcessRuntime
       // ChatStore dual-path: use async layer in backend mode, sync DB otherwise.
       {
         const chatLayer2 = this.taskStore.getAsyncLayer();
-        this.chatStore ??= new ChatStore(
-          this.taskStore.getFusionDir(),
-          chatLayer2 ? null : this.taskStore.getDatabase(),
-          { asyncLayer: chatLayer2 },
-        );
+        if (!chatLayer2) throw new Error("SelfHealingManager requires the TaskStore PostgreSQL AsyncDataLayer");
+        this.chatStore ??= new ChatStore(chatLayer2);
       }
       this.selfHealingManager = new SelfHealingManager(this.taskStore, {
         rootDir: this.config.workingDirectory,

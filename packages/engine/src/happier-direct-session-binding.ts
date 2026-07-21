@@ -1,6 +1,5 @@
 import {
   AsyncCliSessionStore,
-  CliSessionStore,
   type AsyncDataLayer,
   type CliAutonomyPosture,
   type CliSession,
@@ -73,18 +72,14 @@ export class TaskHappierDirectSessionIntegrityError extends Error {
   }
 }
 
-type SessionStore = {
-  getSession(id: string): CliSession | undefined | Promise<CliSession | undefined>;
-  updateSession(
-    id: string,
-    input: CliSessionUpdateInput,
-  ): CliSession | undefined | Promise<CliSession | undefined>;
-};
+type SessionStore = AsyncCliSessionStore;
 
 function resolveSessionStore(store: Store): SessionStore {
   const asyncLayer = store.getAsyncLayer();
-  if (asyncLayer) return new AsyncCliSessionStore(asyncLayer);
-  return new CliSessionStore(store.getFusionDir(), store.getDatabase());
+  if (!asyncLayer) {
+    throw new Error("Happier direct session binding requires the TaskStore PostgreSQL AsyncDataLayer");
+  }
+  return new AsyncCliSessionStore(asyncLayer);
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -297,55 +292,6 @@ async function bindAsyncTransaction(input: {
   return binding;
 }
 
-function bindSyncTransaction(input: {
-  sessionStore: CliSessionStore;
-  taskId: string;
-  cliSessionId: string;
-  ensured: HappierDirectSessionEnsureMetadata;
-}): TaskHappierDirectSessionBinding {
-  const currentSession = input.sessionStore.getSession(input.cliSessionId);
-  if (!currentSession) throw new Error(`CLI session not found: ${input.cliSessionId}`);
-  const currentBinding = existingBindingForEnsure({
-    ...input,
-    session: currentSession,
-    ensuredHappierSessionId: input.ensured.sessionId,
-  });
-  if (currentBinding) return currentBinding;
-
-  const claim = input.sessionStore.claimNativeSessionId(
-    input.cliSessionId,
-    input.ensured.sessionId,
-  );
-  if (!claim) throw new Error(`CLI session not found during native-session claim: ${input.cliSessionId}`);
-  assertClaimedHappierSession({
-    ...input,
-    claimedHappierSessionId: claim.nativeSessionId,
-    ensuredHappierSessionId: input.ensured.sessionId,
-  });
-
-  const latestSession = input.sessionStore.getSession(input.cliSessionId);
-  if (!latestSession) throw new Error(`CLI session not found after native-session claim: ${input.cliSessionId}`);
-  const existingAfterClaim = existingBindingForEnsure({
-    ...input,
-    session: latestSession,
-    ensuredHappierSessionId: input.ensured.sessionId,
-  });
-  if (existingAfterClaim) return existingAfterClaim;
-
-  const binding = createConnectedBinding({
-    cliSessionId: input.cliSessionId,
-    happierSessionId: claim.nativeSessionId,
-    ensured: input.ensured,
-  });
-  const autonomyPosture: CliAutonomyPosture = {
-    ...(latestSession.autonomyPosture ?? {}),
-    happierDirectSession: persistedBinding(binding),
-  };
-  const updated = input.sessionStore.updateSession(input.cliSessionId, { autonomyPosture });
-  if (!updated) throw new Error(`CLI session not found while linking Happier metadata: ${input.cliSessionId}`);
-  return binding;
-}
-
 async function bindWithDatabaseSerialization(input: {
   store: Store;
   taskId: string;
@@ -365,11 +311,7 @@ async function bindWithDatabaseSerialization(input: {
     ));
   }
 
-  const database = input.store.getDatabase();
-  return database.transactionImmediate(() => bindSyncTransaction({
-    ...input,
-    sessionStore: new CliSessionStore(input.store.getFusionDir(), database),
-  }));
+  throw new Error("Happier direct session binding requires the TaskStore PostgreSQL AsyncDataLayer");
 }
 
 export async function readTaskHappierDirectSessionBinding(input: {

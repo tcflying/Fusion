@@ -1898,6 +1898,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     const runAuditEventsPromise: Promise<RunAuditEvent[]> = asyncLayer
       ? queryRunAuditEvents(asyncLayer.db, auditFilter).then((events) => events.map((event) => ({
           ...event,
+          projectId: event.projectId ?? undefined,
           domain: event.domain as RunAuditEvent["domain"],
           mutationType: event.mutationType as RunAuditEvent["mutationType"],
           taskId: event.taskId ?? undefined,

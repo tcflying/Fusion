@@ -1588,6 +1588,7 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
       const events = await queryRunAuditEvents(this.asyncLayer.db, options);
       return events.map((event) => ({
         ...event,
+        projectId: event.projectId ?? undefined,
         taskId: event.taskId ?? undefined,
         metadata: event.metadata ?? undefined,
         domain: event.domain as RunAuditEvent["domain"],

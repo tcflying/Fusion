@@ -433,7 +433,6 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       hostAsyncLayer: centralBootResult?.hostAsyncLayer,
     });
   const engineManager = new ProjectEngineManager(sharedCentralCore, {
-    onMigrationProgress: (event) => migrationHoldingServer?.setMigrationProgress(event),
     cliPackageVersion,
     getMergeStrategy,
     processPullRequestMerge: (s, wd, taskId, pool) =>

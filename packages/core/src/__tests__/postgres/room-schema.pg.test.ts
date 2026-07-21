@@ -12,8 +12,9 @@ import {
   applySchemaBaseline,
   getAppliedMigrations,
   MIGRATION_BOOKKEEPING_TABLE,
+  readBaselineMigrationSql,
   readSchemaMigrationSql,
-  SCHEMA_BASELINE_VERSION,
+  SQLITE_MIGRATION_RUNTIME_READ_VERSION,
   SCHEMA_MIGRATIONS,
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
@@ -69,7 +70,7 @@ async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
 
 async function materializeHistoricalBaseline(context: EmbeddedTestContext): Promise<void> {
   await context.connections!.migration.execute(
-    sql.raw(await readSchemaMigrationSql(SCHEMA_BASELINE_VERSION)),
+    sql.raw(await readBaselineMigrationSql()),
   );
 }
 
@@ -1278,7 +1279,7 @@ describe("Session Room PostgreSQL migration", () => {
         applied_at timestamptz NOT NULL DEFAULT now()
       );
       INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
-      VALUES ('${SCHEMA_BASELINE_VERSION}');
+      VALUES ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}');
     `));
 
     const historicalBaselineTables = (await context.connections!.migration.execute(sql`
@@ -1291,7 +1292,7 @@ describe("Session Room PostgreSQL migration", () => {
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
     expect(result.appliedVersions).toEqual(
-      expectedRegisteredMigrationsAfter(SCHEMA_BASELINE_VERSION),
+      expectedRegisteredMigrationsAfter(SQLITE_MIGRATION_RUNTIME_READ_VERSION),
     );
     expect(result.appliedVersions).toContain(SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION);
     expect(result.baselineApplied).toBe(false);
@@ -1320,7 +1321,7 @@ describe("Session Room PostgreSQL migration", () => {
         applied_at timestamptz NOT NULL DEFAULT now()
       );
       INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
-      VALUES ('${SCHEMA_BASELINE_VERSION}'), ('${SCHEMA_ROOM_VERSION}');
+      VALUES ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}'), ('${SCHEMA_ROOM_VERSION}');
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
@@ -1365,7 +1366,7 @@ describe("Session Room PostgreSQL migration", () => {
       );
       INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
       VALUES
-        ('${SCHEMA_BASELINE_VERSION}'),
+        ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}'),
         ('${SCHEMA_ROOM_VERSION}'),
         ('${SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION}');
     `));
@@ -1398,7 +1399,7 @@ describe("Session Room PostgreSQL migration", () => {
       );
       INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
       VALUES
-        ('${SCHEMA_BASELINE_VERSION}'),
+        ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}'),
         ('${SCHEMA_ROOM_VERSION}'),
         ('${SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION}'),
         ('${SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION}');
@@ -1582,7 +1583,7 @@ describe("Session Room PostgreSQL migration", () => {
       );
       INSERT INTO public.${MIGRATION_BOOKKEEPING_TABLE} (version)
       VALUES
-        ('${SCHEMA_BASELINE_VERSION}'),
+        ('${SQLITE_MIGRATION_RUNTIME_READ_VERSION}'),
         ('${SCHEMA_ROOM_VERSION}'),
         ('${SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION}'),
         ('${SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION}'),

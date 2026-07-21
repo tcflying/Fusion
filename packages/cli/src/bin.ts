@@ -170,6 +170,8 @@ function loadCommandHandlers() {
   const { runAgentStop, runAgentStart } = lazyCommandModule(() => import("./commands/agent.js"));
   const { runAgentImport } = lazyCommandModule(() => import("./commands/agent-import.js"));
   const { runAgentExport } = lazyCommandModule(() => import("./commands/agent-export.js"));
+  const { runOrgExport } = lazyCommandModule(() => import("./commands/org-export.js"));
+  const { runOrgImport } = lazyCommandModule(() => import("./commands/org-import.js"));
   const { runMessageInbox, runMessageOutbox, runMessageSend, runMessageRead, runMessageDelete, runAgentMailbox } = lazyCommandModule(() => import("./commands/message.js"));
   const { runChatInteractive } = lazyCommandModule(() => import("./commands/chat.js"));
   const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable, runPluginSetupStatus, runPluginSetup, runPluginAvailable, runPluginSettings, runPluginRescan } = lazyCommandModule(() => import("./commands/plugin.js"));

@@ -1,7 +1,6 @@
 import {
   AgentStore,
   AsyncCliSessionStore,
-  CliSessionStore,
   HAPPIER_RUNTIME_PLUGIN_ID,
   type Agent,
   type Task,
@@ -188,9 +187,8 @@ function assertHappierOpenUrlConfiguration(
 async function hasPersistedBindingMetadata(store: TaskStore, taskId: string): Promise<boolean> {
   const cliSessionId = resolveTaskHappierCliSessionId({ taskId, purpose: "execute" });
   const asyncLayer = store.getAsyncLayer();
-  const session = asyncLayer
-    ? await new AsyncCliSessionStore(asyncLayer).getSession(cliSessionId)
-    : new CliSessionStore(store.getFusionDir(), store.getDatabase()).getSession(cliSessionId);
+  if (!asyncLayer) return false;
+  const session = await new AsyncCliSessionStore(asyncLayer).getSession(cliSessionId);
   return isRecord(session?.autonomyPosture)
     && Object.prototype.hasOwnProperty.call(session.autonomyPosture, "happierDirectSession");
 }

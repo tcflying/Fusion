@@ -336,7 +336,9 @@ it("serializes connected metadata across distinct stores sharing one database", 
   expect(JSON.parse(row.autonomyPosture ?? "null")).toMatchObject({ unrelated: { keep: "yes" } });
 });
 
-describe.each<Backend>(["async", "sync"])("%s store", (backend) => {
+// Fusion 0.73's official cutover removes the synchronous SQLite runtime;
+// Happier ownership is PostgreSQL AsyncDataLayer-only from this boundary.
+describe.each<Backend>(["async"])("%s store", (backend) => {
   it("claims before persisting connected metadata and preserves unrelated posture", async () => {
     const taskId = `FN-HAPPIER-FIRST-${backend}`;
     const harness = createHarness(backend);

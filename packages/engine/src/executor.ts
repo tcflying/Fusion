@@ -247,7 +247,7 @@ import {
   getResearchGuidanceForSurface,
   isResearchToolSurfaceEnabled,
 } from "./tool-availability.js";
-import { createFusionAuthStorage, getModelRegistryModelsPath } from "./auth-storage.js";
+import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
 import { createRunVerificationTool } from "./run-verification-tool.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { recordRetry } from "./retry-burned-logger.js";
@@ -2437,7 +2437,7 @@ export class TaskExecutor {
   private totalSpawnedCount = 0;
   /** Token cap detector for proactive context compaction. */
   private tokenCapDetector = new TokenCapDetector();
-  private _modelRegistry?: ModelRegistry;
+  private _modelRegistryPromise?: Promise<ModelRegistry>;
   private _approvalRequestStore?: ApprovalRequestStore;
   /** Current run context for mutation correlation, keyed by task id. */
   private currentRunContexts = new Map<string, RunMutationContext>();
@@ -2493,13 +2493,12 @@ export class TaskExecutor {
     return handedOff;
   }
 
-  private get modelRegistry(): ModelRegistry {
-    if (!this._modelRegistry) {
+  private async getModelRegistry(): Promise<ModelRegistry> {
+    if (!this._modelRegistryPromise) {
       const authStorage = createFusionAuthStorage();
-      this._modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
-      this._modelRegistry.refresh();
+      this._modelRegistryPromise = createFusionModelRegistry(authStorage);
     }
-    return this._modelRegistry;
+    return this._modelRegistryPromise;
   }
 
   private get approvalRequestStore(): ApprovalRequestStore {
@@ -3372,7 +3371,7 @@ export class TaskExecutor {
               activeEntry.lastResolvedModelProvider = ownProvider;
               activeEntry.lastResolvedModelId = ownModelId;
               try {
-                const model = this.modelRegistry.find(ownProvider, ownModelId);
+                const model = (await this.getModelRegistry()).find(ownProvider, ownModelId);
                 if (model) {
                   await activeEntry.session.setModel(model);
                   executorLog.log(`${task.id}: binding released — model reverted to ${ownProvider}/${ownModelId}`);
@@ -3431,7 +3430,7 @@ export class TaskExecutor {
                   activeEntry.lastResolvedModelId = newModelId;
                   if (newProvider && newModelId) {
                     try {
-                      const model = this.modelRegistry.find(newProvider, newModelId);
+                      const model = (await this.getModelRegistry()).find(newProvider, newModelId);
                       if (model) {
                         await activeEntry.session.setModel(model);
                         executorLog.log(`${task.id}: column-agent hot-swap → agent '${newAgent.id}' model ${newProvider}/${newModelId}`);
@@ -3502,7 +3501,7 @@ export class TaskExecutor {
 
             if (newProvider && newModelId) {
               try {
-                const model = this.modelRegistry.find(newProvider, newModelId);
+                const model = (await this.getModelRegistry()).find(newProvider, newModelId);
                 if (model) {
                   await activeEntry.session.setModel(model);
                   executorLog.log(`${task.id}: executor model hot-swapped to ${newProvider}/${newModelId}`);
