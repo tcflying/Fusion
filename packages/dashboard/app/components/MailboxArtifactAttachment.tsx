@@ -1,6 +1,6 @@
 import { memo, useMemo, useState, type ReactNode } from "react";
 import type { ArtifactType } from "@fusion/core";
-import { artifactMediaUrl } from "../api";
+import { artifactMediaUrlWithToken } from "../api";
 
 export interface MailboxArtifactAttachmentProps {
   artifactId?: unknown;
@@ -10,6 +10,8 @@ export interface MailboxArtifactAttachmentProps {
   projectId?: string;
   taskId?: unknown;
   onOpenTask?: (taskId: string) => void;
+  /** The shared related-work control already renders this message's task link. */
+  hideTaskLink?: boolean;
 }
 
 function readString(value: unknown): string | undefined {
@@ -24,7 +26,7 @@ function readArtifactType(value: unknown): ArtifactType | "unknown" {
 
 /**
  * FNXC:ArtifactRegistry 2026-07-12-00:00:
- * Artifact-registration mail messages must expose the artifact announced by message.metadata. Render image artifacts inline, keep every type reachable through artifactMediaUrl(projectId-aware), and render nothing when metadata has no artifactId so ordinary messages keep their exact layout.
+ * Artifact-registration mail messages must expose the artifact announced by message.metadata. Render image artifacts inline, keep every type reachable through the authenticated project-aware media URL, and render nothing when metadata has no artifactId so ordinary messages keep their exact layout.
  *
  * FNXC:ArtifactRegistry 2026-07-12-00:00:
  * Artifact-registration mail messages must also expose the producing task when message.metadata.taskId is paired with an onOpenTask handler. Render no task affordance when either side is absent so artifact-only and ordinary messages do not gain empty shells.
@@ -37,6 +39,7 @@ export const MailboxArtifactAttachment = memo(function MailboxArtifactAttachment
   projectId,
   taskId,
   onOpenTask,
+  hideTaskLink = false,
 }: MailboxArtifactAttachmentProps) {
   const id = readString(artifactId);
   const type = readArtifactType(artifactType);
@@ -44,7 +47,7 @@ export const MailboxArtifactAttachment = memo(function MailboxArtifactAttachment
   const mediaMimeType = readString(mimeType);
   const task = readString(taskId);
   const [imageFailed, setImageFailed] = useState(false);
-  const mediaUrl = useMemo(() => id ? artifactMediaUrl(id, projectId) : "", [id, projectId]);
+  const mediaUrl = useMemo(() => id ? artifactMediaUrlWithToken(id, projectId) : "", [id, projectId]);
 
   if (!id) return null;
 
@@ -59,7 +62,7 @@ export const MailboxArtifactAttachment = memo(function MailboxArtifactAttachment
       Open artifact
     </a>
   );
-  const taskLink = task && onOpenTask ? (
+  const taskLink = task && onOpenTask && !hideTaskLink ? (
     <button
       type="button"
       className="mailbox-artifact-attachment__link btn"

@@ -1,13 +1,12 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import "./executor-test-helpers.js";
 import { TaskExecutor } from "../executor.js";
 import * as worktreePool from "../worktree-pool.js";
-import { TaskStore } from "@fusion/core";
-import { createMockStore, mockedCreateFnAgent, mockedExec, mockedExecSync, resetExecutorMocks } from "./executor-test-helpers.js";
+import { type TaskStore } from "@fusion/core";
+import { createTaskStoreForTest, pgDescribe, type PgTestHarness } from "../../../core/src/__test-utils__/pg-test-harness.js";
+import { captureNamedTool, createMockStore, mockedCreateFnAgent, mockedExec, mockedExecSync, resetExecutorMocks } from "./executor-test-helpers.js";
 
 const fn416Prompt = `# Task: FN-416 - Assign ready implementation task to active owner
 
@@ -88,12 +87,41 @@ async function setup(overrides: Record<string, unknown> = {}) {
   });
 
   mockedCreateFnAgent.mockImplementation(async ({ customTools }: any) => {
-    tool = customTools.find((t: any) => t.name === "fn_task_done");
+    tool = captureNamedTool(customTools, "fn_task_done", tool);
     return { session: { prompt: vi.fn().mockResolvedValue(undefined), dispose: vi.fn() } } as any;
   });
 
   const executor = new TaskExecutor(store as any, "/repo");
   await executor.execute(task as any);
+
+  /*
+  FNXC:EngineTests 2026-07-19-16:10 (U10b):
+  `execute()` here is only a VEHICLE for capturing the live `fn_task_done` tool; the requirement
+  under test in this file is what that tool does when the agent calls it against a given row state.
+  Under graph ownership the vehicle is no longer inert: the harness session never calls
+  fn_task_done, so the graph spends the task-done budget and rebounds the row (column -> todo,
+  steps reset to the prompt-derived pending shape, taskDoneRetryCount bumped) and records its own
+  moveTask/updateStep calls. That vehicle noise is not the contract — it silently rewrote the
+  PRECONDITION each test declares (all-steps-done source-free delivery, two-pending-step bulk
+  guard, ...) and polluted the spies the assertions read.
+  Restoring the declared row through `_setRow` (patches win over the per-file `getTask` override,
+  so this is the only ordering that beats the executor's own writes) and clearing call history
+  re-establishes the exact precondition each test always intended, without weakening any assertion.
+  */
+  const baseline = baseTask(overrides);
+  task = { ...baseline, column: "in-progress", paused: false, pausedByAgentId: null, status: null, error: null };
+  store._setRow(baseline.id as string, { ...task });
+  for (const spy of [
+    store.moveTask,
+    store.updateStep,
+    store.updateTask,
+    store.logEntry,
+    store.recordActivity,
+    store.handoffToReview,
+    mockedExecSync,
+  ]) {
+    spy.mockClear();
+  }
 
   return { store, tool, setTask: (next: any) => (task = { ...task, ...next }) };
 }
@@ -332,7 +360,15 @@ Atlas Notes task-board artifacts only:
 
     expect(result.content[0].text).toContain("Task marked complete");
     expect(result.content[0].text).not.toContain("fn_task_done refused: no_commits");
-    expect(store.moveTask.mock.calls).toEqual([["FN-350", "in-progress"]]);
+    /*
+    FNXC:EngineTests 2026-07-19-16:25 (U10b):
+    A clean completion performs NO column move of its own. The old expectation of a single
+    `moveTask(id,"in-progress")` was an artifact of the vehicle leaving the row parked in `todo`;
+    with the row restored to its declared `in-progress` state the requirement is exactly the
+    stricter one this test always meant — the completion neither rebounds to `todo` nor stages the
+    review handoff itself (the merge-node boundary owns the in-review move).
+    */
+    expect(store.moveTask.mock.calls).toEqual([]);
     expect(store.handoffToReview).not.toHaveBeenCalled();
   });
 
@@ -766,23 +802,23 @@ Assign or route exactly one ready implementation task to an eligible active owne
   });
 });
 
-describe("FN-5241 executor handoff auditing", () => {
+/* FNXC:PgMigrationQuarantine 2026-07-18-01:20: FN-8258 runs handoff-audit invariants against the PostgreSQL TaskStore and its async audit boundary, replacing the removed SQLite constructor. */
+pgDescribe("FN-5241 executor handoff auditing", () => {
   let rootDir: string;
-  let globalDir: string;
+  let harness: PgTestHarness;
   let store: TaskStore;
 
   beforeEach(async () => {
-    rootDir = mkdtempSync(join(tmpdir(), "fn-5241-executor-"));
-    globalDir = join(rootDir, ".fusion-global");
-    store = new TaskStore(rootDir, globalDir);
-    await store.init();
+    // Reset the executor subprocess mock before PG setup so the harness can pass psql through.
     resetExecutorMocks();
+    harness = await createTaskStoreForTest({ prefix: "fusion_executor_handoff_audit" });
+    rootDir = harness.rootDir;
+    store = harness.store;
     vi.spyOn(worktreePool, "isUsableTaskWorktree").mockResolvedValue(true);
   });
 
   afterEach(async () => {
-    store.close();
-    await rm(rootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await harness?.teardown();
   });
 
   async function createExecutorTask(taskDoneRetryCount = 0) {
@@ -869,11 +905,11 @@ describe("FN-5241 executor handoff auditing", () => {
     // Forensic intent preserved via the mechanism that actually fires now: the merge boundary records a
     // task:move into in-review (the review-seam task:handoff("workflow-graph-review") event and the
     // review-seam merge-queue enqueue no longer occur on this path).
-    const moveToReview = store
-      .getRunAuditEvents({ taskId: task.id, mutationType: "task:move", limit: 20 })
+    const moveToReview = (await store
+      .getRunAuditEventsAsync({ taskId: task.id, mutationType: "task:move", limit: 20 }))
       .find((event) => (event.metadata as { to?: string })?.to === "in-review");
     expect(moveToReview).toBeDefined();
-    expect(store.getRunAuditEvents({ taskId: task.id, mutationType: "task:handoff", limit: 10 })).toHaveLength(0);
+    expect(await store.getRunAuditEventsAsync({ taskId: task.id, mutationType: "task:handoff", limit: 10 })).toHaveLength(0);
   });
 
   it("fails a no-fn_task_done retry-budget-exhausted run in place without moving to in-review", async () => {
@@ -906,7 +942,7 @@ describe("FN-5241 executor handoff auditing", () => {
     // FN-5241 review-seam handoff auditing (task:handoff "workflow-graph-review" /
     // "max-task-done-retries-exhausted") + merge-queue enqueue are superseded — none of them fire here.
     expect(latest?.column).not.toBe("in-review");
-    expect(store.getRunAuditEvents({ taskId: task.id, mutationType: "task:handoff", limit: 10 })).toHaveLength(0);
-    expect(store.peekMergeQueue()).toEqual([]);
+    expect(await store.getRunAuditEventsAsync({ taskId: task.id, mutationType: "task:handoff", limit: 10 })).toHaveLength(0);
+    expect(await store.peekMergeQueue()).toEqual([]);
   });
 });

@@ -11,13 +11,14 @@
  */
 
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Database } from "./db.js";
 import { fromJson, toJsonNullable } from "./db.js";
 import { createLogger } from "./logger.js";
 import { DASHBOARD_USER_ID, normalizeMessageParticipant, validateMessageMetadata, type Message, type MessageCreateInput, type MessageFilter, type MessageType, type Mailbox, type ParticipantType } from "./types.js";
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
 import * as asyncMessageStore from "./async-message-store.js";
+import { sanitizeTextValue, sanitizeJsonbValue } from "./postgres/nul-sanitize.js";
 
 const messageStoreLog = createLogger("message-store");
 
@@ -33,6 +34,8 @@ export interface MessageStoreEvents {
   "message:read": [message: Message];
   /** Emitted when a message is deleted */
   "message:deleted": [messageId: string];
+  /** Emitted when proposal metadata changes without creating a new message. */
+  "message:updated": [message: Message];
 }
 
 // ── Row Interfaces ───────────────────────────────────────────────────
@@ -83,6 +86,7 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
 
   // Prepared statements for frequently-run queries (SQLite path only)
   private stmtInsert!: ReturnType<Database["prepare"]>;
+  private stmtInsertOnce!: ReturnType<Database["prepare"]>;
   private stmtGetById!: ReturnType<Database["prepare"]>;
   private stmtUpdateRead!: ReturnType<Database["prepare"]>;
   private stmtDelete!: ReturnType<Database["prepare"]>;
@@ -105,6 +109,10 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     const sqliteDb = this.db!;
     this.stmtInsert = sqliteDb.prepare(`
       INSERT INTO messages (id, fromId, fromType, toId, toType, content, type, read, metadata, createdAt, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    this.stmtInsertOnce = sqliteDb.prepare(`
+      INSERT OR IGNORE INTO messages (id, fromId, fromType, toId, toType, content, type, read, metadata, createdAt, updatedAt)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
@@ -169,10 +177,17 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
       fromType: from.type,
       toId: to.id,
       toType: to.type,
-      content: input.content,
+      // FNXC:PostgresMigrationNulSanitize 2026-07-21: sanitize here so the
+      // exact same object is persisted, emitted (message:sent/message:received,
+      // consumed by the agent wake hook), and returned to the caller. The
+      // async-message-store.ts sendMessage() layer also sanitizes before its
+      // own insert, but this class discarded that function's return value and
+      // used its own locally-built (unsanitized) `message` object for
+      // everything else — this closes that gap.
+      content: sanitizeTextValue(input.content),
       type: input.type,
       read: false,
-      metadata: input.metadata,
+      metadata: sanitizeJsonbValue(input.metadata),
       createdAt: now,
       updatedAt: now,
     };
@@ -236,6 +251,82 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
   }
 
   /**
+   * Atomically send one message for a globally scoped idempotency key.
+   *
+   * FNXC:PostgresMigrationInbox 2026-07-14-12:10:
+   * Once-only system notices use a deterministic message primary key and each backend's conflict-ignore insert. This closes the check-then-send race between concurrent engine starts while preserving normal MessageStore events only for the winning insert.
+   */
+  async sendMessageOnce(
+    input: MessageCreateInput,
+    idempotencyKey: string,
+  ): Promise<{ message: Message; inserted: boolean }> {
+    validateMessageMetadata(input.metadata);
+    const now = new Date().toISOString();
+    const digest = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 24);
+    const from = normalizeMessageParticipant(input.fromId ?? "system", input.fromType ?? "system");
+    const to = normalizeMessageParticipant(input.toId, input.toType);
+    const message: Message = {
+      id: `msg-once-${digest}`,
+      fromId: from.id,
+      fromType: from.type,
+      toId: to.id,
+      toType: to.type,
+      // FNXC:PostgresMigrationNulSanitize 2026-07-21: see sendMessage() above
+      // for why this must sanitize here rather than rely solely on
+      // asyncMessageStore.sendMessageOnce's own internal sanitization —
+      // that function only returns a boolean, so this class's locally-built
+      // `message` object is what actually gets emitted/returned.
+      content: sanitizeTextValue(input.content),
+      type: input.type,
+      read: false,
+      metadata: sanitizeJsonbValue(input.metadata),
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    let inserted: boolean;
+    if (this.asyncLayer) {
+      inserted = await asyncMessageStore.sendMessageOnce(this.asyncLayer.db, {
+        ...message,
+        metadata: message.metadata ?? null,
+      });
+    } else {
+      const result = this.stmtInsertOnce.run(
+        message.id,
+        message.fromId,
+        message.fromType,
+        message.toId,
+        message.toType,
+        message.content,
+        message.type,
+        0,
+        toJsonNullable(message.metadata),
+        message.createdAt,
+        message.updatedAt,
+      );
+      inserted = result.changes === 1;
+      if (inserted) this.db!.bumpLastModified();
+    }
+
+    if (!inserted) return { message, inserted: false };
+
+    this.emit("message:sent", message);
+    this.emit("message:received", message);
+    if (message.toType === "agent" && this.onMessageToAgent) {
+      try {
+        await this.onMessageToAgent(message);
+      } catch (err) {
+        messageStoreLog.warn(
+          `MessageStore onMessageToAgent hook failed for once-only id=${message.id} (send still succeeded): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    return { message, inserted: true };
+  }
+
+  /**
    * Get a single message by ID.
    * @param id - The message ID
    * @returns The message, or null if not found
@@ -247,6 +338,50 @@ export class MessageStore extends EventEmitter<MessageStoreEvents> {
     const row = this.stmtGetById.get(id) as unknown as MessageRow | undefined;
     if (!row) return null;
     return this.rowToMessage(row);
+  }
+
+  /** Atomically acquire a pending proposal's transient creation lease. */
+  async claimProposalForCreation(messageId: string): Promise<{ claimed: boolean; idempotencyKey?: string; claimOwnerToken?: string }> {
+    if (this.asyncLayer) {
+      const result = await asyncMessageStore.claimProposalForCreation(this.asyncLayer.db, messageId);
+      if (result.message) this.emit("message:updated", result.message);
+      return result;
+    }
+    const owner = randomUUID();
+    const now = new Date().toISOString();
+    // FNXC:EphemeralAgentTaskCreation 2026-07-30-16:00: SQLite-compatible stores persist the lease start with its owner, allowing a later operator request to recover a dead creator without changing the stable idempotency key.
+    const changed = this.db!.prepare(`UPDATE messages SET metadata = json_set(metadata, '$.proposalStatus', 'creating', '$.claimOwnerToken', ?, '$.claimStartedAt', ?), updatedAt = ? WHERE id = ? AND json_extract(metadata, '$.kind') = 'task-proposal' AND json_extract(metadata, '$.proposalStatus') = 'pending'`).run(owner, now, now, messageId).changes;
+    if (!changed) return { claimed: false };
+    this.db!.bumpLastModified();
+    const message = await this.getMessage(messageId);
+    if (message) this.emit("message:updated", message);
+    return { claimed: true, idempotencyKey: message?.metadata?.proposalIdempotencyKey as string | undefined, claimOwnerToken: owner };
+  }
+
+  async finalizeProposalCreation(messageId: string, claimOwnerToken: string, createdTaskId: string): Promise<Message | null> {
+    if (this.asyncLayer) {
+      const message = await asyncMessageStore.finalizeProposalCreation(this.asyncLayer.db, messageId, claimOwnerToken, createdTaskId);
+      if (message) this.emit("message:updated", message);
+      return message;
+    }
+    const existing = await this.getMessage(messageId);
+    if (existing?.metadata?.proposalStatus === "created" && existing.metadata.createdTaskId === createdTaskId) return existing;
+    const changed = this.db!.prepare(`UPDATE messages SET metadata = json_set(metadata, '$.proposalStatus', 'created', '$.createdTaskId', ?, '$.claimOwnerToken', null, '$.claimStartedAt', null), updatedAt = ? WHERE id = ? AND json_extract(metadata, '$.proposalStatus') = 'creating' AND json_extract(metadata, '$.claimOwnerToken') = ?`).run(createdTaskId, new Date().toISOString(), messageId, claimOwnerToken).changes;
+    if (!changed) return null;
+    this.db!.bumpLastModified(); const message = await this.getMessage(messageId); if (message) this.emit("message:updated", message); return message;
+  }
+
+  async releaseProposalClaim(messageId: string, claimOwnerToken: string): Promise<Message | null> {
+    if (this.asyncLayer) { const message = await asyncMessageStore.releaseProposalClaim(this.asyncLayer.db, messageId, claimOwnerToken); if (message) this.emit("message:updated", message); return message; }
+    const changed = this.db!.prepare(`UPDATE messages SET metadata = json_set(metadata, '$.proposalStatus', 'pending', '$.claimOwnerToken', null, '$.claimStartedAt', null), updatedAt = ? WHERE id = ? AND json_extract(metadata, '$.proposalStatus') = 'creating' AND json_extract(metadata, '$.claimOwnerToken') = ?`).run(new Date().toISOString(), messageId, claimOwnerToken).changes;
+    if (!changed) return null; this.db!.bumpLastModified(); const message = await this.getMessage(messageId); if (message) this.emit("message:updated", message); return message;
+  }
+
+  async reconcileProposalCreation(messageId: string, resolvedTaskId: string | undefined): Promise<Message | null> {
+    const message = await this.getMessage(messageId);
+    if (!message || message.metadata?.proposalStatus !== "creating") return message;
+    if (resolvedTaskId) return this.finalizeProposalCreation(messageId, message.metadata.claimOwnerToken ?? "", resolvedTaskId);
+    return this.releaseProposalClaim(messageId, message.metadata.claimOwnerToken ?? "");
   }
 
   /**

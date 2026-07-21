@@ -32,8 +32,8 @@ describe("electron-builder desktop config", () => {
     const extractArchValues = (archBlock: string) =>
       Array.from(archBlock.matchAll(/-\s*(x64|arm64)/g), (match) => match[1]).sort();
 
-    expect(extractArchValues(nsisArchMatch![1])).toEqual(["arm64", "x64"]);
-    expect(extractArchValues(portableArchMatch![1])).toEqual(["arm64", "x64"]);
+    expect(extractArchValues(nsisArchMatch![1])).toEqual(["x64"]);
+    expect(extractArchValues(portableArchMatch![1])).toEqual(["x64"]);
 
     expect(builderConfig).toMatch(/nsis:\s*[\s\S]*?artifactName:\s*"\$\{productName\}-\$\{version\}-\$\{os\}-\$\{arch\}\.\$\{ext\}"/m);
     expect(builderConfig).toMatch(/nsis:\s*[\s\S]*?oneClick:\s*false/m);
@@ -75,6 +75,18 @@ describe("electron-builder desktop config", () => {
 
     expect(builderConfig).toMatch(/mac:\s*[\s\S]*?target:\s*[\s\S]*?-\s*target:\s*dmg/m);
     expect(builderConfig).toMatch(/mac:\s*[\s\S]*?target:\s*[\s\S]*?-\s*target:\s*zip/m);
+
+    const macSection = builderConfig.match(/mac:\s*([\s\S]*?)(?=\nwin:)/m)?.[1] ?? "";
+    const macArchBlocks = Array.from(
+      macSection.matchAll(/-\s*target:\s*(dmg|zip)\s*arch:\s*([\s\S]*?)(?=\n\s*-\s*target:|\n\w|$)/g),
+    );
+    expect(macArchBlocks).toHaveLength(2);
+    for (const [, , archBlock] of macArchBlocks) {
+      expect(Array.from(archBlock.matchAll(/-\s*(x64|arm64)/g), (entry) => entry[1]).sort()).toEqual([
+        "arm64",
+        "x64",
+      ]);
+    }
 
     const linuxSectionMatch = builderConfig.match(/linux:\s*[\s\S]*$/m);
     expect(linuxSectionMatch?.[0]).toBeDefined();
@@ -120,6 +132,23 @@ describe("electron-builder desktop config", () => {
     }
   });
 
+  it("unpacks full embedded Postgres packages from app.asar", async () => {
+    /*
+     * FNXC:DesktopEmbeddedPostgres 2026-07-14-18:25:
+     * Native-only asarUnpack left dist/index.js inside app.asar; binary paths then
+     * resolved under the archive and chmod/spawn failed on packaged desktop boots.
+     * Assert the full platform + parent packages are unpacked.
+     */
+    const builderConfig = await readDesktopFile("electron-builder.yml");
+
+    expect(builderConfig).toMatch(
+      /asarUnpack:\s*[\s\S]*?-\s*"node_modules\/@embedded-postgres\/\*\*\/\*"/m,
+    );
+    expect(builderConfig).toMatch(
+      /asarUnpack:\s*[\s\S]*?-\s*"node_modules\/embedded-postgres\/\*\*\/\*"/m,
+    );
+  });
+
   it("packages @fusion/core runtime dependencies used during desktop startup", async () => {
     const builderConfig = await readDesktopFile("electron-builder.yml");
     const requiredRuntimeDependencyGlobs = [
@@ -142,6 +171,31 @@ describe("electron-builder desktop config", () => {
       "node_modules/minizlib/**/*",
       "node_modules/yallist/**/*",
       "node_modules/yaml/**/*",
+      // FNXC:DesktopEmbeddedPostgres 2026-07-14-18:25: local-mode Postgres boot deps
+      // FNXC:DesktopEmbeddedPostgres 2026-07-15-03:11: assert the full pg transitive
+      // allowlist (protocol/types/pgpass/codecs/split2/xtend) so dropping any glob
+      // fails this regression and cannot silently break packaged startup.
+      "node_modules/embedded-postgres/**/*",
+      "node_modules/@embedded-postgres/**/*",
+      "node_modules/pg/**/*",
+      "node_modules/pg-connection-string/**/*",
+      "node_modules/pg-int8/**/*",
+      "node_modules/pg-pool/**/*",
+      "node_modules/pg-protocol/**/*",
+      "node_modules/pg-types/**/*",
+      "node_modules/pgpass/**/*",
+      "node_modules/postgres-array/**/*",
+      "node_modules/postgres-bytea/**/*",
+      "node_modules/postgres-date/**/*",
+      "node_modules/postgres-interval/**/*",
+      "node_modules/split2/**/*",
+      "node_modules/xtend/**/*",
+      "node_modules/postgres/**/*",
+      "node_modules/async-exit-hook/**/*",
+      // FNXC:DesktopOmpPlugin 2026-07-14-18:55: dashboard-static plugin packages
+      "node_modules/@fusion-plugin-examples/**/*",
+      "node_modules/@fusion/plugin-sdk/**/*",
+      "node_modules/@agentclientprotocol/sdk/**/*",
     ];
 
     for (const dependencyGlob of requiredRuntimeDependencyGlobs) {

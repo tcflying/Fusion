@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { makeReliabilityFixture } from "./_helpers.js";
+/*
+FNXC:PgMigrationQuarantine 2026-07-18-04:10:
+VAL-REMOVAL-005 reliability fixtures use PostgreSQL AsyncDataLayer storage. Read
+run audits through getRunAuditEventsAsync so each assertion observes committed
+backend events rather than the removed synchronous SQLite read surface.
+*/
+import { hasGit, hasPg, makeReliabilityFixture } from "./_helpers.js";
 
-describe("reliability interactions: meta chain auto-close", () => {
+const canRun = hasGit && hasPg;
+(canRun ? describe : describe.skip)("reliability interactions: meta chain auto-close", () => {
   it("replays FN-4890 incident shape across two maintenance ticks", async () => {
     const now = Date.now();
     const fixture = await makeReliabilityFixture({
@@ -71,7 +78,7 @@ describe("reliability interactions: meta chain auto-close", () => {
         [meta4.id]: "archived",
       });
 
-      const runAudits = fixture.store.getRunAuditEvents({ limit: 200 });
+      const runAudits = await fixture.store.getRunAuditEventsAsync({ limit: 200 });
       const decayAudits = runAudits.filter((event) => event.mutationType === "task:auto-rebound-paused-scope-decay");
       const metaResolvedAudits = runAudits.filter((event) => event.mutationType === "task:auto-archived-meta-resolved");
       expect(decayAudits.length).toBeGreaterThanOrEqual(1);

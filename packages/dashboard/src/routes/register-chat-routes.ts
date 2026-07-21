@@ -193,10 +193,24 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
       }
 
       const agentId = `${TASK_PLANNER_CHAT_AGENT_ID_PREFIX}${task.id}`;
-      const existing = await chatStore.findLatestActiveSessionForTarget({
+      let existing = await chatStore.findLatestActiveSessionForTarget({
         agentId,
         ...(projectId ? { projectId } : {}),
       });
+
+      // FNXC:CentralProjectIdentity 2026-07-14-00:15:
+      // ctx projectId now resolves to the launch id, so a projectId-filtered lookup
+      // misses legacy active planner sessions created with a null projectId → we'd
+      // create a duplicate. On a scoped miss, retry unscoped and reuse a matched
+      // legacy (null-projectId) session for this task-specific agent. The projectId
+      // is not stamped onto it: ChatSessionUpdateInput has no projectId field, so no
+      // clean update path exists — reusing it is enough to prevent the duplicate.
+      if (!existing && projectId) {
+        const legacy = await chatStore.findLatestActiveSessionForTarget({ agentId });
+        if (legacy && legacy.projectId == null) {
+          existing = legacy;
+        }
+      }
 
       if (existing) {
         const session = modelProvider && modelId
@@ -477,7 +491,12 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
    * PATCH /api/chat/sessions/:id
    * Update a chat session (title, status, thinkingLevel, model, or agent target).
    * Body: { title?: string, status?: "active" | "archived", thinkingLevel?: string | null,
-   *         modelProvider?: string | null, modelId?: string | null, agentId?: string }
+   *         modelProvider?: string | null, modelId?: string | null, agentId?: string, pinned?: boolean }
+   *
+   * FNXC:ChatPinned 2026-07-16-12:00:
+   * `pinned` delegates to ChatStore's advisory-lock-protected max-three check.
+   * Null project sessions use its default scope safely, and archiving clears
+   * pinnedAt in the same store update so archived sessions cannot retain pins.
    *
    * FNXC:Chat-ThinkingLevel 2026-07-12-19:30:
    * FN-7775 only let a user pick a session's thinking level at creation time
@@ -512,6 +531,7 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
         modelProvider: rawModelProvider,
         modelId: rawModelId,
         agentId: rawAgentId,
+        pinned: rawPinned,
       } = req.body as {
         title?: string;
         status?: string;
@@ -519,11 +539,16 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
         modelProvider?: string | null;
         modelId?: string | null;
         agentId?: string;
+        pinned?: boolean;
       };
 
       // Validate status if provided
       if (status !== undefined && status !== "active" && status !== "archived") {
         throw badRequest("status must be 'active' or 'archived'");
+      }
+
+      if (rawPinned !== undefined && typeof rawPinned !== "boolean") {
+        throw badRequest("pinned must be a boolean");
       }
 
       // Normalize thinkingLevel before persisting: undefined leaves the field
@@ -558,7 +583,7 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
         normalizedAgentId = rawAgentId.trim();
       }
 
-      const session = await chatStore.updateSession(sessionId, {
+      let session = await chatStore.updateSession(sessionId, {
         ...(title !== undefined && { title: title?.trim() || null }),
         ...(status !== undefined && { status }),
         ...(normalizedThinkingLevel !== undefined && { thinkingLevel: normalizedThinkingLevel }),
@@ -568,6 +593,16 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
 
       if (!session) {
         throw notFound(`Chat session ${sessionId} not found`);
+      }
+      if (rawPinned !== undefined) {
+        try {
+          session = await chatStore.setSessionPinned(sessionId, rawPinned);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unable to update conversation pin";
+          if (message.includes("pin") || message.includes("Archived")) throw badRequest(message);
+          throw err;
+        }
+        if (!session) throw notFound(`Chat session ${sessionId} not found`);
       }
 
       res.json({ session });
@@ -736,8 +771,13 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
         throw notFound(`Chat session ${sessionId} not found`);
       }
 
+      // FNXC:CentralProjectIdentity 2026-07-14-00:15:
+      // ctx projectId now resolves to the launch id, but legacy sessions stored a
+      // null/undefined projectId before scoping existed. Treat those as launch-owned
+      // so attaching to their in-flight stream is not spuriously 404'd; only reject a
+      // session that is explicitly stamped with a DIFFERENT project id.
       const { projectId } = await getProjectContext(req);
-      if (projectId !== undefined && session.projectId !== projectId) {
+      if (projectId !== undefined && session.projectId != null && session.projectId !== projectId) {
         throw notFound(`Chat session ${sessionId} not found`);
       }
 

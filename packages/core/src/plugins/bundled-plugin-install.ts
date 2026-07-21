@@ -24,6 +24,7 @@ import type { PluginStore } from "../plugin-store.js";
 const DEPENDENCY_GRAPH_PLUGIN_ID = "fusion-plugin-dependency-graph";
 const CURSOR_RUNTIME_PLUGIN_ID = "fusion-plugin-cursor-runtime";
 const GROK_RUNTIME_PLUGIN_ID = "fusion-plugin-grok-runtime";
+export const CLAUDE_RUNTIME_PLUGIN_ID = "fusion-plugin-claude-runtime";
 
 export const BUNDLED_PLUGIN_IDS = [
   "fusion-plugin-dependency-graph",
@@ -31,13 +32,18 @@ export const BUNDLED_PLUGIN_IDS = [
   "fusion-plugin-whatsapp-chat",
   "fusion-plugin-roadmap",
   "fusion-plugin-hermes-runtime",
+  "fusion-plugin-happier-runtime",
   "fusion-plugin-openclaw-runtime",
   "fusion-plugin-paperclip-runtime",
   "fusion-plugin-cursor-runtime",
   "fusion-plugin-grok-runtime",
+  "fusion-plugin-claude-runtime",
+  // FNXC:OmpAcp 2026-07-11-23:35: Oh My Pi ACP runtime available as a staged/bundled install target.
+  "fusion-plugin-omp-runtime",
   "fusion-plugin-cli-printing-press",
   "fusion-plugin-compound-engineering",
   "fusion-plugin-linear-import",
+  "fusion-plugin-quality",
 ] as const;
 
 export type BundledPluginId = (typeof BUNDLED_PLUGIN_IDS)[number];

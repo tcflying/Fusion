@@ -20,6 +20,12 @@ import {
 } from "@fusion-plugin-examples/hermes-runtime";
 
 import {
+  probeHappierRuntime,
+  type HappierCliSettings,
+  type HappierRuntimeHealth,
+} from "@fusion-plugin-examples/happier-runtime";
+
+import {
   probeOpenClawBinary,
   type OpenClawBinaryStatus,
 } from "@fusion-plugin-examples/openclaw-runtime";
@@ -35,6 +41,22 @@ import {
   probeGrokBinary,
   type GrokBinaryStatus,
 } from "@fusion-plugin-examples/grok-runtime";
+
+import {
+  discoverClaudeProviderModels,
+  probeClaudeBinary,
+  type ClaudeBinaryStatus,
+} from "@fusion-plugin-examples/claude-runtime";
+
+/*
+FNXC:OmpAcp 2026-07-13-22:50:
+Oh My Pi (omp) ACP runtime probe façade — same boundary as Grok/Cursor so route handlers and tests mock here without importing the plugin package directly.
+*/
+import {
+  discoverOmpProviderModels,
+  probeOmpBinary,
+  type OmpBinaryStatus,
+} from "@fusion-plugin-examples/omp-runtime";
 
 import {
   agentsMe,
@@ -55,6 +77,7 @@ import {
 } from "@fusion-plugin-examples/paperclip-runtime";
 
 export type {
+  HappierRuntimeHealth,
   HermesBinaryStatus,
   HermesProfileSummary,
   MintCliKeyOptions,
@@ -62,6 +85,8 @@ export type {
   OpenClawBinaryStatus,
   CursorBinaryStatus,
   GrokBinaryStatus,
+  ClaudeBinaryStatus,
+  OmpBinaryStatus,
   PaperclipAgentSummary,
   PaperclipCliDiscoveryResult,
   PaperclipCompanySummary,
@@ -75,6 +100,27 @@ export async function probeCursorCliProvider(opts?: { binaryPath?: string }): Pr
 
 export async function probeGrokCliProvider(opts?: { binaryPath?: string }): Promise<GrokBinaryStatus> {
   return probeGrokBinary(opts);
+}
+
+export async function probeClaudeCliProvider(opts?: { binaryPath?: string }): Promise<ClaudeBinaryStatus> {
+  return probeClaudeBinary(opts);
+}
+
+export async function discoverClaudeCliModels(opts?: { binaryPath?: string; timeoutMs?: number }) {
+  return discoverClaudeProviderModels(opts);
+}
+
+/*
+FNXC:OmpAcp 2026-07-11-23:35:
+Oh My Pi (omp) ACP runtime probe façade — same boundary pattern as Grok/Cursor so
+route handlers and tests mock here without importing the plugin package directly.
+*/
+export async function probeOmpCliProvider(opts?: { binaryPath?: string }): Promise<OmpBinaryStatus> {
+  return probeOmpBinary(opts);
+}
+
+export async function discoverOmpCliModels(opts?: { binaryPath?: string; timeoutMs?: number }) {
+  return discoverOmpProviderModels(opts);
 }
 
 /**
@@ -151,6 +197,13 @@ export async function probeHermesProvider(opts?: {
   binaryPath?: string;
 }): Promise<HermesBinaryStatus> {
   return probeHermesBinary(opts);
+}
+
+/** Probe every non-secret Happier runtime layer through official CLI contracts. */
+export async function probeHappierProvider(
+  settings?: HappierCliSettings,
+): Promise<HappierRuntimeHealth> {
+  return probeHappierRuntime(settings);
 }
 
 /**

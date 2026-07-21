@@ -9,8 +9,11 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     getSettings: vi.fn().mockResolvedValue({ requirePlanApproval: false } as Settings),
     logEntry: vi.fn(),
     deleteTask: vi.fn(),
+    deleteTaskIf: vi.fn().mockResolvedValue({ deleted: true }),
     recordActivity: vi.fn(),
     updateTask: vi.fn(),
+    withTaskLock: vi.fn().mockImplementation(async (_id: string, operation: () => Promise<unknown>) => await operation()),
+    readTaskForMove: vi.fn().mockImplementation(async () => createTask()),
     moveTask: vi.fn(),
     on: vi.fn(),
     off: vi.fn(),
@@ -43,9 +46,10 @@ describe("triage explicit duplicate marker short-circuit", () => {
     store: TaskStore,
     task: Task,
     prompt: string,
+    testSettings: Settings = settings,
   ): Promise<boolean> {
     const processor = new TriageProcessor(store, rootDir);
-    return await (processor as any).tryFinalizeExplicitDuplicateMarker(task, prompt, settings, {});
+    return await (processor as any).tryFinalizeExplicitDuplicateMarker(task, prompt, testSettings, {});
   }
 
   it("deletes the duplicate task and records explicit-marker activity", async () => {
@@ -54,9 +58,9 @@ describe("triage explicit duplicate marker short-circuit", () => {
       getTask: vi.fn().mockImplementation(async (id: string) => (id === canonical.id ? canonical : null)),
     });
 
-    await expect(runExplicitDuplicateMarker(store, createTask(), "DUPLICATE: FN-001\n")).resolves.toBe(true);
+    await expect(runExplicitDuplicateMarker(store, createTask(), "DUPLICATE: FN-001\n", { ...settings, triageDuplicateResolution: "delete" })).resolves.toBe(true);
 
-    expect(store.deleteTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+    expect((store as any).deleteTaskIf).toHaveBeenCalledWith("FN-002", expect.any(Function), expect.objectContaining({
       removeLineageReferences: true,
       auditContext: expect.objectContaining({
         agentId: "triage",
@@ -70,15 +74,116 @@ describe("triage explicit duplicate marker short-circuit", () => {
     }));
   });
 
-  it("does not short-circuit when the canonical target is missing", async () => {
+
+  it("flags and system-pauses duplicates by default instead of deleting", async () => {
+    const canonical = createTask({ id: "FN-001", column: "todo" });
+    const store = createMockStore({ getTask: vi.fn().mockResolvedValue(canonical) });
+    await expect(runExplicitDuplicateMarker(store, createTask(), "DUPLICATE: FN-001\n")).resolves.toBe(true);
+    expect(store.deleteTask).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: true, pausedReason: "duplicate-decision-required" }));
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({ sourceMetadataPatch: expect.objectContaining({ nearDuplicateOf: "FN-001", duplicateSource: "triage-marker" }) }));
+  });
+
+  it("keeps a marker duplicate by clearing its system pause for replanning", async () => {
+    const canonical = createTask({ id: "FN-001", column: "todo" });
+    const task = createTask();
     const store = createMockStore({
-      getTask: vi.fn().mockResolvedValue(null),
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+      withTaskLock: vi.fn().mockImplementation(async (_id: string, operation: () => Promise<unknown>) => await operation()),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
+    });
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n", { ...settings, triageDuplicateResolution: "keep" })).resolves.toBe(true);
+    expect(store.deleteTask).not.toHaveBeenCalled();
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: false, pausedReason: null, status: null }));
+  });
+
+  it("does not re-pause a same-canonical Keep acknowledgement after marker reprocessing", async () => {
+    const canonical = createTask({ id: "FN-001", column: "todo" });
+    const task = createTask({
+      sourceMetadata: { nearDuplicateOf: "fn-001", duplicateSource: "triage-marker", nearDuplicateDismissed: true },
+    });
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === canonical.id ? canonical : task),
+      withTaskLock: vi.fn().mockImplementation(async (_id: string, operation: () => Promise<unknown>) => await operation()),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
     });
 
-    await expect(runExplicitDuplicateMarker(store, createTask(), "DUPLICATE: FN-999\n")).resolves.toBe(false);
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
 
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      paused: false,
+      pausedReason: null,
+      sourceMetadataPatch: { nearDuplicateDismissed: true },
+    }));
+    expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: true }));
+  });
+
+  it("prompts when a reprocessed marker names a different active canonical", async () => {
+    const canonical = createTask({ id: "FN-001", column: "todo" });
+    const task = createTask({
+      sourceMetadata: { nearDuplicateOf: "FN-003", duplicateSource: "triage-marker", nearDuplicateDismissed: true },
+    });
+    const store = createMockStore({ getTask: vi.fn().mockResolvedValue(canonical) });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", expect.objectContaining({
+      paused: true,
+      pausedReason: "duplicate-decision-required",
+      sourceMetadataPatch: expect.objectContaining({ nearDuplicateDismissed: false, nearDuplicateOf: "FN-001" }),
+    }));
+  });
+
+  it("preserves a user pause when reprocessing an acknowledged marker", async () => {
+    const canonical = createTask({ id: "FN-001", column: "todo" });
+    const task = createTask({
+      paused: true,
+      pausedReason: "manual",
+      userPaused: true,
+      sourceMetadata: { nearDuplicateOf: "FN-001", duplicateSource: "triage-marker", nearDuplicateDismissed: true },
+    });
+    const store = createMockStore({
+      getTask: vi.fn().mockResolvedValue(canonical),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
+    });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).not.toHaveBeenCalled();
+  });
+  it.each([
+    ["missing", null],
+    ["soft-deleted", createTask({ id: "FN-001", deletedAt: new Date().toISOString() })],
+    ["done", createTask({ id: "FN-001", column: "done" })],
+    ["archived", createTask({ id: "FN-001", column: "archived" })],
+  ])("clears an inactive %s canonical marker instead of pausing for a hidden decision", async (_state, canonical) => {
+    const task = createTask();
+    const store = createMockStore({
+      getTask: vi.fn().mockImplementation(async (id: string) => id === "FN-001" ? canonical : task),
+      readTaskForMove: vi.fn().mockResolvedValue(task),
+    });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).toHaveBeenCalledWith("FN-002", {
+      paused: false,
+      pausedReason: null,
+      status: null,
+    });
+    expect(store.updateTask).not.toHaveBeenCalledWith("FN-002", expect.objectContaining({ paused: true }));
     expect(store.deleteTask).not.toHaveBeenCalled();
-    expect(store.recordActivity).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["user pause", createTask({ userPaused: true, paused: true, pausedReason: "manual" })],
+    ["implicit user pause", createTask({ paused: true, pausedReason: null })],
+    ["unrelated pause", createTask({ paused: true, pausedReason: "awaiting-approval" })],
+  ])("preserves a %s while an inactive marker is encountered", async (_label, task) => {
+    const store = createMockStore({ getTask: vi.fn().mockResolvedValue(null) });
+
+    await expect(runExplicitDuplicateMarker(store, task, "DUPLICATE: FN-001\n")).resolves.toBe(true);
+
+    expect(store.updateTask).not.toHaveBeenCalled();
   });
 
   it("does not short-circuit on circular self-reference", async () => {

@@ -29,18 +29,19 @@ import {
   registerBuiltInZaiProvider,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
-import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
+import { createDaemonRoomControlPlaneAuthorizer, createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
+  createWindowsNativeRoomHostCompositionAdapterRegistry,
   PeerExchangeService,
   HybridExecutor,
   shouldUseHybridExecutor,
   setHostExtensionPaths,
   createFusionAuthStorage,
+  createFusionModelRegistry,
 } from "@fusion/engine";
 import {
   DefaultPackageManager,
-  ModelRegistry,
   SettingsManager,
   discoverAndLoadExtensions,
   createExtensionRuntime,
@@ -56,7 +57,7 @@ import {
 import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
+import { getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import {
   ensureClaudeSkillsForAllProjectsOnStartup,
@@ -284,29 +285,37 @@ export async function runServe(
    * The SQLite CentralDatabase path is removed (VAL-REMOVAL-005). CentralCore
    * needs its AsyncDataLayer attached to function against PostgreSQL. We use
    * the same startup factory the engine uses to resolve the backend, extract
-   * the asyncLayer for CentralCore, then pass the full boot result (including
+   * its unscoped hostAsyncLayer for CentralCore, then pass the full boot result (including
    * the TaskStore) as the externalTaskStore for the cwd project's engine so
    * the connection pool is shared — no second embedded PG instance is started.
    */
-  let centralBootResult: { taskStore: import("@fusion/core").TaskStore; asyncLayer: import("@fusion/core").AsyncDataLayer; shutdown: () => Promise<void> } | null = null;
+  let centralBootResult: {
+    taskStore: import("@fusion/core").TaskStore;
+    asyncLayer: import("@fusion/core").AsyncDataLayer;
+    hostAsyncLayer: import("@fusion/core").AsyncDataLayer;
+    shutdown: () => Promise<void>;
+  } | null = null;
+  let centralBackendAvailable = false;
   try {
     const { createTaskStoreForBackend } = await import("@fusion/core");
     centralBootResult = await createTaskStoreForBackend({ rootDir: cwd });
     if (centralBootResult) {
-      sharedCentralCore = new CentralCore(undefined, { asyncLayer: centralBootResult.asyncLayer });
-    } else {
-      sharedCentralCore = new CentralCore();
+      // FNXC:HostBootstrap 2026-07-20-05:16: host coordination must use the
+      // factory's unscoped sibling layer; the project-bound TaskStore layer
+      // remains reserved for project data and owns the shared pool lifecycle.
+      sharedCentralCore = new CentralCore(undefined, { asyncLayer: centralBootResult.hostAsyncLayer });
+      await sharedCentralCore.init();
+      centralBackendAvailable = true;
     }
-    await sharedCentralCore.init();
   } catch {
-    if (!sharedCentralCore) {
-      sharedCentralCore = new CentralCore();
-      try {
-        await sharedCentralCore.init();
-      } catch {
-        // Non-fatal — engine uses fallback defaults
-      }
+    await sharedCentralCore?.close().catch(() => undefined);
+    sharedCentralCore = null;
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
     }
+    // FNXC:CliCentralRegistration 2026-07-19-21:46: never route cwd auto-registration through a CentralCore without an AsyncDataLayer.
+    console.warn("[serve] Central PostgreSQL bootstrap failed; CWD auto-registration is disabled for this run.");
   }
 
   // ── ProjectEngineManager: uniform engine lifecycle for all projects ──
@@ -373,14 +382,16 @@ export async function runServe(
     }
   }
 
-  if (sharedCentralCore) {
+  if (sharedCentralCore && (centralBackendAvailable || opts.noAutoRegister)) {
     const registered = await ensureCwdProjectRegistered({
       cwd,
       central: sharedCentralCore,
       logPrefix: "serve",
-      autoRegister: !opts.noAutoRegister,
+      autoRegister: centralBackendAvailable && !opts.noAutoRegister,
     });
     ntfyProjectId = registered?.id;
+  } else if (!centralBackendAvailable) {
+    console.warn("[serve] Central PostgreSQL backend is unavailable; skipped CWD project auto-registration.");
   }
 
   try {
@@ -392,6 +403,16 @@ export async function runServe(
   const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
   const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
+  /*
+   * FNXC:WindowsNativeRoomHostComposition 2026-07-21-02:17:
+   * Build one registry from the canonical unscoped bootstrap layer and give it
+   * to the manager. Do not infer provider telemetry from settings or labels.
+   */
+  const roomHostCompositionOperatorAdapterRegistry =
+    createWindowsNativeRoomHostCompositionAdapterRegistry({
+      hostAsyncLayer: centralBootResult?.hostAsyncLayer,
+    });
+
   const engineManager = new ProjectEngineManager(sharedCentralCore, {
     cliPackageVersion,
     getMergeStrategy,
@@ -402,6 +423,7 @@ export async function runServe(
     prNodeGithubOps: createPrNodeGithubOps(githubClient),
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
+    roomHostCompositionOperatorAdapterRegistry,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
     // FNXC:SqliteFinalRemoval 2026-06-26-11:15: share the central boot's TaskStore
     // as the externalTaskStore so the cwd engine reuses the same connection pool
@@ -636,8 +658,6 @@ export async function runServe(
          */
         if (store.isBackendMode()) {
           console.log("[plugins] Schema initialization skipped — backend mode (PostgreSQL Drizzle migrations)");
-        } else {
-          await store.getDatabase().runPluginSchemaInits(schemaHooks);
         }
       } catch (err) {
         console.error(
@@ -658,7 +678,7 @@ export async function runServe(
   const automationStore = primaryEngine.getAutomationStore();
 
   const authStorage = createFusionAuthStorage();
-  const modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
+  const modelRegistry = await createFusionModelRegistry(authStorage);
   registerBuiltInZaiProvider(modelRegistry, (message) => console.log(`[extensions] ${message}`));
   registerBuiltInGrokProvider(modelRegistry, (message) => console.log(`[extensions] ${message}`));
   const dashboardAuthStorage = wrapAuthStorageWithApiKeyProviders(authStorage, modelRegistry);
@@ -848,6 +868,9 @@ export async function runServe(
     }
   }
 
+  const roomControlPlaneAuthorizeProject: NonNullable<Parameters<typeof createServer>[1]>["roomControlPlaneAuthorizeProject"] =
+    daemonToken ? createDaemonRoomControlPlaneAuthorizer(daemonToken) : undefined;
+
   // ── Skills adapter for skills discovery and execution toggling ─────────────
   //
   // Create the skills adapter using the same DefaultPackageManager instance
@@ -1016,6 +1039,7 @@ export async function runServe(
     },
     headless: true,
     skillsAdapter,
+    roomControlPlaneAuthorizeProject,
     daemon: daemonToken ? { token: daemonToken } : undefined,
     https: loadTlsCredentialsFromEnv(),
   });
@@ -1193,6 +1217,11 @@ export async function runServe(
         // best-effort
       });
       centralCore = null;
+    }
+
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
     }
 
     try {

@@ -11,14 +11,14 @@
  *
  * Requires packages/core to be built (`pnpm --filter @fusion/core build`).
  */
-import { cpSync, existsSync } from "node:fs";
+import { cpSync, existsSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 /**
- * Stage the PostgreSQL baseline migration SQL into core's dist. `tsc` emits
+ * Stage the PostgreSQL migration SQL into core's dist. `tsc` emits
  * only JS, so dist lacks src/postgres/migrations/*.sql; the schema applier
  * resolves them relative to the compiled file (__dirname/migrations). The CLI
  * bundle does the same staging in packages/cli/tsup.config.ts.
@@ -26,7 +26,14 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 function ensureMigrationsStaged() {
   const src = resolve(repoRoot, "packages/core/src/postgres/migrations");
   const dest = resolve(repoRoot, "packages/core/dist/postgres/migrations");
-  if (existsSync(src) && !existsSync(resolve(dest, "0000_initial.sql"))) {
+  /*
+   * FNXC:AutomationIsolation 2026-07-13-22:37:
+   * Operational scripts must stage every versioned PostgreSQL migration, not merely the initial baseline, so an already-initialized database receives the automation project-isolation upgrade before scripts open it.
+   */
+  const requiredMigrations = existsSync(src)
+    ? readdirSync(src).filter((file) => file.endsWith(".sql"))
+    : [];
+  if (existsSync(src) && requiredMigrations.some((file) => !existsSync(resolve(dest, file)))) {
     cpSync(src, dest, { recursive: true });
   }
 }
@@ -56,18 +63,12 @@ async function importCore() {
  * - `shutdown` — releases the pool and stops an embedded cluster this boot
  *   started. Always call it in `finally`.
  *
- * Throws when the factory opts out (FUSION_NO_EMBEDDED_PG=1): these scripts
- * must never fall back to the removed SQLite runtime.
+ * Throws when PostgreSQL cannot start. These scripts must never fall back to
+ * the removed SQLite runtime.
  */
 export async function openBackend(rootDir = process.cwd()) {
   const core = await importCore();
   const boot = await core.createTaskStoreForBackend({ rootDir });
-  if (!boot) {
-    throw new Error(
-      "PostgreSQL backend unavailable (FUSION_NO_EMBEDDED_PG=1 opt-out is set). " +
-        "This script requires the PostgreSQL backend; the SQLite runtime was removed.",
-    );
-  }
   const asyncLayer = boot.taskStore.getAsyncLayer();
   if (!asyncLayer) {
     await boot.shutdown().catch(() => {});

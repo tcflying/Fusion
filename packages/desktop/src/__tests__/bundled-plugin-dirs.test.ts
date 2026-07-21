@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { pathToFileURL } from "node:url";
+import { dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { resolveDesktopBundlePluginDirs } from "../bundled-plugin-dirs.js";
 
 /*
@@ -21,7 +22,8 @@ describe("resolveDesktopBundlePluginDirs", () => {
     });
 
     expect(requestedSpecifier).toBe("@fusion-plugin-examples/hermes-runtime");
-    expect(dirs).toEqual(["/desktop/deploy/node_modules/@fusion-plugin-examples/hermes-runtime"]);
+    const expectedPackageRoot = dirname(dirname(fileURLToPath(pathToFileURL(fakeEntryPath))));
+    expect(dirs).toEqual([expectedPackageRoot]);
   });
 
   it("returns an empty candidate list when the package is not resolvable (e.g. desktop does not bundle it)", () => {
@@ -42,11 +44,13 @@ describe("resolveDesktopBundlePluginDirs", () => {
     resolveDesktopBundlePluginDirs("fusion-plugin-dependency-graph", resolver);
     resolveDesktopBundlePluginDirs("fusion-plugin-cli-printing-press", resolver);
     resolveDesktopBundlePluginDirs("fusion-plugin-openclaw-runtime", resolver);
+    resolveDesktopBundlePluginDirs("fusion-plugin-happier-runtime", resolver);
 
     expect(seen).toEqual([
       "@fusion-plugin-examples/dependency-graph",
       "@fusion-plugin-examples/cli-printing-press",
       "@fusion-plugin-examples/openclaw-runtime",
+      "@fusion-plugin-examples/happier-runtime",
     ]);
   });
 

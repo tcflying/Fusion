@@ -19,7 +19,13 @@ vi.mock("../../pi.js", () => ({
 import type { Settings } from "@fusion/core";
 import { activeSessionRegistry, executingTaskLock } from "../../active-session-registry.js";
 import { aiMergeTask } from "../../merger.js";
-import { git, hasGit, makeReliabilityFixture } from "./_helpers.js";
+/*
+FNXC:PgMigrationQuarantine 2026-07-18-04:10:
+VAL-REMOVAL-005 reliability fixtures use PostgreSQL AsyncDataLayer storage. Read
+run audits through getRunAuditEventsAsync so each assertion observes committed
+backend events rather than the removed synchronous SQLite read surface.
+*/
+import { git, hasGit, hasPg, makeReliabilityFixture } from "./_helpers.js";
 
 const RM = { recursive: true, force: true, maxRetries: 5, retryDelay: 50 } as const;
 
@@ -84,7 +90,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
     executingTaskLock._clearForTest();
   });
 
-  it.skipIf(!hasGit)("FN-6817: roots the shared reliability fixture under the Vitest worker root", async () => {
+  it.skipIf(!hasGit || !hasPg)("FN-6817: roots the shared reliability fixture under the Vitest worker root", async () => {
     const previousWorkerRoot = process.env.FUSION_TEST_WORKER_ROOT;
     const workerRoot = await mkdtemp(join(tmpdir(), "fn-6817-worker-root-"));
     process.env.FUSION_TEST_WORKER_ROOT = workerRoot;
@@ -113,7 +119,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
     }
   });
 
-  it.skipIf(!hasGit)("reacquires before spawning git when the reuse worktree cwd vanished", async () => {
+  it.skipIf(!hasGit || !hasPg)("reacquires before spawning git when the reuse worktree cwd vanished", async () => {
     const { fixture, rootDir, store, taskId, branch, worktreeRoot, worktreePath } = await setupReuseMergeFixture({
       taskId: "FN-6278-RI-VANISHED",
       fileName: "packages/engine/src/fn-6278-ri-vanished.ts",
@@ -128,7 +134,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
 
       const result = await aiMergeTask(store, rootDir, taskId);
       const taskAfter = await store.getTask(taskId);
-      const audits = store.getRunAuditEvents({ taskId });
+      const audits = await store.getRunAuditEventsAsync({ taskId });
       const auditTypes = audits.map((event) => event.mutationType);
 
       expect(result.merged).toBe(true);
@@ -161,7 +167,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
     }
   }, 60_000);
 
-  it.skipIf(!hasGit)("reacquires before spawning git when the reuse worktree is present but de-registered", async () => {
+  it.skipIf(!hasGit || !hasPg)("reacquires before spawning git when the reuse worktree is present but de-registered", async () => {
     const { fixture, rootDir, store, taskId, branch, worktreeRoot, worktreePath } = await setupReuseMergeFixture({
       taskId: "FN-6278-RI-UNREGISTERED",
       fileName: "packages/engine/src/fn-6278-ri-unregistered.ts",
@@ -180,7 +186,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
 
       const result = await aiMergeTask(store, rootDir, taskId);
       const taskAfter = await store.getTask(taskId);
-      const audits = store.getRunAuditEvents({ taskId });
+      const audits = await store.getRunAuditEventsAsync({ taskId });
       const auditTypes = audits.map((event) => event.mutationType);
 
       expect(result.merged).toBe(true);
@@ -207,7 +213,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
     }
   }, 60_000);
 
-  it.skipIf(!hasGit)("leaves a healthy reuse worktree on the normal handoff path", async () => {
+  it.skipIf(!hasGit || !hasPg)("leaves a healthy reuse worktree on the normal handoff path", async () => {
     const { fixture, rootDir, store, taskId, worktreeRoot, worktreePath } = await setupReuseMergeFixture({
       taskId: "FN-6278-RI-HEALTHY",
       fileName: "packages/engine/src/fn-6278-ri-healthy.ts",
@@ -217,7 +223,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
     try {
       const result = await aiMergeTask(store, rootDir, taskId);
       const taskAfter = await store.getTask(taskId);
-      const audits = store.getRunAuditEvents({ taskId });
+      const audits = await store.getRunAuditEventsAsync({ taskId });
       const auditTypes = audits.map((event) => event.mutationType);
 
       expect(result.merged).toBe(true);
@@ -233,7 +239,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
     }
   }, 60_000);
 
-  it.skipIf(!hasGit)("still surfaces genuine handoff failures after a healthy cwd preflight", async () => {
+  it.skipIf(!hasGit || !hasPg)("still surfaces genuine handoff failures after a healthy cwd preflight", async () => {
     const { fixture, rootDir, store, taskId, worktreeRoot, worktreePath } = await setupReuseMergeFixture({
       taskId: "FN-6278-RI-ACTIVE-BINDING",
       fileName: "packages/engine/src/fn-6278-ri-active-binding.ts",
@@ -247,7 +253,7 @@ describe("FN-6278 reliability interactions: merge runner cwd preflight", () => {
         gate: "active-session-binding",
       });
       const taskAfter = await store.getTask(taskId);
-      const audits = store.getRunAuditEvents({ taskId });
+      const audits = await store.getRunAuditEventsAsync({ taskId });
       const auditTypes = audits.map((event) => event.mutationType);
 
       expect(taskAfter?.column).toBe("in-review");

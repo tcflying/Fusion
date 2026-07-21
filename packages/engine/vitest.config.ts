@@ -295,6 +295,12 @@ export default defineConfig({
             // SQLite-path gate test evicted + quarantined (see engine-core comment + ledger).
             "node_modules/**",
             "dist/**",
+            // FNXC:PgMigrationQuarantine 2026-07-18-04:30: FN-8270 rescued the final seven VAL-REMOVAL-005 holdouts by awaiting PG audit reads and modeling async collaborators. Their paired ledger entries and excludes were removed only after targeted green runs.
+            // FNXC:WorkflowStepInstancePersistence 2026-07-16-20:35: FN-8157 restores this PG-backed foreach suite through async store persistence, so it must execute in engine-default.
+            /*
+            FNXC:EngineTests 2026-07-18-07:30:
+            FN-8271 restored heartbeat-error-recovery to engine-default after synchronizing on its first mocked prompt and draining the known retry timers once. This removes the load-amplified thirty-yield fake-timer poll without changing the 30s test timeout or recovery assertions; its matching quarantine-ledger row is removed in lockstep.
+            */
             /*
             FNXC:EngineTests 2026-06-14-02:11:
             FN-6433 rescued the AI-merge suites by replacing broad activeSessionRegistry cleanup with path-scoped cleanup, so the default engine lane should execute them again. The soft-delete blocker residue suite was deleted under the ratchet because deterministic soft-delete deadlock coverage already owns that invariant.
@@ -345,7 +351,20 @@ export default defineConfig({
             Database class being deleted. Quarantined on sight per AGENTS.md; mirrored in
             scripts/lib/test-quarantine.json.
             */
-            // SQLite-path (delete-sqlite-runtime-final SESSION 3 PHASE A): uses createStore via _helpers.ts (inMemoryDb:true).
+            // FNXC:PgMigrationQuarantine 2026-07-18-04:30: FN-8270 restored the final VAL-REMOVAL-005 reliability suites with awaited PostgreSQL audit reads. Keep the project partition below while allowing these tests to execute under engine-reliability.
+            // FNXC:PgMigrationQuarantine 2026-07-16-04:59:
+            // FN-8044 migrated dependency-reconcile suites to the PG corrupt-row seeding seam, so
+            // they are deliberately absent from this quarantine list and ledger.
+            // FNXC:PgMigrationQuarantine 2026-07-16-10:45:
+            // FN-8047 restored multi-node claim and owning-node handoff coverage with shared PG-backed
+            // AgentStores and AsyncCentralClaimStore; their paired ledger entries are intentionally live.
+            // FNXC:PgMigrationQuarantine 2026-07-16-11:25:
+            // FN-8117 restored explicit-marker coverage by configuring its PG fixture with taskPrefix: FN.
+            // The strict marker parser now receives valid FN ids, so this file is intentionally unquarantined.
+            // FNXC:PgMigrationQuarantine 2026-07-16-11:58:
+            // FN-8111 restored meta-archive guard composition with PG-authoritative audits and canonical fixture ids, and fixed completed stale continuations so the in-memory wedge suite is intentionally unquarantined.
+            // FNXC:PgMigrationQuarantine 2026-07-16-12:30:
+            // FN-8118 verified the already-landed post-done continuation rescue: this pure in-memory suite has no PG fixture and passed its serialized reliability lane three times. Keep it absent from this quarantine list while preserving the engine-default reliability partition exclusion.
           ],
           // These tests assert event ordering across real worktrees. Parallel
           // execution under merger load caused subprocess-guard timeouts and

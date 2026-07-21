@@ -207,6 +207,7 @@ describe("agent-action-gate", () => {
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_create", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_add_dep", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_delegate_task", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
+    expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_assign", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_update_agent_config", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_import_github", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
     expect(evaluateAgentActionGate({ agentId: "a1", toolName: "fn_task_import_github_issue", args: {}, permissionPolicy: unrestrictedPolicy }).category).toBe("task_agent_mutation");
@@ -527,18 +528,22 @@ describe("agent-action-gate", () => {
   it.each([
     "fn_task_create",
     "fn_delegate_task",
+    "fn_task_assign",
     "fn_task_import_github",
     "fn_task_import_github_issue",
     "fn_task_import_gitlab_project_issues",
     "fn_task_import_gitlab_group_issues",
     "fn_task_import_gitlab_merge_requests",
   ] as const)("governs task creation/import tool %s as task_agent_mutation", (toolName) => {
-    for (const args of [{}, undefined]) {
-      expect(evaluateAgentActionGate({ agentId: "a1", toolName, args, permissionPolicy: approvalPolicy })).toMatchObject({
+    const args = toolName === "fn_task_create" || toolName === "fn_delegate_task"
+      ? { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } }
+      : {};
+    for (const argsValue of [args, args]) {
+      expect(evaluateAgentActionGate({ agentId: "a1", toolName, args: argsValue, permissionPolicy: approvalPolicy })).toMatchObject({
         category: "task_agent_mutation",
         disposition: "require-approval",
       });
-      expect(evaluateAgentActionGate({ agentId: "a1", toolName, args, permissionPolicy: lockedDownPolicy })).toMatchObject({
+      expect(evaluateAgentActionGate({ agentId: "a1", toolName, args: argsValue, permissionPolicy: lockedDownPolicy })).toMatchObject({
         category: "task_agent_mutation",
         disposition: "block",
       });

@@ -396,6 +396,28 @@ describe("GET /plugins/:id/settings", () => {
     expect(res.body).toEqual({});
   });
 
+  it("returns empty settings for Happier before its first lazy install", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      Object.assign(new Error('Plugin "fusion-plugin-happier-runtime" not found'), { code: "ENOENT" }),
+    );
+
+    const res = await GET(buildApp(), "/api/plugins/fusion-plugin-happier-runtime/settings");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({});
+  });
+
+  it("does not hide a Happier settings store failure as an uninstalled plugin", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("plugin database unavailable"),
+    );
+
+    const res = await GET(buildApp(), "/api/plugins/fusion-plugin-happier-runtime/settings");
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toContain("plugin database unavailable");
+  });
+
   it("supports projectId query param scoping", async () => {
     const scopedPluginStore = createMockPluginStore();
     (scopedPluginStore.getPlugin as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -1080,7 +1102,7 @@ describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", (
   it("auto-installs a bundled runtime plugin on first save", async () => {
     // Plugin not yet registered → first getPlugin throws.
     (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error("Plugin not found"),
+      Object.assign(new Error("Plugin not found"), { code: "ENOENT" }),
     );
     (pluginStore.updatePluginSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ...FAKE_PLUGIN,
@@ -1099,6 +1121,63 @@ describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", (
     expect(res.status).toBe(200);
     expect(ensure).toHaveBeenCalledWith("fusion-plugin-hermes-runtime");
     expect(pluginStore.updatePluginSettings).toHaveBeenCalled();
+  });
+
+  it("auto-installs the Happier runtime on first save", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      Object.assign(new Error("Plugin not found"), { code: "ENOENT" }),
+    );
+    (pluginStore.updatePluginSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ...FAKE_PLUGIN,
+      id: "fusion-plugin-happier-runtime",
+      settings: { backend: "codex" },
+    });
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-happier-runtime/settings",
+      { settings: { backend: "codex" } },
+    );
+
+    expect(res.status).toBe(200);
+    expect(ensure).toHaveBeenCalledWith("fusion-plugin-happier-runtime");
+    expect(pluginStore.updatePluginSettings).toHaveBeenCalled();
+  });
+
+  it("rejects undeclared Happier settings before install or persistence", async () => {
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-happier-runtime/settings",
+      { settings: { token: "must-not-store" } },
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Unsupported Happier setting");
+    expect(ensure).not.toHaveBeenCalled();
+    expect(pluginStore.updatePluginSettings).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-install Happier when the plugin store itself fails", async () => {
+    (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new Error("plugin database unavailable"),
+    );
+    const ensure = vi.fn().mockResolvedValue(true);
+
+    const res = await REQUEST(
+      buildAppWithBundleHook(ensure),
+      "PUT",
+      "/api/plugins/fusion-plugin-happier-runtime/settings",
+      { settings: { backend: "codex" } },
+    );
+
+    expect(res.status).toBe(500);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(pluginStore.updatePluginSettings).not.toHaveBeenCalled();
   });
 
   it("skips auto-install when the plugin is already registered", async () => {
@@ -1134,7 +1213,7 @@ describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", (
 
   it("returns 500 with intentional message when bundled auto-install reports missing bundle", async () => {
     (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error("Plugin not found"),
+      Object.assign(new Error("Plugin not found"), { code: "ENOENT" }),
     );
     const ensure = vi.fn().mockResolvedValue(false);
 
@@ -1151,7 +1230,7 @@ describe("PUT /plugins/:id/settings auto-install for bundled runtime plugins", (
 
   it("returns 500 when auto-install throws", async () => {
     (pluginStore.getPlugin as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new Error("Plugin not found"),
+      Object.assign(new Error("Plugin not found"), { code: "ENOENT" }),
     );
     const ensure = vi.fn().mockRejectedValue(new Error("bundle missing"));
 

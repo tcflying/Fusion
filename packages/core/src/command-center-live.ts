@@ -175,12 +175,19 @@ export async function composeLiveSnapshot(
       .get() as CountRow
   ).count;
 
+  /*
+  FNXC:LiveActivity 2026-08-03-00:00:
+  FN-8429 requires current board metrics to exclude soft-deleted tasks. Live
+  readers obey VAL-DATA-005, so archived/deleted rows cannot inflate the
+  Overview or Mission Control stage counts after their board lifecycle ends.
+  */
   // Current per-column task counts. `column` is a reserved word in the schema,
   // so it is quoted.
   const columnRows = db
     .prepare(
       `SELECT "column" AS column, COUNT(*) AS count
        FROM tasks
+       WHERE deletedAt IS NULL
        GROUP BY "column"
        ORDER BY count DESC`,
     )
@@ -206,12 +213,19 @@ export async function composeLiveSnapshot(
  * PostgreSQL fetch path for {@link composeLiveSnapshot}. Mirrors the sync branch
  * one-for-one: active (non-terminal, non-terminated) cli_sessions, active
  * agent_runs (data is jsonb — taskId read directly), distinct active worktree
- * nodes, and the present per-column task distribution. The column counts are
- * NOT filtered by deleted_at, matching the sync `FROM tasks GROUP BY column`
- * behavior so the live funnel distribution is identical across backends.
+ * nodes, and the present per-column task distribution. Both storage backends
+ * filter soft-deleted tasks under VAL-DATA-005 so deleted rows cannot become
+ * live funnel work.
  */
 async function composeLiveSnapshotAsync(layer: AsyncDataLayer, now?: number): Promise<LiveSnapshot> {
   const capturedAt = new Date(now ?? Date.now()).toISOString();
+  /*
+  FNXC:PostgresCommandCenterAnalytics 2026-07-14-00:49:
+  An unbound live Command Center layer is deliberately project-agnostic. Sessions, heartbeat runs, and board-column counts must all omit the project predicate together, while an explicitly bound layer remains isolated to its project.
+  */
+  const projectScope = layer.projectId !== undefined
+    ? sql`AND project_id = ${layer.projectId}`
+    : sql``;
 
   const sessionRows = (await layer.db.execute(
     sql`SELECT id,
@@ -223,6 +237,7 @@ async function composeLiveSnapshotAsync(layer: AsyncDataLayer, now?: number): Pr
                updated_at     AS "updatedAt"
         FROM project.cli_sessions
         WHERE agent_state NOT IN ('done', 'dead')
+          ${projectScope}
           AND termination_reason IS NULL
         ORDER BY updated_at DESC`,
   )) as Array<Record<string, unknown>>;
@@ -245,7 +260,7 @@ async function composeLiveSnapshotAsync(layer: AsyncDataLayer, now?: number): Pr
   const runRows = (await layer.db.execute(
     sql`SELECT id, agent_id AS "agentId", started_at AS "startedAt", data
         FROM project.agent_runs
-        WHERE status = 'active'
+        WHERE status = 'active' ${projectScope}
         ORDER BY started_at DESC`,
   )) as Array<{ id: string; agentId: string; startedAt: string; data: unknown }>;
   const runs: LiveRun[] = runRows.map((r) => {
@@ -260,6 +275,7 @@ async function composeLiveSnapshotAsync(layer: AsyncDataLayer, now?: number): Pr
   const columnRows = (await layer.db.execute(
     sql`SELECT "column" AS column, count(*)::int AS count
         FROM project.tasks
+        WHERE deleted_at IS NULL ${projectScope}
         GROUP BY "column"
         ORDER BY count DESC`,
   )) as Array<{ column: string; count: number }>;

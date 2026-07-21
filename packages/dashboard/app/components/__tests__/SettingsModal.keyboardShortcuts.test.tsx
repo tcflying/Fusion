@@ -30,6 +30,8 @@ vi.mock("../../hooks/useMemoryBackendStatus", () => ({
 }));
 vi.mock("../../hooks/useViewportMode", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
+  isFullScreenSheetViewport: () => false,
+  isShortViewport: () => false,
   useViewportMode: () => "desktop",
   getViewportMode: () => "desktop",
   isMobileViewport: () => false,
@@ -115,7 +117,7 @@ describe("SettingsModal Keyboard Shortcuts section", () => {
     const openFilesInput = await screen.findByRole("textbox", { name: "Open Files" });
     await user.clear(openFilesInput);
     await user.type(openFilesInput, "alt+e");
-    await user.click(screen.getByRole("button", { name: "Save" }));
+
 
     await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalled());
     const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;
@@ -136,8 +138,7 @@ describe("SettingsModal Keyboard Shortcuts section", () => {
     await user.type(openFilesInput, "Ctrl+K");
 
     expect(screen.getByRole("alert")).toHaveTextContent("both use Ctrl+K");
-    await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(addToast).toHaveBeenCalledWith(expect.stringContaining("both use Ctrl+K"), "error");
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith(expect.stringContaining("both use Ctrl+K"), "error"));
     expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();
   });
 
@@ -147,7 +148,7 @@ describe("SettingsModal Keyboard Shortcuts section", () => {
 
     const newTaskInput = await screen.findByRole("textbox", { name: "New Task" });
     await user.clear(newTaskInput);
-    await user.click(screen.getByRole("button", { name: "Save" }));
+
 
     await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalled());
     const globalPayload = mockUpdateGlobalSettings.mock.calls[0]?.[0] as Record<string, unknown>;

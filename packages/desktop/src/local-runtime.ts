@@ -56,6 +56,12 @@ type TaskStoreLike = {
   getDatabase(): PluginDatabaseLike;
 };
 
+type BackendOwnedTaskStoreLike = TaskStoreLike & {
+  __backendShutdown?: () => Promise<void>;
+  /** Unscoped sibling of the project TaskStore layer; owned by the backend boot result. */
+  __backendHostAsyncLayer?: import("@fusion/core").AsyncDataLayer;
+};
+
 type RuntimeCleanup = () => Promise<void> | void;
 
 type RuntimeInstance = {
@@ -64,6 +70,7 @@ type RuntimeInstance = {
   port: number;
   baseUrl: string;
   cleanup?: RuntimeCleanup;
+  detachTerminationListeners?: () => void;
 };
 
 export interface LocalRuntimeManagerOptions {
@@ -108,9 +115,12 @@ async function createStoreDefault(rootDir: string): Promise<TaskStoreLike> {
   const backendBoot = await createTaskStoreForBackend({ rootDir });
   if (backendBoot) {
     const store = backendBoot.taskStore as unknown as TaskStoreLike;
+    const backendStore = store as BackendOwnedTaskStoreLike;
     // Attach the backend shutdown so LocalRuntimeManager can invoke it on stop.
-    (store as TaskStoreLike & { __backendShutdown?: () => Promise<void> }).__backendShutdown =
-      backendBoot.shutdown;
+    backendStore.__backendShutdown = backendBoot.shutdown;
+    // Keep the CentralCore layer with the same store instance so the default server factory can
+    // use it without adding a second connection pool or widening the project TaskStore layer.
+    backendStore.__backendHostAsyncLayer = backendBoot.hostAsyncLayer;
     return store;
   }
   return new TaskStore(rootDir) as TaskStoreLike;
@@ -168,14 +178,37 @@ export async function resolveDesktopSystemControl(): Promise<
 async function createDashboardServerDefault(store: TaskStoreLike, rootDir: string): Promise<{ server: Server; cleanup: RuntimeCleanup }> {
   const { CentralCore, PluginLoader, ensureBundledPluginInstalled, isBundledPluginId } = await import("@fusion/core");
   const { createServer } = await import("@fusion/dashboard");
-  const { ProjectEngineManager, createFusionAuthStorage, createFusionModelRegistry, seedDashboardProviders } = await import("@fusion/engine");
+  const {
+    ProjectEngineManager,
+    createFusionAuthStorage,
+    createFusionModelRegistry,
+    createWindowsNativeRoomHostCompositionAdapterRegistry,
+    seedDashboardProviders,
+  } = await import("@fusion/engine");
 
   /*
    * FNXC:DesktopRuntime 2026-06-20-23:39:
    * Embedded desktop local mode should be an executable Fusion node, not a dashboard-only shell. Start all registered project engines and pass the manager to the API server so project-scoped routes can start newly accessed engines.
    */
-  const centralCore = new CentralCore();
-  const engineManager = new ProjectEngineManager(centralCore);
+  const hostAsyncLayer = (store as BackendOwnedTaskStoreLike).__backendHostAsyncLayer;
+  /*
+   * FNXC:DesktopHostBootstrap 2026-07-19-23:40:
+   * The embedded Windows desktop must give CentralCore the startup factory's unscoped host layer.
+   * Passing the project-scoped TaskStore layer would leak the project partition into global policy;
+   * omitting it makes CentralCore a legacy no-op. The factory owns pool shutdown, not CentralCore.
+  */
+  const centralCore = new CentralCore(undefined, hostAsyncLayer ? { asyncLayer: hostAsyncLayer } : undefined);
+  /*
+   * FNXC:WindowsNativeRoomHostComposition 2026-07-21-02:28:
+   * Packaged Electron uses the same host-owned registry as the other Windows
+   * entry points. An absent backend layer leaves the registry fail-closed;
+   * model labels or desktop settings must never substitute provider telemetry.
+   */
+  const roomHostCompositionOperatorAdapterRegistry =
+    createWindowsNativeRoomHostCompositionAdapterRegistry({ hostAsyncLayer });
+  const engineManager = new ProjectEngineManager(centralCore, {
+    roomHostCompositionOperatorAdapterRegistry,
+  });
   const providerSeeding: { dispose?: () => void } = {};
   const cleanup = async () => {
     providerSeeding.dispose?.();
@@ -363,6 +396,16 @@ function getAddressPort(server: Server): number {
   return port;
 }
 
+function closeServerBestEffort(server: Server): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
 export class LocalRuntimeManager {
   private runtime: RuntimeInstance | null = null;
   private startupPromise: Promise<DesktopRuntimeStatus> | null = null;
@@ -514,7 +557,9 @@ export class LocalRuntimeManager {
 
       const port = getAddressPort(server);
       const baseUrl = `http://127.0.0.1:${port}`;
-      this.runtime = { store, server, port, baseUrl, cleanup };
+      const runtime: RuntimeInstance = { store, server, port, baseUrl, cleanup };
+      this.runtime = runtime;
+      this.attachTerminationListeners(runtime);
       this.status = { source: "embedded-local", state: "running", port, baseUrl };
       strace(`startEmbedded: RUNNING port=${port}`);
       return this.status;
@@ -531,6 +576,63 @@ export class LocalRuntimeManager {
       this.runtime = null;
       strace(`startEmbedded: CATCH/ERROR ${error instanceof Error ? error.stack : String(error)}`);
       throw error;
+    }
+  }
+
+  /*
+   * FNXC:DesktopRuntimeTermination 2026-07-19-23:59:
+   * A successful `listening` event is not perpetual liveness proof. On Windows
+   * an embedded dashboard can later close or emit an error while the renderer
+   * remains open; retaining `this.runtime` would falsely show it as running.
+   * Treat either event as a visible local error, release only that runtime's
+   * owned resources, and never auto-restart or turn a connector/server health
+   * signal into provider execution authority.
+   */
+  private attachTerminationListeners(runtime: RuntimeInstance): void {
+    const onError = () => this.handleUnexpectedRuntimeTermination(runtime, "error");
+    const onClose = () => this.handleUnexpectedRuntimeTermination(runtime, "close");
+    runtime.server.on("error", onError);
+    runtime.server.on("close", onClose);
+    runtime.detachTerminationListeners = () => {
+      runtime.server.removeListener("error", onError);
+      runtime.server.removeListener("close", onClose);
+    };
+  }
+
+  private handleUnexpectedRuntimeTermination(runtime: RuntimeInstance, event: "error" | "close"): void {
+    if (this.runtime !== runtime) return;
+
+    this.runtime = null;
+    this.status = {
+      source: "embedded-local",
+      state: "error",
+      error: event === "error"
+        ? "Embedded Fusion dashboard server encountered an unexpected error."
+        : "Embedded Fusion dashboard server closed unexpectedly.",
+    };
+    strace(`embedded dashboard terminated unexpectedly (${event})`);
+    void this.releaseUnexpectedRuntime(runtime, event === "error");
+  }
+
+  private async releaseUnexpectedRuntime(runtime: RuntimeInstance, closeServer: boolean): Promise<void> {
+    try {
+      if (closeServer) await closeServerBestEffort(runtime.server);
+      try {
+        await runtime.cleanup?.();
+      } catch {
+        strace("embedded dashboard cleanup failed after unexpected termination");
+      }
+      try {
+        runtime.store.close();
+      } catch {
+        strace("embedded dashboard store close failed after unexpected termination");
+      }
+      const backendShutdown = (runtime.store as BackendOwnedTaskStoreLike).__backendShutdown;
+      if (backendShutdown) {
+        await backendShutdown().catch(() => strace("embedded dashboard backend shutdown failed after unexpected termination"));
+      }
+    } finally {
+      runtime.detachTerminationListeners?.();
     }
   }
 
@@ -551,14 +653,15 @@ export class LocalRuntimeManager {
     if (this.runtime) {
       const runtime = this.runtime;
       this.runtime = null;
-      await new Promise<void>((resolve) => runtime.server.close(() => resolve()));
+      runtime.detachTerminationListeners?.();
+      await closeServerBestEffort(runtime.server);
       await runtime.cleanup?.();
       runtime.store.close();
       // FNXC:RuntimeStartupWiring 2026-06-24-10:30:
       // Release the backend connection pool / embedded PG cluster if the store
       // was booted via the startup factory. store.close() already closes the
       // AsyncDataLayer pool; this adds embedded-cluster teardown. Best-effort.
-      const backendShutdown = (runtime.store as TaskStoreLike & { __backendShutdown?: () => Promise<void> }).__backendShutdown;
+      const backendShutdown = (runtime.store as BackendOwnedTaskStoreLike).__backendShutdown;
       if (backendShutdown) {
         await backendShutdown().catch(() => undefined);
       }

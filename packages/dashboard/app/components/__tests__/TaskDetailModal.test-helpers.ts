@@ -43,7 +43,8 @@ vi.mock("../../api", async (importOriginal) => {
     assignTask: vi.fn().mockResolvedValue({}),
     fetchAgents: vi.fn().mockResolvedValue([]),
     fetchAgent: vi.fn().mockResolvedValue(null),
-    fetchModels: vi.fn().mockResolvedValue({ models: [], favoriteProviders: [] }),
+    fetchModels: vi.fn().mockResolvedValue({ models: [], favoriteProviders: [], favoriteModels: [] }),
+    fetchNodes: vi.fn().mockResolvedValue([]),
     fetchSettings: vi.fn().mockResolvedValue({ modelPresets: [], autoSelectModelPreset: false, defaultPresetBySize: {} }),
     fetchGlobalSettings: vi.fn().mockResolvedValue({}),
     fetchWorkflowSteps: vi.fn().mockResolvedValue([]),
@@ -100,6 +101,13 @@ vi.mock("lucide-react", () => ({
   Maximize2: () => null,
   Minimize2: () => null,
   Loader2: (props: any) => React.createElement("svg", { "data-testid": "loader2-icon", ...props }),
+  /*
+  FNXC:TaskDetailTabPersistence 2026-07-20-19:10:
+  FN-8394's restored mocked-session guard reaches TaskVerificationStatus. Keep
+  its success-icon mock available so this deterministic tab-state regression
+  does not depend on the unrelated lucide module implementation.
+  */
+  CheckCircle2: () => null,
   Send: (props: any) => React.createElement("svg", { "data-testid": "send-icon", ...props }),
   Square: (props: any) => React.createElement("svg", { "data-testid": "square-icon", ...props }),
   Info: (props: any) => React.createElement("svg", { "data-testid": "info-icon", ...props }),
@@ -131,8 +139,15 @@ vi.mock("lucide-react", () => ({
   Code2: () => null,
   Cpu: () => null,
   Bell: () => null,
-  // FNXC:PlannerOversight 2026-07-04-19:00: FN-7545 mobile oversight overflow-menu trigger icon.
-  MoreVertical: (props: any) => React.createElement("svg", { "data-testid": "more-vertical-icon", ...props }),
+  /*
+  FNXC:DashboardTests 2026-07-16-16:00:
+  FN-8194 replaces the Task Detail oversight dots with Eye and adds Paperclip
+  to its inline action row. Keep both exports in the shared modal mock so every
+  focused TaskDetailModal suite mounts the production affordances.
+  */
+  Paperclip: (props: any) => React.createElement("svg", { "data-testid": "paperclip-icon", ...props }),
+  Eye: (props: any) => React.createElement("svg", { "data-testid": "eye-icon", ...props }),
+  EyeOff: (props: any) => React.createElement("svg", { "data-testid": "eye-off-icon", ...props }),
   // FNXC:Test 2026-07-05-11:20: FN-7579 added "ask-user"/"exit-gate" workflow node types to
   // WorkflowNodeTypes.tsx (HelpCircle, DoorOpen), which WorkflowNodeEditor/WorkflowResultsTab
   // import transitively behind TaskDetailModal's lazy workflow surfaces. The explicit mock list
@@ -140,6 +155,31 @@ vi.mock("lucide-react", () => ({
   // FN-7582's copy change) — keep this list in sync with the node-editor icon set.
   HelpCircle: () => null,
   DoorOpen: () => null,
+  /*
+  FNXC:ReviewArtifacts 2026-07-18-13:25:
+  FN-8286 mounts ArtifactsGallery + TaskReviewTab from TaskDetailModal. Their lucide imports
+  (Image/FileText/FileType/Video/AudioLines/Package/Download/User) must stay on this shared mock
+  or every focused TaskDetailModal suite fails at import with missing lucide exports.
+  */
+  Image: (props: any) => React.createElement("svg", { "data-testid": "image-icon", ...props }),
+  FileText: (props: any) => React.createElement("svg", { "data-testid": "file-text-icon", ...props }),
+  FileType: (props: any) => React.createElement("svg", { "data-testid": "file-type-icon", ...props }),
+  Video: (props: any) => React.createElement("svg", { "data-testid": "video-icon", ...props }),
+  AudioLines: (props: any) => React.createElement("svg", { "data-testid": "audio-lines-icon", ...props }),
+  Package: (props: any) => React.createElement("svg", { "data-testid": "package-icon", ...props }),
+  Download: (props: any) => React.createElement("svg", { "data-testid": "download-icon", ...props }),
+  User: (props: any) => React.createElement("svg", { "data-testid": "user-icon", ...props }),
+  /*
+  FNXC:NativeStructureEmbed 2026-07-19-04:30:
+  FN-8291/8292/8293 mount NativeStructurePreview from chat/mail surfaces reachable via
+  StandardChatSurface under TaskDetailModal. Keep Map/Lightbulb/BarChart3/Target/CircleAlert
+  on this shared mock or every focused TaskDetailModal suite fails at import.
+  */
+  Map: (props: any) => React.createElement("svg", { "data-testid": "map-icon", ...props }),
+  Lightbulb: (props: any) => React.createElement("svg", { "data-testid": "lightbulb-icon", ...props }),
+  BarChart3: (props: any) => React.createElement("svg", { "data-testid": "bar-chart-3-icon", ...props }),
+  Target: (props: any) => React.createElement("svg", { "data-testid": "target-icon", ...props }),
+  CircleAlert: (props: any) => React.createElement("svg", { "data-testid": "circle-alert-icon", ...props }),
 }));
 
 vi.mock("../../hooks/useAgentLogs", () => ({

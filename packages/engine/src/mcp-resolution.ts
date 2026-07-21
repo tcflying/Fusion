@@ -22,9 +22,9 @@ export interface ResolvedMcpServersForRuntime {
 }
 
 /**
- * A content-free executor bootstrap failure. The message deliberately contains
- * only server names and a coarse category; raw secret-store errors can contain
- * credential-bearing configuration details.
+ * Keep executor bootstrap failures content-free: secret-store errors may
+ * contain credential-bearing configuration details and must not cross the
+ * runtime boundary.
  */
 export class McpResolutionBootstrapError extends Error {
   readonly serverNames: string[];
@@ -62,8 +62,12 @@ export async function resolveMcpServersForRuntime(
     options.secrets,
     options.reader ?? {},
   );
+  const failedServerNames = new Set(materialized.errors.map((error) => error.serverName));
   return {
-    servers: materialized.value ?? [],
+    // Never forward a partially materialized definition: it could connect
+    // without the operator-required credential. Other healthy MCP servers and
+    // the owning agent session remain available.
+    servers: (materialized.value ?? []).filter((server) => !failedServerNames.has(server.name)),
     errors: materialized.errors,
   };
 }

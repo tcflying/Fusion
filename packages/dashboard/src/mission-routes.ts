@@ -15,9 +15,13 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { TaskStore, resolvePlanningSettingsModel, AgentStore, THINKING_LEVELS } from "@fusion/core";
-import type { Goal, ThinkingLevel } from "@fusion/core";
-import { listEligibleExecutorAgents } from "@fusion/engine";
-import { getOrCreateProjectStore } from "./project-store-resolver.js";
+import type { Goal, Settings, ThinkingLevel } from "@fusion/core";
+import { listEligibleExecutorAgents, resolvePlanningThinkingLevel } from "@fusion/engine";
+import {
+  getScopedStore as resolveScopedRequestStore,
+  getProjectContext as resolveSharedProjectContext,
+} from "./routes/context.js";
+import type { ServerOptions } from "./server.js";
 import type {
   Mission,
   MissionBranchStrategy,
@@ -59,6 +63,14 @@ import {
 } from "./api-error.js";
 import type { AiSessionStore } from "./ai-session-store.js";
 import { resolveBranchAssignmentContext, resolveBranchSelection } from "./routes/branch-selection.js";
+
+/** Resolve the mission-start override through the planning settings hierarchy. */
+export function resolveMissionInterviewThinkingLevel(
+  settings: Partial<Settings> | undefined,
+  thinkingLevel: ThinkingLevel | undefined,
+): ThinkingLevel | undefined {
+  return resolvePlanningThinkingLevel(settings, thinkingLevel) as ThinkingLevel | undefined;
+}
 
 // ── Validation Utilities ────────────────────────────────────────────────────
 
@@ -251,23 +263,6 @@ function replayBufferedSSE(
   return true;
 }
 
-async function checkSessionLock(
-  sessionId: string,
-  tabId: string | undefined,
-  store: AiSessionStore | undefined,
-): Promise<{ allowed: true } | { allowed: false; currentHolder: string | null }> {
-  if (!tabId || !store) {
-    return { allowed: true };
-  }
-
-  const result = await store.acquireLock(sessionId, tabId);
-  if (result.acquired) {
-    return { allowed: true };
-  }
-
-  return { allowed: false, currentHolder: result.currentHolder };
-}
-
 export function createMissionRouter(
   store: TaskStore,
   missionAutopilot?: {
@@ -290,19 +285,10 @@ export function createMissionRouter(
   },
   engineManager?: import("@fusion/engine").ProjectEngineManager,
   pluginRunner?: Parameters<typeof import("@fusion/engine").buildSessionSkillContextSync>[3],
+  options?: ServerOptions,
 ): Router {
   const router = Router();
   const requestContext = new AsyncLocalStorage<TaskStore>();
-
-  function getProjectIdFromRequest(req: Request): string | undefined {
-    if (typeof req.query.projectId === "string" && req.query.projectId.trim()) {
-      return req.query.projectId;
-    }
-    if (req.body && typeof req.body === "object" && typeof req.body.projectId === "string" && req.body.projectId.trim()) {
-      return req.body.projectId;
-    }
-    return undefined;
-  }
 
   function getScopedStore(): TaskStore {
     return requestContext.getStore() ?? store;
@@ -414,8 +400,10 @@ export function createMissionRouter(
 
   router.use(async (req, _res, next) => {
     try {
-      const projectId = getProjectIdFromRequest(req);
-      const scopedStore = projectId ? await getOrCreateProjectStore(projectId) : store;
+      // FNXC:CentralProjectIdentity 2026-07-13-23:54:
+      // Resolve an explicit central-registry project id via the shared seam
+      // (request id → registered launch project id → raw launch store last resort).
+      const scopedStore = await resolveScopedRequestStore(req, store, options);
       requestContext.run(scopedStore, next);
     } catch (error) {
       next(error);
@@ -462,7 +450,7 @@ export function createMissionRouter(
   router.post(
     "/",
     catchTypedHandler(async (req, res) => {
-      const { title, description, autoAdvance, baseBranch, branchStrategy, goalIds } = req.body;
+      const { title, description, autoAdvance, autoMerge, baseBranch, branchStrategy, goalIds } = req.body;
 
       const validatedTitle = validateTitle(title);
       const validatedDescription = validateDescription(description);
@@ -473,6 +461,14 @@ export function createMissionRouter(
         description: validatedDescription,
         baseBranch: validateDescription(baseBranch),
         branchStrategy: validateMissionBranchStrategy(branchStrategy),
+        ...(autoMerge !== undefined
+          ? {
+              // FNXC:MissionAutoMerge 2026-07-18-12:00: Create accepts only a real boolean; null is reserved for PATCH clear-to-inherited.
+              autoMerge: typeof autoMerge === "boolean"
+                ? validateBoolean(autoMerge, "autoMerge")
+                : (() => { throw badRequest("autoMerge must be a boolean"); })(),
+            }
+          : {}),
       };
 
       const mission = await missionStore.createMission(input);
@@ -503,31 +499,23 @@ export function createMissionRouter(
   //
   // UTILITY PATH: All interview routes (mission, milestone, slice) are on a separate
   // control-plane lane. They must NOT be gated on task-lane saturation (maxConcurrent,
-  // semaphore, queue depth). Session-lock 409 with { error, lockedByTab } is preserved.
+  // semaphore, queue depth). Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
 
   /**
    * Helper to resolve scoped store for the current request's project scope.
    */
-  async function getScopedStoreForRequest(req: Request) {
-    const projectId = getProjectIdFromRequest(req);
-    return projectId ? await getOrCreateProjectStore(projectId) : store;
-  }
-
   /**
    * Helper to resolve project context for the current request.
    * When engineManager is available and the request targets a known project,
    * returns the engine's TaskStore so callers share the same in-memory state.
+   *
+   * FNXC:CentralProjectIdentity 2026-07-13-23:54:
+   * Delegates to the shared seam so identity always resolves an explicit
+   * central-registry id (request id → registered launch project id) instead of
+   * the implicit raw-store fallback.
    */
   async function getProjectContext(req: Request) {
-    const projectId = getProjectIdFromRequest(req);
-    if (projectId && engineManager) {
-      const engine = engineManager.getEngine(projectId);
-      if (engine) {
-        return { store: engine.getTaskStore(), engine, projectId };
-      }
-    }
-    const scopedStore = await getScopedStoreForRequest(req);
-    return { store: scopedStore, engine: undefined, projectId };
+    return resolveSharedProjectContext(req, store, options);
   }
 
   /**
@@ -578,6 +566,13 @@ export function createMissionRouter(
         const effectiveModel = resolvePlanningSettingsModel(settings);
         const resolvedProvider = modelProvider ?? effectiveModel.provider;
         const resolvedModelId = modelId ?? effectiveModel.modelId;
+        /*
+        FNXC:MissionInterview 2026-07-19-20:46:
+        FN-8414 / GitHub #2356 makes omitted request thinkingLevel inherit the planning
+        settings hierarchy, matching model resolution above. The fixed session signature
+        then preserves projectId and pluginRunner instead of shifting positional arguments.
+        */
+        const resolvedThinkingLevel = resolveMissionInterviewThinkingLevel(settings, validatedThinkingLevel);
 
         const sessionId = await createMissionInterviewSession(
           ip,
@@ -587,7 +582,7 @@ export function createMissionRouter(
           settings.promptOverrides,
           resolvedProvider,
           resolvedModelId,
-          validatedThinkingLevel,
+          resolvedThinkingLevel,
           projectId ?? null,
           pluginRunner,
         );
@@ -609,12 +604,12 @@ export function createMissionRouter(
    * Body: { sessionId: string, responses: Record<string, unknown> }
    *
    * UTILITY PATH: Independent of task-lane saturation.
-   * Session-lock 409 with { error, lockedByTab } is preserved.
+   * Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
    */
   router.post(
     "/interview/respond",
     catchTypedHandler(async (req, res) => {
-      const { sessionId, responses, tabId } = req.body;
+      const { sessionId, responses } = req.body;
 
       if (!sessionId || typeof sessionId !== "string") {
         throw badRequest("sessionId is required");
@@ -622,16 +617,6 @@ export function createMissionRouter(
 
       if (!responses || typeof responses !== "object") {
         throw badRequest("responses is required and must be an object");
-      }
-
-      const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {
@@ -670,7 +655,7 @@ export function createMissionRouter(
    * Retry a failed interview session by replaying the last user interaction.
    *
    * UTILITY PATH: Independent of task-lane saturation.
-   * Session-lock 409 with { error, lockedByTab } is preserved.
+   * Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
    */
   router.post(
     "/interview/:sessionId/retry",
@@ -679,18 +664,6 @@ export function createMissionRouter(
 
       if (!sessionId || typeof sessionId !== "string") {
         throw badRequest("sessionId is required");
-      }
-
-      const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
-        ? req.body.tabId.trim()
-        : undefined;
-      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {
@@ -726,20 +699,10 @@ export function createMissionRouter(
   router.post(
     "/interview/cancel",
     catchTypedHandler(async (req, res) => {
-      const { sessionId, tabId } = req.body;
+      const { sessionId } = req.body;
 
       if (!sessionId || typeof sessionId !== "string") {
         throw badRequest("sessionId is required");
-      }
-
-      const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {
@@ -762,9 +725,11 @@ export function createMissionRouter(
   router.get(
     "/interview/drafts",
     catchTypedHandler(async (req, res) => {
-      const projectId = typeof req.query.projectId === "string" && req.query.projectId.trim().length > 0
-        ? req.query.projectId.trim()
-        : undefined;
+      // FNXC:CentralProjectIdentity 2026-07-14-00:15:
+      // Read drafts under the SAME resolved id that POST /interview/start stamped on
+      // write (request id → registered launch project id). Filtering by the raw
+      // request projectId (undefined on a launch-dir request) hid launch-owned drafts.
+      const { projectId } = await getProjectContext(req);
       const { listMissionInterviewDrafts } = await import("./mission-interview.js");
       res.json({ drafts: await listMissionInterviewDrafts(projectId) });
     })
@@ -774,24 +739,13 @@ export function createMissionRouter(
     "/interview/drafts/:sessionId/discard",
     catchTypedHandler(async (req, res) => {
       const { sessionId } = req.params;
-      const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
-        ? req.body.tabId.trim()
-        : undefined;
-      const projectId = typeof req.query.projectId === "string" && req.query.projectId.trim().length > 0
-        ? req.query.projectId.trim()
-        : undefined;
+      // FNXC:CentralProjectIdentity 2026-07-14-00:15:
+      // Discard against the SAME resolved id writes stamped (request id → launch id),
+      // matching GET /interview/drafts, so a launch-dir discard finds the session.
+      const { projectId } = await getProjectContext(req);
 
       if (!sessionId || typeof sessionId !== "string") {
         throw badRequest("sessionId is required");
-      }
-
-      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       const { discardMissionInterviewSession } = await import("./mission-interview.js");
@@ -1148,7 +1102,7 @@ export function createMissionRouter(
     "/:missionId",
     catchTypedHandler(async (req, res) => {
       const { missionId } = req.params;
-      const { title, description, status, autoAdvance, autopilotEnabled, baseBranch, branchStrategy, goalIds } = req.body;
+      const { title, description, status, autoAdvance, autoMerge, autopilotEnabled, baseBranch, branchStrategy, goalIds } = req.body;
 
       if (!validateMissionId(missionId)) {
         throw badRequest("Invalid mission ID format");
@@ -1173,6 +1127,12 @@ export function createMissionRouter(
       }
       if (autoAdvance !== undefined) {
         updates.autoAdvance = validateBoolean(autoAdvance, "autoAdvance");
+      }
+      // FNXC:MissionAutoMerge 2026-07-18-12:00: PATCH null explicitly clears a mission override; omission preserves it.
+      if (autoMerge === null) {
+        updates.autoMerge = undefined;
+      } else if (autoMerge !== undefined) {
+        updates.autoMerge = validateBoolean(autoMerge, "autoMerge");
       }
       if (autopilotEnabled !== undefined) {
         updates.autopilotEnabled = validateBoolean(autopilotEnabled, "autopilotEnabled");
@@ -3363,15 +3323,15 @@ export function createMissionRouter(
   /**
    * POST /milestones/:milestoneId/interview/respond
    * Submit response to milestone interview question.
-   * Body: { sessionId: string, responses: Record<string, unknown>, tabId?: string }
+   * Body: { sessionId: string, responses: Record<string, unknown> }
    *
    * UTILITY PATH: Independent of task-lane saturation.
-   * Session-lock 409 with { error, lockedByTab } is preserved.
+   * Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
    */
   router.post(
     "/milestones/:milestoneId/interview/respond",
     catchTypedHandler(async (req, res) => {
-      const { sessionId, responses, tabId } = req.body;
+      const { sessionId, responses } = req.body;
 
       if (!validateMilestoneId(req.params.milestoneId)) {
         throw badRequest("Invalid milestone ID format");
@@ -3383,16 +3343,6 @@ export function createMissionRouter(
 
       if (!responses || typeof responses !== "object") {
         throw badRequest("responses is required and must be an object");
-      }
-
-      const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {
@@ -3534,7 +3484,7 @@ export function createMissionRouter(
    * Retry a failed milestone interview session.
    *
    * UTILITY PATH: Independent of task-lane saturation.
-   * Session-lock 409 with { error, lockedByTab } is preserved.
+   * Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
    */
   router.post(
     "/milestones/:milestoneId/interview/:sessionId/retry",
@@ -3547,18 +3497,6 @@ export function createMissionRouter(
 
       if (!sessionId || typeof sessionId !== "string") {
         throw badRequest("sessionId is required");
-      }
-
-      const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
-        ? req.body.tabId.trim()
-        : undefined;
-      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {
@@ -3716,15 +3654,15 @@ export function createMissionRouter(
   /**
    * POST /slices/:sliceId/interview/respond
    * Submit response to slice interview question.
-   * Body: { sessionId: string, responses: Record<string, unknown>, tabId?: string }
+   * Body: { sessionId: string, responses: Record<string, unknown> }
    *
    * UTILITY PATH: Independent of task-lane saturation.
-   * Session-lock 409 with { error, lockedByTab } is preserved.
+   * Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
    */
   router.post(
     "/slices/:sliceId/interview/respond",
     catchTypedHandler(async (req, res) => {
-      const { sessionId, responses, tabId } = req.body;
+      const { sessionId, responses } = req.body;
 
       if (!validateSliceId(req.params.sliceId)) {
         throw badRequest("Invalid slice ID format");
@@ -3736,16 +3674,6 @@ export function createMissionRouter(
 
       if (!responses || typeof responses !== "object") {
         throw badRequest("responses is required and must be an object");
-      }
-
-      const normalizedTabId = typeof tabId === "string" && tabId.trim().length > 0 ? tabId.trim() : undefined;
-      const lockCheck = await checkSessionLock(sessionId, normalizedTabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {
@@ -3887,7 +3815,7 @@ export function createMissionRouter(
    * Retry a failed slice interview session.
    *
    * UTILITY PATH: Independent of task-lane saturation.
-   * Session-lock 409 with { error, lockedByTab } is preserved.
+   * Lock-free: any tab may interact (see FNXC:PlanningMultiTab).
    */
   router.post(
     "/slices/:sliceId/interview/:sessionId/retry",
@@ -3900,18 +3828,6 @@ export function createMissionRouter(
 
       if (!sessionId || typeof sessionId !== "string") {
         throw badRequest("sessionId is required");
-      }
-
-      const tabId = typeof req.body?.tabId === "string" && req.body.tabId.trim().length > 0
-        ? req.body.tabId.trim()
-        : undefined;
-      const lockCheck = await checkSessionLock(sessionId, tabId, aiSessionStore);
-      if (!lockCheck.allowed) {
-        res.status(409).json({
-          error: "Session locked by another tab",
-          lockedByTab: lockCheck.currentHolder,
-        });
-        return;
       }
 
       try {

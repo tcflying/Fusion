@@ -123,13 +123,31 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      /*
+      FNXC:GitHubImportTranslate 2026-07-15-09:30:
+      The browser bundle aliases `@fusion/core` to the leaf `types.ts` to keep Node-only deps out of the client, so anything the app imports from core must resolve to a browser-safe module.
+      Language detection is pure string logic shared with the server; alias its subpath explicitly rather than widening the `@fusion/core` alias, which would drag the full index (and its Node deps) into the bundle.
+      This alias MUST precede the `@fusion/core` entry — Vite matches aliases in order, so the broader key would otherwise swallow the subpath.
+      */
+      /*
+      FNXC:DashboardBrowserSafeCore 2026-07-16-12:00:
+      The dashboard core-import scanner enforces this alias boundary for both relative core/src and package-subpath value imports.
+      Add a new browser leaf only after its full dependency graph is reviewed and it has a dated entry in scripts/lib/dashboard-browser-safe-core-modules.json.
+      */
+      "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/detect-content-language.ts"),
       "@fusion/core": resolve(__dirname, "../core/src/types.ts"),
       "@fusion/dashboard/app/components/TaskCard": resolve(__dirname, "app/components/TaskCard.tsx"),
       // FNXC:PluginBuild 2026-06-22-03:50: Bundled plugin source can import the dashboard's shared ViewHeader through the package export; Vite needs the same source alias during dashboard builds so plugin UI normalization does not fail only in CI merge builds.
       "@fusion/dashboard/app/components/ViewHeader": resolve(__dirname, "app/components/ViewHeader.tsx"),
+      // FNXC:Quality 2026-07-19-12:00: The bundled Quality plugin needs the host's token-appended artifact URL helper because native video loads cannot attach authorization headers.
+      "@fusion/dashboard/app/api/task-content": resolve(__dirname, "app/api/task-content.ts"),
       "@fusion/dashboard/app/plugins/types": resolve(__dirname, "app/plugins/types.ts"),
       "@fusion/dashboard/app/utils/projectStorage": resolve(__dirname, "app/utils/projectStorage.ts"),
       "@fusion/dashboard/app/utils/taskStuck": resolve(__dirname, "app/utils/taskStuck.ts"),
+      "@fusion-plugin-examples/happier-runtime": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-happier-runtime/src/index.ts",
+      ),
       "@fusion-plugin-examples/compound-engineering/dashboard-view": resolve(
         __dirname,
         "../../plugins/fusion-plugin-compound-engineering/src/dashboard-view.tsx",
@@ -153,6 +171,22 @@ export default defineConfig({
       "@fusion-plugin-examples/linear-import": resolve(
         __dirname,
         "../../plugins/fusion-plugin-linear-import/src/index.ts",
+      ),
+      "@fusion-plugin-examples/quality/dashboard-view": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-quality/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/roadmap/dashboard-view": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-roadmap/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/quality/qa-tab": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-quality/src/qa-tab.tsx",
+      ),
+      "@fusion-plugin-examples/quality": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-quality/src/index.ts",
       ),
     },
   },

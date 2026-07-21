@@ -15,7 +15,14 @@
  */
 
 import type { AgentSession, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { PermanentAgentGatingContext, ResolvedMcpServerDefinition } from "@fusion/core";
+import { AsyncCliSessionStore, CliSessionStore } from "@fusion/core";
+import type {
+  CliSessionPurpose,
+  PermanentAgentGatingContext,
+  ResolvedMcpServerDefinition,
+  TaskStore,
+} from "@fusion/core";
+import { createHash } from "node:crypto";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import type { FallbackModelUsedPayload } from "./pi.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -46,6 +53,142 @@ export interface AgentMcpServerConfig {
 
 export type AgentRuntimeMcpServerConfig = ResolvedMcpServerDefinition | AgentMcpServerConfig;
 
+/**
+ * Durable native-session identity owned by a canonical Fusion CLI session.
+ * Runtime adapters must await persistence before sending work to a newly
+ * created native session.
+ */
+export interface AgentRuntimeNativeSessionBinding {
+  /** Stable canonical owner key shared by every runtime object for this Fusion CLI session. */
+  key: string;
+  nativeSessionId: string | null;
+  refreshNativeSessionId(): Promise<string | null> | string | null;
+  claimNativeSessionId(candidate: string): Promise<{ claimed: boolean; nativeSessionId: string }> | { claimed: boolean; nativeSessionId: string };
+  persistNativeSessionId(nativeSessionId: string): Promise<void> | void;
+}
+
+function resolveHappierCliSessionId(input: {
+  sessionKey: string;
+  purpose: CliSessionPurpose;
+}): string {
+  return `cli-happier-${input.purpose}-${createHash("sha256").update(input.sessionKey).digest("hex").slice(0, 24)}`;
+}
+
+export function resolveTaskHappierCliSessionId(input: {
+  taskId: string;
+  purpose: "execute";
+}): string {
+  return resolveHappierCliSessionId({
+    sessionKey: `executor:${input.taskId}:primary`,
+    purpose: input.purpose,
+  });
+}
+
+/**
+ * FNXC:HappierRuntime 2026-07-13-19:42:
+ * Bridge the canonical CliSessionStore record into the AgentRuntime creation
+ * path. A fresh binding re-reads durable state, so a restarted runtime receives
+ * the same native id instead of relying on plugin-local option shapes.
+ */
+export function createCliSessionNativeSessionBinding(
+  options: {
+    store: Pick<CliSessionStore, "getSession" | "claimNativeSessionId">;
+    sessionId: string;
+    bindingKey?: string;
+  },
+): AgentRuntimeNativeSessionBinding {
+  const session = options.store.getSession(options.sessionId);
+  if (!session) throw new Error(`CLI session not found: ${options.sessionId}`);
+  const refreshNativeSessionId = () => {
+    const current = options.store.getSession(options.sessionId);
+    if (!current) throw new Error(`CLI session not found: ${options.sessionId}`);
+    return current.nativeSessionId;
+  };
+  const claimNativeSessionId = async (candidate: string) => {
+    const result = await options.store.claimNativeSessionId(options.sessionId, candidate);
+    if (!result) throw new Error(`CLI session not found: ${options.sessionId}`);
+    return result;
+  };
+  return {
+    key: options.bindingKey ?? options.sessionId,
+    nativeSessionId: session.nativeSessionId,
+    refreshNativeSessionId,
+    claimNativeSessionId,
+    persistNativeSessionId: async (nativeSessionId: string) => {
+      const result = await claimNativeSessionId(nativeSessionId);
+      if (result.nativeSessionId !== nativeSessionId) {
+        throw new Error(`CLI session ${options.sessionId} already belongs to native session ${result.nativeSessionId}`);
+      }
+    },
+  };
+}
+
+/**
+ * Create or reload the canonical CLI-session record for a production
+ * AgentRuntime session. Other runtimes remain behavior-inert; Happier receives
+ * a real CliSessionStore-backed binding and therefore fails closed if a caller
+ * bypasses this orchestration boundary.
+ */
+export async function createTaskStoreNativeSessionBinding(options: {
+  runtimeHint: string | undefined;
+  taskStore: Pick<TaskStore, "getFusionDir" | "getAsyncLayer">;
+  sessionKey: string;
+  taskId?: string | null;
+  purpose: CliSessionPurpose;
+  worktreePath?: string | null;
+}): Promise<AgentRuntimeNativeSessionBinding | undefined> {
+  if (options.runtimeHint?.trim().toLowerCase() !== "happier") return undefined;
+
+  const layer = options.taskStore.getAsyncLayer();
+  if (!layer) throw new Error("Happier runtime requires the TaskStore PostgreSQL AsyncDataLayer");
+  const store = new AsyncCliSessionStore(layer);
+  const sessionId = resolveHappierCliSessionId({
+    sessionKey: options.sessionKey,
+    purpose: options.purpose,
+  });
+  const projectId = layer.projectId || options.taskStore.getFusionDir();
+  let existing = await store.getSession(sessionId);
+  if (!existing) {
+    existing = await store.createSession({
+      id: sessionId,
+      taskId: options.taskId ?? null,
+      purpose: options.purpose,
+      projectId,
+      adapterId: "happier",
+      worktreePath: options.worktreePath ?? null,
+    });
+  } else if (
+    existing.adapterId !== "happier"
+    || existing.purpose !== options.purpose
+    || existing.projectId !== projectId
+    || existing.taskId !== (options.taskId ?? null)
+  ) {
+    throw new Error(`CLI session ${sessionId} does not match the requested Happier runtime owner`);
+  }
+
+  return {
+    key: `${options.taskStore.getFusionDir()}:${sessionId}`,
+    nativeSessionId: existing.nativeSessionId,
+    refreshNativeSessionId: async () => {
+      const current = await store.getSession(sessionId);
+      if (!current) throw new Error(`CLI session not found: ${sessionId}`);
+      return current.nativeSessionId;
+    },
+    claimNativeSessionId: async (candidate: string) => {
+      const result = await store.claimNativeSessionId(sessionId, candidate);
+      if (!result) throw new Error(`CLI session not found: ${sessionId}`);
+      return result;
+    },
+    persistNativeSessionId: async (nativeSessionId: string) => {
+      const result = await store.claimNativeSessionId(sessionId, nativeSessionId);
+      if (!result) throw new Error(`CLI session not found: ${sessionId}`);
+      if (result.nativeSessionId !== nativeSessionId) {
+        throw new Error(`CLI session ${sessionId} already belongs to native session ${result.nativeSessionId}`);
+      }
+    },
+  };
+}
+
 export function normalizeAgentRuntimeMcpServers(
   servers: AgentRuntimeMcpServerConfig[] | undefined,
 ): ResolvedMcpServerDefinition[] | undefined {
@@ -67,6 +210,13 @@ export interface AgentRuntimeOptions {
   cwd: string;
   /** System prompt for the agent */
   systemPrompt: string;
+  /*
+  FNXC:MergeQueue 2026-07-15-11:08:
+  Session purpose must reach createFnAgent so merger lanes can skip host-extension fn_* tools.
+  Those tools boot a second TaskStore via createTaskStoreForBackend and have been observed wedging merges on hung fn_task_show (no per-tool timeout, AbortSignal ignored).
+  */
+  /** Lane purpose (executor/merger/triage/…). Used for host-extension policy and diagnostics. */
+  sessionPurpose?: string;
   /**
    * Optional structured prompt layers for cross-session caching.
    * When present, runtimes that support prompt caching use the `stable`
@@ -107,6 +257,8 @@ export interface AgentRuntimeOptions {
   defaultThinkingLevel?: string;
   /** Optional pre-configured SessionManager for persistence */
   sessionManager?: SessionManager;
+  /** Canonical Fusion CLI-session binding for native runtime identity. */
+  nativeSession?: AgentRuntimeNativeSessionBinding;
   /** Optional skill selection context */
   skillSelection?: SkillSelectionContext;
   /** Convenience: skill names to include in the session */

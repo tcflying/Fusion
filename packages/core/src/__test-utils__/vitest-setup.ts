@@ -74,6 +74,13 @@ function installWarningFilter(): void {
 
 installWarningFilter();
 
+// Never let a DATABASE_URL exported for the operator's normal Fusion runtime
+// leak into a Vitest worker. Tests that exercise external PostgreSQL construct
+// an isolated database through FUSION_PG_TEST_* and set DATABASE_URL explicitly
+// inside the test after this setup file has run.
+delete process.env.DATABASE_URL;
+delete process.env.DATABASE_MIGRATION_URL;
+
 const TEST_HOME_PREFIX = "fn-test-home-";
 const WORKER_ROOT_OWNER_FILE = ".fusion-test-worker-root-owner";
 const FUSION_TEST_RUN_TOKEN_ENV = "FUSION_TEST_RUN_TOKEN";
@@ -81,6 +88,8 @@ const DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS = Math.max(
   1_000,
   Number.parseInt(process.env.FUSION_TEST_SUBPROCESS_TIMEOUT_MS ?? "30000", 10) || 30_000,
 );
+const EMBEDDED_POSTGRES_TEST_SUBPROCESS_TIMEOUT_MS = 120_000;
+const EMBEDDED_POSTGRES_TEST_EXECUTABLE_PATTERN = /^(?:initdb|pg_ctl|postgres)(?:\.exe)?$/i;
 const BLOCKED_TEST_CLI_PATTERN =
   /(^|[\s"'\\/])(?:claude|droid|paperclipai|hermes|openclaw)(?:\.(?:cmd|bat|ps1|exe))?(?=$|[\s"'\\/])/i;
 
@@ -872,13 +881,35 @@ function blockedCliError(commandLine: string): Error {
   );
 }
 
-function withDefaultTimeout<T extends { timeout?: number | undefined }>(options: T | undefined): T {
+function testSubprocessTimeoutMs(commandLine: string): number {
+  const trimmed = commandLine.trim();
+  const firstToken = trimmed.startsWith('"')
+    ? trimmed.slice(1, trimmed.indexOf('"', 1) >= 0 ? trimmed.indexOf('"', 1) : undefined)
+    : trimmed.startsWith("'")
+      ? trimmed.slice(1, trimmed.indexOf("'", 1) >= 0 ? trimmed.indexOf("'", 1) : undefined)
+      : trimmed.split(/\s+/, 1)[0] ?? "";
+  const executableName = basename(firstToken.replace(/\\/g, "/"));
+  return EMBEDDED_POSTGRES_TEST_EXECUTABLE_PATTERN.test(executableName)
+    ? Math.max(DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS, EMBEDDED_POSTGRES_TEST_SUBPROCESS_TIMEOUT_MS)
+    : DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS;
+}
+
+export const __fusionSubprocessTimeoutTestHooks = {
+  defaultTimeoutMs: DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS,
+  embeddedPostgresTimeoutMs: EMBEDDED_POSTGRES_TEST_SUBPROCESS_TIMEOUT_MS,
+  testSubprocessTimeoutMs,
+};
+
+function withDefaultTimeout<T extends { timeout?: number | undefined }>(
+  options: T | undefined,
+  commandLine: string,
+): T {
   if (typeof options?.timeout === "number" && Number.isFinite(options.timeout)) {
     return options;
   }
   return {
     ...(options ?? {}),
-    timeout: DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS,
+    timeout: testSubprocessTimeoutMs(commandLine),
   } as T;
 }
 
@@ -893,6 +924,7 @@ function cleanupTrackedSubprocess(proc: ChildProcess): void {
 }
 
 function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): void {
+  const timeoutMs = testSubprocessTimeoutMs(commandLine);
   const tracked: TrackedSubprocess = {
     commandLine,
     startedAt: Date.now(),
@@ -906,14 +938,14 @@ function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): voi
     tracked.timedOut = true;
     completedSubprocessFailures.push({
       ownerTestName: tracked.testName,
-      message: `Timed out after ${DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS}ms: ${tracked.commandLine}${tracked.testName ? ` (${tracked.testName})` : ""}`,
+      message: `Timed out after ${timeoutMs}ms: ${tracked.commandLine}${tracked.testName ? ` (${tracked.testName})` : ""}`,
     });
     try {
       proc.kill("SIGKILL");
     } catch {
       // Ignore — the process may have already exited.
     }
-  }, DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS);
+  }, timeoutMs);
 
   const finish = () => cleanupTrackedSubprocess(proc);
   proc.once("close", finish);
@@ -945,8 +977,10 @@ function installChildProcessGuards(): void {
 
   mutableChildProcess.spawnSync = ((command: string, argsOrOptions?: readonly string[] | SpawnSyncOptions, maybeOptions?: SpawnSyncOptions) => {
     const args = Array.isArray(argsOrOptions) ? [...argsOrOptions] : [];
-    const options = Array.isArray(argsOrOptions) ? withDefaultTimeout(maybeOptions) : withDefaultTimeout(argsOrOptions);
     const commandLine = describeTestSubprocessCommand(command, args);
+    const options = Array.isArray(argsOrOptions)
+      ? withDefaultTimeout(maybeOptions, commandLine)
+      : withDefaultTimeout(argsOrOptions, commandLine);
     if (shouldBlockReservedPortKill(commandLine)) {
       throw blockedReservedPortError(commandLine);
     }
@@ -965,13 +999,15 @@ function installChildProcessGuards(): void {
       throw blockedCliError(command);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.execSync(command, withDefaultTimeout(options));
+    return originalChildProcess.execSync(command, withDefaultTimeout(options, command));
   }) as ChildProcessModule["execSync"];
 
   mutableChildProcess.execFileSync = ((file: string, argsOrOptions?: readonly string[] | ExecFileSyncOptions, maybeOptions?: ExecFileSyncOptions) => {
     const args = Array.isArray(argsOrOptions) ? [...argsOrOptions] : [];
-    const options = Array.isArray(argsOrOptions) ? withDefaultTimeout(maybeOptions) : withDefaultTimeout(argsOrOptions);
     const commandLine = describeTestSubprocessCommand(file, args);
+    const options = Array.isArray(argsOrOptions)
+      ? withDefaultTimeout(maybeOptions, commandLine)
+      : withDefaultTimeout(argsOrOptions, commandLine);
     if (shouldBlockReservedPortKill(commandLine)) {
       throw blockedReservedPortError(commandLine);
     }
@@ -995,7 +1031,7 @@ function installChildProcessGuards(): void {
     const options = typeof optionsOrCallback === "function" ? undefined : optionsOrCallback;
     const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.exec(command, withDefaultTimeout(options), callback);
+    const proc = originalChildProcess.exec(command, withDefaultTimeout(options, command), callback);
     registerTrackedSubprocess(proc, command);
     return proc;
   }) as unknown as ChildProcessModule["exec"];
@@ -1029,7 +1065,7 @@ function installChildProcessGuards(): void {
       ? (typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback)
       : (typeof argsOrOptions === "function" ? argsOrOptions : typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback);
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.execFile(file, args, withDefaultTimeout(options), callback);
+    const proc = originalChildProcess.execFile(file, args, withDefaultTimeout(options, commandLine), callback);
     registerTrackedSubprocess(proc, commandLine);
     return proc;
   }) as unknown as ChildProcessModule["execFile"];

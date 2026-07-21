@@ -12,6 +12,7 @@ export const mockCancelPlanning = vi.fn();
 export const mockStopPlanningGeneration = vi.fn();
 export const mockUpdatePlanningSessionDraft = vi.fn();
 export const mockCreateTaskFromPlanning = vi.fn();
+export const mockValidatePlanningSession = vi.fn();
 export const mockStartPlanningBreakdown = vi.fn();
 export const mockCreateTasksFromPlanning = vi.fn();
 export const mockFetchAiSession = vi.fn();
@@ -196,6 +197,29 @@ export function mockViewport(mode: "mobile" | "desktop" | "tablet") {
         removeEventListener: vi.fn(),
       };
     }),
+  });
+}
+
+/*
+FNXC:PlanningModeMobileTablet 2026-07-20-09:30:
+Short-landscape Planning tests must exercise the wide CSS viewport plus phone-class physical screen
+combination. Returning mobile mode mirrors getViewportMode() after isMobileViewport() accepts that
+phone-class short-height exception; width-only mocks cannot cover the historical desync.
+*/
+export function mockShortLandscapePhone() {
+  mockUseViewportMode.mockReturnValue("mobile");
+  Object.defineProperty(window, "screen", {
+    configurable: true,
+    value: { width: 844, height: 390 },
+  });
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(max-height: 480px)" || query === "(max-width: 768px), (max-height: 480px)",
+      media: query,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })),
   });
 }
 

@@ -37,6 +37,7 @@ class FakeServer {
   }
 
   close(callback: () => void): void {
+    this.emit("close");
     callback();
   }
 }
@@ -78,6 +79,10 @@ const engineMocks = vi.hoisted(() => {
   const ProjectEngineManager = vi.fn(function () {
     return engineManager;
   });
+  const createWindowsNativeRoomHostCompositionAdapterRegistry = vi.fn((input: unknown) => ({
+    kind: "windows-native-room-host-composition-registry",
+    input,
+  }));
   const seedDashboardProvidersDispose = vi.fn();
   const seedDashboardProviders = vi.fn(async ({ authStorage }: { authStorage: unknown }) => ({
     authStorage: { ...(authStorage as object), __wrapped: true },
@@ -99,6 +104,7 @@ const engineMocks = vi.hoisted(() => {
     CentralCore,
     PluginLoader,
     ProjectEngineManager,
+    createWindowsNativeRoomHostCompositionAdapterRegistry,
     seedDashboardProviders,
     seedDashboardProvidersDispose,
     createServer,
@@ -121,6 +127,7 @@ vi.mock("../bundled-plugin-dirs.js", () => ({ resolveDesktopBundlePluginDirs: en
 vi.mock("@fusion/dashboard", () => ({ createServer: engineMocks.createServer }));
 vi.mock("@fusion/engine", () => ({
   ProjectEngineManager: engineMocks.ProjectEngineManager,
+  createWindowsNativeRoomHostCompositionAdapterRegistry: engineMocks.createWindowsNativeRoomHostCompositionAdapterRegistry,
   createFusionAuthStorage: () => ({ reload: () => undefined, getOAuthProviders: () => [], hasAuth: () => false }),
   createFusionModelRegistry: () => ({ listModels: () => [], refresh: () => undefined }),
   seedDashboardProviders: engineMocks.seedDashboardProviders,
@@ -162,6 +169,62 @@ describe("LocalRuntimeManager", () => {
       baseUrl: "http://127.0.0.1:4545",
     });
     expect(manager.getServerPort()).toBe(4545);
+  });
+
+  it("marks an unexpectedly closed embedded dashboard visible and releases its owned resources", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const server = new FakeServer(4545);
+    const cleanup = vi.fn(async () => undefined);
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => store,
+      createDashboardServer: async () => {
+        setTimeout(() => server.emit("listening"), 0);
+        return { server: server as unknown as Server, cleanup };
+      },
+    });
+
+    await manager.startLocal();
+    server.emit("close");
+
+    expect(manager.getStatus()).toEqual({
+      source: "embedded-local",
+      state: "error",
+      error: "Embedded Fusion dashboard server closed unexpectedly.",
+    });
+    await vi.waitFor(() => {
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(store.close).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("contains an unexpected server error without reporting a dead runtime as running", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const server = new FakeServer(4545);
+    const closeSpy = vi.spyOn(server, "close");
+    const cleanup = vi.fn(async () => undefined);
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => store,
+      createDashboardServer: async () => {
+        setTimeout(() => server.emit("listening"), 0);
+        return { server: server as unknown as Server, cleanup };
+      },
+    });
+
+    await manager.startLocal();
+    server.emit("error", new Error("runtime probe detail must not reach the desktop status"));
+
+    expect(manager.getStatus()).toEqual({
+      source: "embedded-local",
+      state: "error",
+      error: "Embedded Fusion dashboard server encountered an unexpected error.",
+    });
+    await vi.waitFor(() => {
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(store.close).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("returns external-cli status without starting embedded runtime", async () => {
@@ -477,6 +540,44 @@ describe("LocalRuntimeManager", () => {
 
     await manager.stopLocal();
     expect(engineMocks.seedDashboardProvidersDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a backend boot's unscoped host layer for the default CentralCore", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const server = new FakeServer(4545);
+    const hostAsyncLayer = { scope: "host" };
+    const backendStore = {
+      ...store,
+      __backendHostAsyncLayer: hostAsyncLayer,
+    };
+    engineMocks.createServer.mockReturnValueOnce({
+      listen: vi.fn(() => {
+        setTimeout(() => server.emit("listening"), 0);
+        return server as unknown as Server;
+      }),
+    });
+
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => backendStore,
+    });
+
+    await manager.startLocal();
+
+    expect(engineMocks.CentralCore).toHaveBeenCalledWith(undefined, { asyncLayer: hostAsyncLayer });
+    expect(engineMocks.createWindowsNativeRoomHostCompositionAdapterRegistry).toHaveBeenCalledWith({
+      hostAsyncLayer,
+    });
+    expect(engineMocks.ProjectEngineManager).toHaveBeenCalledWith(
+      engineMocks.centralCore,
+      expect.objectContaining({
+        roomHostCompositionOperatorAdapterRegistry: expect.objectContaining({
+          kind: "windows-native-room-host-composition-registry",
+        }),
+      }),
+    );
+
+    await manager.stopLocal();
   });
 
   /*

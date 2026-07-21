@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import type { BranchGroup, BranchGroupPrState, DirectMergeCommitStrategy, IssueInfo, PrConflictDiagnostics, PrConflictState, PrInfo, TaskReviewData, TaskReviewItem, TaskReviewSummary } from "@fusion/core";
+import type { BranchGroup, BranchGroupPrState, DirectMergeCommitStrategy, IssueInfo, PrConflictDiagnostics, PrConflictState, PrInfo, Task, TaskReviewData, TaskReviewItem, TaskReviewSummary, TaskSourceIssue } from "@fusion/core";
 import {
   isGhAvailable,
   isGhAuthenticated,
@@ -13,6 +13,7 @@ import {
   getCurrentRepo,
   runGh,
 } from "@fusion/core";
+import { ALLOWED_IMAGE_MIMES, MAX_IMAGE_BYTES } from "./issue-image-attachments.js";
 
 const execAsync = promisify(exec);
 
@@ -112,6 +113,71 @@ function parseIssueUrl(stdout: string): { owner: string; repo: string; number: n
   };
 }
 
+/*
+FNXC:GithubImport 2026-07-17-00:00:
+GitHub issue import deduplication treats persisted provenance as authoritative so edited descriptions and owner/repo casing changes cannot misidentify an import. Every dashboard, CLI, and extension issue-import surface shares this helper, which checks sourceIssue first, legacy github_import metadata second, and legacy description URLs last.
+
+FNXC:GithubImport 2026-07-17-00:00:
+The description compatibility fallback is eligible only when neither GitHub sourceIssue nor object-shaped github_import metadata exists. A nonmatching structured record must return false rather than letting quoted or stale URL text override its provenance.
+*/
+export function buildGitHubIssueSource(owner: string, repo: string, issue: { number: number; html_url: string }): {
+  sourceIssue: TaskSourceIssue;
+  sourceMetadata: Record<string, unknown>;
+} {
+  return {
+    sourceIssue: {
+      provider: "github",
+      repository: `${owner}/${repo}`,
+      externalIssueId: String(issue.number),
+      issueNumber: issue.number,
+      url: issue.html_url,
+    },
+    sourceMetadata: { issueUrl: issue.html_url, issueNumber: issue.number },
+  };
+}
+
+function equalsIgnoreCase(left: string | undefined, right: string | undefined): boolean {
+  return Boolean(left && right && left.toLocaleLowerCase() === right.toLocaleLowerCase());
+}
+
+function repositoryFromGitHubIssueUrl(url: unknown): string | undefined {
+  if (typeof url !== "string") return undefined;
+  const match = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/\d+\/?$/i);
+  return match ? `${match[1]}/${match[2]}` : undefined;
+}
+
+export function isGitHubIssueAlreadyImported(
+  task: Pick<Task, "description" | "sourceIssue" | "source">,
+  input: { owner: string; repo: string; issueNumber: number; sourceUrl: string },
+): boolean {
+  const { owner, repo, issueNumber, sourceUrl } = input;
+  const repository = `${owner}/${repo}`;
+  const sourceIssue = task.sourceIssue;
+  const hasGitHubSourceIssue = sourceIssue?.provider === "github";
+  if (hasGitHubSourceIssue) {
+    if (equalsIgnoreCase(sourceIssue.url, sourceUrl)) return true;
+    if (equalsIgnoreCase(sourceIssue.repository, repository)
+      && (sourceIssue.issueNumber === issueNumber || sourceIssue.externalIssueId === String(issueNumber))) {
+      return true;
+    }
+  }
+
+  const metadata = task.source?.sourceMetadata;
+  const hasGitHubSourceMetadata = task.source?.sourceType === "github_import" && metadata && typeof metadata === "object";
+  if (hasGitHubSourceMetadata) {
+    const sourceMetadata = metadata as Record<string, unknown>;
+    if (equalsIgnoreCase(typeof sourceMetadata.issueUrl === "string" ? sourceMetadata.issueUrl : undefined, sourceUrl)) return true;
+    if (sourceMetadata.issueNumber === issueNumber
+      && equalsIgnoreCase(repositoryFromGitHubIssueUrl(sourceMetadata.issueUrl), repository)) {
+      return true;
+    }
+  }
+
+  if (hasGitHubSourceIssue || hasGitHubSourceMetadata) return false;
+
+  return task.description?.toLocaleLowerCase().includes(sourceUrl.toLocaleLowerCase()) ?? false;
+}
+
 /**
  * Result of a throttled fetch operation.
  */
@@ -169,6 +235,65 @@ export interface CreatedIssue {
   createdAt: string;
 }
 
+export interface UploadImageAssetParams {
+  owner: string;
+  repo: string;
+  path: string;
+  contentBase64: string;
+  message: string;
+  branch?: string;
+  mimeType: string;
+}
+
+export interface UploadedImageAsset {
+  htmlUrl: string;
+  rawUrl: string;
+  path: string;
+  sha: string;
+}
+
+export interface DiscussionCandidate {
+  id: string;
+  number: number;
+  title: string;
+  body: string | null;
+  url: string;
+  state: "open" | "closed";
+}
+
+export interface DiscussionCategory {
+  id: string;
+  name: string;
+  slug: string;
+}
+
+/** A repository capability error that allows report delivery to fall back to Issues. */
+export class DiscussionsDisabledError extends Error {
+  override readonly name = "DiscussionsDisabledError";
+
+  constructor(owner: string, repo: string, cause?: unknown) {
+    super(`Discussions are not enabled for ${owner}/${repo}.`, { cause });
+  }
+}
+
+export function isDiscussionsDisabledError(error: unknown): error is DiscussionsDisabledError {
+  return error instanceof DiscussionsDisabledError;
+}
+
+function mapDiscussionsDisabledError(owner: string, repo: string, error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/discussions? (?:are |is )?(?:not )?(?:enabled|disabled)|discussion.*disabled/i.test(message)) {
+    throw new DiscussionsDisabledError(owner, repo, error);
+  }
+  throw error;
+}
+
+export interface CreatedDiscussion {
+  id: string;
+  number: number;
+  htmlUrl: string;
+}
+
 export interface PrComment {
   id: number;
   body: string;
@@ -180,6 +305,16 @@ export interface PrComment {
 
 const PR_REVIEW_PAGE_SIZE = 100;
 const MAX_PR_REVIEW_PAGES = 10;
+
+/*
+FNXC:GitHubImport 2026-07-16-16:20:
+Upper bound on issues returned by listIssues for the import picker. The picker pages this set client-side,
+so this cap bounds one fetch: gh's `--limit` paginates internally to reach it, and the REST path loops
+`page` at ISSUE_LIST_PAGE_SIZE (100, GitHub's per_page max) until the cap or exhaustion. Keeps a huge repo
+from returning an unbounded body while still surfacing far more than the old single 30/100-issue page.
+*/
+const MAX_LIST_ISSUES = 300;
+const ISSUE_LIST_PAGE_SIZE = 100;
 
 export type ReviewDecision = "APPROVED" | "CHANGES_REQUESTED" | "REVIEW_REQUIRED" | null;
 export type PrCheckState =
@@ -661,6 +796,152 @@ export class GitHubClient {
 
     this.token = tokenOrOptions?.token;
     this.forceMode = tokenOrOptions?.forceMode;
+  }
+
+  /**
+   * FNXC:ReportScreenshotUpload 2026-07-19-12:00:
+   * Report pixels cross the permanent GitHub boundary only through the documented
+   * Contents API, never the undocumented web upload endpoint. MIME and decoded-size
+   * validation happens before either auth transport. A private repository's raw URL
+   * requires viewer authentication and therefore cannot be promised as anonymous inline media.
+   */
+  async uploadImageAsset(params: UploadImageAssetParams): Promise<UploadedImageAsset> {
+    if (!ALLOWED_IMAGE_MIMES.has(params.mimeType)) throw new Error("Unsupported image MIME type for GitHub upload.");
+    const normalized = params.contentBase64.replace(/\s/g, "");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || Buffer.from(normalized, "base64").byteLength > MAX_IMAGE_BYTES) {
+      throw new Error("Image upload exceeds the 5MB limit or is not valid base64.");
+    }
+    const endpoint = `repos/${encodeURIComponent(params.owner)}/${encodeURIComponent(params.repo)}/contents/${params.path.split("/").map(encodeURIComponent).join("/")}`;
+    if (this.forceMode === "gh-cli") { this.requireGh(); return this.uploadImageAssetWithGh(endpoint, params); }
+    if (this.forceMode === "token") { this.requireToken(); return this.uploadImageAssetWithApi(endpoint, params); }
+    if (this.hasGhAuth()) {
+      try { return await this.uploadImageAssetWithGh(endpoint, params); }
+      catch (error) { if (!this.token) throw new Error("Failed to upload GitHub image asset.", { cause: error }); }
+    }
+    if (this.token) return this.uploadImageAssetWithApi(endpoint, params);
+    throw new Error("GitHub CLI (gh) is not available or not authenticated, and no GITHUB_TOKEN provided. Run 'gh auth login' or set GITHUB_TOKEN.");
+  }
+
+  private async uploadImageAssetWithGh(endpoint: string, params: UploadImageAssetParams): Promise<UploadedImageAsset> {
+    const body = JSON.stringify({ message: params.message, content: params.contentBase64, ...(params.branch ? { branch: params.branch } : {}) });
+    const result = await runGhJsonAsync<{ content?: { html_url?: string; download_url?: string; path?: string; sha?: string } }>(["api", "--method", "PUT", endpoint, "--input", "-"], { input: body });
+    const content = result.content;
+    if (!content?.html_url || !content.download_url || !content.path || !content.sha) throw new Error("GitHub Contents API returned an incomplete image asset.");
+    return { htmlUrl: content.html_url, rawUrl: content.download_url, path: content.path, sha: content.sha };
+  }
+
+  private async uploadImageAssetWithApi(endpoint: string, params: UploadImageAssetParams): Promise<UploadedImageAsset> {
+    const result = await this.fetchThrottled<{ content?: { html_url?: string; download_url?: string; path?: string; sha?: string } }>(`${this.baseUrl}/${endpoint}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: params.message, content: params.contentBase64, ...(params.branch ? { branch: params.branch } : {}) }) });
+    const content = result.data?.content;
+    if (!result.success || !content?.html_url || !content.download_url || !content.path || !content.sha) throw new Error(result.error ?? "GitHub Contents API returned an incomplete image asset.");
+    return { htmlUrl: content.html_url, rawUrl: content.download_url, path: content.path, sha: content.sha };
+  }
+
+  /**
+   * FNXC:ReportPipeline 2026-07-18-16:30:
+   * An explicitly reviewed report screenshot may be hosted only in the selected
+   * GitHub repository through this client's existing authenticated transport.
+   * A failed or unsupported upload returns undefined so filing remains scrubbed,
+   * text-only; raw data URLs must never leave the report pipeline.
+   */
+  async uploadReportImage(owner: string, repo: string, screenshot: { dataUrl: string; capturedAt: string }): Promise<string | undefined> {
+    const match = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/]+={0,2})$/.exec(screenshot.dataUrl);
+    if (!match) return undefined;
+
+    const extension = match[1] === "jpeg" ? "jpg" : "png";
+    const path = `.fusion/report-screenshots/${crypto.randomUUID()}.${extension}`;
+    const endpoint = `repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`;
+    const body = {
+      message: "chore: add user-reviewed Fusion report screenshot",
+      content: match[2],
+    };
+
+    try {
+      if (this.forceMode === "gh-cli") {
+        this.requireGh();
+        return this.uploadReportImageWithGh(endpoint, body);
+      }
+      if (this.forceMode === "token") {
+        this.requireToken();
+        return this.uploadReportImageWithApi(endpoint, body);
+      }
+      if (this.hasGhAuth()) {
+        try {
+          return await this.uploadReportImageWithGh(endpoint, body);
+        } catch {
+          if (!this.token) return undefined;
+        }
+      }
+      return this.token ? await this.uploadReportImageWithApi(endpoint, body) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * FNXC:ReportPipeline 2026-07-18-19:30: Screenshot attachment is a two-step
+   * GitHub operation. Compensate if the post-upload report comment fails so a
+   * sensitive, user-reviewed image is not orphaned outside the report thread.
+   */
+  async deleteReportImage(owner: string, repo: string, url: string): Promise<void> {
+    const prefix = `https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/main/`;
+    if (!url.startsWith(prefix)) return;
+    const path = url.slice(prefix.length);
+    if (!path.startsWith(".fusion/report-screenshots/") || path.includes("..")) return;
+    const endpoint = `repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`;
+    try {
+      if (this.forceMode === "gh-cli") {
+        this.requireGh();
+        await this.deleteReportImageWithGh(endpoint);
+      } else if (this.forceMode === "token") {
+        this.requireToken();
+        await this.deleteReportImageWithApi(endpoint);
+      } else if (this.hasGhAuth()) {
+        try {
+          await this.deleteReportImageWithGh(endpoint);
+        } catch {
+          if (this.token) await this.deleteReportImageWithApi(endpoint);
+        }
+      } else if (this.token) {
+        await this.deleteReportImageWithApi(endpoint);
+      }
+    } catch {
+      // Best-effort compensation: never let cleanup mask successful text filing.
+    }
+  }
+
+  private async uploadReportImageWithGh(endpoint: string, body: { message: string; content: string }): Promise<string | undefined> {
+    const result = await runGhJsonAsync<{ content?: { download_url?: string | null } }>([
+      "api", "--method", "PUT", endpoint,
+      "-f", `message=${body.message}`,
+      "-f", `content=${body.content}`,
+    ]);
+    return result.content?.download_url ?? undefined;
+  }
+
+  private async uploadReportImageWithApi(endpoint: string, body: { message: string; content: string }): Promise<string | undefined> {
+    const result = await this.fetchThrottled<{ content?: { download_url?: string | null } }>(`${this.baseUrl}/${endpoint}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return result.success ? result.data?.content?.download_url ?? undefined : undefined;
+  }
+
+  private async deleteReportImageWithGh(endpoint: string): Promise<void> {
+    const existing = await runGhJsonAsync<{ sha?: string }>(["api", endpoint]);
+    if (!existing.sha) return;
+    await runGhJsonAsync(["api", "--method", "DELETE", endpoint, "-f", "message=chore: remove unattached Fusion report screenshot", "-f", `sha=${existing.sha}`]);
+  }
+
+  private async deleteReportImageWithApi(endpoint: string): Promise<void> {
+    const existing = await this.fetchThrottled<{ sha?: string }>(`${this.baseUrl}/${endpoint}`);
+    if (!existing.success || !existing.data?.sha) return;
+    await this.fetchThrottled(`${this.baseUrl}/${endpoint}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: "chore: remove unattached Fusion report screenshot", sha: existing.data.sha }),
+    });
   }
 
   private hasGhAuth(): boolean {
@@ -2056,11 +2337,131 @@ export class GitHubClient {
     }));
   }
 
+  /*
+  FNXC:ReportPipeline 2026-07-16-23:45:
+  Feedback and unresolved Help reports can belong in repository Discussions,
+  not only Issues. Keep their search, creation, and data-point comments in the
+  existing GitHub client so the established gh/token transport and auth fallback
+  remain the only egress mechanism.
+  */
+  async searchDiscussions(owner: string, repo: string, query: string, options?: { limit?: number }): Promise<DiscussionCandidate[]> {
+    const limit = Math.max(1, options?.limit ?? 1000);
+    const words = query.toLocaleLowerCase().split(/\s+/).filter((word) => word.length > 3);
+    const matches: DiscussionCandidate[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    type DiscussionConnection = {
+      nodes?: Array<{ id: string; number: number; title: string; body: string | null; url: string; isClosed?: boolean | null }> | null;
+      pageInfo?: { hasNextPage: boolean; endCursor: string | null } | null;
+    };
+    type DiscussionSearchPayload = { repository?: { discussions?: DiscussionConnection | null } | null };
+
+    /*
+    FNXC:ReportPipeline 2026-07-18-11:15:
+    Discussion dedupe must not only inspect the most recently updated page.
+    Page through open and older discussions until the caller's explicit bound,
+    so reports cannot silently miss a duplicate merely because it is inactive.
+    */
+    while (hasNextPage && matches.length < limit) {
+      let payload: DiscussionSearchPayload | undefined;
+      try {
+        payload = await this.runGraphqlQuery<DiscussionSearchPayload>(`query($owner:String!, $repo:String!, $cursor:String) {
+          repository(owner:$owner, name:$repo) { discussions(first:100, after:$cursor, orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { id number title body url isClosed } pageInfo { hasNextPage endCursor } } }
+        }`, { owner, repo, cursor });
+      } catch (error) {
+        mapDiscussionsDisabledError(owner, repo, error);
+      }
+      const discussions: DiscussionConnection | undefined = payload?.repository?.discussions ?? undefined;
+      for (const discussion of discussions?.nodes ?? []) {
+        if (discussion.isClosed) continue;
+        if (words.length > 0 && !words.some((word) => `${discussion.title} ${discussion.body ?? ""}`.toLocaleLowerCase().includes(word))) continue;
+        matches.push({ ...discussion, state: "open" });
+        if (matches.length >= limit) break;
+      }
+      hasNextPage = discussions?.pageInfo?.hasNextPage === true;
+      cursor = discussions?.pageInfo?.endCursor ?? null;
+      if (hasNextPage && !cursor) break;
+    }
+    return matches;
+  }
+
+  /*
+  FNXC:GithubDiscussions 2026-07-16-20:00:
+  GitHub Discussions have no REST API coverage. Category discovery stays on the
+  established GraphQL transport, preserving the same gh/token auth behavior as
+  search, creation, comments, and reactions.
+  */
+  async listDiscussionCategories(owner: string, repo: string): Promise<DiscussionCategory[]> {
+    type CategoryPayload = {
+      repository?: { discussionCategories?: { nodes?: Array<DiscussionCategory | null> | null } | null } | null;
+    };
+    const payload = await this.runGraphqlQuery<CategoryPayload>(`query($owner:String!, $repo:String!) {
+      repository(owner:$owner, name:$repo) { discussionCategories(first:100) { nodes { id name slug } } }
+    }`, { owner, repo });
+    return (payload?.repository?.discussionCategories?.nodes ?? [])
+      .filter((category): category is DiscussionCategory => Boolean(category?.id && category.name && category.slug));
+  }
+
+  /** Adds the same visible +1 signal to a Discussion duplicate as to an Issue duplicate. */
+  async addDiscussionReaction(discussionId: string): Promise<void> {
+    const payload = await this.runGraphqlQuery<{
+      addReaction?: { reaction?: { content?: string | null } | null } | null;
+    }>(`mutation($subjectId:ID!) {
+      addReaction(input:{subjectId:$subjectId, content:THUMBS_UP}) { reaction { content } }
+    }`, { subjectId: discussionId });
+    if (!payload?.addReaction?.reaction) throw new Error("GitHub did not return the discussion reaction.");
+  }
+
+  /*
+  FNXC:ReportPipeline 2026-07-18-12:00:
+  FN-8308 owns category discovery and the reportDiscussionCategory setting.
+  A stale or absent selected category deterministically uses the repository's
+  first category, while disabled Discussions is a typed signal for Issue fallback.
+  */
+  async createDiscussion(owner: string, repo: string, title: string, body: string, selectedCategoryId?: string): Promise<CreatedDiscussion> {
+    let categoryPayload: { repository?: { id?: string; discussionCategories?: { nodes?: Array<{ id: string }> | null } | null } | null } | undefined;
+    try {
+      categoryPayload = await this.runGraphqlQuery(`query($owner:String!, $repo:String!) {
+        repository(owner:$owner, name:$repo) { id discussionCategories(first:100) { nodes { id } } }
+      }`, { owner, repo });
+    } catch (error) {
+      mapDiscussionsDisabledError(owner, repo, error);
+    }
+    const repositoryId = categoryPayload?.repository?.id;
+    const categories = categoryPayload?.repository?.discussionCategories?.nodes ?? [];
+    const categoryId = categories.find((category) => category.id === selectedCategoryId)?.id ?? categories[0]?.id;
+    if (!repositoryId || !categoryId) throw new DiscussionsDisabledError(owner, repo);
+    let payload: { createDiscussion?: { discussion?: { id: string; number: number; url: string } | null } | null } | undefined;
+    try {
+      payload = await this.runGraphqlQuery(`mutation($repositoryId:ID!, $categoryId:ID!, $title:String!, $body:String!) {
+        createDiscussion(input:{repositoryId:$repositoryId, categoryId:$categoryId, title:$title, body:$body}) { discussion { id number url } }
+      }`, { repositoryId, categoryId, title, body });
+    } catch (error) {
+      mapDiscussionsDisabledError(owner, repo, error);
+    }
+    const discussion = payload?.createDiscussion?.discussion;
+    if (!discussion) throw new Error("GitHub did not return the created discussion.");
+    return { id: discussion.id, number: discussion.number, htmlUrl: discussion.url };
+  }
+
+  async commentOnDiscussion(discussionId: string, body: string): Promise<{ url: string }> {
+    const payload = await this.runGraphqlQuery<{
+      addDiscussionComment?: { comment?: { url: string } | null } | null;
+    }>(`mutation($discussionId:ID!, $body:String!) {
+      addDiscussionComment(input:{discussionId:$discussionId, body:$body}) { comment { url } }
+    }`, { discussionId, body });
+    const url = payload?.addDiscussionComment?.comment?.url;
+    if (!url) throw new Error("GitHub did not return the discussion comment.");
+    return { url };
+  }
+
   /** Run a read-only GraphQL query (gh CLI when available, else token/REST). */
-  private async runGraphqlQuery<T>(query: string, variables: Record<string, string | number>): Promise<T | undefined> {
-    if (this.hasGhAuth()) {
+  private async runGraphqlQuery<T>(query: string, variables: Record<string, string | number | null>): Promise<T | undefined> {
+    if (this.forceMode === "gh-cli" || (this.forceMode === undefined && this.hasGhAuth())) {
+      if (this.forceMode === "gh-cli") this.requireGh();
       const args = ["api", "graphql", "-f", `query=${query}`];
       for (const [key, value] of Object.entries(variables)) {
+        if (value === null) continue;
         const flag = typeof value === "number" ? "-F" : "-f";
         args.push(flag, `${key}=${value}`);
       }
@@ -2069,6 +2470,7 @@ export class GitHubClient {
       if (payload.errors?.length) throw new Error(payload.errors[0].message);
       return payload.data;
     }
+    if (this.forceMode === "token") this.requireToken();
     if (this.token) {
       const response = await fetch(`${this.baseUrl}/graphql`, {
         method: "POST",
@@ -2113,7 +2515,8 @@ export class GitHubClient {
   }
 
   private async runGraphqlMutation(query: string, variables: Record<string, string>): Promise<void> {
-    if (this.hasGhAuth()) {
+    if (this.forceMode === "gh-cli" || (this.forceMode === undefined && this.hasGhAuth())) {
+      if (this.forceMode === "gh-cli") this.requireGh();
       const args = ["api", "graphql", "-f", `query=${query}`];
       for (const [key, value] of Object.entries(variables)) {
         args.push("-F", `${key}=${value}`);
@@ -2123,6 +2526,7 @@ export class GitHubClient {
       if (payload.errors?.length) throw new Error(payload.errors[0].message);
       return;
     }
+    if (this.forceMode === "token") this.requireToken();
     if (this.token) {
       const response = await fetch(`${this.baseUrl}/graphql`, {
         method: "POST",
@@ -2421,10 +2825,47 @@ export class GitHubClient {
     return response.json() as Promise<PrComment[]>;
   }
 
-  async commentOnIssue(owner: string, repo: string, issueNumber: number, body: string): Promise<void> {
+  /**
+   * Adds a GitHub reaction to an issue through the same authenticated client
+   * transport used for issue comments.
+   */
+  async addIssueReaction(owner: string, repo: string, issueNumber: number, content: "+1" = "+1"): Promise<void> {
+    const endpoint = `repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/reactions`;
     if (this.forceMode === "gh-cli") {
       this.requireGh();
-      runGh([
+      await runGhJsonAsync(["api", "--method", "POST", endpoint, "-f", `content=${content}`]);
+      return;
+    }
+
+    if (this.forceMode === "token") {
+      this.requireToken();
+    } else if (this.hasGhAuth()) {
+      try {
+        await runGhJsonAsync(["api", "--method", "POST", endpoint, "-f", `content=${content}`]);
+        return;
+      } catch (err) {
+        if (!this.token) throw new Error(getGhErrorMessage(err));
+      }
+    }
+
+    if (!this.token) {
+      throw new Error("GitHub CLI (gh) is not available or not authenticated, and no GITHUB_TOKEN provided.");
+    }
+    const result = await this.fetchThrottled(`${this.baseUrl}/${endpoint}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/vnd.github+json",
+      },
+      body: JSON.stringify({ content }),
+    });
+    if (!result.success) throw new Error(result.error ?? "Failed to react to GitHub issue");
+  }
+
+  async commentOnIssue(owner: string, repo: string, issueNumber: number, body: string): Promise<{ url?: string }> {
+    if (this.forceMode === "gh-cli") {
+      this.requireGh();
+      const output = runGh([
         "issue",
         "comment",
         String(issueNumber),
@@ -2433,14 +2874,14 @@ export class GitHubClient {
         "--body",
         body,
       ]);
-      return;
+      return { url: output.match(/https:\/\/github\.com\/[^\s]+/i)?.[0] };
     }
 
     if (this.forceMode === "token") {
       this.requireToken();
     } else if (this.hasGhAuth()) {
       try {
-        runGh([
+        const output = runGh([
           "issue",
           "comment",
           String(issueNumber),
@@ -2449,7 +2890,7 @@ export class GitHubClient {
           "--body",
           body,
         ]);
-        return;
+        return { url: output.match(/https:\/\/github\.com\/[^\s]+/i)?.[0] };
       } catch (err) {
         if (!this.token) {
           throw new Error(getGhErrorMessage(err));
@@ -2462,7 +2903,7 @@ export class GitHubClient {
     }
 
     const url = `${this.baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/comments`;
-    const result = await this.fetchThrottled<{ id: number }>(
+    const result = await this.fetchThrottled<{ id: number; html_url?: string }>(
       url,
       {
         method: "POST",
@@ -2476,6 +2917,7 @@ export class GitHubClient {
     if (!result.success) {
       throw new Error(result.error ?? "Failed to comment on GitHub issue");
     }
+    return { url: result.data?.html_url };
   }
 
   async setIssueState(
@@ -3144,10 +3586,19 @@ export class GitHubClient {
     updatedAt?: string;
     author?: string | null;
   }>> {
-    const limit = options?.limit ?? 30;
+    const limit = Math.min(options?.limit ?? 30, MAX_LIST_ISSUES);
     const state = options?.state ?? "open";
 
-    // gh issue list doesn't support label filtering directly, so we fetch and filter client-side
+    /*
+    FNXC:GitHubImport 2026-07-16-16:20:
+    Label filtering is client-side (OR across labels, matching the historical `.some()` semantics that `gh --label`'s AND cannot express).
+    Because filtering happens AFTER the fetch, the fetch must pull the full cap when labels are set — otherwise `gh` returns the first `limit` UNFILTERED issues and the post-filter `.slice(0, limit)` starves, hiding labeled issues that sort past the first `limit` rows.
+    Without labels there is nothing to filter, so fetch exactly `limit`. `gh --limit` paginates internally past 100 to reach the requested count.
+    */
+    const hasLabelFilter = Boolean(options?.labels && options.labels.length > 0);
+    const fetchCount = hasLabelFilter ? MAX_LIST_ISSUES : limit;
+
+    // gh issue list doesn't support OR label filtering directly, so we fetch and filter client-side
     const issues = await runGhJsonAsync<Array<{
       number: number;
       title: string;
@@ -3161,7 +3612,7 @@ export class GitHubClient {
       "issue", "list",
       "--repo", `${owner}/${repo}`,
       "--state", state,
-      "--limit", String(Math.min(limit, 100)),
+      "--limit", String(fetchCount),
       // FNXC:GitHubImport 2026-06-22-18:30: Request `author` so the import preview pane can show full issue metadata (author/state alongside the already-present full body) without a per-item detail fetch.
       "--json", "number,title,body,url,labels,state,updatedAt,author",
     ]);
@@ -3203,54 +3654,79 @@ export class GitHubClient {
     updatedAt?: string;
     author?: string | null;
   }>> {
-    const limit = options?.limit ?? 30;
+    const limit = Math.min(options?.limit ?? 30, MAX_LIST_ISSUES);
     const state = options?.state ?? "open";
-
-    const params = new URLSearchParams();
-    params.append("state", state);
-    params.append("per_page", String(Math.min(limit, 100)));
-    if (options?.labels && options.labels.length > 0) {
-      params.append("labels", options.labels.join(","));
-    }
-
-    const url = `${this.baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?${params}`;
     const headers = this.buildHeaders();
 
-    const response = await fetch(url, { headers });
-
-    if (!response.ok) {
-      if (response.status === 404) {
-        throw new Error(`Repository not found: ${owner}/${repo}`);
-      }
-      throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as Array<{
+    /*
+    FNXC:GitHubImport 2026-07-16-16:20:
+    REST `/issues` caps per_page at 100, so loop `page` until we collect `limit` real issues or a short page
+    signals exhaustion. Pull requests share the `/issues` feed and are dropped here, which can shrink a page
+    below per_page — so keep paging on a full 100-item page even after PR filtering, and stop only on a genuinely
+    short page. Bounded by MAX_LIST_ISSUES pages-worth so a huge repo can't loop unbounded.
+    */
+    const perPage = Math.min(limit, ISSUE_LIST_PAGE_SIZE);
+    const collected: Array<{
       number: number;
       title: string;
       body: string | null;
       html_url: string;
       labels: Array<{ name: string }>;
-      state: string;
-      updated_at: string;
-      user?: { login?: string } | null;
-      pull_request?: unknown;
-    }>;
+      state?: "open" | "closed";
+      updatedAt?: string;
+      author?: string | null;
+    }> = [];
 
-    // Filter out pull requests (they have a pull_request property)
-    return data
-      .filter((issue) => !issue.pull_request)
-      .map((issue) => ({
-        number: issue.number,
-        title: issue.title,
-        body: issue.body,
-        html_url: issue.html_url,
-        labels: issue.labels,
-        state: this.mapIssueState(issue.state),
-        updatedAt: issue.updated_at,
-        author: issue.user?.login ?? null,
-      }))
-      .slice(0, limit);
+    for (let page = 1; collected.length < limit; page += 1) {
+      const params = new URLSearchParams();
+      params.append("state", state);
+      params.append("per_page", String(perPage));
+      params.append("page", String(page));
+      if (options?.labels && options.labels.length > 0) {
+        params.append("labels", options.labels.join(","));
+      }
+
+      const url = `${this.baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues?${params}`;
+      const response = await fetch(url, { headers });
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          throw new Error(`Repository not found: ${owner}/${repo}`);
+        }
+        throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+      }
+
+      const data = (await response.json()) as Array<{
+        number: number;
+        title: string;
+        body: string | null;
+        html_url: string;
+        labels: Array<{ name: string }>;
+        state: string;
+        updated_at: string;
+        user?: { login?: string } | null;
+        pull_request?: unknown;
+      }>;
+
+      for (const issue of data) {
+        if (issue.pull_request) continue; // PRs share the /issues feed; exclude them
+        collected.push({
+          number: issue.number,
+          title: issue.title,
+          body: issue.body,
+          html_url: issue.html_url,
+          labels: issue.labels,
+          state: this.mapIssueState(issue.state),
+          updatedAt: issue.updated_at,
+          author: issue.user?.login ?? null,
+        });
+      }
+
+      // A page shorter than per_page means GitHub has no further issues to return.
+      if (data.length < perPage) break;
+    }
+
+    return collected.slice(0, limit);
   }
 
   async searchIssues(
@@ -3947,6 +4423,55 @@ export class GitHubClient {
         method: "PATCH",
         headers: { ...this.buildHeaders(), "Content-Type": "application/json" },
         body: JSON.stringify({ state: "closed" }),
+      }
+    );
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error(`Issue #${number} not found in ${owner}/${repo}`);
+      }
+      const error = await response.json().catch(() => ({ message: response.statusText }));
+      throw new Error(`GitHub API error: ${response.status} ${error.message || response.statusText}`);
+    }
+  }
+
+
+  /*
+  FNXC:GitHubImport 2026-07-17-12:00:
+  Import-preview operators can post a new comment to the upstream issue without leaving Fusion.
+  Prefer `gh issue comment` and fall back to the authenticated REST endpoint, matching closeIssue
+  so hosts with either CLI authentication or GITHUB_TOKEN remain supported.
+  */
+  async addIssueComment(owner: string, repo: string, number: number, body: string): Promise<void> {
+    if (this.hasGhAuth()) {
+      try {
+        await runGhAsync([
+          "issue", "comment", String(number),
+          "--repo", `${owner}/${repo}`,
+          "--body", body,
+        ]);
+        return;
+      } catch (err) {
+        if (this.token) {
+          await this.addIssueCommentWithApi(owner, repo, number, body);
+          return;
+        }
+        throw new Error(getGhErrorMessage(err));
+      }
+    }
+    if (this.token) {
+      await this.addIssueCommentWithApi(owner, repo, number, body);
+      return;
+    }
+    throw new Error("GitHub CLI (gh) is not available or not authenticated, and no GITHUB_TOKEN provided. Run 'gh auth login' to authenticate.");
+  }
+
+  private async addIssueCommentWithApi(owner: string, repo: string, number: number, body: string): Promise<void> {
+    const response = await fetch(
+      `${this.baseUrl}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${number}/comments`,
+      {
+        method: "POST",
+        headers: { ...this.buildHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({ body }),
       }
     );
     if (!response.ok) {

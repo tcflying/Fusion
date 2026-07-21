@@ -1,8 +1,9 @@
 /**
- * AgentStore - SQLite-backed persistence for agent lifecycle management.
+ * AgentStore - persistence for agent lifecycle management.
  *
+ * FNXC:PostgresRuntimeStorage 2026-07-14-18:49:
  * Agent records, heartbeat events, runs, task sessions, API keys, config
- * revisions, and blocked-state snapshots are stored in `.fusion/fusion.db`.
+ * revisions, and blocked-state snapshots are stored in project-scoped PostgreSQL tables.
  * Managed instruction bundle markdown files remain on disk because they are
  * edited as normal project files.
  */
@@ -12,6 +13,7 @@ import { constants as fsConstants, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { sql } from "drizzle-orm";
 import type {
   Agent,
   AgentState,
@@ -161,6 +163,10 @@ export interface AgentStoreOptions {
   asyncLayer?: AsyncDataLayer;
 }
 
+export interface ExactRuntimeConfigAgentCreateInput extends AgentCreateInput {
+  runtimeConfig: Record<string, unknown>;
+}
+
 /** Agent data as stored in SQLite JSON columns */
 interface AgentData {
   id: string;
@@ -268,6 +274,46 @@ function resolveCreationRuntimeConfig(
   return rc;
 }
 
+function buildAgentCreationRecord(
+  input: AgentCreateInput,
+  normalizedName: string,
+  metadata: Record<string, unknown>,
+  runtimeConfig: Record<string, unknown> | undefined,
+): Agent {
+  const ephemeral = isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo });
+  const now = new Date().toISOString();
+  const agentId = `agent-${randomUUID().slice(0, 8)}`;
+  const resolvedHeartbeatProcedurePath = input.heartbeatProcedurePath
+    ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId, input.name));
+  const normalizedPermissionPolicy = input.permissionPolicy
+    ? normalizeAgentPermissionPolicy(input.permissionPolicy)
+    : undefined;
+  const permissions = normalizeStoredPermissions(input.permissions);
+
+  return {
+    id: agentId,
+    name: normalizedName,
+    role: input.role,
+    state: ephemeral ? "idle" : "active",
+    createdAt: now,
+    updatedAt: now,
+    metadata,
+    ...(input.title && { title: input.title }),
+    ...(input.icon && { icon: input.icon }),
+    ...(input.imageUrl && { imageUrl: input.imageUrl }),
+    ...(input.reportsTo && { reportsTo: input.reportsTo }),
+    ...(runtimeConfig && { runtimeConfig }),
+    ...(permissions && { permissions }),
+    ...(normalizedPermissionPolicy && { permissionPolicy: normalizedPermissionPolicy }),
+    ...(input.instructionsPath && { instructionsPath: input.instructionsPath }),
+    ...(input.instructionsText && { instructionsText: input.instructionsText }),
+    ...(input.soul && { soul: input.soul }),
+    ...(input.memory && { memory: input.memory }),
+    ...(input.bundleConfig && { bundleConfig: input.bundleConfig }),
+    ...(resolvedHeartbeatProcedurePath && { heartbeatProcedurePath: resolvedHeartbeatProcedurePath }),
+  };
+}
+
 /**
  * Process-wide cache of initialized Database connections, keyed by absolute
  * rootDir. Without this, callers that re-instantiate AgentStore per request
@@ -363,6 +409,18 @@ export class AgentStore extends EventEmitter {
       throw new Error("AgentStore requires projectId when claimStore is configured");
     }
     this.asyncLayer = options.asyncLayer ?? null;
+  }
+
+  private get backendProjectId(): string {
+    const projectId = this.asyncLayer?.projectId;
+    /*
+    FNXC:AgentHeartbeatIsolation 2026-07-14-00:37:
+    Backend heartbeat runs are project-owned. Reject unbound backend heartbeat/run access instead of silently reading or writing the legacy empty-string partition, which could mix ownership on a shared PostgreSQL cluster.
+    */
+    if (!projectId) {
+      throw new Error("AgentStore backend heartbeat/run operations require asyncLayer.projectId");
+    }
+    return projectId;
   }
 
   private get db(): Database {
@@ -528,6 +586,15 @@ export class AgentStore extends EventEmitter {
    * Runtime reads come from SQLite; this only seeds old projects.
    */
   async importLegacyFileRuns(): Promise<number> {
+    /*
+    FNXC:PostgresOnlyDataAccess 2026-07-17-14:20:
+    One-shot legacy SQLite migration. In backend mode the INSERT below hits the
+    removed-SQLite stub, and this method's per-file try/catch would swallow the
+    throw and silently report "0 imported". There are no legacy SQLite file runs
+    to import against PostgreSQL (the PG baseline already covers this), so no-op
+    cleanly instead of laundering a stub throw into a false success.
+    */
+    if (this.backendMode) return 0;
     const entries = await readdir(this.agentsDir, { withFileTypes: true }).catch(() => []);
     const runDirs = entries.filter((entry) => entry.isDirectory() && entry.name.endsWith("-runs"));
 
@@ -703,6 +770,31 @@ export class AgentStore extends EventEmitter {
     return existing !== null;
   }
 
+  private async createDurableNamedAgentUnderLock(
+    input: AgentCreateInput,
+    normalizedName: string,
+    metadata: Record<string, unknown>,
+    runtimeConfig: Record<string, unknown> | undefined,
+  ): Promise<Agent> {
+    if (!this.backendMode) {
+      throw new Error("Locked durable agent creation requires the PostgreSQL AsyncDataLayer");
+    }
+
+    const lockKey = `fusion:agent-name:${normalizedName}`;
+    return this.asyncLayer!.transactionImmediate(async (tx) => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+      const candidates = await findAgentRowsByNameAsync(tx, normalizedName);
+      const existing = candidates.find((candidate) => !isEphemeralAgent(candidate));
+      if (existing) {
+        throw new Error(`Agent with name "${normalizedName}" already exists (agentId: ${existing.id})`);
+      }
+
+      const created = buildAgentCreationRecord(input, normalizedName, metadata, runtimeConfig);
+      await writeAgentAsync(tx, created);
+      return created;
+    });
+  }
+
   /**
    * Create a new agent with a default state based on ephemeral classification.
    *
@@ -734,6 +826,19 @@ export class AgentStore extends EventEmitter {
     const metadata = input.metadata ?? {};
     const ephemeral = isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo });
 
+    const runtimeConfig = resolveCreationRuntimeConfig(input.runtimeConfig, metadata);
+
+    if (!ephemeral && this.backendMode) {
+      const agent = await this.createDurableNamedAgentUnderLock(
+        input,
+        normalizedName,
+        metadata,
+        runtimeConfig,
+      );
+      this.emit("agent:created", agent);
+      return agent;
+    }
+
     if (!ephemeral) {
       const existing = await this.findAgentByName(normalizedName);
       if (existing) {
@@ -741,57 +846,49 @@ export class AgentStore extends EventEmitter {
       }
     }
 
-    const now = new Date().toISOString();
-    const agentId = `agent-${randomUUID().slice(0, 8)}`;
-
-    const runtimeConfig = resolveCreationRuntimeConfig(input.runtimeConfig, metadata);
-
-    // Default heartbeatProcedurePath for new non-ephemeral agents so operators
-    // get an editable HEARTBEAT.md file from day one. Each agent gets its
-    // own per-agent file (under `.fusion/agents/<id>/HEARTBEAT.md`) so
-    // tweaks to one agent's procedure do not bleed into the rest of the
-    // team. Ephemeral task workers skip this — they're short-lived and
-    // don't need persistent procedure files.
-    const resolvedHeartbeatProcedurePath = input.heartbeatProcedurePath
-      ?? (ephemeral ? undefined : getDefaultHeartbeatProcedurePath(agentId, input.name));
-
-    /*
-    FNXC:AgentPermissions 2026-07-02-00:00:
-    FN-7413 makes permission configuration lifetime-agnostic: durable identity agents and ephemeral task-worker agents may both store explicit capability grants and runtime permission policies. Missing policies stay absent for every lifetime so legacy rows and newly created agents inherit the project default at runtime instead of being materialized as explicit unrestricted overrides.
-    */
-    const normalizedPermissionPolicy = input.permissionPolicy
-      ? normalizeAgentPermissionPolicy(input.permissionPolicy)
-      : undefined;
-
-    const agent: Agent = {
-      id: agentId,
-      name: normalizedName,
-      role: input.role,
-      // Non-ephemeral agents start active so they immediately participate in
-      // heartbeat scheduling; ephemeral/task-worker agents start idle and are
-      // activated by the engine when work is assigned.
-      state: ephemeral ? "idle" : "active",
-      createdAt: now,
-      updatedAt: now,
-      metadata,
-      ...(input.title && { title: input.title }),
-      ...(input.icon && { icon: input.icon }),
-      ...(input.imageUrl && { imageUrl: input.imageUrl }),
-      ...(input.reportsTo && { reportsTo: input.reportsTo }),
-      ...(runtimeConfig && { runtimeConfig }),
-      ...(normalizeStoredPermissions(input.permissions) && { permissions: normalizeStoredPermissions(input.permissions) }),
-      ...(normalizedPermissionPolicy && { permissionPolicy: normalizedPermissionPolicy }),
-      ...(input.instructionsPath && { instructionsPath: input.instructionsPath }),
-      ...(input.instructionsText && { instructionsText: input.instructionsText }),
-      ...(input.soul && { soul: input.soul }),
-      ...(input.memory && { memory: input.memory }),
-      ...(input.bundleConfig && { bundleConfig: input.bundleConfig }),
-      ...(resolvedHeartbeatProcedurePath && { heartbeatProcedurePath: resolvedHeartbeatProcedurePath }),
-    };
+    const agent = buildAgentCreationRecord(input, normalizedName, metadata, runtimeConfig);
 
     await this.writeAgent(agent);
     this.emit("agent:created", agent);
 
+    return agent;
+  }
+
+  /**
+   * Create one durable named agent while preserving the caller's runtimeConfig
+   * byte-for-byte at the persistence boundary.
+   *
+   * FNXC:HappierTaskBinding 2026-07-16-13:10:
+   * Bridge agents must never become visible with AgentStore heartbeat or auto-claim defaults before a follow-up update. Serialize exact named creation with a PostgreSQL transaction-scoped advisory lock, check durable-name uniqueness and insert the final row in that same transaction, then emit creation only after commit.
+   */
+  async createAgentWithExactRuntimeConfig(input: ExactRuntimeConfigAgentCreateInput): Promise<Agent> {
+    if (!input.name?.trim()) {
+      throw new Error("Agent name is required");
+    }
+    if (!input.role) {
+      throw new Error("Agent role is required");
+    }
+    if (!input.runtimeConfig || typeof input.runtimeConfig !== "object" || Array.isArray(input.runtimeConfig)) {
+      throw new Error("Exact runtimeConfig is required");
+    }
+
+    const normalizedName = input.name.trim();
+    const metadata = input.metadata ?? {};
+    if (isEphemeralAgent({ metadata, name: input.name, role: input.role, reportsTo: input.reportsTo })) {
+      throw new Error("Exact named creation is only supported for durable agents");
+    }
+    if (!this.backendMode) {
+      throw new Error("Exact named agent creation requires the PostgreSQL AsyncDataLayer");
+    }
+
+    const agent = await this.createDurableNamedAgentUnderLock(
+      input,
+      normalizedName,
+      metadata,
+      { ...input.runtimeConfig },
+    );
+
+    this.emit("agent:created", agent);
     return agent;
   }
 
@@ -1800,7 +1897,7 @@ export class AgentStore extends EventEmitter {
     }
 
     if (this.claimStore && this.claimProjectId && task.checkoutNodeId) {
-      this.claimStore.releaseTaskClaim({
+      await this.claimStore.releaseTaskClaim({
         projectId: this.claimProjectId,
         taskId,
         nodeId: task.checkoutNodeId,
@@ -2119,6 +2216,9 @@ export class AgentStore extends EventEmitter {
     status: AgentHeartbeatEvent["status"],
     runId?: string
   ): Promise<AgentHeartbeatEvent> {
+    if (this.backendMode) {
+      void this.backendProjectId;
+    }
     return this.withLock(agentId, async () => {
       // Verify agent exists
       const agent = await this.getAgent(agentId);
@@ -2183,6 +2283,7 @@ export class AgentStore extends EventEmitter {
     // FNXC:SqliteFinalRemoval 2026-06-26-00:05:
     // Backend mode: read via async Drizzle helper.
     if (this.backendMode) {
+      void this.backendProjectId;
       return getHeartbeatHistoryAsync(this.asyncLayer!.db, agentId, limit);
     }
     const rows = this.db.prepare(`
@@ -2244,7 +2345,7 @@ export class AgentStore extends EventEmitter {
     let agentId: string;
     let existingRun: AgentHeartbeatRun;
     if (this.backendMode) {
-      const found = await getRunByIdAsync(this.asyncLayer!.db, runId);
+      const found = await getRunByIdAsync(this.asyncLayer!.db, this.backendProjectId, runId);
       if (!found) {
         return;
       }
@@ -2324,7 +2425,7 @@ export class AgentStore extends EventEmitter {
      * Backend-mode: delegate to async Drizzle listActiveHeartbeatRuns helper.
      */
     if (this.backendMode) {
-      return listActiveHeartbeatRunsAsync(this.asyncLayer!.db);
+      return listActiveHeartbeatRunsAsync(this.asyncLayer!.db, this.backendProjectId);
     }
     const rows = this.db.prepare(`
       SELECT data FROM agentRuns
@@ -2539,7 +2640,7 @@ export class AgentStore extends EventEmitter {
      * Backend-mode: delegate to async Drizzle saveRun helper.
      */
     if (this.backendMode) {
-      await saveRunAsync(this.asyncLayer!.db, run);
+      await saveRunAsync(this.asyncLayer!.db, this.backendProjectId, run);
       return;
     }
     this.db.prepare(`
@@ -2567,7 +2668,7 @@ export class AgentStore extends EventEmitter {
      * Backend-mode: delegate to async Drizzle getRunDetail helper.
      */
     if (this.backendMode) {
-      return getRunDetailAsync(this.asyncLayer!.db, agentId, runId);
+      return getRunDetailAsync(this.asyncLayer!.db, this.backendProjectId, agentId, runId);
     }
     const row = this.db.prepare(`
       SELECT data FROM agentRuns WHERE agentId = ? AND id = ?
@@ -2587,7 +2688,7 @@ export class AgentStore extends EventEmitter {
      * Backend-mode: delegate to async Drizzle getRecentRuns helper.
      */
     if (this.backendMode) {
-      return getRecentRunsAsync(this.asyncLayer!.db, agentId, limit);
+      return getRecentRunsAsync(this.asyncLayer!.db, this.backendProjectId, agentId, limit);
     }
     const rows = this.db.prepare(`
       SELECT data FROM agentRuns
@@ -2606,7 +2707,7 @@ export class AgentStore extends EventEmitter {
      * Backend-mode: delegate to async Drizzle getRunStatusCounts helper.
      */
     if (this.backendMode) {
-      return getRunStatusCountsAsync(this.asyncLayer!.db, agentIds);
+      return getRunStatusCountsAsync(this.asyncLayer!.db, this.backendProjectId, agentIds);
     }
     let rows: Array<{ status: string; count: number }>;
 
@@ -3195,7 +3296,7 @@ export class AgentStore extends EventEmitter {
     // FNXC:SqliteFinalRemoval 2026-06-25-23:40:
     // Backend mode: delegate to async Drizzle writeAgent helper.
     if (this.backendMode) {
-      await writeAgentAsync(this.asyncLayer!.db, agent);
+      await writeAgentAsync(this.asyncLayer!.db, agent, this.asyncLayer!.projectId);
       return;
     }
     const data: AgentData = {

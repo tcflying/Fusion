@@ -17,10 +17,16 @@ vi.mock("../pi.js", () => ({
 import { aiMergeTask } from "../merger.js";
 import { mergerLog } from "../logger.js";
 import { resolveMergeIntegrationRoot } from "../merger-integration-worktree.js";
-import { git, hasGit, makeReliabilityFixture } from "./reliability-interactions/_helpers.js";
+/*
+FNXC:PgMigrationQuarantine 2026-07-18-04:10:
+VAL-REMOVAL-005 reliability fixtures use PostgreSQL AsyncDataLayer storage. Read
+run audits through getRunAuditEventsAsync so each assertion observes committed
+backend events rather than the removed synchronous SQLite read surface.
+*/
+import { git, hasGit, hasPg, makeReliabilityFixture } from "./reliability-interactions/_helpers.js";
 
 describe("FN-5348 cwd integration fallback removed", () => {
-  it.skipIf(!hasGit)("Scenario A/B: dirty reused worktree is autostashed and the merge proceeds without any cwd fallback", async () => {
+  it.skipIf(!hasGit || !hasPg)("Scenario A/B: dirty reused worktree is autostashed and the merge proceeds without any cwd fallback", async () => {
     const fixture = await makeReliabilityFixture({
       taskId: "FN-5348-DIRTY-AUTOSTASH",
       settings: {
@@ -54,7 +60,7 @@ describe("FN-5348 cwd integration fallback removed", () => {
 
       await aiMergeTask(store, rootDir, task.id).catch(() => undefined);
 
-      const autostashEvents = store.getRunAuditEvents({ taskId: task.id })
+      const autostashEvents = (await store.getRunAuditEventsAsync({ taskId: task.id }))
         .filter((event) => event.mutationType === "merge:reuse-handoff-autostash");
       expect(autostashEvents.length).toBeGreaterThanOrEqual(1);
       const meta = autostashEvents[0]?.metadata ?? {};
@@ -63,7 +69,7 @@ describe("FN-5348 cwd integration fallback removed", () => {
       expect((meta.stashSha as string).length).toBeGreaterThan(0);
 
       // FN-5348 invariant preserved: no cwd-main fallback path was taken.
-      const refused = store.getRunAuditEvents({ taskId: task.id })
+      const refused = (await store.getRunAuditEventsAsync({ taskId: task.id }))
         .filter((event) => event.mutationType === "merge:cwd-integration-fallback-refused");
       expect(refused).toHaveLength(0);
 
@@ -83,7 +89,7 @@ describe("FN-5348 cwd integration fallback removed", () => {
     expect(root.mode).toBe("reuse-task-worktree");
   });
 
-  it.skipIf(!hasGit)("Scenario D: explicit opt-in (legacy alias) emits warning", async () => {
+  it.skipIf(!hasGit || !hasPg)("Scenario D: explicit opt-in (legacy alias) emits warning", async () => {
     const fixture = await makeReliabilityFixture({
       taskId: "FN-5348-CWD-OPTIN",
       settings: {
@@ -114,7 +120,7 @@ describe("FN-5348 cwd integration fallback removed", () => {
       const result = await aiMergeTask(store, rootDir, task.id);
       expect(result.merged).toBe(true);
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("mergeIntegrationWorktree=cwd-integration-branch is explicit opt-in"));
-      const auditTypes = store.getRunAuditEvents({ taskId: task.id }).map((event) => event.mutationType);
+      const auditTypes = (await store.getRunAuditEventsAsync({ taskId: task.id })).map((event) => event.mutationType);
       expect(auditTypes).not.toContain("merge:cwd-integration-fallback-removed");
     } finally {
       await fixture.cleanup();

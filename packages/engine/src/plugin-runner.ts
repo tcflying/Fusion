@@ -17,6 +17,7 @@ import type {
   PluginUiSlotDefinition,
   PluginUiContributionDefinition,
   PluginRuntimeRegistration,
+  PluginSessionConnectorRegistration,
   CliProviderContribution,
   PluginContext,
   PluginSkillContribution,
@@ -239,30 +240,10 @@ export class PluginRunner {
     const result = await this.options.pluginLoader.loadAllPlugins();
     executorLog.log(`PluginRunner loaded ${result.loaded} plugins (${result.errors} errors)`);
 
-    // Execute onSchemaInit hooks from loaded plugins.
-    const schemaInitHooks = this.options.pluginLoader.getPluginSchemaInitHooks();
-    if (schemaInitHooks.length > 0) {
-      executorLog.log(`Executing onSchemaInit hooks from ${schemaInitHooks.length} plugins`);
-      try {
-        /*
-         * FNXC:PostgresCutover 2026-07-04:
-         * Skip the SQLite-specific runPluginSchemaInits path in backend mode.
-         * PostgreSQL uses Drizzle migrations for schema management. Matches the
-         * daemon.ts / dashboard.ts / serve.ts convention. Previously
-         * getDatabase() threw in backend mode and the catch swallowed it, so
-         * plugin onSchemaInit hooks silently never ran.
-         */
-        if (this.options.taskStore.isBackendMode()) {
-          executorLog.log("onSchemaInit skipped — backend mode (PostgreSQL Drizzle migrations)");
-        } else {
-          const db = this.options.taskStore.getDatabase();
-          await db.runPluginSchemaInits(schemaInitHooks);
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        executorLog.log(`onSchemaInit execution failed: ${message}`);
-      }
-    }
+    /*
+    FNXC:PluginPostgresSchema 2026-07-14-21:48:
+    PluginLoader completes each plugin's backend-specific schema initialization before loadAllPlugins counts it as loaded. PluginRunner must not replay the accumulated contracts after loading.
+    */
 
     // Subscribe to store events for task lifecycle hooks
     this.subscribeToStoreEvents();
@@ -397,6 +378,24 @@ export class PluginRunner {
       };
     }
     return this.cachedRuntimes.runtimes;
+  }
+
+  /** Discover Session Connectors through the generic plugin contribution seam. */
+  getPluginSessionConnectors(): Array<{
+    pluginId: string;
+    sessionConnector: PluginSessionConnectorRegistration;
+  }> {
+    return this.options.pluginLoader.getPluginSessionConnectors();
+  }
+
+  /** Resolve one connector registration without provider-specific branching. */
+  getSessionConnectorById(connectorId: string): {
+    pluginId: string;
+    sessionConnector: PluginSessionConnectorRegistration;
+  } | undefined {
+    return this.getPluginSessionConnectors().find(
+      (registration) => registration.sessionConnector.metadata.connectorId === connectorId,
+    );
   }
 
   getCliProviderContributions(): Array<{ pluginId: string; contribution: CliProviderContribution }> {
@@ -1259,7 +1258,10 @@ export class PluginRunner {
    * @param pluginId - The plugin ID to create context for
    * @returns The plugin context, or null if the plugin is not loaded
    */
-  async createRuntimeContext(pluginId: string): Promise<PluginContext | null> {
+  async createRuntimeContext(
+    pluginId: string,
+    hostExtensions: Pick<PluginContext, "sessionConnectorWriteAuthorizer"> = {},
+  ): Promise<PluginContext | null> {
     const plugin = this.options.pluginLoader.getPlugin(pluginId);
     if (!plugin) {
       this.log.warn(`Plugin "${pluginId}" not loaded, cannot create runtime context`);
@@ -1275,6 +1277,9 @@ export class PluginRunner {
       emitEvent: (event: string, data: unknown) => {
         this.log.log(`[plugin:${pluginId}] Event: ${event}`, data);
       },
+      ...(hostExtensions.sessionConnectorWriteAuthorizer
+        ? { sessionConnectorWriteAuthorizer: hostExtensions.sessionConnectorWriteAuthorizer }
+        : {}),
     };
   }
 

@@ -9,7 +9,7 @@ FN-6444 confirmed this ChatManager API-path suite is deterministic under dashboa
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   ChatManager,
@@ -414,15 +414,19 @@ describe("ChatManager.sendMessage", () => {
   });
 
   it("records task-detail planner chat tokens separately from task execution usage", async () => {
-    __setCreateResolvedAgentSession(async () => ({
-      session: {
-        prompt: vi.fn().mockResolvedValue(undefined),
-        dispose: vi.fn(),
-        model: { provider: "anthropic", id: "claude-sonnet-4-5" },
-        getSessionStats: () => ({ tokens: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0 } }),
-        state: { messages: [{ role: "assistant", content: "Planner response" }] },
-      },
-    }));
+    let createOptions: any;
+    __setCreateResolvedAgentSession(async (options: any) => {
+      createOptions = options;
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          model: { provider: "anthropic", id: "claude-sonnet-4-5" },
+          getSessionStats: () => ({ tokens: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0 } }),
+          state: { messages: [{ role: "assistant", content: "Planner response" }] },
+        },
+      };
+    });
     mockChatStore.getSession.mockReturnValue({
       id: "chat-planner",
       agentId: "task-planner:FN-7449",
@@ -451,6 +455,8 @@ describe("ChatManager.sendMessage", () => {
       agentId: "task-planner:FN-7449",
       totalTokens: 14,
     }));
+    expect(createOptions.tools).toBe("coding");
+    expect(createOptions).not.toHaveProperty("toolsAllowlist");
   });
 
   it("does not record chat token usage when session stats are unavailable or zero", async () => {
@@ -833,6 +839,55 @@ describe("ChatManager.sendMessage", () => {
     );
   });
 
+  it("passes action and permanent-agent gates to bound Mission chat sessions", async () => {
+    let createOptions: any;
+    __setCreateResolvedAgentSession(async (options: any) => {
+      createOptions = options;
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          state: { messages: [{ role: "assistant", content: "ok" }] },
+        },
+      };
+    });
+    const taskStore = {
+      getSettings: vi.fn().mockResolvedValue({
+        defaultAgentPermissionPolicy: { rules: { task_agent_mutation: "block" } },
+      }),
+      getAsyncLayer: vi.fn(() => ({})),
+      getFusionDir: () => "/tmp/test/.fusion",
+    };
+
+    const chatManager = new ChatManager(
+      mockChatStore as any,
+      "/tmp/test",
+      mockAgentStore as any,
+      undefined,
+      undefined,
+      undefined,
+      taskStore as any,
+    );
+    await chatManager.sendMessage("chat-001", "Create a mission");
+
+    /*
+    FNXC:ChatMissionGatingTests 2026-07-29-15:30:
+    Mission mutations in a bound chat session are safe only when both wrappers
+    receive the bound agent policy. The engine gating suites assert block and
+    approval execution; this dashboard seam asserts chat cannot omit either context.
+    */
+    expect(createOptions.actionGateContext).toMatchObject({
+      agentId: "agent-001",
+      permissionPolicy: { rules: { task_agent_mutation: "block" } },
+    });
+    expect(createOptions.permanentAgentGating).toMatchObject({
+      requester: { actorId: "agent-001" },
+      permissionPolicy: { rules: { task_agent_mutation: "block" } },
+    });
+    expect(createOptions.customTools.map((tool: { name: string }) => tool.name)).toContain("fn_mission_create");
+    expect(createOptions.customTools.map((tool: { name: string }) => tool.name)).toContain("fn_ideation_converge");
+  });
+
   it("exposes fn_task_document_* tools to the chat agent when a task store is present", async () => {
     let capturedTools: Array<{ name: string; execute?: (...args: any[]) => Promise<any> }> = [];
     __setCreateFnAgent(async (options: any) => {
@@ -847,6 +902,7 @@ describe("ChatManager.sendMessage", () => {
     });
 
     const taskStore = {
+      getSettings: vi.fn().mockResolvedValue({}),
       upsertTaskDocument: vi.fn().mockResolvedValue({
         id: "doc-1",
         taskId: "FN-6635",
@@ -873,6 +929,31 @@ describe("ChatManager.sendMessage", () => {
     const names = capturedTools.map((tool) => tool.name);
     expect(names).toContain("fn_task_document_write");
     expect(names).toContain("fn_task_document_read");
+    for (const required of [
+      "fn_task_list",
+      "fn_task_show",
+      "fn_task_search",
+      "fn_task_create",
+      "fn_delegate_task",
+      "fn_task_assign",
+      "fn_list_agents",
+      "fn_get_agent_config",
+      "fn_web_fetch",
+      "fn_goal_list",
+      "fn_goal_show",
+      "fn_memory_search",
+      "fn_memory_get",
+      "fn_research_run",
+      "fn_research_list",
+      "fn_research_get",
+    ]) {
+      expect(names).toContain(required);
+    }
+    expect(names).not.toContain("fn_agent_create");
+    expect(names).not.toContain("fn_agent_delete");
+    expect(names).not.toContain("fn_agent_update");
+    expect(names).not.toContain("fn_memory_append");
+    expect(new Set(names).size).toBe(names.length);
 
     const writeTool = capturedTools.find((tool) => tool.name === "fn_task_document_write");
     const writeResult = await writeTool?.execute?.("call-doc-write", {
@@ -1080,7 +1161,7 @@ describe("ChatManager.sendMessage", () => {
 
   it("creates chat agents with the full coding toolset", async () => {
     let createOptions: any;
-    __setCreateFnAgent(async (options: any) => {
+    __setCreateResolvedAgentSession(async (options: any) => {
       createOptions = options;
       return {
         session: {
@@ -1097,6 +1178,7 @@ describe("ChatManager.sendMessage", () => {
     await chatManager.sendMessage("chat-001", "Hello");
 
     expect(createOptions.tools).toBe("coding");
+    expect(createOptions).not.toHaveProperty("toolsAllowlist");
   });
 
   it("requests bound agent and enabled plugin skills for regular chat", async () => {
@@ -1118,10 +1200,12 @@ describe("ChatManager.sendMessage", () => {
       runtimeConfig: {},
       metadata: { skills: ["agent-debug", "ce-debug"] },
     });
+    const pluginRoot = "/tmp/plugin-chat-skills";
+    const pluginSkillDir = join(pluginRoot, "skills", "ce-debug");
     const pluginRunner = {
       getPluginSkills: vi.fn(() => [
-        { pluginId: "fusion-plugin-compound-engineering", skill: { name: "ce-debug", enabled: true } },
-        { pluginId: "disabled-plugin", skill: { name: "disabled-debug", enabled: false } },
+        { pluginId: "fusion-plugin-compound-engineering", pluginRoot, skill: { name: "ce-debug", enabled: true } },
+        { pluginId: "disabled-plugin", pluginRoot, skill: { name: "disabled-debug", enabled: false } },
       ]),
     };
 
@@ -1135,6 +1219,7 @@ describe("ChatManager.sendMessage", () => {
     });
     expect(createOptions.skillSelection.requestedSkillNames).toEqual(["agent-debug", "ce-debug"]);
     expect(createOptions.skillSelection.requestedSkillNames).not.toContain("disabled-debug");
+    expect(createOptions.additionalSkillPaths).toEqual([pluginSkillDir, dirname(pluginSkillDir)]);
   });
 
   it("requests enabled plugin skills for model-only QuickChat sessions", async () => {
@@ -1154,9 +1239,11 @@ describe("ChatManager.sendMessage", () => {
         },
       };
     });
+    const pluginRoot = "/tmp/plugin-quick-chat-skills";
+    const pluginSkillDir = join(pluginRoot, "skills", "ce-debug");
     const pluginRunner = {
       getPluginSkills: vi.fn(() => [
-        { pluginId: "fusion-plugin-compound-engineering", skill: { name: "ce-debug" } },
+        { pluginId: "fusion-plugin-compound-engineering", pluginRoot, skill: { name: "ce-debug" } },
       ]),
     };
 
@@ -1165,6 +1252,7 @@ describe("ChatManager.sendMessage", () => {
 
     expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion", "ce-debug"]);
     expect(createOptions.skillSelection.sessionPurpose).toBe("executor");
+    expect(createOptions.additionalSkillPaths).toEqual([pluginSkillDir, dirname(pluginSkillDir)]);
   });
 
   it("merges plugin skills when a bound chat agent has no metadata skills", async () => {
@@ -1196,6 +1284,7 @@ describe("ChatManager.sendMessage", () => {
     await chatManager.sendMessage("chat-001", "Hello");
 
     expect(createOptions.skillSelection.requestedSkillNames).toEqual(["fusion", "ce-debug"]);
+    expect(createOptions).not.toHaveProperty("additionalSkillPaths");
   });
 
   it("loads a single-segment /skill command and strips it from the chat prompt", async () => {
@@ -3594,7 +3683,9 @@ describe("ChatManager generation isolation", () => {
     mockAgentStore.getAgent.mockResolvedValue({ id: "agent-001", name: "Avery", role: "executor", state: "idle" });
 
     let capturedTools: Array<{ name: string }> = [];
+    let createOptions: any;
     __setCreateResolvedAgentSession(async (options: any) => {
+      createOptions = options;
       capturedTools = options.customTools ?? [];
       return {
         session: {
@@ -3609,7 +3700,80 @@ describe("ChatManager generation isolation", () => {
     const chatManager = new ChatManager(mockChatStore as any, "/tmp/test", mockAgentStore as any, undefined, undefined, undefined, taskStore as any);
     await chatManager.sendRoomMessage("room-1", "How many tokens did FN-7310 use?");
 
-    expect(capturedTools.map((tool) => tool.name)).not.toContain("fn_task_planner_get_task_metrics");
+    const names = capturedTools.map((tool) => tool.name);
+    expect(createOptions.tools).toBe("coding");
+    expect(createOptions).not.toHaveProperty("toolsAllowlist");
+    expect(names).not.toContain("fn_task_planner_get_task_metrics");
+    for (const required of [
+      "fn_task_list",
+      "fn_task_show",
+      "fn_task_search",
+      "fn_task_create",
+      "fn_delegate_task",
+      "fn_task_assign",
+      "fn_list_agents",
+      "fn_get_agent_config",
+      "fn_web_fetch",
+      "fn_goal_list",
+      "fn_goal_show",
+      "fn_memory_search",
+      "fn_memory_get",
+      "fn_research_run",
+      "fn_research_list",
+      "fn_research_get",
+    ]) {
+      expect(names).toContain(required);
+    }
+    expect(names).not.toContain("fn_agent_create");
+    expect(names).not.toContain("fn_agent_delete");
+    expect(names).not.toContain("fn_agent_update");
+    expect(names).not.toContain("fn_memory_append");
+    expect(new Set(names).size).toBe(names.length);
+  });
+
+  it("sendRoomMessage forwards enabled plugin skill names and body paths to responders", async () => {
+    (mockChatStore as any).getRoom = vi.fn().mockReturnValue({ id: "room-1", name: "team" });
+    (mockChatStore as any).listRoomMembers = vi.fn().mockReturnValue([
+      { roomId: "room-1", agentId: "agent-001", role: "member", addedAt: "2026-01-01" },
+    ]);
+    (mockChatStore as any).addRoomMessage = vi.fn().mockImplementation((_roomId: string, input: any) => ({
+      id: "room-msg",
+      roomId: "room-1",
+      ...input,
+    }));
+    mockAgentStore.listAgents.mockResolvedValue([{ id: "agent-001", name: "Avery", role: "executor", state: "idle" }]);
+    mockAgentStore.getAgent.mockResolvedValue({
+      id: "agent-001",
+      name: "Avery",
+      role: "executor",
+      state: "idle",
+      metadata: { skills: ["agent-debug"] },
+    });
+
+    let createOptions: any;
+    __setCreateResolvedAgentSession(async (options: any) => {
+      createOptions = options;
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          dispose: vi.fn(),
+          state: { messages: [{ role: "assistant", content: "Room answer" }] },
+        },
+      };
+    });
+    const pluginRoot = "/tmp/plugin-room-chat-skills";
+    const pluginSkillDir = join(pluginRoot, "skills", "ce-debug");
+    const pluginRunner = {
+      getPluginSkills: vi.fn(() => [
+        { pluginId: "fusion-plugin-compound-engineering", pluginRoot, skill: { name: "ce-debug", enabled: true } },
+      ]),
+    };
+
+    await createChatManager(pluginRunner).sendRoomMessage("room-1", "hello @Avery");
+
+    expect(createOptions.skillSelection.requestedSkillNames).toEqual(["ce-debug"]);
+    expect(createOptions.skillSelection.sessionPurpose).toBe("heartbeat");
+    expect(createOptions.additionalSkillPaths).toEqual([pluginSkillDir, dirname(pluginSkillDir)]);
   });
 
   it("sendRoomMessage persists assistant room replies", async () => {

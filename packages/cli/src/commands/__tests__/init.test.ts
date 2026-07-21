@@ -34,7 +34,11 @@ const mockGetProjectByPath = vi.fn();
 const mockRegisterProject = vi.fn();
 const mockEnsureProjectForPath = vi.fn();
 const mockUpdateProject = vi.fn().mockResolvedValue({});
-const { mockIsValidSqliteDatabaseFile } = vi.hoisted(() => ({
+const mockCentralConstructor = vi.fn();
+const mockBackendShutdown = vi.fn();
+const mockAsyncLayer = {};
+const { mockCreateTaskStoreForBackend, mockIsValidSqliteDatabaseFile } = vi.hoisted(() => ({
+  mockCreateTaskStoreForBackend: vi.fn(),
   mockIsValidSqliteDatabaseFile: vi.fn(),
 }));
 
@@ -42,14 +46,18 @@ vi.mock("@fusion/core", async () => {
   const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
   return {
     ...actual,
-    CentralCore: makeConstructibleMock(() => ({
-      init: mockCentralInit,
-      close: mockCentralClose,
-      getProjectByPath: mockGetProjectByPath,
-      registerProject: mockRegisterProject,
-      ensureProjectForPath: mockEnsureProjectForPath,
-      updateProject: mockUpdateProject,
-    })),
+    CentralCore: makeConstructibleMock((...args: unknown[]) => {
+      mockCentralConstructor(...args);
+      return {
+        init: mockCentralInit,
+        close: mockCentralClose,
+        getProjectByPath: mockGetProjectByPath,
+        registerProject: mockRegisterProject,
+        ensureProjectForPath: mockEnsureProjectForPath,
+        updateProject: mockUpdateProject,
+      };
+    }),
+    createTaskStoreForBackend: mockCreateTaskStoreForBackend,
     isQmdAvailable: vi.fn(() => Promise.resolve(true)),
     QMD_INSTALL_COMMAND: "bun install -g @tobilu/qmd",
     resolveGlobalDir: vi.fn(),
@@ -90,27 +98,43 @@ describe("init command", () => {
     tempHomeDir = tempDir("fn-init-home-");
     process.env.HOME = tempHomeDir;
     process.env.USERPROFILE = tempHomeDir;
+    mockCentralInit.mockReset();
+    mockCentralClose.mockReset();
+    mockGetProjectByPath.mockReset();
+    mockRegisterProject.mockReset();
+    mockEnsureProjectForPath.mockReset();
+    mockUpdateProject.mockReset();
     mockCentralInit.mockResolvedValue(undefined);
     mockCentralClose.mockResolvedValue(undefined);
+    mockCentralConstructor.mockReset();
+    mockCreateTaskStoreForBackend.mockReset();
+    mockBackendShutdown.mockReset();
+    mockBackendShutdown.mockResolvedValue(undefined);
+    mockCreateTaskStoreForBackend.mockResolvedValue({
+      taskStore: {},
+      asyncLayer: mockAsyncLayer,
+      shutdown: mockBackendShutdown,
+    });
     mockGetProjectByPath.mockResolvedValue(undefined);
+    mockUpdateProject.mockResolvedValue({});
     mockRegisterProject.mockResolvedValue({
-      id: "proj_test",
+      id: "proj_1234567890abcdef",
       name: "test-project",
       path: tempProjectDir,
       isolationMode: "in-process",
       status: "initializing",
-      createdAt: "",
+      createdAt: "2026-07-14T00:00:00.000Z",
       updatedAt: "",
     });
     mockEnsureProjectForPath.mockResolvedValue({
       outcome: "registered",
       project: {
-        id: "proj_test",
+        id: "proj_1234567890abcdef",
         name: "test-project",
         path: tempProjectDir,
         isolationMode: "in-process",
         status: "initializing",
-        createdAt: "",
+        createdAt: "2026-07-14T00:00:00.000Z",
         updatedAt: "",
       },
     });
@@ -153,14 +177,94 @@ describe("init command", () => {
     expect(existsSync(fusionDir)).toBe(true);
   });
 
-  it("should create fusion.db when initializing", async () => {
+  it("should create project.json without creating fusion.db when initializing", async () => {
+    const markerPath = join(tempProjectDir, ".fusion", "project.json");
     const dbPath = join(tempProjectDir, ".fusion", "fusion.db");
-    expect(existsSync(dbPath)).toBe(false);
+    expect(existsSync(markerPath)).toBe(false);
 
     await runInit({ path: tempProjectDir });
 
-    expect(existsSync(dbPath)).toBe(true);
-    expect(statSync(dbPath).size).toBeGreaterThan(0);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(statSync(markerPath).size).toBeGreaterThan(0);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it("should repair a missing project identity for an existing central registration", async () => {
+    const markerPath = join(tempProjectDir, ".fusion", "project.json");
+    mkdirSync(join(tempProjectDir, ".fusion"), { recursive: true });
+    mockGetProjectByPath.mockResolvedValueOnce({
+      id: "proj_1234567890abcdef",
+      name: "registered-project",
+      path: tempProjectDir,
+      isolationMode: "in-process",
+      status: "active",
+      createdAt: "2026-07-14T00:00:00.000Z",
+      updatedAt: "2026-07-14T00:00:00.000Z",
+    });
+    mockEnsureProjectForPath.mockClear();
+
+    await runInit({ path: tempProjectDir });
+
+    expect(JSON.parse(readFileSync(markerPath, "utf8"))).toMatchObject({
+      id: "proj_1234567890abcdef",
+      createdAt: "2026-07-14T00:00:00.000Z",
+    });
+    expect(mockEnsureProjectForPath).not.toHaveBeenCalled();
+  });
+
+  it("boots a backend layer for central registration and releases it after success", async () => {
+    await runInit({ path: tempProjectDir });
+
+    expect(mockCreateTaskStoreForBackend).toHaveBeenCalledWith({ rootDir: tempProjectDir });
+    expect(mockCentralConstructor).toHaveBeenCalledWith(undefined, { asyncLayer: mockAsyncLayer });
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith(expect.objectContaining({ path: tempProjectDir }));
+    expect(mockCentralClose).toHaveBeenCalledTimes(1);
+    expect(mockBackendShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers a valid local-only project instead of telling the user to register it later", async () => {
+    const fusionDir = join(tempProjectDir, ".fusion");
+    const dbPath = join(fusionDir, "fusion.db");
+    mkdirSync(fusionDir, { recursive: true });
+    writeFileSync(dbPath, "SQLite format 3\u0000");
+
+    await runInit({ path: tempProjectDir });
+
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith(expect.objectContaining({ path: tempProjectDir }));
+    expect(mockBackendShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when no PostgreSQL backend can be created", async () => {
+    mockCreateTaskStoreForBackend.mockResolvedValueOnce(null);
+
+    await expect(runInit({ path: tempProjectDir })).rejects.toThrow(
+      "Central project registration requires a PostgreSQL backend",
+    );
+    expect(mockBackendShutdown).not.toHaveBeenCalled();
+  });
+
+  it("does not report local initialization as success after central registration fails", async () => {
+    mockEnsureProjectForPath.mockRejectedValueOnce(new Error("postgres password=super-secret"));
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (...args: unknown[]) => {
+      logs.push(args.join(" "));
+    };
+
+    try {
+      await expect(runInit({ path: tempProjectDir })).rejects.toThrow(
+        "Central project registration failed",
+      );
+    } finally {
+      console.log = originalLog;
+    }
+
+    const logOutput = logs.join("\n");
+    expect(logOutput).not.toContain("Project initialized locally");
+    expect(logOutput).not.toContain("Registered in central database");
+    expect(logOutput).not.toContain("super-secret");
+    expect(mockCentralClose).toHaveBeenCalledTimes(1);
+    expect(mockBackendShutdown).toHaveBeenCalledTimes(1);
   });
 
   it("should reject existing invalid fusion.db files", async () => {
@@ -186,7 +290,7 @@ describe("init command", () => {
     // First init
     await runInit({ path: tempProjectDir });
     mockGetProjectByPath.mockResolvedValue({
-      id: "proj_test",
+      id: "proj_1234567890abcdef",
       name: "registered-project",
       path: tempProjectDir,
       isolationMode: "in-process",
@@ -234,7 +338,8 @@ describe("init command", () => {
     await runInit({ path: tempProjectDir });
 
     expect(existsSync(fusionDir)).toBe(true);
-    expect(existsSync(join(fusionDir, "fusion.db"))).toBe(true);
+    expect(existsSync(join(fusionDir, "project.json"))).toBe(true);
+    expect(existsSync(join(fusionDir, "fusion.db"))).toBe(false);
   });
 
   it("should add local storage directories to .gitignore when it doesn't exist", async () => {
@@ -322,7 +427,8 @@ describe("init command", () => {
       console.warn = originalWarn;
     }
 
-    expect(existsSync(join(tempProjectDir, ".fusion", "fusion.db"))).toBe(true);
+    expect(existsSync(join(tempProjectDir, ".fusion", "project.json"))).toBe(true);
+    expect(existsSync(join(tempProjectDir, ".fusion", "fusion.db"))).toBe(false);
     expect(warnings.some((warning) => warning.includes("Could not install bundled Fusion skill for Claude"))).toBe(true);
     expect(existsSync(join(tempHomeDir, ".codex", "skills", "fusion", "SKILL.md"))).toBe(true);
     expect(existsSync(join(tempHomeDir, ".gemini", "skills", "fusion", "SKILL.md"))).toBe(true);
@@ -409,12 +515,12 @@ describe("init command", () => {
       outcome: "registered",
       gitRepository: "initialized",
       project: {
-        id: "proj_test",
+        id: "proj_1234567890abcdef",
         name: "test-project",
         path: tempProjectDir,
         isolationMode: "in-process",
         status: "initializing",
-        createdAt: "",
+        createdAt: "2026-07-14T00:00:00.000Z",
         updatedAt: "",
       },
     });

@@ -27,6 +27,22 @@ const ACTIVE_SESSION_STORAGE_KEY = "kb-chat-active-session";
 export const FN_AGENT_ID = "__fn_agent__";
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
 
+/** FNXC:ChatPinned 2026-07-16-12:00: one comparator keeps refresh, cache,
+ * optimistic mutations, SSE updates, and search results pinned-first. */
+export function compareChatSessions(a: ChatSessionInfo, b: ChatSessionInfo): number {
+  const aPinned = a.pinnedAt !== null && a.pinnedAt !== undefined;
+  const bPinned = b.pinnedAt !== null && b.pinnedAt !== undefined;
+  if (aPinned !== bPinned) return aPinned ? -1 : 1;
+  const primary = aPinned
+    ? new Date(b.pinnedAt!).getTime() - new Date(a.pinnedAt!).getTime()
+    : new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  return primary || new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+}
+
+function sortChatSessions(sessions: ChatSessionInfo[]): ChatSessionInfo[] {
+  return [...sessions].sort(compareChatSessions);
+}
+
 function isTaskPlannerSession(session: ChatSessionInfo): boolean {
   return session.agentId.startsWith(TASK_PLANNER_CHAT_AGENT_ID_PREFIX);
 }
@@ -43,6 +59,7 @@ export interface ChatSessionInfo {
   modelProvider?: string | null;
   modelId?: string | null;
   thinkingLevel?: string | null;
+  pinnedAt?: string | null;
   createdAt: string;
   updatedAt: string;
   lastMessagePreview?: string;
@@ -102,6 +119,8 @@ export interface UseChatReturn {
   ) => Promise<ChatSessionInfo>;
   archiveSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
+  pinSession: (id: string, pinned: boolean) => Promise<void>;
+  pinnedCount: number;
   setSessionModel: (
     id: string,
     selection: { agentId?: string; modelProvider?: string | null; modelId?: string | null },
@@ -304,18 +323,34 @@ function mapChatMessageToInfo(message: ChatMessage): ChatMessageInfo {
   };
 }
 
+/*
+FNXC:ChatMessageOrder 2026-07-19-00:00:
+Leaving and returning to direct Chat during an active generation can merge a persisted user echo
+into a partial cache after a later assistant turn. Every client-side transcript merge must restore
+ascending createdAt order, with id as a deterministic tie-breaker, so optimistic replacement,
+mid-stream reloads, and SSE echoes cannot move user bubbles past later turns.
+*/
+function sortChatMessagesChronologically(messages: ChatMessageInfo[]): ChatMessageInfo[] {
+  return [...messages].sort((a, b) => {
+    const createdAtDifference = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+    return Number.isFinite(createdAtDifference) && createdAtDifference !== 0
+      ? createdAtDifference
+      : a.id.localeCompare(b.id);
+  });
+}
+
 function reconcileOptimisticSentMessage(previous: ChatMessageInfo[], persisted: ChatMessageInfo): ChatMessageInfo[] {
-  if (previous.some((message) => message.id === persisted.id)) return previous;
+  if (previous.some((message) => message.id === persisted.id)) return sortChatMessagesChronologically(previous);
   const optimisticIndex = previous.findIndex((candidate) =>
     candidate.role === "user"
     && candidate.id.startsWith("temp-")
     && candidate.sessionId === persisted.sessionId
     && candidate.content.trim() === persisted.content.trim(),
   );
-  if (optimisticIndex < 0) return [...previous, persisted];
+  if (optimisticIndex < 0) return sortChatMessagesChronologically([...previous, persisted]);
   const next = [...previous];
   next[optimisticIndex] = persisted;
-  return next;
+  return sortChatMessagesChronologically(next);
 }
 
 export function useChat(
@@ -442,10 +477,7 @@ export function useChat(
     }
     try {
       const data: ChatSessionListResponse = await fetchChatSessions(projectId);
-      // Sort by updatedAt descending
-      const sorted = [...data.sessions].sort(
-        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-      );
+      const sorted = sortChatSessions(data.sessions);
       setSessions(sorted);
       const cacheKey = getChatSessionsCacheKey(projectId);
       if (cacheKey) {
@@ -466,7 +498,7 @@ export function useChat(
   }, [getChatSessionsCacheKey, projectId]);
 
   useEffect(() => {
-    const cachedSessions = readCachedSessions(projectId);
+    const cachedSessions = sortChatSessions(readCachedSessions(projectId));
     setSessions(cachedSessions);
     setSessionsLoading(cachedSessions.length === 0);
   }, [projectId, readCachedSessions]);
@@ -524,7 +556,7 @@ export function useChat(
     (sessionId?: string | null, opts?: { clearOnMiss?: boolean }) => {
       const cachedMessages = readCachedMessages(projectId, sessionId);
       if (cachedMessages.length > 0) {
-        setMessages(cachedMessages);
+        setMessages(sortChatMessagesChronologically(cachedMessages));
         setMessagesLoading(false);
         return true;
       }
@@ -546,7 +578,7 @@ export function useChat(
       const hasCachedMessages = cachedMessages.length > 0;
 
       if (!isPaginationRequest && hasCachedMessages) {
-        setMessages(cachedMessages);
+        setMessages(sortChatMessagesChronologically(cachedMessages));
         setMessagesLoading(false);
       } else {
         setMessagesLoading(true);
@@ -554,13 +586,14 @@ export function useChat(
 
       try {
         const data = await fetchChatMessages(sessionId, { limit: 50, order: "desc", ...opts }, projectId);
-        // API returns newest-first (order=desc); reverse so display is oldest-first.
-        const mappedMessages = data.messages.slice().reverse().map(mapChatMessageToInfo);
+        // API returns newest-first (order=desc); normalize display order instead of trusting
+        // reversal alone so equal timestamps also use the canonical id tie-breaker.
+        const mappedMessages = sortChatMessagesChronologically(data.messages.map(mapChatMessageToInfo));
         const shouldCommitMessages = activeSessionRef.current?.id === sessionId
           || (opts?.commitForStreamingAttach === true && lastAttachedGenerationRef.current?.sessionId === sessionId);
         if (isPaginationRequest) {
           if (shouldCommitMessages) {
-            setMessages((prev) => [...mappedMessages, ...prev]);
+            setMessages((prev) => sortChatMessagesChronologically([...mappedMessages, ...prev]));
             setHasMoreMessages(data.messages.length >= 50);
           }
         } else {
@@ -591,7 +624,7 @@ export function useChat(
                       seen.add(message.id);
                     }
                   }
-                  return merged;
+                  return sortChatMessagesChronologically(merged);
                 }
               }
 
@@ -603,7 +636,7 @@ export function useChat(
         }
       } catch {
         if (!isPaginationRequest && messagesRef.current.length === 0 && hasCachedMessages) {
-          setMessages(cachedMessages);
+          setMessages(sortChatMessagesChronologically(cachedMessages));
           setMessagesLoading(false);
         }
         // Silently fail
@@ -954,13 +987,14 @@ export function useChat(
         modelProvider: data.session.modelProvider,
         modelId: data.session.modelId,
         thinkingLevel: data.session.thinkingLevel,
+        pinnedAt: data.session.pinnedAt,
         createdAt: data.session.createdAt,
         updatedAt: data.session.updatedAt,
       };
 
       setSessions((prev) => {
         if (prev.some((s) => s.id === newSession.id)) return prev;
-        return [newSession, ...prev];
+        return sortChatSessions([newSession, ...prev]);
       });
 
       removePersistedPendingChatMessages(previousSessionId);
@@ -1029,6 +1063,36 @@ export function useChat(
         setSessions(previousSessions);
         setActiveSession(previousActiveSession);
         addToast?.("Failed to rename conversation", "error");
+        throw error;
+      }
+    },
+    [activeSession, addToast, projectId, sessions],
+  );
+
+  /**
+   * FNXC:ChatPinned 2026-07-16-12:00:
+   * Optimistically pin/unpin both displayed session state and the active header;
+   * the server remains authoritative for the advisory-locked limit and restores
+   * the prior snapshot when that limit rejects a fourth conversation.
+   */
+  const pinSession = useCallback(
+    async (id: string, pinned: boolean) => {
+      const previousSessions = sessions;
+      const previousActiveSession = activeSession;
+      const optimisticPinnedAt = pinned ? new Date().toISOString() : null;
+      setSessions((prev) => sortChatSessions(prev.map((session) =>
+        session.id === id ? { ...session, pinnedAt: optimisticPinnedAt } : session,
+      )));
+      setActiveSession((prev) => prev?.id === id ? { ...prev, pinnedAt: optimisticPinnedAt } : prev);
+      try {
+        const data = await updateChatSession(id, { pinned }, projectId);
+        const patch = { pinnedAt: data.session.pinnedAt, updatedAt: data.session.updatedAt };
+        setSessions((prev) => sortChatSessions(prev.map((session) => session.id === id ? { ...session, ...patch } : session)));
+        setActiveSession((prev) => prev?.id === id ? { ...prev, ...patch } : prev);
+      } catch (error) {
+        setSessions(previousSessions);
+        setActiveSession(previousActiveSession);
+        addToast?.(error instanceof Error ? error.message : "You can pin up to 3 conversations", "error");
         throw error;
       }
     },
@@ -1275,7 +1339,7 @@ export function useChat(
         content,
         createdAt: new Date().toISOString(),
       };
-      setMessages((prev) => [...prev, userMessage]);
+      setMessages((prev) => sortChatMessagesChronologically([...prev, userMessage]));
 
       // Clear streaming state
       setStreamingText("");
@@ -1323,7 +1387,7 @@ export function useChat(
           streamingMessageIdsRef.current.add(assistantMessage.id);
 
           // Preserve user message and add assistant message
-          setMessages((prev) => [...prev, assistantMessage]);
+          setMessages((prev) => sortChatMessagesChronologically([...prev, assistantMessage]));
 
           setStreamingText("");
           setStreamingThinking("");
@@ -1359,7 +1423,7 @@ export function useChat(
             if (shouldSuppressSuspensionError) {
               return nextMessages;
             }
-            return [
+            return sortChatMessagesChronologically([
               ...nextMessages,
               {
                 id: `error-${Date.now()}`,
@@ -1369,7 +1433,7 @@ export function useChat(
                 failureInfo,
                 createdAt: new Date().toISOString(),
               },
-            ];
+            ]);
           });
           setStreamingText("");
           setStreamingThinking("");
@@ -1446,17 +1510,22 @@ export function useChat(
         return;
       }
 
-      // Optimistic truncation: drop the edited message and everything after it immediately.
-      setMessages(previousMessages.slice(0, targetIndex));
-
       try {
         await editChatMessage(sessionId, messageId, trimmed, projectId);
+        // Keep the editor's message mounted until the PATCH succeeds so a rejected save retains its correction.
+        setMessages(previousMessages.slice(0, targetIndex));
       } catch (error) {
         console.error("[useChat] Failed to edit message:", error);
         addToast?.("Failed to edit message", "error");
         // Restore truthful state from the server rather than trusting the optimistic truncation.
         await loadMessages(sessionId);
-        return;
+        /*
+         * FNXC:ChatMessageEdit 2026-07-19-00:00:
+         * The inline editor closes only when its async handler fulfills. Rethrow a failed PATCH
+         * after recovery so Direct Chat keeps the user's correction available instead of treating
+         * a toast-only failure as a successful save.
+         */
+        throw error;
       }
 
       const cacheKey = getChatMessagesCacheKey(projectId, sessionId);
@@ -1535,9 +1604,7 @@ export function useChat(
       const existing = merged.get(session.id);
       merged.set(session.id, { ...(existing ?? session), matchedMessagePreview: preview });
     }
-    return Array.from(merged.values()).sort(
-      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-    );
+    return sortChatSessions(Array.from(merged.values()));
   })();
 
   useEffect(() => {
@@ -1657,8 +1724,7 @@ export function useChat(
       // Avoid duplicates
       setSessions((prev) => {
         if (prev.some((s) => s.id === session.id)) return prev;
-        // Add at the top (sessions are sorted by updatedAt desc)
-        return [session, ...prev];
+        return sortChatSessions([session, ...prev]);
       });
     };
 
@@ -1667,7 +1733,7 @@ export function useChat(
       const updatedSession: ChatSessionInfo = JSON.parse(e.data);
       setSessions((prev) => {
         const updated = prev.map((s) => (s.id === updatedSession.id ? updatedSession : s));
-        return [...updated];
+        return sortChatSessions(updated);
       });
       // If this is the active session, update it too
       if (activeSessionRef.current?.id === updatedSession.id) {
@@ -1731,7 +1797,7 @@ export function useChat(
       ) {
         setMessages((prev) => {
           if (prev.some((m) => m.id === message.id)) return prev;
-          return [...prev, message];
+          return sortChatMessagesChronologically([...prev, message]);
         });
         setStreamingText("");
         setStreamingThinking("");
@@ -1756,7 +1822,7 @@ export function useChat(
             return reconcileOptimisticSentMessage(prev, message);
           }
 
-          return [...prev, message];
+          return sortChatMessagesChronologically([...prev, message]);
         });
       }
     };
@@ -1791,6 +1857,8 @@ export function useChat(
     };
   }, []);
 
+  const pinnedCount = sessions.filter((session) => session.status === "active" && session.pinnedAt != null).length;
+
   return {
     sessions,
     activeSession,
@@ -1806,6 +1874,8 @@ export function useChat(
     createSession,
     archiveSession,
     renameSession,
+    pinSession,
+    pinnedCount,
     setSessionModel,
     setSessionThinkingLevel,
     deleteSession,

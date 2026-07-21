@@ -2570,11 +2570,62 @@ describe("usage", () => {
       expect(codex.email).toBe("test@example.com");
       expect(codex.plan).toBe("Pro");
       expect(codex.windows).toHaveLength(2);
+      expect(codex.windows.map((window) => window.label)).toEqual(["Session (5h)", "Weekly"]);
 
       const sessionWindow = codex.windows.find((w) => w.label.includes("Session"));
       expect(sessionWindow).toBeDefined();
       expect(sessionWindow!.percentUsed).toBe(67.5);
       expect(sessionWindow!.percentLeft).toBe(32.5);
+    });
+
+    it("labels a seven-day primary window as Weekly when no secondary window is returned", async () => {
+      const mockResponse = {
+        rate_limit: {
+          primary_window: {
+            used_percent: 67,
+            limit_window_seconds: 7 * 24 * 60 * 60,
+            reset_after_seconds: 4 * 24 * 60 * 60,
+          },
+          secondary_window: null,
+        },
+      };
+
+      mockReadFile.mockImplementation((filePath: string) => {
+        if (filePath.includes("codex")) {
+          return JSON.stringify({
+            tokens: {
+              access_token: "test-token",
+            },
+          });
+        }
+        return Promise.reject(new Error("File not found"));
+      });
+
+      const mockReq = { on: vi.fn(), write: vi.fn(), end: vi.fn() };
+      mockRequest.mockImplementation((_options: any, callback: any) => {
+        const mockRes = {
+          statusCode: 200,
+          headers: {},
+          on: vi.fn((event: string, handler: any) => {
+            if (event === "data") handler(Buffer.from(JSON.stringify(mockResponse)));
+            if (event === "end") handler();
+          }),
+        };
+        callback(mockRes);
+        return mockReq;
+      });
+
+      const providers = await fetchAllProviderUsage();
+      const codex = providers.find((provider) => provider.name === "Codex")!;
+
+      expect(codex.status).toBe("ok");
+      expect(codex.windows).toHaveLength(1);
+      expect(codex.windows[0]).toMatchObject({
+        label: "Weekly",
+        percentUsed: 67,
+        windowDurationMs: 7 * 24 * 60 * 60 * 1000,
+      });
+      expect(codex.windows.some((window) => window.label === "Session (5h)")).toBe(false);
     });
 
     it("sets resetAt from reset_at timestamp", async () => {
@@ -3648,6 +3699,40 @@ describe("usage", () => {
         label: "Weekly (credits)",
         percentUsed: 6,
         percentLeft: 94,
+      });
+      expect(grok.windows[0].resetText).toContain("resets in");
+      expect(mockRequest).toHaveBeenCalledTimes(1);
+    });
+
+    it("treats an omitted exhausted percentage as 100% used for a valid weekly CLI billing period", async () => {
+      mockReadFile.mockImplementation(async (filePath: string) => {
+        if (String(filePath).includes(".grok/auth.json")) return GROK_CLI_AUTH_JSON;
+        return Promise.reject(new Error("File not found"));
+      });
+      mockExecFileSync.mockImplementation(() => {
+        throw new Error("Keychain item not found");
+      });
+      const periodEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+      mockGrokBillingResponse(200, {
+        config: {
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", start: new Date().toISOString(), end: periodEnd },
+          billingPeriodEnd: periodEnd,
+          onDemandCap: { val: 0 },
+          onDemandUsed: { val: 0 },
+          prepaidBalance: { val: 0 },
+          isUnifiedBillingUser: true,
+        },
+      });
+
+      const providers = await fetchAllProviderUsage();
+      const grok = providers.find((provider) => provider.name === "Grok")!;
+
+      expect(grok.status).toBe("ok");
+      expect(grok.windows).toHaveLength(1);
+      expect(grok.windows[0]).toMatchObject({
+        label: "Weekly (credits)",
+        percentUsed: 100,
+        percentLeft: 0,
       });
       expect(grok.windows[0].resetText).toContain("resets in");
       expect(mockRequest).toHaveBeenCalledTimes(1);

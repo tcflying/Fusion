@@ -38,9 +38,13 @@ function uniqueDbName(): string {
   return `fusion_chat_search_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/*
+FNXC:PgTestAuthFix 2026-07-14-00:00:
+The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+*/
 function adminExec(statement: string): void {
   execSync(
-    `psql -h localhost -p 5432 -U ${process.env.USER ?? "postgres"} -d postgres -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
+    `psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
     { stdio: "pipe", env: process.env },
   );
 }
@@ -229,5 +233,38 @@ pgDescribe("async chat store content search + edit primitives (PostgreSQL)", () 
     await expect(
       updateChatMessageMetadata(ctx.layer.db, "msg-missing", { x: 1 }),
     ).rejects.toThrow(/not found/);
+  });
+
+  /*
+  FNXC:PostgresMigrationNulSanitize 2026-07-20:
+  Production incident: the CEO agent's chat turn crashed mid-conversation
+  because a tool call piped raw Windows CLI diagnostics output (containing a
+  literal U+0000 byte) straight into the chat message body. Postgres rejected
+  the INSERT with PostgresError code 22P05 ("unsupported Unicode escape
+  sequence" / "\u0000 cannot be converted to text"), which aborted the write
+  and killed the turn. addChatMessage now sanitizes content/thinkingOutput
+  (text) and metadata/attachments (jsonb) before insert — verify a message
+  containing a raw NUL byte round-trips instead of throwing.
+  */
+  it("addChatMessage strips a raw U+0000 byte instead of throwing (regression for the CEO-agent chat crash)", async () => {
+    ctx = await setupCtx();
+    const session = await makeSession(ctx);
+
+    const diagnosticDump =
+      "===FUSION DB AGENTS===\n===NODES===\n\u0000===RUNNING PROCESSES===\n";
+    const sent = await addMessage(ctx, session.id, "assistant", diagnosticDump, {
+      toolOutput: `payload\u0000tail`,
+    });
+
+    expect(sent.content).toBe(
+      "===FUSION DB AGENTS===\n===NODES===\n===RUNNING PROCESSES===\n",
+    );
+    expect(sent.metadata).toEqual({ toolOutput: "payloadtail" });
+
+    const [persisted] = await getChatMessages(ctx.layer.db, session.id);
+    expect(persisted.content).toBe(
+      "===FUSION DB AGENTS===\n===NODES===\n===RUNNING PROCESSES===\n",
+    );
+    expect(persisted.metadata).toEqual({ toolOutput: "payloadtail" });
   });
 });

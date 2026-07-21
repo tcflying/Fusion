@@ -150,6 +150,8 @@ vi.mock("../../hooks/useConfirm", () => ({
 
 vi.mock("../../hooks/useViewportMode", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
+  isFullScreenSheetViewport: () => false,
+  isShortViewport: () => false,
   getViewportMode: () => "mobile",
   isMobileViewport: () => true,
   useViewportMode: () => "mobile",
@@ -194,6 +196,14 @@ vi.mock("../FileBrowser", () => ({
 
 describe("SettingsModal", () => {
   installSettingsModalEnv();
+
+  /*
+  FNXC:SettingsModalTests 2026-07-16-13:30:
+  The Advanced settings switch (FNXC:SettingsSimplification 2026-07-11) hides advanced-only nav items (remote, scheduled-evals, research-global, research-project) in Basic mode, and these suites navigate to those sections via the nav. Opt into Advanced mode the same way settings-mobile and models-auth do; installSettingsModalEnv()'s beforeEach clears localStorage first, so this must be re-set per test.
+  */
+  beforeEach(() => {
+    localStorage.setItem("fusion:settings:show-advanced", "true");
+  });
 
   describe("Remote section", () => {
     beforeEach(() => {
@@ -347,7 +357,7 @@ describe("SettingsModal", () => {
         await settingsModalUser.click(screen.getByLabelText("Accept routes"));
         await openAdvancedSettings();
         await settingsModalUser.click(screen.getByLabelText("Remember last running state"));
-        await settingsModalUser.click(screen.getByRole("button", { name: "Save" }));
+
 
         await waitFor(() => {
           expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -378,7 +388,7 @@ describe("SettingsModal", () => {
       await settingsModalUser.click(screen.getByLabelText("Accept routes"));
       await openAdvancedSettings();
       await settingsModalUser.click(screen.getByLabelText("Remember last running state"));
-      await settingsModalUser.click(screen.getByRole("button", { name: "Save" }));
+
 
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -452,7 +462,7 @@ describe("SettingsModal", () => {
       await settingsModalUser.click(screen.getByLabelText("Accept routes"));
       await openAdvancedSettings();
       await settingsModalUser.click(screen.getByLabelText("Remember last running state"));
-      await settingsModalUser.click(screen.getByRole("button", { name: "Save" }));
+
 
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -755,7 +765,7 @@ describe("SettingsModal", () => {
         expect(delayInput).toBeDisabled();
         await settingsModalUser.selectOptions(modeSelect, "sticky-only");
         fireEvent.change(delayInput, { target: { value: "45000" } });
-        await settingsModalUser.click(screen.getByRole("button", { name: "Save" }));
+
 
         await waitFor(() => {
           expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -770,7 +780,7 @@ describe("SettingsModal", () => {
       it("persists terminal-only selection on save", async () => {
         const modeSelect = screen.getByLabelText("Failure notification mode") as HTMLSelectElement;
         await settingsModalUser.selectOptions(modeSelect, "terminal-only");
-        await settingsModalUser.click(screen.getByRole("button", { name: "Save" }));
+
 
         await waitFor(() => {
           expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -894,7 +904,7 @@ describe("SettingsModal", () => {
     it("calls testNotification with ntfy provider ID when ntfy test button clicked", async () => {
       mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: true, ntfyTopic: "test-topic" });
       await renderModalSection("notifications", "Notifications");
-      await settingsModalUser.click(screen.getByText("Advanced"));
+      await settingsModalUser.click(screen.getByText("Advanced", { selector: "summary" }));
       fireEvent.change(screen.getByLabelText("Access token (optional)"), { target: { value: "secret-token" } });
 
       await settingsModalUser.click(screen.getByRole("button", { name: /Test notification/ }));
@@ -912,13 +922,13 @@ describe("SettingsModal", () => {
       });
     });
 
-    it("sends unsaved ntfy form config before saving", async () => {
+    it("sends current ntfy form config to tests while auto-saving", async () => {
       mockFetchSettings.mockResolvedValueOnce({ ...defaultSettings, ntfyEnabled: false, ntfyTopic: undefined });
       await renderModalSection("notifications", "Notifications");
 
       await settingsModalUser.click(screen.getByLabelText("Enable"));
       fireEvent.change(screen.getByLabelText("ntfy Topic"), { target: { value: "fresh-topic" } });
-      await settingsModalUser.click(screen.getByText("Advanced"));
+      await settingsModalUser.click(screen.getByText("Advanced", { selector: "summary" }));
       fireEvent.change(screen.getByLabelText("Custom ntfy server URL (optional)"), { target: { value: "https://ntfy.override.example//" } });
       fireEvent.change(screen.getByLabelText("Access token (optional)"), { target: { value: "override-token" } });
       await settingsModalUser.click(screen.getByRole("button", { name: /Test notification/ }));
@@ -935,8 +945,12 @@ describe("SettingsModal", () => {
           undefined,
         );
       });
-      expect(mockUpdateSettings).not.toHaveBeenCalled();
-      expect(mockUpdateGlobalSettings).not.toHaveBeenCalled();
+      await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(expect.objectContaining({
+        ntfyEnabled: true,
+        ntfyTopic: "fresh-topic",
+        ntfyBaseUrl: "https://ntfy.override.example//",
+        ntfyAccessToken: "override-token",
+      })));
     });
 
     it("keeps ntfy test disabled until the current form has a valid topic", async () => {
@@ -964,10 +978,10 @@ describe("SettingsModal", () => {
         ntfyAccessToken: "saved-token",
       });
       await renderModalSection("notifications", "Notifications");
-      await settingsModalUser.click(screen.getByText("Advanced"));
+      await settingsModalUser.click(screen.getByText("Advanced", { selector: "summary" }));
       const tokenInput = screen.getByLabelText("Access token (optional)");
       await settingsModalUser.clear(tokenInput);
-      await settingsModalUser.click(screen.getByRole("button", { name: "Save" }));
+
 
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -1115,7 +1129,7 @@ describe("SettingsModal", () => {
       fireEvent.change(screen.getByLabelText("Evaluator Model"), { target: { value: "gpt-5" } });
       await settingsModalUser.selectOptions(screen.getByLabelText("Follow-up Policy"), "auto-create");
       fireEvent.change(screen.getByLabelText("Retention (days)"), { target: { value: "14" } });
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -1154,7 +1168,7 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.clear(screen.getByLabelText("Evaluator Provider"));
       await settingsModalUser.clear(screen.getByLabelText("Evaluator Model"));
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -1185,7 +1199,7 @@ describe("SettingsModal", () => {
       fireEvent.change(screen.getByLabelText("Memory Retention Count"), { target: { value: "21" } });
       fireEvent.change(screen.getByLabelText("Memory Backup Directory"), { target: { value: ".fusion/backups/custom-memory" } });
       await settingsModalUser.selectOptions(screen.getByLabelText("Memory Backup Scope"), "agents");
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -1211,11 +1225,15 @@ describe("SettingsModal", () => {
     });
 
     const openResearchGlobalSection = async () => {
-      await settingsModalUser.click(await screen.findByRole("button", { name: /Research Defaults/i }));
+      await settingsModalUser.click(await screen.findByRole("button", { name: /Research · Global/i }));
     };
 
+    /*
+    FNXC:SettingsModalTests 2026-07-16-13:30:
+    The project research nav entry is labeled "Research · Project" (settings.nav.researchProject); the old anchored /^Research$/ matcher predates that rename.
+    */
     const openResearchProjectSection = async () => {
-      await settingsModalUser.click(await screen.findByRole("button", { name: /^Research$/i }));
+      await settingsModalUser.click(await screen.findByRole("button", { name: /Research · Project/i }));
     };
 
     it("renders global research defaults fields with expected default values", async () => {
@@ -1247,7 +1265,7 @@ describe("SettingsModal", () => {
       fireEvent.change(screen.getByLabelText("Max Synthesis Rounds"), { target: { value: "3" } });
       await settingsModalUser.click(screen.getByRole("checkbox", { name: /^GitHub$/i }));
       await settingsModalUser.click(screen.getByRole("checkbox", { name: /^Local Docs$/i }));
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       await waitFor(() => {
         expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
@@ -1307,7 +1325,7 @@ describe("SettingsModal", () => {
       expect(webSearch).toBeChecked();
 
       await settingsModalUser.click(screen.getByRole("checkbox", { name: "Page Fetch" }));
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -1332,7 +1350,7 @@ describe("SettingsModal", () => {
       await settingsModalUser.click(screen.getByLabelText("Enable research in this project"));
       const maxConcurrent = await screen.findByLabelText("Max Concurrent Runs");
       fireEvent.change(maxConcurrent, { target: { value: "4" } });
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       await waitFor(() => {
         expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -1357,7 +1375,7 @@ describe("SettingsModal", () => {
 
       const maxConcurrent = await screen.findByLabelText("Max Concurrent Runs");
       fireEvent.change(maxConcurrent, { target: { value: "0" } });
-      await settingsModalUser.click(screen.getByText("Save"));
+
 
       expect(await screen.findByText("Research max concurrent runs must be at least 1.")).toBeInTheDocument();
     });
@@ -1395,10 +1413,14 @@ describe("SettingsModal", () => {
       expect(await screen.findByLabelText("SearXNG URL")).toBeInTheDocument();
       expect(screen.getByText(/Open Authentication Settings/i)).toBeInTheDocument();
 
+      /*
+      FNXC:SettingsModalTests 2026-07-16-13:30:
+      The three provider controls migrated from bespoke `.form-group` markup to the shared Settings*Row primitives (`.settings-field-row`), and the provider dropdown is a `.select`, not an `.input`. The intent is unchanged: the disclosure body holds exactly the three provider controls, styled with the standard control classes.
+      */
       const advancedBody = details?.querySelector(".settings-research-provider-advanced-body");
       expect(advancedBody).toBeTruthy();
-      expect(advancedBody?.querySelectorAll(".form-group")).toHaveLength(3);
-      expect(screen.getByLabelText("Search Provider")).toHaveClass("input");
+      expect(advancedBody?.querySelectorAll(".settings-field-row")).toHaveLength(3);
+      expect(screen.getByLabelText("Search Provider")).toHaveClass("select");
       expect(screen.getByLabelText("SearXNG URL")).toHaveClass("input");
       expect(screen.getByLabelText("Google Search CX")).toHaveClass("input");
     });
@@ -1496,7 +1518,7 @@ describe("SettingsModal", () => {
       expect(screen.getByRole("checkbox", { name: "LLM Synthesis" }).closest(".settings-research-source-grid")).toBe(sourceGrid);
 
       fireEvent.change(maxConcurrent, { target: { value: "0" } });
-      await settingsModalUser.click(screen.getByText("Save"));
+
       expect(await screen.findByText("Research max concurrent runs must be at least 1.")).toBeInTheDocument();
     });
 
@@ -1527,7 +1549,8 @@ describe("SettingsModal", () => {
     it("falls back to first visible section when initial section is unavailable", async () => {
       renderModal({ initialSection: "unknown-section" as any });
       await waitForSettingsModalReady();
-      expect(await screen.findByRole("heading", { name: "General" })).toBeInTheDocument();
+      // FNXC:SettingsNavigation 2026-07-16-13:40: FN-8130 keeps the unknown-section fallback on the always-visible Appearance default.
+      expect(await screen.findByRole("heading", { name: "Appearance" })).toBeInTheDocument();
     });
   });
 

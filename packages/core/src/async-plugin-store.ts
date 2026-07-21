@@ -79,6 +79,7 @@ interface ProjectPluginStateRow {
   enabled: number;
   state: string;
   error: string | null;
+  settings: unknown;
   createdAt: string;
   updatedAt: string;
 }
@@ -154,6 +155,7 @@ export async function getProjectState(
       enabled: schema.central.projectPluginStates.enabled,
       state: schema.central.projectPluginStates.state,
       error: schema.central.projectPluginStates.error,
+      settings: schema.central.projectPluginStates.settings,
       createdAt: schema.central.projectPluginStates.createdAt,
       updatedAt: schema.central.projectPluginStates.updatedAt,
     })
@@ -191,6 +193,7 @@ export async function upsertProjectState(
       input.enabled === undefined ? (existing?.enabled ?? 0) : input.enabled ? 1 : 0,
     state: input.state ?? existing?.state ?? "installed",
     error: input.error === undefined ? (existing?.error ?? null) : input.error,
+    settings: existing?.settings ?? {},
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -203,6 +206,7 @@ export async function upsertProjectState(
       enabled: row.enabled,
       state: row.state,
       error: row.error,
+      settings: row.settings,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     })
@@ -223,6 +227,48 @@ export async function upsertProjectState(
 }
 
 /**
+ * FNXC:HappierProjectBindingPersistence 2026-07-20-01:52:
+ * Project-scoped connector bindings must replace only this project's state
+ * record. Do not read/merge global plugin settings: concurrent projects would
+ * otherwise overwrite or observe one another's bindings.
+ */
+export async function updateProjectPluginSettings(
+  handle: QueryHandle,
+  input: {
+    projectPath: string;
+    pluginId: string;
+    settings: Record<string, unknown>;
+  },
+): Promise<ProjectPluginStateRow> {
+  const now = new Date().toISOString();
+  await handle
+    .insert(schema.central.projectPluginStates)
+    .values({
+      projectPath: input.projectPath,
+      pluginId: input.pluginId,
+      enabled: 0,
+      state: "installed",
+      error: null,
+      settings: input.settings,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: [
+        schema.central.projectPluginStates.projectPath,
+        schema.central.projectPluginStates.pluginId,
+      ],
+      set: {
+        settings: input.settings,
+        updatedAt: now,
+      },
+    });
+  const persisted = await getProjectState(handle, input.projectPath, input.pluginId);
+  if (!persisted) throw new Error("Project plugin settings were not persisted");
+  return persisted;
+}
+
+/**
  * FNXC:PluginStore 2026-06-24-13:15:
  * Register a plugin install row + per-project state in one transaction so the
  * install and its default enabled-state commit atomically. Throws EEXISTS if
@@ -234,6 +280,7 @@ export async function registerPlugin(
     manifest: PluginManifest;
     path: string;
     settings?: Record<string, unknown>;
+    projectSettings?: Record<string, unknown>;
     aiScanOnLoad?: boolean;
     projectPath: string;
   },
@@ -287,6 +334,13 @@ export async function registerPlugin(
       state: "installed",
       error: null,
     });
+    if (input.projectSettings && Object.keys(input.projectSettings).length > 0) {
+      await updateProjectPluginSettings(tx, {
+        projectPath: input.projectPath,
+        pluginId: input.manifest.id,
+        settings: input.projectSettings,
+      });
+    }
 
     const plugin = await getPlugin(tx, input.manifest.id, input.projectPath);
     return plugin;

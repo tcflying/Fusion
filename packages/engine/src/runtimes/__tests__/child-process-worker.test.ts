@@ -11,6 +11,7 @@ import {
 const mockState = vi.hoisted(() => ({
   ipcWorkers: [] as any[],
   runtimes: [] as any[],
+  roomControlPlaneStartRequested: false,
 }));
 
 vi.mock("../../logger.js", () => {
@@ -94,10 +95,19 @@ vi.mock("../../project-engine.js", async () => {
   const { InProcessRuntime } = await import("../in-process-runtime.js");
   class MockProjectEngine {
     private runtime: any;
-    constructor(config: any, centralCore: any, _options?: any) {
+    constructor(config: any, centralCore: any, private readonly options?: any) {
       this.runtime = new InProcessRuntime(config, centralCore);
     }
-    start = vi.fn(async () => { await this.runtime.start(); });
+    start = vi.fn(async () => {
+      await this.runtime.start();
+      if (!mockState.roomControlPlaneStartRequested) return;
+
+      const roomController = this.options?.roomControllerFactory?.({} as never);
+      if (!roomController) {
+        throw new Error("Expected a fail-closed child-process Room controller factory");
+      }
+      await roomController.start();
+    });
     stop = vi.fn(async () => { await this.runtime.stop(); });
     getRuntime = vi.fn(() => this.runtime);
     getTaskStore = vi.fn(() => null);
@@ -170,6 +180,7 @@ describe("child-process-worker", () => {
 
     mockState.ipcWorkers.length = 0;
     mockState.runtimes.length = 0;
+    mockState.roomControlPlaneStartRequested = false;
 
     sigtermBaseline = process.listeners("SIGTERM") as unknown as SignalListener[];
     sigintBaseline = process.listeners("SIGINT") as unknown as SignalListener[];
@@ -227,6 +238,17 @@ describe("child-process-worker", () => {
     expect(runtime.getStatus).toHaveBeenCalled();
     expect(typeof runtime.centralCore.getGlobalConcurrencyState).toBe("function");
     expect(typeof runtime.centralCore.recordTaskCompletion).toBe("function");
+  });
+
+  it("fails closed before a Room controller can start without a verified serializable composition", async () => {
+    mockState.roomControlPlaneStartRequested = true;
+    const worker = await loadWorkerModule();
+    const startHandler = getHandler(worker, START_RUNTIME);
+
+    await expect(startHandler({ config: testConfig })).rejects.toThrow(
+      "Child-process runtimes cannot start sessionRoomControlPlane without a verified serializable composition",
+    );
+    expect(mockState.runtimes).toHaveLength(1);
   });
 
   it("START_RUNTIME throws if runtime is already started", async () => {

@@ -19,7 +19,7 @@ function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) 
   return mock;
 }
 
-const { mockSyncStartupModels, mockShouldUseHybridExecutor, mockHybridExecutorCtor, mockHybridExecutorInitialize, mockHybridExecutorShutdown } = vi.hoisted(() => ({
+const { mockSyncStartupModels, mockShouldUseHybridExecutor, mockHybridExecutorCtor, mockHybridExecutorInitialize, mockHybridExecutorShutdown, mockRoomHostCompositionAdapterRegistryFactory } = vi.hoisted(() => ({
   mockSyncStartupModels: vi.fn().mockResolvedValue(undefined),
   mockShouldUseHybridExecutor: vi.fn().mockResolvedValue({ enabled: false, reason: "single-project-local-only" }),
   mockHybridExecutorInitialize: vi.fn().mockResolvedValue(undefined),
@@ -30,6 +30,7 @@ const { mockSyncStartupModels, mockShouldUseHybridExecutor, mockHybridExecutorCt
       shutdown: mockHybridExecutorShutdown,
     };
   }),
+  mockRoomHostCompositionAdapterRegistryFactory: vi.fn(() => ({ source: "windows-host" })),
 }));
 vi.mock("../startup-model-sync.js", () => ({
   syncStartupModels: mockSyncStartupModels,
@@ -605,6 +606,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
   PluginLoader: mocks.pluginLoaderCtor,
   getEnabledPiExtensionPaths: vi.fn(() => []),
   getTaskMergeBlocker: vi.fn().mockReturnValue(null),
+  createTaskStoreForBackend: vi.fn().mockResolvedValue(undefined),
   syncInsightExtractionAutomation: mocks.syncInsightExtractionAutomationMock,
   INSIGHT_EXTRACTION_SCHEDULE_NAME: "Memory Insight Extraction",
   processAndAuditInsightExtraction: mocks.processAndAuditInsightExtractionMock,
@@ -631,6 +633,7 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
   getCliPackageVersion: vi.fn(() => "0.0.0"),
   // FNXC:CliTests 2026-07-13-08:00: getCliPackageVersion added to @fusion/dashboard barrel export; mock must surface it for daemon/serve startup model sync.
   createServer: mocks.createServerMock,
+  createDaemonRoomControlPlaneAuthorizer: vi.fn(() => vi.fn()),
   GitHubClient: vi.fn().mockImplementation(function () {
     return {};
   }),
@@ -638,14 +641,13 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
   getProjectSettingsPath: vi.fn().mockReturnValue("/tmp/project/.fusion/settings.json"),
   loadTlsCredentialsFromEnv: vi.fn().mockReturnValue(undefined),
   refreshAllCustomProviderModels: mocks.refreshAllCustomProviderModels,
-  // FNXC:CliTests 2026-07-13-09:40: Missing dashboard barrel exports added for mock completeness (scripts/check-mock-completeness.mjs gate).
-  registerGithubTrackingHook: vi.fn(),
 }));
 
 vi.mock("@fusion/engine", async (importOriginal) => {
   const { createCliEngineMock } = await import("../../test/mockCoreEngine");
   return createCliEngineMock(() => importOriginal<typeof import("@fusion/engine")>(), {
     createFusionAuthStorage: vi.fn(() => mocks.authStorage),
+    createWindowsNativeRoomHostCompositionAdapterRegistry: mockRoomHostCompositionAdapterRegistryFactory,
     ProjectEngine: mocks.projectEngineCtor,
     ProjectEngineManager: vi.fn().mockImplementation(function (centralCore: any, options: any) {
     const engines = new Map<string, any>();
@@ -2113,9 +2115,86 @@ describe("runServe — multi-project cwd/default engine resolution", () => {
     expect(serverOpts2.engine).toBe(originalEngine);
   });
 
+  it("wires Room authorization only when daemon authentication is enabled", async () => {
+    const { createServer, createDaemonRoomControlPlaneAuthorizer } = await import("@fusion/dashboard");
+    const factoryMock = createDaemonRoomControlPlaneAuthorizer as ReturnType<typeof vi.fn>;
+    const token = "fn_room_serve_authorizer";
+    process.env.FUSION_DAEMON_TOKEN = token;
+
+    try {
+      await runServe(4040, { daemon: true });
+
+      expect(factoryMock).toHaveBeenCalledWith(token);
+      const serverOptions = (createServer as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1] as {
+        roomControlPlaneAuthorizeProject?: unknown;
+      };
+      expect(serverOptions.roomControlPlaneAuthorizeProject).toBe(factoryMock.mock.results.at(-1)?.value);
+    } finally {
+      await triggerSignal("SIGINT");
+      delete process.env.FUSION_DAEMON_TOKEN;
+    }
+  });
+
+  it("boots CentralCore from the backend factory's unscoped host layer", async () => {
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    const projectLayer = { projectId: "project-1" };
+    const hostLayer = { projectId: undefined, close: vi.fn() };
+    const backendShutdown = vi.fn().mockResolvedValue(undefined);
+    (createTaskStoreForBackend as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: projectLayer,
+      hostAsyncLayer: hostLayer,
+      shutdown: backendShutdown,
+    });
+
+    await runServe(4040, {});
+
+    expect(mocks.centralCoreCtor).toHaveBeenCalledWith(undefined, {
+      asyncLayer: hostLayer,
+    });
+    expect(mocks.centralCoreCtor).not.toHaveBeenCalledWith(undefined, {
+      asyncLayer: projectLayer,
+    });
+
+    await triggerSignal("SIGINT");
+    expect(backendShutdown).toHaveBeenCalledTimes(1);
+    expect(hostLayer.close).not.toHaveBeenCalled();
+  });
+
+  it("passes a Windows host-composition registry built from the unscoped host layer to the manager", async () => {
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    const { ProjectEngineManager } = await import("@fusion/engine");
+    const hostAsyncLayer = { projectId: undefined };
+    (createTaskStoreForBackend as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: { projectId: "project-1" },
+      hostAsyncLayer,
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await runServe(4040, {});
+
+    const registry = mockRoomHostCompositionAdapterRegistryFactory.mock.results.at(-1)?.value;
+    expect(mockRoomHostCompositionAdapterRegistryFactory).toHaveBeenCalledWith({ hostAsyncLayer });
+    expect(ProjectEngineManager).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ roomHostCompositionOperatorAdapterRegistry: registry }),
+    );
+
+    await triggerSignal("SIGINT");
+  });
+
   it("auto-registers cwd project when not previously registered", async () => {
     const freshCwd = mkdtempSync(join(tmpdir(), "serve-auto-register-"));
     cwdSpy.mockReturnValue(freshCwd);
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    const backendShutdown = vi.fn().mockResolvedValue(undefined);
+    (createTaskStoreForBackend as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: {},
+      hostAsyncLayer: {},
+      shutdown: backendShutdown,
+    });
     const ensureSpy = vi.spyOn(ensureProjectRegisteredModule, "ensureCwdProjectRegistered")
       .mockResolvedValue({ ...PROJECT_FIXTURES.primary, path: freshCwd });
 
@@ -2129,6 +2208,25 @@ describe("runServe — multi-project cwd/default engine resolution", () => {
       }));
       expect(process.exit).not.toHaveBeenCalledWith(1);
 
+      await triggerSignal("SIGINT");
+      expect(backendShutdown).toHaveBeenCalledTimes(1);
+    } finally {
+      ensureSpy.mockRestore();
+      rmSync(freshCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not auto-register cwd when the PostgreSQL backend bootstrap is unavailable", async () => {
+    const freshCwd = mkdtempSync(join(tmpdir(), "serve-no-central-backend-"));
+    cwdSpy.mockReturnValue(freshCwd);
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    (createTaskStoreForBackend as ReturnType<typeof vi.fn>).mockResolvedValueOnce(null);
+    const ensureSpy = vi.spyOn(ensureProjectRegisteredModule, "ensureCwdProjectRegistered");
+
+    try {
+      await runServe(4040, {});
+
+      expect(ensureSpy).not.toHaveBeenCalled();
       await triggerSignal("SIGINT");
     } finally {
       ensureSpy.mockRestore();

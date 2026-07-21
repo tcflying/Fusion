@@ -93,6 +93,7 @@ import {
   resolveValidatorThinkingLevel,
   resolveValidatorFallbackThinkingLevel,
 } from "./agent-session-helpers.js";
+import { createTaskStoreNativeSessionBinding } from "./agent-runtime.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import type { SkillSelectionContext } from "./skill-resolver.js";
 import { assertMcpResolutionSucceeded, resolveMcpServersForStore } from "./mcp-resolution.js";
@@ -102,6 +103,13 @@ import { resolveSandboxBackend } from "./sandbox/index.js";
 import type { SandboxBackend } from "./sandbox/types.js";
 import { ModelRegistry, SessionManager, type ToolDefinition, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { PRIORITY_EXECUTE, type AgentSemaphore } from "./concurrency.js";
+import {
+  GLOBAL_CAPACITY_LEGACY_RECOVERY_PAUSE_REASON_PREFIX,
+  type GlobalCapacityLegacyRecoveryGateV1,
+} from "./global-capacity-legacy-recovery-gate.js";
+import type { GlobalCapacityLegacyDispatchControlV1 } from "./global-capacity-legacy-dispatch-control.js";
+import type { GlobalCapacityLegacyLeaseMaintainerV1 } from "./global-capacity-legacy-lease-maintainer.js";
+import type { GlobalCapacityLegacyAttemptRunResultV1 } from "./global-capacity-legacy-attempt-runner.js";
 // FNXC:Workspace 2026-06-21-15:00: F5/F8 — wire in the previously dead workspace-path helpers.
 // `normalizeRepoRelPath` is the single shared scope-path normalizer (F8); `deriveRepoScopeSubset`
 // maps the task's repo-prefixed declared File Scope to a repo-LOCAL subset so the per-repo scope-leak
@@ -239,7 +247,7 @@ import {
   getResearchGuidanceForSurface,
   isResearchToolSurfaceEnabled,
 } from "./tool-availability.js";
-import { createFusionAuthStorage, getModelRegistryModelsPath } from "./auth-storage.js";
+import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
 import { createRunVerificationTool } from "./run-verification-tool.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { recordRetry } from "./retry-burned-logger.js";
@@ -1707,7 +1715,30 @@ export interface TaskExecutorOptions {
    * PTY manager + telemetry hub + adapter registry + hook endpoint together.
    */
   cliAgentRuntime?: CliAgentRuntime;
+  /**
+   * Optional durable restart gate for legacy task execution. When configured it
+   * parks a task whose newest capacity attempt may already have crossed an
+   * external-effect boundary before any executor dispatch surface is reached.
+   */
+  globalCapacityLegacyRecoveryGate?: GlobalCapacityLegacyRecoveryGateV1;
+  /**
+   * Runtime-owned durable admission control for the exact legacy-task external
+   * work boundary. Absent preserves the legacy compatibility runtime behavior.
+   */
+  globalCapacityLegacyDispatchControl?: GlobalCapacityLegacyDispatchControlV1;
 }
+
+type PauseAbortProvenance =
+  | "global-pause"
+  | "merge-seam"
+  | "hard-cancel"
+  | "completion-finalize"
+  | "capacity-reconciliation";
+
+type GlobalCapacityLegacyExecutionGrant = Extract<
+  GlobalCapacityLegacyAttemptRunResultV1,
+  { readonly state: "execution_granted" }
+>;
 
 /** Bundled CLI Agent Executor runtime dependencies (U7). */
 export interface CliAgentRuntime {
@@ -1842,7 +1873,17 @@ export class TaskExecutor {
    * FNXC:WorkflowLifecycle 2026-06-17-23:31:
    * FN-6625 adds completion-finalize provenance for the FN-6614 symptom where a completed/no-commit execution already handed off to in-review, then a trailing graph abort looked like a pause/resume engine abort and re-parked the task failed. Completion-finalize is sibling provenance to FN-6568 merge-seam, not operator pause intent.
    */
-  private pausedAbortProvenance = new Map<string, "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize">();
+  private pausedAbortProvenance = new Map<string, PauseAbortProvenance>();
+  /** One task-local abort promise per durable capacity reconciliation boundary. */
+  private capacityReconciliationAborts = new Map<string, Promise<void>>();
+  /*
+   * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:42:
+   * Durable-pause projection per task. A `false` result is deliberately retained
+   * until an explicit manual retry clears the volatile pause state: releasing a
+   * work-started receipt after its safety pause failed to persist would turn a
+   * crash/restart into an unguarded replay.
+   */
+  private capacityReconciliationPauseProjections = new Map<string, Promise<boolean>>();
   /**
    * FNXC:WorkflowLifecycle 2026-06-18-10:56:
    * FN-6644 makes completed/no-commit finalize-to-review state durable beyond volatile pause provenance. FN-6641 showed FN-6625 was incomplete because teardown can re-mark `completion-finalize` as `hard-cancel`; this marker keeps the already-finalized handoff from being re-parked as an operator-action pause abort while preserving genuine live pauses and active hard-cancels.
@@ -1894,7 +1935,7 @@ export class TaskExecutor {
 
   private markPausedAborted(
     taskId: string,
-    provenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" = "hard-cancel",
+    provenance: PauseAbortProvenance = "hard-cancel",
     source = "unspecified",
   ): void {
     const previousProvenance = this.pausedAbortProvenance.get(taskId);
@@ -1910,6 +1951,136 @@ export class TaskExecutor {
         taskId,
         `Pause abort marked: provenance=${provenance} source=${source}${previousProvenance && previousProvenance !== provenance ? ` previous=${previousProvenance}` : ""}`,
       );
+    }
+  }
+
+  private isGlobalCapacityRecoveryPauseReason(value: unknown): boolean {
+    return typeof value === "string" && value.startsWith(GLOBAL_CAPACITY_LEGACY_RECOVERY_PAUSE_REASON_PREFIX);
+  }
+
+  private async hasGlobalCapacityReconciliationAbort(taskId: string): Promise<boolean> {
+    if (this.pausedAbortProvenance.get(taskId) === "capacity-reconciliation") return true;
+    try {
+      return this.isGlobalCapacityRecoveryPauseReason((await this.store.getTask(taskId)).pausedReason);
+    } catch {
+      return false;
+    }
+  }
+
+  /*
+   * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:55:
+   * A renewal callback can land between ordinary executor awaits. Check the
+   * task-local durable reconciliation marker immediately before each new
+   * external surface; an active marker may resume only through explicit human
+   * reconciliation, never by letting a late worktree/session creation continue.
+   */
+  private async shouldWithholdExternalStartForGlobalCapacity(taskId: string, surface: string): Promise<boolean> {
+    if (!await this.hasGlobalCapacityReconciliationAbort(taskId)) return false;
+    executorLog.warn(`${taskId}: global-capacity reconciliation is active; withholding ${surface}`);
+    await this.store.logEntry(
+      taskId,
+      `Global-capacity reconciliation is active; withheld ${surface} before it could start or continue external work.`,
+      undefined,
+      this.getRunContextFor(taskId),
+    ).catch(() => undefined);
+    return true;
+  }
+
+  private async abortForGlobalCapacityReconciliation(taskId: string, source: string): Promise<void> {
+    const existing = this.capacityReconciliationAborts.get(taskId);
+    if (existing) return existing;
+
+    const abort = this.awaitAbortInFlightTaskWork(taskId, source, {
+      provenance: "capacity-reconciliation",
+    }).finally(() => {
+      if (this.capacityReconciliationAborts.get(taskId) === abort) {
+        this.capacityReconciliationAborts.delete(taskId);
+      }
+    });
+    this.capacityReconciliationAborts.set(taskId, abort);
+    return abort;
+  }
+
+  /**
+   * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:46:
+   * A failed capacity renewal or uncertain durable boundary is not a user cancel
+   * and cannot enter ordinary executor retry. Persist the shared recovery prefix,
+   * then use one task-scoped abort promise so the lease is not released until every
+   * worktree/session surface has settled. If the pause projection itself fails, the
+   * local abort still runs; the durable attempt gate remains the restart backstop.
+   */
+  private pauseForGlobalCapacityReconciliation(taskId: string, reason: string, source: string): Promise<boolean> {
+    const existing = this.capacityReconciliationPauseProjections.get(taskId);
+    if (existing) return existing;
+
+    const projection = (async (): Promise<boolean> => {
+      const pausedReason = `${GLOBAL_CAPACITY_LEGACY_RECOVERY_PAUSE_REASON_PREFIX}${reason}`;
+      this.markPausedAborted(taskId, "capacity-reconciliation", source);
+      let persisted = false;
+      try {
+        await this.store.pauseTask(taskId, true, this.getRunContextFor(taskId), { pausedReason });
+        persisted = true;
+      } catch (error) {
+        executorLog.warn(`${taskId}: failed to persist global-capacity reconciliation pause (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+        this.safeLogEntry(taskId, `Global capacity reconciliation pause persistence failed: ${reason}`);
+      }
+      try {
+        await this.abortForGlobalCapacityReconciliation(taskId, `global-capacity:${reason}`);
+      } catch (error) {
+        executorLog.warn(`${taskId}: failed to abort active work after global-capacity reconciliation (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return persisted;
+    })();
+    this.capacityReconciliationPauseProjections.set(taskId, projection);
+    return projection;
+  }
+
+  private async deferForGlobalCapacity(task: Task, reason: string, capacityRetryAt?: string): Promise<void> {
+    const retrySuffix = capacityRetryAt ? `; next capacity probe is not before ${capacityRetryAt}` : "";
+    const message = `Global capacity withheld before external execution (${reason}); task remains retryable without starting a worktree or session${retrySuffix}.`;
+    executorLog.log(`${task.id}: ${message}`);
+    try {
+      await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+      const latest = await this.store.getTask(task.id);
+      if (latest.paused || latest.userPaused || this.isGlobalCapacityRecoveryPauseReason(latest.pausedReason)) {
+        await this.store.logEntry(
+          task.id,
+          "Global capacity hold observed a concurrent pause; left the existing pause projection untouched.",
+          undefined,
+          this.getRunContextFor(task.id),
+        );
+        return;
+      }
+      if (capacityRetryAt) {
+        const existingRetryAt = latest.nextRecoveryAt;
+        const retryAt = existingRetryAt && Date.parse(existingRetryAt) > Date.parse(capacityRetryAt)
+          ? existingRetryAt
+          : capacityRetryAt;
+        await this.store.updateTask(
+          task.id,
+          { nextRecoveryAt: retryAt },
+          this.getRunContextFor(task.id),
+        );
+      }
+      if (latest.column !== "todo" && latest.column !== "done" && latest.column !== "archived") {
+        this.markGraphExecuteSelfRequeued(task.id);
+        await this.store.moveTask(task.id, "todo", {
+          preserveProgress: true,
+          preserveResumeState: true,
+          preserveWorktree: true,
+          // A pause that lands between the read above and this mutation must not
+          // be erased by the default todo-reopen behavior.
+          preservePause: true,
+          moveSource: "engine",
+        });
+      }
+    } catch (error) {
+      await this.pauseForGlobalCapacityReconciliation(
+        task.id,
+        "defer-persistence-unavailable",
+        "global-capacity-defer-persistence-unavailable",
+      );
+      executorLog.warn(`${task.id}: failed to persist/requeue global capacity hold: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -1942,10 +2113,21 @@ export class TaskExecutor {
     this.pausedAborted.delete(taskId);
     this.pausedAbortProvenance.delete(taskId);
     this.completionFinalizedTaskIds.delete(taskId);
+    this.capacityReconciliationPauseProjections.delete(taskId);
   }
 
   private async clearStalePauseAbortBeforeDispatch(task: Task): Promise<void> {
     if (!this.pausedAborted.has(task.id)) return;
+    if (this.pausedAbortProvenance.get(task.id) === "capacity-reconciliation") {
+      const live = await this.store.getTask(task.id).catch(() => task);
+      if (
+        live.paused === true
+        || live.userPaused === true
+        || this.isGlobalCapacityRecoveryPauseReason(live.pausedReason)
+      ) {
+        return;
+      }
+    }
     let globalPause = false;
     try {
       globalPause = (await this.store.getSettings()).globalPause === true;
@@ -2255,7 +2437,7 @@ export class TaskExecutor {
   private totalSpawnedCount = 0;
   /** Token cap detector for proactive context compaction. */
   private tokenCapDetector = new TokenCapDetector();
-  private _modelRegistry?: ModelRegistry;
+  private _modelRegistryPromise?: Promise<ModelRegistry>;
   private _approvalRequestStore?: ApprovalRequestStore;
   /** Current run context for mutation correlation, keyed by task id. */
   private currentRunContexts = new Map<string, RunMutationContext>();
@@ -2311,13 +2493,12 @@ export class TaskExecutor {
     return handedOff;
   }
 
-  private get modelRegistry(): ModelRegistry {
-    if (!this._modelRegistry) {
+  private async getModelRegistry(): Promise<ModelRegistry> {
+    if (!this._modelRegistryPromise) {
       const authStorage = createFusionAuthStorage();
-      this._modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
-      this._modelRegistry.refresh();
+      this._modelRegistryPromise = createFusionModelRegistry(authStorage);
     }
-    return this._modelRegistry;
+    return this._modelRegistryPromise;
   }
 
   private get approvalRequestStore(): ApprovalRequestStore {
@@ -2665,14 +2846,18 @@ export class TaskExecutor {
    * `abortInFlightTaskWork`, but awaits the async `abort()` / `terminateAllSessions()`
    * calls instead of fire-and-forget.
    */
-  async awaitAbortInFlightTaskWork(taskId: string, reason: string, options: { userCanceled?: boolean } = {}): Promise<void> {
+  async awaitAbortInFlightTaskWork(
+    taskId: string,
+    reason: string,
+    options: { userCanceled?: boolean; provenance?: PauseAbortProvenance } = {},
+  ): Promise<void> {
     let hadActiveSurface = false;
     const abortedSurfaces: string[] = [];
 
     if (options.userCanceled) {
       this.userCanceledTaskIds.add(taskId);
     }
-    this.markPausedAborted(taskId, "hard-cancel", `abort-in-flight:${reason}`);
+    this.markPausedAborted(taskId, options.provenance ?? "hard-cancel", `abort-in-flight:${reason}`);
     this.options.stuckTaskDetector?.untrackTask(taskId);
     this.clearWorkflowRerunWatchdog(taskId);
     this.clearCompletedTaskWatchdog(taskId);
@@ -3087,7 +3272,11 @@ export class TaskExecutor {
           )
         ) {
           executorLog.log(`Pausing ${task.id} — awaiting in-flight session disposal`);
-          await this.awaitAbortInFlightTaskWork(task.id, "task paused");
+          if (this.isGlobalCapacityRecoveryPauseReason(task.pausedReason)) {
+            await this.abortForGlobalCapacityReconciliation(task.id, "task paused by global-capacity reconciliation");
+          } else {
+            await this.awaitAbortInFlightTaskWork(task.id, "task paused");
+          }
           return;
         }
 
@@ -3182,7 +3371,7 @@ export class TaskExecutor {
               activeEntry.lastResolvedModelProvider = ownProvider;
               activeEntry.lastResolvedModelId = ownModelId;
               try {
-                const model = this.modelRegistry.find(ownProvider, ownModelId);
+                const model = (await this.getModelRegistry()).find(ownProvider, ownModelId);
                 if (model) {
                   await activeEntry.session.setModel(model);
                   executorLog.log(`${task.id}: binding released — model reverted to ${ownProvider}/${ownModelId}`);
@@ -3241,7 +3430,7 @@ export class TaskExecutor {
                   activeEntry.lastResolvedModelId = newModelId;
                   if (newProvider && newModelId) {
                     try {
-                      const model = this.modelRegistry.find(newProvider, newModelId);
+                      const model = (await this.getModelRegistry()).find(newProvider, newModelId);
                       if (model) {
                         await activeEntry.session.setModel(model);
                         executorLog.log(`${task.id}: column-agent hot-swap → agent '${newAgent.id}' model ${newProvider}/${newModelId}`);
@@ -3312,7 +3501,7 @@ export class TaskExecutor {
 
             if (newProvider && newModelId) {
               try {
-                const model = this.modelRegistry.find(newProvider, newModelId);
+                const model = (await this.getModelRegistry()).find(newProvider, newModelId);
                 if (model) {
                   await activeEntry.session.setModel(model);
                   executorLog.log(`${task.id}: executor model hot-swapped to ${newProvider}/${newModelId}`);
@@ -8375,7 +8564,7 @@ export class TaskExecutor {
   private async isRetryableBenignMergePauseAbort(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
     pausedAborted: boolean,
   ): Promise<boolean> {
     /*
@@ -8383,7 +8572,7 @@ export class TaskExecutor {
     FN-6735 treats a generic engine pause/resume abort at the merge seam as transient only when the row is still a clean in-review auto-merge candidate: no user/global pause, no pre-existing failure, no merge-confirmed partial landing, no terminal conflict/contamination value, within mergeRetries budget, and still eligible for auto-merge or shared-branch local integration. Anything outside those guards keeps the existing terminal operator-action park.
     */
     if (!pausedAborted) return false;
-    if (abortProvenance === "global-pause" || live.userPaused === true) return false;
+    if (abortProvenance === "global-pause" || abortProvenance === "capacity-reconciliation" || live.userPaused === true) return false;
     if (abortProvenance === "completion-finalize") return false;
     if (live.column !== "in-review" || !this.isRetryableMergePauseAbortStatus(live.status) || live.error != null) return false;
     if (live.mergeDetails?.mergeConfirmed === true) return false;
@@ -8406,7 +8595,7 @@ export class TaskExecutor {
   private isBenignInReviewPauseAbort(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
     pausedAborted: boolean,
     userCanceled: boolean,
   ): boolean {
@@ -8440,7 +8629,7 @@ export class TaskExecutor {
   private async isBenignManualMergeHoldPauseAbort(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
     pausedAborted: boolean,
   ): Promise<boolean> {
     /*
@@ -8472,7 +8661,7 @@ export class TaskExecutor {
   private async handleStaleInReviewPlanPauseAbortReplay(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
     pausedAborted: boolean,
     userCanceled: boolean,
   ): Promise<boolean> {
@@ -8544,7 +8733,7 @@ export class TaskExecutor {
   private async handleStaleInReviewParsePauseAbortReplay(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
     pausedAborted: boolean,
     userCanceled: boolean,
   ): Promise<boolean> {
@@ -8650,7 +8839,7 @@ export class TaskExecutor {
   private async isReentrantPausedAbortedInFlightNode(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
     pausedAborted: boolean,
     userCanceled: boolean,
   ): Promise<boolean> {
@@ -8695,7 +8884,7 @@ export class TaskExecutor {
   private async reenterPausedAbortedWorkflowNode(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
   ): Promise<boolean> {
     const nodeId = result.interruptedNodeId ?? result.visitedNodeIds[result.visitedNodeIds.length - 1] ?? "unknown";
     const priorRetries = live.graphResumeRetryCount ?? 0;
@@ -8776,7 +8965,7 @@ export class TaskExecutor {
   private async routeGraphMergeFailureToRetry(
     live: TaskDetail,
     result: WorkflowGraphTaskRunResult,
-    abortProvenance: "global-pause" | "merge-seam" | "hard-cancel" | "completion-finalize" | undefined,
+    abortProvenance: PauseAbortProvenance | undefined,
   ): Promise<boolean> {
     if (!this.mergeRequester) return false;
     const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1] ?? "unknown";
@@ -8828,6 +9017,8 @@ export class TaskExecutor {
       const abortProvenance = this.pausedAbortProvenance.get(task.id);
       const mergeSeamAborted = abortProvenance === "merge-seam";
       const completionFinalizeAborted = abortProvenance === "completion-finalize";
+      const capacityReconciliationAborted = abortProvenance === "capacity-reconciliation"
+        || this.isGlobalCapacityRecoveryPauseReason(live.pausedReason);
       const persistedCompletionFinalizeLog = live.log?.some((entry) => entry.action.includes("Execution paused after completion — finalizing to in-review")) === true;
       const persistedCompletedProgress = live.steps.length > 0 && live.steps.every((step) => step.status === "done" || step.status === "skipped");
       /*
@@ -8877,6 +9068,7 @@ export class TaskExecutor {
       const genuinePauseAbort = Boolean(
         live.userPaused
           || abortProvenance === "global-pause"
+          || capacityReconciliationAborted
           // FN-6648: gate the bare `paused` clause on the completion-finalize
           // suppression so a completed task carrying a non-user post-completion
           // pause flag is not parked as an operator-action failure.
@@ -8890,6 +9082,18 @@ export class TaskExecutor {
           task.id,
           `Pause abort classified: provenance=${abortProvenance ?? "unknown"}; node=${failedNodeForLog}; interrupted=${result.interruptedNodeId ?? "none"}; abortKind=${result.interruptedAbortKind ?? "none"}; column=${live.column}; status=${live.status ?? "none"}; paused=${live.paused === true}; userPaused=${live.userPaused === true}; value=${failureValueForLog}; genuine=${genuinePauseAbort}; mergeSeam=${mergeSeamAborted}; completionSuppressed=${suppressFinalizedCompletionAbort}`,
         );
+      }
+      if (capacityReconciliationAborted) {
+        /*
+         * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:48:
+         * A capacity renewal/release reconciliation pause is a durable safety
+         * boundary, not a transient graph abort. Leave its paused row and
+         * worktree evidence untouched; auto-reentry, merge retry, and generic
+         * hard-cancel recovery would otherwise recreate work after lease trust
+         * was lost.
+         */
+        await this.persistTokenUsage(task.id);
+        return;
       }
       if (genuinePauseAbort && await this.isReentrantPausedAbortedInFlightNode(live, result, abortProvenance, pausedAborted, this.userCanceledTaskIds.has(task.id))) {
         if (await this.reenterPausedAbortedWorkflowNode(live, result, abortProvenance)) {
@@ -8964,7 +9168,10 @@ export class TaskExecutor {
         // to gate the auto-continue branch so the gate cannot silently drift if
         // the human-readable provenance label is ever revised.
         const isEngineInternalAbort =
-          pausedAborted && !live.paused && !live.userPaused && abortProvenance !== "global-pause";
+          pausedAborted
+            && !live.paused
+            && !live.userPaused
+            && abortProvenance !== "global-pause";
         if (live.column !== "in-progress") {
           // FN-6782: a pause/resume abort that has left the task back in `todo`
           // is benign — the work is simply re-queued for a fresh dispatch, not
@@ -9637,6 +9844,22 @@ export class TaskExecutor {
   }
 
   async execute(task: Task): Promise<void> {
+    /*
+     * FNXC:GlobalCapacityLegacyRecoveryGate 2026-07-20-06:03:
+     * A direct execute() call can bypass scheduler pause filters and enter graph,
+     * authoritative, or work-engine routing before worktree/session creation.
+     * Ask the durable recovery gate first; a parked capacity attempt must never
+     * be interpreted as permission to retry the prior external worker.
+     */
+    const capacityRecovery = await this.options.globalCapacityLegacyRecoveryGate?.check({
+      taskId: task.id,
+      resourceKind: "legacy_task",
+      resourceId: task.id,
+    });
+    if (capacityRecovery?.state === "blocked") {
+      executorLog.warn(`${task.id}: executor dispatch withheld by global capacity recovery gate (${capacityRecovery.reason})`);
+      return;
+    }
     this.completionFinalizedTaskIds.delete(task.id);
     await this.clearStalePauseAbortBeforeDispatch(task);
     // Workflow graph interpreter routing (cutover M-C): graph-selected tasks
@@ -9827,6 +10050,8 @@ export class TaskExecutor {
     let taskDone = false;
     let reviewAddressingActivated = false;
     let taskEnv: NodeJS.ProcessEnv | undefined;
+    let globalCapacityExecution: GlobalCapacityLegacyExecutionGrant | undefined;
+    let globalCapacityLeaseMaintainer: GlobalCapacityLegacyLeaseMaintainerV1 | undefined;
 
     try {
       await this.transitionReviewAddressing(task.id, ["queued"], "in-progress");
@@ -9877,6 +10102,90 @@ export class TaskExecutor {
       }
 
       const hadAssignedWorktree = Boolean(task.worktree);
+      const globalCapacityControl = this.options.globalCapacityLegacyDispatchControl;
+      if (globalCapacityControl) {
+        /*
+         * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:52:
+         * Acquire durable central capacity immediately before any legacy task can
+         * create/reuse a worktree or launch a provider session. A normal hold is
+         * returned to todo without external work; ambiguous post-start states,
+         * rejected admission, and lease maintenance faults use the recovery pause
+         * prefix so they cannot fall into the executor's generic retry paths.
+         */
+        const capacityStart = await globalCapacityControl.begin({
+          resourceKind: "legacy_task",
+          resourceId: task.id,
+          workClass: "normal",
+          slots: 1,
+        });
+        if (capacityStart.state === "execution_granted") {
+          globalCapacityExecution = capacityStart;
+          try {
+            globalCapacityLeaseMaintainer = globalCapacityControl.maintain({
+              handle: capacityStart.handle,
+              onRenewalFailure: (failure) => {
+                const reason = failure.state === "not_renewed" ? "renewal-lost" : "renewal-unresolved";
+                void this.pauseForGlobalCapacityReconciliation(
+                  task.id,
+                  reason,
+                  `global-capacity-${reason}`,
+                ).then((persisted) => {
+                  if (!persisted) {
+                    executorLog.warn(`${task.id}: global capacity renewal pause did not persist; work-start receipt will remain unreleased`);
+                  }
+                });
+              },
+            });
+            globalCapacityLeaseMaintainer.start();
+            const startupPauseProjection = this.capacityReconciliationPauseProjections.get(task.id);
+            if (startupPauseProjection) {
+              const pausePersisted = await startupPauseProjection;
+              executorLog.warn(
+                `${task.id}: global capacity renewal failed before worktree/session start (${pausePersisted ? "durably parked" : "pause projection unavailable"}); no external task work will be created`,
+              );
+              return;
+            }
+          } catch (error) {
+            const pausePersisted = await this.pauseForGlobalCapacityReconciliation(
+              task.id,
+              "lease-maintainer-unavailable",
+              "global-capacity-lease-maintainer-unavailable",
+            );
+            if (!pausePersisted) {
+              executorLog.warn(`${task.id}: global capacity lease-maintainer failure could not be durably paused; work-start receipt will remain unreleased`);
+            }
+            executorLog.warn(`${task.id}: unable to start global capacity lease maintenance: ${error instanceof Error ? error.message : String(error)}`);
+            return;
+          }
+        } else if (capacityStart.state === "withheld") {
+          await this.deferForGlobalCapacity(task, capacityStart.reason, capacityStart.attempt.expiresAt);
+          return;
+        } else if (capacityStart.state === "recovery_required") {
+          await this.pauseForGlobalCapacityReconciliation(
+            task.id,
+            "external_work_may_have_started",
+            "global-capacity-recovery-required",
+          );
+          return;
+        } else if (capacityStart.state === "unresolved" && capacityStart.phase === "work_start") {
+          await this.pauseForGlobalCapacityReconciliation(
+            task.id,
+            "external_work_may_have_started",
+            "global-capacity-work-start-unresolved",
+          );
+          return;
+        } else if (capacityStart.state === "unresolved") {
+          await this.deferForGlobalCapacity(task, `durable-${capacityStart.phase}`);
+          return;
+        } else {
+          await this.pauseForGlobalCapacityReconciliation(
+            task.id,
+            "admission-rejected",
+            `global-capacity-${capacityStart.reason}`,
+          );
+          return;
+        }
+      }
       const taskCommandAbortController = new AbortController();
       this.registerConfiguredCommandController(task.id, taskCommandAbortController);
       /*
@@ -9926,6 +10235,9 @@ export class TaskExecutor {
         }
       })();
       worktreePath = acquisition.worktreePath;
+      if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "post-acquisition task execution")) {
+        return;
+      }
 
       if (acquisition.reclaimed) {
         await audit.git({
@@ -10227,6 +10539,9 @@ export class TaskExecutor {
         Graph-pinned step sessions are lifecycle-owned by the workflow graph, not by the legacy executor prompt/tools. Their callback projection must use source:"graph" so independent steps can finish out of index order and so duplicate graph runner writes do not trigger the legacy sequential fn_task_update guard.
         */
         const stepProjectionOptions = forceStepSession ? { source: "graph" as const } : undefined;
+        if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "step-session creation")) {
+          return;
+        }
 
         const stepExecutor = new StepSessionExecutor({
           store: this.store,
@@ -10297,6 +10612,9 @@ export class TaskExecutor {
         this.setActiveStepExecutor(task.id, stepExecutor, worktreePath, this.createSeenSteeringIds(detail));
 
         const stepWork = async () => {
+          if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "step-session execution")) {
+            return;
+          }
           const results = await stepExecutor.executeAll();
 
           // Check abort conditions after execution completes
@@ -10306,6 +10624,15 @@ export class TaskExecutor {
             return;
           }
           if (this.pausedAborted.has(task.id)) {
+            if (await this.hasGlobalCapacityReconciliationAbort(task.id)) {
+              await this.store.logEntry(
+                task.id,
+                "Global-capacity reconciliation pause preserved after step-session exit; automatic resume is withheld.",
+                undefined,
+                this.getRunContextFor(task.id),
+              );
+              return;
+            }
             if (this.userCanceledTaskIds.has(task.id)) {
               this.clearPausedAborted(task.id);
               this.stuckAborted.delete(task.id);
@@ -10590,6 +10917,15 @@ export class TaskExecutor {
             this.depAborted.delete(task.id);
             await this.handleDepAbortCleanup(task.id, worktreePath);
           } else if (this.pausedAborted.has(task.id)) {
+            if (await this.hasGlobalCapacityReconciliationAbort(task.id)) {
+              await this.store.logEntry(
+                task.id,
+                "Global-capacity reconciliation pause preserved after step-session failure; automatic resume is withheld.",
+                undefined,
+                this.getRunContextFor(task.id),
+              );
+              return;
+            }
             if (this.userCanceledTaskIds.has(task.id)) {
               this.clearPausedAborted(task.id);
               this.stuckAborted.delete(task.id);
@@ -11046,6 +11382,9 @@ export class TaskExecutor {
         let session: AgentSession;
         let sessionFile: string | null | undefined;
         try {
+          if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "agent-session creation")) {
+            return;
+          }
           const createdSession = await createResolvedAgentSession({
             sessionPurpose: "executor",
             runtimeHint: executorRuntimeHint,
@@ -11053,6 +11392,14 @@ export class TaskExecutor {
             cwd: worktreePath,
             systemPrompt: executorSystemPromptFinal,
             systemPromptLayers: executorLayers,
+            nativeSession: await createTaskStoreNativeSessionBinding({
+              runtimeHint: executorRuntimeHint,
+              taskStore: this.store,
+              sessionKey: `executor:${task.id}:primary`,
+              taskId: task.id,
+              purpose: "execute",
+              worktreePath,
+            }),
             tools: "coding",
             customTools,
             onText: agentLogger.onText,
@@ -11093,6 +11440,10 @@ export class TaskExecutor {
           });
           session = createdSession.session;
           sessionFile = createdSession.sessionFile;
+          if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "agent-session prompt")) {
+            session.dispose();
+            return;
+          }
         } catch (sessionStartError) {
           if (await this.recoverMissingWorktreeSessionStartFailure(task, worktreePath, sessionStartError, audit)) {
             return;
@@ -11269,6 +11620,16 @@ export class TaskExecutor {
           // after unpause. This path fires when session.dispose() causes the
           // prompt to resolve gracefully instead of throwing.
           if (this.pausedAborted.has(task.id)) {
+            if (await this.hasGlobalCapacityReconciliationAbort(task.id)) {
+              wasPaused = true;
+              await this.store.logEntry(
+                task.id,
+                "Global-capacity reconciliation pause preserved after agent-session exit; automatic resume is withheld.",
+                undefined,
+                this.getRunContextFor(task.id),
+              );
+              return;
+            }
             if (this.userCanceledTaskIds.has(task.id)) {
               this.clearPausedAborted(task.id);
               this.stuckAborted.delete(task.id);
@@ -11483,6 +11844,9 @@ export class TaskExecutor {
 
               let retrySession: AgentSession | null = null;
               try {
+                if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "retry agent-session creation")) {
+                  return;
+                }
                 const createdRetrySession = await createResolvedAgentSession({
                   sessionPurpose: "executor",
                   runtimeHint: executorRuntimeHint,
@@ -11490,6 +11854,14 @@ export class TaskExecutor {
                   cwd: worktreePath,
                   systemPrompt: executorSystemPromptFinal,
                   systemPromptLayers: executorLayers,
+                  nativeSession: await createTaskStoreNativeSessionBinding({
+                    runtimeHint: executorRuntimeHint,
+                    taskStore: this.store,
+                    sessionKey: `executor:${task.id}:primary`,
+                    taskId: task.id,
+                    purpose: "execute",
+                    worktreePath,
+                  }),
                   tools: "coding",
                   customTools,
                   onText: agentLogger.onText,
@@ -11521,6 +11893,10 @@ export class TaskExecutor {
                   taskId: task.id,
                 });
                 retrySession = createdRetrySession.session;
+                if (await this.shouldWithholdExternalStartForGlobalCapacity(task.id, "retry agent-session prompt")) {
+                  retrySession.dispose();
+                  return;
+                }
                 if (createdRetrySession.sessionFile) {
                   this.store.updateTask(task.id, { sessionFile: createdRetrySession.sessionFile }).catch((err: unknown) => {
                     const msg = err instanceof Error ? err.message : String(err);
@@ -11815,6 +12191,15 @@ export class TaskExecutor {
         this.signalTaskComplete(task);
       } else if (this.pausedAborted.has(task.id)) {
         // Task was paused mid-execution — clean up worktree and move to todo
+        if (await this.hasGlobalCapacityReconciliationAbort(task.id)) {
+          await this.store.logEntry(
+            task.id,
+            "Global-capacity reconciliation pause preserved after executor error; automatic resume is withheld.",
+            undefined,
+            this.getRunContextFor(task.id),
+          );
+          return;
+        }
         if (this.userCanceledTaskIds.has(task.id)) {
           this.clearPausedAborted(task.id);
           this.stuckAborted.delete(task.id);
@@ -12444,6 +12829,73 @@ export class TaskExecutor {
         this.options.onError?.(task, err instanceof Error ? err : new Error(errorMessage));
       }
     } finally {
+      /*
+       * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:42:
+       * Terminate all spawned child agents before releasing global capacity. A
+       * child that is still draining after a parent return is still external work,
+       * so a new task must not obtain its slot yet.
+       */
+      let spawnedChildrenSettled = true;
+      try {
+        await this.terminateAllChildren(task.id);
+      } catch (err) {
+        spawnedChildrenSettled = false;
+        executorLog.warn(`terminateAllChildren failed for ${task.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (globalCapacityExecution) {
+        /*
+         * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:54:
+         * The work-start receipt remains private to the durable handle. Stop its
+         * one-shot renewer, wait for a capacity-triggered abort if one exists,
+         * and only then record work settlement/release. A failed settlement or
+         * release is parked for reconciliation instead of turning into a normal
+         * executor error/retry after a provider boundary may have been crossed.
+        */
+        try {
+          if (!spawnedChildrenSettled) {
+            const parked = await this.pauseForGlobalCapacityReconciliation(
+              task.id,
+              "child-cleanup-unresolved",
+              "global-capacity-child-cleanup-unresolved",
+            );
+            if (!parked) {
+              executorLog.warn(`${task.id}: child cleanup and durable capacity pause both failed; work-start receipt will remain unreleased`);
+            }
+          }
+          await globalCapacityLeaseMaintainer?.settle();
+          const pauseProjection = this.capacityReconciliationPauseProjections.get(task.id);
+          const pausePersisted = pauseProjection ? await pauseProjection : true;
+          if (!spawnedChildrenSettled || !pausePersisted) {
+            executorLog.warn(
+              !spawnedChildrenSettled
+                ? `${task.id}: child external work did not settle; preserving the work-started receipt for recovery reconciliation`
+                : `${task.id}: global capacity pause projection is not durable; preserving the work-started receipt for recovery reconciliation`,
+            );
+          } else {
+            const capacityFinish = await globalCapacityExecution.handle.finish();
+            if (capacityFinish.state !== "released") {
+              const parked = await this.pauseForGlobalCapacityReconciliation(
+                task.id,
+                capacityFinish.phase === "work_settlement" ? "external_work_may_have_started" : "release_pending",
+                `global-capacity-${capacityFinish.phase}`,
+              );
+              if (!parked) {
+                executorLog.warn(`${task.id}: failed to durably project unresolved global capacity finalization; durable attempt remains the recovery fence`);
+              }
+            }
+          }
+        } catch (error) {
+          executorLog.warn(`${task.id}: global capacity finalization failed: ${error instanceof Error ? error.message : String(error)}`);
+          const parked = await this.pauseForGlobalCapacityReconciliation(
+            task.id,
+            "external_work_may_have_started",
+            "global-capacity-finalization-unresolved",
+          );
+          if (!parked) {
+            executorLog.warn(`${task.id}: failed to durably park unresolved global capacity finalization; durable attempt remains the recovery fence`);
+          }
+        }
+      }
       if (reviewAddressingActivated) {
         const latestTask = await this.store.getTask(task.id);
         if (taskDone) {
@@ -12464,16 +12916,6 @@ export class TaskExecutor {
       // permanently block the column agent's heartbeat ticks. Deleting here in the
       // outer finally covers BOTH paths since both run inside execute().
       this.effectiveColumnAgentByTask.delete(task.id);
-
-      // Terminate all spawned child agents on ALL exit paths.
-      // This must run here (in the outer finally) rather than only in agentWork's
-      // finally block, because failures during worktree creation or before
-      // agentWork is entered leave children orphaned with no other cleanup path.
-      try {
-        await this.terminateAllChildren(task.id);
-      } catch (err) {
-        executorLog.warn(`terminateAllChildren failed for ${task.id}: ${err instanceof Error ? err.message : String(err)}`);
-      }
 
       // Reset loop recovery state at end of execute() lifecycle.
       // State is in-memory and per-run — should not persist across attempts.
@@ -14447,6 +14889,7 @@ export class TaskExecutor {
 
       // Resolve model using the executor's model hierarchy
       const assignedRuntimeConfig = await this.getAssignedAgentRuntimeConfig(task.assignedAgentId);
+      const verificationRuntimeHint = extractRuntimeHint(assignedRuntimeConfig);
       const { provider: executorProvider, modelId: executorModelId } = resolveExecutorSessionModel(
         task.modelProvider,
         task.modelId,
@@ -14457,6 +14900,7 @@ export class TaskExecutor {
       // Create the fix agent session
       const { session } = await createResolvedAgentSession({
         sessionPurpose: "executor",
+        runtimeHint: verificationRuntimeHint,
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath, // Run in the task's worktree
         systemPrompt: `You are a verification fix agent running during task execution in a worktree.
@@ -14475,6 +14919,14 @@ Do not refactor, rename broadly, or make opportunistic improvements.
 5. Do NOT make any git commits — just fix the code
 6. You MAY modify any files needed to make the verification pass, including files unrelated to this task's original change. Pre-existing build/test breakage is in scope: fix it. Prefer the smallest change that makes verification green.
 7. If you cannot fix the issue within scope, explain why and what evidence indicates a deeper/root problem`,
+        nativeSession: await createTaskStoreNativeSessionBinding({
+          runtimeHint: verificationRuntimeHint,
+          taskStore: this.store,
+          sessionKey: `executor:${task.id}:verification-fix:${retryNumber}`,
+          taskId: task.id,
+          purpose: "execute",
+          worktreePath,
+        }),
         tools: "coding",
         onText: logger.onText,
         onThinking: logger.onThinking,
@@ -15582,6 +16034,14 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         pluginRunner: this.options.pluginRunner,
         cwd: worktreePath,
         systemPrompt: stepSystemPrompt,
+        nativeSession: await createTaskStoreNativeSessionBinding({
+          runtimeHint: workflowRuntimeHint,
+          taskStore: this.store,
+          sessionKey: `executor:${task.id}:workflow:${workflowStep.name}:${attemptLabel}:${worktreePath}`,
+          taskId: task.id,
+          purpose: "execute",
+          worktreePath,
+        }),
         tools: toolMode,
         defaultProvider: provider,
         defaultModelId: modelId,
@@ -18459,6 +18919,14 @@ Child agent: ${agent.id} (${name})`;
             pluginRunner: this.options.pluginRunner,
             cwd: childWorktreePath,
             systemPrompt: childSystemPrompt,
+            nativeSession: await createTaskStoreNativeSessionBinding({
+              runtimeHint: childRuntimeHint,
+              taskStore: this.store,
+              sessionKey: `executor:${taskId}:child:${agent.id}`,
+              taskId,
+              purpose: "execute",
+              worktreePath: childWorktreePath,
+            }),
             tools: "coding",
             defaultProvider: childExecutorProvider,
             defaultModelId: childExecutorModelId,

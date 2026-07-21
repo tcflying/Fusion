@@ -167,6 +167,22 @@ export const EXPECTED_PROJECT_COLUMNS: ReadonlyArray<{ schema?: string; table: s
   // FNXC:WorkflowLifecycle 2026-07-12: FN-7863 execute self-requeue streak (merge port).
   { table: "tasks", column: "execute_requeue_loop_count", type: "integer" },
   { table: "tasks", column: "execute_requeue_loop_signature", type: "text" },
+  // FNXC:PlanReviewReplan 2026-07-13: bounded triage Plan Review REVISE replan counter.
+  // Additive column not present in the baseline snapshot, so existing embedded-PG
+  // databases must self-heal it via ALTER TABLE ADD COLUMN IF NOT EXISTS on boot.
+  { table: "tasks", column: "plan_review_replan_count", type: "integer" },
+  // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker. Additive nullable
+  // timestamp column absent from older embedded-PG snapshots, so it must self-heal via
+  // ALTER TABLE ADD COLUMN IF NOT EXISTS on boot (CREATE TABLE IF NOT EXISTS never upgrades).
+  { table: "tasks", column: "bulk_completion_refusal_at", type: "text" },
+  // FNXC:WorkflowIrPin 2026-07-19-03:10: U9b/KTD-3 — same self-heal contract as the marker
+  // above; migration 0026 lands these on upgraded clusters, and boot repairs a snapshot that
+  // predates them so the first slim TaskStore SELECT cannot crash on a missing column.
+  { table: "tasks", column: "workflow_ir_pin", type: "text" },
+  { table: "tasks", column: "workflow_ir_pin_node_id", type: "text" },
+  { table: "tasks", column: "workflow_ir_pin_column_id", type: "text" },
+  // FNXC:LegacyAdoption 2026-07-19-03:10: U9b/KTD-8 one-time adoption stamp.
+  { table: "tasks", column: "legacy_adopted_at", type: "text" },
   // distributed_task_id_state
   { table: "distributed_task_id_state", column: "prefix", type: "text" },
   { table: "distributed_task_id_state", column: "next_sequence", type: "integer" },
@@ -189,11 +205,18 @@ export const EXPECTED_PROJECT_COLUMNS: ReadonlyArray<{ schema?: string; table: s
   // ADD COLUMN IF NOT EXISTS on boot (CREATE TABLE IF NOT EXISTS alone never
   // upgrades an existing table).
   { table: "chat_sessions", column: "thinking_level", type: "text" },
+  // FNXC:ChatPinned 2026-07-16-12:00: CREATE TABLE IF NOT EXISTS cannot add
+  // this nullable persisted Direct-chat pin timestamp to existing embedded DBs.
+  { table: "chat_sessions", column: "pinned_at", type: "text" },
+  { table: "chat_sessions", column: "validator_thinking_level", type: "text" },
+  { table: "chat_sessions", column: "planning_thinking_level", type: "text" },
   // FNXC:Settings-ThinkingLevel 2026-07-13 (merge port): sqlite v143-145 additive
   // columns — validator/planning task overrides + chat-room default; listed so
   // existing embedded-PG databases self-heal them on boot.
   { table: "tasks", column: "validator_thinking_level", type: "text" },
   { table: "tasks", column: "planning_thinking_level", type: "text" },
+  // FNXC:PlannerOversight 2026-07-14-18:11: per-task session advisor override (null/0/1).
+  { table: "tasks", column: "session_advisor_enabled", type: "integer" },
   { table: "chat_rooms", column: "thinking_level", type: "text" },
 ];
 

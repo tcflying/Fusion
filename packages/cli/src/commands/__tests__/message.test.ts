@@ -32,6 +32,7 @@ vi.mock("@fusion/core", () => {
   };
   return {
     createDatabase: vi.fn().mockReturnValue(mockDb),
+    DASHBOARD_USER_ID: "dashboard",
     MessageStore: makeConstructibleMock(() => ({
       getInbox: mockGetInbox,
       getOutbox: mockGetOutbox,
@@ -46,13 +47,11 @@ vi.mock("@fusion/core", () => {
 
 // ── Mock project-context ─────────────────────────────────────────────
 
-vi.mock("../project-context.js", () => ({
-  resolveProject: vi.fn().mockResolvedValue({
-    projectId: "test-project",
-    projectPath: "/tmp/test-project",
-    projectName: "test-project",
-    isRegistered: true,
-    store: {},
+vi.mock("../../project-context.js", () => ({
+  resolveAgentStoreBase: vi.fn().mockResolvedValue({
+    rootDir: "/tmp/test-project",
+    asyncLayer: {},
+    cleanup: vi.fn(async () => undefined),
   }),
 }));
 
@@ -125,6 +124,17 @@ describe("runMessageInbox", () => {
     await runMessageInbox();
 
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("No messages"));
+  });
+
+  it("lists the distinct dashboard operator mailbox when requested", async () => {
+    mockGetMailbox.mockReturnValue({ unreadCount: 1, ownerId: "dashboard", ownerType: "user" });
+    mockGetInbox.mockReturnValue([{ ...mockMessage, toId: "dashboard" }]);
+
+    await runMessageInbox(undefined, "dashboard");
+
+    expect(mockGetMailbox).toHaveBeenCalledWith("dashboard", "user");
+    expect(mockGetInbox).toHaveBeenCalledWith("dashboard", "user", { limit: 20 });
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Dashboard Inbox"));
   });
 
   it("should show unread marker for unread messages", async () => {

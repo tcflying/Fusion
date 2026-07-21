@@ -17,6 +17,7 @@ import { Package, Settings, Trash2, Plus, X, RefreshCw, RotateCcw, ExternalLink,
 import { fetchPlugins, fetchPluginRegistry, installPlugin, enablePlugin, disablePlugin, uninstallPlugin, fetchPluginSettings, updatePluginSettings, reloadPlugin, fetchPluginSetupStatus, installPluginSetup, updatePlugin, rescanPlugin } from "../api";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { LoadingSpinner } from "./LoadingSpinner";
+import { WhatsAppChatPairingPanel } from "./WhatsAppChatPairingPanel";
 import type { PluginInstallation, PluginState, PluginSettingSchema } from "@fusion/core";
 import type { PluginSetupStatusResponse, RegistryPluginEntry } from "../api";
 import type { ToastType } from "../hooks/useToast";
@@ -119,6 +120,14 @@ export const BUILTIN_PLUGINS: BuiltinPlugin[] = [
     experimental: true,
   },
   {
+    id: "fusion-plugin-happier-runtime",
+    name: "Happier Runtime",
+    description: "Durable Codex, Claude, and OpenCode sessions through Happier.",
+    category: "runtime",
+    path: "./plugins/fusion-plugin-happier-runtime",
+    experimental: true,
+  },
+  {
     id: "fusion-plugin-paperclip-runtime",
     name: "Paperclip Runtime",
     description: "Runtime provider for Paperclip agent connections.",
@@ -175,6 +184,18 @@ export const BUILTIN_PLUGINS: BuiltinPlugin[] = [
     description: "A dedicated dashboard surface for compound-engineering artifacts and interactive ce-* sessions.",
     category: "integration",
     path: "./plugins/fusion-plugin-compound-engineering",
+  },
+  /*
+  FNXC:Quality 2026-07-14-21:50:
+  Quality is a bundled first-party plugin (Task QA tab + Quality hub). Register in Plugin Manager
+  so operators can enable/manage it like other built-in integrations.
+  */
+  {
+    id: "fusion-plugin-quality",
+    name: "Quality",
+    description: "Task QA tab and Quality hub: preview servers, test runs, reports, screenshots, and suggested cases.",
+    category: "integration",
+    path: "./plugins/fusion-plugin-quality",
   },
   /*
    * FNXC:PluginManager 2026-07-02-17:56:
@@ -780,6 +801,9 @@ export function PluginManager({ addToast, projectId }: PluginManagerProps) {
 
           <div className="plugin-detail-card">
             <h5 className="plugin-detail-section-heading">{t("plugins.settings", "Settings")}</h5>
+            {selectedPlugin.id === "fusion-plugin-whatsapp-chat" && (
+              <WhatsAppChatPairingPanel projectId={projectId} settings={pluginSettings} />
+            )}
             {settingsLoading ? (
               <p className="text-muted"><LoadingSpinner label={t("plugins.loading", "Loading...")} /></p>
             ) : (() => {

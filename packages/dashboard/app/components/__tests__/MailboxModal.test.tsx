@@ -20,6 +20,7 @@ vi.mock("../../api", () => ({
   fetchConversation: vi.fn(),
   fetchMessage: vi.fn(),
   sendMessage: vi.fn(),
+  fetchNativeStructurePreview: vi.fn(),
 }));
 
 vi.mock("../../hooks/useMobileKeyboard", () => ({
@@ -49,6 +50,12 @@ vi.mock("lucide-react", () => ({
   ChevronRight: () => <span data-testid="icon-chevron-right">ChevronRight</span>,
   ChevronDown: () => <span data-testid="icon-chevron-down">ChevronDown</span>,
   AlertCircle: () => <span data-testid="icon-alert">Alert</span>,
+  Map: () => <span data-testid="icon-map">Map</span>,
+  Flag: () => <span data-testid="icon-flag">Flag</span>,
+  Lightbulb: () => <span data-testid="icon-lightbulb">Lightbulb</span>,
+  BarChart3: () => <span data-testid="icon-chart">Chart</span>,
+  Target: () => <span data-testid="icon-target">Target</span>,
+  CircleAlert: () => <span data-testid="icon-circle-alert">CircleAlert</span>,
 }));
 
 const mockFetchInbox = vi.mocked(apiModule.fetchInbox);
@@ -123,6 +130,8 @@ const defaultProps = {
   isOpen: true,
   onClose: vi.fn(),
   addToast: vi.fn(),
+  onOpenNativeStructure: vi.fn(),
+  nativeStructureCandidates: [],
   agents: mockAgents,
 };
 
@@ -425,6 +434,37 @@ describe("MailboxModal", () => {
     await waitFor(() => {
       expect(screen.getByTestId("mailbox-message-detail")).toBeDefined();
     });
+  });
+
+  it("opens task-only and planning-clarification related work from modal detail", async () => {
+    const taskMessage: Message = {
+      ...mockMessage,
+      id: "msg-modal-task",
+      fromId: "task-agent",
+      metadata: { taskId: "FN-8428" },
+    };
+    const planningMessage: Message = {
+      ...mockMessage,
+      id: "msg-modal-planning",
+      fromId: "planning-agent",
+      metadata: { kind: "planning-clarification", sessionId: "planning-8428", questionId: "question-8428" },
+    };
+    const onOpenTask = vi.fn();
+    const onOpenPlanningSession = vi.fn();
+    mockFetchInbox.mockResolvedValue({ messages: [taskMessage, planningMessage], total: 2, unreadCount: 2 });
+    mockFetchConversation.mockImplementation(async (fromId) => [fromId === taskMessage.fromId ? taskMessage : planningMessage]);
+
+    render(<MailboxModal {...defaultProps} onOpenTask={onOpenTask} onOpenPlanningSession={onOpenPlanningSession} />);
+    await screen.findByTestId("mailbox-item-msg-modal-task");
+
+    fireEvent.click(screen.getByTestId("mailbox-item-msg-modal-task"));
+    fireEvent.click(await screen.findByTestId("mailbox-view-task"));
+    expect(onOpenTask).toHaveBeenCalledWith("FN-8428");
+
+    fireEvent.click(screen.getByTestId("mailbox-back-to-list"));
+    fireEvent.click(screen.getByTestId("mailbox-item-msg-modal-planning"));
+    fireEvent.click(await screen.findByTestId("mailbox-open-planning-session"));
+    expect(onOpenPlanningSession).toHaveBeenCalledWith("planning-8428");
   });
 
   it("marks message as read when opening unread message", async () => {

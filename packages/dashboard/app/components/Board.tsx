@@ -9,6 +9,7 @@ import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { promoteTask, type ModelInfo, type BoardWorkflowsPayload, type BoardWorkflowColumn, type RevertTaskOptions, type RevertTaskResult } from "../api";
 import { useBlockerFanout } from "../hooks/useBlockerFanout";
+import { useColumnScrollSnap } from "../hooks/useColumnScrollSnap";
 import { MOBILE_MEDIA_QUERY, useViewportMode } from "../hooks/useViewportMode";
 import { recordResumeEvent } from "../utils/resumeInstrumentation";
 import { getBoardCanDropTaskRejection } from "./boardCanDropTask";
@@ -40,7 +41,7 @@ interface BoardProps {
   onOpenGroupModal?: (groupId: string) => void;
   addToast: (message: string, type?: ToastType) => void;
   onQuickCreate?: (input: TaskCreateInput) => Promise<Task | void>;
-  onNewTask: () => void;
+  onNewTask: (workflowId?: string | null) => void;
   autoMerge: boolean;
   /** Project merge strategy passed to Board-owned card context menus. */
   mergeStrategy?: string;
@@ -178,6 +179,18 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
   );
   const archivedLoadedRef = useRef(false);
   const boardRef = useRef<HTMLElement | null>(null);
+  const [boardElement, setBoardElement] = useState<HTMLElement | null>(null);
+  /*
+  FNXC:BoardNavigation 2026-07-16-00:00:
+  The board can first render a workflow-loading skeleton, so a mutable ref alone would not
+  re-run the snap effect after the live board mounts. Mirror the callback ref in state to attach
+  user-only mobile snapping to every live Board variant without snapping the skeleton.
+  */
+  const setBoardRef = useCallback((element: HTMLElement | null) => {
+    boardRef.current = element;
+    setBoardElement((current) => current === element ? current : element);
+  }, []);
+  useColumnScrollSnap(boardElement, { mobileOnly: true });
   const [headerWorkflowSlot, setHeaderWorkflowSlot] = useState<HTMLElement | null>(() => {
     if (typeof document === "undefined") return null;
     return document.getElementById("header-workflow-slot");
@@ -617,6 +630,10 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
       ?? selectedWorkflowColumns.find((column) => !column.flags.archived)?.id;
   }, [selectedWorkflowColumns]);
 
+  const handleSelectedWorkflowNewTask = useCallback(() => {
+    onNewTask(selectedWorkflow?.id);
+  }, [onNewTask, selectedWorkflow?.id]);
+
   const workflowContextMenuColumnsByWorkflowId = useMemo(() => {
     const map = new Map<string, readonly TaskContextMenuColumnMetadata[]>();
     for (const workflow of boardWorkflows?.workflows ?? []) {
@@ -786,6 +803,10 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
     return null;
   }, [boardWorkflows]);
 
+  const handleAggregateWorkflowNewTask = useCallback(() => {
+    onNewTask(aggregateQuickCreateTarget?.workflowId);
+  }, [aggregateQuickCreateTarget?.workflowId, onNewTask]);
+
   const aggregateVisibleBoardColumns = useMemo(
     () => aggregateBoardColumns.filter((column) => column.flags.archived !== true),
     [aggregateBoardColumns],
@@ -919,7 +940,7 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
       return (
         <div className="board-workflow-view">
           {renderedWorkflowToolbar}
-          <main className="board board-workflow-columns" id="board" ref={boardRef}>
+          <main className="board board-workflow-columns" id="board" ref={setBoardRef}>
             {aggregateRenderedBoardColumns.map((columnDef) => {
               const isCreateColumn = aggregateQuickCreateTarget?.columnId === columnDef.id;
               const isDoneLikeColumn = columnDef.flags.complete === true && columnDef.flags.archived !== true;
@@ -972,7 +993,7 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
                   mergeStrategy={mergeStrategy}
                   // FNXC:PlanApproval 2026-07-07-00:00: FN-7653 — the plan auto-approve shortcut belongs only to the intake/planning column, never to hold (Todo-like) columns; the built-in Coding workflow's Todo column carries the hold trait and was wrongly receiving this prop pair.
                   {...((columnDef.flags.intake && !columnDef.flags.archived && !columnDef.flags.complete && !columnDef.flags.countsTowardWip && !columnDef.flags.mergeBlocker && !columnDef.flags.humanReview) ? { planAutoApproveEnabled, onTogglePlanAutoApprove } : {})}
-                  {...(isCreateColumn && aggregateQuickCreateTarget ? { workflowId: aggregateQuickCreateTarget.workflowId, workflowOptions, defaultWorkflowId: boardWorkflows?.defaultWorkflowId ?? null, onQuickCreate: handleAggregateWorkflowQuickCreate, onNewTask, onSubtaskBreakdown } : {})}
+                  {...(isCreateColumn && aggregateQuickCreateTarget ? { workflowId: aggregateQuickCreateTarget.workflowId, workflowOptions, defaultWorkflowId: boardWorkflows?.defaultWorkflowId ?? null, onQuickCreate: handleAggregateWorkflowQuickCreate, onNewTask: handleAggregateWorkflowNewTask, onSubtaskBreakdown } : {})}
                   {...(columnDef.flags.mergeBlocker || columnDef.flags.humanReview ? { onToggleAutoMerge: handleToggleAutoMerge } : {})}
                   {...(columnDef.id === "done" ? { onArchiveAllDone } : {})}
                   {...(isDoneLikeColumn ? { doneSortMode, onDoneSortModeChange: setDoneSortMode } : {})}
@@ -991,7 +1012,7 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
         <main
           className="board board-workflow-columns"
           id="board"
-          ref={boardRef}
+          ref={setBoardRef}
           onDragStart={(e) => {
             const id = (e.target as HTMLElement)?.closest?.("[data-id]")?.getAttribute("data-id");
             if (id) draggingTaskIdRef.current = id;
@@ -1055,7 +1076,7 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
                 mergeStrategy={mergeStrategy}
                 // FNXC:PlanApproval 2026-07-07-00:00: FN-7653 — the plan auto-approve shortcut belongs only to the intake/planning column, never to hold (Todo-like) columns; the built-in Coding workflow's Todo column carries the hold trait and was wrongly receiving this prop pair.
                 {...((columnDef.flags.intake && !columnDef.flags.archived && !columnDef.flags.complete && !columnDef.flags.countsTowardWip && !columnDef.flags.mergeBlocker && !columnDef.flags.humanReview) ? { planAutoApproveEnabled, onTogglePlanAutoApprove } : {})}
-                {...(isCreateColumn ? { workflowOptions, defaultWorkflowId: selectedWorkflow.id, onQuickCreate: handleWorkflowQuickCreate, onNewTask, onSubtaskBreakdown } : {})}
+                {...(isCreateColumn ? { workflowOptions, defaultWorkflowId: selectedWorkflow.id, onQuickCreate: handleWorkflowQuickCreate, onNewTask: handleSelectedWorkflowNewTask, onSubtaskBreakdown } : {})}
                 {...(columnDef.flags.mergeBlocker || columnDef.flags.humanReview ? { onToggleAutoMerge: handleToggleAutoMerge } : {})}
                 {...(columnDef.id === "done" ? { onArchiveAllDone } : {})}
                 {...(isWorkflowDoneLikeColumn ? { doneSortMode, onDoneSortModeChange: setDoneSortMode } : {})}
@@ -1126,7 +1147,7 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
 
   return (
     <>
-      <main className="board" id="board" ref={boardRef}>
+      <main className="board" id="board" ref={setBoardRef}>
         {COLUMNS.map((col) => (
           <Column
             key={col}

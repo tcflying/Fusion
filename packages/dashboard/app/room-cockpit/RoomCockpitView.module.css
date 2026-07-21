@@ -1,0 +1,1273 @@
+.root,
+.staticState {
+  --room-cockpit-bg: #081014;
+  --room-cockpit-surface: #0d1a1d;
+  --room-cockpit-raised: #112328;
+  --room-cockpit-line: #2a4a4f;
+  --room-cockpit-line-hot: #74c6cb;
+  --room-cockpit-ink: #e5f4ec;
+  --room-cockpit-muted: #9ab4ae;
+  --room-cockpit-signal: #d8ff5e;
+  --room-cockpit-caution: #f6bd4d;
+  --room-cockpit-danger: #ff7058;
+  --room-cockpit-stable: #6ee7c8;
+  position: relative;
+  isolation: isolate;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--room-cockpit-ink);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, #0f2a2b 68%, transparent), transparent 47%),
+    var(--room-cockpit-bg);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 76%, transparent);
+  font-family: "IBM Plex Mono", "Cascadia Mono", "JetBrains Mono", monospace;
+}
+
+.root {
+  display: grid;
+  gap: clamp(14px, 2vw, 24px);
+  padding: clamp(14px, 2.5vw, 30px);
+}
+
+.root::before,
+.staticState::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  content: "";
+  pointer-events: none;
+  opacity: 0.5;
+  background-image:
+    linear-gradient(90deg, color-mix(in srgb, var(--room-cockpit-line) 28%, transparent) 1px, transparent 1px),
+    linear-gradient(0deg, color-mix(in srgb, var(--room-cockpit-line) 18%, transparent) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: linear-gradient(to bottom, #000000, transparent 88%);
+}
+
+.commandHeader {
+  display: grid;
+  grid-template-columns: minmax(0, 1.75fr) minmax(190px, 0.55fr) minmax(210px, 0.7fr);
+  gap: 1px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--room-cockpit-line) 78%, transparent);
+  border: 1px solid var(--room-cockpit-line);
+}
+
+.commandIdentity,
+.commandStatus,
+.phaseReadout {
+  min-width: 0;
+  padding: clamp(16px, 2vw, 24px);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 96%, #000000 4%);
+}
+
+.commandStatus {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.eyebrow,
+.panelKicker,
+.statusLabel,
+.columnMarker {
+  color: var(--room-cockpit-signal);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.roomId {
+  margin-top: 8px;
+  color: var(--room-cockpit-ink);
+  font-size: clamp(1.1rem, 2.1vw, 1.72rem);
+  font-weight: 800;
+  letter-spacing: -0.05em;
+}
+
+.objective {
+  max-width: 72ch;
+  margin-top: 12px;
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: clamp(0.9rem, 1.5vw, 1.05rem);
+  line-height: 1.55;
+}
+
+.statusLamp {
+  width: 11px;
+  height: 11px;
+  margin-top: 5px;
+  flex: 0 0 auto;
+  background: var(--room-cockpit-stable);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--room-cockpit-stable) 12%, transparent), 0 0 18px color-mix(in srgb, var(--room-cockpit-stable) 72%, transparent);
+}
+
+.statusLamp[data-health="degraded"],
+.statusLamp[data-health="paused"] {
+  background: var(--room-cockpit-caution);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--room-cockpit-caution) 12%, transparent), 0 0 18px color-mix(in srgb, var(--room-cockpit-caution) 68%, transparent);
+}
+
+.statusLamp[data-health="critical"] {
+  background: var(--room-cockpit-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--room-cockpit-danger) 12%, transparent), 0 0 18px color-mix(in srgb, var(--room-cockpit-danger) 68%, transparent);
+  animation: roomCockpitAlertPulse 1.5s steps(2, end) infinite;
+}
+
+.statusLamp[data-health="unknown"] {
+  background: var(--room-cockpit-muted);
+  box-shadow: none;
+}
+
+.commandStatus strong,
+.phaseReadout strong {
+  display: block;
+  margin-top: 5px;
+  color: var(--room-cockpit-ink);
+  font-size: 0.92rem;
+  line-height: 1.35;
+}
+
+.statusDetail,
+.phaseReadout > span:last-child {
+  display: block;
+  margin-top: 7px;
+  color: var(--room-cockpit-muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+
+.degradedNotice {
+  display: flex;
+  align-items: center;
+  gap: 10px 16px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  color: #fff3d2;
+  background: color-mix(in srgb, var(--room-cockpit-caution) 14%, var(--room-cockpit-surface));
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-caution) 55%, var(--room-cockpit-line));
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.noticeAction,
+.staticAction,
+.alertAction {
+  min-height: 36px;
+  padding: 8px 10px;
+  color: var(--room-cockpit-ink);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 62%, #000000 38%);
+  border: 1px solid var(--room-cockpit-line-hot);
+  border-radius: 0;
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background-color var(--duration-fast, 0.15s) ease, color var(--duration-fast, 0.15s) ease, transform var(--duration-fast, 0.15s) ease;
+}
+
+.noticeAction {
+  margin-left: auto;
+}
+
+.noticeAction:hover,
+.staticAction:hover,
+.alertAction:hover {
+  color: #071012;
+  background: var(--room-cockpit-signal);
+  transform: translateY(-1px);
+}
+
+.executionPanel {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.1fr) minmax(300px, 1.45fr);
+  gap: 1px;
+  overflow: hidden;
+  background: var(--room-cockpit-line);
+  border: 1px solid var(--room-cockpit-line);
+}
+
+.executionIdentity,
+.executionFacts,
+.executionReasons,
+.executionBoundary {
+  min-width: 0;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 92%, #000000 8%);
+}
+
+.executionIdentity {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 14px 16px;
+}
+
+.executionIdentity > p,
+.executionReasons > span,
+.executionBoundary {
+  color: var(--room-cockpit-muted);
+  font-size: 0.69rem;
+  letter-spacing: 0.08em;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.executionIdentity > p {
+  color: var(--room-cockpit-signal);
+  font-weight: 700;
+}
+
+.executionIdentity > strong {
+  color: var(--room-cockpit-ink);
+  font-size: clamp(0.9rem, 1.7vw, 1.05rem);
+  line-height: 1.25;
+}
+
+.executionIdentity > span {
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.executionFacts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--room-cockpit-line);
+}
+
+.executionFacts > div {
+  min-width: 0;
+  padding: 13px;
+  background: color-mix(in srgb, var(--room-cockpit-surface) 94%, #000000 6%);
+}
+
+.executionFacts dt {
+  color: var(--room-cockpit-muted);
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.executionFacts dd {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  color: var(--room-cockpit-ink);
+  font-size: 0.75rem;
+  line-height: 1.35;
+}
+
+.executionReasons,
+.executionBoundary {
+  grid-column: 1 / -1;
+  padding: 10px 14px;
+}
+
+.executionReasons {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.executionReasons code {
+  padding: 3px 6px;
+  color: var(--room-cockpit-caution);
+  background: color-mix(in srgb, var(--room-cockpit-caution) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-caution) 38%, transparent);
+  font: inherit;
+  font-size: 0.68rem;
+}
+
+.executionBoundary {
+  color: color-mix(in srgb, var(--room-cockpit-muted) 82%, #ffffff 18%);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 94%, #000000 6%);
+  border-top: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.executionPanel[data-execution-state="execution_started"] .executionIdentity > strong {
+  color: var(--room-cockpit-stable);
+}
+
+.executionPanel[data-execution-state="read_only_withheld"] .executionIdentity > strong,
+.executionPanel[data-execution-state="not_enabled"] .executionIdentity > strong,
+.executionPanel[data-execution-state="unavailable"] .executionIdentity > strong {
+  color: var(--room-cockpit-caution);
+}
+
+.executionPanel[data-execution-state="startup_failed"] .executionIdentity > strong,
+.executionPanel[data-execution-state="permission-denied"] .executionIdentity > strong {
+  color: var(--room-cockpit-danger);
+}
+
+.signalTape {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--room-cockpit-line);
+  border: 1px solid var(--room-cockpit-line);
+}
+
+.signalReadout {
+  position: relative;
+  min-width: 0;
+  padding: 14px 16px 12px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 90%, #000000 10%);
+}
+
+.signalReadout::after {
+  position: absolute;
+  right: -12px;
+  bottom: -27px;
+  width: 84px;
+  height: 84px;
+  content: "";
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line-hot) 34%, transparent);
+  border-radius: 50%;
+}
+
+.signalReadout > span,
+.signalReadout > small {
+  display: block;
+  color: var(--room-cockpit-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.signalReadout > strong {
+  display: block;
+  max-width: 25ch;
+  margin-top: 7px;
+  color: var(--room-cockpit-ink);
+  font-size: clamp(0.87rem, 1.7vw, 1.05rem);
+  line-height: 1.25;
+}
+
+.signalReadout > small {
+  margin-top: 7px;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.signalReadout[data-tone^="confidence-"] > strong,
+.signalReadout[data-tone="completion"] > strong {
+  color: var(--room-cockpit-signal);
+}
+
+.signalReadout[data-tone="confidence-low"] > strong,
+.signalReadout[data-tone="confidence-unknown"] > strong {
+  color: var(--room-cockpit-caution);
+}
+
+.signalMeter {
+  display: block;
+  width: 100%;
+  height: 5px;
+  margin-top: 12px;
+  appearance: none;
+  accent-color: var(--room-cockpit-signal);
+}
+
+.signalMeter::-webkit-meter-bar {
+  background: color-mix(in srgb, var(--room-cockpit-line) 66%, transparent);
+  border: 0;
+  border-radius: 0;
+}
+
+.signalMeter::-webkit-meter-optimum-value,
+.signalMeter::-webkit-meter-suboptimum-value,
+.signalMeter::-webkit-meter-even-less-good-value {
+  background: var(--room-cockpit-signal);
+  border-radius: 0;
+}
+
+.operationsGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(280px, 0.72fr);
+  gap: clamp(14px, 2vw, 22px);
+  min-width: 0;
+}
+
+.graphPanel,
+.detailPanel,
+.confidencePanel,
+.capacityPanel,
+.alertPanel {
+  position: relative;
+  min-width: 0;
+  background: color-mix(in srgb, var(--room-cockpit-surface) 94%, #000000 6%);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 85%, transparent);
+}
+
+.graphPanel::before,
+.detailPanel::before,
+.confidencePanel::before,
+.capacityPanel::before,
+.alertPanel::before {
+  position: absolute;
+  top: -1px;
+  left: 14px;
+  width: 40px;
+  height: 2px;
+  content: "";
+  background: var(--room-cockpit-signal);
+}
+
+.panelHeading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 17px 18px 14px;
+  border-bottom: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.panelHeading h2 {
+  margin-top: 5px;
+  color: var(--room-cockpit-ink);
+  font-size: 0.94rem;
+  letter-spacing: -0.03em;
+}
+
+.panelCounter,
+.bandBadge,
+.capacityRate {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  color: var(--room-cockpit-muted);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 75%, transparent);
+  font-size: 0.66rem;
+  letter-spacing: 0.04em;
+}
+
+.bandBadge {
+  color: var(--room-cockpit-signal);
+  border-color: color-mix(in srgb, var(--room-cockpit-signal) 55%, var(--room-cockpit-line));
+  text-transform: uppercase;
+}
+
+.bandBadge[data-band="low"],
+.bandBadge[data-band="unknown"] {
+  color: var(--room-cockpit-caution);
+  border-color: color-mix(in srgb, var(--room-cockpit-caution) 55%, var(--room-cockpit-line));
+}
+
+.dagViewport {
+  min-width: 0;
+  padding: 18px;
+  overflow-x: auto;
+}
+
+.dagColumns {
+  display: grid;
+  grid-template-columns: repeat(var(--room-cockpit-columns), minmax(180px, 1fr));
+  gap: 16px;
+  min-width: max-content;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dagColumn {
+  position: relative;
+  min-width: 180px;
+}
+
+.dagColumn:not(:first-child)::before {
+  position: absolute;
+  top: 30px;
+  left: -16px;
+  width: 16px;
+  height: 1px;
+  content: "";
+  background: var(--room-cockpit-line-hot);
+  box-shadow: 0 0 9px color-mix(in srgb, var(--room-cockpit-line-hot) 44%, transparent);
+}
+
+.nodeStack {
+  display: grid;
+  gap: 10px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.taskNode {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  min-height: 108px;
+  padding: 12px;
+  overflow: hidden;
+  color: var(--room-cockpit-ink);
+  text-align: left;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 94%, #000000 6%);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 86%, transparent);
+  border-radius: 0;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color var(--duration-fast, 0.15s) ease, border-color var(--duration-fast, 0.15s) ease, transform var(--duration-fast, 0.15s) ease;
+}
+
+.taskNode::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 26px;
+  height: 26px;
+  content: "";
+  background: linear-gradient(135deg, transparent 49%, color-mix(in srgb, var(--room-cockpit-line) 80%, transparent) 50%);
+}
+
+.taskNode:hover,
+.taskNode[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--room-cockpit-raised) 70%, #164044 30%);
+  border-color: var(--room-cockpit-line-hot);
+  transform: translateY(-2px);
+}
+
+.taskNode[data-critical="true"] {
+  border-left: 3px solid var(--room-cockpit-caution);
+}
+
+.taskNode[data-task-state="failed"],
+.taskNode[data-task-state="blocked"] {
+  border-color: color-mix(in srgb, var(--room-cockpit-danger) 78%, var(--room-cockpit-line));
+}
+
+.taskNode[data-task-state="running"] {
+  border-color: color-mix(in srgb, var(--room-cockpit-signal) 68%, var(--room-cockpit-line));
+}
+
+.taskNode[data-task-state="waiting_dependency"],
+.taskNode[data-task-state="waiting_approval"],
+.taskNode[data-task-state="rate_limited"] {
+  border-color: color-mix(in srgb, var(--room-cockpit-caution) 68%, var(--room-cockpit-line));
+}
+
+.taskNode:focus-visible,
+.noticeAction:focus-visible,
+.staticAction:focus-visible,
+.alertAction:focus-visible,
+.alertInspect:focus-visible {
+  outline: 2px solid var(--room-cockpit-signal);
+  outline-offset: 3px;
+}
+
+.nodeState,
+.criticalFlag,
+.alertSeverity,
+.dimensionBand {
+  width: fit-content;
+  padding: 3px 5px;
+  color: var(--room-cockpit-signal);
+  background: color-mix(in srgb, var(--room-cockpit-signal) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-signal) 32%, transparent);
+  font-size: 0.61rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.nodeState[data-task-state="failed"],
+.nodeState[data-task-state="blocked"] {
+  color: var(--room-cockpit-danger);
+  background: color-mix(in srgb, var(--room-cockpit-danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--room-cockpit-danger) 38%, transparent);
+}
+
+.nodeState[data-task-state="waiting_dependency"],
+.nodeState[data-task-state="waiting_approval"],
+.nodeState[data-task-state="rate_limited"],
+.criticalFlag {
+  color: var(--room-cockpit-caution);
+  background: color-mix(in srgb, var(--room-cockpit-caution) 12%, transparent);
+  border-color: color-mix(in srgb, var(--room-cockpit-caution) 38%, transparent);
+}
+
+.taskNode > strong {
+  font-size: 0.79rem;
+  line-height: 1.35;
+}
+
+.nodeMeta,
+.nodeDependency {
+  overflow: hidden;
+  color: var(--room-cockpit-muted);
+  font-size: 0.66rem;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nodeDependency {
+  color: color-mix(in srgb, var(--room-cockpit-line-hot) 82%, var(--room-cockpit-ink));
+}
+
+.edgeLedger {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.edgeLedger li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 18px;
+  color: var(--room-cockpit-muted);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 96%, #000000 4%);
+  font-size: 0.67rem;
+  line-height: 1.4;
+}
+
+.edgeLedger small {
+  flex: 0 0 auto;
+  color: var(--room-cockpit-signal);
+  font-size: inherit;
+  text-transform: uppercase;
+}
+
+.edgeLedger li > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.edgeLedgerEmpty {
+  color: var(--room-cockpit-muted);
+}
+
+.detailPanel {
+  min-height: 100%;
+}
+
+.detailBody {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+}
+
+.detailTitleRow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.detailBody h3 {
+  color: var(--room-cockpit-ink);
+  font-size: 0.94rem;
+  line-height: 1.35;
+}
+
+.detailFacts,
+.capacityList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: color-mix(in srgb, var(--room-cockpit-line) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.detailFacts > div,
+.capacityList > div {
+  min-width: 0;
+  padding: 8px;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 88%, #000000 12%);
+}
+
+.detailFacts dt,
+.capacityList dt {
+  color: var(--room-cockpit-muted);
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.detailFacts dd,
+.capacityList dd {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--room-cockpit-ink);
+  font-size: 0.69rem;
+  line-height: 1.35;
+}
+
+.detailList {
+  display: grid;
+  gap: 6px;
+}
+
+.detailList h4 {
+  color: var(--room-cockpit-signal);
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.detailList ul,
+.detailList p {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--room-cockpit-muted);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
+.detailList li {
+  padding: 3px 5px;
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 64%, transparent);
+}
+
+.waitReason,
+.recoveryAction {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 10px;
+  color: var(--room-cockpit-muted);
+  border-left: 2px solid var(--room-cockpit-caution);
+  background: color-mix(in srgb, var(--room-cockpit-caution) 8%, transparent);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.recoveryAction {
+  border-left-color: var(--room-cockpit-line-hot);
+  background: color-mix(in srgb, var(--room-cockpit-line-hot) 7%, transparent);
+}
+
+.waitReason strong,
+.recoveryAction strong {
+  color: var(--room-cockpit-ink);
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.detailPlaceholder {
+  max-width: 32ch;
+  padding: 18px;
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.87rem;
+  line-height: 1.6;
+}
+
+.intelligenceGrid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(220px, 0.65fr) minmax(280px, 1.2fr);
+  gap: clamp(14px, 2vw, 22px);
+  min-width: 0;
+}
+
+.supplementalGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  gap: clamp(14px, 2vw, 22px);
+  min-width: 0;
+}
+
+.participantSurface,
+.composerSurface {
+  min-width: 0;
+}
+
+.composerUnavailable {
+  position: relative;
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: clamp(18px, 2.2vw, 26px);
+  color: var(--room-cockpit-ink);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 94%, #000000 6%);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-caution) 58%, var(--room-cockpit-line));
+}
+
+.composerUnavailable::before {
+  position: absolute;
+  top: -1px;
+  left: 14px;
+  width: 40px;
+  height: 2px;
+  content: "";
+  background: var(--room-cockpit-caution);
+}
+
+.composerUnavailableKicker {
+  color: var(--room-cockpit-caution);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.composerUnavailable h2 {
+  color: var(--room-cockpit-ink);
+  font-size: 0.98rem;
+  letter-spacing: -0.03em;
+}
+
+.composerUnavailable > p:last-child {
+  max-width: 72ch;
+  overflow-wrap: anywhere;
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.dimensionList,
+.idleReasons,
+.alertList {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dimensionList li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 18px;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 72%, #000000 28%);
+}
+
+.dimensionList strong {
+  color: var(--room-cockpit-ink);
+  font-size: 0.72rem;
+}
+
+.dimensionList p {
+  margin-top: 4px;
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.dimensionBand[data-band="medium"] {
+  color: var(--room-cockpit-caution);
+  background: color-mix(in srgb, var(--room-cockpit-caution) 12%, transparent);
+  border-color: color-mix(in srgb, var(--room-cockpit-caution) 38%, transparent);
+}
+
+.dimensionBand[data-band="low"],
+.dimensionBand[data-band="unknown"] {
+  color: var(--room-cockpit-danger);
+  background: color-mix(in srgb, var(--room-cockpit-danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--room-cockpit-danger) 38%, transparent);
+}
+
+.dimensionEmpty,
+.idleReasons li {
+  padding: 12px 18px;
+  color: var(--room-cockpit-muted);
+  background: color-mix(in srgb, var(--room-cockpit-raised) 72%, #000000 28%);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+
+.capacityList {
+  margin: 18px;
+}
+
+.capacityList dd {
+  color: var(--room-cockpit-signal);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.capacityTelemetryState {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  margin: 18px;
+  padding: 12px;
+  color: var(--room-cockpit-ink);
+  background: color-mix(in srgb, var(--room-cockpit-signal) 7%, var(--room-cockpit-raised));
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-signal) 44%, var(--room-cockpit-line));
+}
+
+.capacityTelemetryState[data-availability="unavailable"] {
+  background: color-mix(in srgb, var(--room-cockpit-caution) 9%, var(--room-cockpit-raised));
+  border-color: color-mix(in srgb, var(--room-cockpit-caution) 58%, var(--room-cockpit-line));
+}
+
+.capacityTelemetryState[data-availability="withheld"] {
+  background: color-mix(in srgb, var(--room-cockpit-danger) 9%, var(--room-cockpit-raised));
+  border-color: color-mix(in srgb, var(--room-cockpit-danger) 58%, var(--room-cockpit-line));
+}
+
+.capacityTelemetryKicker {
+  color: var(--room-cockpit-signal);
+  font-size: 0.61rem;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.capacityTelemetryState[data-availability="unavailable"] .capacityTelemetryKicker {
+  color: var(--room-cockpit-caution);
+}
+
+.capacityTelemetryState[data-availability="withheld"] .capacityTelemetryKicker {
+  color: var(--room-cockpit-danger);
+}
+
+.capacityTelemetryState > strong {
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.capacityTelemetryState > p:last-of-type {
+  overflow-wrap: anywhere;
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+
+.capacityTelemetryFacts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 2px 0 0;
+  background: color-mix(in srgb, var(--room-cockpit-line) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.capacityTelemetryFacts > div {
+  min-width: 0;
+  padding: 7px;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 88%, #000000 12%);
+}
+
+.capacityTelemetryFacts dt {
+  color: var(--room-cockpit-muted);
+  font-size: 0.57rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.capacityTelemetryFacts dd {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--room-cockpit-ink);
+  font-size: 0.64rem;
+  line-height: 1.4;
+}
+
+.idleReasons {
+  margin: 0 18px 18px;
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.idleReasons strong {
+  color: var(--room-cockpit-caution);
+}
+
+.idleReasons .capacityUnavailableItem {
+  color: var(--room-cockpit-caution);
+}
+
+.alertList > li {
+  display: grid;
+  gap: 8px;
+  padding: 12px 18px;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 70%, #000000 30%);
+  border-left: 2px solid var(--room-cockpit-line-hot);
+}
+
+.alertList > li[data-severity="warning"],
+.alertList > li[data-severity="severe"] {
+  border-left-color: var(--room-cockpit-caution);
+}
+
+.alertList > li[data-severity="critical"] {
+  border-left-color: var(--room-cockpit-danger);
+}
+
+.alertInspect {
+  display: grid;
+  gap: 5px;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+.alertInspect strong {
+  color: var(--room-cockpit-ink);
+  font-size: 0.74rem;
+  line-height: 1.35;
+}
+
+.alertInspect > span:last-child,
+.alertEvidence,
+.recoveryTrace {
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.71rem;
+  line-height: 1.45;
+}
+
+.alertSeverity {
+  color: var(--room-cockpit-caution);
+  background: color-mix(in srgb, var(--room-cockpit-caution) 12%, transparent);
+  border-color: color-mix(in srgb, var(--room-cockpit-caution) 42%, transparent);
+}
+
+.alertList > li[data-severity="critical"] .alertSeverity {
+  color: var(--room-cockpit-danger);
+  background: color-mix(in srgb, var(--room-cockpit-danger) 12%, transparent);
+  border-color: color-mix(in srgb, var(--room-cockpit-danger) 42%, transparent);
+}
+
+.alertEvidence {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.recoveryTrace {
+  margin: 0;
+}
+
+.alertActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.alertAction {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 8px;
+  font-size: 0.65rem;
+}
+
+.alertAction > span {
+  color: var(--room-cockpit-caution);
+  font-size: 0.57rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.alertEmpty {
+  padding: 18px;
+  color: var(--room-cockpit-muted);
+  font-size: 0.72rem;
+}
+
+.staticState {
+  display: grid;
+  place-items: center;
+  min-height: min(480px, 62vh);
+  padding: 24px;
+}
+
+.staticCopy {
+  display: grid;
+  gap: 12px;
+  width: min(100%, 560px);
+  padding: clamp(22px, 5vw, 48px);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 95%, #000000 5%);
+  border: 1px solid var(--room-cockpit-line);
+  box-shadow: 14px 14px 0 color-mix(in srgb, var(--room-cockpit-line) 30%, transparent);
+}
+
+.staticCopy h1 {
+  color: var(--room-cockpit-ink);
+  font-size: clamp(1.1rem, 3.5vw, 1.7rem);
+  letter-spacing: -0.05em;
+}
+
+.staticCopy > p:last-of-type {
+  max-width: 56ch;
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.staticAction {
+  width: fit-content;
+  margin-top: 8px;
+}
+
+.loadingGrid {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  opacity: 0.35;
+}
+
+.loadingGrid span {
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-line) 60%, transparent);
+  animation: roomCockpitScan 2.2s steps(3, end) infinite;
+}
+
+.loadingGrid span:nth-child(2) { animation-delay: 0.18s; }
+.loadingGrid span:nth-child(3) { animation-delay: 0.36s; }
+.loadingGrid span:nth-child(4) { animation-delay: 0.54s; }
+.loadingGrid span:nth-child(5) { animation-delay: 0.72s; }
+.loadingGrid span:nth-child(6) { animation-delay: 0.9s; }
+
+@keyframes roomCockpitScan {
+  0%,
+  100% { background: transparent; }
+  50% { background: color-mix(in srgb, var(--room-cockpit-signal) 20%, transparent); }
+}
+
+@keyframes roomCockpitAlertPulse {
+  50% { opacity: 0.35; }
+}
+
+@media (max-width: 980px) {
+  .commandHeader,
+  .operationsGrid,
+  .intelligenceGrid,
+  .supplementalGrid,
+  .executionPanel {
+    grid-template-columns: 1fr;
+  }
+
+  .commandHeader {
+    gap: 1px;
+  }
+
+  .detailPanel {
+    min-height: 0;
+  }
+}
+
+@media (max-width: 680px) {
+  .root {
+    gap: 12px;
+    padding: 10px;
+  }
+
+  .commandIdentity,
+  .commandStatus,
+  .phaseReadout {
+    padding: 14px;
+  }
+
+  .signalTape {
+    grid-template-columns: 1fr;
+  }
+
+  .signalReadout {
+    padding: 12px 14px;
+  }
+
+  .panelHeading,
+  .dagViewport,
+  .detailBody,
+  .capacityList,
+  .idleReasons,
+  .capacityTelemetryState {
+    margin-left: 0;
+    margin-right: 0;
+  }
+
+  .panelHeading,
+  .dagViewport,
+  .detailBody,
+  .composerUnavailable,
+  .capacityTelemetryState {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .capacityList,
+  .idleReasons {
+    margin-bottom: 14px;
+  }
+
+  .edgeLedger li {
+    align-items: flex-start;
+    flex-direction: column;
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .dagViewport {
+    overflow-x: hidden;
+  }
+
+  .dagColumns {
+    grid-template-columns: 1fr;
+    min-width: 0;
+  }
+
+  .dagColumn {
+    min-width: 0;
+  }
+
+  .dagColumn:not(:first-child)::before {
+    top: -10px;
+    left: 20px;
+    width: 1px;
+    height: 10px;
+  }
+
+  .detailFacts,
+  .capacityList,
+  .capacityTelemetryFacts,
+  .executionFacts {
+    grid-template-columns: 1fr;
+  }
+
+  .noticeAction {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .staticState {
+    min-height: 360px;
+    padding: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .statusLamp[data-health="critical"],
+  .loadingGrid span {
+    animation: none;
+  }
+
+  .taskNode,
+  .noticeAction,
+  .staticAction,
+  .alertAction {
+    transition: none;
+  }
+}

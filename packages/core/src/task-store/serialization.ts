@@ -96,18 +96,33 @@ export function rowToTask(row: TaskRow): Task {
     validatorModelId: row.validatorModelId || undefined,
     planningModelProvider: row.planningModelProvider || undefined,
     planningModelId: row.planningModelId || undefined,
+    mergerModelProvider: row.mergerModelProvider || undefined,
+    mergerModelId: row.mergerModelId || undefined,
     mergeRetries: row.mergeRetries ?? undefined,
     workflowStepRetries: row.workflowStepRetries ?? undefined,
     stuckKillCount: row.stuckKillCount ?? undefined,
     resumeLimboCount: row.resumeLimboCount ?? undefined,
     graphResumeRetryCount: row.graphResumeRetryCount ?? undefined,
+    consecutiveToolFailureRetryCount: row.consecutiveToolFailureRetryCount ?? undefined,
+    executorEscalationAttempted: row.executorEscalationAttempted ? true : undefined,
+    toolFailureDetectorLogCursor: row.toolFailureDetectorLogCursor ?? undefined,
+    toolFailureRetryExhaustedAuditEmitted: row.toolFailureRetryExhaustedAuditEmitted ? true : undefined,
     resumeLimboTipSha: row.resumeLimboTipSha || undefined,
     resumeLimboStepSignature: row.resumeLimboStepSignature || undefined,
     executeRequeueLoopCount: row.executeRequeueLoopCount ?? undefined,
     executeRequeueLoopSignature: row.executeRequeueLoopSignature || undefined,
     postReviewFixCount: row.postReviewFixCount ?? undefined,
+    planReviewReplanCount: row.planReviewReplanCount ?? undefined,
     recoveryRetryCount: row.recoveryRetryCount ?? undefined,
     taskDoneRetryCount: row.taskDoneRetryCount ?? undefined,
+    // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker; empty/null → undefined (no taint).
+    bulkCompletionRefusalAt: row.bulkCompletionRefusalAt || undefined,
+    // FNXC:WorkflowIrPin 2026-07-19-03:10: U9b/KTD-3 — hydrate the durable pin; empty/null → undefined (unpinned).
+    workflowIrPin: row.workflowIrPin || undefined,
+    workflowIrPinNodeId: row.workflowIrPinNodeId || undefined,
+    workflowIrPinColumnId: row.workflowIrPinColumnId || undefined,
+    // FNXC:LegacyAdoption 2026-07-19-03:10: U9b/KTD-8 — empty/null → undefined (never adopted).
+    legacyAdoptedAt: row.legacyAdoptedAt || undefined,
     worktreeSessionRetryCount: row.worktreeSessionRetryCount ?? undefined,
     completionHandoffLimboRecoveryCount: row.completionHandoffLimboRecoveryCount ?? undefined,
     verificationFailureCount: row.verificationFailureCount ?? undefined,
@@ -123,12 +138,24 @@ export function rowToTask(row: TaskRow): Task {
     thinkingLevel: (row.thinkingLevel || undefined) as Task["thinkingLevel"],
     validatorThinkingLevel: (row.validatorThinkingLevel || undefined) as Task["validatorThinkingLevel"],
     planningThinkingLevel: (row.planningThinkingLevel || undefined) as Task["planningThinkingLevel"],
+    mergerThinkingLevel: (row.mergerThinkingLevel || undefined) as Task["mergerThinkingLevel"],
     executionMode: (row.executionMode || undefined) as Task["executionMode"],
+    // FNXC:PlannerOversight 2026-07-14-18:11: null → undefined (inherit); 0/1 → boolean.
+    sessionAdvisorEnabled: row.sessionAdvisorEnabled === null || row.sessionAdvisorEnabled === undefined
+      ? undefined
+      : row.sessionAdvisorEnabled === 1,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     columnMovedAt: row.columnMovedAt || undefined,
     firstExecutionAt: row.firstExecutionAt || undefined,
     cumulativeActiveMs: row.cumulativeActiveMs ?? undefined,
+    cumulativePlanningMs: row.cumulativePlanningMs ?? undefined,
+    planningStartedAt: row.planningStartedAt || undefined,
+    columnDwellMs: fromJson<Record<string, number>>(row.columnDwellMs) ?? undefined,
+    workflowTransitionNotification: fromJson<import("../types.js").WorkflowTransitionNotificationMarker>(row.workflowTransitionNotification) ?? undefined,
+    plannerOversightLevel: (row.plannerOversightLevel || undefined) as Task["plannerOversightLevel"],
+    awaitingApprovalReason: (row.awaitingApprovalReason || undefined) as Task["awaitingApprovalReason"],
+    approvedPlanFingerprint: row.approvedPlanFingerprint || undefined,
     executionStartedAt: row.executionStartedAt || undefined,
     executionCompletedAt: row.executionCompletedAt || undefined,
     dependencies: fromJson<string[]>(row.dependencies) || [],
@@ -193,6 +220,7 @@ export function rowToTask(row: TaskRow): Task {
     })(),
     issueInfo: fromJson<import("../types.js").IssueInfo>(row.issueInfo),
     githubTracking: fromJson<import("../types.js").TaskGithubTracking>(row.githubTracking) ?? undefined,
+    gitlabTracking: fromJson<import("../types.js").TaskGitLabTracking>(row.gitlabTracking) ?? undefined,
     sourceIssue: (() => {
       if (
         row.sourceIssueProvider === null
@@ -227,6 +255,7 @@ export function rowToTask(row: TaskRow): Task {
     // materialized" are different states (mirrors main's SQLite-path fix).
     enabledWorkflowSteps: (() => { const e = fromJson<string[]>(row.enabledWorkflowSteps); return Array.isArray(e) ? e : undefined; })(),
     modifiedFiles: (() => { const m = fromJson<string[]>(row.modifiedFiles); return m && m.length > 0 ? m : undefined; })(),
+    declaredSymbols: (() => { const v = fromJson<string[]>(row.declaredSymbols); return v && v.length > 0 ? v : undefined; })(),
     missionId: row.missionId || undefined,
     sliceId: row.sliceId || undefined,
     assignedAgentId: row.assignedAgentId || undefined,
@@ -241,6 +270,7 @@ export function rowToTask(row: TaskRow): Task {
     sourceSessionId: row.sourceSessionId || undefined,
     sourceMessageId: row.sourceMessageId || undefined,
     sourceParentTaskId: row.sourceParentTaskId || undefined,
+    proposalClaimId: row.proposalClaimId || undefined,
     sourceMetadata: (() => {
       const parsed = fromJson<Record<string, unknown>>(row.sourceMetadata) ?? undefined;
       return withTaskBranchContextInSourceMetadata(parsed, parseTaskBranchContextFromSourceMetadata(parsed));
@@ -322,6 +352,7 @@ export function archiveEntryToTask(
     prInfos: slim ? undefined : entry.prInfos,
     issueInfo: slim ? undefined : entry.issueInfo,
     githubTracking: entry.githubTracking,
+    gitlabTracking: entry.gitlabTracking,
     sourceIssue: slim ? undefined : entry.sourceIssue,
     attachments: slim ? undefined : entry.attachments,
     comments: entry.comments,
@@ -333,6 +364,11 @@ export function archiveEntryToTask(
     columnMovedAt: entry.columnMovedAt,
     firstExecutionAt: entry.firstExecutionAt,
     cumulativeActiveMs: entry.cumulativeActiveMs,
+    // FNXC:TaskTiming 2026-08-01-13:00: archive/restore must retain both
+    // planning fields so archived tasks neither lose accumulated AI time nor
+    // revive without the live segment anchor needed for exactly-once finalize.
+    cumulativePlanningMs: entry.cumulativePlanningMs,
+    planningStartedAt: entry.planningStartedAt,
     executionStartedAt: entry.executionStartedAt,
     executionCompletedAt: entry.executionCompletedAt,
     modelPresetId: entry.modelPresetId,
@@ -342,14 +378,19 @@ export function archiveEntryToTask(
     validatorModelId: entry.validatorModelId,
     planningModelProvider: entry.planningModelProvider,
     planningModelId: entry.planningModelId,
+    mergerModelProvider: entry.mergerModelProvider,
+    mergerModelId: entry.mergerModelId,
+    mergerThinkingLevel: entry.mergerThinkingLevel,
     breakIntoSubtasks: entry.breakIntoSubtasks,
     noCommitsExpected: entry.noCommitsExpected,
     branchContext: entry.branchContext,
     autoMerge: entry.autoMerge,
     modifiedFiles: slim ? undefined : entry.modifiedFiles,
+    declaredSymbols: entry.declaredSymbols,
     missionId: entry.missionId,
     sliceId: entry.sliceId,
     assigneeUserId: entry.assigneeUserId,
+    mergeDetails: slim ? undefined : entry.mergeDetails,
   };
 }
 

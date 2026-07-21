@@ -111,6 +111,7 @@ function renderSidebar(overrides: Partial<ComponentProps<typeof LeftSidebarNav>>
       devServerView: true,
       researchView: true,
       evalsView: true,
+      ideationView: true,
       goalsView: true,
     },
     pluginDashboardViews: pluginViews,
@@ -224,6 +225,7 @@ describe("LeftSidebarNav", () => {
       "sidebar-nav-workflows",
       "sidebar-nav-insights",
       "sidebar-nav-research",
+      "sidebar-nav-ideation",
       "sidebar-nav-skills",
       "sidebar-nav-memory",
       "sidebar-nav-evals",
@@ -287,6 +289,7 @@ describe("LeftSidebarNav", () => {
       "sidebar-nav-workflows",
       "sidebar-nav-insights",
       "sidebar-nav-research",
+      "sidebar-nav-ideation",
       "sidebar-nav-evals",
     ];
     const orderedIndices = orderedTestIds.map((testId) => primaryButtons.indexOf(screen.getByTestId(testId)));
@@ -352,6 +355,7 @@ describe("LeftSidebarNav", () => {
     expect(screen.queryByTestId("sidebar-nav-stash-recovery")).toBeNull();
     expect(screen.queryByTestId("sidebar-nav-agents")).toBeNull();
     expect(screen.queryByTestId("sidebar-nav-research")).toBeNull();
+    expect(screen.queryByTestId("sidebar-nav-ideation")).toBeNull();
     expect(screen.queryByTestId("sidebar-nav-insights")).toBeNull();
     expect(screen.queryByTestId("sidebar-nav-skills")).toBeNull();
     expect(screen.queryByTestId("sidebar-nav-memory")).toBeNull();
@@ -384,7 +388,7 @@ describe("LeftSidebarNav", () => {
     expect(screen.queryByRole("button", { name: /view$/i })).toBeNull();
   });
 
-  it("filters the removed Roadmaps plugin destination when registered", () => {
+  it("renders the hosted Roadmaps plugin destination when registered", () => {
     const roadmapView: PluginDashboardViewEntry = {
       pluginId: "fusion-plugin-roadmap",
       view: {
@@ -397,8 +401,7 @@ describe("LeftSidebarNav", () => {
     };
     renderSidebar({ pluginDashboardViews: [pluginViews[0], roadmapView, pluginViews[1]] });
 
-    // FNXC:Navigation 2026-06-22-18:50: Roadmaps was removed from dashboard navigation; plugin rows must not reintroduce it.
-    expect(screen.queryByTestId("sidebar-nav-plugin-fusion-plugin-roadmap-roadmaps")).toBeNull();
+    expect(screen.getByTestId("sidebar-nav-plugin-fusion-plugin-roadmap-roadmaps")).toBeInTheDocument();
     expect(screen.getByTestId("sidebar-nav-plugin-fusion-plugin-primary-primary-view")).toBeInTheDocument();
     expect(screen.getByTestId("sidebar-nav-plugin-fusion-plugin-overflow-overflow-view")).toBeInTheDocument();
   });
@@ -423,13 +426,13 @@ describe("LeftSidebarNav", () => {
   });
 
   it("renders plugin labels without view suffix and pins Compound Engineering to the Boxes sidebar icon", () => {
-    renderSidebar({
+    const rendered = renderSidebar({
       pluginDashboardViews: [
         ...pluginViews,
         {
           pluginId: "fusion-plugin-compound-engineering",
           view: {
-            viewId: "compound",
+            viewId: "compound-engineering",
             label: "Compound Engineering",
             componentPath: "./CompoundEngineering",
             icon: "Sparkles",
@@ -441,7 +444,7 @@ describe("LeftSidebarNav", () => {
     });
 
     const primaryPlugin = screen.getByTestId("sidebar-nav-plugin-fusion-plugin-primary-primary-view");
-    const compoundPlugin = screen.getByTestId("sidebar-nav-plugin-fusion-plugin-compound-engineering-compound");
+    const compoundPlugin = screen.getByTestId("sidebar-nav-plugin-fusion-plugin-compound-engineering-compound-engineering");
     expect(primaryPlugin).toHaveAccessibleName("Primary Plugin");
     expect(primaryPlugin).toHaveAttribute("title", "Primary Plugin");
     expect(primaryPlugin).toHaveTextContent("Primary Plugin");
@@ -453,11 +456,33 @@ describe("LeftSidebarNav", () => {
     expect(compoundPlugin.querySelector(".lucide-boxes")).not.toBeNull();
     expect(compoundPlugin.querySelector(".lucide-sparkles")).toBeNull();
     expect(compoundPlugin.querySelector(".lucide-grid-3x3")).toBeNull();
+
+    /*
+    FNXC:CompoundEngineeringNav 2026-07-19-17:27:
+    Disable and uninstall both remove the shared view entry; neither may leave a dead sidebar shell.
+    */
+    rendered.rerender(<LeftSidebarNav {...rendered.props} pluginDashboardViews={[]} />);
+    expect(screen.queryByTestId("sidebar-nav-plugin-fusion-plugin-compound-engineering-compound-engineering")).toBeNull();
+    rendered.rerender(<LeftSidebarNav {...rendered.props} pluginDashboardViews={[...pluginViews, {
+      pluginId: "fusion-plugin-compound-engineering",
+      view: {
+        viewId: "compound-engineering",
+        label: "Compound Engineering",
+        componentPath: "./CompoundEngineering",
+        icon: "Sparkles",
+        placement: "primary",
+        order: 0,
+      },
+    }]} />);
+    expect(screen.getByTestId("sidebar-nav-plugin-fusion-plugin-compound-engineering-compound-engineering")).toBeInTheDocument();
+    rendered.rerender(<LeftSidebarNav {...rendered.props} pluginDashboardViews={[]} />);
+    expect(screen.queryByTestId("sidebar-nav-plugin-fusion-plugin-compound-engineering-compound-engineering")).toBeNull();
   });
 
   it.each<[TaskView, string]>([
     ["board", "sidebar-nav-board"],
     ["research", "sidebar-nav-research"],
+    ["ideation", "sidebar-nav-ideation"],
     ["planning", "sidebar-nav-planning"],
     ["plugin:fusion-plugin-primary:primary-view", "sidebar-nav-plugin-fusion-plugin-primary-primary-view"],
     ["plugin:fusion-plugin-overflow:overflow-view", "sidebar-nav-plugin-fusion-plugin-overflow-overflow-view"],

@@ -57,6 +57,20 @@ const createStubCentralCore = (): CentralCore => {
   } as unknown as CentralCore;
 };
 
+/*
+ * FNXC:ChildProcessRoomControlPlane 2026-07-20-00:57:
+ * A child receives only the serializable START_RUNTIME config. It cannot
+ * reconstruct the verified Room factories and ports that remain host-local,
+ * so it must not serialize closures or fall back to a default Room
+ * composition. This factory fails a feature-gated Room lifecycle before a
+ * controller can start; legacy non-Room runtime startup never invokes it.
+ */
+const rejectUnverifiedChildProcessRoomControlPlane = (): never => {
+  throw new Error(
+    "Child-process runtimes cannot start sessionRoomControlPlane without a verified serializable composition",
+  );
+};
+
 // Register command handlers
 
 // START_RUNTIME: Create and start the ProjectEngine (wraps InProcessRuntime + subsystems)
@@ -74,6 +88,7 @@ ipcWorker.onCommand(START_RUNTIME, async (payload: unknown) => {
   // Create ProjectEngine (includes InProcessRuntime + triage, merge, PR, notifications, cron)
   engine = new ProjectEngine(config, centralCore, {
     projectId: config.projectId,
+    roomControllerFactory: rejectUnverifiedChildProcessRoomControlPlane,
   });
 
   const runtime = engine.getRuntime();

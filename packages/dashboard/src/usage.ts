@@ -1320,10 +1320,22 @@ async function fetchCodexUsage(): Promise<ProviderUsage> {
       };
     };
 
-    // Main rate limits
+    const getWindowLabel = (win: unknown, fallbackLabel: string): string => {
+      if (!win || typeof win !== "object") return fallbackLabel;
+      const durationSeconds = (win as { limit_window_seconds?: unknown }).limit_window_seconds;
+      if (durationSeconds === 7 * 24 * 60 * 60) return "Weekly";
+      if (durationSeconds === 5 * 60 * 60) return "Session (5h)";
+      return fallbackLabel;
+    };
+
+    // Codex has used both positional shapes: primary=session + secondary=weekly,
+    // and primary=weekly with no secondary. Prefer the declared duration so the
+    // same quota keeps its meaning across both API responses.
     if (data.rate_limit) {
-      const primary = parseWindow(data.rate_limit.primary_window, "Session (5h)");
-      const secondary = parseWindow(data.rate_limit.secondary_window, "Weekly");
+      const primaryWindow = data.rate_limit.primary_window;
+      const secondaryWindow = data.rate_limit.secondary_window;
+      const primary = parseWindow(primaryWindow, getWindowLabel(primaryWindow, "Session (5h)"));
+      const secondary = parseWindow(secondaryWindow, getWindowLabel(secondaryWindow, "Weekly"));
       if (primary) usage.windows.push(primary);
       if (secondary) usage.windows.push(secondary);
     }
@@ -1678,11 +1690,20 @@ async function fetchGrokCliBillingUsage(token: string, usage: ProviderUsage): Pr
     const config = data?.config;
     if (!config || typeof config !== "object") return false;
 
-    const pctUsed = config.creditUsagePercent;
-    if (typeof pctUsed !== "number" || !Number.isFinite(pctUsed)) return false;
-
     const parsedReset = _parseResetTimestamp(config.billingPeriodEnd ?? config.currentPeriod?.end);
     const isWeekly = config.currentPeriod?.type === "USAGE_PERIOD_TYPE_WEEKLY";
+    /*
+    FNXC:UsageProviders 2026-07-14-14:47:
+    Grok's billing endpoint omits `creditUsagePercent` when the weekly allowance is exhausted. Grok Build renders that valid reduced config as “Weekly limit: 0%” (zero allowance remaining), while Fusion's usage model stores percent consumed. Therefore the omitted exhausted value maps to 100% used—not 0% used. Only infer exhaustion when the response still proves a weekly billing period and reset boundary, so malformed payloads continue to fail closed.
+    */
+    const rawPercentUsed = config.creditUsagePercent;
+    const pctUsed = typeof rawPercentUsed === "number" && Number.isFinite(rawPercentUsed)
+      ? rawPercentUsed
+      : isWeekly && parsedReset
+        ? 100
+        : undefined;
+    if (pctUsed === undefined) return false;
+
     usage.windows.push({
       label: isWeekly ? "Weekly (credits)" : "Credits",
       percentUsed: Math.min(100, Math.max(0, pctUsed)),

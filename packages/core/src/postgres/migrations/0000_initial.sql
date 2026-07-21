@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   validator_model_id text,
   planning_model_provider text,
   planning_model_id text,
+  merger_model_provider text,
+  merger_model_id text,
+  merger_thinking_level text,
   merge_retries integer,
   workflow_step_retries integer,
   resume_limbo_count integer DEFAULT 0,
@@ -78,6 +81,14 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   execute_requeue_loop_signature text,
   recovery_retry_count integer,
   task_done_retry_count integer DEFAULT 0,
+  -- FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker (nullable ISO timestamp).
+  bulk_completion_refusal_at text,
+  -- FNXC:WorkflowIrPin 2026-07-19-03:10: U9b/KTD-3 durable per-node-entry IR pin (see migration 0026).
+  workflow_ir_pin text,
+  workflow_ir_pin_node_id text,
+  workflow_ir_pin_column_id text,
+  -- FNXC:LegacyAdoption 2026-07-19-03:10: U9b/KTD-8 one-time adoption stamp (see migration 0026).
+  legacy_adopted_at text,
   worktree_session_retry_count integer DEFAULT 0,
   completion_handoff_limbo_recovery_count integer DEFAULT 0,
   merge_conflict_bounce_count integer DEFAULT 0,
@@ -86,6 +97,7 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   -- FNXC:SqliteFinalRemoval 2026-06-25: retry/stuck counters missed in initial snapshot
   stuck_kill_count integer DEFAULT 0,
   post_review_fix_count integer DEFAULT 0,
+  plan_review_replan_count integer DEFAULT 0,
   verification_failure_count integer DEFAULT 0,
   branch_conflict_recovery_count integer DEFAULT 0,
   reviewer_context_retry_count integer DEFAULT 0,
@@ -97,11 +109,11 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   validator_thinking_level text,
   planning_thinking_level text,
   execution_mode text DEFAULT 'standard',
-  token_usage_input_tokens integer,
-  token_usage_output_tokens integer,
-  token_usage_cached_tokens integer,
-  token_usage_cache_write_tokens integer,
-  token_usage_total_tokens integer,
+  token_usage_input_tokens bigint,
+  token_usage_output_tokens bigint,
+  token_usage_cached_tokens bigint,
+  token_usage_cache_write_tokens bigint,
+  token_usage_total_tokens bigint,
   token_usage_first_used_at text,
   token_usage_last_used_at text,
   token_usage_model_provider text,
@@ -114,7 +126,7 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   updated_at text NOT NULL,
   column_moved_at text,
   first_execution_at text,
-  cumulative_active_ms integer,
+  cumulative_active_ms bigint,
   execution_started_at text,
   execution_completed_at text,
   dependencies jsonb DEFAULT '[]',
@@ -143,6 +155,7 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   no_commits_expected integer DEFAULT 0,
   enabled_workflow_steps jsonb DEFAULT '[]',
   modified_files jsonb DEFAULT '[]',
+  declared_symbols jsonb NOT NULL DEFAULT '[]'::jsonb,
   mission_id text,
   slice_id text,
   scope_override integer,
@@ -162,12 +175,13 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   source_message_id text,
   source_parent_task_id text,
   source_metadata jsonb,
+  proposal_claim_id text,
   checked_out_by text,
   checked_out_at text,
   checkout_node_id text,
   checkout_run_id text,
   checkout_lease_renewed_at text,
-  checkout_lease_epoch integer DEFAULT 0,
+  checkout_lease_epoch bigint DEFAULT 0,
   deleted_at text,
   allow_resurrection integer DEFAULT 0,
   transition_pending text,
@@ -202,15 +216,18 @@ CREATE TABLE IF NOT EXISTS project.config (
 );
 
 CREATE TABLE IF NOT EXISTS project.distributed_task_id_state (
-  prefix text PRIMARY KEY,
+  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  prefix text NOT NULL,
   next_sequence integer NOT NULL,
   committed_cluster_task_count integer NOT NULL,
   last_committed_task_id text,
-  updated_at text NOT NULL
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, prefix)
 );
 
 CREATE TABLE IF NOT EXISTS project.distributed_task_id_reservations (
-  reservation_id text PRIMARY KEY,
+  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  reservation_id text NOT NULL,
   prefix text NOT NULL,
   node_id text NOT NULL,
   sequence integer NOT NULL,
@@ -222,19 +239,45 @@ CREATE TABLE IF NOT EXISTS project.distributed_task_id_reservations (
   aborted_at text,
   created_at text NOT NULL,
   updated_at text NOT NULL,
+  PRIMARY KEY (project_id, reservation_id),
   CONSTRAINT distributed_task_id_reservations_prefix_fkey
-    FOREIGN KEY (prefix) REFERENCES project.distributed_task_id_state(prefix) ON DELETE CASCADE,
+    FOREIGN KEY (project_id, prefix) REFERENCES project.distributed_task_id_state(project_id, prefix) ON DELETE CASCADE,
   CONSTRAINT distributed_task_id_reservations_status_check
     CHECK (status IN ('reserved', 'committed', 'aborted', 'expired')),
   CONSTRAINT distributed_task_id_reservations_reason_check
     CHECK (reason IS NULL OR reason IN ('abort', 'expired', 'failed-create')),
-  CONSTRAINT distributed_task_id_reservations_prefix_sequence_unique UNIQUE (prefix, sequence),
-  CONSTRAINT distributed_task_id_reservations_prefix_task_id_unique UNIQUE (prefix, task_id)
+  CONSTRAINT distributed_task_id_reservations_prefix_sequence_unique UNIQUE (project_id, prefix, sequence),
+  CONSTRAINT distributed_task_id_reservations_prefix_task_id_unique UNIQUE (project_id, prefix, task_id)
 );
 CREATE INDEX IF NOT EXISTS "idxDistributedTaskIdReservationsPrefixStatus"
-  ON project.distributed_task_id_reservations(prefix, status);
+  ON project.distributed_task_id_reservations(project_id, prefix, status);
 CREATE INDEX IF NOT EXISTS "idxDistributedTaskIdReservationsExpiry"
   ON project.distributed_task_id_reservations(status, expires_at);
+
+-- FNXC:SymbolLock 2026-07-30-14:10: baseline creates the table only; 0025
+-- applies RLS after 0006 defines the ownership trigger and policy machinery.
+CREATE TABLE IF NOT EXISTS project.symbol_locks (
+  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  symbol_key text NOT NULL,
+  owner_task_id text NOT NULL,
+  mission_id text,
+  feature_id text,
+  lineage_id text,
+  node_id text,
+  agent_id text,
+  status text NOT NULL,
+  acquired_at text NOT NULL,
+  renewed_at text NOT NULL,
+  expires_at text NOT NULL,
+  created_at text NOT NULL,
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, symbol_key),
+  CONSTRAINT symbol_locks_status_check CHECK (status IN ('held', 'released', 'expired'))
+);
+CREATE INDEX IF NOT EXISTS "idxSymbolLocksOwner"
+  ON project.symbol_locks(project_id, owner_task_id);
+CREATE INDEX IF NOT EXISTS "idxSymbolLocksExpiry"
+  ON project.symbol_locks(status, expires_at);
 
 CREATE TABLE IF NOT EXISTS project.workflow_steps (
   id text PRIMARY KEY,
@@ -275,7 +318,28 @@ CREATE TABLE IF NOT EXISTS project.task_workflow_selection (
   updated_at text NOT NULL
 );
 
+-- FNXC:TaskVerificationRequest 2026-07-30-00:00: chat queues profiles; only executor runs the resolved command.
+CREATE TABLE IF NOT EXISTS project.task_verification_requests (
+  project_id text NOT NULL DEFAULT current_setting('fusion.project_id', true),
+  task_id text NOT NULL,
+  request_id text NOT NULL,
+  status text NOT NULL,
+  profile text NOT NULL,
+  command text NOT NULL,
+  scope text NOT NULL,
+  requested_by text NOT NULL,
+  requested_at text NOT NULL,
+  started_at text,
+  completed_at text,
+  result jsonb,
+  rejection_reason text,
+  PRIMARY KEY (project_id, task_id),
+  UNIQUE (project_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_verification_requests_status ON project.task_verification_requests(project_id, status, requested_at);
+
 CREATE TABLE IF NOT EXISTS project.activity_log (
+  project_id text NOT NULL,
   id text PRIMARY KEY,
   timestamp text NOT NULL,
   type text NOT NULL,
@@ -285,6 +349,7 @@ CREATE TABLE IF NOT EXISTS project.activity_log (
   metadata jsonb
 );
 CREATE INDEX IF NOT EXISTS "idxActivityLogTimestamp" ON project.activity_log(timestamp);
+CREATE INDEX IF NOT EXISTS "idxActivityLogProjectTimestamp" ON project.activity_log(project_id, timestamp);
 CREATE INDEX IF NOT EXISTS "idxActivityLogType" ON project.activity_log(type);
 CREATE INDEX IF NOT EXISTS "idxActivityLogTaskId" ON project.activity_log(task_id);
 
@@ -325,7 +390,8 @@ CREATE INDEX IF NOT EXISTS "idxTaskCommitAssociationsCommitSha"
   ON project.task_commit_associations(commit_sha);
 
 CREATE TABLE IF NOT EXISTS project.automations (
-  id text PRIMARY KEY,
+  project_id text NOT NULL DEFAULT '',
+  id text NOT NULL,
   name text NOT NULL,
   description text,
   schedule_type text NOT NULL,
@@ -341,7 +407,8 @@ CREATE TABLE IF NOT EXISTS project.automations (
   run_history jsonb DEFAULT '[]',
   scope text DEFAULT 'project',
   created_at text NOT NULL,
-  updated_at text NOT NULL
+  updated_at text NOT NULL,
+  PRIMARY KEY (project_id, id)
 );
 
 CREATE TABLE IF NOT EXISTS project.agents (
@@ -370,6 +437,7 @@ CREATE INDEX IF NOT EXISTS "idxAgentHeartbeatsAgentId" ON project.agent_heartbea
 CREATE INDEX IF NOT EXISTS "idxAgentHeartbeatsRunId" ON project.agent_heartbeats(run_id);
 
 CREATE TABLE IF NOT EXISTS project.agent_runs (
+  project_id text NOT NULL,
   id text PRIMARY KEY,
   agent_id text NOT NULL,
   data jsonb NOT NULL,
@@ -380,6 +448,7 @@ CREATE TABLE IF NOT EXISTS project.agent_runs (
     FOREIGN KEY (agent_id) REFERENCES project.agents(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS "idxAgentRunsAgentIdStartedAt" ON project.agent_runs(agent_id, started_at);
+CREATE INDEX IF NOT EXISTS "idxAgentRunsProjectStartedAt" ON project.agent_runs(project_id, started_at);
 CREATE INDEX IF NOT EXISTS "idxAgentRunsStatus" ON project.agent_runs(status);
 
 CREATE TABLE IF NOT EXISTS project.agent_task_sessions (
@@ -965,6 +1034,9 @@ CREATE TABLE IF NOT EXISTS project.mission_features (
   last_validator_status text,
   generated_from_feature_id text,
   generated_from_run_id text,
+  research_run_id text,
+  research_finding_id text,
+  research_source_urls jsonb,
   CONSTRAINT mission_features_slice_id_fkey
     FOREIGN KEY (slice_id) REFERENCES project.slices(id) ON DELETE CASCADE,
   CONSTRAINT mission_features_task_id_fkey
@@ -1005,6 +1077,25 @@ CREATE TABLE IF NOT EXISTS project.plugins (
   created_at text NOT NULL,
   updated_at text NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS central.global_routines (
+  id text PRIMARY KEY,
+  name text NOT NULL UNIQUE,
+  description text,
+  agent_id text NOT NULL DEFAULT '',
+  trigger_type text NOT NULL,
+  trigger_config jsonb NOT NULL,
+  command text,
+  enabled integer NOT NULL DEFAULT 1,
+  last_run_at text,
+  last_run_result jsonb,
+  next_run_at text,
+  run_count integer NOT NULL DEFAULT 0,
+  run_history jsonb NOT NULL DEFAULT '[]',
+  created_at text NOT NULL,
+  updated_at text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_global_routines_next_run_at ON central.global_routines(next_run_at);
 
 CREATE TABLE IF NOT EXISTS project.routines (
   id text PRIMARY KEY,
@@ -1113,6 +1204,7 @@ CREATE INDEX IF NOT EXISTS "idxTodoItemsListId" ON project.todo_items(list_id);
 CREATE INDEX IF NOT EXISTS "idxTodoItemsSortOrder" ON project.todo_items(list_id, sort_order);
 
 CREATE TABLE IF NOT EXISTS project.usage_events (
+  project_id text NOT NULL,
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   ts text NOT NULL,
   kind text NOT NULL,
@@ -1126,6 +1218,7 @@ CREATE TABLE IF NOT EXISTS project.usage_events (
   meta jsonb
 );
 CREATE INDEX IF NOT EXISTS "idxUsageEventsTs" ON project.usage_events(ts);
+CREATE INDEX IF NOT EXISTS "idxUsageEventsProjectTs" ON project.usage_events(project_id, ts);
 CREATE INDEX IF NOT EXISTS "idxUsageEventsTaskId" ON project.usage_events(task_id);
 CREATE INDEX IF NOT EXISTS "idxUsageEventsAgentId" ON project.usage_events(agent_id);
 CREATE INDEX IF NOT EXISTS "idxUsageEventsKindTs" ON project.usage_events(kind, ts);
@@ -1162,7 +1255,8 @@ CREATE INDEX IF NOT EXISTS "idxKnowledgePagesUpdatedAt"
 
 CREATE TABLE IF NOT EXISTS project.deployments (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  deployment_id text NOT NULL UNIQUE,
+  project_id text NOT NULL DEFAULT '',
+  deployment_id text NOT NULL,
   service text,
   environment text,
   version text,
@@ -1172,11 +1266,14 @@ CREATE TABLE IF NOT EXISTS project.deployments (
   meta jsonb,
   created_at text NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS "idxDeploymentsProjectDeploymentId" ON project.deployments(project_id, deployment_id);
+CREATE INDEX IF NOT EXISTS "idxDeploymentsProjectDeployedAt" ON project.deployments(project_id, deployed_at);
 CREATE INDEX IF NOT EXISTS "idxDeploymentsDeployedAt" ON project.deployments(deployed_at);
 CREATE INDEX IF NOT EXISTS "idxDeploymentsService" ON project.deployments(service);
 
 CREATE TABLE IF NOT EXISTS project.incidents (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  project_id text NOT NULL DEFAULT '',
   incident_id text NOT NULL UNIQUE,
   grouping_key text NOT NULL,
   title text NOT NULL,
@@ -1191,6 +1288,8 @@ CREATE TABLE IF NOT EXISTS project.incidents (
   created_at text NOT NULL,
   updated_at text NOT NULL
 );
+CREATE INDEX IF NOT EXISTS "idxIncidentsProjectOpenedAt" ON project.incidents(project_id, opened_at);
+CREATE INDEX IF NOT EXISTS "idxIncidentsProjectStatus" ON project.incidents(project_id, status);
 CREATE INDEX IF NOT EXISTS "idxIncidentsGroupingKey" ON project.incidents(grouping_key);
 CREATE INDEX IF NOT EXISTS "idxIncidentsStatus" ON project.incidents(status);
 CREATE INDEX IF NOT EXISTS "idxIncidentsOpenedAt" ON project.incidents(opened_at);
@@ -1254,8 +1353,11 @@ CREATE TABLE IF NOT EXISTS project.chat_sessions (
   model_provider text,
   model_id text,
   thinking_level text,
+  validator_thinking_level text,
+  planning_thinking_level text,
   created_at text NOT NULL,
   updated_at text NOT NULL,
+  pinned_at text,
   cli_session_file text,
   in_flight_generation jsonb,
   cli_executor_adapter_id text
@@ -1300,11 +1402,11 @@ CREATE TABLE IF NOT EXISTS project.chat_token_usage (
   agent_id text,
   model_provider text,
   model_id text,
-  input_tokens integer NOT NULL,
-  output_tokens integer NOT NULL,
-  cached_tokens integer NOT NULL,
-  cache_write_tokens integer NOT NULL,
-  total_tokens integer NOT NULL,
+  input_tokens bigint NOT NULL,
+  output_tokens bigint NOT NULL,
+  cached_tokens bigint NOT NULL,
+  cache_write_tokens bigint NOT NULL,
+  total_tokens bigint NOT NULL,
   created_at text NOT NULL
 );
 
@@ -1409,6 +1511,7 @@ CREATE TABLE IF NOT EXISTS project.approval_requests (
 );
 
 CREATE TABLE IF NOT EXISTS project.approval_request_audit_events (
+  project_id text NOT NULL DEFAULT '',
   id text PRIMARY KEY,
   request_id text NOT NULL,
   event_type text NOT NULL,
@@ -1478,6 +1581,7 @@ CREATE INDEX IF NOT EXISTS "idxTasksUpdatedAt" ON project.tasks(updated_at DESC)
 -- filters on source_parent_task_id on every archive/delete. Without this index
 -- the gate is a full tasks-table scan. Sparse: most rows have NULL parent.
 CREATE INDEX IF NOT EXISTS "idxTasksSourceParentTaskId" ON project.tasks(source_parent_task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS "uqTasksProjectProposalClaimId" ON project.tasks(project_id, proposal_claim_id) WHERE proposal_claim_id IS NOT NULL;
 -- FNXC:TaskStoreReads 2026-06-26-10:00:
 -- Partial index for the hot kanban / board-read query shape
 -- WHERE deleted_at IS NULL AND "column" = ? (every live board hydration).
@@ -1575,6 +1679,8 @@ CREATE INDEX IF NOT EXISTS "idxApprovalRequestsTaskCreatedAt" ON project.approva
 -- approval_request_audit_events
 CREATE INDEX IF NOT EXISTS "idxApprovalRequestAuditRequestCreatedAt"
   ON project.approval_request_audit_events(request_id, created_at, id);
+CREATE INDEX IF NOT EXISTS "idxApprovalRequestAuditProjectCreatedAt"
+  ON project.approval_request_audit_events(project_id, created_at);
 
 -- chat_rooms
 CREATE UNIQUE INDEX IF NOT EXISTS "idxChatRoomsSlug" ON project.chat_rooms(project_id, slug);
@@ -1589,7 +1695,8 @@ CREATE INDEX IF NOT EXISTS "idxChatRoomMessagesRoomCreatedAt" ON project.chat_ro
 CREATE INDEX IF NOT EXISTS "idxChatRoomMessagesRoomId" ON project.chat_room_messages(room_id);
 
 -- automations
-CREATE INDEX IF NOT EXISTS "idxAutomationsScope" ON project.automations(scope);
+CREATE INDEX IF NOT EXISTS "idxAutomationsProjectScope" ON project.automations(project_id, scope);
+CREATE INDEX IF NOT EXISTS "idxAutomationsProjectDue" ON project.automations(project_id, enabled, next_run_at);
 
 -- routines
 CREATE INDEX IF NOT EXISTS "idxRoutinesNextRunAt" ON project.routines(next_run_at);
@@ -1921,3 +2028,4 @@ CREATE INDEX IF NOT EXISTS "idxArchivedTasksCreatedAt"
 -- GIN index on the archive search_vector (VAL-SEARCH-005).
 CREATE INDEX IF NOT EXISTS "idxArchivedTasksSearchVector"
   ON archive.archived_tasks USING gin(search_vector);
+

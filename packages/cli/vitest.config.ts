@@ -44,24 +44,30 @@ const quarantinedCliTests: string[] = [
   /*
   FNXC:CliTests 2026-06-25-14:00:
   The SQLite-to-PostgreSQL cutover (feature quarantine-sqlite-internals-tests, retry session)
-  quarantines 7 pre-existing CLI test failures observed during verify:workspace. All confirmed
-  failing on clean baseline (stash + rerun, 7 failed | 92 passed). Root causes vary:
+  recorded pre-existing CLI test failures observed during verify:workspace. Root causes varied:
   - extension-fn-secret-get.test.ts: store.getAsyncLayer mock drift (async-satellite dual-path).
   - chat.test.ts: MessageStore.getInbox returns non-array under Node 26 node:sqlite (SQLite-path).
-  - package-config.test.ts: pi-coding-agent version drift + embedded-postgres not yet in deps.
   - skill-sync.test.ts: undocumented engine tools (fn_acquire_repo_worktree, fn_artifact_*).
   - version.test.ts: changeset script assertion drift (project now uses scripts/release.mjs).
   - dashboard.test.ts: mesh lifecycle mock assertion drift.
   - bundled-plugin-freshness.test.ts: bundled plugin build freshness drift.
-  Quarantined on sight per AGENTS.md flaky-test rule so verify:workspace goes green.
-  Mirrored in scripts/lib/test-quarantine.json.
+  The entries were quarantined on sight per AGENTS.md; FN-8219 deleted the five
+  in-scope expired entries on 2026-07-17 rather than rescuing or re-recording them.
+
+  FNXC:CliTests 2026-07-17-09:45:
+  FN-8210 restores package-config.test.ts to the package lane after the direct green run proved its failures were stale tsup plugin-external and verify:workspace expectations, not flaky behavior. Its old exclusion had no matching ledger entry; do not re-quarantine without new root-cause evidence and a lockstep ledger entry.
   */
-  "src/__tests__/extension-fn-secret-get.test.ts",
-  "src/__tests__/package-config.test.ts",
-  "src/__tests__/skill-sync.test.ts",
-  "src/__tests__/version.test.ts",
-  "src/commands/__tests__/dashboard.test.ts",
-  "src/plugins/__tests__/bundled-plugin-freshness.test.ts",
+  /*
+  FNXC:CliTests 2026-07-17-10:00:
+  FN-8219 reconciled the five 2026-06-25 config-only quarantines after their
+  2026-07-09 deletion deadline. Per docs/testing.md, expired quarantines are
+  deleted rather than rescued or re-recorded: extension-fn-secret-get
+  (async-layer mock drift), skill-sync (undocumented engine tools), version
+  (release-script assertion drift), dashboard (mesh lifecycle mock drift), and
+  bundled-plugin-freshness (build freshness drift) are now git-history-only.
+  The quarantine ledger has no packages/cli rows. FN-8223 now enforces full
+  CLI config↔ledger lockstep, including package-config.test.ts if re-quarantined.
+  */
   /*
   FNXC:CliTests 2026-06-25-16:30:
   The SQLite-to-PostgreSQL cutover (feature delete-sqlite-runtime-final, PHASE A)
@@ -85,14 +91,35 @@ const quarantinedCliTests: string[] = [
   FNXC:CliTests 2026-06-27-10:05:
   FN-7119 re-ran extension.test.ts twice with the exclude removed and the fn_delegate_task null-target symptom no longer reproduces at HEAD. Keep this list empty so delegate-task validation coverage stays active in the package lane.
 
-  FNXC:CliTests 2026-07-04-10:40:
-  FN-7447 re-quarantines extension.test.ts after its built-dist-barrel fn_task_list test (line ~3084) timed out at 5000ms in full-suite shard 4/4 (run 28697507894) while passing locally at ~1.2s and in 3 of the 4 surrounding CI runs. The root-cause invariant is the loaded-lane signature: in-test dist-barrel recompilation (vi.resetModules + vi.importActual of the full @fusion/core dist barrel + a fresh dynamic import of extension.js) inside the default 5s timeout is CPU-bound and degrades non-linearly under 4-shard CI contention. This is the same signature rescued in FN-6483/FN-6705/FN-6795/FN-6839; widening the timeout is forbidden by the flaky-test rule and removing the recompilation removes the test's only purpose, so the file is excluded per the deletion ratchet rather than re-attempting a fifth fixture rescue. Mirrors scripts/lib/test-quarantine.json; collateral is the ~68 otherwise-stable tests in this file, recoverable via rescue before the 2026-07-18 deletion deadline.
-
-  FNXC:CliTests 2026-07-04-13:50:
-  FN-7530 resolved the FN-7447 entry: RESCUE-by-split, not delete. The single dist-barrel recompilation test (unchanged assertions) moved to packages/cli/src/__tests__/extension-dist-barrel.test.ts; extension.test.ts is back in the default lane and its ~68 stable tests run again. The isolated file still stays quarantined here under its OWN fresh entry, because the root cause is loaded-lane CPU contention during vi.resetModules()/vi.importActual(dist barrel)/dynamic import() -- a property of that operation under 4-shard CI, not of file layout -- so splitting the file does not by itself make it safe to re-admit, and with only one test in the file there is no second call site to amortize a module-top-level rescue against. No testTimeout widening, retries, or worker/concurrency changes were made. Mirrors scripts/lib/test-quarantine.json; this isolated file's own 14-day deletion clock is due 2026-07-18.
+  FNXC:CliTests 2026-07-16-06:27:
+  FN-8093 rescues the isolated dist-barrel test before its deletion deadline. Its entire CPU-bound recompilation unit and fixture seeding run once in suite-scoped beforeAll, while each default-5s test body only executes an already-injected fn_task_list tool. The exclusion and matching ledger entry were removed in lockstep after loaded-lane verification; do not re-add either unless a new root cause is quarantined under the deletion ratchet.
   */
-  "src/__tests__/extension-dist-barrel.test.ts",
+  /*
+  FNXC:CliTests 2026-07-16-09:00:
+  FN-8077 removed project-context.test.ts from this list and the ledger in lockstep. Its CentralCore coverage now uses the external PostgreSQL test harness under pgDescribe rather than launching an embedded postmaster for each test in forked loaded lanes; pure formatting coverage remains ungated.
+  */
+  /*
+  FNXC:CliTests 2026-07-18-07:30:
+  FN-8271 rescued the shard-4 cascade after removing unrelated PostgreSQL template-copy and persistent-seeding work from extension-dist-barrel's built-dist hook. All fourteen affected CLI files return to the default lane with their matching quarantine-ledger rows removed; retain normal worker budgets and timeout defaults rather than reintroducing appeasement.
+
+
+  FNXC:CliTests 2026-07-18-20:45:
+  FN-8381 deletes extension-dist-barrel after its fourth quarantine cycle. Timing isolated the full core dist-barrel and re-mocked extension module graph as a 4–5.5s CPU-bound beforeAll while temp setup and cache seeding were negligible; shard contention pushed the same hook beyond Vitest's default 10s in run 29662476909. The source-side extension test retains the fn_task_list formatting/truncation invariant, while this test's marginal full-barrel substitution signal is not worth another load-sensitive rescue. Keep it out of both this exclusion and scripts/lib/test-quarantine.json; do not replace deletion with timeout, retry, or worker-budget appeasement.
+  */
 ];
+
+/*
+FNXC:CliTests 2026-07-18-02:15:
+The full CLI suite must continue excluding quarantined integration tests, but an explicitly named quarantined file needs to remain runnable for focused diagnosis and regression verification. Preserve the quarantine for discovery runs while removing only the exact requested path from Vitest's exclude list (FN-8268).
+*/
+const explicitlyRequestedTestFiles = new Set(
+  process.argv
+    .filter((argument) => /(^|[/\\])src[/\\].+\.test\.(?:ts|tsx)$/.test(argument))
+    .map((argument) => argument.replace(/\\/g, "/").replace(/^\.\//, "")),
+);
+const activeQuarantinedCliTests = quarantinedCliTests.filter(
+  (testFile) => !explicitlyRequestedTestFiles.has(testFile),
+);
 
 export default defineConfig({
   resolve: {
@@ -118,6 +145,10 @@ export default defineConfig({
       {
         find: /^@fusion-plugin-examples\/hermes-runtime$/,
         replacement: resolve(__dirname, "../../plugins/fusion-plugin-hermes-runtime/src/index.ts"),
+      },
+      {
+        find: /^@fusion-plugin-examples\/happier-runtime$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-happier-runtime/src/index.ts"),
       },
       {
         find: /^@fusion-plugin-examples\/openclaw-runtime$/,
@@ -152,6 +183,41 @@ export default defineConfig({
         replacement: resolve(__dirname, "../../plugins/fusion-plugin-grok-runtime/src/index.ts"),
       },
       /*
+      FNXC:PluginTests 2026-07-18-01:58:
+      runtime-provider-probes.ts is reached from @fusion/dashboard through server.ts, routes.ts, and register-runtime-provider-routes.ts, where it imports @fusion-plugin-examples/claude-runtime. Mirror the Cursor, Grok, and OMP source aliases so source checkouts without built plugin dist resolve the Claude runtime (FN-8268).
+      */
+      {
+        find: /^@fusion-plugin-examples\/claude-runtime$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-claude-runtime/src/index.ts"),
+      },
+      /*
+      FNXC:OmpAcp 2026-07-11-23:35:
+      runtime-provider-probes imports @fusion-plugin-examples/omp-runtime; alias source for checkout tests.
+      */
+      {
+        find: /^@fusion-plugin-examples\/omp-runtime\/probe$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-omp-runtime/src/probe.ts"),
+      },
+      {
+        find: /^@fusion-plugin-examples\/omp-runtime$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-omp-runtime/src/index.ts"),
+      },
+      /*
+      FNXC:CliTests 2026-07-18-09:15:
+      runtime-provider-probes imports @fusion-plugin-examples/claude-runtime for probe/model
+      discovery only. Alias the package root to probes-entry (not full index) so CLI tests do
+      not load ACP/runtime-adapter or require @agentclientprotocol/sdk on the CLI resolver path.
+      Full-suite shard 4 failed with dist/ entry resolution + missing ACP deps under package lane.
+      */
+      {
+        find: /^@fusion-plugin-examples\/claude-runtime\/probe$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-claude-runtime/src/probe.ts"),
+      },
+      {
+        find: /^@fusion-plugin-examples\/claude-runtime$/,
+        replacement: resolve(__dirname, "../../plugins/fusion-plugin-claude-runtime/src/probes-entry.ts"),
+      },
+      /*
       FNXC:PluginTests 2026-07-04-09:30:
       The roadmap plugin (@fusion-plugin-examples/roadmap) is imported by the CLI extension. Without source aliases, Vite resolves to the dist/ exports which don't exist in a source checkout.
       */
@@ -175,7 +241,7 @@ export default defineConfig({
     // build-exe + build-exe-cross live in their own vitest project
     // (see vitest.build-exe.config.ts) so the rest of the CLI suite can
     // run with file parallelism enabled.
-    exclude: ["**/node_modules/**", "**/dist/**", "src/__tests__/build-exe*.test.ts", ...quarantinedCliTests],
+    exclude: ["**/node_modules/**", "**/dist/**", "src/__tests__/build-exe*.test.ts", ...activeQuarantinedCliTests],
     setupFiles: [
       resolve(__dirname, "../core/src/__test-utils__/vitest-setup.ts"),
     ],

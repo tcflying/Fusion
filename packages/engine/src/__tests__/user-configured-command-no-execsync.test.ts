@@ -19,7 +19,10 @@ import { describe, expect, it } from "vitest";
  * - packages/engine/src/sandbox/bubblewrap-backend.ts :: BubblewrapBackend.runBwrapSpawn — concrete bubblewrap spawn path uses setTimeout(options.timeoutMs) and options.maxBuffer.
  * - packages/engine/src/sandbox/sandbox-exec-backend.ts :: SandboxExecBackend.run — macOS isolating backend uses async exec with timeout, maxBuffer, and signal.
  *
- * Explicit exclusions: git-only execSync in merger.ts, self-healing.ts, already-merged-detector.ts, integration-branch.ts, worktree-prune.ts, and executor.ts git merge-base ancestry checks. The guard slices only registry function bodies instead of asserting over whole files.
+ * Explicit exclusions: audited short git plumbing is enforced call-site-by-call-site
+ * by engine-no-blocking-shellout.test.ts (including review-checkout.ts and bounded
+ * data-dependent git diffs). This focused registry slices only user-command
+ * function bodies instead of asserting over whole files.
  */
 
 type GuardEntry = {
@@ -39,9 +42,15 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
+    /*
+    FNXC:EngineProcessRules 2026-07-15-11:40:
+    runVerificationCommand is a concurrency-slot wrapper; the actual user-configured
+    command spawn lives in runVerificationCommandUnlocked (execWithProcessGroup + bounds).
+    Guard the unlocked body so slot extraction cannot reintroduce unbounded exec.
+    */
     file: "src/verification-utils.ts",
-    name: "runVerificationCommand",
-    signature: "export async function runVerificationCommand(",
+    name: "runVerificationCommandUnlocked",
+    signature: "async function runVerificationCommandUnlocked(",
     requiredSafeguards: [
       { label: "execWithProcessGroup async runner", pattern: /execWithProcessGroup\(/ },
       { label: "timeout option", pattern: /timeout\s*:\s*timeoutMs/ },
@@ -49,12 +58,30 @@ const protectedCommandPaths: GuardEntry[] = [
     ],
   },
   {
+    file: "src/verification-utils.ts",
+    name: "runVerificationCommand",
+    signature: "export async function runVerificationCommand(",
+    requiredSafeguards: [
+      { label: "verification slot wrapper", pattern: /withVerificationSlot\(/ },
+      { label: "unlocked runner", pattern: /runVerificationCommandUnlocked\(/ },
+    ],
+  },
+  {
+    file: "src/run-verification-tool.ts",
+    name: "runVerificationCommandUnlocked",
+    signature: "async function runVerificationCommandUnlocked(",
+    requiredSafeguards: [
+      { label: "superviseSpawn async runner", pattern: /superviseSpawn\(/ },
+      { label: "process lifetime cap", pattern: /maxLifetimeMs\s*:/ },
+    ],
+  },
+  {
     file: "src/run-verification-tool.ts",
     name: "runVerificationCommand",
     signature: "export async function runVerificationCommand(",
     requiredSafeguards: [
-      { label: "superviseSpawn async runner", pattern: /superviseSpawn\(/ },
-      { label: "process lifetime cap", pattern: /maxLifetimeMs\s*:/ },
+      { label: "verification slot wrapper", pattern: /withVerificationSlot\(/ },
+      { label: "unlocked runner", pattern: /runVerificationCommandUnlocked\(/ },
     ],
   },
   {

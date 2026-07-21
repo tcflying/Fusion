@@ -38,9 +38,13 @@ function uniqueDbName(): string {
   return `fusion_sat_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/*
+FNXC:PgTestAuthFix 2026-07-14-00:00:
+The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+*/
 function adminExec(statement: string): void {
   execSync(
-    `psql -h localhost -p 5432 -U ${process.env.USER ?? "postgres"} -d postgres -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
+    `psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
     { stdio: "pipe", env: process.env },
   );
 }
@@ -349,6 +353,19 @@ pgDescribe("PostgreSQL satellite DB-injected stores (VAL-DATA-016)", () => {
 
     await addChatRoomMessage(ctx.layer.db, { id: "rmsg-1", roomId: "room-1", role: "user", content: "Room hello", thinkingOutput: null, metadata: null, attachments: null, senderAgentId: "agent-1", mentions: ["agent-2"], createdAt: now });
     expect((await getChatRoomMessages(ctx.layer.db, "room-1"))).toHaveLength(1);
+
+    /*
+    FNXC:ChatPinned 2026-07-16-12:30:
+    A pin must never survive archiving, and an archived session must reject a
+    later pin request. The store's row lock makes these invariants hold when
+    archive and pin requests overlap as well as in this serial regression case.
+    */
+    const chatStore = new (await import("../../chat-store.js")).ChatStore(ctx.layer);
+    const pinned = await chatStore.setSessionPinned("chat-1", true);
+    expect(pinned?.pinnedAt).not.toBeNull();
+    const archived = await chatStore.archiveSession("chat-1");
+    expect(archived).toMatchObject({ status: "archived", pinnedAt: null });
+    await expect(chatStore.setSessionPinned("chat-1", true)).rejects.toThrow("Archived conversations cannot be pinned");
 
     const cleared = await clearChatRoomMessages(ctx.layer.db, "room-1");
     expect(cleared).toBe(1);

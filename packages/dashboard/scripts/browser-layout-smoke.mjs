@@ -116,6 +116,91 @@ export function createSmokeHtml() {
     `)
     .join("");
 
+  /*
+  FNXC:QuickAddActionRow 2026-07-17-12:00:
+  FN-8299 protects the localized Quick Add Save label with a production-CSS browser fixture.
+  The Board column's 300px effective minimum content width is the supported boundary: below it,
+  a fixed-height single-line action cannot promise an unbreakable label without changing the UX.
+  Render every supported translation here so the smoke measures the widest emitted-font label
+  instead of assuming French is widest from character count.
+
+  FNXC:QuickAddActionRow 2026-07-18-11:22:
+  The fixture must include all five production icon controls before Save, including the session
+  advisor toggle. Omitting it understates the primary group's minimum width and could conceal a
+  300px overflow or wrap regression on either Board or List.
+  */
+  const localizedSaveLabels = [
+    ["en", "Save"],
+    ["es", "Guardar"],
+    ["fr", "Enregistrer"],
+    ["ko", "저장"],
+    ["zh-CN", "保存"],
+    ["zh-TW", "儲存"],
+  ];
+  const quickAddComposerFixtures = [
+    ["board", "", "minimum", "300px", "disabled"],
+    ["board", "", "wide", "600px", "disabled"],
+    ["list", "quick-entry--single-line", "minimum", "300px", "enabled"],
+    ["list", "quick-entry--single-line", "wide", "600px", "enabled"],
+  ].flatMap(([surface, modifier, width, maxWidth, state]) => localizedSaveLabels.map(([locale, label]) => `
+    <section class="quick-entry-smoke-fixture" data-smoke="quick-add-save-${surface}-${width}-${locale}" style="width: min(${maxWidth}, calc(100vw - 24px)); margin: 0 auto 12px;">
+      <div class="quick-entry-box quick-entry-box--expanded ${modifier}" data-smoke="quick-add-${surface}-composer">
+        <div class="quick-entry-actions" data-smoke="quick-add-save-row">
+          <div class="quick-entry-primary-group">
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-attach" type="button" aria-label="Attach"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-github-toggle" type="button" aria-label="GitHub"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-session-advisor-toggle" type="button" aria-label="Session advisor"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7s2-3 5-3 5 3 5 3-2 3-5 3-5-3-5-3Z"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-priority-button" type="button" aria-label="Priority"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-icon btn-sm" data-testid="quick-entry-fast-toggle" type="button" aria-label="Fast"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3 7h8"/></svg></button>
+            <button class="btn btn-task-create btn-sm" data-testid="quick-entry-save" data-smoke="quick-add-save-button" data-locale="${locale}" type="button" ${state === "disabled" ? "disabled" : ""}><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true" style="vertical-align: middle; margin-right: 4px;"><path d="M2 6h8"/></svg>${label}</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  `)).join("");
+
+  /*
+  FNXC:TaskDetailModalResponsive 2026-07-19-12:00:
+  FN-8396 mirrors Task Detail's direct and wrapped SVG structures so Blink can
+  prove the scoped row rule normalizes ProviderIcon alongside the CSS-only
+  Oversight Eye/EyeOff contract at every responsive breakpoint.
+  */
+  const taskDetailInlineRowFixtures = [
+    ["full", true, true],
+    ["without-github", false, true],
+    ["without-oversight", true, false],
+    ["without-optionals", false, false],
+  ].map(([variant, includeGithub, includeOversight]) => `
+    <section data-smoke="task-detail-inline-row-${variant}" aria-label="Task Detail inline action ${variant} fixture">
+      <div class="detail-meta-inline-controls" data-testid="detail-meta-inline-controls">
+        <button class="btn btn-icon btn-sm" data-testid="detail-inline-attach" type="button" aria-label="Attach file"><svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8"/></svg></button>
+        ${includeGithub ? '<button class="btn btn-icon btn-sm" data-testid="detail-inline-github-toggle" type="button" aria-label="Toggle GitHub tracking"><span class="provider-icon"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 8h12"/></svg></span></button>' : ""}
+        ${includeOversight ? '<button class="btn btn-icon btn-sm detail-oversight-menu-trigger" data-testid="detail-oversight-menu-trigger" type="button" aria-label="Oversight actions"><svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12Z"/></svg></button>' : ""}
+        <div class="detail-priority-picker"><button class="btn btn-icon btn-sm" data-testid="detail-priority-trigger" type="button" aria-label="Priority: Normal"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7h10"/></svg></button></div>
+        <button class="btn btn-icon btn-sm detail-execution-mode-toggle" data-testid="detail-execution-mode-toggle" type="button" aria-label="Execution mode: fast"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M7 2v10"/></svg></button>
+      </div>
+    </section>
+  `).join("");
+
+  /*
+  FNXC:MailboxMobile 2026-07-19-17:00:
+  FN-8407 requires a real-browser 320px regression surface because jsdom cannot
+  measure the shared ViewHeader flex geometry. Exercise the unread Inbox's tightest
+  badge + Compose + Mark all read + Refresh row and both Compose + Refresh-only states.
+  */
+  const mailboxMobileHeaderFixtures = [
+    ["unread-inbox", '<span class="mailbox-unread-badge">9</span><button class="btn btn-sm btn-primary" data-testid="mailbox-header-compose" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2h10v10H2z"/></svg><span>Compose</span></button><button class="btn btn-sm btn-secondary" data-testid="mailbox-mark-all-read" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7l3 3 7-7"/></svg><span>Mark all read</span></button><button class="btn-icon" data-testid="mailbox-refresh" type="button" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7a5 5 0 1 0 2-4"/></svg></button>'],
+    ["read-inbox", '<button class="btn btn-sm btn-primary" data-testid="mailbox-header-compose" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2h10v10H2z"/></svg><span>Compose</span></button><button class="btn-icon" data-testid="mailbox-refresh" type="button" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7a5 5 0 1 0 2-4"/></svg></button>'],
+    ["non-inbox", '<button class="btn btn-sm btn-primary" data-testid="mailbox-header-compose" type="button"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 2h10v10H2z"/></svg><span>Compose</span></button><button class="btn-icon" data-testid="mailbox-refresh" type="button" aria-label="Refresh"><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7a5 5 0 1 0 2-4"/></svg></button>'],
+  ].map(([state, actions]) => `
+    <section class="mailbox-view mailbox-view--mobile" data-smoke="mailbox-mobile-header-${state}" style="width: 100%; max-width: 20rem;">
+      <header class="view-header">
+        <h2 class="view-header__title"><svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 3h16v14H2z"/></svg><span>Mailbox</span></h2>
+        <div class="view-header__actions">${actions}</div>
+      </header>
+    </section>
+  `).join("");
+
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -190,6 +275,18 @@ export function createSmokeHtml() {
           </div>
         </section>
       </main>
+
+      <section data-smoke="quick-add-save-fixtures" aria-label="Quick Add localized Save layout fixtures">
+        ${quickAddComposerFixtures}
+      </section>
+
+      <section data-smoke="task-detail-inline-row-fixtures" aria-label="Task Detail inline action layout fixtures">
+        ${taskDetailInlineRowFixtures}
+      </section>
+
+      <section data-smoke="mailbox-mobile-header-fixtures" aria-label="Mailbox mobile header layout fixtures">
+        ${mailboxMobileHeaderFixtures}
+      </section>
 
       <footer class="executor-status-bar">
         <div class="executor-status-bar__segment">
@@ -1065,13 +1162,157 @@ async function runSmokeChecks(page, pageUrl) {
     JSON.stringify(mobileCommandCenterChartsLayout),
   );
 
+  const collectQuickAddSaveLayout = () => evaluate(page, `(() => {
+    const fixtures = [...document.querySelectorAll('[data-smoke^="quick-add-save-"][data-smoke*="-minimum-"], [data-smoke^="quick-add-save-"][data-smoke*="-wide-"]')];
+    return fixtures.map((fixture) => {
+      const save = fixture.querySelector('[data-smoke="quick-add-save-button"]');
+      const row = fixture.querySelector('[data-smoke="quick-add-save-row"]');
+      const composer = fixture.querySelector('[data-smoke$="-composer"]');
+      const rect = save.getBoundingClientRect();
+      return {
+        fixture: fixture.dataset.smoke,
+        locale: save.dataset.locale,
+        label: save.textContent.trim(),
+        saveWidth: rect.width,
+        saveOverflow: save.scrollWidth - save.clientWidth,
+        rowOverflow: row.scrollWidth - row.clientWidth,
+        composerOverflow: composer.scrollWidth - composer.clientWidth,
+        saveRight: rect.right,
+        composerRight: composer.getBoundingClientRect().right,
+      };
+    });
+  })()`);
+
+  const collectTaskDetailInlineIconSizes = () => evaluate(page, `(() => {
+    return [...document.querySelectorAll('section[data-smoke^="task-detail-inline-row-"]:not([data-smoke="task-detail-inline-row-fixtures"])')].map((fixture) => {
+      const row = fixture.querySelector('.detail-meta-inline-controls');
+      const icons = [...row.querySelectorAll('svg')].map((svg) => {
+        const style = getComputedStyle(svg);
+        return { width: style.width, height: style.height };
+      });
+      return {
+        fixture: fixture.dataset.smoke,
+        rowOverflow: row.scrollWidth - row.clientWidth,
+        icons,
+      };
+    });
+  })()`);
+
+  /*
+  FNXC:TaskDetailModalResponsive 2026-07-19-12:00:
+  Visible SVG dimensions are a browser-only invariant: every optional-control
+  variant must measure the compact token at mobile, tablet, and desktop, rather
+  than relying on CSS-source parsing or a tablet-only regression check.
+  */
+  for (const [name, width, height, deviceScaleFactor, mobile] of [
+    ["mobile", 390, 844, 2, true],
+    ["tablet", 900, 900, 1, false],
+    ["desktop", 1440, 900, 1, false],
+  ]) {
+    await page.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor, mobile });
+    await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+    const taskDetailIconSizes = await collectTaskDetailInlineIconSizes();
+    assertSmokeResult(
+      `Task Detail inline action icons are uniformly 14px at ${name}`,
+      taskDetailIconSizes.length === 4
+        && taskDetailIconSizes.every((fixture) => fixture.rowOverflow <= 1
+          && fixture.icons.length >= 3
+          && fixture.icons.every((icon) => icon.width === "14px" && icon.height === "14px")
+          && new Set(fixture.icons.map((icon) => `${icon.width}×${icon.height}`)).size === 1),
+      JSON.stringify(taskDetailIconSizes),
+    );
+  }
+
   await page.send("Emulation.setDeviceMetricsOverride", {
-    width: 1280,
+    width: 320,
+    height: 844,
+    deviceScaleFactor: 2,
+    mobile: true,
+  });
+  await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+  const mailboxMobileHeaderLayout = await evaluate(page, `(() => {
+    return [...document.querySelectorAll('[data-smoke^="mailbox-mobile-header-"]:not([data-smoke="mailbox-mobile-header-fixtures"])')].map((fixture) => {
+      const header = fixture.querySelector('.view-header').getBoundingClientRect();
+      const title = fixture.querySelector('.view-header__title').getBoundingClientRect();
+      const titleLabel = fixture.querySelector('.view-header__title span').getBoundingClientRect();
+      const actions = fixture.querySelector('.view-header__actions').getBoundingClientRect();
+      return {
+        state: fixture.dataset.smoke,
+        documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+        headerLeft: header.left,
+        headerRight: header.right,
+        headerOverflow: fixture.scrollWidth - fixture.clientWidth,
+        titleLeft: title.left,
+        titleTop: title.top,
+        titleBottom: title.bottom,
+        titleLabelWidth: titleLabel.width,
+        actionsLeft: actions.left,
+        actionsRight: actions.right,
+        actionsTop: actions.top,
+        actionsBottom: actions.bottom,
+        actionsHeight: actions.height,
+      };
+    });
+  })()`);
+  assertSmokeResult(
+    "Mailbox mobile headers keep title and actions inline at 320px",
+    mailboxMobileHeaderLayout.length === 3
+      && mailboxMobileHeaderLayout.every((layout) => layout.documentOverflow <= 1
+        && layout.headerOverflow <= 1
+        && layout.actionsLeft > layout.titleLeft
+        && layout.actionsRight <= layout.headerRight + 1
+        && Math.abs(layout.titleTop - layout.actionsTop) <= layout.actionsHeight
+        && layout.actionsTop < layout.titleBottom)
+      && mailboxMobileHeaderLayout.find((layout) => layout.state === "mailbox-mobile-header-unread-inbox")?.titleLabelWidth > 0,
+    JSON.stringify(mailboxMobileHeaderLayout),
+  );
+
+  await page.send("Emulation.setDeviceMetricsOverride", {
+    width: 412,
+    height: 915,
+    deviceScaleFactor: 2,
+    mobile: true,
+  });
+  await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+  const mobileQuickAddSaveLayout = await collectQuickAddSaveLayout();
+  const frenchMobileWidth = mobileQuickAddSaveLayout.find((layout) => layout.fixture === "quick-add-save-board-minimum-fr")?.saveWidth;
+  const widestMobileWidth = Math.max(...mobileQuickAddSaveLayout
+    .filter((layout) => layout.fixture.includes("-minimum-"))
+    .map((layout) => layout.saveWidth));
+  assertSmokeResult(
+    "Quick Add localized Save labels fit at the 300px supported minimum on mobile",
+    frenchMobileWidth === widestMobileWidth
+      && mobileQuickAddSaveLayout.length === 24
+      && mobileQuickAddSaveLayout.every((layout) => layout.saveOverflow <= 1
+        && layout.rowOverflow <= 1
+        && layout.composerOverflow <= 1
+        && layout.saveRight <= layout.composerRight + 1),
+    JSON.stringify(mobileQuickAddSaveLayout),
+  );
+
+  await page.send("Emulation.setDeviceMetricsOverride", {
+    width: 1400,
     height: 900,
     deviceScaleFactor: 1,
     mobile: false,
   });
   await evaluate(page, "document.fonts ? document.fonts.ready.then(() => true) : true");
+  const desktopQuickAddSaveLayout = await collectQuickAddSaveLayout();
+  const frenchDesktopWidth = desktopQuickAddSaveLayout.find((layout) => layout.fixture === "quick-add-save-board-minimum-fr")?.saveWidth;
+  const widestDesktopWidth = Math.max(...desktopQuickAddSaveLayout
+    .filter((layout) => layout.fixture.includes("-minimum-"))
+    .map((layout) => layout.saveWidth));
+  assertSmokeResult(
+    "Quick Add localized Save labels fit at the 300px supported minimum on desktop",
+    frenchDesktopWidth === widestDesktopWidth
+      && desktopQuickAddSaveLayout.length === 24
+      && desktopQuickAddSaveLayout.every((layout) => layout.saveOverflow <= 1
+        && layout.rowOverflow <= 1
+        && layout.composerOverflow <= 1
+        && layout.saveRight <= layout.composerRight + 1),
+    JSON.stringify(desktopQuickAddSaveLayout),
+  );
+  log(`Quick Add Save intrinsic widths at the 300px minimum: mobile French=${frenchMobileWidth}px, desktop French=${frenchDesktopWidth}px.`);
   const desktopCommandCenterChartsLayout = await collectCommandCenterChartLayout(page);
   assertSmokeResult(
     "command-center charts desktop layout",

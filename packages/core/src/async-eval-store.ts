@@ -18,16 +18,17 @@
  *   flip. These helpers are the async target the PostgreSQL integration tests
  *   consume.
  */
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import * as schema from "./postgres/schema/index.js";
 import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
-import { EvalLifecycleError } from "./eval-store.js";
+import { EvalLifecycleError, applyEvalRunUpdate } from "./eval-store.js";
 import type {
   EvalRun,
   EvalRunCreateInput,
   EvalRunListOptions,
   EvalRunStatus,
+  EvalRunUpdateInput,
   EvalTaskResult,
   EvalTaskResultCreateInput,
   EvalTaskResultListOptions,
@@ -54,7 +55,8 @@ type QueryHandle = AsyncDataLayer["db"] | DbTransaction;
 function rowToRun(row: Record<string, unknown>): EvalRun {
   return {
     id: String(row.id),
-    projectId: String(row.projectId),
+    // FNXC:MultiProjectIsolation 2026-07-15-23:40: the domain projectId now maps to owner_project_id; project_id is the trigger/GUC-owned RLS partition (migration 0011).
+    projectId: String(row.ownerProjectId ?? ""),
     status: row.status as EvalRunStatus,
     trigger: row.trigger as EvalRun["trigger"],
     scope: String(row.scope),
@@ -122,7 +124,8 @@ export async function createEvalRun(
 ): Promise<EvalRun> {
   await handle.insert(schema.project.evalRuns).values({
     id: run.id,
-    projectId: run.projectId,
+    // FNXC:MultiProjectIsolation 2026-07-15-23:40: write the caller's domain project to owner_project_id and never project_id — domain writes into the partition desynced parent/child partitions and broke composite FKs (23503).
+    ownerProjectId: run.projectId,
     status: "pending",
     trigger: run.trigger,
     scope: run.scope,
@@ -143,7 +146,7 @@ export async function createEvalRun(
   });
   return rowToRun({
     id: run.id,
-    projectId: run.projectId,
+    ownerProjectId: run.projectId,
     status: "pending",
     trigger: run.trigger,
     scope: run.scope,
@@ -180,19 +183,20 @@ export async function getEvalRun(handle: QueryHandle, id: string): Promise<EvalR
  */
 export async function listEvalRuns(handle: QueryHandle, options: EvalRunListOptions = {}): Promise<EvalRun[]> {
   const conditions: ReturnType<typeof eq>[] = [];
-  if (options.projectId) conditions.push(eq(schema.project.evalRuns.projectId, options.projectId));
+  if (options.projectId) conditions.push(eq(schema.project.evalRuns.ownerProjectId, options.projectId));
   if (options.status) conditions.push(eq(schema.project.evalRuns.status, options.status));
   if (options.trigger) conditions.push(eq(schema.project.evalRuns.trigger, options.trigger));
-  const query = handle
+  let query = handle
     .select()
     .from(schema.project.evalRuns)
-    .orderBy(asc(schema.project.evalRuns.createdAt), asc(schema.project.evalRuns.id));
-  const rows = conditions.length > 0
-    ? await query.where(and(...conditions))
-    : await query;
-  const limited = options.limit !== undefined ? rows.slice(0, options.limit) : rows;
-  const offsetted = options.offset !== undefined ? limited.slice(options.offset) : limited;
-  return offsetted.map(rowToRun);
+    .$dynamic();
+  if (conditions.length > 0) query = query.where(and(...conditions));
+  query = options.order === "desc"
+    ? query.orderBy(desc(schema.project.evalRuns.createdAt), desc(schema.project.evalRuns.id))
+    : query.orderBy(asc(schema.project.evalRuns.createdAt), asc(schema.project.evalRuns.id));
+  if (options.offset !== undefined) query = query.offset(options.offset);
+  if (options.limit !== undefined) query = query.limit(options.limit);
+  return (await query).map(rowToRun);
 }
 
 /**
@@ -230,9 +234,22 @@ export async function upsertEvalTaskResult(
   handle: QueryHandle,
   result: EvalTaskResult,
 ): Promise<void> {
+  // FNXC:MultiProjectIsolation 2026-07-16-08:05: children inherit the parent run's
+  // project_id partition explicitly. The GUC-driven trigger only covers bound sessions;
+  // unbound/bypass handles (tests, admin, maintenance) or a GUC naming another partition
+  // would otherwise violate the composite (project_id, run_id) FK with SQLSTATE 23503.
+  // Inherit the PARTITION column (projectId), never the domain field (ownerProjectId).
+  const runRows = await handle
+    .select({ projectId: schema.project.evalRuns.projectId })
+    .from(schema.project.evalRuns)
+    .where(eq(schema.project.evalRuns.id, result.runId))
+    .limit(1);
+  const parentProjectId = runRows[0]?.projectId;
+  if (!parentProjectId) throw new Error(`Eval run not found: ${result.runId}`);
   await handle
     .insert(schema.project.evalTaskResults)
     .values({
+      projectId: parentProjectId,
       id: result.id,
       runId: result.runId,
       taskId: result.taskId,
@@ -253,7 +270,11 @@ export async function upsertEvalTaskResult(
       updatedAt: result.updatedAt,
     })
     .onConflictDoUpdate({
-      target: [schema.project.evalTaskResults.runId, schema.project.evalTaskResults.taskId],
+      target: [
+        schema.project.evalTaskResults.projectId,
+        schema.project.evalTaskResults.runId,
+        schema.project.evalTaskResults.taskId,
+      ],
       set: {
         taskSnapshot: result.taskSnapshot,
         status: result.status,
@@ -332,6 +353,16 @@ export async function appendEvalRunEvent(
   input: { id: string; runId: string; type: string; message: string; status?: EvalRunStatus; taskId?: string; metadata?: Record<string, unknown> },
 ): Promise<EvalRunEvent> {
   return layer.transactionImmediate(async (tx) => {
+    // FNXC:MultiProjectIsolation 2026-07-16-08:05: inherit the parent run's project_id
+    // partition explicitly (see upsertEvalTaskResult) — the ambient GUC is not guaranteed
+    // to match for unbound/bypass handles, and a mismatch breaks the composite parent FK.
+    const runRows = await tx
+      .select({ projectId: schema.project.evalRuns.projectId })
+      .from(schema.project.evalRuns)
+      .where(eq(schema.project.evalRuns.id, input.runId))
+      .limit(1);
+    const parentProjectId = runRows[0]?.projectId;
+    if (!parentProjectId) throw new Error(`Eval run not found: ${input.runId}`);
     const seqRows = await tx
       .select({ maxSeq: sql<number | null>`max(${schema.project.evalRunEvents.seq})` })
       .from(schema.project.evalRunEvents)
@@ -339,6 +370,7 @@ export async function appendEvalRunEvent(
     const seq = (seqRows[0]?.maxSeq ?? 0) + 1;
     const createdAt = new Date().toISOString();
     await tx.insert(schema.project.evalRunEvents).values({
+      projectId: parentProjectId,
       id: input.id,
       runId: input.runId,
       seq,
@@ -428,6 +460,23 @@ export class AsyncEvalStore {
       updatedAt: now,
     });
     return run;
+  }
+
+  /*
+  FNXC:ScheduledEvalsPostgres 2026-07-14-01:41:
+  PostgreSQL scheduled batches require one serialized lifecycle mutation per run. Hold a transaction-scoped run lock across the authoritative read, applyEvalRunUpdate validation, and persistence so concurrent terminal transitions cannot both validate a stale active row and the later writer cannot overwrite the committed terminal state. Preserve terminal immutability, transition validation, nullable clears, and metadata/provenance merge semantics through the shared helper.
+  */
+  async updateRun(id: string, input: EvalRunUpdateInput): Promise<EvalRun | undefined> {
+    return this.layer.transactionImmediate(async (tx) => {
+      await tx.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${`fusion:eval-run-update:${id}`}, 0))`,
+      );
+      const existing = await getEvalRun(tx, id);
+      if (!existing) return undefined;
+      const updated = applyEvalRunUpdate(existing, input);
+      await persistEvalRun(tx, updated);
+      return updated;
+    });
   }
 
   async getTaskResult(id: string): Promise<EvalTaskResult | undefined> {

@@ -91,7 +91,16 @@ export class DesktopLocalServerManager {
        * FNXC:DesktopRuntime 2026-06-20-23:39:
        * This legacy desktop local server path still needs to launch project engines so every embedded desktop server follows the same executable-by-default contract.
        */
-      const centralCore = new CentralCore();
+      /*
+       * FNXC:DesktopHostBootstrap 2026-07-19-23:40:
+       * DesktopLocalServerManager shares the backend boot's unscoped host layer with CentralCore.
+       * Global Room policy and capacity cannot read through the root project's partition, and this
+       * consumer never closes the shared pool; backendBoot.shutdown remains its sole owner.
+       */
+      const centralCore = new CentralCore(
+        undefined,
+        backendBoot ? { asyncLayer: backendBoot.hostAsyncLayer } : undefined,
+      );
       const engineManager = new ProjectEngineManager(centralCore);
       const providerSeeding: { dispose?: () => void } = {};
       cleanup = async () => {

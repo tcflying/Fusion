@@ -27,10 +27,18 @@ import type {
   MessageStore,
   Settings,
   TaskStore,
+  PermanentAgentGatingContext,
 } from "@fusion/core";
-import type { SkillSelectionContext } from "@fusion/engine";
-import { summarizeTitle, FUSION_RUNTIME_SELF_AWARENESS } from "@fusion/core";
+import type { AgentActionGateContext, SkillSelectionContext } from "@fusion/engine";
+import {
+  ApprovalRequestStore,
+  isEphemeralAgent,
+  resolveEffectiveAgentPermissionPolicy,
+  summarizeTitle,
+  FUSION_RUNTIME_SELF_AWARENESS,
+} from "@fusion/core";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join, resolve, relative } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -56,9 +64,25 @@ import {
   createAskQuestionTool,
   createChatArtifactTools,
   createChatTaskDocumentTools,
+  createChatTaskLogsReadTool,
   createWorkflowAuthoringTools,
+  createTaskCreateTool,
+  createTaskListTool,
+  createTaskShowTool,
+  createTaskSearchTool,
+  createListAgentsTool,
+  createDelegateTaskTool,
+  createTaskAssignTool,
+  createGetAgentConfigTool,
+  createWebFetchTool,
+  createGoalRetrievalTools,
+  createMissionTools,
+  createIdeationTools,
+  createMemoryTools,
+  createResearchTools,
   resolveMcpServersForStore,
   resolveExecutorThinkingLevel,
+  wrapToolsWithActionGate,
 } from "@fusion/engine";
 import * as engineModule from "@fusion/engine";
 
@@ -216,10 +240,13 @@ async function ensureEngineReady(): Promise<void> {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-/** Chat system prompt for the AI agent */
+/**
+ * FNXC:DashboardChat 2026-07-15-00:00:
+ * FN-7984 keeps the live checkout's branch sticky because chat commands run in the user's project directory. Agents may inspect Git state, but must not switch branches unless the user explicitly requests it.
+ */
 export const CHAT_SYSTEM_PROMPT = `${FUSION_RUNTIME_SELF_AWARENESS}
 
-You are a helpful AI assistant integrated into the fn task board system. You help users with questions about their project, code, architecture, and tasks. You have access to project files and can read them to provide informed responses, including referencing specific file paths and line numbers when possible. Response length policy: default to a short, crisp reply (a few sentences or a short bulleted list) that directly answers the user; avoid preamble, restating the question, and filler. If a thorough answer genuinely needs long-form content (for example multi-step plans, design proposals, deep analyses, or long file excerpts), keep the chat reply brief with a one- or two-sentence summary and then send the full write-up via \`fn_send_message\` using \`type: "agent-to-user"\` and \`to_id: "dashboard"\`. That mailbox follow-up must add new substantive detail and must not duplicate the chat reply.`;
+You are a helpful AI assistant integrated into the fn task board system. You help users with questions about their project, code, architecture, and tasks. You have coding workspace tools on the project checkout: \`read\`, \`write\`, \`edit\`, \`bash\`, \`grep\`, \`find\`, and \`ls\`. Use \`write\`, \`edit\`, and \`bash\` for user-requested code changes, file edits, or shell investigation; prefer minimal, user-directed mutations and respect any pending-approval or blocked tool result. Do not claim that you only have read access. Do not change the branch the working directory is checked out on: do not run \`git checkout <branch>\` or \`git switch <branch>\` to a different branch unless the user explicitly asks. Read-only Git and branch inspection, such as \`git status\`, \`git branch\`, and \`git log\`, is allowed. Response length policy: default to a short, crisp reply (a few sentences or a short bulleted list) that directly answers the user; avoid preamble, restating the question, and filler. If a thorough answer genuinely needs long-form content (for example multi-step plans, design proposals, deep analyses, or long file excerpts), keep the chat reply brief with a one- or two-sentence summary and then send the full write-up via \`fn_send_message\` using \`type: "agent-to-user"\` and \`to_id: "dashboard"\`. That mailbox follow-up must add new substantive detail and must not duplicate the chat reply.`;
 
 export const CHAT_AGENT_MESSAGE_ROUTING_GUIDANCE = `## Messaging Semantics\n\nYour chat reply is the primary response to the user. Do not also call \`fn_send_message\` with the same content just to mirror your chat response into mailbox.\n\nUse \`fn_send_message\` only when either (a) the user explicitly asks for mailbox/inbox/notification delivery (for example: "send me this in mail", "ntfy me when…", or "leave me a note in my inbox"), or (b) you are sending a genuinely longer follow-up that did not fit in a short chat reply. In either case, send with \`type: "agent-to-user"\` and target the dashboard user alias (\`to_id: "dashboard"\` is preferred), and ensure the mailbox message is additive rather than a duplicate of the chat reply. Never route that as a user/CLI → agent message.`;
 
@@ -241,6 +268,12 @@ const MAX_MESSAGES_PER_IP_PER_MINUTE = 30;
 /** Maximum file size for # mentions (50KB). Files larger than this are skipped. */
 const MAX_REFERENCED_FILE_SIZE = 50 * 1024;
 export const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
+
+/*
+FNXC:ChatCodingTools 2026-07-19-00:00:
+Dashboard Chat sessions intentionally use the project-root coding workspace builtins so direct, room, and task-detail planner Chat can read, write, edit, and investigate with bash. Keep this shared mode unfiltered: permanent-agent action gates still enforce file-write and command-execution policy when a durable agent is bound, while task-planner Chat reaches the same direct-chat session path.
+*/
+const CHAT_CODING_TOOLS = "coding" as const;
 const ROOM_AMBIENT_MAX_RESPONDERS = 5;
 
 type ChatSessionStatsLike = { tokens?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number } };
@@ -324,6 +357,204 @@ function createChatWorkflowAuthoringTools(taskStore: TaskStore | undefined, proj
   */
   return createWorkflowAuthoringTools(taskStore, "", { stripApprovalFlags: true })
     .map((tool) => wrapWorkflowMutationTool(tool, projectId));
+}
+
+export interface ChatFusionToolsetOptions {
+  taskStore?: TaskStore;
+  agentStore?: AgentStore;
+  rootDir: string;
+  agentId?: string;
+  /** True only when the session has both policy gate contexts for its bound agent. */
+  missionMutationGated?: boolean;
+  /** Required for command-execution requests; status remains safely readable without it. */
+  actionGateContext?: AgentActionGateContext;
+}
+
+const CHAT_MISSION_READ_TOOL_NAMES = new Set(["fn_mission_list", "fn_mission_show"]);
+const CHAT_IDEATION_READ_TOOL_NAMES = new Set(["fn_ideation_list", "fn_ideation_show"]);
+
+async function createChatMissionGateContexts(
+  taskStore: TaskStore | undefined,
+  agentStore: AgentStore | undefined,
+  agent: Agent | null,
+): Promise<Pick<ChatFusionToolsetOptions, "missionMutationGated"> & Pick<import("@fusion/engine").AgentRuntimeOptions, "actionGateContext" | "permanentAgentGating">> {
+  if (!taskStore || !agentStore || !agent || isEphemeralAgent(agent)) {
+    return { missionMutationGated: false };
+  }
+
+  // Lightweight dashboard/test stores may provide hierarchy reads without the PostgreSQL approval layer.
+  const asyncLayer = typeof taskStore.getAsyncLayer === "function" ? taskStore.getAsyncLayer() : undefined;
+  if (!asyncLayer) {
+    return { missionMutationGated: false };
+  }
+
+  const settings = await taskStore.getSettings();
+  const permissionPolicy = resolveEffectiveAgentPermissionPolicy(
+    agent.permissionPolicy,
+    settings.defaultAgentPermissionPolicy,
+  );
+  const approvalStore = new ApprovalRequestStore(null, { asyncLayer });
+  const requester = { actorId: agent.id, actorType: "agent" as const, actorName: agent.name };
+  const createApprovalRequest: AgentActionGateContext["createApprovalRequest"] = async (decision, args) => await approvalStore.create({
+    requester,
+    targetAction: {
+      category: decision.category === "exempt" ? "command_execution" : decision.category,
+      action: decision.operation,
+      summary: decision.summary,
+      resourceType: decision.resourceType,
+      resourceId: decision.resourceId ?? "",
+      context: { ...decision.metadata, approvalDedupeKey: decision.approvalDedupeKey, toolName: decision.toolName, toolArgs: args },
+    },
+  });
+
+  /*
+  FNXC:ChatMissionGating 2026-07-29-15:30:
+  Bound permanent-agent chat sessions must carry the same action and permanent-agent
+  gate contexts as executor lanes. Unbound or ephemeral chat has no durable principal
+  or approval store, so it exposes only positively read-only Mission tools.
+  */
+  const actionGateContext: AgentActionGateContext = {
+    agentId: agent.id,
+    agentName: agent.name,
+    isEphemeral: false,
+    permissionPolicy,
+    createApprovalRequest,
+    findApprovalByDedupeKey: async (dedupeKey) => {
+      const latest = await approvalStore.findLatestByDedupeKey({ requesterActorId: agent.id, dedupeKey });
+      return latest ? { id: latest.id, status: latest.status } : null;
+    },
+    pauseForApproval: async () => {
+      await agentStore.updateAgentState(agent.id, "paused");
+      await agentStore.updateAgent(agent.id, { pauseReason: "awaiting-approval" });
+    },
+    markApprovalCompleted: async (approvalRequestId) => {
+      await approvalStore.markCompleted(approvalRequestId, { actor: requester, note: "Tool executed after approval" });
+    },
+  };
+  const permanentAgentGating: PermanentAgentGatingContext = {
+    permissionPolicy,
+    requester,
+    createApprovalRequest: async ({ category, toolName, args, approvalDedupeKey }) => await approvalStore.create({
+      requester,
+      targetAction: {
+        category,
+        action: toolName,
+        summary: `Agent gated action for ${toolName}`,
+        resourceType: "tool",
+        resourceId: toolName,
+        context: { toolName, toolArgs: args, source: "agent-gating", ...(approvalDedupeKey ? { approvalDedupeKey } : {}) },
+      },
+    }),
+    findPendingApprovalRequest: async (dedupeKey) => {
+      const pending = await approvalStore.list({ status: "pending", requesterActorId: agent.id, limit: 100 });
+      return pending.find((request) => request.targetAction.context?.approvalDedupeKey === dedupeKey) ?? null;
+    },
+  };
+
+  return { missionMutationGated: true, actionGateContext, permanentAgentGating };
+}
+
+/*
+FNXC:ChatAgentTools 2026-07-15-00:00:
+Chat agents, including Grok CLI sessions reached through the plugin MCP bridge,
+must receive one safe coordination/productivity toolset in both model-loop and
+room-responder lanes. Workflow, document, artifact, messaging, and task-planner
+tools stay additive at their call sites; unbound chat retains only read-only Mission
+tools because it has no durable action-gate principal.
+*/
+/*
+FNXC:TaskVerificationRequest 2026-07-30-00:00:
+Chat records an allowlisted profile only. It deliberately has no shell runner: the
+executor claims this record on its existing task worktree under the shared slot.
+*/
+function createTaskVerificationTools(taskStore: TaskStore, actionGateContext?: AgentActionGateContext): ChatCustomTool[] {
+  const profiles = new Set(["verify:fast", "test-command"]);
+  const request = {
+    name: "fn_task_request_verification", label: "Request Task Verification",
+    description: "Queue an allowlisted verification profile for an in-progress task with a live executor worktree. This only records a request; chat never runs a command.",
+    parameters: { type: "object", properties: { task_id: { type: "string" }, profile: { type: "string", enum: ["verify:fast", "test-command"] } }, required: ["task_id"], additionalProperties: false },
+    execute: async (_id: string, raw: { task_id?: unknown; profile?: unknown }) => {
+      const taskId = typeof raw.task_id === "string" ? raw.task_id.trim() : "";
+      const profile = typeof raw.profile === "string" ? raw.profile : "verify:fast";
+      if (!taskId || !profiles.has(profile)) return { content: [{ type: "text" as const, text: "ERROR: task_id and an allowlisted profile are required; raw commands are not accepted." }], isError: true, details: {} };
+      const task = await taskStore.getTask(taskId);
+      if (!task || task.column !== "in-progress" || !task.worktree || !existsSync(task.worktree)) return { content: [{ type: "text" as const, text: "ERROR: verification requires an in-progress task with a live executor worktree." }], isError: true, details: {} };
+      const settings = await taskStore.getSettings();
+      const command = profile === "verify:fast" ? "pnpm verify:fast" : typeof settings.testCommand === "string" ? settings.testCommand : "";
+      if (!command) return { content: [{ type: "text" as const, text: "ERROR: the selected verification profile is not configured." }], isError: true, details: {} };
+      const created = await taskStore.createTaskVerificationRequest({ taskId, requestId: randomUUID(), profile: profile as "verify:fast" | "test-command", command, scope: "workspace", requestedBy: "chat" });
+      if (created.inFlightRequestId) return { content: [{ type: "text" as const, text: `ERROR: verification request ${created.inFlightRequestId} is already in flight.` }], isError: true, details: created };
+      return { content: [{ type: "text" as const, text: `Queued verification request ${created.request!.requestId} for ${taskId}.` }], details: created.request };
+    },
+  } as ChatCustomTool;
+  const status = {
+    name: "fn_task_verification_status", label: "Get Task Verification Status", description: "Read the latest persisted task verification request and bounded result.",
+    parameters: { type: "object", properties: { task_id: { type: "string" } }, required: ["task_id"], additionalProperties: false },
+    execute: async (_id: string, raw: { task_id?: unknown }) => {
+      const taskId = typeof raw.task_id === "string" ? raw.task_id.trim() : "";
+      if (!taskId) return { content: [{ type: "text" as const, text: "ERROR: task_id is required." }], isError: true, details: {} };
+      const record = await taskStore.getTaskVerificationRequestAsync(taskId);
+      return { content: [{ type: "text" as const, text: record ? JSON.stringify(record) : `No verification request exists for ${taskId}.` }], details: record ?? {} };
+    },
+  } as ChatCustomTool;
+  /*
+  FNXC:TaskVerificationRequest 2026-07-30-17:40:
+  A chat verification request is command_execution even though this closure only
+  persists a queue row. Apply the engine's action-gate at this server boundary
+  before persistence; sessions without a durable principal may read status but
+  must not enqueue executor-owned subprocess work.
+  */
+  return [
+    ...(actionGateContext ? wrapToolsWithActionGate([request], actionGateContext) as ChatCustomTool[] : []),
+    status,
+  ];
+}
+
+export async function createChatFusionToolset(options: ChatFusionToolsetOptions): Promise<ChatCustomTool[]> {
+  const { taskStore, agentStore, rootDir, agentId, missionMutationGated = false } = options;
+  const tools: ChatCustomTool[] = [];
+
+  if (taskStore) {
+    const settings = await taskStore.getSettings?.();
+    tools.push(
+      createTaskListTool(taskStore),
+      createTaskShowTool(taskStore),
+      createTaskSearchTool(taskStore),
+      ...createTaskVerificationTools(taskStore, options.actionGateContext),
+      createTaskCreateTool(taskStore, { sourceType: "api" }, { rootDir }),
+      /* FNXC:ResearchMissionBridge 2026-07-18-12:00: Promotion is a mission mutation because it creates canonical roadmap work; dashboard chat exposes it only through the same permanent-agent action gate as all hierarchy writes. */
+      ...createMissionTools(taskStore).filter((tool) => missionMutationGated || CHAT_MISSION_READ_TOOL_NAMES.has(tool.name)), 
+      /* FNXC:Ideation 2026-07-30-15:30: Unbound or ephemeral chat exposes only positive ideation reads; mutations require the same durable gate context as Mission writes. */
+      ...createIdeationTools(taskStore).filter((tool) => missionMutationGated || CHAT_IDEATION_READ_TOOL_NAMES.has(tool.name)),
+      ...createGoalRetrievalTools(taskStore),
+      /* FNXC:ChatAgentTools 2026-07-15-00:00: Chat exposes memory retrieval only and respects the workspace memory-enabled setting; prompt-triggered persistent writes stay excluded without an action-gate context. */
+      ...createMemoryTools(rootDir, settings).filter((tool) => tool.name !== "fn_memory_append"),
+      ...createResearchTools({ store: taskStore, rootDir, getSettings: () => taskStore.getSettings() }),
+    );
+  }
+
+  if (agentStore) {
+    tools.push(createListAgentsTool(agentStore));
+    if (taskStore) {
+      tools.push(createDelegateTaskTool(agentStore, taskStore, { rootDir }));
+      tools.push(createTaskAssignTool(agentStore, taskStore));
+    }
+    if (agentId) {
+      tools.push(createGetAgentConfigTool(agentStore, agentId));
+    }
+  }
+
+  tools.push(createWebFetchTool());
+  return dedupeChatTools(tools);
+}
+
+export function dedupeChatTools(tools: ChatCustomTool[]): ChatCustomTool[] {
+  const names = new Set<string>();
+  return tools.filter((tool) => {
+    if (names.has(tool.name)) return false;
+    names.add(tool.name);
+    return true;
+  });
 }
 
 function createTaskPlannerMetricsTool(taskStore: TaskStore, taskId: string, getPricingOverrides: () => Promise<Settings["modelPricingOverrides"] | undefined>) {
@@ -1645,7 +1876,7 @@ export class ChatManager {
           mentions: mentions.map((mention) => mention.agentId),
         });
         if (response.tokenUsage) {
-          this.chatStore.recordTokenUsage({
+          await this.chatStore.recordTokenUsage({
             sourceKind: "room-chat",
             roomId,
             messageId: assistantMessage.id,
@@ -1787,23 +2018,36 @@ export class ChatManager {
     );
 
     const workflowTools = createChatWorkflowAuthoringTools(this.taskStore, input.roomProjectId);
+    const missionGateContexts = await createChatMissionGateContexts(this.taskStore, this.agentStore, input.responder);
+    const chatFusionTools = await createChatFusionToolset({
+      taskStore: this.taskStore,
+      agentStore: this.agentStore,
+      rootDir: this.rootDir,
+      agentId: input.responder.id,
+      missionMutationGated: missionGateContexts.missionMutationGated,
+      actionGateContext: missionGateContexts.actionGateContext,
+    });
 
     const resolvedSession = await createResolvedAgentSession({
       sessionPurpose: "heartbeat",
       pluginRunner: this.pluginRunner,
       runtimeHint: extractRuntimeHint(input.responder.runtimeConfig),
       /*
-      FNXC:ChatSkills 2026-06-16-19:13:
-      Chat-room responder sessions must request the responder agent skills plus enabled plugin skills so chat-only agent replies can use skills such as ce-debug just like heartbeat/executor lanes.
+      FNXC:ChatSkills 2026-07-20-10:30:
+      Chat-room responder sessions must request responder and enabled plugin skill names plus forward additionalSkillPaths from buildSessionSkillContextSync.
+      The pi loader cannot discover plugin SKILL.md bodies from names alone, so preserve both #2017 contract halves (FN-8443 / #2364).
 
       FNXC:ChatSkills 2026-06-17-18:16:
       Room responders share the chat slash-command contract: `/skill:{name}` is removed from the prompt text and merged into heartbeat skill selection without changing persisted room-message text.
       */
       ...(mergedRoomSkillSelection ? { skillSelection: mergedRoomSkillSelection } : {}),
+      ...(roomSkillContext.additionalSkillPaths.length > 0 ? { additionalSkillPaths: roomSkillContext.additionalSkillPaths } : {}),
       cwd: this.rootDir,
       systemPrompt,
-      tools: "coding",
-      ...(workflowTools.length > 0 ? { customTools: workflowTools } : {}),
+      tools: CHAT_CODING_TOOLS,
+      ...(workflowTools.length + chatFusionTools.length > 0
+        ? { customTools: dedupeChatTools([...workflowTools, ...chatFusionTools]) }
+        : {}),
       ...(effectiveModelProvider && effectiveModelId
         ? {
             defaultProvider: effectiveModelProvider,
@@ -1817,6 +2061,8 @@ export class ChatManager {
             fallbackModelId: chatModelSettings.fallbackModelId,
           }
         : {}),
+      ...(missionGateContexts.actionGateContext ? { actionGateContext: missionGateContexts.actionGateContext } : {}),
+      ...(missionGateContexts.permanentAgentGating ? { permanentAgentGating: missionGateContexts.permanentAgentGating } : {}),
       onFallbackModelUsed: (payload: { primaryModel: string; fallbackModel: string; triggerPoint: "session-creation" | "prompt-time" }) => {
         roomFallbackInfo = payload;
         diagnostics.warn(
@@ -1954,7 +2200,7 @@ export class ChatManager {
            * FNXC:ChatTokenAccounting 2026-07-02-00:00:
            * CLI-agent-backed chat returns before the dashboard model loop, so read the runner's per-turn telemetry snapshot here and persist it as `cli-chat`. This keeps CLI/pi chat tokens in Command Center while leaving task execution tokenUsage untouched.
            */
-          this.chatStore.recordTokenUsage({
+          await this.chatStore.recordTokenUsage({
             sourceKind: "cli-chat",
             chatSessionId: sessionId,
             messageId: usageSnapshot?.messageId ?? null,
@@ -2296,7 +2542,7 @@ export class ChatManager {
 
       const messagingTools = agent?.id && this.messageStore
         ? [
-            createSendMessageTool(this.messageStore, agent.id),
+            createSendMessageTool(this.messageStore, agent.id, { agentStore: this.agentStore }),
             createReadMessagesTool(this.messageStore, agent.id),
           ]
         : [];
@@ -2309,6 +2555,9 @@ export class ChatManager {
       */
       const documentTools = this.taskStore
         ? createChatTaskDocumentTools(this.taskStore)
+        : [];
+      const taskLogReadTools = this.taskStore
+        ? [createChatTaskLogsReadTool(this.taskStore)]
         : [];
       const artifactTools = this.taskStore
         ? createChatArtifactTools(this.taskStore, this.messageStore)
@@ -2331,12 +2580,32 @@ export class ChatManager {
         ? [createTaskPlannerRefinementTool(this.taskStore, taskPlannerChatTaskId)]
         : [];
 
-      const customTools = [createAskQuestionTool(), ...taskPlannerSteeringTools, ...taskPlannerMetricsTools, ...taskPlannerRefinementTools, ...messagingTools, ...workflowTools, ...documentTools, ...artifactTools];
+      const missionGateContexts = await createChatMissionGateContexts(this.taskStore, this.agentStore, agent);
+      const chatFusionTools = await createChatFusionToolset({
+        taskStore: this.taskStore,
+        agentStore: this.agentStore,
+        rootDir: this.rootDir,
+        agentId: agent?.id,
+        missionMutationGated: missionGateContexts.missionMutationGated,
+        actionGateContext: missionGateContexts.actionGateContext,
+      });
+      const customTools = dedupeChatTools([
+        createAskQuestionTool(),
+        ...taskPlannerSteeringTools,
+        ...taskPlannerMetricsTools,
+        ...taskPlannerRefinementTools,
+        ...messagingTools,
+        ...workflowTools,
+        ...documentTools,
+        ...taskLogReadTools,
+        ...artifactTools,
+        ...chatFusionTools,
+      ]);
 
       const sessionOptions = {
         cwd: this.rootDir,
         systemPrompt,
-        tools: "coding" as const,
+        tools: CHAT_CODING_TOOLS,
         ...(customTools.length > 0 ? { customTools } : {}),
         sessionManager,
         ...(effectiveModelProvider && effectiveModelId
@@ -2352,6 +2621,8 @@ export class ChatManager {
               fallbackModelId: chatModelSettings.fallbackModelId,
             }
           : {}),
+        ...(missionGateContexts.actionGateContext ? { actionGateContext: missionGateContexts.actionGateContext } : {}),
+        ...(missionGateContexts.permanentAgentGating ? { permanentAgentGating: missionGateContexts.permanentAgentGating } : {}),
         onFallbackModelUsed: (payload: {
           primaryModel: string;
           fallbackModel: string;
@@ -2435,10 +2706,12 @@ export class ChatManager {
         ...(agentRuntimeHint ? { runtimeHint: agentRuntimeHint } : {}),
         pluginRunner: this.pluginRunner,
         /*
-        FNXC:ChatSkills 2026-06-16-19:13:
-        Regular chat and QuickChat must request bound-agent skills plus enabled plugin skills so dashboard chat loads capabilities such as ce-debug instead of creating skill-less sessions.
+        FNXC:ChatSkills 2026-07-20-10:30:
+        Regular chat and QuickChat must request bound-agent and enabled plugin skill names plus forward additionalSkillPaths from buildSessionSkillContextSync.
+        The pi loader cannot discover plugin SKILL.md bodies from names alone, so preserve both #2017 contract halves (FN-8443 / #2364).
         */
         ...(mergedChatSkillSelection ? { skillSelection: mergedChatSkillSelection } : {}),
+        ...(chatSkillContext.additionalSkillPaths.length > 0 ? { additionalSkillPaths: chatSkillContext.additionalSkillPaths } : {}),
         // FNXC:McpConfig 2026-06-25-22:36: Dashboard chat/QuickChat reuses the scoped task store when available to resolve trusted MCP servers at session creation without persisting materialized secrets.
         ...(this.taskStore ? { mcpServers: (await resolveMcpServersForStore(this.taskStore, { agentId: agent?.id })).servers } : {}),
         ...sessionOptions,
@@ -2534,7 +2807,7 @@ export class ChatManager {
          * FNXC:ChatTokenAccounting 2026-07-02-00:00:
          * Successful dashboard chat turns persist provider-reported session stats as chat-token rows. Task-detail planner chat uses sourceKind `task-planner-chat` instead of task.tokenUsage so the planner's own model call is visible in Command Center without mutating execution totals for the task it discusses.
          */
-        this.chatStore.recordTokenUsage({
+        await this.chatStore.recordTokenUsage({
           sourceKind: taskPlannerChatTaskId ? "task-planner-chat" : "chat",
           chatSessionId: sessionId,
           messageId: assistantMessage.id,

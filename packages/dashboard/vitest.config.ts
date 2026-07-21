@@ -48,14 +48,10 @@ const qualityAppFoundationUiTests = [
   "app/__tests__/board-mobile-corner-rendering.test.ts",
   "app/__tests__/board-tablet-overflow.test.ts",
   "app/__tests__/browser-layout-smoke-fixture.test.ts",
-  "app/__tests__/chat-tool-calls-mobile-layout.test.ts",
   "app/__tests__/column-fixed-width.test.ts",
-  "app/__tests__/component-css-no-raw-rgba.test.ts",
   "app/__tests__/dashboard-component-color-tokenization.test.ts",
-  "app/__tests__/dashboard-css-token-validity.css.test.ts",
   "app/__tests__/dashboard-footer-mobile-layout.test.ts",
   "app/__tests__/detail-body-mobile-overflow.test.ts",
-  "app/__tests__/dev-server-layout-css.test.ts",
   "app/__tests__/executor-status-bar-theme.test.ts",
   "app/__tests__/footer-safe-layout.test.ts",
   "app/__tests__/git-manager-theme-styling.test.ts",
@@ -83,16 +79,13 @@ const qualityAppFoundationUiTests = [
   "app/__tests__/setup-wizard-modal-layout.test.ts",
   "app/__tests__/shell-host.test.ts",
   "app/__tests__/shell-native.test.ts",
-  "app/__tests__/spinner-animation.css.test.ts",
   "app/__tests__/sse-bus.test.ts",
-  "app/__tests__/status-colors-theme.test.ts",
   "app/__tests__/swUpdate.test.ts",
   "app/__tests__/tablet-header-controls.test.tsx",
   "app/__tests__/task-detail-modal-tablet-width.test.ts",
   "app/__tests__/terminal-input.test.ts",
   "app/__tests__/terminal-mobile-header-row.test.ts",
   "app/__tests__/terminal-mobile-keyboard-layout.test.ts",
-  "app/__tests__/text-token-canonicalization.test.ts",
   "app/__tests__/versionCheck.test.ts",
   "app/__tests__/viewport-compensation-keyboard.test.ts",
 ];
@@ -322,63 +315,42 @@ FN-6722 workspace verification observed dev-server-process time out only in the 
 FNXC:DashboardTestQuarantine 2026-06-21-12:42:
 FN-6860 rescued dev-server-process by settling stdout detection and fallback-probe lifecycle work before stop/close/failure teardown, then removed its ledger/config quarantine entry. The same loaded API shard also confirmed FN-6742's session-cross-tab rescue still holds, so its stale ledger-only entry was removed to restore lockstep.
 
+FNXC:DashboardTestQuarantine 2026-07-19-18:45:
+FN-8394 rescues dev-server-process after its second load-sensitive quarantine.
+Its injected child-process and process-tree-signal seams preserve lifecycle,
+stdout/URL, fallback-timer, failure, and restart assertions without a real shell
+child or filesystem store; keep it out of this exclude list and ledger.
+
 FNXC:DashboardTestQuarantine 2026-06-22-18:05:
 FN-6937 verified that FN-6860's claimed session-cross-tab ledger removal had not landed: the file was active because this exclude list was empty, but `test-quarantine.json` still carried the stale 2026-06-19 row. The repeated loaded `dashboard-api-quality-backfill` runs and lock-holder mutation proof confirmed FN-6742's rescue still holds, so remove the orphaned ledger row and keep this list empty to restore ledger↔config lockstep.
 
 FNXC:DashboardTestQuarantine 2026-06-25-11:15:
 The SQLite-to-PostgreSQL cutover (feature quarantine-sqlite-internals-tests) quarantines dashboard test files that exercise SQLite-only behavior. knowledge-index.test.ts asserts the knowledge_pages schema via PRAGMA table_info and sqlite_master on the SQLite store, with no PostgreSQL equivalent at this layer. Mirrored in scripts/lib/test-quarantine.json; will be DELETED when the SQLite code is removed.
 */
+/*
+FNXC:DashboardTestQuarantine 2026-07-14-07:15:
+The 16 dashboard test files quarantined on 2026-06-25 (cutover batch) were
+deleted per the AGENTS.md deletion ratchet (14 days expired, not rescued).
+Ledger entries removed from scripts/lib/test-quarantine.json in the same commit.
+The array stays empty; add new entries here only with a matching ledger row.
+
+FNXC:DashboardTestQuarantine 2026-07-16-09:00:
+FN-8077 removed routes-system.test.ts from this list and the ledger in lockstep. Its test now explicitly advances a fake Date-only clock between CPU samples, so unrelated route clock reads cannot stretch elapsed time under the loaded API lane; assertions and timeout policy are unchanged.
+*/
 const quarantinedDashboardTests: string[] = [
-  // SQLite-internals quarantine (cutover): see scripts/lib/test-quarantine.json.
   /*
-  FNXC:DashboardTestQuarantine 2026-06-25-09:50:
-  Quarantine DevServerView.mobile.test.tsx: CI full-suite shard 4/4 fails with 'expected +0 to be 1' on the mobile CSS structure assertion. Under the deletion ratchet — see scripts/lib/test-quarantine.json.
-  */
-  "app/components/__tests__/DevServerView.mobile.test.tsx",
-  // Pre-existing CSS token/lint regressions (cutover batch): see scripts/lib/test-quarantine.json.
-  // These fail on clean baseline (CSS drift, not flakes); quarantined on sight
-  // per AGENTS.md so verify:workspace goes green during the SQLite-to-PostgreSQL cutover.
-  "app/__tests__/chat-tool-calls-mobile-layout.test.ts",
-  "app/__tests__/component-css-no-raw-rgba.test.ts",
-  "app/__tests__/dashboard-css-token-validity.css.test.ts",
-  "app/__tests__/dev-server-layout-css.test.ts",
-  "app/__tests__/spinner-animation.css.test.ts",
-  "app/__tests__/status-colors-theme.test.ts",
-  "app/__tests__/text-token-canonicalization.test.ts",
-  // Pre-existing mock drift (getAsyncLayer not on mock store); quarantined on sight per AGENTS.md.
-  "app/api/__tests__/research-api.test.ts",
-  // Pre-existing mock drift (detectWorkspace / theme dropdown): quarantined on sight per AGENTS.md.
-  "app/components/__tests__/SetupWizardModal.test.tsx",
-  "app/components/command-center/__tests__/CommandCenterControls.test.tsx",
-  // Pre-existing CSS / mobile-render regressions (backfill shards, cutover batch):
-  // see scripts/lib/test-quarantine.json. All fail on clean baseline.
-  "app/__tests__/global-theme-css-no-raw-rgba.test.ts",
-  "app/components/__tests__/WorkflowNodeEditor.css.test.ts",
-  "app/components/__tests__/board-mobile-initial-render.test.tsx",
-  "app/__tests__/toast-theme-contrast.test.ts",
-  "app/components/__tests__/ProjectOverview.test.tsx",
-  /*
-  FNXC:DashboardTestQuarantine 2026-06-25-13:30:
-  The SQLite-to-PostgreSQL cutover (feature quarantine-sqlite-internals-tests, retry session)
-  applied the undefined→null coercion fix in sqlite-adapter.ts prepare() which resolved the
-  ERR_INVALID_ARG_TYPE binding failures. However, 92 dashboard API test files still fail from
-  a DIFFERENT pre-existing root cause: the async-satellite dual-path work (server.ts:924 +
-  routes/*) now calls store.getAsyncLayer() / store.isBackendMode() but these test files' mock
-  TaskStore implementations do not expose those methods (TypeError: store.getAsyncLayer is not
-  a function). Confirmed pre-existing on clean baseline (stash + rerun). Quarantined on sight
-  per AGENTS.md so verify:workspace goes green. Rescue requires updating each file's mock
-  TaskStore to expose getAsyncLayer() (return null) and isBackendMode() (return false).
-  Mirrored in scripts/lib/test-quarantine.json; will be DELETED when the SQLite code is removed.
+  FNXC:DashboardTestQuarantine 2026-07-17-16:50:
+  FN-8245 re-admits all three UI files with their ledger rows removed in lockstep.
+  QuickEntryBox restores focus from its resolved submit path while isolated jsdom
+  globals prevent cross-file focus leakage; PlanningModeModal stream doubles use
+  deterministic microtasks instead of wall-clock timers; and the oversight menu
+  focuses its first button after the opening frame, never the native select.
   */
   /*
-  FNXC:DashboardTestQuarantine 2026-07-05-17:10:
-  RESCUED: the five 2026-06-28 SQLite-cutover entries (project-store-resolver,
-  routes-planning, routes-auth, routes-automation, routes-tasks) were root-cause
-  fixed and un-quarantined: mock stores expose getAsyncLayer(), AgentStore
-  seeding was replaced with prototype spies (legacy runtime removed under
-  VAL-REMOVAL-005), the resolver test mocks the createTaskStoreForBackend seam,
-  and the manual-backup parity tests stub runBackupCommand (post-cutover it
-  pg_dumps a live cluster). Ledger entries removed in the same commit.
+  FNXC:DashboardTests 2026-07-17-22:10:
+  FN-8240 verified the 18 VAL-REMOVAL-005 dashboard API tests on their PG-backed
+  async-store or applicable mock/non-store contracts. Remove their ledger/exclude
+  pairs so dashboard-api-quality-backfill collects the restored coverage.
   */
 ];
 
@@ -426,6 +398,13 @@ const qualityAppBackfillTests = ["app/**/*.test.{ts,tsx}"];
 
 const backfillApiExclude = [
   ...qualityApiTests,
+  /*
+  FNXC:DashboardDistArtifacts 2026-07-17-15:10:
+  FN-8245 reclassified plugin-registry-dist as a curated skip-list build-only
+  assertion, not a flake. Keep this lane exclusion: test:build supplies its
+  required emitted dist artifact without making every API backfill shard build.
+  */
+  "src/__tests__/plugin-registry-dist.test.ts",
   ...skipListDashboardGlobs.filter((file) => file.startsWith("src/")),
 ];
 const qualityApiBackfillTests = ["src/**/*.test.{ts,tsx}"];
@@ -516,12 +495,19 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
+      /*
+      FNXC:GitHubImportTranslate 2026-07-15-09:30:
+      Must precede the `@fusion/core` alias: Vite string aliases match by PREFIX, so the broader key would rewrite this subpath to `index.ts/detect-content-language` and fail to resolve.
+      */
+      "@fusion/core/detect-content-language": resolve(__dirname, "../core/src/detect-content-language.ts"),
       "@fusion/core": resolve(__dirname, "../core/src/index.ts"),
       "@fusion/engine": resolve(__dirname, "../engine/src/index.ts"),
       "@fusion/plugin-sdk": resolve(__dirname, "../plugin-sdk/src/index.ts"),
       "@fusion/test-utils": resolve(__dirname, "../core/src/__test-utils__/workspace.ts"),
       "@fusion/dashboard/app/components/TaskCard": resolve(__dirname, "app/components/TaskCard.tsx"),
       "@fusion/dashboard/app/components/ViewHeader": resolve(__dirname, "app/components/ViewHeader.tsx"),
+      // FNXC:Quality 2026-07-19-12:00: Keep the Quality plugin's tokenized artifact-media bridge resolvable under host Vitest just as it is in the production dashboard bundle.
+      "@fusion/dashboard/app/api/task-content": resolve(__dirname, "app/api/task-content.ts"),
       "@fusion/dashboard/app/plugins/types": resolve(__dirname, "app/plugins/types.ts"),
       "@fusion/dashboard/app/utils/projectStorage": resolve(__dirname, "app/utils/projectStorage.ts"),
       "@fusion/dashboard/app/utils/taskStuck": resolve(__dirname, "app/utils/taskStuck.ts"),
@@ -536,6 +522,10 @@ export default defineConfig({
       "@fusion-plugin-examples/hermes-runtime": resolve(
         __dirname,
         "../../plugins/fusion-plugin-hermes-runtime/src/index.ts",
+      ),
+      "@fusion-plugin-examples/happier-runtime": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-happier-runtime/src/index.ts",
       ),
       "@fusion-plugin-examples/openclaw-runtime": resolve(
         __dirname,
@@ -560,6 +550,22 @@ export default defineConfig({
       "@fusion-plugin-examples/compound-engineering": resolve(
         __dirname,
         "../../plugins/fusion-plugin-compound-engineering/src/index.ts",
+      ),
+      "@fusion-plugin-examples/quality/dashboard-view": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-quality/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/roadmap/dashboard-view": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-roadmap/src/dashboard-view.tsx",
+      ),
+      "@fusion-plugin-examples/quality/qa-tab": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-quality/src/qa-tab.tsx",
+      ),
+      "@fusion-plugin-examples/quality": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-quality/src/index.ts",
       ),
       "@fusion-plugin-examples/linear-import/dashboard-view": resolve(
         __dirname,
@@ -592,6 +598,33 @@ export default defineConfig({
       "@fusion-plugin-examples/grok-runtime": resolve(
         __dirname,
         "../../plugins/fusion-plugin-grok-runtime/src/index.ts",
+      ),
+      /*
+      FNXC:DashboardTests 2026-07-18-09:45:
+      Alias Claude runtime to probes-entry (probe + model discovery only), not the full
+      ACP index — same class as CLI #2292. Importing index pulls @agentclientprotocol/sdk
+      and breaks dashboard-api-quality under source-checkout full-suite resolution.
+      */
+      "@fusion-plugin-examples/claude-runtime": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-claude-runtime/src/probes-entry.ts",
+      ),
+      "@fusion-plugin-examples/claude-runtime/probe": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-claude-runtime/src/probe.ts",
+      ),
+      /*
+      FNXC:OmpAcp 2026-07-11-23:35:
+      runtime-provider-probes.ts imports probeOmpBinary from @fusion-plugin-examples/omp-runtime.
+      Source aliases avoid missing dist/ on a source checkout.
+      */
+      "@fusion-plugin-examples/omp-runtime/probe": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-omp-runtime/src/probe.ts",
+      ),
+      "@fusion-plugin-examples/omp-runtime": resolve(
+        __dirname,
+        "../../plugins/fusion-plugin-omp-runtime/src/index.ts",
       ),
       "@fusion-plugin-examples/roadmap/roadmap-suggestions": resolve(
         __dirname,

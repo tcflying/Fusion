@@ -1,0 +1,20 @@
+{
+  "id": "fusion-plugin-happier-runtime",
+  "name": "Happier Runtime Plugin",
+  "version": "0.2.73",
+  "description": "Happier JSON CLI contract layer for Fusion runtime sessions",
+  "author": "Fusion Team",
+  "homepage": "https://github.com/Runfusion/Fusion",
+  "runtime": {
+    "runtimeId": "happier",
+    "name": "Happier Runtime",
+    "description": "Official Happier CLI-backed runtime session contract",
+    "version": "0.2.73"
+  },
+  "sessionConnector": {
+    "connectorId": "happier",
+    "name": "Happier Session Connector",
+    "description": "Official Happier MCP-backed connector for manually bound Sessions",
+    "version": "0.2.73"
+  }
+}

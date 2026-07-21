@@ -58,7 +58,7 @@ When `--project` is not supplied, Fusion resolves project context in this order:
 
 1. Explicit `--project` flag
 2. Default project (set via `fn project set-default <name>`)
-3. Current-directory auto-detection (`.fusion/fusion.db` lookup upward)
+3. Current-directory auto-detection (`.fusion/project.json` lookup upward; legacy `fusion.db` is recognized only for migration)
 
 ---
 
@@ -126,23 +126,34 @@ onboarding does not auto-launch.
 
 ## `fn update`
 
-Check for and install the latest `@runfusion/fusion` CLI release from npm.
+<!--
+FNXC:UpdateChannels 2026-07-19-16:20:
+User-facing update-channel contract: `--channel` persists the chosen track to the shared `updateChannel` global setting; stable resolves the npm `latest` dist-tag only while beta resolves the newer of `latest` and `beta`; switching beta → stable never downgrades and `--force` is the sole explicit downgrade path; installs always pin the exact resolved version, never a dist-tag.
+Keep this comment in sync with packages/cli/src/commands/update.ts when the contract changes.
+-->
+
+Check for and install the latest `@runfusion/fusion` CLI release from npm, on the configured release channel.
 
 ```bash
 fn update
 fn update --check
 fn update --global
 fn update --json
+fn update --channel beta      # switch to the beta track and update onto it
+fn update --channel stable    # switch back to stable (no downgrade; see --force)
+fn update --channel stable --force   # explicit downgrade onto the current stable
 fn upgrade
 ```
 
 | Option | Description |
 |---|---|
 | `--check` | Check only. Does not install. Exit code `1` when an update is available. |
-| `--global` | Explicitly install globally (`npm install -g @runfusion/fusion@latest`). This is the default behavior. |
-| `--json` | Output machine-readable status: `currentVersion`, `latestVersion`, `updateAvailable`, `updated`. |
+| `--global` | Explicitly install globally (`npm install -g @runfusion/fusion@<version>`). This is the default behavior. |
+| `--json` | Output machine-readable status: `currentVersion`, `latestVersion`, `updateAvailable`, `updated`, `channel`. |
+| `--channel <stable\|beta>` | Select the release track and persist it to global settings (`updateChannel`), shared with the dashboard and desktop updater. `stable` follows the npm `latest` dist-tag; `beta` follows the newer of `latest` and `beta`. |
+| `--force` | Install the resolved channel target even when it is not newer than the current version — the explicit beta → stable downgrade path. |
 
-`fn upgrade` is an alias for `fn update`.
+`fn upgrade` is an alias for `fn update`. Installs always pin the exact resolved version rather than a dist-tag, so a beta-channel install can never silently land on stable (or vice versa).
 
 ---
 
@@ -590,10 +601,10 @@ fn task logs FN-001 --follow --limit 50 --type tool
 - unavailable-node policy value
 - source provenance line (`Source: <origin>`), including parent task / GitHub issue URL context when present
 
-Every `fn task` subcommand that touches the board retries on lock (FN-7731,
-generalized to all subcommands in FN-7734): if the board database
-(`.fusion/fusion.db`) is momentarily locked by the engine or another agent,
-the command retries with bounded exponential backoff instead of failing
+Every `fn task` subcommand that touches the board retries transient storage
+failures (FN-7731, generalized to all subcommands in FN-7734): if PostgreSQL
+reports a retryable transaction or availability error, the command retries
+with bounded exponential backoff instead of failing
 outright. If the lock hasn't cleared once the retry deadline (default 15s)
 is reached, the command fails fast with a clear, actionable, non-zero-exit
 error naming the task and operation rather than hanging. Override the
@@ -635,7 +646,7 @@ lock, the canonical transient-lock case) and closes the resolved store
 BEFORE each `process.exit()` call, since `runDbVacuum` always exits
 explicitly and a pending `finally` does not run after `process.exit()`. MCP
 global-scope settings live in the file-backed `GlobalSettingsStore`
-(`~/.fusion/settings.json`, no SQLite handle) and are intentionally left
+(`~/.fusion/settings.json`, no database handle) and are intentionally left
 with no close and no lock-retry. All of the above honor the same
 `FUSION_CLI_LOCK_RETRY_MS` deadline override.
 
@@ -1020,6 +1031,7 @@ User mailbox operations for sending and managing direct messages with agents.
 
 ```bash
 fn message inbox
+fn message inbox --user dashboard
 fn message outbox
 fn message send AGENT-001 "Please prioritize FN-222"
 fn message read MSG-123
@@ -1028,7 +1040,7 @@ fn message delete MSG-123
 
 | Subcommand | Description |
 |---|---|
-| `fn message inbox` | List your inbox messages (newest first, up to 20). |
+| `fn message inbox [--user <cli\|dashboard>]` | List the selected user mailbox (newest first, up to 20); defaults to the CLI mailbox. |
 | `fn message outbox` | List messages you sent (newest first, up to 20). |
 | `fn message send <agent-id> <content>` | Send a user→agent message and print the created message ID. |
 | `fn message read <id>` | Show one full message by ID and auto-mark it as read if unread. |
@@ -1036,7 +1048,8 @@ fn message delete MSG-123
 
 ### Mailbox behavior
 
-- `inbox` header shows unread totals as `Inbox (<count> unread)`.
+- `inbox` defaults to the separate CLI user mailbox (`cli`). Use `fn message inbox --user dashboard` to automate reads of the dashboard operator mailbox (`dashboard`) shown by the UI; the two identities are intentionally not unified.
+- `inbox` header shows unread totals as `Inbox (<count> unread)` or `Dashboard Inbox (<count> unread)`.
 - Unread inbox rows are prefixed with `●`; read rows have no dot.
 - Inbox sender labels use `Agent <id>` for agent senders and raw user IDs for user senders.
 - Outbox recipient labels use `Agent <id>` for agent recipients.
@@ -1051,10 +1064,11 @@ fn message delete MSG-123
 | Option | Description |
 |---|---|
 | `--project <name>` | Route mailbox operations to a specific registered project (resolved via project context). Supported by all `fn message` subcommands. |
+| `--user <cli\|dashboard>` | Select the mailbox for `fn message inbox`; defaults to `cli`. |
 
 ### Related command
 
-`fn agent mailbox <agent-id>` is separate from `fn message`: it inspects an **agent-owned mailbox** (agent inbox view), while `fn message ...` manages the **CLI user mailbox**.
+`fn agent mailbox <agent-id>` is separate from `fn message`: it inspects an **agent-owned mailbox** (agent inbox view), while `fn message ...` manages the CLI or dashboard operator user mailbox.
 
 ---
 
@@ -1063,15 +1077,17 @@ fn message delete MSG-123
 Interactive CLI conversation loop with a specific agent.
 
 ```bash
-fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>]
+fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>] [--reply-timeout-ms <n>] [--conversation-id <id>]
 ```
 
 ### Behavior
 
-- `fn chat <agent-id>` starts an interactive REPL.
+- `fn chat <agent-id>` starts an interactive mailbox-conversation REPL.
 - `fn chat <agent-id> <message…>` sends one message and waits for a reply (`--once` implied).
-- Messages are sent as `user-to-agent` records from CLI user `cli` with `metadata.wakeRecipient=true`.
-- Replies are polled from the CLI user inbox and printed as they arrive.
+- Messages are sent as `user-to-agent` records from CLI user `cli` with `metadata.wakeRecipient=true`, `metadata.kind="cli-chat"`, and a durable `metadata.conversationId`.
+- This is MessageStore mail plus polling, not token-streaming SSE. Replies are printed only when they carry the active conversation ID or reply to a known thread message.
+- Agents replying through `fn_send_message` should pass `reply_to_message_id`; replies default to the original sender only when that parent message was addressed to the replying agent.
+- One-shot chat has a reply deadline independent of the polling interval. Interactive chat tracks each outbound message independently: it prints a timeout for an unanswered request, clears that request, and continues the REPL for later messages.
 
 ### Options
 
@@ -1079,7 +1095,9 @@ fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>]
 |---|---|
 | `--once` | Send one message and exit after first reply (or timeout). |
 | `--non-interactive` | Read full stdin to EOF as message body (useful for pipes/scripts). |
-| `--poll-ms <n>` | Poll interval in milliseconds (default `1000`, or `FUSION_CHAT_POLL_MS`). |
+| `--poll-ms <n>` | Poll interval in milliseconds (default `1000`, or `FUSION_CHAT_POLL_MS`). Poll sleeps are capped at the nearest reply deadline. |
+| `--reply-timeout-ms <n>` | Per-reply deadline in milliseconds (default `60000`, or `FUSION_CHAT_REPLY_TIMEOUT_MS`), independent of `--poll-ms`. |
+| `--conversation-id <id>` | Override the default named mailbox conversation ID. |
 
 ### Examples
 
@@ -1279,5 +1297,15 @@ Subcommands: `search`, `install`.
 | `--once` | `fn chat` |
 | `--non-interactive` | `fn chat` |
 | `--poll-ms` | `fn chat` |
+| `--reply-timeout-ms` | `fn chat` |
 
 For configuration details used by these commands, see [Settings Reference](./settings-reference.md).
+
+### Organization portability
+
+- `fn org-export <file> [--project <name>]` writes a single secret-scrubbed bundle of
+  the selected project's agents, raw skill files, routines, automations, and settings
+  plus global settings.
+- `fn org-import <file> [--project <name>] [--dry-run] [--collision-mode skip|suffix]`
+  materializes a bundle. `--dry-run` reports the plan without modifying stores or files;
+  collision mode defaults to `skip` and `suffix` creates deterministically named copies.

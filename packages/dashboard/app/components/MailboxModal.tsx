@@ -17,7 +17,7 @@ import {
   ChevronRight,
   ChevronDown,
 } from "lucide-react";
-import type { Message, MessageType, ParticipantType } from "@fusion/core";
+import type { Message, MessageType, NativeStructurePreviewResult, NativeStructureRef, ParticipantType } from "@fusion/core";
 import {
   fetchInbox,
   fetchOutbox,
@@ -34,9 +34,12 @@ import {
   type AgentMailboxResponse,
   type AllAgentsMailboxResponse,
 } from "../api";
-import { MessageComposer } from "./MessageComposer";
+import { MessageComposer, type NativeStructureCandidate } from "./MessageComposer";
 import { MailboxMessageContent } from "./MailboxMessageContent";
 import { MailboxArtifactAttachment } from "./MailboxArtifactAttachment";
+import { MailboxRelatedWorkLink, hasRelatedTaskLink } from "./MailboxRelatedWorkLink";
+import { MailboxNativeStructureEmbeds } from "./MailboxNativeStructureEmbeds";
+import { MailboxTaskProposal } from "./MailboxTaskProposal";
 import type { Agent } from "../api";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
@@ -57,6 +60,10 @@ interface MailboxModalProps {
   projectId?: string;
   addToast?: (msg: string, type?: "success" | "error") => void;
   onOpenTask?: (taskId: string) => void;
+  onOpenPlanningSession?: (sessionId: string) => void;
+  /** Opens a persisted structure from the shared preview card. */
+  onOpenNativeStructure: (ref: NativeStructureRef, payload: NativeStructurePreviewResult) => void;
+  nativeStructureCandidates: NativeStructureCandidate[];
   agents?: Agent[];
 }
 
@@ -171,6 +178,9 @@ export function MailboxModal({
   projectId,
   addToast,
   onOpenTask,
+  onOpenPlanningSession,
+  onOpenNativeStructure,
+  nativeStructureCandidates,
   agents = [],
 }: MailboxModalProps) {
   const { t } = useTranslation("app");
@@ -394,6 +404,7 @@ export function MailboxModal({
         "message:received": onMailboxUpdate,
         "message:read": onMailboxUpdate,
         "message:deleted": onMailboxUpdate,
+        "message:updated": onMailboxUpdate,
       },
     });
   }, [isOpen, projectId, activeTab, selectedAgentId, refreshUnreadCount, loadInbox, loadOutbox, loadAgentMailbox, loadAllAgentsMailbox]);
@@ -891,6 +902,11 @@ export function MailboxModal({
                           content={msg.content}
                           className="mailbox-conversation-msg-body"
                         />
+                        <MailboxRelatedWorkLink
+                          metadata={msg.metadata}
+                          onOpenTask={onOpenTask}
+                          onOpenPlanningSession={onOpenPlanningSession}
+                        />
                         <MailboxArtifactAttachment
                           artifactId={msg.metadata?.artifactId}
                           artifactType={msg.metadata?.artifactType}
@@ -899,7 +915,10 @@ export function MailboxModal({
                           projectId={projectId}
                           taskId={msg.metadata?.taskId}
                           onOpenTask={onOpenTask}
+                          hideTaskLink={hasRelatedTaskLink(msg.metadata, onOpenTask)}
                         />
+                        <MailboxNativeStructureEmbeds message={msg} projectId={projectId} onOpen={onOpenNativeStructure} />
+                        <MailboxTaskProposal messageId={msg.id} metadata={msg.metadata} projectId={projectId} onOpenTask={onOpenTask} />
                       </div>
                     );
                   })}
@@ -922,6 +941,11 @@ export function MailboxModal({
                     className="mailbox-message-body"
                     testId="mailbox-message-body"
                   />
+                  <MailboxRelatedWorkLink
+                    metadata={selectedMessage.metadata}
+                    onOpenTask={onOpenTask}
+                    onOpenPlanningSession={onOpenPlanningSession}
+                  />
                   <MailboxArtifactAttachment
                     artifactId={selectedMessage.metadata?.artifactId}
                     artifactType={selectedMessage.metadata?.artifactType}
@@ -930,7 +954,10 @@ export function MailboxModal({
                     projectId={projectId}
                     taskId={selectedMessage.metadata?.taskId}
                     onOpenTask={onOpenTask}
+                    hideTaskLink={hasRelatedTaskLink(selectedMessage.metadata, onOpenTask)}
                   />
+                  <MailboxNativeStructureEmbeds message={selectedMessage} projectId={projectId} onOpen={onOpenNativeStructure} />
+                  <MailboxTaskProposal messageId={selectedMessage.id} metadata={selectedMessage.metadata} projectId={projectId} onOpenTask={onOpenTask} />
                 </>
               )}
             </div>
@@ -943,6 +970,7 @@ export function MailboxModal({
               replyContext={composeReplyContext}
               agents={agents}
               projectId={projectId}
+              nativeStructureCandidates={nativeStructureCandidates}
               onSend={handleMessageSent}
               onCancel={handleComposeCancel}
               addToast={addToast}

@@ -106,6 +106,10 @@ Dashboard surfaces this as a yellow Duplicate chip plus modal actions only while
 
 This layer complements, rather than replaces, FN-4829 similarity detection, FN-4918 deterministic deduplication, and FN-4892 same-agent intake heuristics.
 
+### Workspace worktree cleanup on archive
+
+Archiving a workspace (multi-repository) task now synchronously removes every recorded per-sub-repository worktree, including archives initiated by `fn_task_archive` and CLI paths that do not construct an executor. Each path is protected by a per-repository cross-process reservation until backend removal and branch cleanup finish. If one removal fails, its reservation is quarantined and the next acquisition reconciles that orphan; successful sibling repositories are still released. `archiveTask(..., { cleanup: false })` intentionally retains worktrees, and the self-healing workspace sweep remains an idempotent backstop.
+
 #### Explicit duplicate-marker guard (FN-5220)
 
 Fusion also recognizes the canonical one-line redirect marker:
@@ -134,6 +138,8 @@ Layer behavior:
 - **Triage planning loop** — after triage reads the generated `PROMPT.md`, an exact redirect marker short-circuits directly into `finalizeApprovedTask()`. Normal plans run deterministic spec hygiene checks in triage, then the selected workflow's optional Plan Review gate owns AI plan review before execution.
 - **Self-healing sweep** — maintenance Batch 2 runs `resolveExplicitDuplicateMarkerTasks()` across `triage`/`todo` tasks to clean up older stuck marker tasks. The sweep is best-effort, capped at 50 marker tasks per cycle, and can be disabled with the internal setting `resolveExplicitDuplicateMarkerEnabled: false` (default `true`).
 
+An operator's decision is durable for a task and its active canonical pair. **Keep** records the acknowledgement, clears the marker-only prompt and triage decision hold, and lets planning continue; triage and self-healing will not ask again if that same marker is reprocessed. A marker for a different active canonical remains a new decision. **Delete** for an explicit-marker decision soft-deletes the duplicate, while **Archive** for an ordinary near-duplicate leaves it terminal in Archived; neither outcome is reopened as a duplicate decision.
+
 All three layers fail open: parse errors, task lookup failures, file-read failures, activity-recording errors, or other unexpected exceptions log a warning and continue normal intake/triage/self-healing flow instead of blocking task creation or recovery.
 
 Activity uses the existing `task:auto-archived-duplicate` event with `metadata.source` disambiguators:
@@ -149,15 +155,15 @@ The duplicate-close task log line remains `Duplicate of <canonicalTaskId> — cl
 Fusion applies two conservative intake heuristics that may auto-archive newly filed tasks before execution starts:
 
 - **Ghost-bug preflight** (triage finalize path): for bug-fix-shaped specs that cite concrete constructs/commands, Fusion probes current `main`. If all definitive probes show the cited bug does not reproduce, the task is archived as `auto-resolved-ghost-bug`.
-- **Same-agent duplicate intake** (create path): if the same `source.sourceAgentId` (or `source.sourceParentTaskId`) filed a highly similar task within 24h (threshold `0.75`), Fusion still detects the near-duplicate — but what happens next depends on the `autoArchiveDuplicateTasksEnabled` project/global setting (default **`false`**, FN-7658):
-  - **Default (`false`)**: the later task is left in place and flagged via the same near-duplicate marker used elsewhere (`sourceMetadata.nearDuplicateOf` / `nearDuplicateScore`), so the dashboard's yellow "Duplicate" chip with Keep/Archive actions surfaces it for a human decision. The task is never moved to `archived` automatically.
-  - **`true`** (legacy behavior, opt-in): the later task is archived as `auto-resolved-duplicate` and the earliest sibling is kept, exactly as before FN-7658.
+- **Same-agent duplicate intake** (all task-create backends): if the same `source.sourceAgentId` (or `source.sourceParentTaskId`) filed a highly similar task within 24h (threshold `0.75`), Fusion still detects the near-duplicate — but what happens next depends on the `autoArchiveDuplicateTasksEnabled` project/global setting (default **`false`**, FN-7658/FN-8401):
+  - **Default (`false`)**: the later task is left in place and flagged via the same near-duplicate marker used elsewhere (`sourceMetadata.nearDuplicateOf` / `nearDuplicateScore`), so the dashboard's yellow "Duplicate" chip with Keep/Archive actions surfaces it for a human decision. Neither the new task nor its live siblings are moved to `archived` or deleted automatically.
+  - **`true`** (legacy behavior, opt-in): only the later/new task is archived as `auto-resolved-duplicate`; its live siblings remain intact.
 
 Ghost-bug preflight is unaffected by `autoArchiveDuplicateTasksEnabled` — it is a distinct heuristic and always auto-archives on a definitive non-repro.
 
 Both heuristics are **fail-open**: probe/detection errors, timeouts, or inconclusive signals do not block normal intake — the task continues in the regular flow.
 
-Tombstone-resurrection blocking (recreating a soft-deleted task within the sticky window) is a separate safety mechanism from same-agent duplicate intake and is **not** gated by `autoArchiveDuplicateTasksEnabled` — it always throws `TombstonedTaskResurrectionError` regardless of the setting.
+Tombstone-resurrection blocking (including a same-agent near-duplicate of a soft-deleted task within the sticky window) is shared by every task-create backend and is **not** gated by `autoArchiveDuplicateTasksEnabled` — it always throws `TombstonedTaskResurrectionError` regardless of the setting.
 
 Activity + run-audit event types:
 
@@ -355,6 +361,10 @@ Auto-completion/finalization remains owned by existing recovery passes:
 5. **done** — merged/finalized
 6. **archived** — preserved history, optionally cleaned from filesystem
 
+### Archive worktree cleanup
+
+Archiving a single-repository task synchronously removes its git worktree before branch and task-metadata cleanup. This applies to random and pinned (`task-id`/`task-title`) names, including `fn_task_archive` and direct CLI archive commands that run without an executor. A host-scoped filesystem reservation serializes a successor's deterministic-path acquisition with archival disposal; if removal fails, the reservation is quarantined so the next acquisition can reconcile the orphan instead of colliding with it. `archive({ cleanup: false })` intentionally retains the worktree. Workspace tasks' per-repository `workspaceWorktrees` are not removed by this lifecycle yet.
+
 Board ordering behavior:
 - `todo` mirrors scheduler dispatch order: priority first (`urgent` → `low`), then oldest `createdAt` within a priority tier, then task ID as deterministic tie-break.
 - `triage`, `in-progress`, and `in-review` remain priority-first with task-ID tie-breaks (`in-review` still pins merge-active statuses above non-merging tasks).
@@ -423,7 +433,7 @@ When a task was created to resolve a temporary failure state in another task (fo
 
 Use supported TaskStore/API paths to reconcile safely:
 
-- Remove/replace stale dependencies through task update APIs (do not hand-edit `task.json`/SQLite)
+- Remove/replace stale dependencies through task update APIs (do not hand-edit `task.json` or PostgreSQL rows)
 - Add a single comment/log entry explaining why the dependency changed
 - Keep downstream blockers coherent (only tasks that still truly depend on unfinished work should remain blocked)
 
@@ -433,7 +443,7 @@ Auto-merge recovery follow-up creation is deduplicated: Fusion creates at most o
 
 ### Landed-task state reconciliation (maintenance)
 
-If a task already shipped (`column: done`) but still carries transient failure metadata (`status: failed`, `error`, `worktree`, `blockedBy`, recovery retry fields), reconcile through supported TaskStore/API paths so SQLite and task JSON stay in sync.
+If a task already shipped (`column: done`) but still carries transient failure metadata (`status: failed`, `error`, `worktree`, `blockedBy`, recovery retry fields), reconcile through supported TaskStore/API paths so PostgreSQL and task JSON compatibility artifacts stay in sync.
 
 Recommended pattern:
 - Audit first (dry-run) for contradictory `done` + transient-failure state.
@@ -441,7 +451,7 @@ Recommended pattern:
 - Add one durable reconciliation log entry explaining why stale transient fields were cleared (avoid duplicating historical failure logs).
 - Re-audit after apply and resolve or explicitly disposition any related stale follow-up tasks.
 
-Do **not** patch `.fusion/fusion.db` directly without synchronizing `.fusion/tasks/*/task.json` through a supported store-backed path.
+Do **not** patch PostgreSQL rows or compatibility `task.json` files directly; use a supported store/API path so both representations remain synchronized.
 
 ## Branch conflict handling
 
@@ -645,7 +655,7 @@ Behavior:
 
 ### Cleanup behavior
 
-- Archived entries are persisted as compact archive snapshots in `archive.db`; legacy in-main-DB `archivedTasks` rows and older `.fusion/archive.jsonl` references may still appear in historical data/docs.
+- Archived entries are persisted as compact snapshots in PostgreSQL cold-storage tables; legacy `archive.db`, in-main-DB `archivedTasks`, and older `.fusion/archive.jsonl` data remain migration inputs only.
 - Task directory (`task.json`, `PROMPT.md`, `agent.log`, attachments) can be removed
 
 ### Compact archive entry format
@@ -679,7 +689,7 @@ Archive entries preserve key metadata needed for restoration, including:
 
 If you suspect **historical overwrites from pre-FN-4044 builds**, inspect surviving evidence in this order:
 
-1. `archive.db` / archived task snapshots for the missing ID
+1. PostgreSQL archived-task snapshots for the missing ID (then legacy `archive.db` only when auditing unmigrated data)
 2. `.fusion/tasks/<id>/task.json.bak`, `PROMPT.md`, attachments, and any surviving worktree branch named for the task
 3. agent run logs / task documents / activity log entries that still mention the original ID
 4. git commits whose subject/body references the original task ID but no longer matches the current task metadata
@@ -929,7 +939,12 @@ Use `noCommitsExpected: true` for tasks where the deliverable is a decision/repo
 - Review Level 1 coordination/routing tasks that are board-only, explicitly say not to change source, and scope only task documents/metadata can also complete without commits even if older prompts omitted the explicit flag. This fallback is intentionally narrow and exists to recover plan-only coordination work; it does not bypass wrong-worktree or wrong-branch checks.
 - Ambiguous/forked tasks (e.g. "Investigate..." or "Investigate and fix if needed") leave it unset by default.
 - Implementation, feature, bug-fix, source-docs, test, config, or broad investigation tasks still require commits unless they have an explicit and valid no-commit contract.
-- If a legacy coordination task is stuck with `fn_task_done refused: no_commits`, prefer setting/verifying `noCommitsExpected` and re-running normal no-op finalization rather than editing `.fusion/fusion.db` directly.
+- If a legacy coordination task is stuck with `fn_task_done refused: no_commits`, prefer setting/verifying `noCommitsExpected` and re-running normal no-op finalization rather than editing storage directly.
 - You can manually set/clear it in Task Detail via **No commits expected (decision-only task)**.
 - Task cards show a **decision-only** badge when enabled.
 - Finalization still uses the existing no-op review/merge path (`mergeDetails.noOpMerge: true`, `mergeConfirmed: true`); no synthetic merge strategy values are introduced.
+
+
+### Active-time statistics
+
+Task Detail labels this measure **Total active time**. It sums durable planning AI time (`cumulativePlanningMs`, including a live `planningStartedAt` segment) and in-progress execution time (`cumulativeActiveMs`, including a live `executionStartedAt` segment). Column dwell is wall-clock queue time and is intentionally excluded.

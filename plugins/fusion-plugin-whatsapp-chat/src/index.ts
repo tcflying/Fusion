@@ -2,19 +2,13 @@ import { definePlugin } from "@fusion/plugin-sdk";
 import type { FusionPlugin, PluginContext, PluginRouteDefinition, PluginRouteResponse, PluginSettingSchema } from "@fusion/plugin-sdk";
 import { WhatsAppConnection } from "./connection.js";
 import { generateReply } from "./reply.js";
+import { createWhatsAppPersistence } from "./persistence.js";
+export type { ChatTurn } from "./persistence.js";
 
 const DEFAULT_HISTORY_TURN_LIMIT = 40;
 const DEFAULT_DEDUPE_RETENTION_DAYS = 7;
 
-export type ChatTurn = { role: "user" | "assistant"; text: string; createdAt: string };
-
-export type PluginDb = {
-  exec(sql: string): void;
-  prepare(sql: string): {
-    get(...args: unknown[]): unknown;
-    run(...args: unknown[]): unknown;
-  };
-};
+import type { ChatTurn } from "./persistence.js";
 
 const settingsSchema: Record<string, PluginSettingSchema> = {
   pairingMode: {
@@ -22,13 +16,19 @@ const settingsSchema: Record<string, PluginSettingSchema> = {
     label: "Pairing Mode",
     enumValues: ["qr", "code"],
     defaultValue: "qr",
+    description: "Use QR to scan from WhatsApp Linked Devices, or code to pair a phone number from Plugin Manager.",
   },
   pairingPhoneNumber: {
     type: "string",
     label: "Pairing Phone Number",
-    description: "E.164 digits without + (required when pairingMode is code)",
+    description: "E.164 digits without +. Required to request a pairing code in code mode.",
   },
-  allowedSenders: { type: "array", label: "Allowed WhatsApp Senders", itemType: "string" },
+  allowedSenders: {
+    type: "array",
+    label: "Allowed WhatsApp Senders",
+    description: "WhatsApp JIDs or E.164 digits. Leave empty to block every inbound sender.",
+    itemType: "string",
+  },
   agentSystemPrompt: {
     type: "string",
     label: "Agent System Prompt",
@@ -85,83 +85,6 @@ export function splitMessageForWhatsapp(text: string): string[] {
   return WhatsAppConnection.splitMessageForWhatsapp(text);
 }
 
-export function ensureSchema(db: PluginDb): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS whatsapp_chat_sessions (
-      sender TEXT PRIMARY KEY,
-      history TEXT NOT NULL,
-      updatedAt TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS whatsapp_chat_dedupe (
-      messageId TEXT PRIMARY KEY,
-      sender TEXT NOT NULL,
-      receivedAt TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS whatsapp_auth_creds (
-      id TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updatedAt TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS whatsapp_auth_keys (
-      category TEXT NOT NULL,
-      keyId TEXT NOT NULL,
-      value TEXT NOT NULL,
-      updatedAt TEXT NOT NULL,
-      PRIMARY KEY (category, keyId)
-    );
-  `);
-}
-
-export function loadHistory(db: PluginDb, sender: string): ChatTurn[] {
-  const row = db.prepare("SELECT history FROM whatsapp_chat_sessions WHERE sender = ?").get(sender) as { history: string } | undefined;
-  if (!row) return [];
-  try {
-    const parsed = JSON.parse(row.history) as ChatTurn[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export function saveHistory(db: PluginDb, sender: string, history: ChatTurn[]): void {
-  const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO whatsapp_chat_sessions(sender, history, updatedAt)
-    VALUES(?, ?, ?)
-    ON CONFLICT(sender) DO UPDATE SET history = excluded.history, updatedAt = excluded.updatedAt
-  `).run(sender, JSON.stringify(history), now);
-}
-
-export function wasProcessed(db: PluginDb, messageId: string): boolean {
-  const row = db.prepare("SELECT 1 as found FROM whatsapp_chat_dedupe WHERE messageId = ?").get(messageId) as { found: number } | undefined;
-  return Boolean(row?.found);
-}
-
-export function markProcessed(
-  db: PluginDb,
-  messageId: string,
-  sender: string,
-  retentionDays: number = DEFAULT_DEDUPE_RETENTION_DAYS,
-): void {
-  const now = new Date().toISOString();
-  const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
-  db.prepare("DELETE FROM whatsapp_chat_dedupe WHERE receivedAt < ?").run(cutoff);
-  db.prepare("INSERT INTO whatsapp_chat_dedupe(messageId, sender, receivedAt) VALUES(?, ?, ?)").run(messageId, sender, now);
-}
-
-
-function getDbFromTaskStore(ctx: PluginContext): PluginDb {
-  const pluginStore = ctx.taskStore.getPluginStore();
-  const db = (pluginStore as unknown as { db?: PluginDb }).db;
-  if (!db) {
-    throw new Error("Plugin database unavailable");
-  }
-  return db;
-}
-
 function getConnectionOrResponse(ctx: PluginContext): { connection?: WhatsAppConnection; error?: PluginRouteResponse } {
   const connection = connections.get(getConnectionKey(ctx));
   if (!connection) {
@@ -178,11 +101,21 @@ const routes: PluginRouteDefinition[] = [
       const { connection, error } = getConnectionOrResponse(ctx);
       if (!connection) return error as PluginRouteResponse;
       const status = connection.getStatus();
+      /**
+       * FNXC:WhatsAppStatusVisibility 2026-07-17-09:15:
+       * /status must expose lastError: a stale-protocol 405 rejection previously showed only a bare "disconnected" with no way to diagnose it from the API surface the README points troubleshooters at.
+       *
+       * FNXC:WhatsAppSettingsPairing 2026-07-20-12:00:
+       * Status includes the current QR/code so Plugin Manager can offer settings-first pairing from one poll. Operators should not need to discover raw API endpoints or coordinate a separate QR request.
+       */
       return {
         status: 200,
         body: {
           status: status.state,
           jid: status.jid,
+          lastError: status.lastError,
+          qrDataUrl: status.qrDataUrl,
+          pairingCode: status.pairingCode,
           allowedSenders: Array.from(getAllowedSenders(ctx.settings)),
         },
       };
@@ -240,12 +173,9 @@ const plugin: FusionPlugin = definePlugin({
   state: "installed",
   routes,
   hooks: {
-    onSchemaInit: (db) => {
-      ensureSchema(db as PluginDb);
-    },
     onLoad: async (ctx) => {
-      const db = getDbFromTaskStore(ctx);
-      const connection = new WhatsAppConnection(ctx, plugin.manifest.version, generateReply, db);
+      const persistence = createWhatsAppPersistence(ctx);
+      const connection = new WhatsAppConnection(ctx, plugin.manifest.version, generateReply, persistence);
       connections.set(getConnectionKey(ctx), connection);
       await connection.start();
     },

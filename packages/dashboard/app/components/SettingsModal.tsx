@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Globe, Folder, RefreshCw, Star, HelpCircle, Settings as SettingsIcon, Search, X as SearchToggleCloseIcon } from "lucide-react";
+import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type SetStateAction } from "react";
+import { Globe, Folder, GitBranch, Power, RefreshCw, Star, Settings as SettingsIcon, Search, X as SearchToggleCloseIcon } from "lucide-react";
 import {
   getErrorMessage,
   resolveGitlabConfig,
@@ -8,9 +8,9 @@ import {
 } from "@fusion/core";
 import type { Settings, GlobalSettings, ThemeMode, ColorTheme, ModelPreset } from "@fusion/core";
 import { DEFAULT_GLOBAL_SETTINGS } from "@fusion/core";
-import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotes, fetchGitRemotesDetailed, fetchGitBranches, fetchProjects, fetchDashboardHealth, checkForUpdates, installUpdate, fetchRemoteSettings, fetchRemoteStatus, installCloudflared, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode } from "../api";
+import { fetchSettings, fetchSettingsByScope, updateSettings, updateGlobalSettings, fetchAuthStatus, loginProvider, logoutProvider, cancelProviderLogin, saveApiKey, clearApiKey, fetchModels, testNotification, fetchBackups, createBackup, exportSettings, importSettings, fetchMemoryFile, fetchMemoryFiles, saveMemoryFile, compactMemory, fetchGlobalConcurrency, updateGlobalConcurrency, installQmd, testMemoryRetrieval, triggerMemoryDreams, fetchGitRemotes, fetchGitRemotesDetailed, fetchGitBranches, fetchProjects, fetchDashboardHealth, checkForUpdates, installUpdate, fetchSystemInfo, requestSystemRestart, fetchRemoteSettings, fetchRemoteStatus, installCloudflared, fetchRemoteQr, fetchRemoteUrl, submitProviderManualCode } from "../api";
 import type { AuthProvider, ManualOAuthCodeInfo, ModelInfo, BackupListResponse, SettingsExportData, MemoryFileInfo, MemoryRetrievalTestResult, GitRemote, GitRemoteDetailed, ProjectInfo, RemoteStatus, UpdateCheckResponse, UpdateInstallResponse, OAuthDeviceCodeInfo } from "../api";
-import { splitSettingsSave } from "./settings/save-split";
+import { resolveScopedMcpSettings, splitSettingsSave, type McpSettingsScope } from "./settings/save-split";
 import {
   ALL_PROJECT_RESET_KEYS,
   getResetIneligibleReason,
@@ -23,6 +23,7 @@ import {
   type DashboardShortcutAction,
 } from "../utils/keyboardShortcuts";
 import type { DashboardKeyboardShortcutMap } from "../utils/keyboardShortcuts";
+import { SettingsHelpTip } from "./settings/SettingsHelpTip";
 import type { SectionSaveHandler } from "./settings/sections/context";
 import { AppearanceSection } from "./settings/sections/AppearanceSection";
 import { ExperimentalSection } from "./settings/sections/ExperimentalSection";
@@ -36,6 +37,7 @@ import { GlobalMcpSection } from "./settings/sections/GlobalMcpSection";
 import { GlobalModelsSection } from "./settings/sections/GlobalModelsSection";
 import { AuthenticationSection } from "./settings/sections/AuthenticationSection";
 import {
+  HappierRuntimeSection,
   HermesRuntimeSection,
   OpenClawRuntimeSection,
   PaperclipRuntimeSection,
@@ -45,16 +47,22 @@ import { PromptsSection } from "./settings/sections/PromptsSection";
 import { GeneralSection } from "./settings/sections/GeneralSection";
 import { ProjectModelsSection, WorkflowLaneFlushRejection } from "./settings/sections/ProjectModelsSection";
 import { SchedulingSection } from "./settings/sections/SchedulingSection";
+import { SchedulingGlobalSection } from "./settings/sections/SchedulingGlobalSection";
+import { CliBinarySection } from "./settings/sections/CliBinarySection";
 import { ScheduledEvalsSection } from "./settings/sections/ScheduledEvalsSection";
 import { NodeRoutingSection } from "./settings/sections/NodeRoutingSection";
 import { WorktreesSection } from "./settings/sections/WorktreesSection";
 import { CommandsSection } from "./settings/sections/CommandsSection";
 import { MergeSection } from "./settings/sections/MergeSection";
+import { SourceControlSection } from "./settings/sections/SourceControlSection";
+import { SourceControlGlobalSection } from "./settings/sections/SourceControlGlobalSection";
 import { AgentPermissionsSection } from "./settings/sections/AgentPermissionsSection";
 import { MemorySection } from "./settings/sections/MemorySection";
 import { ResearchProjectSection } from "./settings/sections/ResearchProjectSection";
 import { ProjectMcpSection } from "./settings/sections/ProjectMcpSection";
 import { BackupsSection } from "./settings/sections/BackupsSection";
+import { ConfigurationVersionsSection } from "./settings/sections/ConfigurationVersionsSection";
+import { DatabaseBackupsSection } from "./settings/sections/DatabaseBackupsSection";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { PluginsSection } from "./settings/sections/PluginsSection";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
@@ -70,6 +78,7 @@ import { ProviderIcon } from "./ProviderIcon";
 import { generateUniquePresetId } from "../utils/modelPresets";
 import { copyTextToClipboard } from "../utils/copyToClipboard";
 import { appendTokenQuery, OAUTH_RELOGIN_SUCCESS_EVENT } from "../auth";
+import { openExternalUrl } from "../utils/open-external";
 import { useConfirm } from "../hooks/useConfirm";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
@@ -79,12 +88,15 @@ import { useViewportMode } from "../hooks/useViewportMode";
 import { useWorktrunkInstallStatus } from "../hooks/useWorktrunkInstallStatus";
 import { type TrackingRepoOption } from "./TrackingRepoSelect";
 import { filterVisibleOnboardingAndSettingsProviders } from "./providerVisibility";
+import { SETTINGS_SEARCH_ENTRIES } from "./settings/search/entries";
+import { rankSettingsSearchResults, matchedSectionIds } from "./settings/search/match";
+import { SettingsSearchHighlightProvider } from "./settings/SettingsSearchHighlightContext";
 
 // ---------------------------------------------------------------------------
-// GitHub star count — fetched once per session, cached in localStorage (1 h).
+// GitHub star count — cached locally and refreshed only while Settings is visible.
 // ---------------------------------------------------------------------------
-const GITHUB_STAR_CACHE_KEY = "fusion_github_star_count";
-const GITHUB_STAR_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+export const GITHUB_STAR_CACHE_KEY = "fusion_github_star_count";
+export const GITHUB_STAR_CACHE_TTL_MS = 15 * 60 * 1000;
 const GITHUB_STAR_CLICKED_KEY = "fusion:github-star-clicked";
 
 function isSlashPrefixedAbsolutePath(path: string): boolean {
@@ -148,56 +160,79 @@ interface StarCache {
   fetchedAt: number;
 }
 
-function useGitHubStarCount(): number | null {
-  const [count, setCount] = useState<number | null>(() => {
-    try {
-      const raw = localStorage.getItem(GITHUB_STAR_CACHE_KEY);
-      if (raw) {
-        const parsed: StarCache = JSON.parse(raw) as StarCache;
-        if (Date.now() - parsed.fetchedAt < GITHUB_STAR_CACHE_TTL_MS) {
-          return parsed.count;
-        }
-      }
-    } catch {
-      // ignore malformed cache
-    }
+function readGitHubStarCache(): StarCache | null {
+  try {
+    const raw = localStorage.getItem(GITHUB_STAR_CACHE_KEY);
+    if (!raw) return null;
+
+    const parsed: StarCache = JSON.parse(raw) as StarCache;
+    return Number.isFinite(parsed.count) && Number.isFinite(parsed.fetchedAt) ? parsed : null;
+  } catch {
     return null;
-  });
+  }
+}
 
-  useEffect(() => {
-    // If we already have a fresh count from the initial state, skip the fetch.
-    try {
-      const raw = localStorage.getItem(GITHUB_STAR_CACHE_KEY);
-      if (raw) {
-        const parsed: StarCache = JSON.parse(raw) as StarCache;
-        if (Date.now() - parsed.fetchedAt < GITHUB_STAR_CACHE_TTL_MS) {
-          return;
-        }
-      }
-    } catch {
-      // ignore
+function isGitHubStarCacheFresh(cache: StarCache | null): boolean {
+  return cache !== null && Date.now() - cache.fetchedAt < GITHUB_STAR_CACHE_TTL_MS;
+}
+
+/**
+ * FNXC:SettingsGitHubStar 2026-07-16-07:47:
+ * Keep the Settings star counter current with a visibility-gated, bounded interval refresh.
+ * The hook never fetches while its interface is off-screen, disables HTTP caching to avoid stale
+ * GitHub responses, and shares an in-flight guard so foreground and interval triggers cannot flood the network.
+ */
+export function useGitHubStarCount(): number | null {
+  const [count, setCount] = useState<number | null>(() => readGitHubStarCache()?.count ?? null);
+  const inFlightRef = useRef(false);
+
+  const refresh = useCallback(() => {
+    if (document.hidden || inFlightRef.current || isGitHubStarCacheFresh(readGitHubStarCache())) {
+      return;
     }
 
-    fetch("https://api.github.com/repos/Runfusion/Fusion")
-      .then((res) => {
-        if (!res.ok) return;
-        return res.json() as Promise<{ stargazers_count?: number }>;
+    inFlightRef.current = true;
+    void fetch("https://api.github.com/repos/Runfusion/Fusion", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) return null;
+        const data = await response.json() as { stargazers_count?: unknown };
+        return typeof data.stargazers_count === "number" && Number.isFinite(data.stargazers_count)
+          ? data.stargazers_count
+          : null;
       })
-      .then((data) => {
-        if (data && typeof data.stargazers_count === "number") {
-          const cache: StarCache = { count: data.stargazers_count, fetchedAt: Date.now() };
-          try {
-            localStorage.setItem(GITHUB_STAR_CACHE_KEY, JSON.stringify(cache));
-          } catch {
-            // quota exceeded — just skip
-          }
-          setCount(data.stargazers_count);
+      .then((starCount) => {
+        if (starCount === null) return;
+
+        const cache: StarCache = { count: starCount, fetchedAt: Date.now() };
+        try {
+          localStorage.setItem(GITHUB_STAR_CACHE_KEY, JSON.stringify(cache));
+        } catch {
+          // quota exceeded — preserve the displayed value even when persistence is unavailable
         }
+        setCount(starCount);
       })
       .catch(() => {
-        // Network failure — hide count gracefully, no update
+        // Keep the last known value and stale cache so the next eligible trigger can retry.
+      })
+      .finally(() => {
+        inFlightRef.current = false;
       });
   }, []);
+
+  useEffect(() => {
+    refresh();
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    const intervalId = window.setInterval(refresh, GITHUB_STAR_CACHE_TTL_MS);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.clearInterval(intervalId);
+    };
+  }, [refresh]);
 
   return count;
 }
@@ -239,6 +274,25 @@ export type SettingsSection = {
 const MOBILE_SETTINGS_MEDIA_QUERY = "(max-width: 768px)";
 const DEFAULT_MEMORY_EDITOR_PATH = ".fusion/memory/DREAMS.md";
 const ADVANCED_SETTINGS_STORAGE_KEY = "fusion:settings:show-advanced";
+/*
+FNXC:SettingsSearch 2026-07-15-17:35:
+Mirrors `--settings-search-match-duration` in SettingsFieldRow.css: the highlight clears when the row's wash finishes. If this drifts shorter the class is pulled mid-animation and the wash cuts out; longer and the highlight lingers into the operator's next query.
+*/
+const SETTINGS_SEARCH_HIGHLIGHT_MS = 1600;
+
+/** Per-setting results shown before the list is capped; see the hits list. */
+const SETTINGS_SEARCH_MAX_RESULTS = 8;
+
+/**
+ * Scroll behavior for landing a search result, honoring reduced-motion.
+ * Follows the inline `matchMedia` idiom used by OAuthManualCodeForm rather than
+ * adding a hook — the dashboard has no shared reduced-motion hook.
+ */
+function settingsSearchScrollBehavior(): ScrollBehavior {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return "auto";
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+}
+
 const SETTINGS_NAV_WIDTH_STORAGE_KEY = "fusion:settings-nav-width";
 const SETTINGS_NAV_DEFAULT_WIDTH = 248;
 const SETTINGS_NAV_MIN_WIDTH = 200;
@@ -247,6 +301,9 @@ const SETTINGS_NAV_MAX_WIDTH = 420;
 /*
 FNXC:SettingsSimplification 2026-07-10-23:24:
 Settings opens in a focused mode that omits specialist integration, runtime, diagnostics, and infrastructure sections. The Advanced settings switch restores every section, applies consistently to desktop navigation, mobile navigation, and search, and persists only as a browser-local display preference so it never changes or exports project settings.
+
+FNXC:SettingsNavigation 2026-07-16-12:00:
+FN-8128 returns CLI Binary to the default Settings view. It is deliberately absent from this Advanced-only set so desktop navigation, the mobile picker, and search expose binary install and diagnostic controls without requiring the browser-local Advanced preference.
 */
 const ADVANCED_SETTINGS_SECTION_IDS = new Set([
   "node-sync",
@@ -256,6 +313,7 @@ const ADVANCED_SETTINGS_SECTION_IDS = new Set([
   "remote",
   "experimental",
   "hermes-runtime",
+  "happier-runtime",
   "openclaw-runtime",
   "paperclip-runtime",
   "scheduled-evals",
@@ -312,8 +370,19 @@ export function sectionMatchesSettingsSearch(
   query: string,
   label: string,
   translateSearchKey: (key: string) => string,
+  entryMatchedSectionIds?: ReadonlySet<string>,
 ): boolean {
   if (!query || section.isGroupHeader) {
+    return true;
+  }
+
+  /*
+  FNXC:SettingsSearch 2026-07-15-17:35:
+  A section also matches when the per-setting index matched any control inside it, which is the path that finds settings the section's own curated keywords never mentioned.
+  Checked before the keyword list because it is the authoritative one: it indexes the label and help text operators actually read, whereas `searchableText` is a hand-written approximation of it.
+  The keyword list still runs as the fallback — sections are migrated to the index incrementally, and an unmigrated section has no entries, so dropping it here would make those sections unsearchable mid-rollout.
+  */
+  if (entryMatchedSectionIds?.has(section.id)) {
     return true;
   }
 
@@ -331,6 +400,7 @@ export function filterSettingsSectionsForSearch(
   query: string,
   translateLabel: (section: SettingsSection) => string,
   translateSearchKey: (key: string) => string,
+  entryMatchedSectionIds?: ReadonlySet<string>,
 ): SettingsSection[] {
   if (!query) {
     return sections;
@@ -338,7 +408,7 @@ export function filterSettingsSectionsForSearch(
 
   const matchedIds = new Set(
     sections
-      .filter((section) => !section.isGroupHeader && sectionMatchesSettingsSearch(section, query, translateLabel(section), translateSearchKey))
+      .filter((section) => !section.isGroupHeader && sectionMatchesSettingsSearch(section, query, translateLabel(section), translateSearchKey, entryMatchedSectionIds))
       .map((section) => section.id),
   );
 
@@ -363,47 +433,33 @@ function resolveFirstSelectableSettingsSection(sections: SettingsSection[], fall
   return sections.find((section) => !section.isGroupHeader)?.id ?? fallback;
 }
 
+
 /*
-FNXC:SettingsNavigation 2026-07-04-00:00:
-The mobile Settings section picker (`<select>` on narrow viewports) prefixes every
-section option with its owning group (`Global — `/`Project — `) so entries are
-unambiguous when labels collide across scopes (e.g. "MCP Servers" exists in both
-Global and Project). The Authentication section is intentionally `scope: undefined`
-(it is not backed by settings storage — see SETTINGS_SECTIONS), but it still lives
-under the Global group header in SETTINGS_SECTIONS, so its mobile option rendered as
-bare "Authentication" instead of "Global — Authentication", inconsistent with its
-Global-group siblings (FN-7552). SETTINGS_SECTION_GROUP_LABEL_BY_ID maps every
-non-header section id to the label of the most recent group-header row preceding it
-in SETTINGS_SECTIONS, so resolveSettingsSectionOptionLabel can fall back to a
-group-derived "Global — " prefix for storage-less sections that belong to the Global
-group — without changing behavior for any section that already declares a scope
-(Runtimes entries keep their existing scope:"global" path) or for undefined-scope
-group-header rows themselves (which are never rendered as selectable options).
+FNXC:SettingsNavigation 2026-07-15-17:35:
+Scope is written as a ` · Global`/` · Project` SUFFIX, matching the nav labels, rather than the former `Global — `/`Project — ` prefix.
+The nav is now grouped by topic, so scope is no longer implied by position and the paired sections spell it out in their own label ("MCP Servers · Global"). Keeping the old prefix here would have rendered "Global — MCP Servers · Global" on mobile.
+The prefix cannot simply be dropped instead: the mobile picker is a bare `<select>` with no room for the scope icon the desktop nav draws, so this suffix is the only scope signal a mobile operator gets — which is why it is still applied to every scoped section, not just the colliding pairs.
 */
-function buildSettingsSectionGroupLabelMap(sections: SettingsSection[]): Map<string, string> {
-  const map = new Map<string, string>();
-  let currentGroupLabel: string | undefined;
-  for (const section of sections) {
-    if (section.isGroupHeader) {
-      currentGroupLabel = section.label;
-      continue;
-    }
-    if (currentGroupLabel !== undefined) {
-      map.set(section.id, currentGroupLabel);
-    }
-  }
-  return map;
-}
+const SETTINGS_SECTION_SCOPE_SUFFIX = / · (Global|Project)$/;
+
+/*
+FNXC:SettingsNavigation 2026-07-15-17:35:
+Storage-less sections that are nevertheless global in effect (FN-7552: Authentication holds credentials shared across every project, but is not backed by settings storage, hence `scope: undefined`).
+This is an explicit list because the previous rule — "the most recent group header says Global" — cannot survive topic-first grouping: there is no group named "Global" any more, and Authentication now sits under Integrations. Deriving scope from a group label was always indirect; naming the exception is honest and does not silently lapse when groups are renamed again.
+*/
+const STORAGE_LESS_GLOBAL_SECTION_IDS = new Set(["authentication"]);
 
 function resolveSettingsSectionOptionLabel(section: SettingsSection, label: string): string {
-  if (section.scope === "global") {
-    return `Global — ${label}`;
+  // Paired sections already carry the suffix in their own label; re-appending
+  // would read "MCP Servers · Global · Global".
+  if (SETTINGS_SECTION_SCOPE_SUFFIX.test(label)) {
+    return label;
+  }
+  if (section.scope === "global" || STORAGE_LESS_GLOBAL_SECTION_IDS.has(section.id)) {
+    return `${label} · Global`;
   }
   if (section.scope === "project") {
-    return `Project — ${label}`;
-  }
-  if (SETTINGS_SECTION_GROUP_LABEL_BY_ID.get(section.id) === "Global") {
-    return `Global — ${label}`;
+    return `${label} · Project`;
   }
   return label;
 }
@@ -413,17 +469,123 @@ function resolveMaxAutoMergeRetriesForSettingsForm(settings?: { maxAutoMergeRetr
   return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : 3;
 }
 
+/** FNXC:ExecutorToolFailureRetry 2026-07-16-12:00: zero is an intentional project setting that disables retries/backoff, so do not use a truthy fallback when normalizing the form. */
+function resolveNonNegativeExecutorToolFailureSetting(value: unknown, fallback: number): number {
+  const configured = Number(value);
+  return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : fallback;
+}
+
 export const SETTINGS_SECTIONS: SettingsSection[] = [
-  // Global group (shared across all Fusion projects)
-  { id: "__global_header", label: "Global", labelKey: "settings.nav.globalHeader", scope: undefined, isGroupHeader: true },
-  { id: "global-general", label: "General", labelKey: "settings.nav.globalGeneral", scope: "global", searchableText: ["global defaults", "modal outside dismiss", "agent logs", "persist tool output", "thinking logs", "GitLab instance URL", "global tracking repo"] },
-  { id: "keyboard-shortcuts", label: "Keyboard Shortcuts", labelKey: "settings.nav.keyboardShortcuts", scope: "global", searchableText: ["keyboard shortcuts", "hotkeys", "quick chat shortcut", "terminal shortcut", "open files", "open settings", "command center", "new task shortcut", "record shortcut"] },
-  { id: "authentication", label: "Authentication", labelKey: "settings.nav.authentication", scope: undefined, icon: Globe, searchableText: ["login", "OAuth", "API key", "custom providers", "Anthropic", "OpenAI", "provider credentials"] },
+  { id: "__preferences_header", label: "Preferences", labelKey: "settings.nav.preferencesHeader", scope: undefined, isGroupHeader: true },
   { id: "appearance", label: "Appearance", labelKey: "settings.nav.appearance", scope: "global", searchableText: ["theme", "color", "sidebar", "dock", "task popup", "task popups", "board list popups", "popup view attachment", "open tasks as popups", "quick chat"] },
+  { id: "keyboard-shortcuts", label: "Keyboard Shortcuts", labelKey: "settings.nav.keyboardShortcuts", scope: "global", searchableText: ["keyboard shortcuts", "hotkeys", "quick chat shortcut", "terminal shortcut", "open files", "open settings", "command center", "new task shortcut", "record shortcut"] },
   { id: "notifications", label: "Notifications", labelKey: "settings.nav.notifications", scope: "global", searchableText: ["ntfy", "webhook", "events", "failure notifications", "sticky", "toast"] },
-  { id: "node-sync", label: "Node Sync", labelKey: "settings.nav.nodeSync", scope: "global", searchableText: ["sync", "node", "distributed", "heartbeat", "coordination"] },
-  { id: "global-models", label: "Models", labelKey: "settings.nav.globalModels", scope: "global", searchableText: ["global models", "model presets", "favorite providers", "model pricing overrides", "LiteLLM pricing", "token pricing"] },
-  { id: "global-mcp", label: "MCP Servers", labelKey: "settings.nav.globalMcp", scope: "global", searchableText: ["global MCP servers", "shared MCP", "user MCP", "tool servers"] },
+  { id: "global-general", label: "General · Global", labelKey: "settings.nav.globalGeneral", scope: "global", searchableText: ["global defaults", "modal outside dismiss", "agent logs", "persist tool output", "thinking logs"] },
+  /*
+  FNXC:SettingsNavigation 2026-07-16-12:00:
+  FN-8128 keeps the `fn` binary panel as a dedicated section rather than re-inlining machine plumbing at the top of General · Global, while restoring it to the default-visible Global group. Operators need installation, version, path, and diagnostic controls in Basic mode when setup or repair is needed.
+  */
+  { id: "cli-binary", label: "CLI Binary", labelKey: "settings.nav.cliBinary", scope: "global", searchableText: ["fn binary", "cli", "install", "version", "path", "upgrade", "homebrew", "binary check"] },
+
+  { id: "__project_header", label: "Project", labelKey: "settings.nav.projectHeader", scope: undefined, isGroupHeader: true },
+  /*
+  FNXC:GitHubImportTranslate 2026-07-15-16:20:
+  Import auto-translation lives in Project General beside the other import-scoped GitHub settings, but operators look for it by what it DOES ("translate", "language", "auto translate issues"), not by the section it happens to live in.
+  FNXC:SettingsSearch 2026-07-15-19:10: the per-setting index now matches these controls on their own label and help text, so the terms that merely restate the copy are no longer load-bearing. The list is kept for the genuine vocabulary gaps — "localize", "localization", "foreign language issues" — which appear nowhere in the copy, and because unmigrated siblings in this section still rely on section-level keywords.
+  */
+  { id: "general", label: "General · Project", labelKey: "settings.nav.projectGeneral", scope: "project", searchableText: ["project general", "Completion Documentation Automation", "Quick Chat launcher", "ephemeral task-worker agents", "chat rooms", "auto-cleanup old chats", "translate", "translation", "auto translate", "auto-translate", "autotranslate", "auto translate issues", "translate issues", "translate imported issues", "githubImportAutoTranslate", "importTranslateTargetLocale", "target language", "translation target language", "translation language", "language", "foreign language issues", "import language", "localize", "localization", "report", "report bug", "send feedback", "share idea", "get help"], searchableKeys: ["settings.general.autoTranslateImportedIssues", "settings.general.autoTranslateImportedIssuesHelp", "settings.general.translationTargetLanguage", "settings.general.translationTargetLanguageHelp", "settings.general.followDashboardLanguage"] },
+  { id: "commands", label: "Commands & Scripts", labelKey: "settings.nav.commands", scope: "project", searchableText: ["test command", "build command", "verification command", "workflow scripts", "commands"] },
+  { id: "worktrees", label: "Worktrees", labelKey: "settings.nav.worktrees", scope: "project", searchableText: ["worktree directory", "copy files", "recycle worktrees", "branch naming", "sibling branch rename"] },
+  { id: "merge", label: "Merge", labelKey: "settings.nav.merge", scope: "project", searchableText: ["auto merge", "AI merge", "merge strategy", "plan approval", "direct merge", "integration branch", "push after merge"] },
+  /*
+  FNXC:SettingsNavigation 2026-07-18-12:30:
+  FN-8350 makes configuration history a project Settings destination instead of a
+  Command Center card. Register it in the shared section registry so desktop
+  navigation, the mobile picker, and Settings search expose one canonical view.
+  */
+  { id: "config-versions", label: "Configuration Versions", labelKey: "settings.nav.configVersions", scope: "project", searchableText: ["configuration versions", "revision history", "roll back settings", "restore configuration", "config rollback"] },
+
+  { id: "__ai_header", label: "AI & Models", labelKey: "settings.nav.aiHeader", scope: undefined, isGroupHeader: true },
+  /*
+  FNXC:SettingsNavigation 2026-07-16-01:30:
+  Authentication leads the AI & Models group. It is a provider-credentials screen, so it belongs with the model settings it gates rather than under Integrations (where it sat among MCP/Plugins/runtimes) or floating above the groups as a special case — connecting a provider and choosing its models are one task, done in that order.
+  First within the group because nothing else in AI & Models can be configured until it is done: with no provider connected there are no models to pick.
+
+  FNXC:SettingsNavigation 2026-07-16-13:40:
+  FN-8130 changes the Settings landing surface from Authentication to Appearance. Authentication remains first within its own AI & Models group, but the always-visible global Preferences section is the default instead.
+  */
+  { id: "authentication", label: "Authentication", labelKey: "settings.nav.authentication", scope: undefined, icon: Globe, searchableText: ["login", "OAuth", "API key", "custom providers", "Anthropic", "OpenAI", "provider credentials"] },
+  { id: "global-models", label: "Models · Global", labelKey: "settings.nav.globalModels", scope: "global", searchableText: ["global models", "model presets", "favorite providers", "model pricing overrides", "LiteLLM pricing", "token pricing", "translate", "translation model", "import translation model", "import auto-translation model"] },
+  /**
+   * FNXC:SettingsNavigation 2026-07-13-00:00:
+   * Project Models owns the FN-7907 Direct-chat default settings. Its shared Settings search index must advertise chat-default terms and i18n labels so desktop nav, the mobile section picker, and filtered search all surface this section when operators search for Chat defaults.
+
+   * FNXC:SettingsNavigation 2026-07-14-20:15:
+   * Title auto-summarization lives under Project Models but operators search for "summarize", "auto summarize", "title summarization", and related phrases that did not match the prior chat-only/summarization-model index. Advertise those terms and the control's i18n keys so Settings search finds this section.
+   */
+  {
+    id: "project-models",
+    label: "Models · Project",
+    labelKey: "settings.nav.projectModels",
+    scope: "project",
+    searchableText: [
+      "default provider",
+      "default model",
+      "workflow model lanes",
+      "Plan/Triage",
+      "Executor",
+      "Reviewer",
+      "summarization model",
+      "summarize",
+      "summarize titles",
+      "auto summarize",
+      "auto-summarize",
+      "auto summarize titles",
+      "auto-summarize titles",
+      "autoSummarizeTitles",
+      "task definition language",
+      "task definitions input language",
+      "taskDefinitionInInputLanguage",
+      "localized task prose",
+      "title summarization",
+      "title summarizer",
+      "AI title",
+      "AI merge commit summaries",
+      "merge commit summary",
+      "chat",
+      "new chat",
+      "new chat behavior",
+      "chat default",
+      "chat default model",
+      "chat default agent",
+      "chat model",
+      "chat agent",
+      "prompt for model",
+      "always use default",
+      // FNXC:GitHubImportTranslate 2026-07-15-16:20: the import-translate lane is picked here.
+      "translate",
+      "translation",
+      "translation model",
+      "import translation model",
+      "import auto-translation model",
+      "auto-translate model",
+    ],
+    searchableKeys: [
+      "settings.projectModels.chatHeading",
+      "settings.projectModels.chatDescription",
+      "settings.projectModels.chatNewSessionMode",
+      "settings.projectModels.chatNewSessionModePrompt",
+      "settings.projectModels.chatNewSessionModeAlwaysDefault",
+      "settings.projectModels.chatDefaultKind",
+      "settings.projectModels.chatDefaultModel",
+      "settings.projectModels.chatDefaultAgent",
+      "settings.projectModels.aITitleAndGitCommitMessageSummarization",
+      "settings.projectModels.autoSummarizeLongDescriptionsAsTitles",
+      "settings.projectModels.whenEnabledTasksCreatedWithoutATitleBut",
+      "settings.projectModels.aIMergeCommitSummaries",
+      "settings.projectModels.whenEnabledMergeCommitMessagesIncludeAnAI",
+    ],
+  },
   {
     id: "cli-agents",
     label: "CLI Agents",
@@ -457,17 +619,56 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
       "settings.cliAgents.approvedNote",
     ],
   },
-  { id: "research-global", label: "Research Defaults", labelKey: "settings.nav.researchGlobal", scope: "global", searchableText: ["research providers", "external search providers", "fetch limits", "global research defaults", "citations"] },
+  { id: "agent-permissions", label: "Agents & Permissions", labelKey: "settings.nav.agentPermissions", scope: "project", searchableText: ["agent provisioning", "approval", "permissions", "policy", "agent creation"] },
+  { id: "prompts", label: "Prompts", labelKey: "settings.nav.prompts", scope: "project", searchableText: ["prompt instructions", "PR title prompt", "PR description prompt", "custom prompts"] },
+  { id: "memory", label: "Memory", labelKey: "settings.nav.memory", scope: "project", searchableText: ["memory backend", "Dreams", "long-term memory", "qmd", "memory file", "retrieval"] },
+  { id: "research-global", label: "Research · Global", labelKey: "settings.nav.researchGlobal", scope: "global", searchableText: ["research providers", "external search providers", "fetch limits", "global research defaults", "citations"] },
+  { id: "research-project", label: "Research · Project", labelKey: "settings.nav.researchProject", scope: "project", searchableText: ["project research", "research runs", "citations", "search limits", "fetch synthesis"] },
+
+  { id: "__automation_header", label: "Automation", labelKey: "settings.nav.automationHeader", scope: undefined, isGroupHeader: true },
+  /*
+  FNXC:SettingsNavigation 2026-07-15-18:52:
+  Scheduling is split into a Global/Project pair rather than one section holding both authority levels behind in-section subheadings. The machine-wide concurrency cap and a project's scheduling posture are different questions, and a search result landing mid-section showed no subheading to disambiguate them.
+  */
+  { id: "scheduling-global", label: "Scheduling · Global", labelKey: "settings.nav.schedulingGlobal", scope: "global", searchableText: ["global max concurrent", "concurrency cap", "all projects", "machine wide", "parallel agents", "scheduler"] },
+  { id: "scheduling", label: "Scheduling · Project", labelKey: "settings.nav.scheduling", scope: "project", searchableText: ["max concurrent", "capacity", "stuck tasks", "poll interval", "parallel steps", "scheduler"] },
+  { id: "scheduled-evals", label: "Scheduled Evals", labelKey: "settings.nav.scheduledEvals", scope: "project", searchableText: ["scheduled evals", "evaluation schedule", "eval runs", "quality jobs"] },
+
+  { id: "__integrations_header", label: "Integrations", labelKey: "settings.nav.integrationsHeader", scope: undefined, isGroupHeader: true },
+  /*
+  FNXC:SourceControl 2026-07-15-20:30:
+  The Global/Project source-control pair sits under Integrations, not Project: these settings configure how Fusion talks to GitHub/GitLab, which is the same kind of thing as the MCP and provider entries beside them.
+  The two are adjacent and ordered global-then-project to match the inheritance they model — the global entry holds the fallbacks the project entry overrides — mirroring the MCP Servers pair directly below.
+  The GitLab/GitHub keywords below were curated on the `general` and `merge` nav entries before their controls moved here; a keyword left behind would send an operator searching "gitlab token" to a section that no longer renders one. The translate keywords deliberately did NOT move: `githubImportAutoTranslate`/`importTranslateTargetLocale` are Import Tasks panel settings and stay in General.
+  */
+  { id: "source-control-global", label: "Source Control · Global", labelKey: "settings.nav.sourceControlGlobal", scope: "global", icon: GitBranch, searchableText: ["GitLab instance URL", "global tracking repo", "GitLab", "GitHub", "global GitLab token", "GitLab fallback", "source control", "forge"] },
+  { id: "source-control", label: "Source Control · Project", labelKey: "settings.nav.sourceControl", scope: "project", icon: GitBranch, searchableText: ["GitHub tracking", "GitLab integration", "GitHub auth mode", "GitLab access token", "GitHub personal access token", "tracking repo", "source control", "forge", "gh cli", "issue tracking"] },
+  { id: "global-mcp", label: "MCP Servers · Global", labelKey: "settings.nav.globalMcp", scope: "global", searchableText: ["global MCP servers", "shared MCP", "user MCP", "tool servers"] },
+  { id: "mcp", label: "MCP Servers · Project", labelKey: "settings.nav.mcp", scope: "project", searchableText: ["project MCP servers", "workspace MCP", "project tool servers", "mcp config"] },
+  { id: "plugins", label: "Plugins", labelKey: "settings.nav.plugins", scope: "project", searchableText: ["Fusion plugins", "Pi extensions", "plugin manager", "extension marketplace"] },
+  { id: "hermes-runtime", label: "Hermes", labelKey: "settings.nav.hermesRuntime", scope: "global", searchableText: ["Hermes runtime", "plugin runtime", "printer runtime"] },
+  { id: "openclaw-runtime", label: "OpenClaw", labelKey: "settings.nav.openclawRuntime", scope: "global", searchableText: ["OpenClaw runtime", "plugin runtime", "open claw"] },
+  { id: "paperclip-runtime", label: "Paperclip", labelKey: "settings.nav.paperclipRuntime", scope: "global", searchableText: ["Paperclip runtime", "plugin runtime"] },
+  { id: "secrets", label: "Secrets", labelKey: "settings.nav.secrets", scope: "project", searchableText: ["secrets", "secret storage", "environment", "credentials"] },
+
+  { id: "__infrastructure_header", label: "Infrastructure", labelKey: "settings.nav.infrastructureHeader", scope: undefined, isGroupHeader: true },
+  { id: "node-sync", label: "Node Sync", labelKey: "settings.nav.nodeSync", scope: "global", searchableText: ["sync", "node", "distributed", "heartbeat", "coordination"] },
+  { id: "node-routing", label: "Node Routing", labelKey: "settings.nav.nodeRouting", scope: "project", searchableText: ["node routing", "routing rules", "node selection", "execution nodes"] },
   /*
   FNXC:SettingsNavigation 2026-06-26-09:20:
   FN-7062 requires the remote settings nav entry to read "Remote Access" only. The stale "& Node Sync" suffix belongs to the separate Node Sync settings section, while this section body already uses the Remote Access heading.
   */
   { id: "remote", label: "Remote Access", labelKey: "settings.nav.remote", scope: "global", searchableText: ["cloudflared", "tunnel", "QR", "persistent token", "remote URL"] },
+  { id: "backups-global", label: "Database Backups", labelKey: "settings.backups.databaseBackups", scope: "global", searchableText: ["database backup", "restore", "shared cluster"] },
+  { id: "backups", label: "Memory Backups", labelKey: "settings.backups.memoryBackups", scope: "project", searchableText: ["memory backup", "memory snapshot"] },
+
+  { id: "__advanced_header", label: "Advanced", labelKey: "settings.nav.advancedHeader", scope: undefined, isGroupHeader: true },
   { id: "experimental", label: "Experimental Features", labelKey: "settings.nav.experimental", scope: "global", searchableText: ["feature flags", "experiments", "research view", "evals view", "sandbox", "subtask breakdown"] },
 
   // Runtimes group (plugin runtimes with their own settings)
   { id: "__runtimes_header", label: "Runtimes", labelKey: "settings.nav.runtimesHeader", scope: undefined, isGroupHeader: true },
   { id: "hermes-runtime", label: "Hermes", labelKey: "settings.nav.hermesRuntime", scope: "global", searchableText: ["Hermes runtime", "plugin runtime", "printer runtime"] },
+  { id: "happier-runtime", label: "Happier", labelKey: "settings.nav.happierRuntime", scope: "global", searchableText: ["Happier runtime", "Codex session", "Claude session", "OpenCode session", "session bridge"] },
   { id: "openclaw-runtime", label: "OpenClaw", labelKey: "settings.nav.openclawRuntime", scope: "global", searchableText: ["OpenClaw runtime", "plugin runtime", "open claw"] },
   { id: "paperclip-runtime", label: "Paperclip", labelKey: "settings.nav.paperclipRuntime", scope: "global", searchableText: ["Paperclip runtime", "plugin runtime"] },
 
@@ -484,45 +685,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "memory", label: "Memory", labelKey: "settings.nav.memory", scope: "project", searchableText: ["memory backend", "Dreams", "long-term memory", "qmd", "memory file", "retrieval"] },
   { id: "backups", label: "Backups", labelKey: "settings.nav.backups", scope: "project", searchableText: ["backup", "restore", "settings export", "settings import"] },
   { id: "research-project", label: "Research", labelKey: "settings.nav.researchProject", scope: "project", searchableText: ["project research", "research runs", "citations", "search limits", "fetch synthesis"] },
-  /**
-   * FNXC:SettingsNavigation 2026-07-13-00:00:
-   * Project Models owns the FN-7907 Direct-chat default settings. Its shared Settings search index must advertise chat-default terms and i18n labels so desktop nav, the mobile section picker, and filtered search all surface this section when operators search for Chat defaults.
-   */
-  {
-    id: "project-models",
-    label: "Project Models",
-    labelKey: "settings.nav.projectModels",
-    scope: "project",
-    searchableText: [
-      "default provider",
-      "default model",
-      "workflow model lanes",
-      "Plan/Triage",
-      "Executor",
-      "Reviewer",
-      "summarization model",
-      "chat",
-      "new chat",
-      "new chat behavior",
-      "chat default",
-      "chat default model",
-      "chat default agent",
-      "chat model",
-      "chat agent",
-      "prompt for model",
-      "always use default",
-    ],
-    searchableKeys: [
-      "settings.projectModels.chatHeading",
-      "settings.projectModels.chatDescription",
-      "settings.projectModels.chatNewSessionMode",
-      "settings.projectModels.chatNewSessionModePrompt",
-      "settings.projectModels.chatNewSessionModeAlwaysDefault",
-      "settings.projectModels.chatDefaultKind",
-      "settings.projectModels.chatDefaultModel",
-      "settings.projectModels.chatDefaultAgent",
-    ],
-  },
+  { id: "project-models", label: "Project Models", labelKey: "settings.nav.projectModels", scope: "project", searchableText: ["default provider", "default model", "workflow model lanes", "Plan/Triage", "Executor", "Reviewer", "summarization model"] },
   { id: "secrets", label: "Secrets", labelKey: "settings.nav.secrets", scope: "project", searchableText: ["secrets", "secret storage", "environment", "credentials"] },
   { id: "mcp", label: "MCP Servers", labelKey: "settings.nav.mcp", scope: "project", searchableText: ["project MCP servers", "workspace MCP", "project tool servers", "mcp config"] },
   { id: "prompts", label: "Prompts", labelKey: "settings.nav.prompts", scope: "project", searchableText: ["prompt instructions", "PR title prompt", "PR description prompt", "custom prompts"] },
@@ -532,7 +695,6 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
 // FNXC:SettingsNavigation 2026-07-04-00:00: sectionId -> owning group label ("Global"/"Runtimes"/"Project"),
 // derived once from SETTINGS_SECTIONS order. Used by resolveSettingsSectionOptionLabel to prefix
 // storage-less (scope: undefined) sections like "authentication" that belong to the Global group (FN-7552).
-const SETTINGS_SECTION_GROUP_LABEL_BY_ID = buildSettingsSectionGroupLabelMap(SETTINGS_SECTIONS);
 
 /** Well-known experimental feature flags with display labels.
  *  These always appear in the Experimental Features settings tab,
@@ -548,6 +710,13 @@ const KNOWN_EXPERIMENTAL_FEATURES: Record<string, string> = {
   todoView: "Todo List",
   researchView: "Research View",
   evalsView: "Evals View",
+  /*
+  FNXC:SettingsExperimental 2026-08-01-00:00:
+  FN-8352 promotes Ideation to a default-off top-level view. Keep its toggle
+  visible so operators explicitly opt into the sidebar and mobile More surface.
+  */
+  ideationView: "Ideation View",
+  qualityPlugin: "Quality Plugin",
   goalsView: "Goals View",
   /* FNXC:QuickAddSubtaskFlag 2026-06-21-00:00: The AI subtask-breakdown quick-add affordance is exposed only through this default-off experimental flag so missing settings keep every quick-add Subtask button hidden. */
   subtaskBreakdown: "Subtask Breakdown",
@@ -657,19 +826,26 @@ function normalizeWorktreeCopyFilesForSave(paths?: string[]): string[] {
 type LegacySectionId = "pi-extensions";
 export type SectionId = SettingsSection["id"] | LegacySectionId;
 
-const DEFAULT_SETTINGS_SECTION: SectionId = "global-general";
+/*
+FNXC:SettingsNavigation 2026-07-16-01:00:
+Authentication was the previous Settings landing section because a provider connection gates model configuration. It remains first within AI & Models, but no longer determines the modal default.
+
+FNXC:SettingsNavigation 2026-07-16-13:40:
+FN-8130 requires Settings to open on Appearance, the global Preferences section, when no explicit initialSection is supplied. Appearance is always visible — it is not behind the Advanced switch — so the default can never land on a section hidden from the operator's navigation.
+*/
+const DEFAULT_SETTINGS_SECTION: SectionId = "appearance";
 
 type PluginsSubsectionId = "fusion-plugins" | "pi-extensions";
 
 /** Local form state extends Settings with a worktreeInitCommand override and lets tokenCap carry null (delete semantic). */
 type SettingsFormState = Settings & { worktreeInitCommand?: string; tokenCap?: number | null };
-type GlobalGitlabSettings = Pick<GlobalSettings, "gitlabEnabled" | "gitlabInstanceUrl" | "gitlabApiBaseUrl" | "gitlabAuthToken" | "gitlabAuthTokenType">;
+type GlobalSourceControlSettings = Pick<GlobalSettings, "gitlabEnabled" | "gitlabInstanceUrl" | "gitlabApiBaseUrl" | "gitlabAuthToken" | "gitlabAuthTokenType" | "reportRoadmapDedupeEnabled" | "reportRoadmapLabel" | "reportRoadmapRepo">;
 
 interface SettingsModalProps {
   onClose: () => void;
   addToast: (message: string, type?: ToastType) => void;
   projectId?: string;
-  /** Optional section to show when the modal first opens. Defaults to the global General section. */
+  /** Optional section to show when the modal first opens. Defaults to the global Appearance section. */
   initialSection?: SectionId;
   /** Current theme mode */
   themeMode?: ThemeMode;
@@ -691,6 +867,8 @@ interface SettingsModalProps {
   onShadcnCustomColorsChange?: (colors: Record<string, string>) => void;
   /** Mirrors pending Quick Chat launcher changes into the app shell immediately. */
   onQuickChatButtonModeChange?: (mode: "floating" | "footer" | "off") => void;
+  /** Mirrors pending mobile quick-action changes into the app shell immediately. */
+  onMobileNavPrimaryItemsChange?: (items: string[]) => void;
   /** Optional callback when user wants to reopen the onboarding guide */
   onReopenOnboarding?: () => void;
   /** Optional callback to open approvals/mailbox view. */
@@ -954,6 +1132,7 @@ export function SettingsModal({
   onDashboardFontScaleChange,
   onShadcnCustomColorsChange,
   onQuickChatButtonModeChange,
+  onMobileNavPrimaryItemsChange,
   onReopenOnboarding,
   onOpenApprovals,
   onOpenWorkflowSettings,
@@ -978,14 +1157,33 @@ export function SettingsModal({
   const modalRef = useRef<HTMLDivElement>(null);
   const settingsContentRef = useRef<HTMLDivElement>(null);
   const workflowLaneSaverRef = useRef<SectionSaveHandler | null>(null);
+  /*
+  FNXC:SettingsAutoSave 2026-08-03-01:00:
+  Workflow lane edits live outside the shared Settings form. Track their revision
+  alongside form dirtiness so Option 1 auto-save and every close path flush them
+  too; a completion only clears the revision it actually persisted.
+  */
+  const workflowLaneRevisionRef = useRef(0);
+  const [workflowLanesDirty, setWorkflowLanesDirty] = useState(false);
+  const markWorkflowLanesDirty = useCallback(() => {
+    workflowLaneRevisionRef.current += 1;
+    setWorkflowLanesDirty(true);
+  }, []);
   const registerWorkflowLaneSaver = useCallback((saver: SectionSaveHandler | null) => {
-    workflowLaneSaverRef.current = saver;
+    /*
+    FNXC:ProjectModelsWorkflowLanes 2026-07-14-09:07:
+    Project Models workflow lane edits are workflow setting-values, not normal project settings. Keep the latest saver registered across section unmounts so auto-save and close flushing retain project-scoped workflow overrides after navigation.
+    */
+    if (saver) {
+      workflowLaneSaverRef.current = saver;
+    }
   }, []);
   // Modal-only: persist user-resized dialog dimensions. Embedded view fills its host and is not resizable.
   useModalResizePersist(modalRef, resizePersistEnabled, "fusion:settings-modal-size");
   const sessionBannersHidden = useSessionBannersHidden();
   const [form, setForm] = useState<SettingsFormState>({
     maxConcurrent: 2,
+    maxConcurrentVerifications: 1,
     maxTriageConcurrent: 2,
     maxWorktrees: 4,
     pollIntervalMs: 15000,
@@ -999,6 +1197,13 @@ export function SettingsModal({
     planApprovalMode: "auto-approve-all",
     mergeStrategy: "direct",
     maxAutoMergeRetries: 3,
+    executorToolFailureRetryCount: 2,
+    executorToolFailureRetryBackoffMs: 2000,
+    executorToolFailureThreshold: 3,
+    executorModelEscalationEnabled: false,
+    executorEscalationProvider: "",
+    executorEscalationModelId: "",
+    executorEscalationNodeId: "",
     mergeIntegrationWorktree: "reuse-task-worktree",
     mergeAdvanceAutoSync: "stash-and-ff",
     merger: { mode: "ai", maxReviewPasses: 3, allowDirtyLocalCheckoutSync: true },
@@ -1006,7 +1211,7 @@ export function SettingsModal({
     showWorktreeGrouping: false,
     openTasksInRightSidebar: false,
     openMobileTasksInPopup: false,
-    taskPopupsBoardListOnly: false,
+    taskPopupsBoardListOnly: true,
     showCostBadgeOnCards: false,
     taskDetailChatFirst: false,
     executorAllowSiblingBranchRename: false,
@@ -1021,6 +1226,7 @@ export function SettingsModal({
     includeTaskIdInCommit: true,
     worktreeInitCommand: "",
     ntfyEnabled: false,
+    agentClarificationEnabled: false,
     ntfyTopic: undefined,
     ntfyAccessToken: undefined,
     failureNotificationMode: "sticky-only",
@@ -1036,15 +1242,49 @@ export function SettingsModal({
   const [loading, setLoading] = useState(true);
   // Guards the Save action against double-submit (rapid clicks / Enter) while the
   // parallel global+project writes are in flight.
-  const [isSaving, setIsSaving] = useState(false);
+  const [, setIsSaving] = useState(false);
+  const [autoSaveStatus, setAutoSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [autoSaveReady, setAutoSaveReady] = useState(false);
+  const autoSaveActivationSnapshotRef = useRef<string | null>(null);
+  const persistInFlightRef = useRef(false);
+  const trailingPersistRef = useRef(false);
+  const lastPersistSucceededRef = useRef(true);
+  const persistSettingsRef = useRef<(() => Promise<boolean>) | null>(null);
+  const latestAutoSaveStateRef = useRef({ dirty: false, changed: false });
+  const requestSectionChangeRef = useRef<((sectionId: SectionId) => void) | null>(null);
   // Track initial values to detect explicit clears for null-as-delete semantics
   const [initialValues, setInitialValues] = useState<Settings | null>(null);
   // Track scoped settings for inheritance detection (fetched alongside merged settings)
   // This stores the raw { global, project } structure from the API
   const [scopedSettings, setScopedSettings] = useState<{ global: GlobalSettings; project: Partial<Settings> } | null>(null);
-  const [globalGitlabSettings, setGlobalGitlabSettings] = useState<GlobalGitlabSettings | null>(null);
+  const [globalGitlabSettings, setGlobalGitlabSettings] = useState<GlobalSourceControlSettings | null>(null);
   // Track initial scoped values for null-as-delete semantics on project overrides
   const [initialScopedValues, setInitialScopedValues] = useState<{ global: GlobalSettings; project: Partial<Settings> } | null>(null);
+  const mcpFormForScope = useCallback((scope: McpSettingsScope): Settings => ({
+    ...form,
+    mcpServers: resolveScopedMcpSettings(scope, scopedSettings),
+  }), [form, scopedSettings]);
+  const setMcpFormForScope = useCallback((scope: McpSettingsScope): Dispatch<SetStateAction<Settings>> => (update) => {
+    setScopedSettings((current) => {
+      if (!current) return current;
+      const currentForm = {
+        ...form,
+        mcpServers: resolveScopedMcpSettings(scope, current),
+      };
+      const nextForm = typeof update === "function" ? update(currentForm) : update;
+      if (scope === "global") {
+        return {
+          ...current,
+          global: { ...current.global, mcpServers: nextForm.mcpServers },
+        };
+      }
+      return {
+        ...current,
+        project: { ...current.project, mcpServers: nextForm.mcpServers },
+      };
+    });
+  }, [form]);
   // Find the first non-group-header section for visibility fallback handling
   const firstNonHeaderSection = SETTINGS_SECTIONS.find((s) => !s.isGroupHeader);
   const [activeSection, setActiveSection] = useState<SectionId>(() => {
@@ -1075,6 +1315,13 @@ export function SettingsModal({
   FNXC:Settings 2026-07-09-00:00:
   Mobile Settings navigation is controlled by both the viewport hook and the CSS media query because tests and embedded shells can mock one surface independently. Treat either mobile signal as sufficient so the compact picker/search-toggle path stays available whenever Settings is in mobile mode.
   */
+  /*
+  FNXC:SettingsSearch 2026-07-15-17:35:
+  The setting a search result asked to land on. Held here rather than in the sections because the modal owns both halves of the jump: it switches the active section AND scrolls to the row, and only the row itself knows how to flag the match (via SettingsSearchHighlightProvider).
+  */
+  const [highlightedSettingKey, setHighlightedSettingKey] = useState<string | null>(null);
+  /** Set when a search result drives the next section change; see the scroll-to-top effect. */
+  const settingsJumpPendingRef = useRef(false);
   const [showMobileSectionPicker, setShowMobileSectionPicker] = useState(() =>
     viewportMode === "mobile" ||
     (typeof window !== "undefined" && typeof window.matchMedia === "function"
@@ -1131,6 +1378,10 @@ export function SettingsModal({
   const [updateCheckResult, setUpdateCheckResult] = useState<UpdateCheckResponse | null>(null);
   const [updateInstallLoading, setUpdateInstallLoading] = useState(false);
   const [updateInstallResult, setUpdateInstallResult] = useState<UpdateInstallResponse | null>(null);
+  const [restartSupported, setRestartSupported] = useState<boolean | undefined>();
+  const [restartLoading, setRestartLoading] = useState(false);
+  const [restartScheduled, setRestartScheduled] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
   const gitHubStarCount = useGitHubStarCount();
   const [starClicked, markStarClicked] = useStarClickedFlag();
   const [prefixError, setPrefixError] = useState<string | null>(null);
@@ -1138,6 +1389,7 @@ export function SettingsModal({
   const [overlapPathPickerIndex, setOverlapPathPickerIndex] = useState<number | null>(null);
   const [worktreesDirPickerOpen, setWorktreesDirPickerOpen] = useState(false);
   const [worktreeCopyFilePickerIndex, setWorktreeCopyFilePickerIndex] = useState<number | null>(null);
+
   /*
   FNXC:SettingsReset 2026-07-04-00:20:
   Reset Settings confirmation dialog state (FN-7506). `resetInFlight` guards both
@@ -1201,12 +1453,34 @@ export function SettingsModal({
   FNXC:SettingsSearch 2026-07-04-00:00:
   Operators need Settings search to find the section containing a setting without bypassing feature gates. Search filters only the already-visible section list, matches section labels plus real setting-label/help i18n keys and curated keywords, suppresses empty group headers, and keeps duplicate global/project labels distinguishable in the mobile picker.
   */
+  /*
+  FNXC:SettingsSearch 2026-07-15-17:35:
+  Search resolves to individual settings, not just sections: the index carries every control's label and help text, so a query lands on the control instead of on a section the operator must then re-scan by eye.
+  Results are restricted to `visibleSections` so search never surfaces a setting behind a feature gate or hidden by the Advanced switch — the pre-existing contract above, now enforced on the per-setting list as well as the nav.
+  `t` is threaded in as the resolver so results follow the active locale; the index stores i18n keys plus English fallbacks rather than resolved strings.
+  */
+  const settingsSearchResults = useMemo(() => {
+    if (!normalizedSettingsSearchQuery) return [];
+    const visibleSectionIds = new Set(visibleSections.map((section) => section.id));
+    return rankSettingsSearchResults(
+      SETTINGS_SEARCH_ENTRIES.filter((entry) => visibleSectionIds.has(entry.sectionId)),
+      normalizedSettingsSearchQuery,
+      (key, fallback) => t(key, fallback),
+    );
+  }, [normalizedSettingsSearchQuery, t, visibleSections]);
+
+  const entryMatchedSectionIds = useMemo(
+    () => matchedSectionIds(settingsSearchResults),
+    [settingsSearchResults],
+  );
+
   const searchMatchedSections = useMemo(() => filterSettingsSectionsForSearch(
     visibleSections,
     normalizedSettingsSearchQuery,
     (section) => t(section.labelKey, section.label),
     (key) => t(key),
-  ), [normalizedSettingsSearchQuery, t, visibleSections]);
+    entryMatchedSectionIds,
+  ), [normalizedSettingsSearchQuery, t, visibleSections, entryMatchedSectionIds]);
   const searchableSectionOptions = searchMatchedSections.filter((section) => !section.isGroupHeader);
   const hasSettingsSearchQuery = normalizedSettingsSearchQuery.length > 0;
   const hasSettingsSearchResults = searchableSectionOptions.length > 0;
@@ -1215,6 +1489,75 @@ export function SettingsModal({
   const isMobileSettingsSearch = viewportMode === "mobile";
   const settingsSearchRowVisible = !isMobileSettingsSearch || mobileSearchRowExpanded;
   const firstSearchMatchedSectionId = resolveFirstSelectableSettingsSection(searchMatchedSections, firstVisibleSectionId);
+
+  /*
+  FNXC:SettingsSearch 2026-07-15-17:35:
+  Landing a search result is two steps that cannot happen in one: switching section unmounts the old one and mounts the target, so the row does not exist in the DOM until React commits. The click sets section + key, and the effect below scrolls once the row is actually there.
+  */
+  const handleSettingsSearchResultSelect = useCallback((sectionId: string, key: string) => {
+    // Claims the upcoming section change so the scroll-to-top below yields to the
+    // jump; otherwise the row we just scrolled to would be scrolled away from.
+    settingsJumpPendingRef.current = true;
+    /*
+    FNXC:SettingsAutoSave 2026-08-03-00:00:
+    Search navigation is an operator-initiated section change too. Route it
+    through the same flush path as sidebar/mobile navigation so a pending edit
+    to raw global GitLab fields cannot be re-scoped as a project save after the
+    search changes activeSection.
+    */
+    requestSectionChangeRef.current?.(sectionId as SectionId);
+    setHighlightedSettingKey(key);
+  }, []);
+
+  /*
+  FNXC:SettingsNavigation 2026-07-16-01:10:
+  Switching section starts you at the top of it.
+  Sections keep no scroll of their own, so the container's offset carried over: leaving a long section scrolled halfway (Scheduling, General) and picking a short one landed mid-content — on mobile, often past everything, on an apparently blank screen with no hint to scroll up.
+  Guarded by a ref rather than by reading `highlightedSettingKey`: a search jump also changes `activeSection`, and that key clears itself ~1.6s later, which would re-run this effect and yank the operator away from the row they had just jumped to. The ref is consumed once, so only the jump's own section change is exempt.
+  */
+  useEffect(() => {
+    if (settingsJumpPendingRef.current) {
+      settingsJumpPendingRef.current = false;
+      return;
+    }
+    /*
+    FNXC:SettingsNavigation 2026-07-16-01:10:
+    Assigns `scrollTop` rather than calling `scrollTo({top:0})`: jsdom implements the property but not the method, so the smarter-looking call throws "scrollTo is not a function" in component tests. The jump is instant either way — a section change is a context switch, not a movement the eye should follow.
+    */
+    if (settingsContentRef.current) settingsContentRef.current.scrollTop = 0;
+  }, [activeSection]);
+
+  useEffect(() => {
+    if (!highlightedSettingKey) return;
+    const container = settingsContentRef.current;
+    if (!container) return;
+
+    const row = container.querySelector<HTMLElement>(`[data-settings-key="${CSS.escape(highlightedSettingKey)}"]`);
+    /*
+    FNXC:SettingsSearch 2026-07-15-17:35:
+    A result can point at a control the active section does not render at all right now — a conditional field whose dependency is off. Scrolling is skipped rather than guessed at; the section still opens, which is strictly better than the pre-rewrite behavior of only ever opening the section.
+    `CSS.escape` because setting keys reach this selector unsanitized; a key with a dot or colon would otherwise build a selector that throws and take the modal down.
+    */
+    if (!row) return;
+
+    /*
+    FNXC:SettingsSearch 2026-07-15-18:52:
+    Reveal every `<details>` ancestor before scrolling. Rows inside a collapsed disclosure are in the DOM but not visible, so the jump would scroll to — and highlight — a control the operator cannot see, which reads as search doing nothing.
+    This is not a rare edge: the settings most worth searching for are the ones tucked behind "Advanced" (the ntfy access token, the Cloudflare named-tunnel trio, the Merge option details).
+    Walks ancestors rather than just the nearest one, since disclosures can nest.
+    */
+    for (let node = row.parentElement; node; node = node.parentElement) {
+      if (node instanceof HTMLDetailsElement) node.open = true;
+    }
+
+    row.scrollIntoView({ block: "center", behavior: settingsSearchScrollBehavior() });
+
+    /*
+    The highlight is a one-shot: it clears itself after the row's wash finishes so it does not persist behind the operator's next query, and so re-selecting the same result re-triggers the animation (an unchanged key would not restart it).
+    */
+    const timer = window.setTimeout(() => setHighlightedSettingKey(null), SETTINGS_SEARCH_HIGHLIGHT_MS);
+    return () => window.clearTimeout(timer);
+  }, [highlightedSettingKey, activeSection]);
 
   /** Get the scope of the currently active section */
   const activeSectionScope = visibleSections.find((s) => s.id === activeSection)?.scope;
@@ -1465,6 +1808,13 @@ export function SettingsModal({
           mergeIntegrationWorktree: normalizeMergeIntegrationWorktreeMode(s.mergeIntegrationWorktree),
           mergeAdvanceAutoSync: normalizeMergeAdvanceAutoSyncMode(s.mergeAdvanceAutoSync),
           maxAutoMergeRetries: resolveMaxAutoMergeRetriesForSettingsForm(s),
+          executorToolFailureRetryCount: resolveNonNegativeExecutorToolFailureSetting(s.executorToolFailureRetryCount, 2),
+          executorToolFailureRetryBackoffMs: resolveNonNegativeExecutorToolFailureSetting(s.executorToolFailureRetryBackoffMs, 2000),
+          executorToolFailureThreshold: Math.max(1, Math.floor(Number(s.executorToolFailureThreshold ?? 3) || 3)),
+          executorModelEscalationEnabled: s.executorModelEscalationEnabled === true,
+          executorEscalationProvider: s.executorEscalationProvider ?? "",
+          executorEscalationModelId: s.executorEscalationModelId ?? "",
+          executorEscalationNodeId: s.executorEscalationNodeId ?? "",
           worktreeCopyFiles: Array.isArray(s.worktreeCopyFiles) ? s.worktreeCopyFiles : [],
         };
         setForm(normalizedSettings);
@@ -1476,6 +1826,9 @@ export function SettingsModal({
           gitlabApiBaseUrl: scoped.global.gitlabApiBaseUrl,
           gitlabAuthToken: scoped.global.gitlabAuthToken,
           gitlabAuthTokenType: scoped.global.gitlabAuthTokenType,
+          reportRoadmapDedupeEnabled: scoped.global.reportRoadmapDedupeEnabled,
+          reportRoadmapLabel: scoped.global.reportRoadmapLabel,
+          reportRoadmapRepo: scoped.global.reportRoadmapRepo,
         });
         setInitialScopedValues({
           ...scoped,
@@ -1505,8 +1858,13 @@ export function SettingsModal({
     void refreshSettingsForm(true);
   }, [addToast, projectId]);
 
+  /*
+  FNXC:SettingsConcurrency 2026-07-15-18:52:
+  Fetches for EITHER scheduling section. `scheduling-global` renders the cap itself, and `scheduling` (project) gates its own concurrency inputs on this load — the FN-era invariant that a concurrency input stays disabled until its live value arrives, so an operator cannot overwrite a resolved limit with a blank fallback.
+  Gating on `"scheduling"` alone (the id before the Global/Project split) would leave the global cap's own section waiting on a fetch that never fires, disabling the only control it renders.
+  */
   useEffect(() => {
-    if (activeSection !== "scheduling" || hasFetchedGlobalConcurrencyRef.current) {
+    if ((activeSection !== "scheduling" && activeSection !== "scheduling-global") || hasFetchedGlobalConcurrencyRef.current) {
       return;
     }
 
@@ -1558,6 +1916,10 @@ export function SettingsModal({
   const handleCheckForUpdates = useCallback(async () => {
     setUpdateCheckLoading(true);
     setUpdateInstallResult(null);
+    setRestartSupported(undefined);
+    setRestartLoading(false);
+    setRestartScheduled(false);
+    setRestartError(null);
 
     try {
       const result = await checkForUpdates();
@@ -1583,6 +1945,9 @@ export function SettingsModal({
   const handleInstallUpdate = useCallback(async () => {
     setUpdateInstallLoading(true);
     setUpdateInstallResult(null);
+    setRestartLoading(false);
+    setRestartScheduled(false);
+    setRestartError(null);
 
     try {
       const result = await installUpdate(projectId);
@@ -1609,6 +1974,53 @@ export function SettingsModal({
       setUpdateInstallLoading(false);
     }
   }, [addToast, appVersion, projectId, t, updateCheckResult]);
+
+  useEffect(() => {
+    if (!updateCheckResult?.updateAvailable && updateInstallResult?.updated !== true) {
+      return;
+    }
+
+    let cancelled = false;
+    setRestartSupported(undefined);
+
+    void fetchSystemInfo()
+      .then((info) => {
+        if (!cancelled) setRestartSupported(info.restartSupported);
+      })
+      .catch(() => {
+        // Fail closed: system capability fetch errors must not expose an unavailable restart action.
+        if (!cancelled) setRestartSupported(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [updateCheckResult?.updateAvailable, updateInstallResult?.updated]);
+
+  /*
+  FNXC:SettingsUpdate 2026-07-16-00:00:
+  After a successful in-app update, the Settings footer must offer the same supervised
+  one-click restart as SystemControlsArea. The FN-8134-deferred Settings surface keeps
+  the control disabled with manual-restart guidance unless restartSupported is true.
+  */
+  const handleRestart = useCallback(async () => {
+    if (restartLoading || restartSupported !== true) return;
+
+    setRestartLoading(true);
+    setRestartError(null);
+    try {
+      const result = await requestSystemRestart("settings-update");
+      if (result.scheduled) {
+        setRestartScheduled(true);
+      } else {
+        setRestartError(t("settings.general.restartFailed", "Restart could not be scheduled. Try restarting Fusion manually."));
+      }
+    } catch (error) {
+      setRestartError(getErrorMessage(error) || t("settings.general.restartFailed", "Restart could not be scheduled. Try restarting Fusion manually."));
+    } finally {
+      setRestartLoading(false);
+    }
+  }, [restartLoading, restartSupported, t]);
 
   const renderUpdateCheckResultContent = useCallback(() => {
     if (!updateCheckResult) {
@@ -1637,10 +2049,48 @@ export function SettingsModal({
             </a>
           </span>
           {installSucceeded ? (
-            <span className="settings-update-install-status settings-update-install-status--success" aria-live="polite">
-              {t("settings.general.updateSuccess", "Updated to v{{version}} — restart Fusion to apply", {
-                version: updateInstallResult.latestVersion ?? updateCheckResult.latestVersion,
-              })}
+            <span className="settings-update-install-succeeded">
+              <span className="settings-update-install-status settings-update-install-status--success" aria-live="polite">
+                {t("settings.general.updateSuccess", "Updated to v{{version}} — restart Fusion to apply", {
+                  version: updateInstallResult.latestVersion ?? updateCheckResult.latestVersion,
+                })}
+              </span>
+              {restartScheduled ? (
+                <span className="settings-update-install-status" aria-live="polite">
+                  {t("settings.general.restarting", "Restarting… Your connection will close shortly.")}
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-sm settings-update-now-btn"
+                  onClick={() => {
+                    void handleRestart();
+                  }}
+                  disabled={restartSupported !== true || restartLoading}
+                >
+                  {restartLoading ? (
+                    <>
+                      <RefreshCw size={12} className="spinning" aria-hidden="true" />
+                      {t("settings.general.restarting", "Restarting…")}
+                    </>
+                  ) : (
+                    <>
+                      <Power size={12} aria-hidden="true" />
+                      {t("settings.general.restartNow", "Restart Fusion")}
+                    </>
+                  )}
+                </button>
+              )}
+              {restartSupported !== true && (
+                <span className="settings-update-install-status" aria-live="polite">
+                  {t("settings.general.restartUnavailable", "Needs a supervising parent — restart Fusion manually without --no-supervise.")}
+                </span>
+              )}
+              {restartError && (
+                <span className="settings-update-install-status settings-update-install-status--error" aria-live="polite">
+                  {restartError}
+                </span>
+              )}
             </span>
           ) : (
             <button
@@ -1671,7 +2121,7 @@ export function SettingsModal({
     }
 
     return t("settings.general.upToDate", "You're up to date ✓");
-  }, [handleInstallUpdate, t, updateCheckResult, updateInstallLoading, updateInstallResult]);
+  }, [handleInstallUpdate, handleRestart, restartError, restartLoading, restartScheduled, restartSupported, t, updateCheckResult, updateInstallLoading, updateInstallResult]);
 
   // Load auth status when the authentication section is active
   const loadAuthStatus = useCallback(async () => {
@@ -1874,7 +2324,8 @@ export function SettingsModal({
   }, [activeSection, projectId]);
 
   useEffect(() => {
-    if (activeSection !== "general") {
+    // FNXC:SourceControl 2026-07-15-20:30: The tracking-repo select moved to the project source-control section; this loader must follow the control it populates or the select renders with no options.
+    if (activeSection !== "source-control") {
       return;
     }
 
@@ -1908,7 +2359,8 @@ export function SettingsModal({
   }, [activeSection, projectId]);
 
   useEffect(() => {
-    if (activeSection !== "global-general" || globalTrackingRepoLoadedRef.current) {
+    // FNXC:SourceControl 2026-07-15-20:30: Follows the global tracking-repo select into the global source-control section.
+    if (activeSection !== "source-control-global" || globalTrackingRepoLoadedRef.current) {
       return;
     }
 
@@ -2159,7 +2611,7 @@ export function SettingsModal({
         setDeviceCodes((prev) => ({ ...prev, [providerId]: deviceCode }));
       }
       if (providerId !== "github-copilot" || !deviceCode) {
-        window.open(appendTokenQuery(deviceCode?.verificationUri ?? url), "_blank");
+        openExternalUrl(appendTokenQuery(deviceCode?.verificationUri ?? url));
       }
 
       // Poll for auth completion every 2 seconds
@@ -2594,21 +3046,6 @@ export function SettingsModal({
     }
   }, [favoriteModels, favoriteProviders]);
 
-  // Modal-only: Escape dismisses the dialog. Embedded view is navigated away via the left sidebar, not Escape.
-  // FNXC:SettingsReset 2026-07-04-00:30: Skipped while the Reset Settings confirmation dialog is
-  // open so Escape closes only that dialog (its own listener below), not the whole Settings modal.
-  useEffect(() => {
-    if (!escapeEnabled) return;
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !resetDialogOpen) onClose();
-    };
-    document.addEventListener("keydown", handleKey);
-    return () => document.removeEventListener("keydown", handleKey);
-  }, [onClose, escapeEnabled, resetDialogOpen]);
-
-  // Modal-only: backdrop click dismisses. Embedded view has no overlay backdrop.
-  const modalOverlayDismissProps = useOverlayDismiss(onClose);
-  const overlayDismissProps = overlayDismissEnabled ? modalOverlayDismissProps : {};
 
   /**
    * Lane status types:
@@ -2707,6 +3144,22 @@ export function SettingsModal({
       projectThinkingKey: "titleSummarizerThinkingLevel",
       helperText: "AI model used for auto-generating task titles and merge commit summaries.",
         fallbackOrder: "Project override → Global summarization lane → Project planning lane → Project default lane → Global default lane → Automatic resolution",
+    },
+    /*
+    FNXC:GitHubImportTranslate 2026-07-15-09:30:
+    Import auto-translation gets its OWN lane instead of riding the summarization lane. Translating an imported GitHub/GitLab issue is one short, readonly, per-issue call with no repo context, so operators must be able to pin a cheap/fast model to it without dragging the summarization lane (which titles tasks and writes merge commit messages) onto that same cheap model. It still falls back THROUGH summarization, so operators who do not care get sensible behavior with zero configuration.
+    */
+    {
+      laneId: "import-translate",
+      label: "Import Auto-Translation Model",
+      globalProviderKey: "importTranslateGlobalProvider",
+      globalModelKey: "importTranslateGlobalModelId",
+      globalThinkingKey: "importTranslateGlobalThinkingLevel",
+      projectProviderKey: "importTranslateProvider",
+      projectModelKey: "importTranslateModelId",
+      projectThinkingKey: "importTranslateThinkingLevel",
+      helperText: "AI model used to translate foreign-language GitHub/GitLab issue titles and bodies in the Import Tasks panel.",
+      fallbackOrder: "Project override → Global import-translate lane → Summarization lane → Project default → Global default",
     },
   ];
 
@@ -2991,38 +3444,66 @@ export function SettingsModal({
     });
   }, []);
 
-  const handleSave = useCallback(async () => {
-    if (isSaving) return;
-    if (prefixError || presetDraft) return;
+  /*
+  FNXC:SettingsAutoSave 2026-08-02-12:00:
+  FN-8395 implements issue #2343 Option 1: form-backed Settings persist through
+  this debounced single-flight path, never a Save button or dirty-leave prompt.
+  Each request works from a captured render snapshot and advances only matching
+  baselines, so an older response cannot erase a newer edit.
+  */
+  const persistSettings = useCallback(async (): Promise<boolean> => {
+    if (persistInFlightRef.current) {
+      trailingPersistRef.current = true;
+      return false;
+    }
+    if (prefixError || presetDraft) {
+      lastPersistSucceededRef.current = false;
+      return false;
+    }
 
-    const limits = form.researchSettings?.limits;
+    const formSnapshot = form;
+    const scopedSettingsSnapshot = scopedSettings;
+    const initialValuesSnapshot = initialValues;
+    const initialScopedValuesSnapshot = initialScopedValues;
+    const globalMaxConcurrentSnapshot = globalMaxConcurrent;
+    const activeSectionSnapshot = activeSection;
+    const globalGitlabSettingsSnapshot = globalGitlabSettings;
+    const workflowLaneRevisionSnapshot = workflowLaneRevisionRef.current;
+    const limits = formSnapshot.researchSettings?.limits;
     if (limits?.maxConcurrentRuns !== undefined && (!Number.isFinite(limits.maxConcurrentRuns) || limits.maxConcurrentRuns < 1)) {
       setResearchLimitError("Research max concurrent runs must be at least 1.");
-      return;
+      lastPersistSucceededRef.current = false;
+      return false;
     }
     if (limits?.maxSourcesPerRun !== undefined && (!Number.isFinite(limits.maxSourcesPerRun) || limits.maxSourcesPerRun < 1)) {
       setResearchLimitError("Research max sources per run must be at least 1.");
-      return;
+      lastPersistSucceededRef.current = false;
+      return false;
     }
     if (limits?.maxDurationMs !== undefined && (!Number.isFinite(limits.maxDurationMs) || limits.maxDurationMs < 1000)) {
       setResearchLimitError("Research max duration must be at least 1000 ms.");
-      return;
+      lastPersistSucceededRef.current = false;
+      return false;
     }
     if (limits?.requestTimeoutMs !== undefined && (!Number.isFinite(limits.requestTimeoutMs) || limits.requestTimeoutMs < 1000)) {
       setResearchLimitError("Research request timeout must be at least 1000 ms.");
-      return;
+      lastPersistSucceededRef.current = false;
+      return false;
     }
     setResearchLimitError(null);
 
-    const shortcutValidationError = describeShortcutValidation(form.dashboardKeyboardShortcuts ?? {});
+    const shortcutValidationError = describeShortcutValidation(formSnapshot.dashboardKeyboardShortcuts ?? {});
     if (shortcutValidationError) {
       addToast(shortcutValidationError, "error");
-      return;
+      lastPersistSucceededRef.current = false;
+      return false;
     }
 
+    persistInFlightRef.current = true;
     setIsSaving(true);
+    setAutoSaveStatus("saving");
     try {
-      const normalizedWorktreeCopyFiles = normalizeWorktreeCopyFilesForSave(form.worktreeCopyFiles);
+      const normalizedWorktreeCopyFiles = normalizeWorktreeCopyFilesForSave(formSnapshot.worktreeCopyFiles);
       /*
       FNXC:WindowsTerminalStartup 2026-07-04-06:30:
       Worktrunk status is now only auto-probed once the integration is enabled, so a
@@ -3033,33 +3514,43 @@ export function SettingsModal({
       that fresh result instead.
       */
       let worktrunkVerifiedForSave = worktrunkInstallVerified;
-      if (form.worktrunk?.enabled === true && !worktrunkVerifiedForSave) {
+      if (formSnapshot.worktrunk?.enabled === true && !worktrunkVerifiedForSave) {
         const freshWorktrunkStatus = await worktrunkInstall.refresh();
         worktrunkVerifiedForSave = freshWorktrunkStatus.status === "installed";
       }
       /*
       FNXC:GitLabEnablement 2026-07-02-00:00:
-      The Global General section must edit raw global GitLab settings, not the merged project-effective form. Otherwise a project override can silently overwrite the global GitLab default on a no-op save.
+      The global source-control section must edit raw global GitLab settings, not the merged project-effective formSnapshot. Otherwise a project override can silently overwrite the global GitLab default on a no-op save.
+
+      FNXC:SourceControl 2026-07-15-20:30:
+      Section id moved with the controls (was "global-general"). This must name whichever section renders the global GitLab rows: a stale id here would send the merged, project-effective values to the global patch — the exact overwrite the scoped-state indirection exists to prevent.
       */
-      const gitlabFormForSave = activeSection === "global-general" && globalGitlabSettings ? globalGitlabSettings : form;
+      const gitlabFormForSave = activeSectionSnapshot === "source-control-global" && globalGitlabSettingsSnapshot ? globalGitlabSettingsSnapshot : formSnapshot;
       const payload = {
-        ...form,
-        worktreeInitCommand: form.worktreeInitCommand?.trim() || undefined,
-        worktreesDir: form.worktreesDir?.trim() || undefined,
+        ...formSnapshot,
+        worktreeInitCommand: formSnapshot.worktreeInitCommand?.trim() || undefined,
+        worktreesDir: formSnapshot.worktreesDir?.trim() || undefined,
         worktrunk: {
-          enabled: worktrunkVerifiedForSave && form.worktrunk?.enabled === true,
-          binaryPath: form.worktrunk?.binaryPath?.trim() || undefined,
-          onFailure: form.worktrunk?.onFailure ?? "fail",
+          enabled: worktrunkVerifiedForSave && formSnapshot.worktrunk?.enabled === true,
+          binaryPath: formSnapshot.worktrunk?.binaryPath?.trim() || undefined,
+          onFailure: formSnapshot.worktrunk?.onFailure ?? "fail",
         },
-        maxAutoMergeRetries: resolveMaxAutoMergeRetriesForSettingsForm(form),
-        taskPrefix: form.taskPrefix?.trim() || undefined,
-        githubTrackingDefaultRepo: form.githubTrackingDefaultRepo?.trim() || undefined,
+        maxAutoMergeRetries: resolveMaxAutoMergeRetriesForSettingsForm(formSnapshot),
+        executorToolFailureRetryCount: resolveNonNegativeExecutorToolFailureSetting(formSnapshot.executorToolFailureRetryCount, 2),
+        executorToolFailureRetryBackoffMs: resolveNonNegativeExecutorToolFailureSetting(formSnapshot.executorToolFailureRetryBackoffMs, 2000),
+        executorToolFailureThreshold: Math.max(1, Math.floor(Number(formSnapshot.executorToolFailureThreshold ?? 3) || 3)),
+        executorModelEscalationEnabled: formSnapshot.executorModelEscalationEnabled === true,
+        executorEscalationProvider: formSnapshot.executorEscalationProvider?.trim() || undefined,
+        executorEscalationModelId: formSnapshot.executorEscalationModelId?.trim() || undefined,
+        executorEscalationNodeId: formSnapshot.executorEscalationNodeId?.trim() || undefined,
+        taskPrefix: formSnapshot.taskPrefix?.trim() || undefined,
+        githubTrackingDefaultRepo: formSnapshot.githubTrackingDefaultRepo?.trim() || undefined,
         /*
         FNXC:DashboardShortcuts 2026-07-04-00:00:
         FN-7553 normalizes every declared shortcut action (derived from resolveDashboardKeyboardShortcuts' key set) on save, not just quickChat/terminal, so newly-added actions get the same trim/normalize-before-persist treatment.
         */
         dashboardKeyboardShortcuts: Object.fromEntries(
-          (Object.entries(resolveDashboardKeyboardShortcuts(form.dashboardKeyboardShortcuts)) as [DashboardShortcutAction, string][])
+          (Object.entries(resolveDashboardKeyboardShortcuts(formSnapshot.dashboardKeyboardShortcuts)) as [DashboardShortcutAction, string][])
             .map(([action, shortcut]) => [action, normalizeKeyboardShortcut(shortcut).normalized]),
         ) as DashboardKeyboardShortcutMap,
         gitlabEnabled: gitlabFormForSave.gitlabEnabled,
@@ -3067,22 +3558,26 @@ export function SettingsModal({
         gitlabApiBaseUrl: gitlabFormForSave.gitlabApiBaseUrl?.trim() || undefined,
         gitlabAuthToken: gitlabFormForSave.gitlabAuthToken?.trim() || undefined,
         gitlabAuthTokenType: gitlabFormForSave.gitlabAuthTokenType ?? "personal",
-        githubAuthToken: form.githubAuthToken?.trim() || undefined,
-        prTitlePromptInstructions: form.prTitlePromptInstructions?.trim() || undefined,
-        prDescriptionPromptInstructions: form.prDescriptionPromptInstructions?.trim() || undefined,
+        reportRoadmapDedupeEnabled: gitlabFormForSave.reportRoadmapDedupeEnabled,
+        reportRoadmapLabel: gitlabFormForSave.reportRoadmapLabel?.trim() || undefined,
+        reportRoadmapRepo: gitlabFormForSave.reportRoadmapRepo?.trim() || undefined,
+        githubAuthToken: formSnapshot.githubAuthToken?.trim() || undefined,
+        prTitlePromptInstructions: formSnapshot.prTitlePromptInstructions?.trim() || undefined,
+        prDescriptionPromptInstructions: formSnapshot.prDescriptionPromptInstructions?.trim() || undefined,
         /*
         FNXC:MergeSettings 2026-07-04-09:18:
         Push target text is meaningful only when direct post-merge pushing is enabled. Hiding the input must not keep submitting a stale remote/branch from the form state; clearing it lets project settings fall back to the default origin target when the toggle is disabled.
         */
-        pushRemote: form.pushAfterMerge ? form.pushRemote?.trim() || undefined : undefined,
-        overlapIgnorePaths: (form.overlapIgnorePaths ?? []).map((path) => path.trim()).filter((path) => path.length > 0),
-        worktreeCopyFiles: normalizedWorktreeCopyFiles.length > 0 || initialScopedValues?.project?.worktreeCopyFiles !== undefined
+        pushRemote: formSnapshot.pushAfterMerge ? formSnapshot.pushRemote?.trim() || undefined : undefined,
+        overlapIgnorePaths: (formSnapshot.overlapIgnorePaths ?? []).map((path) => path.trim()).filter((path) => path.length > 0),
+        worktreeCopyFiles: normalizedWorktreeCopyFiles.length > 0 || initialScopedValuesSnapshot?.project?.worktreeCopyFiles !== undefined
           ? normalizedWorktreeCopyFiles
           : undefined,
-        experimentalFeatures: normalizeExperimentalFeaturesForSave(form.experimentalFeatures),
+        experimentalFeatures: normalizeExperimentalFeaturesForSave(formSnapshot.experimentalFeatures),
       };
 
-      if (activeSection === "general") {
+      // FNXC:SourceControl 2026-07-15-20:30: Both GitLab URL-cache refreshes follow their editing sections ("general"/"global-general" before the move).
+      if (activeSectionSnapshot === "source-control") {
         resolveGitlabConfig({
           project: {
             gitlabInstanceUrl: payload.gitlabInstanceUrl,
@@ -3090,7 +3585,7 @@ export function SettingsModal({
           },
         });
       }
-      if (activeSection === "global-general") {
+      if (activeSectionSnapshot === "source-control-global") {
         resolveGitlabConfig({
           global: {
             gitlabInstanceUrl: payload.gitlabInstanceUrl,
@@ -3106,9 +3601,13 @@ export function SettingsModal({
       // isolation; see settings/save-split.ts.
       const { globalPatch, projectPatch } = splitSettingsSave({
         payload,
-        initialValues,
-        initialScopedValues,
-        activeSection,
+        initialValues: initialValuesSnapshot,
+        initialScopedValues: initialScopedValuesSnapshot,
+        activeSection: activeSectionSnapshot,
+        scopedMcpValues: scopedSettingsSnapshot ? {
+          global: resolveScopedMcpSettings("global", scopedSettingsSnapshot),
+          project: resolveScopedMcpSettings("project", scopedSettingsSnapshot),
+        } : undefined,
       });
 
       // Save both scopes in parallel if they have changes.
@@ -3118,22 +3617,207 @@ export function SettingsModal({
       await Promise.all([
         Object.keys(globalPatch).length > 0 ? updateGlobalSettings(globalPatch) : Promise.resolve(),
         Object.keys(projectPatch).length > 0 ? updateSettings(projectPatch, projectId) : Promise.resolve(),
-        globalMaxConcurrent !== initialGlobalMaxConcurrentRef.current
-          ? updateGlobalConcurrency({ globalMaxConcurrent: globalMaxConcurrent ?? 4 })
+        globalMaxConcurrentSnapshot !== initialGlobalMaxConcurrentRef.current
+          ? updateGlobalConcurrency({ globalMaxConcurrent: globalMaxConcurrentSnapshot ?? 4 })
           : Promise.resolve(),
       ]);
 
       await workflowLaneSaverRef.current?.();
 
-      addToast(t("settings.general.settingsSaved", "Settings saved"), "success");
-      onClose();
+      // Only clear workflow-lane dirtiness when no newer lane edit arrived.
+      if (workflowLaneRevisionRef.current === workflowLaneRevisionSnapshot) {
+        setWorkflowLanesDirty(false);
+      }
+
+      // Quiet state feedback avoids a toast for each debounced edit.
+      setAutoSaveStatus("saved");
+      /*
+      FNXC:SettingsAutoSave 2026-08-02-20:50:
+      A completed request may describe an older form snapshot. Advance only the
+      keys that request actually wrote so a response can never bless unrelated,
+      newer edits as already persisted.
+      */
+      setInitialValues((current) => current ? { ...current, ...globalPatch } : current);
+      setInitialScopedValues((current) => {
+        if (!current) return current;
+        const mergePatch = (base: Record<string, unknown>, patch: Record<string, unknown>) => Object.fromEntries(
+          Object.entries({ ...base, ...patch }).map(([key, value]) => [key, value === null ? undefined : value]),
+        );
+        return {
+          global: mergePatch(current.global as Record<string, unknown>, globalPatch as Record<string, unknown>) as GlobalSettings,
+          project: mergePatch(current.project, projectPatch as Record<string, unknown>) as Partial<Settings>,
+        };
+      });
+      if (globalMaxConcurrentSnapshot !== initialGlobalMaxConcurrentRef.current) {
+        initialGlobalMaxConcurrentRef.current = globalMaxConcurrentSnapshot;
+      }
+      /*
+      FNXC:SettingsAutoSave 2026-08-02-21:45:
+      A successful snapshot becomes the next autosave comparison point. If the
+      user edited while this request was in flight, the live snapshot differs
+      and the effect queues exactly one trailing write.
+      */
+      autoSaveActivationSnapshotRef.current = JSON.stringify({
+        form: formSnapshot,
+        scopedSettings: scopedSettingsSnapshot,
+        globalGitlabSettings: globalGitlabSettingsSnapshot,
+        globalMaxConcurrent: globalMaxConcurrentSnapshot,
+      });
+      lastPersistSucceededRef.current = true;
+      return true;
     } catch (err) {
-      if (err instanceof WorkflowLaneFlushRejection) return;
+      lastPersistSucceededRef.current = false;
+      if (err instanceof WorkflowLaneFlushRejection) return false;
+      setAutoSaveStatus("error");
       addToast(getErrorMessage(err), "error");
+      return false;
     } finally {
+      persistInFlightRef.current = false;
       setIsSaving(false);
+      if (trailingPersistRef.current) {
+        trailingPersistRef.current = false;
+        void persistSettingsRef.current?.();
+      }
     }
-  }, [form, globalGitlabSettings, globalMaxConcurrent, prefixError, presetDraft, initialValues, initialScopedValues, onClose, addToast, projectId, activeSection, isSaving, t]);
+  }, [form, globalGitlabSettings, globalMaxConcurrent, prefixError, presetDraft, initialValues, initialScopedValues, scopedSettings, addToast, projectId, activeSection, t]);
+
+  persistSettingsRef.current = persistSettings;
+  const settingsDirty = useMemo(() => {
+    const dirtyPayload = activeSection === "source-control-global" && globalGitlabSettings
+      ? { ...form, ...globalGitlabSettings }
+      : form;
+    const { globalPatch, projectPatch } = splitSettingsSave({
+      payload: dirtyPayload,
+      initialValues,
+      initialScopedValues,
+      activeSection,
+      scopedMcpValues: scopedSettings ? {
+        global: resolveScopedMcpSettings("global", scopedSettings),
+        project: resolveScopedMcpSettings("project", scopedSettings),
+      } : undefined,
+    });
+    return Object.keys(globalPatch).length > 0 || Object.keys(projectPatch).length > 0
+      || globalMaxConcurrent !== initialGlobalMaxConcurrentRef.current
+      || workflowLanesDirty;
+  }, [form, globalGitlabSettings, globalMaxConcurrent, initialScopedValues, initialValues, scopedSettings, activeSection, workflowLanesDirty]);
+
+  const autoSaveSnapshot = useMemo(() => JSON.stringify({ form, scopedSettings, globalGitlabSettings, globalMaxConcurrent, workflowLaneRevision: workflowLaneRevisionRef.current }), [form, globalGitlabSettings, globalMaxConcurrent, scopedSettings, workflowLanesDirty]);
+  const hasAutoSaveChange = autoSaveActivationSnapshotRef.current !== null
+    && autoSaveActivationSnapshotRef.current !== autoSaveSnapshot;
+  latestAutoSaveStateRef.current = { dirty: settingsDirty, changed: hasAutoSaveChange };
+
+  useEffect(() => {
+    /*
+    FNXC:SettingsAutoSave 2026-08-02-21:35:
+    Some legacy form values are normalized differently from their raw scoped
+    settings. Snapshot the hydrated form before enabling autosave so opening
+    Settings cannot write those untouched defaults; later user edits change the
+    snapshot and are persisted through the normal dirty split.
+    */
+    if (!loading && autoSaveActivationSnapshotRef.current === null) {
+      autoSaveActivationSnapshotRef.current = autoSaveSnapshot;
+      setAutoSaveReady(true);
+    }
+  }, [autoSaveSnapshot, loading]);
+
+  useEffect(() => {
+    if (loading || !autoSaveReady || !hasAutoSaveChange || !settingsDirty || prefixError || presetDraft) return;
+    if (persistInFlightRef.current) {
+      trailingPersistRef.current = true;
+      return;
+    }
+    if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    autoSaveTimerRef.current = setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      void persistSettingsRef.current?.();
+    }, 500);
+    return () => {
+      if (autoSaveTimerRef.current) clearTimeout(autoSaveTimerRef.current);
+    };
+  }, [loading, autoSaveReady, hasAutoSaveChange, settingsDirty, prefixError, presetDraft, form, scopedSettings, globalGitlabSettings, globalMaxConcurrent, workflowLanesDirty, activeSection]);
+
+  const requestClose = useCallback(async () => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    /*
+    FNXC:SettingsAutoSave 2026-08-02-20:50:
+    Close is never a discard path. If a request is already running, queue its
+    latest trailing snapshot and wait for that queue to drain before the modal
+    unmounts; otherwise flush the current dirty snapshot synchronously.
+    */
+    if (persistInFlightRef.current) {
+      trailingPersistRef.current = true;
+    } else if (settingsDirty && hasAutoSaveChange) {
+      await persistSettingsRef.current?.();
+    }
+    while (persistInFlightRef.current || trailingPersistRef.current) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    }
+    // A failed/validation-blocked flush must leave Settings open for correction.
+    if (!lastPersistSucceededRef.current) return;
+    onClose();
+  }, [onClose, settingsDirty, hasAutoSaveChange]);
+
+  const requestSectionChange = useCallback(async (sectionId: SectionId) => {
+    if (sectionId === activeSection) return;
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    if ((settingsDirty && hasAutoSaveChange) || persistInFlightRef.current) {
+      if (persistInFlightRef.current) {
+        trailingPersistRef.current = true;
+        while (persistInFlightRef.current || trailingPersistRef.current) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+        }
+      } else {
+        const persisted = await persistSettingsRef.current?.();
+        if (!persisted) return;
+      }
+      // Do not re-scope a failed raw-global edit after navigating away from it.
+      if (!lastPersistSucceededRef.current) return;
+    }
+    setActiveSection(sectionId);
+  }, [activeSection, settingsDirty, hasAutoSaveChange]);
+
+  requestSectionChangeRef.current = (sectionId) => { void requestSectionChange(sectionId); };
+
+  useEffect(() => () => {
+    if (autoSaveTimerRef.current) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    /*
+    FNXC:SettingsAutoSave 2026-08-03-22:15:
+    Parent-driven unmount is also a dismissal path. Retain a dirty snapshot's
+    flush even when a debounce timer is not present at cleanup, rather than
+    treating the timer itself as the source of durability.
+    */
+    if (!persistInFlightRef.current && latestAutoSaveStateRef.current.dirty && latestAutoSaveStateRef.current.changed) {
+      // The ref always points at the latest render snapshot, even during unmount.
+      void persistSettingsRef.current?.();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!escapeEnabled) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !resetDialogOpen) void requestClose();
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
+  }, [escapeEnabled, requestClose, resetDialogOpen]);
+
+  const modalOverlayDismissProps = useOverlayDismiss(() => { void requestClose(); });
+  /*
+  FNXC:SettingsAutoSave 2026-08-02-21:45:
+  Backdrop dismissal remains preference-gated, but every enabled modal path
+  shares requestClose so its latest dirty snapshot is flushed before unmount.
+  */
+  const overlayDismissProps = !isEmbedded && overlayDismissEnabled ? modalOverlayDismissProps : {};
+
 
   /*
   FNXC:SettingsReset 2026-07-04-00:25:
@@ -3404,65 +4088,48 @@ export function SettingsModal({
     }
   }, [addToast, projectId]);
 
-  /** Render a scope indicator banner for the current section with theme-aware Lucide icons */
-  const renderScopeBanner = () => {
-    if (activeSectionScope === "global") {
-      return (
-        <div className="settings-scope-banner settings-scope-global">
-          <span className="settings-scope-icon"><Globe size={14} /></span>
-          <span>{t("settings.scope.globalBanner", "These settings are shared across all your Fusion projects.")}</span>
-        </div>
-      );
-    }
-    if (activeSectionScope === "project") {
-      return (
-        <div className="settings-scope-banner settings-scope-project">
-          <span className="settings-scope-icon"><Folder size={14} /></span>
-          <span>{t("settings.scope.projectBanner", "These settings only affect this project.")}</span>
-        </div>
-      );
-    }
-    return null;
-  };
-
   const renderSectionFields = () => {
     switch (activeSection) {
       case "cli-agents":
-        return (
-          <>
-            {renderScopeBanner()}
-            <CliAgentsSettingsSection projectId={projectId} addToast={addToast} />
-          </>
-        );
+        return <CliAgentsSettingsSection projectId={projectId} addToast={addToast} />;
       case "general":
         return (
           <GeneralSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             projectId={projectId}
             addToast={addToast}
             prefixError={prefixError}
             setPrefixError={setPrefixError}
+            onQuickChatButtonModeChange={onQuickChatButtonModeChange}
+            onMobileNavPrimaryItemsChange={onMobileNavPrimaryItemsChange}
+          />
+        );
+      case "source-control":
+        return (
+          <SourceControlSection
+            form={form}
+            setForm={setForm}
             projectTrackingRepoOptions={projectTrackingRepoOptions}
             projectTrackingRepoLoading={projectTrackingRepoLoading}
             projectTrackingRepoError={projectTrackingRepoError}
-            onQuickChatButtonModeChange={onQuickChatButtonModeChange}
           />
         );
-      case "global-general":
+      case "source-control-global":
         return (
-          <GlobalGeneralSection
-            scopeBanner={renderScopeBanner()}
+          <SourceControlGlobalSection
             form={form}
             setForm={setForm}
             globalSettings={globalGitlabSettings}
-            onGlobalGitlabSettingsChange={(patch) => setGlobalGitlabSettings((current) => ({
+            onGlobalSourceControlSettingsChange={(patch) => setGlobalGitlabSettings((current) => ({
               gitlabEnabled: current?.gitlabEnabled,
               gitlabInstanceUrl: current?.gitlabInstanceUrl,
               gitlabApiBaseUrl: current?.gitlabApiBaseUrl,
               gitlabAuthToken: current?.gitlabAuthToken,
               gitlabAuthTokenType: current?.gitlabAuthTokenType,
+              reportRoadmapDedupeEnabled: current?.reportRoadmapDedupeEnabled,
+              reportRoadmapLabel: current?.reportRoadmapLabel,
+              reportRoadmapRepo: current?.reportRoadmapRepo,
               ...patch,
             }))}
             globalTrackingRepoOptions={globalTrackingRepoOptions}
@@ -3470,10 +4137,16 @@ export function SettingsModal({
             globalTrackingRepoError={globalTrackingRepoError}
           />
         );
+      case "global-general":
+        return (
+          <GlobalGeneralSection
+            form={form}
+            setForm={setForm}
+          />
+        );
       case "keyboard-shortcuts":
         return (
           <KeyboardShortcutsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
           />
@@ -3481,7 +4154,6 @@ export function SettingsModal({
       case "global-models":
         return (
           <GlobalModelsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             availableModels={availableModels}
@@ -3500,13 +4172,12 @@ export function SettingsModal({
         );
 
       case "secrets":
-        return <SecretsSection scopeBanner={renderScopeBanner()} addToast={addToast} />;
+        return <SecretsSection addToast={addToast} />;
       case "global-mcp":
         return (
           <GlobalMcpSection
-            scopeBanner={renderScopeBanner()}
-            form={form}
-            setForm={setForm}
+            form={mcpFormForScope("global")}
+            setForm={setMcpFormForScope("global")}
             projectId={projectId}
             addToast={addToast}
           />
@@ -3514,9 +4185,8 @@ export function SettingsModal({
       case "mcp":
         return (
           <ProjectMcpSection
-            scopeBanner={renderScopeBanner()}
-            form={form}
-            setForm={setForm}
+            form={mcpFormForScope("project")}
+            setForm={setMcpFormForScope("project")}
             globalSettings={scopedSettings?.global ?? null}
             projectId={projectId}
             addToast={addToast}
@@ -3526,13 +4196,13 @@ export function SettingsModal({
       case "project-models":
         return (
           <ProjectModelsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             projectId={projectId}
             addToast={addToast}
             onOpenWorkflowSettings={onOpenWorkflowSettings}
             registerWorkflowLaneSaver={registerWorkflowLaneSaver}
+            onWorkflowLanesChange={markWorkflowLanesDirty}
             models={{
               modelLanes: MODEL_LANES,
               getLaneStatus,
@@ -3560,7 +4230,6 @@ export function SettingsModal({
       case "appearance":
         return (
           <AppearanceSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             themeMode={themeMode}
@@ -3576,18 +4245,23 @@ export function SettingsModal({
             setSessionBannersHidden={setSessionBannersHidden}
           />
         );
-      case "scheduling":
+      case "scheduling-global":
         return (
-          <SchedulingSection
-            scopeBanner={renderScopeBanner()}
-            form={form}
-            setForm={setForm}
+          <SchedulingGlobalSection
             globalMaxConcurrent={globalMaxConcurrent}
-            concurrencyLoading={activeSection === "scheduling" && !globalConcurrencyLoaded && !globalConcurrencyDirtyRef.current}
+            concurrencyLoading={activeSection === "scheduling-global" && !globalConcurrencyLoaded && !globalConcurrencyDirtyRef.current}
             onGlobalMaxConcurrentChange={(value) => {
               globalConcurrencyDirtyRef.current = true;
               setGlobalMaxConcurrent(value);
             }}
+          />
+        );
+      case "scheduling":
+        return (
+          <SchedulingSection
+            form={form}
+            setForm={setForm}
+            concurrencyLoading={activeSection === "scheduling" && !globalConcurrencyLoaded && !globalConcurrencyDirtyRef.current}
             onOverlapIgnorePathChange={handleOverlapIgnorePathChange}
             onOpenOverlapPathPicker={openOverlapPathPicker}
             onRemoveOverlapIgnorePath={handleRemoveOverlapIgnorePath}
@@ -3598,7 +4272,6 @@ export function SettingsModal({
       case "scheduled-evals":
         return (
           <ScheduledEvalsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
           />
@@ -3606,7 +4279,6 @@ export function SettingsModal({
       case "node-routing":
         return (
           <NodeRoutingSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             nodes={nodes}
@@ -3615,7 +4287,6 @@ export function SettingsModal({
       case "worktrees":
         return (
           <WorktreesSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             gitRemotes={gitRemotes}
@@ -3632,7 +4303,6 @@ export function SettingsModal({
       case "commands":
         return (
           <CommandsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
           />
@@ -3640,7 +4310,6 @@ export function SettingsModal({
       case "merge":
         return (
           <MergeSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             integrationBranchOptions={integrationBranchOptions}
@@ -3651,10 +4320,12 @@ export function SettingsModal({
             projectId={projectId}
           />
         );
+      // FNXC:SettingsNavigation 2026-07-18-12:30: FN-8350 refreshes the Settings form after a rollback so restored values immediately replace the pre-rollback view.
+      case "config-versions":
+        return <ConfigurationVersionsSection projectId={projectId} onSettingsRefresh={() => refreshSettingsForm(false)} />;
       case "agent-permissions":
         return (
           <AgentPermissionsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
           />
@@ -3662,7 +4333,6 @@ export function SettingsModal({
       case "memory":
         return (
           <MemorySection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             memory={{
@@ -3696,7 +4366,6 @@ export function SettingsModal({
       case "research-global":
         return (
           <ResearchGlobalSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             authProviders={authProviders}
@@ -3706,16 +4375,16 @@ export function SettingsModal({
       case "research-project":
         return (
           <ResearchProjectSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             researchLimitError={researchLimitError}
           />
         );
+      case "cli-binary":
+        return <CliBinarySection />;
       case "experimental":
         return (
           <ExperimentalSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             knownFeatures={KNOWN_EXPERIMENTAL_FEATURES}
@@ -3725,10 +4394,9 @@ export function SettingsModal({
             hiddenFeatureKeys={HIDDEN_EXPERIMENTAL_FEATURE_KEYS}
           />
         );
-      case "backups":
+      case "backups-global":
         return (
-          <BackupsSection
-            scopeBanner={renderScopeBanner()}
+          <DatabaseBackupsSection
             form={form}
             setForm={setForm}
             backupInfo={backupInfo}
@@ -3736,10 +4404,11 @@ export function SettingsModal({
             onBackupNow={handleBackupNow}
           />
         );
+      case "backups":
+        return <BackupsSection form={form} setForm={setForm} />;
       case "notifications":
         return (
           <NotificationsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             testNotificationLoading={testNotificationLoading}
@@ -3750,7 +4419,6 @@ export function SettingsModal({
       case "node-sync":
         return (
           <NodeSyncSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
           />
@@ -3758,7 +4426,6 @@ export function SettingsModal({
       case "remote":
         return (
           <RemoteSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             remote={{
@@ -3788,7 +4455,6 @@ export function SettingsModal({
       case "prompts":
         return (
           <PromptsSection
-            scopeBanner={renderScopeBanner()}
             form={form}
             setForm={setForm}
             onOpenWorkflowSettings={onOpenWorkflowSettings}
@@ -3797,7 +4463,6 @@ export function SettingsModal({
       case "plugins":
         return (
           <PluginsSection
-            scopeBanner={renderScopeBanner()}
             projectId={projectId}
             addToast={addToast}
             activePluginsSubsection={activePluginsSubsection}
@@ -3836,6 +4501,8 @@ export function SettingsModal({
         );
       case "hermes-runtime":
         return <HermesRuntimeSection />;
+      case "happier-runtime":
+        return <HappierRuntimeSection />;
       case "openclaw-runtime":
         return <OpenClawRuntimeSection />;
       case "paperclip-runtime":
@@ -3906,7 +4573,7 @@ export function SettingsModal({
             </a>
           </div>
           {!isEmbedded && (
-            <button className="modal-close" onClick={onClose} aria-label={t("actions.close", "Close")}>
+            <button className="modal-close" onClick={() => void requestClose()} aria-label={t("actions.close", "Close")}>
               &times;
             </button>
           )}
@@ -3921,7 +4588,7 @@ export function SettingsModal({
           {isEmbedded && viewportMode === "mobile" && (
             <button
               className="modal-close settings-embedded-mobile-close"
-              onClick={onClose}
+              onClick={() => void requestClose()}
               aria-label={t("actions.close", "Close")}
             >
               &times;
@@ -3950,14 +4617,35 @@ export function SettingsModal({
                         aria-label={t("settings.mobileNav.label", "Settings Section")}
                         className="select touch-target"
                         value={activeSection}
-                        onChange={(event) => setActiveSection(event.target.value as SectionId)}
+                        onChange={(event) => void requestSectionChange(event.target.value as SectionId)}
                       >
-                        {searchableSectionOptions.map((section) => {
-                          const label = t(section.labelKey, section.label);
+                        {/*
+                        FNXC:SettingsNavigation 2026-07-16-14:00:
+                        FN-8236 makes the mobile picker mirror the desktop topic headers with native
+                        optgroups. Sections retain SETTINGS_SECTIONS order within each group, which
+                        keeps scoped Global entries immediately before their Project counterparts so
+                        mobile operators can relate inherited settings without a separate sidebar.
+                        */}
+                        {searchMatchedSections.map((groupHeader, groupIndex) => {
+                          if (!groupHeader.isGroupHeader) return null;
+
+                          const sections = searchMatchedSections.slice(groupIndex + 1).filter((section) => !section.isGroupHeader);
+                          const nextGroupIndex = searchMatchedSections.slice(groupIndex + 1).findIndex((section) => section.isGroupHeader);
+                          const groupSections = nextGroupIndex === -1 ? sections : sections.slice(0, nextGroupIndex);
+
+                          if (groupSections.length === 0) return null;
+
                           return (
-                            <option key={section.id} value={section.id}>
-                              {resolveSettingsSectionOptionLabel(section, label)}
-                            </option>
+                            <optgroup key={groupHeader.id} label={t(groupHeader.labelKey, groupHeader.label)}>
+                              {groupSections.map((section) => {
+                                const label = t(section.labelKey, section.label);
+                                return (
+                                  <option key={section.id} value={section.id}>
+                                    {resolveSettingsSectionOptionLabel(section, label)}
+                                  </option>
+                                );
+                              })}
+                            </optgroup>
                           );
                         })}
                       </select>
@@ -4026,11 +4714,59 @@ export function SettingsModal({
                         </button>
                       )}
                     </div>
+                    {/*
+                    FNXC:SettingsSearch 2026-07-15-17:35:
+                    The count reports matching settings, not matching sections: search now resolves to controls, and "3 matching sections" told an operator nothing about whether the setting they wanted was among them.
+                    It falls back to the section count while any matched section is still keyword-only (an unmigrated section matches without contributing entries), so the number never under-reports what the nav is showing during the rollout.
+                    */}
                     <div id="settings-search-results" className="settings-search-results" aria-live="polite">
+                      {/*
+                      FNXC:SettingsSearch 2026-07-15-17:35:
+                      Counts read through i18next's plural resolution (`_one`/`_other` in the catalog) rather than a single hardcoded string, which is why no inline English fallback is passed here: a literal defaultValue would win over the catalog's singular form and reinstate "1 matching settings".
+                      */}
                       {hasSettingsSearchQuery
-                        ? t("settings.search.resultCount", "{{count}} matching sections", { count: searchableSectionOptions.length })
+                        ? settingsSearchResults.length > 0
+                          ? t("settings.search.settingResultCount", { count: settingsSearchResults.length })
+                          : t("settings.search.resultCount", { count: searchableSectionOptions.length })
                         : t("settings.search.allSections", "Showing all settings sections")}
                     </div>
+                    {/*
+                    FNXC:SettingsSearch 2026-07-15-17:35:
+                    Per-setting results: each row names the control and the section holding it, so an operator can tell two similarly-named settings apart before navigating (several sections carry their own "default model").
+                    Rendered as a list of buttons rather than a listbox/combobox because selecting one navigates the modal rather than filling the input — the input keeps its own value, and announcing it as a combobox would promise a completion that never happens.
+                    Capped for the same reason a nav is: a two-character query matches most of the index, and an unbounded list would bury the search box. The cap is announced below rather than silently truncating.
+                    */}
+                    {settingsSearchResults.length > 0 && (
+                      <ul className="settings-search-hits" data-testid="settings-search-hits">
+                        {settingsSearchResults.slice(0, SETTINGS_SEARCH_MAX_RESULTS).map((result) => {
+                          const section = visibleSections.find((s) => s.id === result.sectionId);
+                          return (
+                            <li key={`${result.sectionId}:${result.key}`}>
+                              <button
+                                type="button"
+                                className="settings-search-hit"
+                                data-testid={`settings-search-hit-${result.key}`}
+                                onClick={() => handleSettingsSearchResultSelect(result.sectionId, result.key)}
+                              >
+                                <span className="settings-search-hit-label">{result.label}</span>
+                                {section && (
+                                  <span className="settings-search-hit-section">
+                                    {t(section.labelKey, section.label)}
+                                  </span>
+                                )}
+                              </button>
+                            </li>
+                          );
+                        })}
+                        {settingsSearchResults.length > SETTINGS_SEARCH_MAX_RESULTS && (
+                          <li className="settings-search-hits-more">
+                            {t("settings.search.moreResults", "{{count}} more — keep typing to narrow", {
+                              count: settingsSearchResults.length - SETTINGS_SEARCH_MAX_RESULTS,
+                            })}
+                          </li>
+                        )}
+                      </ul>
+                    )}
                   </div>
                 </div>
               )}
@@ -4048,7 +4784,7 @@ export function SettingsModal({
                     <button
                       key={section.id}
                       className={`settings-nav-item${activeSection === section.id ? " active" : ""}`}
-                      onClick={() => setActiveSection(section.id)}
+                      onClick={() => void requestSectionChange(section.id)}
                       title={
                         section.scope === "global"
                           ? t("settings.nav.tooltip.global", "Shared across all projects")
@@ -4057,10 +4793,27 @@ export function SettingsModal({
                             : undefined
                       }
                     >
-                      {section.scope === "global" && <Globe className="settings-scope-icon" aria-label={t("settings.nav.aria.global", "Global setting")} size={16} />}
-                      {section.scope === "project" && <Folder className="settings-scope-icon" aria-label={t("settings.nav.aria.project", "Project setting")} size={16} />}
-                      {section.icon && !section.scope && (
-                        <section.icon className="settings-scope-icon" aria-label={t("settings.nav.aria.global", "Global setting")} size={16} />
+                      {/*
+                      FNXC:SettingsNavigation 2026-07-16-01:30:
+                      A section's own icon wins over the generic scope glyph; the glyph is the fallback.
+                      Previously `icon` only rendered when `scope` was undefined, so any scoped section was forced to the globe/folder pair and could not identify itself — Source Control looked exactly like MCP Servers and Scheduling in the nav.
+                      Nothing is lost by yielding the glyph: these sections spell their tier out in the label ("Source Control · Global"), and the aria-label + tooltip below still announce it, so scope survives for assistive tech and hover.
+                      */}
+                      {section.icon ? (
+                        <section.icon
+                          className="settings-scope-icon"
+                          aria-label={
+                            section.scope === "project"
+                              ? t("settings.nav.aria.project", "Project setting")
+                              : t("settings.nav.aria.global", "Global setting")
+                          }
+                          size={16}
+                        />
+                      ) : (
+                        <>
+                          {section.scope === "global" && <Globe className="settings-scope-icon" aria-label={t("settings.nav.aria.global", "Global setting")} size={16} />}
+                          {section.scope === "project" && <Folder className="settings-scope-icon" aria-label={t("settings.nav.aria.project", "Project setting")} size={16} />}
+                        </>
                       )}
                       {t(section.labelKey, section.label)}
                     </button>
@@ -4092,7 +4845,15 @@ export function SettingsModal({
               ref={settingsContentRef}
               data-show-advanced={showAdvancedSettings ? "true" : "false"}
             >
-              {hasSettingsSearchResults ? renderSectionFields() : (
+              {/*
+              FNXC:SettingsSearch 2026-07-15-17:35:
+              Wraps only the section content: the provider's value is the setting a search result asked to highlight, and the rows that consume it all render below here. Scoping it this tightly keeps a highlight change from re-rendering the nav and search box on every jump.
+              */}
+              {hasSettingsSearchResults ? (
+                <SettingsSearchHighlightProvider highlightedKey={highlightedSettingKey}>
+                  {renderSectionFields()}
+                </SettingsSearchHighlightProvider>
+              ) : (
                 <div className="settings-empty-state settings-search-content-empty" role="status">
                   <p>{t("settings.search.noResults", "No settings sections match \"{{query}}\".", { query: settingsSearchQuery.trim() })}</p>
                   <button type="button" className="btn" onClick={() => setSettingsSearchQuery("")}>{t("settings.search.clear", "Clear settings search")}</button>
@@ -4111,7 +4872,6 @@ export function SettingsModal({
               aria-label={t("settings.footer.helpDiscussions", "Help and discussions")}
               title={t("settings.footer.helpDiscussions", "Help and discussions")}
             >
-              <HelpCircle size={13} aria-hidden="true" />
               {t("settings.footer.help", "Help")}
             </a>
             <div className="settings-update-check">
@@ -4186,8 +4946,8 @@ export function SettingsModal({
             (only Cancel is), so this button renders in both automatically (FN-7506
             Surface Enumeration: modal + embedded).
 
-            FNXC:SettingsReset 2026-07-12-00:00:
-            The mobile Settings footer needs the compact Reset label to preserve horizontal space alongside Help, version, Import, Export, Cancel, and Save. Desktop and tablet keep the full Reset Settings wording while the existing destructive confirmation dialog remains unchanged.
+            FNXC:SettingsReset 2026-08-02-21:45:
+            The mobile Settings footer needs the compact Reset label to preserve horizontal space alongside Help, version, Import, Export, and Close. Desktop and tablet keep the full Reset Settings wording while the existing destructive confirmation dialog remains unchanged.
             */}
             <button
               type="button"
@@ -4202,17 +4962,18 @@ export function SettingsModal({
                 : t("settings.reset.button", "Reset Settings")}
             </button>
           </div>
-          <div className="modal-actions-right">
-            {/* FNXC:Settings 2026-06-22-00:00: Cancel/close is a dialog affordance; the embedded main view is left via the sidebar, so it shows only Save. */}
-            {!isEmbedded && (
-              <button className="btn btn-sm" onClick={onClose}>
-                {t("settings.actions.cancel", "Cancel")}
+          {!isEmbedded && (
+            <div className="modal-actions-right">
+              <span className="settings-autosave-status" role="status">
+                {autoSaveStatus === "saving" ? t("settings.general.saving", "Saving…")
+                  : autoSaveStatus === "saved" ? t("settings.general.saved", "Saved")
+                    : autoSaveStatus === "error" ? t("settings.general.saveFailed", "Could not save") : null}
+              </span>
+              <button className="btn btn-sm" onClick={() => void requestClose()} disabled={loading}>
+                {t("settings.actions.close", "Close")}
               </button>
-            )}
-            <button className="btn btn-primary btn-sm" onClick={handleSave} disabled={loading || isSaving}>
-              {t("settings.actions.save", "Save")}
-            </button>
-          </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -4420,16 +5181,19 @@ export function SettingsModal({
               </div>
               
               <div className="form-group">
-                <label htmlFor="import-merge" className="checkbox-label">
-                  <input
-                    id="import-merge"
-                    type="checkbox"
-                    checked={importMerge}
-                    onChange={(e) => setImportMerge(e.target.checked)}
-                  />
-                  {t("settings.importExport.mergeExisting", "Merge with existing settings (recommended)")}
-                </label>
-                <small>{t("settings.importExport.replaceWarning", "If unchecked, existing settings will be replaced with imported values.")}</small>
+                {/* FNXC:SettingsHelp 2026-07-16-12:45: Inline help moved behind the shared "?" affordance — operator requirement: no inline description paragraphs in Settings. */}
+                <div className="settings-field-label-row">
+                  <label htmlFor="import-merge" className="checkbox-label">
+                    <input
+                      id="import-merge"
+                      type="checkbox"
+                      checked={importMerge}
+                      onChange={(e) => setImportMerge(e.target.checked)}
+                    />
+                    {t("settings.importExport.mergeExisting", "Merge with existing settings (recommended)")}
+                  </label>
+                  <SettingsHelpTip settingKey="import-merge">{t("settings.importExport.replaceWarning", "If unchecked, existing settings will be replaced with imported values.")}</SettingsHelpTip>
+                </div>
               </div>
             </div>
             <div className="modal-actions">

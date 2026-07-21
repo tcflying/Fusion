@@ -429,7 +429,13 @@ describe("GET /api/system-stats", () => {
 
   it("returns process/system metrics with task and agent aggregates", async () => {
     const cpuUsageSpy = vi.spyOn(process, "cpuUsage");
-    const dateNowSpy = vi.spyOn(Date, "now");
+    /*
+    FNXC:DashboardCpuSampling 2026-07-16-09:00:
+    CPU sampling measures the delta between two route-owned Date.now() values. Fake only Date and explicitly advance it between requests so unrelated Express and I/O clock reads cannot inflate the sampling interval under a loaded lane.
+    */
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const sampleStart = new Date("2026-07-16T00:00:00.000Z");
+    vi.setSystemTime(sampleStart);
     cpuUsageSpy
       .mockReturnValueOnce({ user: 1_000_000, system: 500_000 })
       .mockImplementation((previousValue?: NodeJS.CpuUsage) => {
@@ -438,12 +444,6 @@ describe("GET /api/system-stats", () => {
         }
         return { user: 1_200_000, system: 600_000 };
       });
-    let now = 1_000;
-    dateNowSpy.mockImplementation(() => {
-      now += 1_000;
-      return now;
-    });
-
     const store = createMockStore({
       listTasks: vi.fn().mockResolvedValue([
         { id: "FN-1", column: "triage" },
@@ -495,6 +495,7 @@ describe("GET /api/system-stats", () => {
       }),
     );
 
+    vi.setSystemTime(new Date(sampleStart.getTime() + 1_000));
     const secondRes = await GET(app, "/api/system-stats");
     expect(secondRes.status).toBe(200);
     expect(secondRes.body.systemStats.cpuPercent).toBe(30);
@@ -521,7 +522,7 @@ describe("GET /api/system-stats", () => {
     expect(res.body.vitestLastAutoKillAt).toBeNull();
 
     cpuUsageSpy.mockRestore();
-    dateNowSpy.mockRestore();
+    vi.useRealTimers();
     mockExecFile.mockClear();
   });
 
@@ -818,6 +819,50 @@ describe("POST /api/kill-vitest", () => {
   });
 });
 
+describe("GET /api/plugins/dashboard-views", () => {
+  it("uses the request project's loaded plugin loader rather than leaking launch-project views", async () => {
+    const compoundEngineeringView = {
+      pluginId: "fusion-plugin-compound-engineering",
+      view: {
+        viewId: "compound-engineering",
+        label: "Compound Engineering",
+        componentPath: "./dashboard-view",
+        icon: "Boxes",
+        placement: "primary",
+        order: 36,
+      },
+    };
+    const projectLoaders = {
+      "project-a": { getPluginDashboardViews: vi.fn().mockResolvedValue([compoundEngineeringView]) },
+      "project-b": { getPluginDashboardViews: vi.fn().mockResolvedValue([]) },
+    };
+    const engines = Object.fromEntries(
+      Object.entries(projectLoaders).map(([projectId, loader]) => [projectId, {
+        getTaskStore: () => createMockStore(),
+        getPluginRunner: () => ({ getLoader: () => loader }),
+      }]),
+    );
+    const app = express();
+    app.use(express.json());
+    app.use("/api", createApiRoutes(createMockStore(), {
+      // The launch loader intentionally has CE to reproduce the prior project-A leak.
+      pluginLoader: projectLoaders["project-a"],
+      engineManager: {
+        getEngine: (projectId: string) => engines[projectId as keyof typeof engines],
+        onProjectAccessed: vi.fn(),
+      } as any,
+    }));
+
+    const [projectA, projectB] = await Promise.all([
+      GET(app, "/api/plugins/dashboard-views?projectId=project-a"),
+      GET(app, "/api/plugins/dashboard-views?projectId=project-b"),
+    ]);
+
+    expect(projectA.body).toEqual([compoundEngineeringView]);
+    expect(projectB.body).toEqual([]);
+  });
+});
+
 describe("GET /api/plugins/runtimes", () => {
   function buildApp(pluginLoader?: { getPluginRuntimes?: () => Array<{ pluginId: string; runtime: { metadata: { runtimeId: string; name: string; description?: string; version?: string }; factory: () => unknown } }> }) {
     const app = express();
@@ -841,6 +886,18 @@ describe("GET /api/plugins/runtimes", () => {
             factory: () => ({ run: async () => undefined }),
           },
         },
+        {
+          pluginId: "plugin-happier",
+          runtime: {
+            metadata: {
+              runtimeId: "happier",
+              name: "Installed Happier Runtime",
+              description: "Installed Happier runtime wins",
+              version: "9.9.9",
+            },
+            factory: () => ({ run: async () => undefined }),
+          },
+        },
       ],
     };
 
@@ -858,9 +915,12 @@ describe("GET /api/plugins/runtimes", () => {
     });
     const ids = body.map((r) => r.runtimeId);
     expect(ids).toContain("hermes");
+    expect(ids).toContain("happier");
     expect(ids).toContain("paperclip");
     // Only one openclaw entry (installed wins over bundled).
     expect(ids.filter((id) => id === "openclaw")).toHaveLength(1);
+    expect(ids.filter((id) => id === "happier")).toHaveLength(1);
+    expect(body.find((runtime) => runtime.runtimeId === "happier")?.pluginId).toBe("plugin-happier");
   });
 
   it("returns the bundled plugin runtime fallbacks when no plugins are installed", async () => {
@@ -869,7 +929,7 @@ describe("GET /api/plugins/runtimes", () => {
     expect(res.status).toBe(200);
     const body = res.body as Array<{ pluginId: string; runtimeId: string }>;
     const ids = body.map((r) => r.runtimeId).sort();
-    expect(ids).toEqual(["hermes", "openclaw", "paperclip"]);
+    expect(ids).toEqual(["happier", "hermes", "openclaw", "paperclip"]);
   });
 });
 

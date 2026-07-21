@@ -23,6 +23,21 @@ Mission: Improve Reliability
         Task: FN-214
 ```
 
+## Canonical lineage approval for autonomous symbol locks
+
+Before autonomous scheduler work may acquire a symbol lock, it resolves the task's Mission → Milestone → Slice → Feature lineage and evaluates the single `@fusion/core` contract: `evaluateMissionLineageApproval`. Resolution and lock acquisition remain scheduler responsibilities; downstream schedulers must not redefine the approval rule.
+
+Approval requires every one of these statuses:
+
+- Mission: `active`
+- Milestone: `active`
+- Slice: `active`
+- Feature: `triaged` or `in-progress`
+
+When the scheduler passes `planApprovalRequired: true`, the linked task must also have an `approvedPlanFingerprint` that is a non-empty string after trimming whitespace. The predicate does not recompute the fingerprint; `plan-approval.ts` owns its generation and validation. When plan approval is not required, the fingerprint is ignored.
+
+The predicate is pure and returns `{ approved, reason }`. Its stable reasons are `approved`, `missing-mission`, `missing-milestone`, `missing-slice`, `missing-feature`, `mission-not-active`, `milestone-not-active`, `slice-not-active`, `feature-not-implementable`, and `plan-not-approved`. A false result is the scheduler's `lineage-blocked` outcome; only an approved result is eligible for symbol-lock admission.
+
 ## Mission → Goal linkage
 
 Missions and goals are stored independently, with an optional many-to-many linkage persisted in the `mission_goals` join table.
@@ -96,6 +111,10 @@ Supported modes:
 - `custom-new`: shared mode using `branchSelection.mode = "custom-new"` with `branchName` as the shared merge-target branch
 
 The Mission Manager create/edit form exposes this as **Branch strategy** plus a conditional **Branch name** field for `existing` and `custom-new`.
+
+### Mission auto-merge override
+
+The **Merge behavior** control can inherit the project default, explicitly enable auto-merge, or select **Single pull request**. In-context help explains that auto-merge lands each feature individually while a single pull request retains all features on a shared branch for joint review. The latter persists `autoMerge: false` on the mission and stamps newly triaged feature tasks with the same false override, while preserving the mission's shared branch group. Returning the control to inherited clears the mission override. Once a shared branch has members, Mission detail displays its branch name, member count, and PR state.
 
 ### Shared branch-group invariant across entry points
 
@@ -490,6 +509,8 @@ On task completion, the scheduler calls `MissionExecutionLoop.processTaskOutcome
 5. Apply the **behavioral-verification posture** (see below): static assertions keep the judge's verdict; behavioral/bug assertions default to fail until a bounded, non-mutating verification run confirms them
 6. Record `MissionValidatorRun` metadata for the validation attempt (per-assertion failures are stored separately in `MissionAssertionFailureRecord` rows)
 
+For a linked task with a recorded `mergeDetails.commitSha`, the read-only judge runs from a disposable detached checkout of that landed merge revision rather than the ambient project checkout. If that checkout cannot be materialized, the judge falls back to the project root; a fail is deferred to **inconclusive** when the landed commit is not reachable from that same inspected root, or when the landed revision/its ancestry cannot be verified, preventing a branch-divergence false failure. The task worktree fork point (`baseCommitSha`) is never used as an inspection revision.
+
 **Behavioral-verification posture (adversarial default-to-fail).** A Contract Assertion now carries a `type` (`static` | `behavioral`). The validator no longer grades a Feature "done" purely from the diff's apparent intent:
 
 - **Static assertions** (e.g. "documented in README") keep today's read-only static judging — no added cost or strictness.
@@ -660,3 +681,23 @@ This lifecycle is validated by integration tests in two dependent tasks:
 ![Mission manager](./screenshots/mission-manager.png)
 
 See also: [Multi-Project](./multi-project.md) and [Task Management](./task-management.md).
+
+## Agent and dashboard-chat tools
+
+Mission hierarchy operations are available with the same project-scoped `MissionStore` contract in the pi extension, engine-managed executor/triage/heartbeat agents, and provider-backed dashboard chat. The surface is `fn_mission_list`, `fn_mission_show`, `fn_mission_create`, `fn_mission_update`, `fn_mission_delete`, `fn_milestone_add`, `fn_milestone_update`, `fn_milestone_delete`, `fn_slice_add`, `fn_slice_activate`, `fn_slice_delete`, `fn_feature_add`, `fn_feature_update`, `fn_feature_delete`, and `fn_feature_link_task`.
+
+`fn_mission_list` and `fn_mission_show` are positively classified read-only. All other hierarchy operations mutate persisted project data and remain subject to the engine action gate and permanent-agent permission policy; they are never treated as unknown or exempt tools.
+
+For example, activate a ready work unit with `fn_slice_activate({ id: "SL-…" })`. Link it to live work with `fn_feature_link_task({ featureId: "F-…", taskId: "FN-…" })`. Linking delegates to `MissionStore.linkFeatureToTask()`: it verifies the task is a live row in the same project, changes the feature to `triaged`, and records the mission/slice linkage on the task. Archived, deleted, missing, and other-project tasks are rejected.
+
+## Ideation handoff
+
+[Persisted ideation](./ideation/persisted-diverge-converge.md) converges a selected candidate into this canonical hierarchy. It atomically creates or attaches a Mission and persists that linkage, rather than maintaining a parallel roadmap document.
+
+## Research-derived features
+
+A completed cited research finding may become a normal Mission Feature. Its feature retains research run, stable finding, and source-URL provenance; optional triage uses the normal feature task flow. Linked task changes reconcile through the existing feature → slice → milestone → mission rollups, and task completion remains subject to assertion validation.
+
+### Autonomous mission admission
+
+Heartbeat agents may create or delegate implementation work only with an approved Feature → Slice → Milestone → Mission lineage. The created task stores that lineage as task metadata; it does not replace the canonical feature `taskId` link. Missing or invalid lineage is rejected before a task is persisted. Roadmap reconciliation marks done tasks done, returns cancelled/requeued tasks to triaged, keeps failed work non-complete, and treats archives as non-promoting no-ops.

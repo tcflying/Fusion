@@ -13,7 +13,7 @@ import {OccupiedColumnsError, assertRehomeTargetValid, computeRemovedOccupiedCol
 import {BUILTIN_CODING_WORKFLOW_IR} from "../builtin-coding-workflow-ir.js";
 import type {WorkflowFieldDefinition} from "../workflow-ir-types.js";
 import "../builtin-traits.js";
-import type {WorkflowDefinition, WorkflowDefinitionUpdate} from "../workflow-definition-types.js";
+import {normalizeWorkflowIcon, type WorkflowDefinition, type WorkflowDefinitionUpdate} from "../workflow-definition-types.js";
 import {resolveDefaultOnOptionalGroupIds} from "../workflow-optional-steps.js";
 import {isBuiltinWorkflowId} from "../builtin-workflows.js";
 import {fromJson} from "../db.js";
@@ -346,7 +346,7 @@ export async function updateWorkflowDefinitionImpl(store: TaskStore, id: string,
       const existingForCheck = await store.getWorkflowDefinition(id);
       if (!existingForCheck) throw new Error(`Workflow '${id}' not found`);
       const nextIrForCheck = parseWorkflowIr(updates.ir);
-      const occupantsByColumn = store.occupantsByColumnForWorkflow(id, false);
+      const occupantsByColumn = await store.occupantsByColumnForWorkflow(id, false);
       const removed = computeRemovedOccupiedColumns(
         existingForCheck.ir,
         nextIrForCheck,
@@ -360,7 +360,7 @@ export async function updateWorkflowDefinitionImpl(store: TaskStore, id: string,
         // Collect the occupant task ids of the removed columns to re-home AFTER
         // the IR save commits, so the cards land in a column the new IR defines.
         const removedSet = new Set(removed.map((r) => r.columnId));
-        const allOccupantTaskIds = store.listWorkflowOccupantTaskIds(id, false);
+        const allOccupantTaskIds = await store.listWorkflowOccupantTaskIds(id, false);
         let occupantTaskIds: string[];
         if (layer) {
           // FNXC:PostgresCutover 2026-06-28: async read for column check
@@ -401,7 +401,7 @@ export async function updateWorkflowDefinitionImpl(store: TaskStore, id: string,
       const fieldsChanged =
         JSON.stringify(oldFields) !== JSON.stringify(newFields);
       if (fieldsChanged) {
-        const occupantTaskIds = store.listWorkflowOccupantTaskIds(id, false);
+        const occupantTaskIds = await store.listWorkflowOccupantTaskIds(id, false);
         const occupantsByField = new Map<string, number>();
         for (const taskId of occupantTaskIds) {
           let values: Record<string, unknown> = {};
@@ -455,6 +455,7 @@ export async function updateWorkflowDefinitionImpl(store: TaskStore, id: string,
         ...existing,
         name,
         description: updates.description !== undefined ? updates.description : existing.description,
+        icon: updates.icon !== undefined ? normalizeWorkflowIcon(updates.icon) : existing.icon,
         ir,
         layout: updates.layout !== undefined ? updates.layout : existing.layout,
         updatedAt: new Date().toISOString(),
@@ -465,6 +466,7 @@ export async function updateWorkflowDefinitionImpl(store: TaskStore, id: string,
         await layer.db.update(schema.project.workflows).set({
           name: next.name,
           description: next.description,
+          icon: next.icon ?? null,
           ir: flagOn ? next.ir : downgradeIrToV1IfPure(next.ir),
           layout: next.layout,
           updatedAt: next.updatedAt,
@@ -472,11 +474,12 @@ export async function updateWorkflowDefinitionImpl(store: TaskStore, id: string,
       } else {
         store.db
           .prepare(
-            `UPDATE workflows SET name = ?, description = ?, ir = ?, layout = ?, updatedAt = ? WHERE id = ?`,
+            `UPDATE workflows SET name = ?, description = ?, icon = ?, ir = ?, layout = ?, updatedAt = ? WHERE id = ?`,
           )
           .run(
             next.name,
             next.description,
+            next.icon ?? null,
             // Rollback compat (#1405): persist v1 shape when pure and flag OFF.
             serializeWorkflowIr(flagOn ? next.ir : downgradeIrToV1IfPure(next.ir)),
             JSON.stringify(next.layout),
@@ -526,7 +529,7 @@ export async function deleteWorkflowDefinitionImpl(store: TaskStore, id: string)
     // their selection rows, so we can re-home them to the DEFAULT workflow's
     // entry column once their selection resolves back to the default (KTD-1).
     const flagOn = await store.workflowColumnsFlagOn();
-    const occupantTaskIds = flagOn ? store.listWorkflowOccupantTaskIds(id, false) : [];
+    const occupantTaskIds = flagOn ? await store.listWorkflowOccupantTaskIds(id, false) : [];
 
     if (layer) {
       // FNXC:PostgresCutover 2026-06-28: async deletes for backend mode
@@ -691,4 +694,3 @@ export async function selectTaskWorkflowImpl(store: TaskStore, taskId: string, w
       return ids;
     });
   }
-

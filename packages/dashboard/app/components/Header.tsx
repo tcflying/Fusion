@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { Settings, LayoutGrid, List, Search, X, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, FileText, Brain, CheckSquare, Lock, Gauge, ChevronDown, ChevronRight, PanelRight } from "lucide-react";
+import { Settings, LayoutGrid, List, Search, X, Activity, MoreHorizontal, Clock, Folder, History, GitBranch, Monitor, Workflow, Bot, Target, Grid3X3, Mail, MessageSquare, Check, Zap, Sparkles, FileText, Brain, CheckSquare, Lock, Gauge, Lightbulb, ChevronDown, ChevronRight, PanelRight } from "lucide-react";
 import "./Header.css";
 // ProjectSelector styles used by the imported standalone component.
 import "./ProjectSelector.css";
@@ -17,6 +17,7 @@ import type { PluginDashboardViewEntry } from "../api";
 import { buildPluginTaskViewId, isPluginViewId } from "../plugins/pluginViewRegistry";
 import { getPluginNavIcon } from "./pluginNavIcon";
 import type { ShellHostContext } from "../shell-host";
+export { resolveReportContextRefs } from "../utils/reportContextRefs";
 
 export { useViewportMode };
 
@@ -115,7 +116,7 @@ export interface HeaderProps {
   /** Whether the current view is a remote node */
   isRemote?: boolean;
   /** Experimental feature flags controlling visibility of nav items. */
-  experimentalFeatures?: { insights?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean; evalsView?: boolean; goalsView?: boolean; leftSidebarNav?: boolean; rightDock?: boolean };
+  experimentalFeatures?: { insights?: boolean; memoryView?: boolean; devServer?: boolean; devServerView?: boolean; researchView?: boolean; evalsView?: boolean; ideationView?: boolean; goalsView?: boolean; leftSidebarNav?: boolean; rightDock?: boolean };
   pluginDashboardViews?: PluginDashboardViewEntry[];
   shellConnectionControl?: ReactNode;
 }
@@ -215,6 +216,7 @@ export function Header({
     return !!(
       onChangeView ||
       experimentalFeatures?.researchView ||
+      experimentalFeatures?.ideationView ||
       todosEnabled ||
       experimentalFeatures?.insights ||
 
@@ -763,7 +765,7 @@ export function Header({
               <>
                 <button
                   ref={viewOverflowTriggerRef}
-                  className={`view-toggle-btn${(["research", "skills", "insights", "memory", "secrets", "dev-server", "devserver", "graph", "todos"].includes(view) || (isTablet && view === "documents") || (experimentalFeatures?.evalsView && view === "evals") || (experimentalFeatures?.goalsView && view === "goalsView") || isPluginViewId(view)) ? " active" : ""}`}
+                  className={`view-toggle-btn${(["research", "ideation", "skills", "insights", "memory", "secrets", "dev-server", "devserver", "graph", "todos"].includes(view) || (isTablet && view === "documents") || (experimentalFeatures?.evalsView && view === "evals") || (experimentalFeatures?.goalsView && view === "goalsView") || isPluginViewId(view)) ? " active" : ""}`}
                   onClick={() => {
                     setIsViewOverflowOpen((prev) => !prev);
                   }}
@@ -822,6 +824,20 @@ export function Header({
                       >
                         <Search size={14} />
                         <span>{t("header.researchView", "Research")}</span>
+                      </button>
+                    )}
+                    {experimentalFeatures?.ideationView && (
+                      <button
+                        className={`view-toggle-overflow-item${view === "ideation" ? " active" : ""}`}
+                        onClick={() => {
+                          onChangeView("ideation");
+                          setIsViewOverflowOpen(false);
+                        }}
+                        role="menuitem"
+                        data-testid="view-overflow-ideation"
+                      >
+                        <Lightbulb size={14} />
+                        <span>{t("nav.ideation", "Ideation")}</span>
                       </button>
                     )}
                     {experimentalFeatures?.insights && (
@@ -963,6 +979,14 @@ export function Header({
         FNXC:Navigation 2026-06-22-00:00:
         When the left sidebar is active it owns Workflows as a main-content destination, so the Header drops its duplicate desktop Workflow button. The flag-off desktop layout keeps the Header button; mobile/tablet keep the overflow entry.
         */}
+        {/*
+        FNXC:ReportPipeline 2026-07-18-19:25:
+        FN-8348 relocates guided Bug, Feedback, Idea, and Help reporting from
+        Header to Settings General and Command Center. Those always-reachable
+        destinations replace this responsive action-row slot without leaving a
+        compact-navigation dependency or an empty header control.
+        */}
+
         {!isCompact && !leftSidebarNavActive && onOpenWorkflowEditor && (
           <button
             className="btn-icon"

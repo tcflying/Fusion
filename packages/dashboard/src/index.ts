@@ -1,4 +1,9 @@
-export { createServer, loadTlsCredentialsFromEnv, type ServerOptions } from "./server.js";
+export {
+  createDaemonRoomControlPlaneAuthorizer,
+  createServer,
+  loadTlsCredentialsFromEnv,
+  type ServerOptions,
+} from "./server.js";
 export {
   refreshAllCustomProviderModels,
   refreshCustomProviderModels,
@@ -17,7 +22,7 @@ export {
   type RuntimeLogSink,
 } from "./runtime-logger.js";
 export { createSkillsAdapter, getProjectSettingsPath, type SkillsAdapter, type DiscoveredSkill, type CatalogEntry, type CatalogFetchResult, type ToggleSkillResult, type UpstreamError, type UpstreamErrorCode, type SkillContent, type SkillFileEntry, type SkillFileContent } from "./skills-adapter.js";
-export { GitHubClient, isPrMergeReady, closeGroupPullRequest, reconcileGroupPullRequest, type GitHubClientOptions, type PrMergeStatus, type PrCheckStatus, type ReviewDecision, type MergePrParams, type UpdatePrParams, type ClosePrParams, type FindPrParams, type CreateIssueParams, type CreatedIssue, type CreateGroupPrResult } from "./github.js";
+export { GitHubClient, isPrMergeReady, closeGroupPullRequest, reconcileGroupPullRequest, buildGitHubIssueSource, isGitHubIssueAlreadyImported, type GitHubClientOptions, type PrMergeStatus, type PrCheckStatus, type ReviewDecision, type MergePrParams, type UpdatePrParams, type ClosePrParams, type FindPrParams, type CreateIssueParams, type CreatedIssue, type DiscussionCategory, type DiscussionCandidate, type CreatedDiscussion, type CreateGroupPrResult } from "./github.js";
 export { generatePrMetadata, type GeneratedPrMetadata } from "./pr-metadata-generator.js";
 export {
   resolvePrConflicts,
@@ -59,10 +64,9 @@ export { GitHubPollingService, type GitHubPollingServiceOptions, type TaskWatchI
 export { GitHubIssueCommentService, DEFAULT_COMMENT_TEMPLATE } from "./github-issue-comment.js";
 export { GitHubSourceIssueCloseService } from "./github-source-issue-close.js";
 export {
-  upsertKnowledgePage,
-  queryKnowledgePages,
-  getKnowledgePage,
-  countKnowledgePages,
+  upsertKnowledgePageAsync,
+  queryKnowledgePagesAsync,
+  countKnowledgePagesAsync,
   refreshKnowledgeForTask,
   renderTaskPage,
   buildSearchText,
@@ -75,6 +79,10 @@ export {
   type KnowledgeQueryOptions,
 } from "./knowledge-index.js";
 export { KnowledgeIndexRefreshService } from "./knowledge-index-refresh.js";
+export { runReportPipeline, endorseDuplicate, resolveReportMode, resolveReportTarget, type ReportInput, type ReportResult, type ReportPipelineDeps, type StructuredReport } from "./report-pipeline.js";
+export { createProjectRoadmapDedupSource, createRoadmapDedupSourceForTaskStore, type RoadmapCandidate, type RoadmapDedupSource, type RoadmapDedupSourceDeps } from "./report-roadmap-source.js";
+export { scrubReportPayload, scrubReportText, type ReportScrubContext } from "./report-scrub.js";
+export { selfCheckHelp, type HelpKnowledgeResult } from "./report-help-selfcheck.js";
 export {
   recordDeployment,
   ingestIncidentSignal,

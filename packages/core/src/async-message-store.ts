@@ -19,8 +19,10 @@
  *   consume.
  */
 import { and, desc, eq, inArray, lte, or, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import * as schema from "./postgres/schema/index.js";
 import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
+import { sanitizeTextValue, sanitizeJsonbValue } from "./postgres/nul-sanitize.js";
 import {
   DASHBOARD_USER_ID,
   type Message,
@@ -45,6 +47,10 @@ interface MessageRow {
   createdAt: string;
   updatedAt: string;
 }
+
+type PersistedMessage = Omit<Message, "metadata"> & {
+  metadata: NonNullable<Message["metadata"]> | null;
+};
 
 const messageColumns = {
   id: schema.project.messages.id,
@@ -89,37 +95,64 @@ function participantIdsForLookup(ownerId: string, ownerType: ParticipantType): s
  */
 export async function sendMessage(
   handle: QueryHandle,
-  message: {
-    id: string;
-    fromId: string;
-    fromType: string;
-    toId: string;
-    toType: string;
-    content: string;
-    type: string;
-    read: boolean;
-    metadata: Record<string, unknown> | null;
-    createdAt: string;
-    updatedAt: string;
-  },
+  message: PersistedMessage,
 ): Promise<Message> {
+  // FNXC:PostgresMigrationNulSanitize 2026-07-20: agent-to-agent/agent-to-user
+  // mailbox content can carry raw tool output (including a stray NUL byte
+  // from piped Windows CLI dumps), which Postgres text/jsonb columns reject
+  // outright. Sanitize before insert instead of letting the send throw, and
+  // return the sanitized value so the in-memory result matches what was
+  // persisted (the original unsanitized `message` object must not be handed
+  // back to the caller).
+  const sanitizedContent = sanitizeTextValue(message.content);
+  const sanitizedMetadata = sanitizeJsonbValue(message.metadata);
   await handle.insert(schema.project.messages).values({
     id: message.id,
     fromId: message.fromId,
     fromType: message.fromType,
     toId: message.toId,
     toType: message.toType,
-    content: message.content,
+    content: sanitizedContent,
     type: message.type,
     read: message.read ? 1 : 0,
-    metadata: message.metadata,
+    metadata: sanitizedMetadata,
     createdAt: message.createdAt,
     updatedAt: message.updatedAt,
   });
   return rowToMessage({
     ...message,
+    content: sanitizedContent,
+    metadata: sanitizedMetadata,
     read: message.read ? 1 : 0,
   });
+}
+
+/*
+FNXC:PostgresMigrationInbox 2026-07-14-12:10:
+Database conflict handling, rather than an inbox read followed by an insert, arbitrates once-only system messages. The caller supplies a deterministic primary-key id so concurrent project starts cannot both create the same logical notice.
+*/
+export async function sendMessageOnce(
+  handle: QueryHandle,
+  message: PersistedMessage,
+): Promise<boolean> {
+  const inserted = await handle
+    .insert(schema.project.messages)
+    .values({
+      id: message.id,
+      fromId: message.fromId,
+      fromType: message.fromType,
+      toId: message.toId,
+      toType: message.toType,
+      content: message.content,
+      type: message.type,
+      read: message.read ? 1 : 0,
+      metadata: message.metadata,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+    })
+    .onConflictDoNothing({ target: [schema.project.messages.projectId, schema.project.messages.id] })
+    .returning({ id: schema.project.messages.id });
+  return inserted.length === 1;
 }
 
 /**
@@ -131,6 +164,44 @@ export async function getMessage(handle: QueryHandle, id: string): Promise<Messa
     .from(schema.project.messages)
     .where(eq(schema.project.messages.id, id));
   return rows[0] ? rowToMessage(rows[0] as MessageRow) : null;
+}
+
+export async function claimProposalForCreation(handle: QueryHandle, messageId: string): Promise<{ claimed: boolean; idempotencyKey?: string; claimOwnerToken?: string; message?: Message }> {
+  const existing = await getMessage(handle, messageId);
+  if (existing?.metadata?.kind !== "task-proposal" || existing.metadata.proposalStatus !== "pending" || !existing.metadata.proposalIdempotencyKey) return { claimed: false };
+  const owner = randomUUID();
+  const claimStartedAt = new Date().toISOString();
+  // FNXC:EphemeralAgentTaskCreation 2026-07-30-16:00: Persist a lease timestamp with the transient owner so a post-crash click can safely reclaim only stale creating proposals without rotating the stable key.
+  const metadata = { ...existing.metadata, proposalStatus: "creating" as const, claimOwnerToken: owner, claimStartedAt };
+  const updated = await handle.update(schema.project.messages).set({ metadata, updatedAt: claimStartedAt }).where(and(eq(schema.project.messages.id, messageId), sql`${schema.project.messages.metadata}->>'proposalStatus' = 'pending'`)).returning(messageColumns);
+  if (!updated[0]) return { claimed: false };
+  const message = rowToMessage(updated[0] as MessageRow);
+  return { claimed: true, idempotencyKey: metadata.proposalIdempotencyKey, claimOwnerToken: owner, message };
+}
+
+export async function finalizeProposalCreation(handle: QueryHandle, messageId: string, claimOwnerToken: string, createdTaskId: string): Promise<Message | null> {
+  const existing = await getMessage(handle, messageId);
+  if (!existing) return null;
+  if (existing.metadata?.proposalStatus === "created" && existing.metadata.createdTaskId === createdTaskId) return existing;
+  if (existing.metadata?.proposalStatus !== "creating" || existing.metadata.claimOwnerToken !== claimOwnerToken) return null;
+  const metadata = { ...existing.metadata, proposalStatus: "created" as const, createdTaskId, claimOwnerToken: undefined, claimStartedAt: undefined };
+  const rows = await handle.update(schema.project.messages).set({ metadata, updatedAt: new Date().toISOString() }).where(and(eq(schema.project.messages.id, messageId), sql`${schema.project.messages.metadata}->>'claimOwnerToken' = ${claimOwnerToken}`)).returning(messageColumns);
+  return rows[0] ? rowToMessage(rows[0] as MessageRow) : null;
+}
+
+export async function releaseProposalClaim(handle: QueryHandle, messageId: string, claimOwnerToken: string): Promise<Message | null> {
+  const existing = await getMessage(handle, messageId);
+  if (existing?.metadata?.proposalStatus !== "creating" || existing.metadata.claimOwnerToken !== claimOwnerToken) return null;
+  // FNXC:EphemeralAgentTaskCreation 2026-07-30-12:00: release only transient ownership; stable idempotency key is retained for an overlapping retry.
+  const metadata = { ...existing.metadata, proposalStatus: "pending" as const, claimOwnerToken: undefined, claimStartedAt: undefined };
+  const rows = await handle.update(schema.project.messages).set({ metadata, updatedAt: new Date().toISOString() }).where(and(eq(schema.project.messages.id, messageId), sql`${schema.project.messages.metadata}->>'claimOwnerToken' = ${claimOwnerToken}`)).returning(messageColumns);
+  return rows[0] ? rowToMessage(rows[0] as MessageRow) : null;
+}
+
+export async function reconcileProposalCreation(handle: QueryHandle, messageId: string, resolvedTaskId: string | undefined): Promise<Message | null> {
+  const existing = await getMessage(handle, messageId);
+  if (!existing || existing.metadata?.proposalStatus !== "creating") return existing;
+  return resolvedTaskId ? finalizeProposalCreation(handle, messageId, existing.metadata.claimOwnerToken ?? "", resolvedTaskId) : releaseProposalClaim(handle, messageId, existing.metadata.claimOwnerToken ?? "");
 }
 
 /**

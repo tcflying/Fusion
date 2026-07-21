@@ -99,6 +99,13 @@ import {
 } from "./spec-validation/external-integration-evidence.js";
 import { buildSessionSkillContext } from "./session-skill-context.js";
 import { PRIORITY_SPECIFY, recoverIdleSemaphoreLeakCandidate, type AgentSemaphore } from "./concurrency.js";
+import {
+  GLOBAL_CAPACITY_LEGACY_RECOVERY_PAUSE_REASON_PREFIX,
+  type GlobalCapacityLegacyRecoveryGateV1,
+} from "./global-capacity-legacy-recovery-gate.js";
+import type { GlobalCapacityLegacyDispatchControlV1 } from "./global-capacity-legacy-dispatch-control.js";
+import type { GlobalCapacityLegacyLeaseMaintainerV1 } from "./global-capacity-legacy-lease-maintainer.js";
+import type { GlobalCapacityLegacyAttemptRunResultV1 } from "./global-capacity-legacy-attempt-runner.js";
 import { AgentLogger } from "./agent-logger.js";
 import {
   resolveAgentInstructions,
@@ -163,7 +170,23 @@ export interface TriageProcessorOptions {
   agentStore?: import("@fusion/core").AgentStore;
   /** Plugin runner for runtime selection. When provided, enables plugin runtime lookup. */
   pluginRunner?: import("./plugin-runner.js").PluginRunner;
+  /**
+   * Optional durable restart gate for triage sessions. A blocked result parks
+   * the task before any planning status, semaphore, or model session begins.
+   */
+  globalCapacityLegacyRecoveryGate?: GlobalCapacityLegacyRecoveryGateV1;
+  /** Runtime-owned durable admission control for the planner/reviewer session boundary. */
+  globalCapacityLegacyDispatchControl?: GlobalCapacityLegacyDispatchControlV1;
 }
+
+type GlobalCapacityTriageExecutionGrant = Extract<
+  GlobalCapacityLegacyAttemptRunResultV1,
+  { readonly state: "execution_granted" }
+>;
+
+type GlobalCapacityReconciliationPauseProjection =
+  | { readonly state: "persisted" }
+  | { readonly state: "persistence_failed" };
 
 /**
  * Processes tasks in the triage column by running an AI agent to generate
@@ -196,6 +219,13 @@ export class TriageProcessor {
    * verdicts. Mirrors `TaskExecutor.activeSubagentSessions`.
    */
   private activeSubagentSessions = new Map<string, Set<AgentSession>>();
+  /** One task-local abort promise per capacity reconciliation boundary. */
+  private capacityReconciliationAborts = new Map<string, Promise<void>>();
+  /** One durable pause projection per active task; the first reconciliation reason owns the receipt. */
+  private capacityReconciliationPauseProjections = new Map<
+    string,
+    Promise<GlobalCapacityReconciliationPauseProjection>
+  >();
   /** Tasks aborted due to globalPause (to avoid reporting as errors). */
   private pauseAborted = new Set<string>();
   /** Tasks killed by the stuck task detector (to avoid reporting as errors). */
@@ -284,6 +314,13 @@ export class TriageProcessor {
       if (!task?.id || (task.paused !== true && task.userPaused !== true)) {
         return;
       }
+      if (
+        typeof task.pausedReason === "string"
+        && task.pausedReason.startsWith(GLOBAL_CAPACITY_LEGACY_RECOVERY_PAUSE_REASON_PREFIX)
+      ) {
+        void this.abortForGlobalCapacityReconciliation(task.id, "task paused by global-capacity reconciliation");
+        return;
+      }
       if (this.activeSubagentSessions.has(task.id)) {
         this.disposeSubagentsForTask(task.id, "task paused");
       }
@@ -310,6 +347,196 @@ export class TriageProcessor {
         this.activeSessions.delete(task.id);
       }
     };
+  }
+
+  private async abortForGlobalCapacityReconciliation(taskId: string, reason: string): Promise<void> {
+    const existing = this.capacityReconciliationAborts.get(taskId);
+    if (existing) return existing;
+
+    const abort = (async () => {
+      this.disposeSubagentsForTask(taskId, reason);
+      const session = this.activeSessions.get(taskId);
+      if (!session) return;
+      this.pauseAborted.add(taskId);
+      this.options.stuckTaskDetector?.untrackTask(taskId);
+      const sessionWithAbort = session as AgentSession & { abort?: () => Promise<void> };
+      if (typeof sessionWithAbort.abort === "function") {
+        try {
+          await sessionWithAbort.abort();
+        } catch (error) {
+          planLog.warn(`${taskId}: failed to abort triage session for global capacity reconciliation: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      await this.recordTriageSessionTokenUsage(taskId, session as AgentSession, { agentId: "triage" }).catch((error: unknown) => {
+        planLog.warn(`${taskId}: failed to capture triage token usage during global capacity reconciliation: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      session.dispose();
+      this.activeSessions.delete(taskId);
+    })();
+    this.capacityReconciliationAborts.set(taskId, abort);
+    void abort.then(() => {
+      if (this.capacityReconciliationAborts.get(taskId) === abort) {
+        this.capacityReconciliationAborts.delete(taskId);
+      }
+    }, () => {
+      if (this.capacityReconciliationAborts.get(taskId) === abort) {
+        this.capacityReconciliationAborts.delete(taskId);
+      }
+    });
+    return abort;
+  }
+
+  /**
+   * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:40:
+   * Planner and Plan Review sessions share one durable triage capacity boundary.
+   * A failed renewal, uncertain work-start, or release failure must first project
+   * the recovery pause, then settle the exact active session. The projection is
+   * idempotent for the active task and reports whether it reached storage: if it
+   * did not, callers must retain the work-start receipt instead of releasing its
+   * global slot and allowing a restart to recreate unknown external work.
+   */
+  private pauseForGlobalCapacityReconciliation(
+    taskId: string,
+    reason: string,
+  ): Promise<GlobalCapacityReconciliationPauseProjection> {
+    const existing = this.capacityReconciliationPauseProjections.get(taskId);
+    if (existing) return existing;
+
+    const projection = (async (): Promise<GlobalCapacityReconciliationPauseProjection> => {
+      let persisted = false;
+      try {
+        await this.store.pauseTask(taskId, true, undefined, {
+          pausedReason: `${GLOBAL_CAPACITY_LEGACY_RECOVERY_PAUSE_REASON_PREFIX}${reason}`,
+        });
+        persisted = true;
+      } catch (error) {
+        planLog.warn(`${taskId}: failed to persist global capacity reconciliation pause (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      try {
+        await this.abortForGlobalCapacityReconciliation(taskId, `global-capacity:${reason}`);
+      } catch (error) {
+        planLog.warn(`${taskId}: failed to abort active triage work after global capacity reconciliation (${reason}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      return persisted ? { state: "persisted" } : { state: "persistence_failed" };
+    })();
+    this.capacityReconciliationPauseProjections.set(taskId, projection);
+    return projection;
+  }
+
+  private async runWithGlobalCapacity<T>(task: Task, work: () => Promise<T>): Promise<T | undefined> {
+    const control = this.options.globalCapacityLegacyDispatchControl;
+    if (!control) return work();
+
+    const capacityStart = await control.begin({
+      resourceKind: "legacy_triage",
+      resourceId: task.id,
+      workClass: "normal",
+      slots: 1,
+    });
+    if (capacityStart.state === "withheld") {
+      /*
+      FNXC:GlobalCapacityLegacyDispatch 2026-07-20-06:40:
+      A normal capacity hold is only an admission observation. Do not move or
+      update the task here: an operator or another controller can pause it while
+      begin() is pending, and capacity backpressure must never erase that
+      paused/userPaused projection.
+      */
+      await this.store.logEntry(
+        task.id,
+        `Global capacity withheld before planning/review (${capacityStart.reason}); no planner session was started; next capacity probe is not before ${capacityStart.attempt.expiresAt}.`,
+      ).catch((error: unknown) => {
+        planLog.warn(`${task.id}: failed to record global capacity hold: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      const existingRetryAt = task.nextRecoveryAt;
+      const retryAt = existingRetryAt && Date.parse(existingRetryAt) > Date.parse(capacityStart.attempt.expiresAt)
+        ? existingRetryAt
+        : capacityStart.attempt.expiresAt;
+      await this.store.updateTask(task.id, { nextRecoveryAt: retryAt }).catch((error: unknown) => {
+        planLog.warn(`${task.id}: failed to persist global capacity retry deadline: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      return undefined;
+    }
+    if (capacityStart.state === "recovery_required") {
+      await this.pauseForGlobalCapacityReconciliation(task.id, "external_work_may_have_started");
+      return undefined;
+    }
+    if (capacityStart.state === "unresolved" && capacityStart.phase === "work_start") {
+      await this.pauseForGlobalCapacityReconciliation(task.id, "external_work_may_have_started");
+      return undefined;
+    }
+    if (capacityStart.state === "unresolved") {
+      await this.store.logEntry(
+        task.id,
+        `Global capacity boundary is unresolved before work start (${capacityStart.phase}); no planner session was started.`,
+      ).catch(() => undefined);
+      return undefined;
+    }
+    if (capacityStart.state === "rejected") {
+      await this.pauseForGlobalCapacityReconciliation(task.id, "admission-rejected");
+      return undefined;
+    }
+
+    const execution = capacityStart as GlobalCapacityTriageExecutionGrant;
+    let maintainer: GlobalCapacityLegacyLeaseMaintainerV1 | undefined;
+    let renewalPauseProjection: Promise<GlobalCapacityReconciliationPauseProjection> | undefined;
+    let startupBlocked = false;
+    try {
+      maintainer = control.maintain({
+        handle: execution.handle,
+        onRenewalFailure: (failure) => {
+          if (renewalPauseProjection) return;
+          const reason = failure.state === "not_renewed" ? "renewal-lost" : "renewal-unresolved";
+          renewalPauseProjection = this.pauseForGlobalCapacityReconciliation(task.id, reason);
+        },
+      });
+      maintainer.start();
+      const startupPauseProjection = renewalPauseProjection
+        ?? this.capacityReconciliationPauseProjections.get(task.id);
+      if (startupPauseProjection) {
+        const reconciliation = await startupPauseProjection;
+        planLog.warn(
+          `${task.id}: global capacity renewal failed before planner/reviewer work started (${reconciliation.state}); no session will be created`,
+        );
+        startupBlocked = true;
+      }
+    } catch (error) {
+      await this.pauseForGlobalCapacityReconciliation(task.id, "lease-maintainer-unavailable");
+      planLog.warn(`${task.id}: unable to start global capacity lease maintenance: ${error instanceof Error ? error.message : String(error)}`);
+      startupBlocked = true;
+    }
+
+    try {
+      return startupBlocked ? undefined : await work();
+    } finally {
+      try {
+        await maintainer?.settle();
+        const pauseProjection = renewalPauseProjection
+          ?? this.capacityReconciliationPauseProjections.get(task.id);
+        const pausePersisted = !pauseProjection || (await pauseProjection).state === "persisted";
+        if (!pausePersisted) {
+          planLog.warn(`${task.id}: global capacity pause projection is not durable; preserving the work-started receipt for recovery reconciliation`);
+        } else {
+          const finished = await execution.handle.finish();
+          if (finished.state !== "released") {
+            const reconciliation = await this.pauseForGlobalCapacityReconciliation(
+              task.id,
+              finished.phase === "work_settlement" ? "external_work_may_have_started" : "release_pending",
+            );
+            if (reconciliation.state !== "persisted") {
+              planLog.warn(`${task.id}: failed to durably project unresolved global capacity finalization; the durable attempt remains the recovery fence`);
+            }
+          }
+        }
+      } catch (error) {
+        planLog.warn(`${task.id}: global capacity finalization failed: ${error instanceof Error ? error.message : String(error)}`);
+        const reconciliation = await this.pauseForGlobalCapacityReconciliation(task.id, "external_work_may_have_started");
+        if (reconciliation.state !== "persisted") {
+          planLog.warn(`${task.id}: failed to durably park unresolved global capacity finalization; the durable attempt remains the recovery fence`);
+        }
+      }
+    }
   }
 
   start(): void {
@@ -346,7 +573,7 @@ export class TriageProcessor {
     const triageTasks = await this.store.listTasks({ column: "triage", slim: true });
     const todoTasks = await this.store.listTasks({ column: "todo", slim: true });
     const stale = [...triageTasks, ...todoTasks].filter(
-      (t) => t.status === "planning" && !this.processing.has(t.id),
+      (t) => t.status === "planning" && !t.paused && !t.userPaused && !this.processing.has(t.id),
     );
     for (const t of stale) {
       planLog.log(`Startup sweep: clearing stale 'planning' status on ${t.id}`);
@@ -897,6 +1124,22 @@ export class TriageProcessor {
    * quality gate before execution; triage does not inject a separate review tool.
    */
   async specifyTask(task: Task): Promise<void> {
+    /*
+     * FNXC:GlobalCapacityLegacyRecoveryGate 2026-07-20-06:04:
+     * Triage can be invoked directly, bypassing poll()'s paused filter. Check
+     * the durable capacity recovery state before touching in-memory processing,
+     * status, semaphore, or planner-session boundaries so a prior external
+     * planning attempt is parked rather than silently recreated after restart.
+     */
+    const capacityRecovery = await this.options.globalCapacityLegacyRecoveryGate?.check({
+      taskId: task.id,
+      resourceKind: "legacy_triage",
+      resourceId: task.id,
+    });
+    if (capacityRecovery?.state === "blocked") {
+      planLog.warn(`${task.id}: triage dispatch withheld by global capacity recovery gate (${capacityRecovery.reason})`);
+      return;
+    }
     if (this.processing.has(task.id)) return;
     this.processing.add(task.id);
     this.processingSince.set(task.id, Date.now());
@@ -923,7 +1166,10 @@ export class TriageProcessor {
       Retry still launches the Plan Review reviewer lane, so it must consume the same global AgentSemaphore slot as planning work while continuing to avoid the planner session and PROMPT.md rewrite path.
       */
       if (currentTask.status === "plan-review-unavailable") {
-        const retryWork = () => this.retryUnavailablePlanReview(currentTask, promptPath, settings);
+        const retryWork = () => this.runWithGlobalCapacity(
+          currentTask,
+          () => this.retryUnavailablePlanReview(currentTask, promptPath, settings),
+        );
         if (this.options.semaphore) {
           await this.options.semaphore.run(retryWork, PRIORITY_SPECIFY);
         } else {
@@ -1416,7 +1662,9 @@ export class TriageProcessor {
         }
       };
 
-      const retryableWork = () => withRateLimitRetry(agentWork, {
+      const retryableWork = () => withRateLimitRetry(
+        () => this.runWithGlobalCapacity(task, agentWork),
+        {
         onRetry: (attempt, delayMs, error) => {
           const delaySec = Math.round(delayMs / 1000);
           planLog.warn(`⏳ ${task.id} rate limited — retry ${attempt} in ${delaySec}s: ${error.message}`);
@@ -1425,7 +1673,8 @@ export class TriageProcessor {
             planLog.warn(`${task.id}: failed to log rate-limit retry entry: ${msg}`);
           });
         },
-      });
+        },
+      );
 
       if (this.options.semaphore) {
         await this.options.semaphore.run(retryableWork, PRIORITY_SPECIFY);
@@ -1553,6 +1802,7 @@ export class TriageProcessor {
     } finally {
       this.processing.delete(task.id);
       this.processingSince.delete(task.id);
+      this.capacityReconciliationPauseProjections.delete(task.id);
     }
   }
 

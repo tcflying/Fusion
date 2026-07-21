@@ -39,6 +39,119 @@ export interface InitOptions {
   git?: boolean;
 }
 
+class CentralBackendUnavailableError extends Error {
+  constructor() {
+    super(
+      "Central project registration requires a PostgreSQL backend. Configure DATABASE_URL or allow Fusion embedded PostgreSQL, then rerun `fn init`.",
+    );
+    this.name = "CentralBackendUnavailableError";
+  }
+}
+
+class CentralProjectRegistrationError extends Error {
+  constructor() {
+    super(
+      "Central project registration failed. Local .fusion files may exist, but this project is not registered. Verify PostgreSQL or embedded PostgreSQL, then rerun `fn init`.",
+    );
+    this.name = "CentralProjectRegistrationError";
+  }
+}
+
+interface CentralProjectRegistrationHandle {
+  central: CentralCore;
+  close(): Promise<void>;
+}
+
+async function openCentralProjectRegistration(cwd: string): Promise<CentralProjectRegistrationHandle> {
+  let backend: Awaited<ReturnType<typeof import("@fusion/core").createTaskStoreForBackend>>;
+  try {
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    backend = await createTaskStoreForBackend({ rootDir: cwd });
+  } catch {
+    throw new CentralProjectRegistrationError();
+  }
+
+  if (!backend) {
+    throw new CentralBackendUnavailableError();
+  }
+
+  const central = new CentralCore(undefined, { asyncLayer: backend.asyncLayer });
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await central.close().catch(() => undefined);
+    await backend.shutdown().catch(() => undefined);
+  };
+
+  try {
+    await central.init();
+  } catch {
+    await close();
+    throw new CentralProjectRegistrationError();
+  }
+
+  return { central, close };
+}
+
+async function ensureCentralProjectRegistration(
+  cwd: string,
+  fusionDir: string,
+  dbPath: string,
+  projectName: string,
+): Promise<{ project: Awaited<ReturnType<CentralCore["ensureProjectForPath"]>>["project"]; alreadyRegistered: boolean; gitRepository?: "initialized" | "existing" }> {
+  let registration: CentralProjectRegistrationHandle | undefined;
+  try {
+    registration = await openCentralProjectRegistration(cwd);
+    const existing = await registration.central.getProjectByPath(cwd);
+    if (existing) {
+      try {
+        writeProjectIdentity(fusionDir, {
+          id: existing.id,
+          createdAt: existing.createdAt,
+        });
+      } catch {
+        // Best-effort backfill only.
+      }
+      return { project: existing, alreadyRegistered: true };
+    }
+
+    const identity = existsSync(dbPath) ? readProjectIdentity(fusionDir) : null;
+    const ensured = await registration.central.ensureProjectForPath({
+      path: cwd,
+      identity: identity ?? undefined,
+      name: projectName,
+    });
+    const project = ensured.project;
+    await registration.central.updateProject(project.id, { status: "active" });
+
+    try {
+      writeProjectIdentity(fusionDir, {
+        id: project.id,
+        createdAt: project.createdAt,
+      });
+    } catch {
+      console.warn("  ⚠ Could not persist project identity");
+    }
+
+    return {
+      project,
+      alreadyRegistered: false,
+      gitRepository: ensured.gitRepository,
+    };
+  } catch (error) {
+    if (error instanceof GitRepositoryInitializationError) {
+      throw error;
+    }
+    if (error instanceof CentralBackendUnavailableError || error instanceof CentralProjectRegistrationError) {
+      throw error;
+    }
+    throw new CentralProjectRegistrationError();
+  } finally {
+    await registration?.close();
+  }
+}
+
 /**
  * Run the init command.
  *
@@ -51,41 +164,7 @@ export async function runInit(options: InitOptions = {}): Promise<void> {
   const dbPath = join(fusionDir, "fusion.db");
   const hasDbPath = existsSync(dbPath);
   const hasValidDb = hasDbPath && isValidSqliteDatabaseFile(dbPath);
-
-  // Check if already initialized
-  if (existsSync(fusionDir) && hasDbPath && hasValidDb) {
-    // Check if registered in central DB
-    const central = new CentralCore();
-    await central.init();
-
-    const existing = await central.getProjectByPath(cwd);
-    if (existing) {
-      try {
-        writeProjectIdentity(join(cwd, ".fusion"), {
-          id: existing.id,
-          createdAt: existing.createdAt,
-        });
-      } catch {
-        // Best-effort backfill only.
-      }
-      console.log(`✓ fn project already initialized: "${existing.name}"`);
-      console.log(`  Path: ${cwd}`);
-      console.log(`\n  Project is registered in the central registry.`);
-      console.log(`  To re-initialize with a different name, run:`);
-      console.log(`    fn project remove ${existing.name}`);
-      console.log(`    fn init --name <new-name>`);
-      await central.close();
-      return;
-    }
-
-    // Has .fusion/ but not registered - offer to register
-    const projectName = options.name ?? await detectProjectName(cwd);
-    console.log(`⚠ Project directory exists but not registered.`);
-    console.log(`  Run: fn project add ${projectName} ${cwd}`);
-    console.log(`  Or: rm -rf ${fusionDir} && fn init`);
-    await central.close();
-    return;
-  }
+  const hasInitializedLocalProject = existsSync(fusionDir) && hasDbPath && hasValidDb;
 
   if (existsSync(fusionDir) && hasDbPath && !hasValidDb) {
     throw new Error(
@@ -94,8 +173,25 @@ export async function runInit(options: InitOptions = {}): Promise<void> {
     );
   }
 
-  // Get or generate project name
   const projectName = options.name ?? await detectProjectName(cwd);
+
+  if (hasInitializedLocalProject) {
+    const registration = await ensureCentralProjectRegistration(cwd, fusionDir, dbPath, projectName);
+    if (registration.alreadyRegistered) {
+      console.log(`✓ fn project already initialized: "${registration.project.name}"`);
+      console.log(`  Path: ${cwd}`);
+      console.log(`\n  Project is registered in the central registry.`);
+      console.log(`  To re-initialize with a different name, run:`);
+      console.log(`    fn project remove ${registration.project.name}`);
+      console.log(`    fn init --name <new-name>`);
+      return;
+    }
+
+    maybeInstallClaudeSkillForNewProject(cwd);
+    console.log(`  ✓ Registered existing local project in central database`);
+    console.log(`\n✓ Project "${registration.project.name}" is ready!`);
+    return;
+  }
 
   console.log(`Initializing fn project: "${projectName}"`);
   console.log(`  Path: ${cwd}`);
@@ -125,71 +221,23 @@ export async function runInit(options: InitOptions = {}): Promise<void> {
   const bundledSkillInstall = installBundledFusionSkill();
   logBundledSkillInstallResults(bundledSkillInstall.results);
 
-  // Register in central database
-  const central = new CentralCore();
-  await central.init();
+  const registration = await ensureCentralProjectRegistration(cwd, fusionDir, dbPath, projectName);
+  maybeInstallClaudeSkillForNewProject(cwd);
 
-  try {
-    // Check if already registered
-    const existing = await central.getProjectByPath(cwd);
-    if (existing) {
-      console.log(`  ✓ Already registered in central database`);
-      maybeInstallClaudeSkillForNewProject(cwd);
-      console.log(`\n✓ Project "${projectName}" is ready!`);
-      console.log(`\n  Next steps:`);
-      console.log(`    fn task list       # View tasks`);
-      console.log(`    fn task create    # Create a task`);
-      console.log(`    fn dashboard      # Open the web UI`);
-      await central.close();
-      return;
-    }
-
-    const identity = existsSync(dbPath) ? readProjectIdentity(fusionDir) : null;
-    const ensured = await central.ensureProjectForPath({
-      path: cwd,
-      identity: identity ?? undefined,
-      name: projectName,
-    });
-
-    const project = ensured.project;
-
-    // Activate the project (registration sets it to 'initializing')
-    await central.updateProject(project.id, { status: "active" });
-
-    try {
-      writeProjectIdentity(join(cwd, ".fusion"), {
-        id: project.id,
-        createdAt: project.createdAt,
-      });
-    } catch (identityError) {
-      console.warn(`  ⚠ Could not persist project identity: ${identityError instanceof Error ? identityError.message : String(identityError)}`);
-    }
-
-    maybeInstallClaudeSkillForNewProject(cwd);
-
-    if (ensured.gitRepository === "initialized") {
+  if (registration.alreadyRegistered) {
+    console.log(`  ✓ Already registered in central database`);
+    console.log(`\n✓ Project "${projectName}" is ready!`);
+  } else {
+    if (registration.gitRepository === "initialized") {
       console.log(`  ✓ Initialized git repository`);
     }
     console.log(`  ✓ Registered in central database`);
-    console.log(`\n✓ Project "${project.name}" initialized successfully!`);
-    console.log(`\n  Next steps:`);
-    console.log(`    fn task list       # View tasks`);
-    console.log(`    fn task create    # Create a task`);
-    console.log(`    fn dashboard      # Open the web UI`);
-
-    await central.close();
-  } catch (err) {
-    if (err instanceof GitRepositoryInitializationError) {
-      await central.close();
-      throw err;
-    }
-    // If central DB registration fails, still report success since local files are created
-    console.log(`  ⚠ Could not register in central database: ${(err as Error).message}`);
-    console.log(`\n✓ Project initialized locally (central registration can be done later)`);
-    console.log(`\n  To register later, run:`);
-    console.log(`    fn project add ${projectName} ${cwd}`);
-    await central.close();
+    console.log(`\n✓ Project "${registration.project.name}" initialized successfully!`);
   }
+  console.log(`\n  Next steps:`);
+  console.log(`    fn task list       # View tasks`);
+  console.log(`    fn task create    # Create a task`);
+  console.log(`    fn dashboard      # Open the web UI`);
 }
 
 /**

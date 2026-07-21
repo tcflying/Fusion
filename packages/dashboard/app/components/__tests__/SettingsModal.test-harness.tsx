@@ -63,6 +63,8 @@ export const mockFetchProjects = vi.fn();
 export const mockFetchDashboardHealth = vi.fn();
 export const mockCheckForUpdates = vi.fn();
 export const mockInstallUpdate = vi.fn();
+export const mockFetchSystemInfo = vi.fn();
+export const mockRequestSystemRestart = vi.fn();
 export const mockFetchRemoteSettings = vi.fn();
 export const mockUpdateRemoteSettings = vi.fn();
 export const mockFetchRemoteStatus = vi.fn();
@@ -140,8 +142,16 @@ export function renderModal(props: Partial<ComponentProps<typeof SettingsModal>>
 }
 
 export async function waitForSettingsModalReady() {
+  /*
+  FNXC:DashboardTests 2026-07-18-13:35:
+  Full Suite shard 4 failed when mockFetchSettings was called but the modal still showed
+  Loading… on the next paint (OAuth incomplete-toast test). Wait for Loading to clear so
+  Authentication/section clicks do not race the initial settings fetch.
+  */
   await waitFor(() => expect(mockFetchSettings).toHaveBeenCalled());
-  expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+  await waitFor(() => {
+    expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+  });
 }
 
 export async function renderModalSection(
@@ -193,19 +203,20 @@ export async function expectSettingPersists({ section, label, kind, value, scope
     fireEvent.change(control, { target: { value: String(value) } });
   }
 
-  fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
+  fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
 
   if (scope === "global") {
     await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalled());
-    expect(mockUpdateGlobalSettings.mock.calls[0]?.[0]).toEqual(
+    expect(mockUpdateGlobalSettings).toHaveBeenCalledWith(
       expect.objectContaining({ [expectedKey]: value }),
     );
     return;
   }
 
   await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalled());
-  expect(mockUpdateSettings.mock.calls[0]?.[0]).toEqual(
+  expect(mockUpdateSettings).toHaveBeenCalledWith(
     expect.objectContaining({ [expectedKey]: value }),
+    undefined,
   );
 }
 
@@ -215,7 +226,7 @@ export async function assertProjectModelSavePayload(provider: string, modelId: s
 
   fireEvent.change(screen.getByLabelText("Default Provider"), { target: { value: provider } });
   fireEvent.change(screen.getByLabelText("Default Model"), { target: { value: modelId } });
-  fireEvent.click(screen.getByRole("button", { name: /^Save$/i }));
+  fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
 
   await waitFor(() => {
     expect(mockUpdateSettings).toHaveBeenCalledWith(
@@ -233,13 +244,31 @@ export function forEachProvider<T>(providers: T[], fn: (provider: T) => void) {
   providers.forEach(fn);
 }
 
-export function installSettingsModalEnv() {
+/*
+FNXC:DashboardTests 2026-07-14-19:35:
+Settings simplification keeps specialist sections and low-frequency controls behind the browser-local Advanced settings disclosure (nav filter + CSS :has() hides). Field-level SettingsModal suites need the full surface; default advanced ON after localStorage.clear so push-after-merge, worktree copy files, Remote Access, Memory, Experimental, etc. remain reachable. Suites that assert the default-off disclosure (e.g. general.test) must remove this key before render.
+*/
+export const ADVANCED_SETTINGS_STORAGE_KEY = "fusion:settings:show-advanced";
+
+export function enableAdvancedSettingsPreference() {
+  localStorage.setItem(ADVANCED_SETTINGS_STORAGE_KEY, "true");
+}
+
+export function clearAdvancedSettingsPreference() {
+  localStorage.removeItem(ADVANCED_SETTINGS_STORAGE_KEY);
+}
+
+export function installSettingsModalEnv(options?: { advancedSettings?: boolean }) {
+  const advancedSettings = options?.advancedSettings !== false;
   beforeEach(() => {
     vi.useRealTimers();
     settingsModalUser = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
     vi.resetAllMocks();
     localStorage.clear();
     sessionStorage.clear();
+    if (advancedSettings) {
+      enableAdvancedSettingsPreference();
+    }
     clearPluginUiSlotsCache();
     mockUseMobileKeyboard.mockReturnValue({
       keyboardOpen: false,
@@ -368,6 +397,8 @@ export function installSettingsModalEnv() {
     mockFetchDashboardHealth.mockResolvedValue({ status: "ok", version: "1.2.3", uptime: 123 });
     mockCheckForUpdates.mockResolvedValue(undefined);
     mockInstallUpdate.mockResolvedValue({ currentVersion: "1.2.3", latestVersion: "2.0.0", updated: true });
+    mockFetchSystemInfo.mockResolvedValue({ supervised: true, restartSupported: true });
+    mockRequestSystemRestart.mockResolvedValue({ scheduled: true });
     mockFetchRemoteSettings.mockResolvedValue({
       settings: {
         remoteActiveProvider: null,

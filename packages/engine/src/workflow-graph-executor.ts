@@ -9,7 +9,8 @@ import type {
   WorkflowNodeExtensionResult,
   WorkflowStepResult,
 } from "@fusion/core";
-import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode } from "@fusion/core";
+import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease } from "@fusion/core";
+import { isNonPlanDefectPlanReviewFailure } from "./transient-error-detector.js";
 
 import {
   createDefaultNodeHandlers,
@@ -41,8 +42,28 @@ import {
 } from "./workflow-graph-foreach.js";
 import { runLoop, runOptionalGroup } from "./workflow-graph-loop.js";
 import type { WorkflowNodeRunnerRegistry } from "./workflow-node-runner.js";
+import { workflowNodeRequiresWorktree } from "./workflow-node-execution-needs.js";
+import type { WorkflowColumnBoundary } from "./workflow-column-boundary.js";
 
 export type WorkflowNodeOutcome = "success" | "failure";
+
+type WorkflowNodeSettings = Pick<Settings, "experimentalFeatures"> & {
+  reviewerInlineFixes?: boolean;
+};
+
+/** A classified Plan Review provider outage terminates the graph without replan traversal. */
+export const PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE = "plan-review-provider-failure-hold";
+
+/*
+FNXC:PlanReviewLease 2026-07-18-23:45:
+U3 / KTD-4/R5 — a live Plan Review LEASE held by another (or a crashed) run within
+the staleness floor makes the graph HOLD in place instead of dispatching a second
+reviewer. Mirrors the provider-failure hold: the run terminates without traversing
+to plan-replan; the next poll re-checks the lease and reclaims once it goes stale.
+This is what makes the FN-1315 duplicate "Starting workflow step: Plan Review"
+interleaving impossible by construction (exactly one reviewer per gate per attempt).
+*/
+export const PLAN_REVIEW_LEASE_HELD_VALUE = "plan-review-lease-held";
 
 export type WorkflowNodeAbortKind = "engine-pause";
 
@@ -79,7 +100,7 @@ export interface WorkflowTaskProjection {
 
 export interface WorkflowNodeExecutionContext {
   task: TaskDetail;
-  settings: Pick<Settings, "experimentalFeatures"> | undefined;
+  settings: WorkflowNodeSettings | undefined;
   context: Record<string, unknown>;
   /** Set during concurrent branch execution; fail-fast aborts via this signal.
    *  Undefined on the sequential path (zero behavior change for linear graphs). */
@@ -216,6 +237,8 @@ export interface WorkflowGraphExecutorDeps {
     phase: WorkflowStepResult["phase"];
     status: WorkflowStepResult["status"];
     verdict?: string;
+    /** Raw node result retained for non-verdict provider-failure classification. */
+    failureValue?: string;
     nodeId?: string;
     maxRevisions?: unknown;
   }) => Promise<boolean> | boolean;
@@ -223,7 +246,23 @@ export interface WorkflowGraphExecutorDeps {
   publishTaskProjection?: (taskId: string, patch: WorkflowTaskProjection, source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] }) => void | Promise<void>;
   /** @deprecated use publishTaskProjection. Kept for older callers. */
   publishTouchedFiles?: (taskId: string, files: string[], source: { nodeId: string; nodeKind: WorkflowIrNode["kind"] }) => void | Promise<void>;
+  /*
+   * FNXC:WorkflowColumnBoundary 2026-07-18-20:45:
+   * U1 (KTD-1/2/3) — the lifecycle column-boundary controller. Invoked on entry
+   * to each real (non-start/end) node BEFORE it executes: when the node's column
+   * differs from the card's current column the controller performs the trait-hook
+   * moveTask (or parks at the ready-for-release seam on a hold→wip boundary), pins
+   * the resolved IR, and emits `task:column-transition`. Its `detectDrift` runs
+   * once at graph start and parks with `task:reconcile-workflow-drift` on a stale
+   * pin. Absent → the graph performs NO lifecycle moves, so every legacy
+   * executor/runner test stays byte-identical.
+   */
+  columnBoundary?: WorkflowColumnBoundary;
 }
+
+/** Context key set when a run is aborted before traversal by an IR-drift park
+ *  (KTD-3). The runner surfaces this as a terminal (failed) disposition. */
+export const WORKFLOW_DRIFT_PARK_CONTEXT_KEY = "workflow:driftPark";
 
 export interface WorkflowGraphExecutorResult {
   executed: boolean;
@@ -339,7 +378,7 @@ export class WorkflowGraphExecutor {
 
   public async run(
     task: TaskDetail,
-    settings: (Pick<Settings, "experimentalFeatures"> & Partial<Pick<Settings, "autoMerge">>) | undefined,
+    settings: (WorkflowNodeSettings & Partial<Pick<Settings, "autoMerge">>) | undefined,
     ir: WorkflowIr = BUILTIN_CODING_WORKFLOW_IR,
   ): Promise<WorkflowGraphExecutorResult> {
     const startNode = ir.nodes.find((node) => node.kind === "start");
@@ -401,12 +440,24 @@ export class WorkflowGraphExecutor {
     })();
     const visitedNodeIds: string[] = [];
     const inStack = new Set<string>();
-    const syntheticMergeNode: WorkflowIrNode = {
+    /*
+    FNXC:WorkflowMerge 2026-07-19-21:05 (U11 / R1 / KTD-1):
+    The merge region collapses into ONE seam invocation recorded under the stable legacy node id
+    `merge`. Its COLUMN, however, must come from the merge-region node actually being entered —
+    not a literal. `column: "in-review"` was hardcoded here, which is precisely R1's motivating
+    defect ("the merge boundary always calls moveTask(id, 'in-review')"): a user-authored
+    workflow that places its merge nodes in a `Merging` column had the card moved to `in-review`
+    instead — a column such a workflow need not even declare. Caught by the 6-column benchmark
+    (U11), whose Merging column never received the card.
+    `in-review` remains the fallback so builtin:coding — whose merge nodes ARE in `in-review` —
+    stays byte-identical (KTD-7 parity oracle).
+    */
+    const syntheticMergeNodeFor = (regionNode?: WorkflowIrNode): WorkflowIrNode => ({
       id: "merge",
       kind: "prompt",
-      column: "in-review",
+      column: regionNode?.column ?? "in-review",
       config: { seam: "merge" },
-    };
+    });
 
     // Bounded-rework generalization (U6). A `kind: "rework"` edge is the only
     // legal cycle: it loops back to a "rework region head" (the edge's `to` node).
@@ -491,8 +542,18 @@ export class WorkflowGraphExecutor {
           return await traverseChildren(node, { outcome: "success" });
         }
         if (node.kind === "end") {
+          // KTD-1: `end` is a graph terminal, not a column destination — the card
+          // never moves here. A failure edge terminating at `end` parks the card
+          // in place (its current wip/merge column), which is exactly the
+          // no-onNodeEntry behavior.
           return { outcome: "success" };
         }
+
+        // U1: cross the lifecycle column boundary on node entry (KTD-1/2/3). A
+        // columnless node, a same-column node, or a hold→wip boundary produces no
+        // move; the controller owns that decision. Runs BEFORE the node executes,
+        // so an execute failure parks the card in the column it just entered.
+        await this.deps.columnBoundary?.onNodeEntry(node);
 
         if (node.kind === "split") {
           // Concurrent fan-out: branches run in parallel up to their join, which
@@ -669,6 +730,40 @@ export class WorkflowGraphExecutor {
             return await traverseChildren(node, { outcome: "success", value: "already-passed" });
           }
           /*
+           * FNXC:PlanReviewLease 2026-07-18-23:50:
+           * U3 / KTD-4/R5 — the graph is now the SOLE Plan Review owner (triage's
+           * out-of-graph gate is deleted). A `pending` Plan Review result is a LEASE:
+           * if a live lease (within the staleness floor) is already held — by a
+           * concurrent run or one that crashed mid-review — ADOPT it and hold in
+           * place rather than dispatching a second reviewer. Only a stale/absent
+           * lease is (re)claimed below, where a fresh lease record is written. This
+           * closes the FN-1315 duplicate-reviewer interleaving by construction.
+           */
+          if (node.id === PLAN_REVIEW_GROUP_ID) {
+            /*
+            FNXC:PlanReviewLease 2026-07-19-01:00:
+            Loud regression lock for the @fusion/core gate-barrel export drift: the `engine-core` vitest project builds @fusion/core from `packages/core/src/index.gate.ts`, so a lease export present in the main barrel but missing from the gate barrel resolves to `undefined` ONLY there (how U3's classifyReviewLease broke every defaultOn Plan Review run under engine-core). Fail loud with a named, diagnostic error instead of the opaque "is not a function" TypeError so the cause — a stale gate barrel — is unmistakable.
+            */
+            if (typeof classifyReviewLease !== "function") {
+              throw new Error(
+                "classifyReviewLease import resolved undefined — @fusion/core gate barrel (packages/core/src/index.gate.ts) is missing the workflow-step-results lease exports; keep it in sync with index.ts",
+              );
+            }
+            const lease = classifyReviewLease(
+              task.workflowStepResults,
+              node.id,
+              this.deps.runLoopNowForTests?.() ?? Date.now(),
+            );
+            if (lease.kind === "adopt") {
+              this.deps.logTaskEntry?.(
+                "[pre-merge] Plan Review already in progress (lease held) — not dispatching a second reviewer",
+              );
+              context[`node:${node.id}:outcome`] = "failure";
+              context[`node:${node.id}:value`] = PLAN_REVIEW_LEASE_HELD_VALUE;
+              return { outcome: "failure", value: PLAN_REVIEW_LEASE_HELD_VALUE };
+            }
+          }
+          /*
            * FNXC:WorkflowPostMerge 2026-06-26-09:00:
            * Phase is read from the optional-group node's `config.phase` (defaults to
            * "pre-merge", so every existing group is byte-identical). A
@@ -689,6 +784,9 @@ export class WorkflowGraphExecutor {
             status: "pending",
             source: "optional-group",
             startedAt: stepStartedAt,
+            // U3/KTD-4: stamp the lease owner so a concurrent/crashed re-entry
+            // adopts this pending gate instead of dispatching a second reviewer.
+            leaseOwner: runId,
           });
           this.deps.logTaskEntry?.(`${logPrefix} Starting workflow step: ${groupName}`);
 
@@ -787,11 +885,23 @@ export class WorkflowGraphExecutor {
           /*
            * FNXC:PlanReviewReplan 2026-06-29-00:41:
            * Plan Review sits between specification and execution. A REVISE verdict
-           * or hard failure at this node means PROMPT.md needs another planning pass,
-           * not executor remediation. Forward the failure into the same pre-merge fix
-           * seam with a synthesized REVISE verdict so the executor can route it back
-           * to triage and then let approved replans continue through todo/execution.
+           * means PROMPT.md needs another planning pass, not executor remediation.
            */
+          /*
+           * FNXC:PlanReviewReplan 2026-07-15-12:00:
+           * FN-7977 / issue #2124: do not fabricate REVISE from a hard Plan Review
+           * provider failure. Transport, rate-limit, model-selection, abort, and
+           * operator-actionable errors must remain visible in place so completed
+           * execution work cannot bounce back to the planner column.
+           */
+          const nonPlanDefectPlanReviewFailure =
+            node.id === PLAN_REVIEW_GROUP_ID
+            && stepStatus === "failed"
+            && isNonPlanDefectPlanReviewFailure({
+              verdict,
+              errorMessage: stepOutput ?? stepNotes,
+              failureValue: verdictRaw,
+            });
           /*
            * FNXC:PlanReview 2026-06-29-02:05:
            * Plan Review should send a task back to triage only for an actual
@@ -802,7 +912,23 @@ export class WorkflowGraphExecutor {
           const shouldRequestPreMergeFix =
             stepPhase === "pre-merge"
             && (stepStatus === "advisory_failure" || stepStatus === "failed")
-            && (verdict === "REVISE" || (node.id === PLAN_REVIEW_GROUP_ID && stepStatus === "failed"));
+            && (verdict === "REVISE" || (
+              node.id === PLAN_REVIEW_GROUP_ID
+              && stepStatus === "failed"
+              && !nonPlanDefectPlanReviewFailure
+            ));
+          if (nonPlanDefectPlanReviewFailure) {
+            /*
+             * FNXC:PlanReviewReplan 2026-07-15-16:35:
+             * FN-7977: a classified provider/model/transport failure is a retryable
+             * hold, not a Plan Review REVISE. Do not traverse the built-in failure
+             * edge to plan-replan without remediation context; the executor retries
+             * this explicit hold in place and preserves advanced execution state.
+             */
+            context[`node:${node.id}:outcome`] = "failure";
+            context[`node:${node.id}:value`] = PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE;
+            return { outcome: "failure", value: PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE };
+          }
           if (shouldRequestPreMergeFix) {
             const feedback = stepOutput?.trim()
               || stepNotes?.trim()
@@ -815,6 +941,7 @@ export class WorkflowGraphExecutor {
               phase: stepPhase,
               status: stepStatus,
               verdict: verdict ?? (node.id === PLAN_REVIEW_GROUP_ID ? "REVISE" : undefined),
+              ...(!verdict && verdictRaw !== undefined ? { failureValue: verdictRaw } : {}),
               nodeId: node.id,
               maxRevisions: node.config?.maxRevisions,
             };
@@ -925,15 +1052,19 @@ export class WorkflowGraphExecutor {
       }
     };
 
-    const runLegacyMergeSeam = async (): Promise<WorkflowNodeResult> => {
+    const runLegacyMergeSeam = async (regionNode?: WorkflowIrNode): Promise<WorkflowNodeResult> => {
       // The merge-policy primitive region is interpreter-owned policy. While the
       // legacy lifecycle remains authoritative, reaching any of its node kinds is
       // the terminal merge boundary: dispatch the same prompt/seam handler a
       // legacy `config.seam: "merge"` node used, but record it under the stable
       // legacy node id `merge` and never expose raw merge-region primitive ids.
-      visitedNodeIds.push(syntheticMergeNode.id);
+      const mergeNode = syntheticMergeNodeFor(regionNode);
+      visitedNodeIds.push(mergeNode.id);
+      // U1: the synthetic merge seam carries the merge-region's column; cross the
+      // boundary on entry so a custom "Merging" column receives the card (KTD-1).
+      await this.deps.columnBoundary?.onNodeEntry(mergeNode);
       const result = await this.executeNodeWithRetries(
-        syntheticMergeNode,
+        mergeNode,
         task,
         settings,
         context,
@@ -941,8 +1072,8 @@ export class WorkflowGraphExecutor {
         this.deps.signal,
       );
       if (result.contextPatch) Object.assign(context, result.contextPatch);
-      context[`node:${syntheticMergeNode.id}:outcome`] = result.outcome;
-      if (result.value !== undefined) context[`node:${syntheticMergeNode.id}:value`] = result.value;
+      context[`node:${mergeNode.id}:outcome`] = result.outcome;
+      if (result.value !== undefined) context[`node:${mergeNode.id}:value`] = result.value;
       return result;
     };
 
@@ -980,7 +1111,7 @@ export class WorkflowGraphExecutor {
           continue;
         }
         if (target && isMergeRegionKind(target.kind)) {
-          aggregate = await runLegacyMergeSeam();
+          aggregate = await runLegacyMergeSeam(target);
           if (aggregate.outcome === "failure") break;
           /*
            * FNXC:WorkflowPostMerge 2026-06-26-09:00:
@@ -1033,6 +1164,16 @@ export class WorkflowGraphExecutor {
       }
       return aggregate;
     };
+
+    // U1 (KTD-3): IR-pin drift guard. If a prior run pinned a node the current IR
+    // has since dropped (or whose column was deleted), park with
+    // `task:reconcile-workflow-drift` and do NOT traverse the mutated graph. The
+    // controller has already emitted the reconcile audit; surface a terminal
+    // failure carrying the drift marker so the runner parks the card.
+    if (this.deps.columnBoundary && (await this.deps.columnBoundary.detectDrift())) {
+      context[WORKFLOW_DRIFT_PARK_CONTEXT_KEY] = true;
+      return { executed: true, outcome: "failure", context, visitedNodeIds };
+    }
 
     const terminal = await walk(startNode.id);
     if (isReworkSignal(terminal)) {
@@ -1236,7 +1377,7 @@ export class WorkflowGraphExecutor {
   private async executeNodeWithRetries(
     node: WorkflowIrNode,
     task: TaskDetail,
-    settings: Pick<Settings, "experimentalFeatures"> | undefined,
+    settings: WorkflowNodeSettings | undefined,
     context: Record<string, unknown>,
     workflow: WorkflowIr,
     signal?: AbortSignal,
@@ -1255,7 +1396,7 @@ export class WorkflowGraphExecutor {
       // Fail-fast cancellation: a branch or top-level graph abort mid-retry stops re-trying.
       if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
       try {
-        await this.prepareNodeExecution(node, task);
+        await this.prepareNodeExecution(node, task, context, settings);
         const progressRecord = recordProgress && this.shouldRecordNodeProgress(node)
           ? await this.recordNodeProgressStart(task.id, node)
           : null;
@@ -1395,23 +1536,36 @@ export class WorkflowGraphExecutor {
     });
   }
 
-  private async prepareNodeExecution(node: WorkflowIrNode, task: TaskDetail): Promise<void> {
-    const requirement = this.classifyNodePreparation(node);
+  private async prepareNodeExecution(
+    node: WorkflowIrNode,
+    task: TaskDetail,
+    context: Record<string, unknown>,
+    settings: WorkflowNodeSettings | undefined,
+  ): Promise<void> {
+    const requirement = this.classifyNodePreparation(node, context, settings);
     if (!requirement.requiresWorktree) return;
     await this.deps.prepareNodeExecution?.(node, task, requirement);
   }
 
-  private classifyNodePreparation(node: WorkflowIrNode): WorkflowNodePreparationRequirement {
-    const cfg = node.config ?? {};
-    const executorKind = typeof cfg.executor === "string" ? cfg.executor : "model";
-    const hasScriptName = typeof cfg.scriptName === "string" && cfg.scriptName.trim().length > 0;
-    const hasCliCommand = executorKind === "cli" && typeof cfg.cliCommand === "string" && cfg.cliCommand.trim().length > 0;
-    const requiresWorktree =
-      cfg.toolMode === "coding"
-      || node.kind === "script"
-      || executorKind === "cli-agent"
-      || hasScriptName
-      || hasCliCommand;
+  private classifyNodePreparation(
+    node: WorkflowIrNode,
+    context: Record<string, unknown>,
+    settings: WorkflowNodeSettings | undefined,
+  ): WorkflowNodePreparationRequirement {
+    const optionalGroupId = typeof context[WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY] === "string"
+      ? context[WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY]
+      : undefined;
+    /*
+     * FNXC:WorkflowExecution 2026-07-15-00:00:
+     * Graph preparation receives the optional-group context and effective inline-fix
+     * setting so it applies the same classifier as runtime. Only an explicit false
+     * disables inline fixes, preserving the default-enabled review worktree contract
+     * that prevents issue #2075's pre-review no-worktree failure.
+     */
+    const requiresWorktree = workflowNodeRequiresWorktree(node, {
+      optionalGroupId,
+      reviewerInlineFixes: settings?.reviewerInlineFixes,
+    });
     return {
       requiresWorktree,
       reason: requiresWorktree ? "write-capable-node" : undefined,

@@ -12,6 +12,9 @@ const mocks = vi.hoisted(() => {
   const app = {
     getVersion: vi.fn(() => "1.2.3"),
   };
+  const shell = {
+    openExternal: vi.fn(async () => undefined),
+  };
 
   const updateTrayStatus = vi.fn();
   const showExportSettingsDialog = vi.fn();
@@ -30,6 +33,7 @@ const mocks = vi.hoisted(() => {
     ipcMain,
     ipcHandlers,
     app,
+    shell,
     updateTrayStatus,
     showExportSettingsDialog,
     showImportSettingsDialog,
@@ -43,6 +47,7 @@ const mocks = vi.hoisted(() => {
 vi.mock("electron", () => ({
   ipcMain: mocks.ipcMain,
   app: mocks.app,
+  shell: mocks.shell,
 }));
 
 vi.mock("../tray.js", () => ({
@@ -153,6 +158,19 @@ describe("ipc handlers", () => {
     expect(channels.has("desktopLaunchMode:setMode")).toBe(true);
     expect(channels.has("platform:get")).toBe(true);
     expect(channels.has("shell:openConnectionManager")).toBe(true);
+    expect(channels.has("shell:openExternal")).toBe(true);
+  });
+
+  it("shell:openExternal permits only http(s) URLs", async () => {
+    await registerHandlers();
+    const handler = mocks.ipcHandlers.get("shell:openExternal");
+
+    await expect(handler?.({}, "file:///C:/sensitive.txt")).resolves.toBe(false);
+    await expect(handler?.({}, "data:text/plain,not-safe")).resolves.toBe(false);
+    await expect(handler?.({}, "https://auth.openai.com/oauth/authorize")).resolves.toBe(true);
+
+    expect(mocks.shell.openExternal).toHaveBeenCalledTimes(1);
+    expect(mocks.shell.openExternal).toHaveBeenCalledWith("https://auth.openai.com/oauth/authorize");
   });
 
   it("shell:getState returns desktop shell state", async () => {

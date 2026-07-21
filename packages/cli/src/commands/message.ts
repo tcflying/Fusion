@@ -1,4 +1,4 @@
-import { MessageStore, createDatabase } from "@fusion/core";
+import { DASHBOARD_USER_ID, MessageStore } from "@fusion/core";
 import type { ParticipantType } from "@fusion/core";
 import { resolveAgentStoreBase } from "../project-context.js";
 
@@ -8,39 +8,37 @@ import { resolveAgentStoreBase } from "../project-context.js";
  *
  * FNXC:PostgresCutover 2026-07-05-12:00:
  * Borrow the PostgreSQL AsyncDataLayer from the resolved project store so the
- * MessageStore runs in backend mode (the sync SQLite Database runtime was
- * removed under VAL-REMOVAL-005). The legacy createDatabase path survives only
- * for the FUSION_NO_EMBEDDED_PG=1 opt-out where no asyncLayer exists. The
- * backend-mode `db` handle is a no-op closer: the AsyncDataLayer pool is owned
+ * MessageStore runs in backend mode. The returned cleanup handle is a no-op:
+ * the AsyncDataLayer pool is owned
  * by the resolved project store, not by this command.
  */
-export async function createMessageStore(projectName?: string): Promise<{ store: MessageStore; db: { close: () => void } }> {
-  const { rootDir, asyncLayer } = await resolveAgentStoreBase(projectName);
-  if (asyncLayer) {
-    const store = new MessageStore(null, { asyncLayer });
-    return { store, db: { close: () => {} } };
-  }
-  const fusionDir = rootDir + "/.fusion";
-  const db = createDatabase(fusionDir);
-  db.init();
-  const store = new MessageStore(db);
-  return { store, db };
+export async function createMessageStore(projectName?: string): Promise<{ store: MessageStore; db: { close: () => Promise<void> } }> {
+  const { asyncLayer, cleanup } = await resolveAgentStoreBase(projectName);
+  /* FNXC:PostgresCliMessages 2026-07-14-18:24: CLI messaging always uses the resolved project's authoritative PostgreSQL layer; the removed SQLite opt-out must not create a second local store. */
+  const store = new MessageStore(null, { asyncLayer });
+  return { store, db: { close: cleanup } };
 }
 
 /** User ID for CLI-originated messages */
 export const CLI_USER_ID = "cli";
 
 /**
- * List inbox messages.
+ * List inbox messages for the CLI or dashboard operator mailbox.
+ *
+ * FNXC:CliChatReplyRouting 2026-07-20-12:00:
+ * Fusion deliberately keeps CLI (`cli`) and dashboard (`dashboard`) user
+ * mailboxes distinct. Default to CLI mail for backwards compatibility, while
+ * allowing automation to inspect the dashboard mailbox where legacy replies
+ * may have landed.
  */
-export async function runMessageInbox(projectName?: string): Promise<void> {
+export async function runMessageInbox(projectName?: string, ownerId = CLI_USER_ID): Promise<void> {
   const { store, db } = await createMessageStore(projectName);
   try {
-    const mailbox = await store.getMailbox(CLI_USER_ID, "user");
-    const messages = await store.getInbox(CLI_USER_ID, "user", { limit: 20 });
+    const mailbox = await store.getMailbox(ownerId, "user");
+    const messages = await store.getInbox(ownerId, "user", { limit: 20 });
 
     console.log();
-    console.log(`  📬 Inbox (${mailbox.unreadCount} unread)`);
+    console.log(`  📬 ${ownerId === DASHBOARD_USER_ID ? "Dashboard Inbox" : "Inbox"} (${mailbox.unreadCount} unread)`);
     console.log();
 
     if (messages.length === 0) {
@@ -59,7 +57,7 @@ export async function runMessageInbox(projectName?: string): Promise<void> {
       console.log();
     }
   } finally {
-    db.close();
+    await db.close();
   }
 }
 
@@ -90,7 +88,7 @@ export async function runMessageOutbox(projectName?: string): Promise<void> {
       console.log();
     }
   } finally {
-    db.close();
+    await db.close();
   }
 }
 
@@ -114,7 +112,7 @@ export async function runMessageSend(toId: string, content: string, projectName?
     console.log(`    To: Agent ${toId}`);
     console.log();
   } finally {
-    db.close();
+    await db.close();
   }
 }
 
@@ -128,6 +126,7 @@ export async function runMessageRead(id: string, projectName?: string): Promise<
 
     if (!message) {
       console.error(`Message ${id} not found`);
+      await db.close();
       process.exit(1);
     }
 
@@ -150,7 +149,7 @@ export async function runMessageRead(id: string, projectName?: string): Promise<
     console.log(`  ${message.content}`);
     console.log();
   } finally {
-    db.close();
+    await db.close();
   }
 }
 
@@ -166,7 +165,7 @@ export async function runMessageDelete(id: string, projectName?: string): Promis
     console.log(`  ✓ Message ${id} deleted`);
     console.log();
   } finally {
-    db.close();
+    await db.close();
   }
 }
 
@@ -199,7 +198,7 @@ export async function runAgentMailbox(agentId: string, projectName?: string): Pr
       console.log();
     }
   } finally {
-    db.close();
+    await db.close();
   }
 }
 

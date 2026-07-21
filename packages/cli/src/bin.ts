@@ -114,44 +114,75 @@ function loadLocalEnv(): void {
 
 loadLocalEnv();
 
+/*
+FNXC:CliCommandIsolation 2026-07-19-20:57:
+Source-worktree `fn init` and `fn project` commands must dispatch without
+resolving dashboard routes or optional runtime-plugin build artifacts. Keep a
+command module loader inside the invoked handler so non-dashboard commands do
+not inherit the dashboard build graph.
+*/
+function lazyCommandModule<TModule extends object>(
+  loadModule: () => Promise<TModule>,
+): TModule {
+  return new Proxy({} as TModule, {
+    get(_target, property: string | symbol) {
+      if (typeof property !== "string") {
+        return undefined;
+      }
+
+      return async (...args: unknown[]) => {
+        const commandModule = await loadModule() as Record<string, unknown>;
+        const commandHandler = commandModule[property];
+        if (typeof commandHandler !== "function") {
+          throw new TypeError(`Command handler "${property}" is not a function`);
+        }
+        return commandHandler(...args);
+      };
+    },
+  });
+}
+
 // Command handlers are loaded lazily so --help can return immediately
 // without importing the full command graph.
-async function loadCommandHandlers() {
-  const { runDashboard } = await import("./commands/dashboard.js");
-  const { runServe } = await import("./commands/serve.js");
-  const { runDaemon } = await import("./commands/daemon.js");
-  const { runDesktop } = await import("./commands/desktop.js");
-  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = await import("./commands/task.js");
-  const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = await import("./commands/pr.js");
-  const { runSettingsShow, runSettingsSet } = await import("./commands/settings.js");
-  const { runSettingsExport } = await import("./commands/settings-export.js");
-  const { runSettingsImport } = await import("./commands/settings-import.js");
-  const { runMcpList, runMcpAdd, runMcpEdit, runMcpRemove, runMcpEnable, runMcpDisable, runMcpImport, runMcpExport, runMcpValidate } = await import("./commands/mcp.js");
-  const { runWorkflowValidate } = await import("./commands/workflow.js");
-  const { runGitStatus, runGitFetch, runGitPull, runGitPush } = await import("./commands/git.js");
-  const { runBranchGroupList, runBranchGroupShow, runBranchGroupPromote, runBranchGroupAbandon } = await import("./commands/branch-group.js");
-  const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = await import("./commands/backup.js");
-  const { runDbVacuum, runDbMigrate } = await import("./commands/db.js");
-  const { runMemoryBackupCreate, runMemoryBackupList, runMemoryBackupRestore } = await import("./commands/memory-backup.js");
-  const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice, runMissionLinkGoal, runMissionUnlinkGoal, runMissionGoals } = await import("./commands/mission.js");
-  const { runGoalsList, runGoalsCreate, runGoalsArchive, runGoalsCitations } = await import("./commands/goals.js");
-  const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = await import("./commands/project.js");
-  const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = await import("./commands/node.js");
-  const { runInit } = await import("./commands/init.js");
-  const { runOnboard } = await import("./commands/onboard.js");
-  const { runAgentStop, runAgentStart } = await import("./commands/agent.js");
-  const { runAgentImport } = await import("./commands/agent-import.js");
-  const { runAgentExport } = await import("./commands/agent-export.js");
-  const { runMessageInbox, runMessageOutbox, runMessageSend, runMessageRead, runMessageDelete, runAgentMailbox } = await import("./commands/message.js");
-  const { runChatInteractive } = await import("./commands/chat.js");
-  const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable, runPluginSetupStatus, runPluginSetup, runPluginAvailable, runPluginSettings, runPluginRescan } = await import("./commands/plugin.js");
-  const { runPluginCreate, runPluginNew } = await import("./commands/plugin-scaffold.js");
-  const { runPluginDev } = await import("./commands/plugin-dev.js");
-  const { runPluginPublish } = await import("./commands/plugin-publish.js");
-  const { runSkillsSearch, runSkillsInstall } = await import("./commands/skills.js");
-  const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = await import("./commands/research.js");
-  const { runExperimentFinalize } = await import("./commands/experiment-finalize.js");
-  const { runUpdate } = await import("./commands/update.js");
+function loadCommandHandlers() {
+  const { runDashboard } = lazyCommandModule(() => import("./commands/dashboard.js"));
+  const { runServe } = lazyCommandModule(() => import("./commands/serve.js"));
+  const { runDaemon } = lazyCommandModule(() => import("./commands/daemon.js"));
+  const { runDesktop } = lazyCommandModule(() => import("./commands/desktop.js"));
+  const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = lazyCommandModule(() => import("./commands/task.js"));
+  const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = lazyCommandModule(() => import("./commands/pr.js"));
+  const { runSettingsShow, runSettingsSet } = lazyCommandModule(() => import("./commands/settings.js"));
+  const { runSettingsExport } = lazyCommandModule(() => import("./commands/settings-export.js"));
+  const { runSettingsImport } = lazyCommandModule(() => import("./commands/settings-import.js"));
+  const { runMcpList, runMcpAdd, runMcpEdit, runMcpRemove, runMcpEnable, runMcpDisable, runMcpImport, runMcpExport, runMcpValidate } = lazyCommandModule(() => import("./commands/mcp.js"));
+  const { runWorkflowValidate } = lazyCommandModule(() => import("./commands/workflow.js"));
+  const { runGitStatus, runGitFetch, runGitPull, runGitPush } = lazyCommandModule(() => import("./commands/git.js"));
+  const { runBranchGroupList, runBranchGroupShow, runBranchGroupPromote, runBranchGroupAbandon } = lazyCommandModule(() => import("./commands/branch-group.js"));
+  const { runBackupCreate, runBackupList, runBackupRestore, runBackupCleanup } = lazyCommandModule(() => import("./commands/backup.js"));
+  const { runDbVacuum, runDbMigrate } = lazyCommandModule(() => import("./commands/db.js"));
+  const { runMemoryBackupCreate, runMemoryBackupList, runMemoryBackupRestore } = lazyCommandModule(() => import("./commands/memory-backup.js"));
+  const { runMissionCreate, runMissionList, runMissionShow, runMissionDelete, runMissionActivateSlice, runMissionLinkGoal, runMissionUnlinkGoal, runMissionGoals } = lazyCommandModule(() => import("./commands/mission.js"));
+  const { runGoalsList, runGoalsCreate, runGoalsArchive, runGoalsCitations } = lazyCommandModule(() => import("./commands/goals.js"));
+  const { runProjectList, runProjectAdd, runProjectRemove, runProjectShow, runProjectInfo, runProjectSetDefault, runProjectDetect } = lazyCommandModule(() => import("./commands/project.js"));
+  const { runNodeList, runNodeConnect, runNodeDisconnect, runNodeShow, runNodeHealth, runMeshStatus } = lazyCommandModule(() => import("./commands/node.js"));
+  const { runInit } = lazyCommandModule(() => import("./commands/init.js"));
+  const { runOnboard } = lazyCommandModule(() => import("./commands/onboard.js"));
+  const { runAgentStop, runAgentStart } = lazyCommandModule(() => import("./commands/agent.js"));
+  const { runAgentImport } = lazyCommandModule(() => import("./commands/agent-import.js"));
+  const { runAgentExport } = lazyCommandModule(() => import("./commands/agent-export.js"));
+  const { runOrgExport } = lazyCommandModule(() => import("./commands/org-export.js"));
+  const { runOrgImport } = lazyCommandModule(() => import("./commands/org-import.js"));
+  const { runMessageInbox, runMessageOutbox, runMessageSend, runMessageRead, runMessageDelete, runAgentMailbox } = lazyCommandModule(() => import("./commands/message.js"));
+  const { runChatInteractive } = lazyCommandModule(() => import("./commands/chat.js"));
+  const { runPluginList, runPluginInstall, runPluginUninstall, runPluginEnable, runPluginDisable, runPluginSetupStatus, runPluginSetup, runPluginAvailable, runPluginSettings, runPluginRescan } = lazyCommandModule(() => import("./commands/plugin.js"));
+  const { runPluginCreate, runPluginNew } = lazyCommandModule(() => import("./commands/plugin-scaffold.js"));
+  const { runPluginDev } = lazyCommandModule(() => import("./commands/plugin-dev.js"));
+  const { runPluginPublish } = lazyCommandModule(() => import("./commands/plugin-publish.js"));
+  const { runSkillsSearch, runSkillsInstall } = lazyCommandModule(() => import("./commands/skills.js"));
+  const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = lazyCommandModule(() => import("./commands/research.js"));
+  const { runExperimentFinalize } = lazyCommandModule(() => import("./commands/experiment-finalize.js"));
+  const { parseRoomControlPlanePolicyCommandArgs, runRoomControlPlanePolicy } = lazyCommandModule(() => import("./commands/room-control-plane.js"));
+  const { runUpdate } = lazyCommandModule(() => import("./commands/update.js"));
 
   return {
     runDashboard,
@@ -256,6 +287,8 @@ async function loadCommandHandlers() {
     runAgentStart,
     runAgentImport,
     runAgentExport,
+    runOrgExport,
+    runOrgImport,
     runMessageInbox,
     runMessageOutbox,
     runMessageSend,
@@ -285,6 +318,8 @@ async function loadCommandHandlers() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    parseRoomControlPlanePolicyCommandArgs,
+    runRoomControlPlanePolicy,
     runUpdate,
     runChatInteractive,
   };
@@ -313,7 +348,8 @@ Usage:
   fn desktop --dev                    Launch source-checkout desktop with hot-reload (connects to Vite dev server)
   fn desktop --paused                 Launch with automation paused
   fn desktop --no-auth                Disable bearer-token auth for the embedded local dashboard
-  fn update [--check] [--global] [--json]   Update Fusion to the latest version
+  fn update [--check] [--global] [--json] [--channel <stable|beta>] [--force]
+                                       Update Fusion on the selected release channel
   fn upgrade                           Alias for fn update
   fn task create [desc] [opts]         Create a new task (goes to triage; supports --node <name>, --no-dedup)
   fn task plan [description] [opts]    Create task via AI-guided planning
@@ -399,6 +435,11 @@ PR:
   fn node show | info [name] [--json] Show node details
   fn node health <name>               Health check a node
   fn mesh status [--json]              Show full mesh state
+  fn room-control-plane host-policy install --file <policy.json>
+  fn room-control-plane host-policy revoke --file <policy.json>
+  fn room-control-plane capacity-policy install --file <policy.json>
+  fn room-control-plane capacity-policy update --file <policy.json>
+                                      Install/revoke explicit Room execution authority; never derives provider facts from settings
   fn settings                          Show current Fusion configuration
   fn settings set <key> <value>        Update a configuration setting
   fn settings set defaultNodeId <node-id>
@@ -407,6 +448,9 @@ PR:
   fn settings set worktrunk.onFailure <fail|fallback-native>
   fn settings export [opts]              Export settings to a JSON file
   fn settings import <file> [opts]       Import settings from a JSON file
+  fn org-export <file> [--project <name>] Export one project plus global settings as a secret-scrubbed org bundle
+  fn org-import <file> [--dry-run] [--collision-mode <skip|suffix>] [--project <name>]
+                                      Import a portable org bundle
   fn mcp list [--project <name>] [--json] List MCP servers by scope and effective resolution
   fn mcp add <name> --scope <global|project> --transport <stdio|sse|http> [opts]
                                       Add an MCP server using secret references for env/header values
@@ -439,13 +483,14 @@ PR:
                                       Export Fusion agents to an Agent Companies package directory
                                       (agent skills assigned via metadata.skills affect execution-time tools)
   fn agent mailbox <id>             View an agent's mailbox
-  fn message inbox                  List inbox messages
+  fn message inbox [--user <cli|dashboard>]
+                                    List CLI or dashboard operator inbox messages
   fn message outbox                 List sent messages
   fn message send <agent-id> <msg>  Send a message to an agent
   fn message read <id>              Read a specific message
   fn message delete <id>            Delete a message
-  fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>]
-                                    Interactive or one-shot chat with an agent
+  fn chat <agent-id> [message…] [--once] [--non-interactive] [--poll-ms <n>] [--reply-timeout-ms <n>] [--conversation-id <id>]
+                                    Named mailbox conversation with deadline-bounded inbox replies
   fn backup --create         Create a database backup immediately
   fn backup --list           List all database backups
   fn backup --restore <file> Restore database from a backup file
@@ -775,6 +820,8 @@ async function main() {
     runAgentStart,
     runAgentImport,
     runAgentExport,
+    runOrgExport,
+    runOrgImport,
     runMessageInbox,
     runMessageOutbox,
     runMessageSend,
@@ -804,9 +851,11 @@ async function main() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    parseRoomControlPlanePolicyCommandArgs,
+    runRoomControlPlanePolicy,
     runUpdate,
     runChatInteractive,
-  } = await loadCommandHandlers();
+  } = loadCommandHandlers();
 
   try {
     switch (command) {
@@ -925,10 +974,23 @@ async function main() {
 
       case "update":
       case "upgrade": {
+        // FNXC:UpdateChannels 2026-07-19-13:05: --channel <stable|beta> selects
+        // and persists the release track; --force installs the channel target
+        // even when not newer (the explicit beta → stable downgrade path).
+        // A bare trailing --channel (or one followed by another flag) errors
+        // instead of being silently ignored (PR #2345 review).
+        const channelFlagIndex = args.indexOf("--channel");
+        const channelValue = channelFlagIndex !== -1 ? args[channelFlagIndex + 1] : undefined;
+        if (channelFlagIndex !== -1 && (channelValue === undefined || channelValue.startsWith("--"))) {
+          console.error("Error: --channel requires a value: stable or beta.");
+          process.exit(1);
+        }
         await runUpdate({
           check: args.includes("--check"),
           global: args.includes("--global") ? true : undefined,
           json: args.includes("--json"),
+          channel: channelValue,
+          force: args.includes("--force"),
         });
         break;
       }
@@ -1127,6 +1189,21 @@ async function main() {
             console.log("Try: fn mesh status");
             process.exit(1);
         }
+        break;
+      }
+
+      case "room-control-plane": {
+        /*
+        FNXC:RoomControlPlanePolicyCommand 2026-07-20-22:36:
+        This is the only CLI path that grants or withdraws Room execution
+        authority. The JSON file contains the exact project and host scope, so
+        a global --project convenience flag must not silently override it.
+        */
+        if (projectName) {
+          throw new Error("Room control-plane policy commands require projectId inside the explicit policy file, not --project");
+        }
+        const parsed = parseRoomControlPlanePolicyCommandArgs(args.slice(1));
+        await runRoomControlPlanePolicy(parsed);
         break;
       }
 
@@ -1662,6 +1739,21 @@ async function main() {
         break;
       }
 
+      case "org-export": {
+        const output = args[1];
+        if (!output) { console.error("Usage: fn org-export <file> [--project <name>]"); process.exit(1); }
+        await runOrgExport(output, { project: projectName });
+        break;
+      }
+      case "org-import": {
+        const file = args[1];
+        if (!file) { console.error("Usage: fn org-import <file> [--dry-run] [--collision-mode <skip|suffix>] [--project <name>]"); process.exit(1); }
+        const collisionMode = getFlagValue(args.slice(2), "--collision-mode");
+        if (collisionMode && collisionMode !== "skip" && collisionMode !== "suffix") { console.error("--collision-mode must be skip or suffix"); process.exit(1); }
+        await runOrgImport(file, { project: projectName, dryRun: args.includes("--dry-run"), collisionMode: collisionMode as "skip" | "suffix" | undefined });
+        break;
+      }
+
       case "settings": {
         const subcommand = args[1];
         if (!subcommand || subcommand === "show") {
@@ -2029,7 +2121,12 @@ async function main() {
         const subcommand = args[1];
         switch (subcommand) {
           case "inbox": {
-            await runMessageInbox(projectName);
+            const inboxUser = getFlagValue(args.slice(2), "--user");
+            if (inboxUser !== undefined && inboxUser !== "cli" && inboxUser !== "dashboard") {
+              console.error("Usage: fn message inbox [--user <cli|dashboard>]");
+              process.exit(1);
+            }
+            await runMessageInbox(projectName, inboxUser);
             break;
           }
           case "outbox": {
@@ -2145,7 +2242,7 @@ async function main() {
             await runPluginAvailable();
             break;
           }
-          case "settings": {
+      case "settings": {
             const id = args[2];
             if (!id) { console.error("Usage: fn plugin settings <id> [key] [value]"); process.exit(1); }
             await runPluginSettings(id, args[3], args[4], { projectName });
@@ -2298,7 +2395,10 @@ async function main() {
     }
   } catch (err) {
     console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
+    const { isPostgresUniqueError, ProjectPartitionRekeyError, FUSION_NON_RETRYABLE_EXIT_CODE } = await import("@fusion/core");
+    process.exit(isPostgresUniqueError(err) || err instanceof ProjectPartitionRekeyError
+      ? FUSION_NON_RETRYABLE_EXIT_CODE
+      : 1);
   }
 }
 

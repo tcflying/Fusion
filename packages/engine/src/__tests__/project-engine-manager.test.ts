@@ -37,6 +37,9 @@ vi.mock("../project-engine.js", () => {
 
 import { ProjectEngineManager } from "../project-engine-manager.js";
 import { ProjectEngine } from "../project-engine.js";
+import type { ProjectEngineOptions } from "../project-engine.js";
+import type { RoomHostCompositionProviderV1 } from "../room-host-composition.js";
+import type { RoomHostCompositionOperatorAdapterRegistryV1 } from "../room-host-composition-operator-policy-provider.js";
 import {
   acquireEngineSingleton,
   EngineAlreadyRunningError,
@@ -58,6 +61,8 @@ function createMockCentralCore(projects: RegisteredProject[]): CentralCore {
     ),
     updateProject: vi.fn().mockResolvedValue(undefined),
     updateProjectHealth: vi.fn().mockResolvedValue(undefined),
+    stopDiscovery: vi.fn(),
+    markLocalNodeOffline: vi.fn().mockResolvedValue(undefined),
     resolveLocalProjectWorkingDirectory: vi
       .fn()
       .mockImplementation((projectId: string) => Promise.resolve(`/mapped/${projectId}`)),
@@ -105,6 +110,45 @@ describe("ProjectEngineManager", () => {
         }),
         centralCore,
         expect.any(Object),
+      );
+    });
+
+    it("injects externalTaskStore only when project working directory matches store root", async () => {
+      const sharedStore = {
+        getRootDir: () => "/mapped/proj_aaa",
+      } as any;
+      const manager = new ProjectEngineManager(centralCore, {
+        externalTaskStore: sharedStore,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+      expect(ProjectEngine).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workingDirectory: "/mapped/proj_aaa" }),
+        centralCore,
+        expect.objectContaining({ externalTaskStore: sharedStore }),
+      );
+
+      await manager.ensureEngine("proj_bbb");
+      expect(ProjectEngine).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workingDirectory: "/mapped/proj_bbb" }),
+        centralCore,
+        expect.not.objectContaining({ externalTaskStore: sharedStore }),
+      );
+    });
+
+    it("shares externalTaskStore when roots differ only by trailing slash", async () => {
+      const sharedStore = {
+        getRootDir: () => "/mapped/proj_aaa/",
+      } as any;
+      const manager = new ProjectEngineManager(centralCore, {
+        externalTaskStore: sharedStore,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+      expect(ProjectEngine).toHaveBeenLastCalledWith(
+        expect.objectContaining({ workingDirectory: "/mapped/proj_aaa" }),
+        centralCore,
+        expect.objectContaining({ externalTaskStore: sharedStore }),
       );
     });
 
@@ -201,6 +245,151 @@ describe("ProjectEngineManager", () => {
       );
     });
 
+    it("forwards the unified Room host composition provider by identity without manufacturing raw seams", async () => {
+      const roomHostCompositionProvider: RoomHostCompositionProviderV1 = {
+        resolve: () => ({
+          state: "withheld",
+          reason: "global_arbiter_not_unified",
+        }),
+      };
+      const manager = new ProjectEngineManager(centralCore, {
+        roomHostCompositionProvider,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+
+      const engineOptions = (ProjectEngine as unknown as ReturnType<typeof vi.fn>)
+        .mock.calls[0][2] as ProjectEngineOptions;
+      expect(engineOptions.roomHostCompositionProvider).toBe(roomHostCompositionProvider);
+      expect(engineOptions.roomGlobalConcurrencyVerifiedPolicy).toBeUndefined();
+      expect(engineOptions.roomProviderBackpressureVerifiedFactory).toBeUndefined();
+      expect(engineOptions.roomCapabilityRegistryRefreshVerifiedFactory).toBeUndefined();
+      expect(engineOptions.roomTaskDispatchCapacityAdmissionVerifiedFactory).toBeUndefined();
+    });
+
+    it("constructs the central operator-policy Room provider only when the host explicitly supplies an adapter registry", async () => {
+      const roomHostCompositionOperatorAdapterRegistry: RoomHostCompositionOperatorAdapterRegistryV1 = {
+        resolve: vi.fn(async () => ({ state: "withheld", reason: "runtime_observation_unavailable" })),
+      };
+      const manager = new ProjectEngineManager(centralCore, {
+        roomHostCompositionOperatorAdapterRegistry,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+
+      const engineOptions = (ProjectEngine as unknown as ReturnType<typeof vi.fn>)
+        .mock.calls[0][2] as ProjectEngineOptions;
+      expect(engineOptions.roomHostCompositionProvider).toBeDefined();
+      expect(engineOptions.roomHostCompositionProvider).not.toBe(roomHostCompositionOperatorAdapterRegistry);
+      expect(engineOptions.roomGlobalConcurrencyVerifiedPolicy).toBeUndefined();
+      expect(engineOptions.roomProviderBackpressureVerifiedFactory).toBeUndefined();
+      expect(engineOptions.roomCapabilityRegistryRefreshVerifiedFactory).toBeUndefined();
+      expect(engineOptions.roomTaskDispatchCapacityAdmissionVerifiedFactory).toBeUndefined();
+    });
+
+    it("rejects ambiguous central adapter, explicit bundle, or raw Room seam combinations before engine construction", () => {
+      const roomHostCompositionOperatorAdapterRegistry: RoomHostCompositionOperatorAdapterRegistryV1 = {
+        resolve: vi.fn(async () => ({ state: "withheld", reason: "runtime_observation_unavailable" })),
+      };
+      const roomHostCompositionProvider: RoomHostCompositionProviderV1 = {
+        resolve: () => ({ state: "withheld", reason: "external_authority" }),
+      };
+
+      expect(() => new ProjectEngineManager(centralCore, {
+        roomHostCompositionOperatorAdapterRegistry,
+        roomHostCompositionProvider,
+      })).toThrow("explicit Room host composition provider with an operator adapter registry");
+      expect(() => new ProjectEngineManager(centralCore, {
+        roomHostCompositionOperatorAdapterRegistry,
+        roomGlobalConcurrencyVerifiedPolicy: {} as never,
+      })).toThrow("operator adapter registry with raw verified Room composition seams");
+    });
+
+    it("forwards verified Room policies from the manager by identity", async () => {
+      const roomGlobalConcurrencyVerifiedPolicy = {} as NonNullable<
+        ProjectEngineOptions["roomGlobalConcurrencyVerifiedPolicy"]
+      >;
+      const roomProviderBackpressureVerifiedFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"]
+      >;
+      const roomCapabilityRegistryRefreshVerifiedFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"]
+      >;
+      const roomTaskDispatchCapacityAdmissionVerifiedFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"]
+      >;
+      const manager = new ProjectEngineManager(centralCore, {
+        roomGlobalConcurrencyVerifiedPolicy,
+        roomProviderBackpressureVerifiedFactory,
+        roomCapabilityRegistryRefreshVerifiedFactory,
+        roomTaskDispatchCapacityAdmissionVerifiedFactory,
+      });
+
+      await manager.ensureEngine("proj_aaa");
+
+      const engineOptions = (ProjectEngine as unknown as ReturnType<typeof vi.fn>)
+        .mock.calls[0][2] as ProjectEngineOptions;
+      expect(engineOptions.roomGlobalConcurrencyVerifiedPolicy).toBe(
+        roomGlobalConcurrencyVerifiedPolicy,
+      );
+      expect(engineOptions.roomProviderBackpressureVerifiedFactory).toBe(
+        roomProviderBackpressureVerifiedFactory,
+      );
+      expect(engineOptions.roomCapabilityRegistryRefreshVerifiedFactory).toBe(
+        roomCapabilityRegistryRefreshVerifiedFactory,
+      );
+      expect(engineOptions.roomTaskDispatchCapacityAdmissionVerifiedFactory).toBe(
+        roomTaskDispatchCapacityAdmissionVerifiedFactory,
+      );
+    });
+
+    it("allows per-engine Room policy overrides to take precedence", async () => {
+      const managerPolicy = {} as NonNullable<
+        ProjectEngineOptions["roomGlobalConcurrencyVerifiedPolicy"]
+      >;
+      const overridePolicy = {} as NonNullable<
+        ProjectEngineOptions["roomGlobalConcurrencyVerifiedPolicy"]
+      >;
+      const managerFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"]
+      >;
+      const overrideFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"]
+      >;
+      const managerCapabilityFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"]
+      >;
+      const overrideCapabilityFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"]
+      >;
+      const managerCapacityFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"]
+      >;
+      const overrideCapacityFactory = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"]
+      >;
+      const manager = new ProjectEngineManager(centralCore, {
+        roomGlobalConcurrencyVerifiedPolicy: managerPolicy,
+        roomProviderBackpressureVerifiedFactory: managerFactory,
+        roomCapabilityRegistryRefreshVerifiedFactory: managerCapabilityFactory,
+        roomTaskDispatchCapacityAdmissionVerifiedFactory: managerCapacityFactory,
+      });
+
+      await manager.ensureEngine("proj_aaa", {
+        roomGlobalConcurrencyVerifiedPolicy: overridePolicy,
+        roomProviderBackpressureVerifiedFactory: overrideFactory,
+        roomCapabilityRegistryRefreshVerifiedFactory: overrideCapabilityFactory,
+        roomTaskDispatchCapacityAdmissionVerifiedFactory: overrideCapacityFactory,
+      });
+
+      const engineOptions = (ProjectEngine as unknown as ReturnType<typeof vi.fn>)
+        .mock.calls[0][2] as ProjectEngineOptions;
+      expect(engineOptions.roomGlobalConcurrencyVerifiedPolicy).toBe(overridePolicy);
+      expect(engineOptions.roomProviderBackpressureVerifiedFactory).toBe(overrideFactory);
+      expect(engineOptions.roomCapabilityRegistryRefreshVerifiedFactory).toBe(overrideCapabilityFactory);
+      expect(engineOptions.roomTaskDispatchCapacityAdmissionVerifiedFactory).toBe(overrideCapacityFactory);
+    });
+
     it("merges per-engine overrides", async () => {
       const manager = new ProjectEngineManager(centralCore);
 
@@ -266,6 +455,19 @@ describe("ProjectEngineManager", () => {
       expect(engineA.stop).toHaveBeenCalledOnce();
       expect(engineB.stop).toHaveBeenCalledOnce();
       expect(manager.getAllEngines().size).toBe(0);
+    });
+
+    it("persists the local node offline before engine backends stop", async () => {
+      const manager = new ProjectEngineManager(centralCore);
+      await manager.startAll();
+      const engineA = manager.getEngine("proj_aaa")!;
+
+      await manager.stopAll();
+
+      expect(centralCore.markLocalNodeOffline).toHaveBeenCalledTimes(1);
+      const offlineOrder = (centralCore.markLocalNodeOffline as unknown as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const engineStopOrder = (engineA.stop as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      expect(offlineOrder).toBeLessThan(engineStopOrder);
     });
 
     it("stopAll frees residual slots from each stopped project scope", async () => {

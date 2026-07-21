@@ -397,7 +397,10 @@ export class CronRunner {
 
         /*
          * FNXC:Automations 2026-06-27-00:00:
-         * Cron execution must claim the due window in SQLite before running so two runner instances, overlapping project/all pollers, or separate engine processes cannot execute the same still-due row. The in-memory inFlight guard remains useful within one process but is not the cross-process authority.
+         * Cron execution must claim the due window in storage before running so two runner instances, overlapping project/all pollers, or separate engine processes cannot execute the same still-due row. The in-memory inFlight guard remains useful within one process but is not the cross-process authority.
+         *
+         * FNXC:AutomationIsolation 2026-07-13-22:37:
+         * PostgreSQL claims include the AutomationStore's bound project ID. A project cron runner may claim its own project or global execution lane, but it must never claim another project's command from the shared table.
          */
         const claimed = await this.automationStore.claimDueSchedule(schedule.id, schedule.nextRunAt);
         if (!claimed) {
@@ -623,10 +626,10 @@ export class CronRunner {
     error: string | undefined;
   }> {
     try {
-      const { runBackupCommand } = await import("@fusion/core");
+      const { runBackupCommand, resolveGlobalBackupRoot } = await import("@fusion/core");
       const fusionDir = this.store.getFusionDir();
       const settings = await this.store.getSettings();
-      const result = await runBackupCommand(fusionDir, settings);
+      const result = await runBackupCommand(resolveGlobalBackupRoot(this.store), settings);
       const output = truncateOutput(result.output ?? "", "");
       return {
         success: result.success,
@@ -1103,7 +1106,7 @@ export function formatInProcessBackupError(err: unknown, fusionDir: string): str
   if (cause.includes("project DB") || cause.includes("central DB")) {
     return cause;
   }
-  return `project DB run backup command failed; source: ${fusionDir}/fusion.db; cause: ${cause}`;
+  return `project PostgreSQL run backup command failed; project state: ${fusionDir}; cause: ${cause}`;
 }
 
 /** Combine and truncate stdout/stderr to stay within storage limits. */

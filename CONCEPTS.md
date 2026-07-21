@@ -224,6 +224,24 @@ The server-derived `canInstall` flag for a Plugin Registry Entry. `canInstall: t
 ### Workflow Extension
 A plugin-contributed workflow capability registered through the engine rather than hardcoded into core workflow logic: column metadata, movement policies, column work engines, workflow node handlers, task verdict providers, or merge-routing facts. A Workflow Extension is opt-in by workflow metadata and must degrade or park by an explicit fallback policy when its plugin is disabled or missing, preserving the Default workflow baseline when no extension is active.
 
+### Quality Hub
+The project-wide Quality plugin dashboard destination (left sidebar on desktop; More sheet on mobile) for test dashboards, test plans, orchestrated test runs, and read-only CI status. Quality Hub runs are advisory visualization/orchestration — they do not redefine or replace the Merge Gate.
+
+### Test Plan (Quality)
+A project-scoped, ordered list of allowlisted verification presets (and optional browser/agent QA references) owned by the Quality plugin. Distinct from agent planning sessions or mission planning artifacts; operators author and run these from the Quality Hub.
+
+### Test Run (Quality)
+A single supervised execution of a Quality preset or plan step, with lifecycle status (queued → running → passed|failed|timed_out|cancelled|error), cwd policy, truncated logs, and optional task/plan linkage. Separate from engine `fn_run_verification` runs, though it may orchestrate the same underlying commands.
+
+### Task QA Tab
+A task-detail plugin tab (`task-detail-tab`) for human-friendly task quality work: start a task-scoped preview/test server, run targeted tests and view reports, browse screenshots/visual evidence (task artifacts and design-preview), review suggested test cases, see PR check status, and hand off into browser-verification / agent QA. Complements the Quality Hub with worktree-local verification rather than replacing workflow review/merge.
+
+### Task Preview Server
+A Quality/Dev-Server–backed process started for a single Task’s worktree so operators can exercise the change in a browser. Distinct from the project-level Dev Server view: same process safety rules (supervised spawn, free port, never 4040), but session identity and default cwd are task-scoped.
+
+### Suggested Test Cases (Quality)
+An advisory checklist of what to verify for a Task, generated from the task prompt, file scope/modified files, and optional AI enrichment. Not a merge gate and not a substitute for automated tests; operators tick, copy, or run related targeted tests from the Task QA Tab.
+
 ## Workflow columns & traits
 
 *Controlled by the default-on `experimentalFeatures.workflowColumns` flag. With an explicit flag-off override, the legacy fixed pipeline (the closed column enum + `VALID_TRANSITIONS`) is authoritative and unchanged.*
@@ -242,6 +260,24 @@ Requires both the workflow-columns and graph-executor flags; with either off, bi
 ### Effective agent (execution principal)
 The agent identity that actually runs a piece of work after column-agent precedence resolves — and the principal every identity-keyed subsystem must consult: permission gating, heartbeat serialization in both directions, resume re-dispatch, and mid-flight change detection. It may differ from the task's assigned agent under an override binding, and one task may have multiple effective agents across concurrent branch sessions.
 
+### Permanent / durable agent
+A non-ephemeral agent row operators create and keep (CEO, specialists, column agents). Permanent agents wake on heartbeats, hold standing instructions (`instructionsText` / `instructionsPath` / `soul`), and coordinate work. Ephemeral task workers are created for a lane and deleted when the session ends.
+
+### Heartbeat run
+A short permanent-agent wake: timer, assignment, message, or on-demand. The run loads identity + Wake Delta + procedure, takes **one** coordination action, and exits via `fn_heartbeat_done`. Task-body coding runs on the **executor** path, not the default heartbeat.
+
+### Heartbeat procedure
+Per-tick ordered checklist text (built-in strict/lite/off templates or a per-agent `HEARTBEAT.md` at `heartbeatProcedurePath`). Task-scoped custom files replace the built-in procedure; no-task runs always use the ambient built-in so task-only tools are never promised. System-prompt **Critical Rules** still apply even when a custom procedure is loaded.
+
+### Checkout lease
+Exclusive execution ownership of a task (`checkedOutBy` + lease metadata / central claim row). Heartbeat validates the lease for a bound task and exits `checkout_conflict` without retry when another agent holds it. Claim/checkout are the binding primitives; agents must not spin on 409-style conflicts.
+
+### Auto-claim
+No-task heartbeat behavior that may claim an unowned ready `todo` matching role/policy (`autoClaimRelevantTasks`, engineer backlog opt-in). Distinct from multi-assign inventory (tasks already `assignedAgentId` to the agent). Auto-claim candidates and “your assigned tasks” must stay separate prompt sections.
+
+### assignmentPolicy
+Per-agent routing eligibility: `auto` (default pool + auto-claim), `explicit-only` (direct assign/delegate only), `none` (never bind implementation work — liaison/observer guarantee). Enforced on claim, checkout, assign, inbox selection, and delegation.
+
 ### Lane
 A horizontal row on the multi-lane board, one per workflow in use by visible cards. Each lane renders its own workflow's columns. Tasks with no workflow selection appear in the Default workflow's lane; every card appears in exactly one lane. Zero-card lanes are hidden; lanes are collapsible with persisted state.
 
@@ -249,13 +285,13 @@ A horizontal row on the multi-lane board, one per workflow in use by visible car
 A workflow node kind expressing passive dwell — a card rests in its column until a release condition fires: manual promote, timer, downstream capacity available, dependency satisfied, or external event. Hold release is evaluated by a substrate sweep (the generalized scheduler), which reserves worktree + semaphore slots before issuing the release move.
 
 ### Split / Join
-Parallel-branch node kinds. A `split` launches its outgoing edges concurrently; a `join` synchronizes them with `mode: all | any | quorum(n)` and `onBranchFailure: fail-fast | collect`. During the parallel window the card stays in the split's column (its board position never forks); on join resolution it advances to the join's column. `execute`/`merge` seam nodes are forbidden inside branches (one worktree/session per task; merge is exclusive). Per-branch run state persists in SQLite so a crashed branch resumes where it died.
+Parallel-branch node kinds. A `split` launches its outgoing edges concurrently; a `join` synchronizes them with `mode: all | any | quorum(n)` and `onBranchFailure: fail-fast | collect`. During the parallel window the card stays in the split's column (its board position never forks); on join resolution it advances to the join's column. `execute`/`merge` seam nodes are forbidden inside branches (one worktree/session per task; merge is exclusive). Per-branch run state persists in PostgreSQL so a crashed branch resumes where it died.
 
 ### Default workflow
 The built-in workflow (`builtin:coding`) that reproduces the legacy pipeline verbatim: six columns whose ids equal the legacy enum values, with traits matching legacy semantics (`triage`=intake, `todo`=hold+reset-on-entry, `in-progress`=wip+abort-on-exit+timing, `in-review`=merge-blocker+stall-detection+merge, `done`=complete, `archived`=archived). A null workflow selection resolves to it at read time. Non-editable, non-deletable.
 
 ### transitionPending
-A persisted crash-safe marker (`tasks.transitionPending`) written in the same transaction as a column change, recording the post-commit hooks (`hooksRemaining`) that still owe idempotent execution. Cleared once they complete. Recovery reads it exclusively from SQLite (the authoritative store); a crash mid-transition re-runs the idempotent hooks. A throwing or missing hook degrades (audit) and clears its entry — it never strands the card or wedges the task lock.
+A persisted crash-safe marker (`tasks.transitionPending`) written in the same PostgreSQL transaction as a column change, recording the post-commit hooks (`hooksRemaining`) that still owe idempotent execution. Cleared once they complete. Recovery reads it from the authoritative PostgreSQL task row; a crash mid-transition re-runs the idempotent hooks. A throwing or missing hook degrades (audit) and clears its entry — it never strands the card or wedges the task lock.
 
 ## Step inversion
 

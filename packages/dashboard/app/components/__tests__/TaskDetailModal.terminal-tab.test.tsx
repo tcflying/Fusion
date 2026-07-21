@@ -1,8 +1,19 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildHappierContinuationCommand,
   deriveCliTabVisibility,
   type CliSessionSummaryRecord,
 } from "../TaskDetailModal";
+
+describe("Happier session continuation visibility", () => {
+  it("builds the current official session send command only for a bound Happier session", () => {
+    const recorded = session("done");
+    expect(buildHappierContinuationCommand({ ...recorded, adapterId: "happier", nativeSessionId: "hp-session-1" }))
+      .toBe("happier session send 'hp-session-1' '<message>' --wait --timeout 300");
+    expect(buildHappierContinuationCommand({ ...recorded, adapterId: "codex", nativeSessionId: "thread-1" })).toBeNull();
+    expect(buildHappierContinuationCommand({ ...recorded, adapterId: "happier", nativeSessionId: null })).toBeNull();
+  });
+});
 
 function session(
   agentState: CliSessionSummaryRecord["agentState"],

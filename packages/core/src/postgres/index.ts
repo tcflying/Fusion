@@ -38,6 +38,15 @@ export {
 } from "./connection.js";
 
 export {
+  registerEmbeddedRuntimeUrl,
+  releaseEmbeddedRuntimeLease,
+  invalidateEmbeddedRuntimeUrl,
+  getActiveEmbeddedRuntimeUrl,
+  clearActiveEmbeddedRuntimeUrl,
+  type EmbeddedRuntimeLease,
+} from "./active-backend-registry.js";
+
+export {
   redactUrlPassword,
   redactUrlQueryPassword,
   redactKeywordPassword,
@@ -64,26 +73,49 @@ export {
 /**
  * FNXC:PostgresSchema 2026-06-24-03:50:
  * Drizzle schema-as-code for the three application databases (project/central/
- * archive) and plugin-owned tables. The fresh migration baseline
- * (migrations/0000_initial.sql) materializes these definitions; the schema
- * applier applies the baseline + plugin hooks to a connection.
+ * archive) and plugin-owned tables. Ordered SQL migrations materialize these
+ * definitions; the schema applier applies pending migrations + plugin hooks.
  */
 export * as schema from "./schema/index.js";
 export {
   applySchemaBaseline,
   getAppliedMigrations,
   readBaselineMigrationSql,
+  readSchemaMigrationSql,
+  SCHEMA_MIGRATIONS,
   SCHEMA_BASELINE_VERSION,
+  // FNXC:StaleBinaryGuard 2026-07-19-03:10 (U9b / R10): old-binary write refusal.
+  StaleBinarySchemaError,
+  assertBinaryNotOlderThanDatabase,
+  WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_VERSION,
+  PROJECT_OWNERSHIP_SCHEMA_VERSION,
+  SESSION_ADVISOR_ENABLED_SCHEMA_VERSION,
+  SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
+  SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
+  SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
+  SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
+  SCHEMA_ROOM_EVOLUTION_TRUST_RECEIPTS_VERSION,
+  SCHEMA_ROOM_EVOLUTION_EXECUTION_RECOVERY_VERSION,
+  SCHEMA_ROOM_PROVIDER_BACKPRESSURE_CLEANUP_ACTIONS_VERSION,
+  SCHEMA_ROOM_PROVIDER_ADMISSION_TIMEOUT_TOMBSTONES_VERSION,
+  SCHEMA_ROOM_HOST_COMPOSITION_OPERATOR_POLICY_AUTHORITY_VERSION,
+  SCHEMA_ROOM_VERSION,
   MIGRATION_BOOKKEEPING_TABLE,
+  type SchemaMigrationVersion,
 } from "./schema-applier.js";
 export {
   roadmapPluginSchemaInit,
   cePluginSchemaInit,
+  whatsappPluginSchemaInit,
+  evenRealitiesPluginSchemaInit,
   reportsPluginSchemaInit,
   cliPressPluginSchemaInit,
   DEFAULT_PLUGIN_SCHEMA_INIT_HOOKS,
   runPluginSchemaInitHooks,
+  runLoadedPluginSchemaInitHooks,
+  assertLoadedPluginSchemaInitHooksSupported,
   type PluginSchemaInitHook,
+  type LoadedPluginSchemaContract,
 } from "./plugin-schema-hook.js";
 
 /**
@@ -155,12 +187,19 @@ export {
  */
 export {
   migrateSqliteToPostgres,
+  isSqliteMigrationComplete,
+  getSqliteMigrationState,
+  completeSqliteMigration,
   defaultMigrationSources,
+  formatMigrationProgress,
   toSnakeCase,
   type SqliteMigrationSource,
   type SchemaName,
   type MigrationOptions,
+  type SqliteMigrationState,
   type MigrationReport,
+  type MigrationProgressEvent,
+  type MigrationProgressPhase,
   type TableMigrationResult,
 } from "./sqlite-migrator.js";
 
@@ -174,31 +213,36 @@ export {
 export {
   stampMigratedProjectRows,
   lookupRegisteredProjectIdByPath,
+  rekeyFallbackProjectPartition,
+  ProjectPartitionRekeyError,
+  selectDegradedBindTarget,
   type StampMigratedProjectRowsInput,
   type StampMigratedProjectRowsResult,
+  type ProjectPartitionOwnership,
+  type ProjectPartitionRekeyReason,
 } from "./migration-stamping.js";
 
 /**
  * FNXC:BackendFlip 2026-06-26-14:30:
  * Runtime startup factory (cutover milestone). `createTaskStoreForBackend()`
  * is the single entry point production construction sites consult to decide
- * whether to boot against PostgreSQL or fall back to the legacy SQLite path.
- * Post default-flip (flip-embedded-pg-default): when DATABASE_URL is unset,
- * the factory boots embedded PostgreSQL by default; FUSION_NO_EMBEDDED_PG=1
- * is the opt-out back to legacy SQLite. When DATABASE_URL is set, external
- * PostgreSQL is used. When it returns a `BackendBootResult`, the call site
- * uses the ready TaskStore and registers the result's `shutdown()` for
- * process teardown. When it returns `null`, the call site constructs the
- * SQLite-backed TaskStore exactly as before (byte-identical legacy path).
+ * how to boot PostgreSQL. Embedded PostgreSQL is the zero-config default and
+ * DATABASE_URL selects an external service; the removed SQLite opt-out is
+ * rejected so callers always receive a live backend result.
  */
 export {
   createTaskStoreForBackend,
+  createCentralBackendLayer,
   shouldUsePostgresBackend,
   isEmbeddedPgRequested,
   isEmbeddedPgOptedOut,
   EMBEDDED_PG_ENV,
   NO_EMBEDDED_PG_ENV,
+  TEST_MODE_ENV,
+  TEST_DATABASE_URL_ENV,
+  TEST_DATABASE_MIGRATION_URL_ENV,
   type BackendBootResult,
+  type CentralBackendLayerResult,
   type CreateTaskStoreForBackendOptions,
 } from "./startup-factory.js";
 

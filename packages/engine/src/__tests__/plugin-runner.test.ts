@@ -56,6 +56,7 @@ describe("PluginRunner", () => {
     getPluginUiSlots: ReturnType<typeof vi.fn>;
     getPluginUiContributions: ReturnType<typeof vi.fn>;
     getPluginRuntimes: ReturnType<typeof vi.fn>;
+    getPluginSessionConnectors: ReturnType<typeof vi.fn>;
     getCliProviderContributions: ReturnType<typeof vi.fn>;
     getPluginSkills: ReturnType<typeof vi.fn>;
     getPluginWorkflowSteps: ReturnType<typeof vi.fn>;
@@ -83,7 +84,6 @@ describe("PluginRunner", () => {
     on: ReturnType<typeof vi.fn>;
     off: ReturnType<typeof vi.fn>;
     getTask: ReturnType<typeof vi.fn>;
-    getDatabase: ReturnType<typeof vi.fn>;
     recordRunAuditEvent: ReturnType<typeof vi.fn>;
   };
   let pluginRunner: PluginRunner;
@@ -123,6 +123,7 @@ describe("PluginRunner", () => {
       getPluginUiSlots: vi.fn().mockReturnValue([]),
       getPluginUiContributions: vi.fn().mockReturnValue([]),
       getPluginRuntimes: vi.fn().mockReturnValue([]),
+      getPluginSessionConnectors: vi.fn().mockReturnValue([]),
       getCliProviderContributions: vi.fn().mockReturnValue([]),
       getPluginSkills: vi.fn().mockReturnValue([]),
       getPluginWorkflowSteps: vi.fn().mockReturnValue([]),
@@ -144,12 +145,10 @@ describe("PluginRunner", () => {
 
     const mockOn = vi.fn();
     const mockOff = vi.fn();
-    const mockRunPluginSchemaInits = vi.fn().mockResolvedValue(undefined);
     mockTaskStore = {
       on: mockOn,
       off: mockOff,
       getTask: vi.fn(),
-      getDatabase: vi.fn().mockReturnValue({ runPluginSchemaInits: mockRunPluginSchemaInits }),
       isBackendMode: vi.fn().mockReturnValue(false),
       recordRunAuditEvent: vi.fn(),
     };
@@ -185,30 +184,20 @@ describe("PluginRunner", () => {
       expect(mockPluginLoader.loadAllPlugins).toHaveBeenCalled();
     });
 
-    it("should execute schema init hooks after plugin load", async () => {
-      const schemaHook = vi.fn();
+    it("does not replay schema init hooks after PluginLoader initializes each plugin", async () => {
       mockPluginLoader.getPluginSchemaInitHooks.mockReturnValue([
-        { pluginId: "plugin-a", hook: schemaHook },
+        { pluginId: "plugin-a", hook: vi.fn() },
       ]);
 
       await pluginRunner.init();
 
-      expect(mockPluginLoader.getPluginSchemaInitHooks).toHaveBeenCalledTimes(1);
-      expect(mockTaskStore.getDatabase).toHaveBeenCalledTimes(1);
-      const db = mockTaskStore.getDatabase.mock.results[0]?.value as {
-        runPluginSchemaInits: ReturnType<typeof vi.fn>;
-      };
-      expect(db.runPluginSchemaInits).toHaveBeenCalledWith([
-        { pluginId: "plugin-a", hook: schemaHook },
-      ]);
+      expect(mockPluginLoader.getPluginSchemaInitHooks).not.toHaveBeenCalled();
     });
 
     it("should skip schema init execution when no hooks are registered", async () => {
       mockPluginLoader.getPluginSchemaInitHooks.mockReturnValue([]);
 
       await pluginRunner.init();
-
-      expect(mockTaskStore.getDatabase).not.toHaveBeenCalled();
     });
 
     it("should subscribe to plugin store events", async () => {
@@ -863,6 +852,24 @@ describe("PluginRunner", () => {
       // Next call should rebuild cache
       pluginRunner.getPluginRuntimes();
       expect(mockPluginLoader.getPluginRuntimes).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("Session Connector contributions", () => {
+    it("discovers a connector by generic connector id", async () => {
+      const registration = {
+        pluginId: "session-plugin",
+        sessionConnector: {
+          metadata: { connectorId: "connector-one", name: "Connector One", version: "1.0.0" },
+          factory: vi.fn(),
+        },
+      };
+      mockPluginLoader.getPluginSessionConnectors.mockReturnValue([registration]);
+      await pluginRunner.init();
+
+      expect(pluginRunner.getPluginSessionConnectors()).toEqual([registration]);
+      expect(pluginRunner.getSessionConnectorById("connector-one")).toBe(registration);
+      expect(pluginRunner.getSessionConnectorById("missing")).toBeUndefined();
     });
   });
 

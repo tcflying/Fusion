@@ -13,6 +13,8 @@ import { readFile, writeFile, mkdir, access, constants, readdir, stat } from "no
 import { existsSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 export const MEMORY_WORKSPACE_PATH = ".fusion/memory";
 export const MEMORY_LONG_TERM_FILENAME = "MEMORY.md";
@@ -1301,10 +1303,14 @@ export function scheduleQmdAgentMemoryRefresh(rootDir: string, agentId: string):
 
 export async function isQmdAvailable(): Promise<boolean> {
   try {
-    const execFileAsync = await getDefaultExecFileAsync();
+    // FNXC:ProjectMemory 2026-07-19-00:00: this check is awaited by one-shot
+    // CLI commands. The background-safe executor deliberately unreferences its
+    // child and streams, which lets Node terminate before this promise settles.
+    const execFileAsync = promisify(execFile);
     await execFileAsync("qmd", ["--help"], {
       timeout: 3000,
       maxBuffer: 128 * 1024,
+      windowsHide: true,
     });
     return true;
   } catch {

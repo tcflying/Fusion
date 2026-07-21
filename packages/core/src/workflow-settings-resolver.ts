@@ -33,12 +33,13 @@ import {
   type WorkflowIrResolverStore,
 } from "./workflow-ir-resolver.js";
 import { resolveEffectiveSettingValues, findOrphanedSettingValues } from "./workflow-settings.js";
-import { BUILTIN_WORKFLOW_SETTINGS } from "./builtin-workflow-settings.js";
+import { BUILTIN_WORKFLOW_SETTINGS, PLANNER_HEARTBEAT_PATROL_ENABLED_SETTING_ID } from "./builtin-workflow-settings.js";
 import type { WorkflowSettingDefinition, WorkflowIr, WorkflowOptionalGroupConfig } from "./workflow-ir-types.js";
 import { PLANNER_OVERSIGHT_LEVELS, DEFAULT_PLANNER_OVERSIGHT_LEVEL, type PlannerOversightLevel } from "./types.js";
 
 export const PLAN_REVIEW_MAX_REVISIONS_SETTING_ID = "planReviewMaxRevisions";
 export const CODE_REVIEW_MAX_REVISIONS_SETTING_ID = "codeReviewMaxRevisions";
+export const PLAN_REVIEW_REPLAN_CAP_SETTING_ID = "planReviewReplanCap";
 export type OptionalReviewRevisionBudget = NonNullable<WorkflowOptionalGroupConfig["maxRevisions"]>;
 
 const REVIEW_REVISION_SETTING_BY_GROUP_ID: Record<string, string | undefined> = {
@@ -107,6 +108,7 @@ export interface EffectiveSettingsResult {
 export interface WorkflowSettingsResolverStore extends WorkflowIrResolverStore {
   /** Raw stored `(workflowId, projectId)` value map; `{}` when no row exists. */
   getWorkflowSettingValues(workflowId: string, projectId: string): Record<string, unknown>;
+  getWorkflowSettingValuesAsync?(workflowId: string, projectId: string): Promise<Record<string, unknown>>;
   /** The stable project id this store scopes `workflow_settings` rows by. A store
    *  instance is bound to one project, so the resolver derives the project key from
    *  the store rather than from the task (Task carries no projectId field). */
@@ -130,17 +132,18 @@ function declarationsFromIr(
 
 /** Compose declarations + raw stored values → effective flat map + the set of keys
  *  whose value came from an explicit stored workflow value (never throws). */
-function effectiveFrom(
+async function effectiveFrom(
   store: WorkflowSettingsResolverStore,
   ir: WorkflowIr,
   workflowId: string | undefined,
   projectId: string,
-): EffectiveSettingsResult {
+): Promise<EffectiveSettingsResult> {
   const declarations = declarationsFromIr(ir, workflowId);
   let stored: Record<string, unknown> = {};
   if (workflowId) {
     try {
-      stored = store.getWorkflowSettingValues(workflowId, projectId) ?? {};
+      stored = await (store.getWorkflowSettingValuesAsync?.(workflowId, projectId)
+        ?? store.getWorkflowSettingValues(workflowId, projectId)) ?? {};
     } catch {
       stored = {};
     }
@@ -172,7 +175,7 @@ export async function resolveEffectiveSettingsById(
   irCache?: Map<string, WorkflowIr>,
 ): Promise<Record<string, unknown>> {
   const ir = await resolveWorkflowIrById(store, workflowId, irCache);
-  return effectiveFrom(store, ir, workflowId, projectId).effective;
+  return (await effectiveFrom(store, ir, workflowId, projectId)).effective;
 }
 
 /** The minimal task identity the per-task resolver reads. Task carries no
@@ -211,7 +214,10 @@ export async function resolveEffectiveSettingsDetailed(
 ): Promise<EffectiveSettingsResult> {
   let workflowId: string | undefined;
   try {
-    workflowId = store.getTaskWorkflowSelection(task.id)?.workflowId;
+    const selection = store.getTaskWorkflowSelectionAsync
+      ? await store.getTaskWorkflowSelectionAsync(task.id)
+      : store.getTaskWorkflowSelection(task.id);
+    workflowId = selection?.workflowId;
   } catch {
     workflowId = undefined;
   }
@@ -253,4 +259,17 @@ export function resolveEffectivePlannerOversightLevel(
     return workflowEffective;
   }
   return DEFAULT_PLANNER_OVERSIGHT_LEVEL;
+}
+
+/*
+ * FNXC:HeartbeatPatrol 2026-07-14-23:36:
+ * Boolean workflow values can arrive from built-in declaration defaults or explicit stored overrides. Normalize the idle-heartbeat patrol flag in one place so engine prompt code preserves default-on compatibility while treating only explicit false as no-patrol.
+ */
+export function resolveEffectivePlannerHeartbeatPatrolEnabled(
+  workflowEffective: Record<string, unknown> | boolean | null | undefined,
+): boolean {
+  const value = typeof workflowEffective === "object" && workflowEffective !== null
+    ? workflowEffective[PLANNER_HEARTBEAT_PATROL_ENABLED_SETTING_ID]
+    : workflowEffective;
+  return value !== false;
 }

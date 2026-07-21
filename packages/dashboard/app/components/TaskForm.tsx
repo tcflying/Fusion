@@ -13,6 +13,7 @@ import { REPO_OVERRIDE_RE, resolveEffectiveGithubRepoDefault } from "./githubTra
 import { getPriorityColorVar, getPriorityIcon, getPriorityLabel } from "../utils/priorityIndicator";
 import { ProviderIcon } from "./ProviderIcon";
 import { WorkflowIcon } from "./WorkflowIcon";
+import { PendingImagePreviews } from "./PendingImagePreviews";
 
 function getNodeStatusLabel(status: NodeInfo["status"], t: (key: string, defaultValue: string) => string): string {
   if (status === "online") return t("taskForm.nodeStatusOnline", "Online");
@@ -1200,24 +1201,13 @@ export function TaskForm({
       {/* Attachments */}
       <div className="form-group">
         <label>{t("taskForm.attachmentsLabel", "Attachments")}</label>
-        {pendingImages.length > 0 && (
-          <div className="inline-create-previews">
-            {pendingImages.map((img, i) => (
-              <div key={img.previewUrl} className="inline-create-preview">
-                <img src={img.previewUrl} alt={img.file.name} />
-                <button
-                  type="button"
-                  className="inline-create-preview-remove"
-                  onClick={() => removeImage(i)}
-                  disabled={disabled}
-                  title={t("taskForm.removeImage", "Remove image")}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+        <PendingImagePreviews
+          images={pendingImages}
+          onRemove={removeImage}
+          disabled={disabled}
+          removeLabel={t("taskForm.removeImage", "Remove image")}
+          testIdPrefix="task-form-preview"
+        />
         <input
           ref={fileInputRef}
           type="file"
@@ -1614,6 +1604,14 @@ export function TaskForm({
               </div>
             )}
             {onReviewLevelChange && (
+              /*
+              FNXC:ReviewLevelPreset 2026-07-19-10:50 (U8 / R6):
+              Review is now a CREATION-TIME preset over the workflow's optional review
+              steps (level -> enabledWorkflowSteps at create), not a runtime signal
+              triage decides. The default (unset) leaves the workflow's own default-on
+              steps in place; an explicit optional-step selection always wins over the
+              level preset (server-side applyReviewLevelPreset).
+              */
               <div className="model-select-row">
                 <label htmlFor="review-level" className="model-select-label">{t("taskForm.reviewLabel", "Review")}</label>
                 <select
@@ -1622,11 +1620,11 @@ export function TaskForm({
                   onChange={(e) => onReviewLevelChange(e.target.value === "" ? undefined : parseInt(e.target.value, 10))}
                   disabled={disabled}
                 >
-                  <option value="">{t("taskForm.reviewDefault", "Default (Auto — triage decides)")}</option>
+                  <option value="">{t("taskForm.reviewDefault", "Default (workflow review steps)")}</option>
                   <option value="0">{t("taskForm.reviewLevel0", "0 — None")}</option>
-                  <option value="1">{t("taskForm.reviewLevel1", "1 — Plan Only")}</option>
-                  <option value="2">{t("taskForm.reviewLevel2", "2 — Plan and Code")}</option>
-                  <option value="3">{t("taskForm.reviewLevel3", "3 — Full")}</option>
+                  <option value="1">{t("taskForm.reviewLevel1", "1 — Code Review")}</option>
+                  <option value="2">{t("taskForm.reviewLevel2", "2 — Plan + Code")}</option>
+                  <option value="3">{t("taskForm.reviewLevel3", "3 — Plan + Browser + Code")}</option>
                 </select>
               </div>
             )}

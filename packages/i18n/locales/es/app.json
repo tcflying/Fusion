@@ -1134,7 +1134,8 @@
     "backendError": {
       "failedFetch": "Error al obtener proyectos"
     },
-    "testMode": "Modo de prueba — sin llamadas reales de IA"
+    "testMode": "Modo de prueba — sin llamadas reales de IA",
+    "migrationInProgress": "Migración de base de datos en curso — el panel se reconectará cuando termine."
   },
   "appName": "",
   "approval": {
@@ -1165,32 +1166,6 @@
     "manageConnection": "Administrar conexión",
     "retryConnection": "Reintentar conexión",
     "retrying": "Reintentando…"
-  },
-  "backgroundTasks": {
-    "confirmMessage": "Esta sesión está activa en otra pestaña. ¿Abrir de todos modos?",
-    "confirmTitle": "Abrir sesión activa",
-    "dismissButton": "Descartar",
-    "pillLabel_one": "",
-    "pillLabel_other": "",
-    "pillTitle_one": "",
-    "pillTitle_other": "",
-    "pillTitleWithInput_one": "",
-    "pillTitleWithInput_other": "",
-    "popoverHeader": "Tareas de fondo",
-    "status": {
-      "activeElsewhere": "activo en otra pestaña",
-      "failed": "Fallido",
-      "generating": "generando...",
-      "needsInput": "necesita entrada"
-    },
-    "typeLabel": {
-      "cliAgent": "",
-      "milestoneInterview": "Entrevista de hito",
-      "missionInterview": "Entrevista de misión",
-      "planning": "Planificación",
-      "sliceInterview": "Entrevista de segmento",
-      "subtask": "Desglose de subtareas"
-    }
   },
   "board": {
     "archived": "Archivado",
@@ -1331,6 +1306,7 @@
     "relativeTimeMinutes_one": "",
     "relativeTimeMinutes_other": "",
     "removeAttachment": "Eliminar {{name}}",
+    "recent": "Reciente",
     "rename": "",
     "renameConversationAria": "",
     "renameConversationBody": "",
@@ -1416,13 +1392,6 @@
     "versionMismatchInfix": "pero este panel espera",
     "versionMismatchPrefix": "Tu",
     "versionMismatchSuffix": "Actualiza para mantenerte sincronizado."
-  },
-  "storageMigrationNotice": {
-    "body": "",
-    "dismissLabel": "",
-    "getHelp": "",
-    "getHelpLabel": "",
-    "title": ""
   },
   "cliBinary": {
     "binaryLabel": "",
@@ -1611,6 +1580,30 @@
         "title": ""
       },
       "title": ""
+    },
+    "portability": {
+      "title": "Exportación / importación de organización",
+      "description": "Descarga o previsualiza un paquete de organización sin secretos.",
+      "export": {
+        "action": "Exportar paquete de organización",
+        "working": "Exportando…",
+        "success": "Exportación lista",
+        "error": "Error al exportar"
+      },
+      "import": {
+        "label": "JSON del paquete de organización",
+        "placeholder": "Pega un paquete de organización sin secretos",
+        "preview": "Vista previa de importación",
+        "previewing": "Generando vista previa…",
+        "previewReady": "Vista previa lista. Confirma para aplicar este paquete.",
+        "apply": "Aplicar importación",
+        "importing": "Importando…",
+        "invalid": "Pega un documento JSON de paquete de organización válido",
+        "error": "No se pudo previsualizar o importar el paquete",
+        "confirmTitle": "¿Importar paquete de organización?",
+        "confirmMessage": "Esto aplica la configuración previsualizada a este proyecto.",
+        "confirmApply": "Importar paquete"
+      }
     },
     "ecosystem": {
       "breadthTitle": "",
@@ -1802,7 +1795,8 @@
       "team": "",
       "workflows": "Workflows",
       "tokens": "",
-      "tools": ""
+      "tools": "",
+      "reviewArtifacts": "Artefactos de revisión"
     },
     "team": {
       "agent": "",
@@ -1880,6 +1874,10 @@
       "sessions": "",
       "summaryTitle": "",
       "toolCalls": ""
+    },
+    "reviewArtifacts": {
+      "title": "Artefactos de revisión",
+      "empty": "Aún no hay artefactos de revisión disponibles."
     }
   },
   "comments": {
@@ -1999,12 +1997,12 @@
     "title": "Panel del proyecto"
   },
   "dbBanner": {
-    "body": "La verificación de integridad de SQLite de Fusion en segundo plano informó de corrupción. Revise los objetos con error a continuación antes de continuar con operaciones críticas.",
-    "instructions": "Haga copia de seguridad del proyecto, intente {{cmd}} si la base de datos aún se abre correctamente, y restaure desde una copia de seguridad conocida si la corrupción persiste. Consulte {{link}} para conocer la disposición del almacenamiento y la orientación de recuperación.",
+    "body": "La comprobación de estado de PostgreSQL de Fusion informó de un fallo. Revise los detalles antes de continuar con operaciones críticas.",
+    "instructions": "Haga una copia de seguridad del proyecto, revise los <cmd>registros de la base de datos</cmd> y la conectividad y los permisos de PostgreSQL, y después actualice el estado. Consulte <docsLink>docs/storage.md</docsLink> para obtener orientación sobre almacenamiento y recuperación.",
     "lastChecked": "Última comprobación: {{checkedAtLabel}}",
     "refreshHealth": "Actualizar estado",
     "refreshing": "Actualizando…",
-    "title": "Corrupción de base de datos detectada",
+    "title": "Falló la comprobación de estado de la base de datos",
     "whatToDo": "Qué hacer:"
   },
   "deepLink": {
@@ -2017,6 +2015,7 @@
     "connectRemoteButton": "Conectarse a Fusion remoto",
     "couldNotStart": "No se puede iniciar Fusion local",
     "loading": "Cargando Fusion…",
+    "migrationInProgress": "Migración de base de datos en curso — puede tardar unos minutos.",
     "opening": "Abriendo…",
     "retry": "Reintentar",
     "runLocalButton": "Ejecutar Fusion localmente",
@@ -2477,6 +2476,11 @@
     "taskMatches": "Tareas coincidentes"
   },
   "git": {
+    "addComment": "Add comment",
+    "addCommentPlaceholder": "Write a comment…",
+    "commentAuthorYou": "You",
+    "commentPosted": "Comment posted",
+    "failedToPostComment": "Failed to post comment",
     "add": "Añadir",
     "addRemote": "Añadir remoto",
     "advancesHelpFix": "<strong>Solución:</strong> Fusion solo muestra <em>Sincronizar árbol de trabajo</em> cuando al menos un avance es genuinamente <code>pending</code> y HEAD no está alineado con la punta de integración. Si las entradas ya están gestionadas (subsumed/orphaned/reachable/superseded), no se ofrece ninguna acción de sincronización.",
@@ -2865,7 +2869,17 @@
     "worktreesInUse_one": "",
     "worktreesInUse_other": "",
     "worktreesTotal_one": "",
-    "worktreesTotal_other": ""
+    "worktreesTotal_other": "",
+    "translateAction": "",
+    "translateDismiss": "",
+    "translateOffer": "",
+    "translateRegionAriaLabel": "",
+    "translateShowingOriginal": "",
+    "translateShowingTranslated": "",
+    "translateShowOriginal": "",
+    "translateShowTranslated": "",
+    "translateUnknownLanguage": "",
+    "translateWorking": ""
   },
   "githubStarPrompt": {
     "body": "",
@@ -3190,7 +3204,6 @@
     "refinedScope": "Alcance refinado",
     "refineScope": "Refinar el alcance {{label}} con IA",
     "sendToBackground": "Enviar al fondo",
-    "sessionActiveAnotherTab": "La sesión está activa en otra pestaña.",
     "showThinking": "Mostrar pensamiento",
     "startInterview": "Iniciar entrevista",
     "targetLabel": {
@@ -3318,7 +3331,8 @@
     "unpauseUnavailable": "La acción de reanudar no está disponible",
     "useProjectDefault": "Usar predeterminado del proyecto",
     "viewOptions": "Opciones de vista",
-    "workflowLabel": ""
+    "workflowLabel": "",
+    "statusReplan": "Replanificar"
   },
   "mailbox": {
     "agent": "Agente",
@@ -3835,9 +3849,6 @@
     "selectGoal": "",
     "selectMissionToView": "Selecciona una misión para ver los detalles",
     "sendToBackground": "Enviar al fondo",
-    "sessionActiveAnother": "La sesión está activa en otra pestaña.",
-    "sessionActiveHeartbeat": "Esta sesión está activa en otra pestaña (pulso en vivo)",
-    "sessionActiveTab": "Esta sesión está activa en otra pestaña",
     "showDetails": "Mostrar detalles",
     "showMetadata": "Mostrar metadatos",
     "showThinking": "Mostrar pensamiento",
@@ -3883,8 +3894,6 @@
     "tabActivity_one": "",
     "tabActivity_other": "",
     "tabStructure": "Estructura",
-    "takeControl": "Tomar control",
-    "takingControl": "Tomando control...",
     "targetBranch": "Rama de destino",
     "targetBranchPlaceholder": "p. ej. main",
     "taskIdPlaceholder": "ID de tarea (p. ej., FN-001)",
@@ -4613,7 +4622,6 @@
     "plain": "Texto plano",
     "planningComplete": "¡Planificación completada!",
     "planningCompleteSubheading": "Revisa y perfecciona tu tarea antes de crearla.",
-    "planningDepth": "Profundidad de planificación",
     "planningModel": "Modelo de planificación",
     "planningModelBlurb": "Selecciona qué modelo realiza la entrevista de planificación y redacta el borrador final.",
     "planningSessions": "Sesiones de planificación",
@@ -4635,8 +4643,6 @@
     "remove": "Eliminar",
     "retryFailed": "El reintento falló. Por favor, inténtalo de nuevo.",
     "retrying": "Reintentando...",
-    "sessionActiveOtherTab": "Esta sesión está activa en otra pestaña",
-    "sessionActiveOtherTabLive": "Esta sesión está activa en otra pestaña (heartbeat activo)",
     "sessionFailed": "La sesión falló al contactar la IA.",
     "sessionFailed2": "Sesión fallida",
     "showArchived": "Mostrar archivadas",
@@ -4659,8 +4665,6 @@
     "subtaskTitle": "Título",
     "suggestedDependencies": "Dependencias sugeridas",
     "suggestedSize": "Tamaño sugerido",
-    "takeControl": "Tomar el control",
-    "takingControl": "Tomando el control...",
     "thinkingElapsed": "Pensando… ({{seconds}} s)",
     "title": "Modo de planificación",
     "tryAnExample": "Prueba un ejemplo:",
@@ -4670,7 +4674,13 @@
     "untitledSession": "Sesión sin título",
     "usingDefault": "Usar predeterminado",
     "whatToBuild": "¿Qué quieres construir?",
-    "whatToBuildPlaceholder": "p. ej., Crear un sistema de autenticación con inicio de sesión, registro y restablecimiento de contraseña..."
+    "whatToBuildPlaceholder": "p. ej., Crear un sistema de autenticación con inicio de sesión, registro y restablecimiento de contraseña...",
+    "agentClarification": "",
+    "nextQuestion": "Siguiente pregunta",
+    "answeredQuestions": "Preguntas respondidas",
+    "runningPlan": "Plan en curso",
+    "renameSession": "Renombrar sesión",
+    "editAnswer": "Editar respuesta para {{question}}"
   },
   "plugins": {
     "addItem": "Agregar elemento",
@@ -5660,7 +5670,11 @@
     "headerErrorSingular_other": "",
     "regionLabel": "Sesiones de IA que necesitan entrada o han fallado",
     "resume": "Reanudar",
-    "retry": "Reintentar"
+    "retry": "Reintentar",
+    "headerGeneratingSingular": "",
+    "headerGeneratingPlural": "",
+    "headerMixed": "",
+    "inProgress": ""
   },
   "settings": {
     "actions": {
@@ -5682,6 +5696,8 @@
       "title": "Apariencia",
       "openTasksInRightSidebarHelp": "",
       "openMobileTasksInPopupHelp": "",
+      "taskPopupsBoardListOnly": "",
+      "taskPopupsBoardListOnlyHelp": "",
       "taskDetailChatFirstHelp": "",
       "showCostBadgeOnCards": "",
       "showCostBadgeOnCardsHelp": ""
@@ -5899,7 +5915,56 @@
       "gitLabEnabledHint": "",
       "allowEphemeralAgentsToCreateTasksHint": "",
       "quickChatCloseOnOutsideClickHint": "",
-      "disabledFusionWorkflowsAreHiddenFromWorkflow": ""
+      "disabledFusionWorkflowsAreHiddenFromWorkflow": "",
+      "autoTranslateImportedIssues": "",
+      "autoTranslateImportedIssuesHelp": "",
+      "translationTargetLanguage": "",
+      "translationTargetLanguageHelp": "",
+      "followDashboardLanguage": "",
+      "restartFailed": "",
+      "restartNow": "",
+      "restartUnavailable": "",
+      "restarting": "",
+      "mobileNavPrimaryItems": "Acciones rápidas del pie móvil",
+      "mobileNavPrimaryItemsHint": "Predeterminado: Panel, Tareas, Agentes, Misiones, Chat, Buzón. Añade destinos elegibles; los no seleccionados permanecen en Más.",
+      "addNavItem": "Añadir acción rápida",
+      "selectNavItem": "Elegir un destino",
+      "removeNavItem": "Quitar {{item}}",
+      "moveNavItemEarlier": "Mover {{item}} antes",
+      "moveNavItemLater": "Mover {{item}} después",
+      "ephemeralAgentTaskCreationPolicy": "Tareas de seguimiento de agentes efímeros",
+      "ephemeralAgentTaskCreationPolicyHint": "Sin valor predeterminado — si no se define, se usa Permitir. «Tras validación» envía una propuesta a tu buzón para aprobar con un clic; Denegar rechaza la creación de tareas de seguimiento.",
+      "ephemeralAgentTaskCreationPolicyAllow": "Permitir",
+      "ephemeralAgentTaskCreationPolicyUponValidation": "Tras validación",
+      "ephemeralAgentTaskCreationPolicyDeny": "Denegar",
+      "reportModeHelp": "Cómo se archivan los informes in-app (error, feedback, idea, ayuda). Predeterminado: draft-review (el operador revisa un borrador antes de archivar).",
+      "reportModeByActionHelp": "Anulación opcional por acción del modo de informe del proyecto (error, feedback, idea o ayuda). Sin valor predeterminado: las acciones no definidas heredan reportMode.",
+      "reportRoadmapRepo": "Public roadmap repository (optional)",
+      "reportRoadmapRepoHelp": "GitHub owner/repository containing public roadmap issues. When unset, uses the tracking repository. No default — unset.",
+      "reviewArtifacts": "Artefactos de revisión",
+      "reviewArtifactsHint": "Controla si las tareas futuras elegibles generan entregables de revisión. Los informes de usuario y la captura de actividad se mantienen independientes. Predeterminado: desactivado.",
+      "reportRoadmapDedupeEnabled": "Deduplicate reports against public roadmap",
+      "reportRoadmapDedupeEnabledHelp": "Match open, labeled roadmap issues before filing. Default: on.",
+      "reportRoadmapLabel": "Public roadmap label",
+      "reportRoadmapLabelHelp": "Open GitHub Issues with this label are considered roadmap items. Default: roadmap.",
+      "reportRoadmapDedup": "Comprobar la hoja de ruta antes de enviar informes",
+      "reportRoadmapDedupHelp": "Cuando está habilitado, las funciones coincidentes de la hoja de ruta se muestran en línea en vez de enviar otra incidencia o discusión de GitHub. Predeterminado: desactivado.",
+      "reportTarget": "Destino predeterminado del informe",
+      "reportTargetHelp": "Destino opcional de incidencia o discusión. Si no se configura, Comentarios y Ayuda usan Discusiones, mientras que Error e Idea usan Incidencias.",
+      "reportTargetInherit": "Conservar el destino predeterminado de la acción",
+      "reportTargetIssue": "Incidencia de GitHub",
+      "reportTargetDiscussion": "Discusión de GitHub",
+      "reportTargetOverride": {
+        "bug": "Anulación de destino para error",
+        "feedback": "Anulación de destino para comentarios",
+        "idea": "Anulación de destino para idea",
+        "help": "Anulación de destino para ayuda"
+      },
+      "reportDiscussionCategory": "Categoría de discusión",
+      "reportDiscussionCategoryHelp": "Obligatoria al enviar a Discusiones de GitHub. Las categorías se cargan desde el repositorio configurado.",
+      "reportDiscussionCategorySelect": "Selecciona una categoría de discusión",
+      "reportDiscussionCategoryUnavailable": "Las categorías de discusión no están disponibles para el repositorio configurado.",
+      "reportDiscussionCategoryEmpty": "No hay categorías de discusión disponibles para el repositorio configurado."
     },
     "globalGeneral": {
       "andShowsUpdateNoticesInTheCLIAnd": "",
@@ -5914,6 +5979,12 @@
       "frequency": "",
       "general": "",
       "globalDefaultTrackingRepo": "",
+      "reportRoadmapDedupeEnabled": "Global public-roadmap deduplication",
+      "reportRoadmapDedupeEnabledHelp": "Fallback for projects that do not set a public-roadmap deduplication preference. No default — unset (projects default to enabled).",
+      "reportRoadmapLabel": "Global public roadmap label",
+      "reportRoadmapLabelHelp": "Fallback label for open public-roadmap issues when a project does not set one. No default — unset (projects default to roadmap).",
+      "reportRoadmapRepo": "Global public roadmap repository (optional)",
+      "reportRoadmapRepoHelp": "Fallback GitHub owner/repository for public-roadmap issues. When unset, uses the tracking repository. No default — unset.",
       "leaveBothThinkingTogglesOffToKeepThe": "",
       "manualOnlyNeverAutoCheck": "",
       "onStartupOncePerServerLaunch": "",
@@ -5935,7 +6006,11 @@
       "gitLabApiBaseUrlHint": "",
       "gitLabTokenTypeHint": "",
       "gitLabAuthTokenHint": "",
-      "dismissModalsByClickingOutsideHint": ""
+      "dismissModalsByClickingOutsideHint": "",
+      "skipConfirmationDialogs": "",
+      "skipConfirmationDialogsHint": "",
+      "enableProactiveTaskChat": "",
+      "enableProactiveTaskChatHint": ""
     },
     "globalModels": {
       "allow": "",
@@ -6260,8 +6335,9 @@
         "global": "Compartido en todos los proyectos",
         "project": "Específico de este proyecto"
       },
-      "globalMcp": "MCP Servers",
-      "mcp": "MCP Servers"
+      "globalMcp": "MCP Servers · Global",
+      "mcp": "MCP Servers · Project",
+      "configVersions": "Versiones de configuración"
     },
     "nodeRouting": {
       "blockExecution": "",
@@ -6342,7 +6418,10 @@
       "ntfyEnabledHint": "",
       "webhookEnabledHint": "",
       "webhookUrlHint": "",
-      "webhookFormatHint": ""
+      "webhookFormatHint": "",
+      "agentClarification": "",
+      "agentClarificationEnable": "",
+      "agentClarificationHint": ""
     },
     "plugins": {
       "fusionPlugins": "",
@@ -6358,6 +6437,8 @@
       "automaticallyCompactContextWhenApproachingThisTokenCount": "",
       "autoSelectPresetBasedOnTaskSize": "",
       "autoSummarizeLongDescriptionsAsTitles": "",
+      "taskDefinitionInInputLanguage": "",
+      "taskDefinitionInInputLanguageHelp": "",
       "configuredPresets": "",
       "configuresTheModelUsedForTwoShortSummary": "",
       "defaultWorkflowModelLaneActions": "",
@@ -6629,11 +6710,28 @@
       "ignoreHiddenDotPathsHelp": "",
       "ignoreHiddenDotPathsInOverlapChecks": "",
       "maxConcurrentTasksHint": "",
-      "pollIntervalMsHint": ""
-    },
-    "scope": {
-      "globalBanner": "Estos ajustes se comparten entre todos tus proyectos de Fusion.",
-      "projectBanner": "Estos ajustes solo afectan a este proyecto."
+      "maxConcurrentVerifications": "",
+      "maxConcurrentVerificationsHint": "",
+      "pollIntervalMsHint": "",
+      "executorToolFailureRetryCount": "",
+      "executorToolFailureRetryCountHelp": "",
+      "executorToolFailureRetryBackoffMs": "",
+      "executorToolFailureRetryBackoffMsHelp": "",
+      "executorToolFailureThreshold": "",
+      "executorToolFailureThresholdHelp": "",
+      "executorModelEscalationEnabled": "",
+      "executorModelEscalationEnabledHelp": "",
+      "executorEscalationProvider": "",
+      "executorEscalationProviderHelp": "",
+      "executorEscalationModelId": "",
+      "executorEscalationModelIdHelp": "",
+      "executorEscalationNodeId": "",
+      "executorEscalationNodeIdHelp": "",
+      "triageDuplicateResolution": "Resolución de duplicados en triage",
+      "triageDuplicateResolutionHelp": "Bloquear duplicados detectados en triage para una decisión Mantener/Eliminar (predeterminado), o mantener/eliminar automáticamente sin bloquear.",
+      "triageDuplicateResolutionPrompt": "Bloquear para decidir (predeterminado)",
+      "triageDuplicateResolutionKeep": "Mantener automáticamente",
+      "triageDuplicateResolutionDelete": "Eliminar automáticamente"
     },
     "title": "Configuración",
     "worktrees": {
@@ -6694,7 +6792,8 @@
       "showWorktreeGroupingHelp": "",
       "copyFilesHelp": "",
       "namingStyleNotApplicableWhenRecycling": "",
-      "howToNameFreshWorktreeDirectories": ""
+      "howToNameFreshWorktreeDirectories": "",
+      "recycleNotApplicableWithTaskIdNaming": ""
     },
     "fileBrowser": {
       "currentDirectory": "",
@@ -6711,11 +6810,15 @@
       "allSections": "",
       "clear": "",
       "label": "",
+      "moreResults": "",
       "navigationLabel": "",
       "noMobileOptions": "",
       "noResults": "",
       "placeholder": "",
-      "resultCount": ""
+      "resultCount_one": "",
+      "resultCount_other": "",
+      "settingResultCount_one": "",
+      "settingResultCount_other": ""
     },
     "prompts": {
       "surfaceExplanation": ""
@@ -6734,6 +6837,25 @@
       "resetAllProjectAction": "",
       "menuResetSuccess": "",
       "allProjectResetSuccess": ""
+    },
+    "database": {
+      "embeddedConnectionCapHelp": "Máximo de conexiones de servidor para el PostgreSQL integrado de Fusion. Se aplica al reiniciar Fusion. Rango: 32–2.000. Predeterminado: 500. PostgreSQL externo usa el límite de su proveedor.",
+      "embeddedConnectionCap": "Límite de conexiones de PostgreSQL integrado",
+      "embeddedConnectionCapError": "Introduce un valor entre 32 y 2.000.",
+      "advanced": "Ajustes avanzados de base de datos"
+    },
+    "configVersions": {
+      "title": "Versiones de configuración",
+      "description": "Restaura cualquier versión de configuración del proyecto registrada.",
+      "loading": "Cargando versiones…",
+      "empty": "Aún no hay versiones de configuración.",
+      "loadError": "No se pudieron cargar las versiones de configuración",
+      "rollback": "Revertir",
+      "rollingBack": "Revirtiendo…",
+      "rollbackError": "No se pudo revertir la configuración",
+      "confirmTitle": "¿Revertir la configuración?",
+      "confirmMessage": "¿Restaurar esta versión? La reversión se registra como una nueva versión.",
+      "confirmRollback": "Revertir"
     }
   },
   "setup": {
@@ -7278,14 +7400,9 @@
     "reviewSubtasksHint": "Edita títulos, descripciones, tamaños y dependencias antes de crear todas las tareas a la vez.",
     "sendToBackgroundAriaLabel": "Enviar a segundo plano",
     "sendToBackgroundTitle": "Enviar a segundo plano",
-    "sessionActiveAnotherTab": "La sesión está activa en otra pestaña.",
-    "sessionActiveAnotherTabLive": "Esta sesión está activa en otra pestaña (latido en directo)",
-    "sessionActiveAnotherTabTakeover": "Esta sesión está activa en otra pestaña",
     "showThinking": "Mostrar razonamiento",
     "sizeLabel": "Tamaño",
     "startingBreakdown": "",
-    "takeControl": "Tomar el control",
-    "takingControl": "Tomando el control...",
     "titleLabel": "Título",
     "untitled": "Sin título",
     "waitingForThinking": ""
@@ -7626,7 +7743,13 @@
       "copy": "Esta tarea parece ser un casi-duplicado de",
       "headline": "Posible duplicado detectado",
       "keepBtn": "Conservar",
-      "kept": "Se conservó {{id}} y se descartó la advertencia de duplicado"
+      "kept": "Se conservó {{id}} y se descartó la advertencia de duplicado",
+      "deleteBtn": "Eliminar",
+      "deleteConfirm": "Eliminar",
+      "deleted": "Eliminado {{id}}",
+      "deleteMessage": "¿Eliminar {{id}} como duplicado de {{duplicateOf}}?",
+      "deleteTitle": "Eliminar tarea duplicada",
+      "triageActions": "Elige Eliminar para quitar este duplicado, o Mantener para continuar de todos modos."
     },
     "nextRecoveryAt": "Próxima recuperación a las {{time}}",
     "no": "No",
@@ -7662,7 +7785,11 @@
       "rejected": "Plan rechazado — {{id}} devuelto a Planificación para replanificar",
       "rejectMessage": "¿Rechazar este plan? La especificación será descartada y regenerada.",
       "rejectTitle": "Rechazar plan",
-      "replanning": "Replanificando {{id}}…"
+      "replanning": "Replanificando {{id}}…",
+      "approvalCopy": "",
+      "approvalHeadline": "",
+      "replanCapCopy": "",
+      "replanCapHeadline": ""
     },
     "pr": {
       "awaitingChecks": "Esperando verificaciones del PR",
@@ -7828,7 +7955,7 @@
     },
     "tokenTotalsAria": "Totales de tokens de la tarea",
     "tokenUsage": "Uso de tokens",
-    "totalExecutionTime": "Tiempo total de ejecución",
+    "totalExecutionTime": "Tiempo activo total",
     "totalTokens": "Total",
     "updateFailed": "Error al actualizar {{id}}: {{error}}",
     "updateSuccess": "{{id}} actualizado",
@@ -8331,11 +8458,17 @@
     "revertNeedsHumanDefault": "",
     "reverted": "",
     "revertTask": "",
+    "revertedBadge": "",
+    "revertedBadgeTitle": "",
     "undoOf": "",
     "undoOfTitle": "",
     "undoTask": "",
     "costBadgeTitle": "",
-    "costBadgeAriaLabel": ""
+    "costBadgeAriaLabel": "",
+    "awaitingApprovalPlanReviewReplanCapTitle": "",
+    "reviewBudgetExhausted": "",
+    "awaitingApprovalTitle": "",
+    "statusReplan": "Replanificar"
   },
   "terminal": {
     "arrowKeysLabel": "",
@@ -8456,7 +8589,11 @@
     "updateFailedWithMessage": "",
     "updateNow": "",
     "updateSuccess": "",
-    "updating": ""
+    "updating": "",
+    "restartFailed": "",
+    "restartNow": "",
+    "restartUnavailable": "",
+    "restarting": ""
   },
   "usage": {
     "configureAuthHint": "Configure la autenticación en Configuración para ver datos de uso.",
@@ -8959,14 +9096,12 @@
     "done": "Done",
     "inProgress": "In Progress",
     "label": "Workflow",
-    "merging": "Fusionando",
-    "mergingTitle": "{{count}} tarea{{plural}} fusionándose",
+    "merging": "",
+    "mergingTitle": "",
     "todo": "Todo",
     "triggerAria": "Select workflow. Current workflow: {{name}}",
     "editWorkflow": "Edit workflow",
-    "newWorkflow": "New workflow",
-    "merging": "",
-    "mergingTitle": ""
+    "newWorkflow": "New workflow"
   },
   "workspace": {
     "projectRoot": "Raíz del proyecto",
@@ -9036,5 +9171,18 @@
     "startCta": "Start engine",
     "starting": "Starting…",
     "title": "Project engine is not connected"
+  },
+  "report": {
+    "roadmapMatch": {
+      "title": "Ya está en la hoja de ruta",
+      "message": "Este informe coincide con una función que ya está planificada."
+    },
+    "roadmapDuplicate": {
+      "title": "Already on the roadmap — add your data point?"
+    },
+    "targetLabel": "Destino del envío",
+    "targetInherit": "Usar el destino configurado para la acción",
+    "targetIssue": "Incidencia de GitHub",
+    "targetDiscussion": "Discusión de GitHub"
   }
 }

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act, within } from "@testing-library/react";
 import type { NodeConfig, Settings } from "@fusion/core";
-import type { ProjectInfo } from "../../api";
+import type { AiSessionSummary, ProjectInfo } from "../../api";
 import { scopedKey } from "../../utils/projectStorage";
 import { useFileBrowser } from "../../context/FileBrowserContext";
 
@@ -175,14 +175,16 @@ vi.mock("../../hooks/useRemoteNodeEvents", () => ({
   })),
 }));
 
+const mockUseBackgroundSessions = vi.fn(() => ({
+  sessions: [],
+  generating: false,
+  needsInput: false,
+  planningSessions: [],
+  dismissSession: vi.fn(),
+}));
+
 vi.mock("../../hooks/useBackgroundSessions", () => ({
-  useBackgroundSessions: vi.fn(() => ({
-    sessions: [],
-    generating: false,
-    needsInput: false,
-    planningSessions: [],
-    dismissSession: vi.fn(),
-  })),
+  useBackgroundSessions: () => mockUseBackgroundSessions(),
 }));
 
 // Mock NodeContext - default to local mode
@@ -325,9 +327,9 @@ vi.mock("../../components/GitHubImportModal", () => ({
 }));
 
 vi.mock("../../components/PlanningModeModal", () => ({
-  PlanningModeModal: ({ isOpen, onClose, presentation = "modal" }: { isOpen: boolean; onClose: () => void; presentation?: "modal" | "embedded" }) =>
+  PlanningModeModal: ({ isOpen, onClose, presentation = "modal", resumeSessionId }: { isOpen: boolean; onClose: () => void; presentation?: "modal" | "embedded"; resumeSessionId?: string }) =>
     isOpen ? (
-      <div className={presentation === "embedded" ? "planning-view open" : "modal-overlay open"} data-testid={presentation === "embedded" ? "planning-view" : undefined}>
+      <div className={presentation === "embedded" ? "planning-view open" : "modal-overlay open"} data-testid={presentation === "embedded" ? "planning-view" : undefined} data-resume-session-id={resumeSessionId ?? ""}>
         <button type="button" aria-label="Close" onClick={onClose}>
           Close
         </button>
@@ -614,6 +616,7 @@ vi.mock("../../hooks/useViewportMode", () => ({
   useViewportMode: (...args: unknown[]) => mockUseViewportMode(...args),
   getViewportMode: () => mockUseViewportMode(),
   isMobileViewport: () => mockUseViewportMode() === "mobile",
+  isFullScreenSheetViewport: () => mockUseViewportMode() === "mobile",
 }));
 
 // Mock isIOS so FN-3290 keyboard-open behavior is testable in jsdom
@@ -629,6 +632,7 @@ import { App, didEnterAwaitingApproval, didEnterDone } from "../../App";
 import { AUTH_TOKEN_RECOVERY_REQUIRED_EVENT } from "../../auth";
 import { fetchAuthStatus, fetchSettings, fetchGlobalSettings, fetchTaskDetail, fetchUnreadCount, updateSettings, runScript, fetchScripts, fetchModels, fetchPluginDashboardViews, fetchDashboardHealth, fetchBoardWorkflows } from "../../api";
 import { __resetShellHostContextForTests } from "../../shell-host";
+import { __test_clearDashboardViewsCache } from "../../hooks/usePluginDashboardViews";
 import * as apiNodeModule from "../../hooks/useRemoteNodeData";
 
 async function waitForAppShell(): Promise<void> {
@@ -640,6 +644,7 @@ async function waitForAppShell(): Promise<void> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  __test_clearDashboardViewsCache();
   /*
    * FNXC:DashboardTests 2026-06-22-03:47:
    * App.test.tsx runs beside other dashboard specs in the same Vitest process, so reset API mock implementations as well as call counts to prevent cross-file implementation leakage.
@@ -694,6 +699,14 @@ beforeEach(() => {
   localStorage.setItem("kb-dashboard-view-mode", "project");
   mockSubscribeSse.mockReset();
   mockSubscribeSse.mockReturnValue(vi.fn());
+  mockUseBackgroundSessions.mockReset();
+  mockUseBackgroundSessions.mockReturnValue({
+    sessions: [],
+    generating: false,
+    needsInput: false,
+    planningSessions: [],
+    dismissSession: vi.fn(),
+  });
   mockCreateTask.mockReset();
   mockUseTasks.mockReset();
   mockUseTasks.mockImplementation(() => ({
@@ -2338,6 +2351,26 @@ describe("App view switching", () => {
     localStorage.removeItem(taskViewStorageKey());
   });
 
+  it("falls back to Board when persisted Ideation view is feature-disabled", async () => {
+    localStorage.setItem("kb-dashboard-view-mode", "project");
+    localStorage.setItem(taskViewStorageKey(), "ideation");
+    (fetchSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...defaultSettings,
+      experimentalFeatures: {
+        ...defaultSettings.experimentalFeatures,
+        ideationView: false,
+      },
+    });
+
+    render(<App />);
+
+    await waitFor(() => expect(document.querySelector(".board")).toBeTruthy());
+    expect(screen.queryByLabelText("Persisted ideation")).not.toBeInTheDocument();
+
+    localStorage.removeItem("kb-dashboard-view-mode");
+    localStorage.removeItem(taskViewStorageKey());
+  });
+
   it("falls back to board when evals view is feature-disabled", async () => {
     localStorage.setItem("kb-dashboard-view-mode", "project");
     localStorage.setItem(taskViewStorageKey(), "evals");
@@ -2537,17 +2570,18 @@ describe("App view switching", () => {
     localStorage.removeItem("kb-dashboard-view-mode");
   });
 
-  it("hides the removed Roadmaps destination even when settings and plugin API still mention it", async () => {
+  it("shows the hosted Roadmaps destination when the plugin API advertises it", async () => {
     /*
-    FNXC:RoadmapsNavigation 2026-06-22-18:50:
-    Roadmaps was removed as an app view and experiment. Stale persisted flags and plugin dashboard rows must not expose the old sidebar destination.
+    FNXC:RoadmapsNavigation 2026-07-19-12:00:
+    Roadmap-item previews open through the restored hosted roadmaps destination, so plugin
+    dashboard rows must remain visible rather than being filtered as legacy navigation.
     */
     mockUseViewportMode.mockReturnValue("desktop");
     (fetchSettings as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       ...defaultSettings,
       experimentalFeatures: { ...defaultSettings.experimentalFeatures, roadmap: true },
     });
-    (fetchPluginDashboardViews as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+    (fetchPluginDashboardViews as ReturnType<typeof vi.fn>).mockResolvedValue([
       {
         pluginId: "fusion-plugin-roadmap",
         view: {
@@ -2564,7 +2598,7 @@ describe("App view switching", () => {
     render(<App />);
 
     expect(await screen.findByTestId("sidebar-nav-missions")).toBeInTheDocument();
-    expect(screen.queryByTestId("sidebar-nav-plugin-fusion-plugin-roadmap-roadmaps")).toBeNull();
+    expect(await screen.findByTestId("sidebar-nav-plugin-fusion-plugin-roadmap-roadmaps")).toBeInTheDocument();
   });
 
   it("restores board and plugin routes when persisted taskView changes across remounts", async () => {
@@ -2802,10 +2836,10 @@ describe("App view switching", () => {
     fireEvent.click(screen.getByTestId("create-task-INS-1"));
 
     await waitFor(() => {
+      // FNXC:InsightsTaskCreate 2026-07-14-19:40: createTask no longer hard-codes column triage; intake column comes from the active workflow defaults.
       expect(mockCreateTask).toHaveBeenCalledWith({
         title: "Task from insight",
         description: "Use this insight as a task description",
-        column: "triage",
         source: {
           sourceType: "dashboard_ui",
           sourceMetadata: {
@@ -3107,6 +3141,68 @@ describe("App Planning Mode", () => {
     });
 
     localStorage.removeItem(taskViewStorageKey());
+  });
+
+  it("opens a planning session from the retained Planning navigation surface", async () => {
+    const session: AiSessionSummary = {
+      id: "planning-session-needs-input",
+      type: "planning",
+      status: "awaiting_input",
+      title: "Planning — needs input",
+      projectId: "proj_123",
+      updatedAt: "2026-07-15T00:00:00.000Z",
+    };
+    mockUseBackgroundSessions.mockReturnValue({
+      sessions: [session],
+      generating: false,
+      needsInput: true,
+      planningSessions: [session],
+      dismissSession: vi.fn(),
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId("sidebar-nav-planning"));
+
+    await waitFor(() => {
+      const planningView = screen.getByTestId("planning-view");
+      expect(planningView).toBeInTheDocument();
+      expect(screen.getByTestId("sidebar-nav-planning")).toHaveAttribute("aria-current", "page");
+    });
+  });
+
+  it.each([
+    { type: "subtask" as const, expectedView: "board", opensSubtaskOverlay: true },
+    { type: "mission_interview" as const, expectedView: "missions", opensSubtaskOverlay: false },
+    { type: "milestone_interview" as const, expectedView: "missions", opensSubtaskOverlay: false },
+    { type: "slice_interview" as const, expectedView: "missions", opensSubtaskOverlay: false },
+  ])("keeps the $type background-session route unchanged", async ({ type, expectedView, opensSubtaskOverlay }) => {
+    const session: AiSessionSummary = {
+      id: `${type}-session`,
+      type,
+      status: "awaiting_input",
+      title: `${type} session`,
+      projectId: "proj_123",
+      updatedAt: "2026-07-15T00:00:00.000Z",
+    };
+    mockUseBackgroundSessions.mockReturnValue({
+      sessions: [session],
+      generating: false,
+      needsInput: true,
+      planningSessions: [],
+      dismissSession: vi.fn(),
+    });
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Resume" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId(`sidebar-nav-${expectedView}`)).toHaveAttribute("aria-current", "page");
+      if (opensSubtaskOverlay) {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      }
+    });
   });
 });
 

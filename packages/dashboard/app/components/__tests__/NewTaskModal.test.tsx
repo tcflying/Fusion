@@ -83,6 +83,8 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 let mockViewportMode: "mobile" | "desktop" = "mobile";
 vi.mock("../../hooks/useViewportMode", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
+  isFullScreenSheetViewport: () => false,
+  isShortViewport: () => false,
   getViewportMode: () => mockViewportMode,
   isMobileViewport: () => mockViewportMode === "mobile",
   useViewportMode: () => mockViewportMode,
@@ -1549,6 +1551,21 @@ describe("NewTaskModal", () => {
         expect(props.onCreateTask).toHaveBeenCalledWith(
           expect.objectContaining({ workflowId: "WF-1" }),
         );
+      });
+    });
+
+    it("submits the workflow supplied by the contextual board opener", async () => {
+      await mockWorkflows([{ id: "WF-IDEAS", name: "Coding (Ideas)" }]);
+      const { props } = renderNewTaskModal({ initialWorkflowId: "WF-IDEAS" });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("task-workflow-dropdown-trigger")).toHaveTextContent("Coding (Ideas)");
+      });
+      fireEvent.change(screen.getByPlaceholderText("What needs to be done?"), { target: { value: "Stay in Ideas" } });
+      fireEvent.click(screen.getByRole("button", { name: "Create Task" }));
+
+      await waitFor(() => {
+        expect(props.onCreateTask).toHaveBeenCalledWith(expect.objectContaining({ workflowId: "WF-IDEAS" }));
       });
     });
 

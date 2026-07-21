@@ -1,6 +1,7 @@
-import type { AgentRole, TaskStore, TaskTokenUsage, TaskTokenUsagePerModel } from "@fusion/core";
+import type { AgentRole, RunMutationContext, TaskStore, TaskTokenUsage, TaskTokenUsagePerModel } from "@fusion/core";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { createLogger } from "./logger.js";
+import { enforceTaskTokenBudgetForPersist } from "./token-budget-enforcer.js";
 
 const log = createLogger("session-token-usage");
 const cacheMetricsLog = createLogger("token-cache-metrics");
@@ -12,6 +13,10 @@ interface SessionBaseline {
   cacheWrite: number;
 }
 
+/*
+ * FNXC:TokenAnalytics 2026-07-17-14:00:
+ * Reuse/resume-capable callers must capture a per-session task-start snapshot when binding a session so lifetime counters from prior tasks cannot bleed into the new task. Fresh-per-task callers intentionally retain the zero-baseline default below: their first accumulation must credit the full new-session counter.
+ */
 // Per-session cumulative-token baselines so repeated calls only persist deltas.
 // The session object is keyed weakly so disposed sessions get garbage-collected.
 const sessionBaselines = new WeakMap<AgentSession, SessionBaseline>();
@@ -72,6 +77,22 @@ function readSessionStats(session: AgentSession): SessionStatsLike | undefined {
   }
 }
 
+/** Capture the current cumulative stats as the baseline for a newly bound task. */
+export function captureSessionTokenBaseline(session: AgentSession): void {
+  const tokens = readSessionStats(session)?.tokens;
+  sessionBaselines.set(session, {
+    input: tokens?.input ?? 0,
+    output: tokens?.output ?? 0,
+    cached: tokens?.cacheRead ?? 0,
+    cacheWrite: tokens?.cacheWrite ?? 0,
+  });
+}
+
+/** Clear a completed task's baseline before this session is bound again. */
+export function resetSessionTokenBaseline(session: AgentSession): void {
+  sessionBaselines.delete(session);
+}
+
 /**
  * Capture the session's cumulative token usage and accumulate any *new* deltas
  * onto `task.tokenUsage`. Safe to call repeatedly on the same session — each
@@ -83,7 +104,7 @@ export async function accumulateSessionTokenUsage(
   store: TaskStore,
   taskId: string,
   session: AgentSession,
-  options?: { agentId?: string; role?: AgentRole },
+  options?: { agentId?: string; role?: AgentRole; runContext?: RunMutationContext },
 ): Promise<void> {
   try {
     const stats = readSessionStats(session);
@@ -156,7 +177,8 @@ export async function accumulateSessionTokenUsage(
       hitRatio: computeCacheHitRatio(tokenUsage.inputTokens, tokenUsage.cachedTokens),
     }));
 
-    await store.updateTask(taskId, { tokenUsage });
+    await store.updateTask(taskId, { tokenUsage }, options?.runContext);
+    await enforceTaskTokenBudgetForPersist(store, taskId, options?.runContext);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log.warn(`${taskId}: session token usage accumulate failed: ${message}`);

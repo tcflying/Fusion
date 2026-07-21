@@ -71,9 +71,24 @@ jobs:
         if: steps.changes.outputs.relevant == 'true'
         run: pnpm --filter @fusion/desktop build
 
+      # FNXC:DesktopEmbeddedPostgres 2026-07-14-09:39:
+      # The advisory Linux packaging lane also executes the real bundled
+      # lifecycle, catching native payload regressions before a release run.
+      - name: Smoke embedded Postgres lifecycle
+        if: steps.changes.outputs.relevant == 'true'
+        run: pnpm --filter @fusion/core test:embedded-postgres
+
       # Authoritative check: electron-builder's production-dependency walk over the staged closure.
       # --dir skips installer/signing but still FAILS if any production dependency's declared version
       # range is unsatisfied in the closure — which is exactly the aws-sdk skew that broke the release.
       - name: Validate packageable closure (electron-builder --dir)
         if: steps.changes.outputs.relevant == 'true'
         run: pnpm --filter @fusion/desktop exec electron-builder --projectDir deploy --dir --publish never
+
+      # FNXC:DesktopEmbeddedPostgres 2026-07-15-10:45:
+      # electron-builder --dir leaves linux-*-unpacked trees; assert embedded Postgres
+      # packaging content (main-bootstrap, natives, omp-runtime) so AppImage regressions
+      # fail on the advisory packaging PR lane, not only at release.
+      - name: Verify Linux AppImage embedded Postgres packaging
+        if: steps.changes.outputs.relevant == 'true'
+        run: node scripts/verify-desktop-linux-pg-packaging.mjs

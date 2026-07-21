@@ -63,6 +63,7 @@ const FN_7111_GOVERNED_TOOLS = [
   ["fn_workflow_delete", "task_agent_mutation"],
   ["fn_workflow_settings", "task_agent_mutation"],
   ["fn_task_update", "task_agent_mutation"],
+  ["fn_task_assign", "task_agent_mutation"],
   ["fn_task_promote", "task_agent_mutation"],
   ["fn_task_refine", "task_agent_mutation"],
   ["fn_run_verification", "command_execution"],
@@ -102,7 +103,6 @@ const gitCases = [
 ] as const;
 
 const ACTION_MUTATION_PERMANENT_READONLY_TOOLS = new Set([
-  "fn_delegate_task",
   "fn_task_import_github",
   "fn_task_import_github_issue",
   "fn_task_import_gitlab_project_issues",
@@ -117,7 +117,6 @@ const policyMatrix = [
 ] as const;
 
 const permanentReadonlySiblingTaskCreationTools = [
-  "fn_delegate_task",
   "fn_task_import_github",
   "fn_task_import_github_issue",
   "fn_task_import_gitlab_project_issues",
@@ -139,10 +138,14 @@ describe("gating-classifications parity", () => {
         "fn_goal_list",
         "fn_goal_show",
         "fn_heartbeat_done",
+        "fn_ideation_list",
+        "fn_ideation_show",
         "fn_list_agents",
         "fn_memory_append",
         "fn_memory_get",
         "fn_memory_search",
+        "fn_mission_list",
+        "fn_mission_show",
         "fn_post_room_message",
         "fn_read_evaluations",
         "fn_read_messages",
@@ -154,8 +157,10 @@ describe("gating-classifications parity", () => {
         "fn_task_get",
         "fn_task_list",
         "fn_task_log",
+        "fn_task_logs_read",
         "fn_task_search",
         "fn_task_show",
+        "fn_task_verification_status",
         "fn_trait_list",
         "fn_update_identity",
         "fn_workflow_get",
@@ -198,6 +203,20 @@ describe("gating-classifications parity", () => {
     });
   });
 
+  it("classifies ideation reads and mutations in both policy paths", () => {
+    for (const toolName of ["fn_ideation_list", "fn_ideation_show"]) {
+      expect(READONLY_FN_TOOLS.has(toolName)).toBe(true);
+      expect((COORDINATION_EXEMPT_TOOLS as readonly string[]).includes(toolName)).toBe(true);
+      expect(classifyPermanentAgentToolCall(toolName)).toEqual({ category: "none", recognized: true });
+    }
+    for (const toolName of ["fn_ideation_start", "fn_ideation_diverge", "fn_ideation_converge"]) {
+      expect(ACTION_GATE_TASK_AGENT_MANAGEMENT_TOOLS.has(toolName)).toBe(true);
+      expect(PERMANENT_AGENT_TASK_MUTATION_TOOLS.has(toolName)).toBe(true);
+      expect(evaluateAgentActionGate({ agentId: "a1", toolName, args: {}, permissionPolicy: blockedPolicy })).toMatchObject({ category: "task_agent_mutation", disposition: "block" });
+      expect(resolvePermanentAgentToolDecision({ toolName, args: {}, gating: { permissionPolicy: blockedPolicy } })).toMatchObject({ category: "task_agent_mutation", disposition: "block", recognized: true });
+    }
+  });
+
   it("governs fn_task_create as task_agent_mutation in both gate paths", () => {
     expect(READONLY_FN_TOOLS.has("fn_task_create")).toBe(false);
     expect(TASK_AGENT_MUTATION_TOOLS.has("fn_task_create")).toBe(true);
@@ -211,7 +230,7 @@ describe("gating-classifications parity", () => {
     for (const [permissionPolicy, disposition] of policyMatrix) {
       expect(resolvePermanentAgentToolDecision({
         toolName: "fn_task_create",
-        args: {},
+        args: { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } },
         gating: { permissionPolicy },
       })).toMatchObject({
         category: "task_agent_mutation",
@@ -221,7 +240,7 @@ describe("gating-classifications parity", () => {
       expect(evaluateAgentActionGate({
         agentId: "a1",
         toolName: "fn_task_create",
-        args: {},
+        args: { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } },
         permissionPolicy,
       })).toMatchObject({
         category: "task_agent_mutation",

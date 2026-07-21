@@ -6,6 +6,8 @@ import type { CustomProvider } from "@fusion/core";
 import { ApiError } from "../api-error.js";
 import { getCursorPickerModels, CURSOR_PICKER_PROVIDER_ID } from "../cursor-model-cache.js";
 import { getGrokPickerModels, GROK_PICKER_PROVIDER_ID } from "../grok-model-cache.js";
+import { getClaudePickerModels, CLAUDE_PICKER_PROVIDER_ID } from "../claude-model-cache.js";
+import { getOmpPickerModels, OMP_PICKER_PROVIDER_ID } from "../omp-model-cache.js";
 import { getHermesPickerModels, HERMES_PICKER_PROVIDER_ID } from "../hermes-model-cache.js";
 import type { AuthStorageLike } from "../routes.js";
 import type { ApiRouteRegistrar } from "./types.js";
@@ -166,6 +168,8 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     let cursorCliBinaryPath: string | undefined;
     let useGrokCli = false;
     let grokCliBinaryPath: string | undefined;
+    let useOmpCli = false;
+    let ompCliBinaryPath: string | undefined;
     let resolvedPlanningProvider: string | undefined;
     let resolvedPlanningModelId: string | undefined;
     let customProviders: CustomProvider[] = [];
@@ -205,6 +209,14 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         const rawGrokCliBinaryPath = (globalSettings as Record<string, unknown>).grokCliBinaryPath;
         grokCliBinaryPath =
           typeof rawGrokCliBinaryPath === "string" ? rawGrokCliBinaryPath.trim() || undefined : undefined;
+        /*
+        FNXC:OmpAcp 2026-07-13-22:50:
+        useOmpCli toggle + ompCliBinaryPath override for model-picker discovery (mirrors Grok).
+        */
+        useOmpCli = (globalSettings as Record<string, unknown>).useOmpCli === true;
+        const rawOmpCliBinaryPath = (globalSettings as Record<string, unknown>).ompCliBinaryPath;
+        ompCliBinaryPath =
+          typeof rawOmpCliBinaryPath === "string" ? rawOmpCliBinaryPath.trim() || undefined : undefined;
         customProviders = globalSettings.customProviders ?? [];
 
         const mergedSettings = await store.getSettingsFast();
@@ -242,7 +254,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
     }
 
     try {
-      options.modelRegistry.refresh();
+      await options.modelRegistry.refresh();
       if (options.modelRegistry.registerProvider) {
         mergeSupplementalAnthropicModels(options.modelRegistry as Parameters<typeof mergeSupplementalAnthropicModels>[0], (message) => runtimeLogger.child("models").warn(message));
         /*
@@ -294,6 +306,9 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       }
       if (!useGrokCli) {
         models = models.filter((m) => m.provider !== "grok-cli");
+      }
+      if (!useOmpCli) {
+        models = models.filter((m) => m.provider !== "omp-cli");
       }
 
       /*
@@ -380,6 +395,15 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       so an existing row always wins over a colliding Grok row — purely
       additive, must never displace, overwrite, or filter out an existing row.
       */
+      if (useClaudeCli) {
+        try {
+          for (const model of await getClaudePickerModels()) {
+            const key = `${model.provider}/${model.id}`;
+            if (!seenModelKeys.has(key)) { seenModelKeys.add(key); models.push(model); }
+          }
+        } catch (error: unknown) { runtimeLogger.child("models").warn(`Failed to load claude-cli models: ${error instanceof Error ? error.message : String(error)}`); }
+      }
+
       if (useGrokCli) {
         // getGrokPickerModels never throws by contract (see
         // grok-model-cache.ts), but this try/catch is a defensive belt so a
@@ -396,6 +420,25 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
         } catch (grokErr: unknown) {
           const message = grokErr instanceof Error ? grokErr.message : String(grokErr);
           runtimeLogger.child("models").warn(`Failed to load grok-cli models: ${message}`);
+        }
+      }
+
+      /*
+      FNXC:OmpAcp 2026-07-13-22:50:
+      Surface omp models under omp-cli when useOmpCli is on (additive; never displace existing rows).
+      */
+      if (useOmpCli) {
+        try {
+          const ompModels = await getOmpPickerModels({ binaryPath: ompCliBinaryPath });
+          for (const ompModel of ompModels) {
+            const key = `${ompModel.provider}/${ompModel.id}`;
+            if (seenModelKeys.has(key)) continue;
+            seenModelKeys.add(key);
+            models.push(ompModel);
+          }
+        } catch (ompErr: unknown) {
+          const message = ompErr instanceof Error ? ompErr.message : String(ompErr);
+          runtimeLogger.child("models").warn(`Failed to load omp-cli models: ${message}`);
         }
       }
 
@@ -419,6 +462,7 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       */
       const configuredProviders = await getConfiguredProviderNames(options?.authStorage);
       if (useClaudeCli) configuredProviders.add("pi-claude-cli");
+      if (useClaudeCli) configuredProviders.add(CLAUDE_PICKER_PROVIDER_ID);
       if (useDroidCli) configuredProviders.add("droid-cli");
       if (useLlamaCpp) configuredProviders.add("llama-server");
       // FNXC:ModelCatalog 2026-07-08-00:05 (FN-7696): allow-list "cursor-cli"
@@ -433,6 +477,8 @@ export const registerModelRoutes: ApiRouteRegistrar = (ctx) => {
       // FNXC:GrokCli 2026-07-08-00:05 (FN-7705): allow-list "grok-cli" through
       // the final filter whenever the toggle is on, mirroring cursor-cli above.
       if (useGrokCli) configuredProviders.add(GROK_PICKER_PROVIDER_ID);
+      // FNXC:OmpAcp 2026-07-13-22:50: allow-list omp-cli when toggle is on.
+      if (useOmpCli) configuredProviders.add(OMP_PICKER_PROVIDER_ID);
       // FNXC:ModelCatalog 2026-07-07-09:05 (FN-7636): only allow-list "hermes"
       // through the final filter when Hermes rows were actually contributed
       // above, mirroring the useClaudeCli/useDroidCli toggle pattern (Hermes

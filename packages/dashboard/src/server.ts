@@ -14,18 +14,26 @@ import type {
   CentralCore,
   MessageStore,
   AgentLogEntry,
-  TaskIdIntegrityReport,
+  RunAuditEvent,
 } from "@fusion/core";
-import { AgentStore, ChatStore, setRunningAgentCountSource } from "@fusion/core";
+import { AgentStore, ChatStore, queryRunAuditEvents, setRunningAgentCountSource } from "@fusion/core";
 import type { AuthStorageLike, ModelRegistryLike } from "./routes.js";
 import { createApiRoutes } from "./routes.js";
+import {
+  createRoomControlPlaneEngineRouteDependencies,
+  type RoomControlPlaneEngineRouteDependenciesOptions,
+} from "./room-control-plane-engine-route-dependencies.js";
+import {
+  createRoomControlPlaneRbacAuthorizer,
+  type RoomControlPlaneRbacAuthorizerOptions,
+} from "./room-control-plane-rbac-authorizer.js";
+import type { RoomControlPlaneRouteDependencies } from "./routes/register-room-control-plane-routes.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
 import { rateLimit, RATE_LIMITS } from "./rate-limit.js";
 import { ApiError, sendErrorResponse } from "./api-error.js";
 import {
   countRunningAgentsInRegisteredProjectStores,
   countRunningAgentsInStore,
-  getOrCreateProjectStore,
   evictAllProjectStores,
   setOnProjectFirstCreated,
 } from "./project-store-resolver.js";
@@ -69,7 +77,7 @@ import type { SkillsAdapter } from "./skills-adapter.js";
 import { createAuthMiddleware, authenticateUpgradeRequest, getDaemonToken } from "./auth-middleware.js";
 import { setupCliSessionWebSocket } from "./cli-session-ws.js";
 import { createCliSessionsRouter } from "./routes/cli-sessions.js";
-import { getProjectIdFromRequest } from "./routes/context.js";
+import { getProjectIdFromRequest, resolveStoreForProjectId } from "./routes/context.js";
 import type { CliRelaunchRegistry } from "./cli-session-transport.js";
 import { validateRemoteAuthToken } from "./remote-auth.js";
 import { getCliPackageVersion, isUnresolvedCliPackageVersion } from "./cli-package-version.js";
@@ -84,6 +92,12 @@ import {
 } from "./reliability-metrics.js";
 import { loadViewChunkManifest, type ViewChunkManifestEntry } from "./view-chunk-manifest.js";
 import { maybeStartOtelExporter, type OtelExporterHandle } from "./otel-exporter.js";
+import { requireAsyncLayer } from "./require-async-layer.js";
+import {
+  evaluateDashboardPostgresHealth,
+  resolveDashboardPostgresLayer,
+  type DashboardTaskIdIntegrityHealth,
+} from "./dashboard-postgres-health.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -104,28 +118,33 @@ function parseVersion(version: string): number[] {
     .map((value) => (Number.isFinite(value) ? value : 0));
 }
 
-function buildTaskIdIntegrityHealth(report: TaskIdIntegrityReport) {
+function buildTaskIdIntegrityHealth(report: DashboardTaskIdIntegrityHealth) {
   return {
     status: report.status,
     checkedAt: report.checkedAt,
     anomalies: report.anomalies,
+    ...(report.status === "error" ? { error: report.error } : {}),
     recommendedAction:
       report.status === "anomaly"
         ? "Pause task delegation, inspect the affected task IDs, and run the allocator audit before creating new tasks."
+        : report.status === "error"
+          ? "Restore PostgreSQL connectivity and rerun the health check before creating new tasks."
         : null,
   };
 }
 
 function buildHealthPayload(args: {
   database: ReturnType<TaskStore["getDatabaseHealth"]>;
-  taskIdIntegrityReport: ReturnType<TaskStore["getTaskIdIntegrityReport"]>;
+  taskIdIntegrityReport: DashboardTaskIdIntegrityHealth;
+  migration?: import("./dashboard-postgres-health.js").DashboardMigrationHealth;
   cliPackageVersion: string;
   engineAvailable: boolean;
 }) {
-  const { database, cliPackageVersion, engineAvailable } = args;
+  const { database, cliPackageVersion, engineAvailable, migration } = args;
   const taskIdIntegrity = buildTaskIdIntegrityHealth(args.taskIdIntegrityReport);
   return {
-    status: !database.healthy || database.corruptionDetected || taskIdIntegrity.status === "anomaly" ? "degraded" : "ok",
+    // Durable running/failed migration markers must never be hidden behind ok health.
+    status: migration || !database.healthy || database.corruptionDetected || taskIdIntegrity.status !== "ok" ? "degraded" : "ok",
     version: cliPackageVersion,
     uptime: Math.floor(process.uptime()),
     /*
@@ -137,6 +156,7 @@ function buildHealthPayload(args: {
     },
     database,
     taskIdIntegrity,
+    ...(migration ? { migration } : {}),
   };
 }
 
@@ -202,19 +222,46 @@ export async function resolveScopedStore(
   projectId: string | undefined,
   store: TaskStore,
   engineManager?: import("@fusion/engine").ProjectEngineManager,
+  launchProjectId?: string,
+  // FNXC:CentralProjectIdentity 2026-07-13-23:55: thread the caller's ServerOptions so
+  // the shared one-time launch-dir fallback warning routes through runtimeLogger
+  // instead of console.warn and isn't consumed on the unstructured sink first.
+  options?: ServerOptions,
 ): Promise<TaskStore> {
-  if (!projectId) {
-    return store;
-  }
+  /*
+  FNXC:CentralProjectIdentity 2026-07-14-00:15:
+  Realtime scoped-store resolution delegates to the SINGLE shared id-based core
+  (routes/context.ts resolveStoreForProjectId) so the realtime path and route path
+  can never drift. This exported signature (separate engineManager/launchProjectId
+  params) is retained for caller compatibility; callers derive both from `options`
+  (engineManager = options.engineManager, launchProjectId = options.engine.getProjectId()),
+  so folding `projectId ?? launchProjectId` into the shared core is equivalent.
+  Note: engineManager/launchProjectId params below are consumed via `options` inside
+  the shared core; they remain in the signature only for backwards compatibility.
+  */
+  void engineManager;
+  void launchProjectId;
+  return resolveStoreForProjectId(projectId ?? launchProjectId, store, options);
+}
 
-  if (engineManager) {
-    const engine = engineManager.getEngine(projectId);
-    if (engine) {
-      return engine.getTaskStore();
+export type RoomControlPlaneProjectAuthorizer =
+  RoomControlPlaneEngineRouteDependenciesOptions["authorizeProject"];
+
+/*
+FNXC:RoomControlPlaneDaemonAuthorization 2026-07-19-18:10:
+Daemon bearer/query validation is transport authentication only. It cannot manufacture a Room
+principal, so this legacy helper preserves its symbol while failing closed until a trusted-device
+RBAC resolver supplies the durable session identity.
+*/
+export function createDaemonRoomControlPlaneAuthorizer(
+  daemonToken: string,
+): RoomControlPlaneProjectAuthorizer {
+  return async ({ request }) => {
+    if (!authenticateUpgradeRequest(daemonToken, request)) {
+      return { allowed: false, reason: "daemon-token-required" };
     }
-  }
-
-  return await getOrCreateProjectStore(projectId);
+    return { allowed: false, reason: "trusted-device-principal-required" };
+  };
 }
 
 export interface ServerOptions {
@@ -226,6 +273,18 @@ export interface ServerOptions {
   /** ProjectEngineManager for uniform multi-project engine lifecycle.
    *  When provided, the server can resolve per-project engines for route handlers. */
   engineManager?: import("@fusion/engine").ProjectEngineManager;
+  /**
+   * Explicit project-scoped authorization for the Engine-backed Room read
+   * surface. Supplying an Engine or daemon bearer token alone never mounts
+   * these routes; the callback is invoked for every Room request.
+   */
+  roomControlPlaneAuthorizeProject?: RoomControlPlaneProjectAuthorizer;
+  /**
+   * Explicit durable trusted-device RBAC. When set, this real authorizer takes
+   * precedence over the legacy callback and derives the Room actor from the
+   * registry-backed Cookie session for every request.
+   */
+  roomControlPlaneRbac?: RoomControlPlaneRbacAuthorizerOptions;
   /** Optional HybridExecutor orchestration context for multi-project runtime plumbing. */
   hybridExecutor?: import("@fusion/engine").HybridExecutor;
   /**
@@ -338,6 +397,7 @@ export interface ServerOptions {
     rootDir: string;
     reconcileInReviewBranchRebind: (opts?: { includeTaskIds?: Set<string> }) => Promise<import("@fusion/engine").RebindResult>;
     getActiveMergeTaskId: () => string | null;
+    getStaleMergingStatusMinAgeMs: () => number;
   };
   /** Optional PluginStore for plugin management routes */
   pluginStore?: import("@fusion/core").PluginStore;
@@ -504,13 +564,10 @@ export interface ServerOptions {
   };
   /*
    * FNXC:PostgresHealth 2026-06-24-16:00:
-   * Optional PostgreSQL health layer. When provided, the /api/health and
-   * /api/health/refresh endpoints use PostgreSQL-native health checks
-   * (connectivity probe, schema drift, task-ID integrity) instead of the
-   * SQLite-specific integrity_check path. This is the integration seam
-   * between the async PostgreSQL data layer and the dashboard health surface.
-   * When absent, the endpoints fall back to the legacy SQLite health checks
-   * via store.getDatabaseHealth().
+   * Optional PostgreSQL health-layer override for integration hosts and tests.
+   * Normal production servers derive the live layer from TaskStore. The
+   * health endpoints fail closed if neither source provides one; PostgreSQL
+   * health must never fall back to the backend-mode healthy sentinel.
    */
   postgresHealthLayer?: import("@fusion/core").AsyncDataLayer;
   /*
@@ -532,6 +589,34 @@ export interface ServerOptions {
     getRecent(limit?: number): SystemLogEntry[];
     subscribe(listener: (entry: SystemLogEntry) => void): () => void;
   };
+}
+
+function createServerRoomControlPlaneRouteDependencies(
+  options?: ServerOptions,
+): RoomControlPlaneRouteDependencies | undefined {
+  const daemonToken = resolveDaemonTransportToken(options);
+  const authorizeProject = options?.roomControlPlaneRbac
+    ? daemonToken
+      ? createRoomControlPlaneRbacAuthorizer({
+        ...options.roomControlPlaneRbac,
+        authorizeDaemonTransport: async (request) => authenticateUpgradeRequest(daemonToken, request),
+      })
+      : undefined
+    : options?.roomControlPlaneAuthorizeProject;
+  if (typeof authorizeProject !== "function") {
+    return undefined;
+  }
+
+  return createRoomControlPlaneEngineRouteDependencies({
+    authorizeProject,
+    resolveProjectEngine: ({ projectId }) => options?.engineManager?.getEngine(projectId),
+  });
+}
+
+function resolveDaemonTransportToken(options?: ServerOptions): string | undefined {
+  return options?.noAuth
+    ? undefined
+    : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
 }
 
 /** System panel log entry shape (mirrors the CLI log sink's ring buffer). */
@@ -894,6 +979,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
             rootDir: engine.getWorkingDirectory(),
             reconcileInReviewBranchRebind: selfHealing.reconcileInReviewBranchRebind.bind(selfHealing),
             getActiveMergeTaskId: selfHealing.getActiveMergeTaskId.bind(selfHealing),
+            getStaleMergingStatusMinAgeMs: selfHealing.getStaleMergingStatusMinAgeMs.bind(selfHealing),
           },
         };
       }
@@ -983,9 +1069,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // that then captures ?token= from the URL and injects a Bearer header on every
   // /api/* call. WebSocket upgrades are gated separately in setupTerminalWebSocket /
   // setupBadgeWebSocket.
-  const daemonToken = options?.noAuth
-    ? undefined
-    : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
+  const daemonToken = resolveDaemonTransportToken(options);
   if (daemonToken) {
     app.use(createAuthMiddleware(daemonToken));
   }
@@ -1089,14 +1173,9 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   }
 
   // Create ChatStore for chat session management (available for SSE event forwarding)
-  // FNXC:RuntimeSatelliteAsync 2026-06-24-21:45:
-  // ChatStore dual-path: uses async layer in backend mode, sync DB otherwise.
-  const chatLayer = store.getAsyncLayer();
-  const chatStore = options?.chatStore ?? new ChatStore(
-    store.getFusionDir(),
-    chatLayer ? null : store.getDatabase(),
-    { asyncLayer: chatLayer },
-  );
+  // FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Dashboard chat persistence is PostgreSQL-only and shares the scoped project layer.
+  const chatLayer = requireAsyncLayer(store, "Dashboard ChatStore");
+  const chatStore = options?.chatStore ?? new ChatStore(chatLayer);
   store.on("task:moved", (data: { task: Task; from: string; to: string }) => {
     if (data.to !== "archived") return;
     /*
@@ -1153,7 +1232,11 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     if (!projectId) {
       // Create AgentStore for default project SSE
       const { AgentStore: AgentStoreClass } = await import("@fusion/core");
-      const defaultAgentStore = new AgentStoreClass({ rootDir: store.getFusionDir() });
+      /* FNXC:PostgresSseAgentStore 2026-07-14-19:35: SSE fallback stores must subscribe to the authoritative project PostgreSQL layer so agent events never read a SQLite shadow. */
+      const defaultAgentStore = new AgentStoreClass({
+        rootDir: store.getFusionDir(),
+        asyncLayer: requireAsyncLayer(store, "Default SSE AgentStore"),
+      });
       await defaultAgentStore.init();
       const defaultMessageStore = options?.engine?.getMessageStore();
       createSSE(
@@ -1174,27 +1257,35 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       // Prefer the engine's store when available — this ensures SSE listeners
       // attach to the same EventEmitter instance that the engine writes to,
       // rather than a separate store created by getOrCreateProjectStore.
-      let scopedStore: TaskStore;
+      const scopedStore: TaskStore = await resolveProjectScopedStore(projectId);
       let agentStore: AgentStore | undefined;
       let messageStore: MessageStore | undefined;
       let automationStore: AutomationStore | undefined;
       let scopedChatStore = chatStore;
+      /*
+      FNXC:ProjectScoping 2026-07-15-20:10:
+      A project-scoped SSE stream must attach to the same canonical TaskStore as
+      request handlers and the launch engine. Reimplementing the resolver here
+      created a second store for the launch project when its engine was not
+      immediately available, which separated its EventEmitter from mutations.
+      */
       if (engineManager) {
         const engine = engineManager.getEngine(projectId);
-        scopedStore = engine?.getTaskStore() ?? await getOrCreateProjectStore(projectId);
         scopedChatStore = getOrCreateScopedChatStore(scopedStore, engine?.getChatStore?.());
-        // Use the engine's stores if available
+        // Use the engine's auxiliary stores when available.
         agentStore = engine?.getAgentStore();
         messageStore = engine?.getMessageStore();
         automationStore = engine?.getAutomationStore();
       } else {
-        scopedStore = await getOrCreateProjectStore(projectId);
         scopedChatStore = getOrCreateScopedChatStore(scopedStore);
       }
       // Fallback: create AgentStore if engine doesn't have one
       if (!agentStore) {
         const { AgentStore: AgentStoreClass } = await import("@fusion/core");
-        agentStore = new AgentStoreClass({ rootDir: scopedStore.getFusionDir() });
+        agentStore = new AgentStoreClass({
+          rootDir: scopedStore.getFusionDir(),
+          asyncLayer: requireAsyncLayer(scopedStore, "Project SSE AgentStore"),
+        });
         await agentStore.init();
       }
       if (!automationStore) {
@@ -1223,7 +1314,11 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
    * Uses module-level resolveScopedStore with current closure context.
    */
   async function resolveProjectScopedStore(projectId: string | undefined): Promise<TaskStore> {
-    return resolveScopedStore(projectId, store, options?.engineManager);
+    // FNXC:CentralProjectIdentity 2026-07-13-23:53:
+    // Thread the daemon's registered launch project id so a realtime request
+    // without projectId resolves the explicit launch project (registry-bound
+    // injected store) rather than the implicit raw-store fallback.
+    return resolveScopedStore(projectId, store, options?.engineManager, options?.engine?.getProjectId?.(), options);
   }
 
   // Per-task SSE endpoint for live agent log streaming
@@ -1429,13 +1524,9 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   }
 
   // Create AiSessionStore for background task persistence
-  // FNXC:RuntimeSatelliteCompletion 2026-06-25-00:05:
-  // AiSessionStore dual-path: uses async layer in backend mode, sync DB otherwise.
-  const aiSessionLayer = store.getAsyncLayer();
-  const aiSessionStore: AiSessionStore | undefined = options?.aiSessionStore ?? new AiSessionStore(
-    aiSessionLayer ? null as unknown as import("@fusion/core").Database : store.getDatabase(),
-    { asyncLayer: aiSessionLayer },
-  );
+  // FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Background AI sessions must use the authoritative project PostgreSQL layer.
+  const aiSessionLayer = requireAsyncLayer(store, "Dashboard AiSessionStore");
+  const aiSessionStore: AiSessionStore | undefined = options?.aiSessionStore ?? new AiSessionStore(aiSessionLayer);
   if (aiSessionStore) {
     // FNXC:RuntimeSatelliteCompletion 2026-06-25-00:20:
     // recoverStaleSessions + rehydrateFromStore are now async. Fire-and-forget
@@ -1468,7 +1559,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   const totalRehydrated = 0;
   if (totalRehydrated > 0) {
     runtimeLogger.info("AI session rehydrate summary", {
-      message: "Rehydrated AI sessions from SQLite",
+      message: "Rehydrated AI sessions from PostgreSQL",
       planningRehydratedCount,
       subtaskRehydratedCount,
       missionRehydratedCount,
@@ -1478,13 +1569,11 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   }
 
   // Create AgentStore for chat prompt enrichment (initialized lazily by ChatManager)
-  // FNXC:SqliteFinalRemoval 2026-06-26-11:00:
-  // In backend mode, pass the AsyncDataLayer so AgentStore delegates to the
-  // async helpers; otherwise use the legacy SQLite path.
-  const chatAgentLayer = store.getAsyncLayer();
+  // FNXC:PostgresSseAgentStore 2026-07-14-19:35: Chat enrichment shares the mandatory default-project PostgreSQL layer.
+  const chatAgentLayer = requireAsyncLayer(store, "Chat AgentStore");
   const chatAgentStore = new AgentStore({
     rootDir: store.getFusionDir(),
-    ...(chatAgentLayer ? { asyncLayer: chatAgentLayer } : {}),
+    asyncLayer: chatAgentLayer,
   });
 
   // Create ChatManager for AI chat message handling.
@@ -1701,41 +1790,26 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
    * FNXC:PostgresHealth 2026-06-24-16:10:
    * The /api/health endpoint is async because PostgreSQL health checks
    * (connectivity probe, task-ID integrity via Drizzle) are inherently async.
-   * When postgresHealthLayer is provided, the endpoint uses PostgreSQL-native
-   * checks; otherwise it falls back to the legacy SQLite health checks.
+   * The endpoint derives the live PostgreSQL layer from TaskStore unless an
+   * integration host supplies an explicit override. Missing layers and failed
+   * connectivity/integrity queries return degraded health.
    * VAL-HEALTH-001: healthy backend reports green; VAL-HEALTH-002: corrupt/
    * unreachable backend surfaces degraded status + errors.
    */
   app.get("/api/health", async (_req, res) => {
-    const pgLayer = options?.postgresHealthLayer;
-    if (pgLayer) {
-      const { checkPostgresHealth } = await import("@fusion/core");
-      const { detectTaskIdIntegrityAnomaliesAsync } = await import("@fusion/core");
-      const errors = await checkPostgresHealth(pgLayer).catch((err: unknown) => [
-        `PostgreSQL health check failed: ${err instanceof Error ? err.message : String(err)}`,
-      ]);
-      const integrityReport = await detectTaskIdIntegrityAnomaliesAsync(pgLayer.db).catch(() => ({
-        status: "ok" as const,
-        checkedAt: new Date().toISOString(),
-        anomalies: [],
-      }));
-      res.json(buildHealthPayload({
-        database: {
-          healthy: errors.length === 0,
-          corruptionDetected: errors.length > 0,
-          corruptionErrors: errors.slice(0, 5),
-          lastCheckedAt: new Date(),
-          isRunning: false,
-        },
-        taskIdIntegrityReport: integrityReport,
-        cliPackageVersion,
-        engineAvailable: hasDashboardEngine(options),
-      }));
-      return;
-    }
+    /*
+    FNXC:MigrationStatusDashboard 2026-07-19-14:30:
+    The daemon's TaskStore is bound to the engine project id, but TaskStore has
+    no project-id accessor. Pass that typed server identity to health so durable
+    migration markers use project:<projectId> instead of a root-path fallback.
+    */
+    const health = await evaluateDashboardPostgresHealth(store, options?.postgresHealthLayer, {
+      projectId: options?.engine?.getProjectId?.(),
+    });
     res.json(buildHealthPayload({
-      database: store.getDatabaseHealth(),
-      taskIdIntegrityReport: store.getTaskIdIntegrityReport(),
+      database: health.database,
+      taskIdIntegrityReport: health.taskIdIntegrity,
+      migration: health.migration,
       cliPackageVersion,
       engineAvailable: hasDashboardEngine(options),
     }));
@@ -1815,8 +1889,24 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     const startIso = new Date(effectiveStartMs).toISOString();
     const endIso = new Date(nowMs).toISOString();
 
+    const auditFilter = { startTime: startIso, endTime: endIso, limit: 50_000 };
+    const asyncLayer = scopedStore.getAsyncLayer();
+    /*
+    FNXC:ReliabilityHealth 2026-07-14-16:13:
+    Backend-mode Reliability must use the authoritative async run-audit reader. The synchronous reader is a SQLite/test compatibility surface and intentionally degrades to an empty result under PostgreSQL.
+    */
+    const runAuditEventsPromise: Promise<RunAuditEvent[]> = asyncLayer
+      ? queryRunAuditEvents(asyncLayer.db, auditFilter).then((events) => events.map((event) => ({
+          ...event,
+          projectId: event.projectId ?? undefined,
+          domain: event.domain as RunAuditEvent["domain"],
+          mutationType: event.mutationType as RunAuditEvent["mutationType"],
+          taskId: event.taskId ?? undefined,
+          metadata: event.metadata ?? undefined,
+        })))
+      : scopedStore.getRunAuditEventsAsync(auditFilter);
     const [runAuditEvents, enteredByDay, bouncedByDay, durationEvents, mergedTaskIds] = await Promise.all([
-      Promise.resolve(scopedStore.getRunAuditEvents({ startTime: startIso, endTime: endIso, limit: 50_000 })),
+      runAuditEventsPromise,
       scopedStore.getTaskMovedCountsByDay({ since: startIso, until: endIso, toColumn: "in-review" }),
       scopedStore.getTaskMovedCountsByDay({ since: startIso, until: endIso, fromColumn: "in-review", toColumn: "in-progress" }),
       scopedStore.getInReviewDurationEvents({ since: startIso, until: endIso }),
@@ -1918,40 +2008,21 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   app.post("/api/health/refresh", async (_req, res) => {
     /*
      * FNXC:PostgresHealth 2026-06-24-16:15:
-     * Force-recompute integrity + database health. When postgresHealthLayer
-     * is provided, uses PostgreSQL-native checks (VAL-HEALTH-002: clears stale
-     * corruption banner after repair). Otherwise falls back to the legacy
-     * SQLite refresh path.
+     * Force-recompute PostgreSQL connectivity and task-ID integrity through
+     * the live TaskStore layer (or an explicit integration override). Query
+     * failures remain visible as degraded health instead of healthy fallback.
+     *
+     * FNXC:MigrationStatusDashboard 2026-07-19-14:30:
+     * Preserve the engine's typed bound project identity on refresh so this
+     * endpoint queries the same durable project migration marker as GET health.
      */
-    const pgLayer = options?.postgresHealthLayer;
-    if (pgLayer) {
-      const { checkPostgresHealth } = await import("@fusion/core");
-      const { detectTaskIdIntegrityAnomaliesAsync } = await import("@fusion/core");
-      const errors = await checkPostgresHealth(pgLayer).catch((err: unknown) => [
-        `PostgreSQL health check failed: ${err instanceof Error ? err.message : String(err)}`,
-      ]);
-      const integrityReport = await detectTaskIdIntegrityAnomaliesAsync(pgLayer.db).catch(() => ({
-        status: "ok" as const,
-        checkedAt: new Date().toISOString(),
-        anomalies: [],
-      }));
-      res.json(buildHealthPayload({
-        database: {
-          healthy: errors.length === 0,
-          corruptionDetected: errors.length > 0,
-          corruptionErrors: errors.slice(0, 5),
-          lastCheckedAt: new Date(),
-          isRunning: false,
-        },
-        taskIdIntegrityReport: integrityReport,
-        cliPackageVersion,
-        engineAvailable: hasDashboardEngine(options),
-      }));
-      return;
-    }
+    const health = await evaluateDashboardPostgresHealth(store, options?.postgresHealthLayer, {
+      projectId: options?.engine?.getProjectId?.(),
+    });
     res.json(buildHealthPayload({
-      database: store.refreshDatabaseHealth(),
-      taskIdIntegrityReport: store.refreshTaskIdIntegrityReport(),
+      database: health.database,
+      taskIdIntegrityReport: health.taskIdIntegrity,
+      migration: health.migration,
       cliPackageVersion,
       engineAvailable: hasDashboardEngine(options),
     }));
@@ -1960,13 +2031,27 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   /*
    * FNXC:PostgresHealth 2026-06-24-16:20:
    * Explicit compaction command: runs VACUUM/ANALYZE on the project-schema
-   * tables and reports per-table stats (VAL-HEALTH-005). Only available when
-   * the PostgreSQL health layer is provided; returns 501 otherwise.
+   * tables and reports per-table stats (VAL-HEALTH-005). Derive the production
+   * layer from TaskStore just like the read/refresh health routes; an explicit
+   * override remains available for integration hosts and tests.
+   *
+   * FNXC:PostgresHealth 2026-07-14-23:45:
+   * PostgreSQL compaction is a supported runtime capability. A missing layer
+   * is service unavailability, not an unimplemented endpoint, and must never
+   * be caused by production callers omitting an optional override.
    */
   app.post("/api/health/compact", async (_req, res) => {
-    const pgLayer = options?.postgresHealthLayer;
+    let pgLayer: import("@fusion/core").AsyncDataLayer | null;
+    try {
+      pgLayer = resolveDashboardPostgresLayer(store, options?.postgresHealthLayer);
+    } catch (error) {
+      res.status(503).json({
+        error: `PostgreSQL health layer resolution failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
     if (!pgLayer) {
-      res.status(501).json({ error: "PostgreSQL compaction is not available (no postgresHealthLayer configured)." });
+      res.status(503).json({ error: "PostgreSQL health layer unavailable for compaction." });
       return;
     }
     try {
@@ -2074,8 +2159,10 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   });
 
   // REST API
+  const roomControlPlaneRouteDependencies = createServerRoomControlPlaneRouteDependencies(options);
   const apiRouter = createApiRoutes(store, {
     ...options,
+    ...(roomControlPlaneRouteDependencies ? { roomControlPlaneRouteDependencies } : {}),
     runtimeLogger,
     aiSessionStore: aiSessionStore as AiSessionStore,
     chatStore,
@@ -2326,7 +2413,7 @@ export function setupTerminalWebSocket(
     try {
       if (projectId) {
         // When projectId is provided, resolve the scoped store and get its root dir
-        const scopedStore = await resolveScopedStore(projectId, store, options?.engineManager);
+        const scopedStore = await resolveScopedStore(projectId, store, options?.engineManager, options?.engine?.getProjectId?.(), options);
         scopedRootDir = scopedStore.getRootDir();
         terminalService = getTerminalService(scopedRootDir);
       } else {
@@ -2516,7 +2603,7 @@ export function setupTerminalWebSocket(
   }, 60_000);
 
   // Stop eviction timer when the server shuts down
-  server.once("close", () => {
+  server.once("close", async () => {
     clearInterval(staleEvictionInterval);
   });
 
@@ -2559,8 +2646,13 @@ export function setupBadgeWebSocket(
       return scopedStore;
     }
     
-    // Create scoped store
-    scopedStore = await resolveScopedStore(projectId, store, options?.engineManager);
+    /*
+    FNXC:ProjectScoping 2026-07-15-20:10:
+    Badge WebSocket listeners use the canonical scoped resolver, including for
+    the launch project, so an explicit `projectId` cannot bind a duplicate
+    TaskStore/EventEmitter and leak or miss cross-project badge updates.
+    */
+    scopedStore = await resolveScopedStore(projectId, store, options?.engineManager, options?.engine?.getProjectId?.(), options);
     scopedStores.set(projectId, scopedStore);
     return scopedStore;
   };
@@ -2763,18 +2855,49 @@ export function setupBadgeWebSocket(
     wsManager.addClient(ws, randomUUID(), projectId);
   });
 
-  server.once("close", () => {
+  server.once("close", async () => {
     // Clean up all scoped listeners
     for (const cleanup of scopedCleanups.values()) {
       cleanup();
     }
     scopedCleanups.clear();
 
+    /*
+    FNXC:PostgresResourceLifecycle 2026-07-14-19:05:
+    Dashboard shutdown must publish this node as offline before project engines close their PostgreSQL pools, then drain every project-scoped store before CentralCore releases its owned embedded backend. This prevents terminal mesh writes or late resolver creations from racing a stopped postmaster.
+    */
+    try {
+      options?.centralCore?.stopDiscovery();
+      await options?.centralCore?.markLocalNodeOffline();
+    } catch (error) {
+      options?.runtimeLogger?.warn("Failed to mark the dashboard node offline during shutdown", {
+        ...normalizeErrorForLog(error),
+      });
+    }
+
+    try {
+      if (options?.engineManager) {
+        await options.engineManager.stopAll();
+      } else {
+        await options?.engine?.stop();
+      }
+    } catch (error) {
+      options?.runtimeLogger?.warn("Failed to stop dashboard project engines", {
+        ...normalizeErrorForLog(error),
+      });
+    }
+
     for (const scopedStore of scopedStores.values()) {
       // Don't close the default store - it's managed externally
       if (scopedStore !== store) {
         scopedStore.stopWatching?.();
-        scopedStore.close?.();
+        try {
+          await Promise.resolve(scopedStore.close?.());
+        } catch (error) {
+          options?.runtimeLogger?.warn("Failed to close a dashboard-scoped project store", {
+            ...normalizeErrorForLog(error),
+          });
+        }
       }
     }
     scopedStores.clear();
@@ -2787,7 +2910,14 @@ export function setupBadgeWebSocket(
     void badgePubSub.dispose();
     wss.close();
     // Clean up cached project-scoped stores (stop watchers, close DB connections)
-    evictAllProjectStores();
+    await evictAllProjectStores();
+    try {
+      await options?.centralCore?.close();
+    } catch (error) {
+      options?.runtimeLogger?.warn("Failed to close CentralCore during dashboard shutdown", {
+        ...normalizeErrorForLog(error),
+      });
+    }
     setRunningAgentCountSource(undefined);
     dashboardApp.terminalWsServer = null;
     dashboardApp.badgeWsServer = null;

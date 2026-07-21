@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { hostname } from "node:os";
 import type {
   TaskStore,
   Task,
@@ -15,7 +16,13 @@ import type {
   CliSession,
   NotificationPayload,
 } from "@fusion/core";
-import { ChatStore, createCentralDatabase, isEphemeralAgent, MissionStore } from "@fusion/core";
+import {
+  ChatStore,
+  createCentralDatabase,
+  isEphemeralAgent,
+  isSessionRoomControlPlaneEnabled,
+  MissionStore,
+} from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
 import type { PrMonitor, PrComment } from "../pr-monitor.js";
 import type { PrInfo } from "@fusion/core";
@@ -49,6 +56,17 @@ import { PluginRunner } from "../plugin-runner.js";
 import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
 import { TriageProcessor } from "../triage.js";
+import {
+  createGlobalCapacityLegacyRecoveryGate,
+  type GlobalCapacityLegacyRecoveryGateV1,
+} from "../global-capacity-legacy-recovery-gate.js";
+import {
+  createGlobalCapacityLegacyAttemptRunner,
+} from "../global-capacity-legacy-attempt-runner.js";
+import {
+  createGlobalCapacityLegacyDispatchControl,
+  type GlobalCapacityLegacyDispatchControlV1,
+} from "../global-capacity-legacy-dispatch-control.js";
 import { EphemeralWorkerManager } from "../ephemeral-worker-manager.js";
 import { validateProjectNodeMapping } from "../node-dispatch-validation.js";
 import { attachAgentLinkSync } from "../task-agent-sync.js";
@@ -56,6 +74,133 @@ import { createRunAuditor, generateSyntheticRunId } from "../run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
+
+export type RoomSessionConnectorBootstrapStateV1 = "not_required" | "ready" | "withheld";
+
+export interface RoomSessionConnectorBootstrapStatusV1 {
+  readonly state: RoomSessionConnectorBootstrapStateV1;
+  readonly reasonCode: "required_session_connector_not_loaded" | null;
+  readonly requiredConnectorIds: readonly string[];
+  readonly loadedConnectorIds: readonly string[];
+  readonly missingConnectorIds: readonly string[];
+}
+
+export interface RoomSessionConnectorBootstrapInputV1 {
+  readonly requiredConnectorIds: readonly string[];
+  readonly loadedConnectorRegistrations: readonly Readonly<{
+    pluginId: string;
+    connectorId: string;
+  }>[];
+}
+
+export interface RoomSessionConnectorBootstrapRunnerV1 {
+  init(): Promise<void>;
+  getPluginSessionConnectors(): readonly Readonly<{
+    pluginId: string;
+    sessionConnector: Readonly<{
+      metadata: Readonly<{
+        connectorId: string;
+      }>;
+    }>;
+  }>[];
+  getStore(): Readonly<{
+    getPlugin(pluginId: string): Promise<Readonly<{
+      id: string;
+      enabled: boolean;
+    }>>;
+  }>;
+}
+
+export interface BootstrapRoomSessionConnectorsInputV1 {
+  readonly resolveRequiredConnectorIds: () => Promise<readonly string[]>;
+  readonly pluginRunner: RoomSessionConnectorBootstrapRunnerV1;
+}
+
+function normalizeRoomSessionConnectorIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return [];
+  return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))]
+    .sort((left, right) => left.localeCompare(right));
+}
+
+/*
+ * FNXC:RoomSessionConnectorBootstrap 2026-07-20-22:39:
+ * A bundled manifest or persisted install record is not authority to use a
+ * Session Connector. A Room-selected connector is usable only when its
+ * installed plugin is still enabled and has loaded a registration; the check
+ * completes before ProjectEngine can freeze the Room registry or start provider delivery.
+ */
+export function evaluateRoomSessionConnectorBootstrap(
+  input: RoomSessionConnectorBootstrapInputV1,
+): RoomSessionConnectorBootstrapStatusV1 {
+  const requiredConnectorIds = normalizeRoomSessionConnectorIds(input.requiredConnectorIds);
+  const loadedConnectorIds = normalizeRoomSessionConnectorIds(
+    input.loadedConnectorRegistrations.map((registration) => registration.connectorId),
+  );
+  const missingConnectorIds = requiredConnectorIds.filter(
+    (connectorId) => !loadedConnectorIds.includes(connectorId),
+  );
+
+  if (requiredConnectorIds.length === 0) {
+    return {
+      state: "not_required",
+      reasonCode: null,
+      requiredConnectorIds,
+      loadedConnectorIds,
+      missingConnectorIds,
+    };
+  }
+
+  if (missingConnectorIds.length > 0) {
+    return {
+      state: "withheld",
+      reasonCode: "required_session_connector_not_loaded",
+      requiredConnectorIds,
+      loadedConnectorIds,
+      missingConnectorIds,
+    };
+  }
+
+  return {
+    state: "ready",
+    reasonCode: null,
+    requiredConnectorIds,
+    loadedConnectorIds,
+    missingConnectorIds,
+  };
+}
+
+async function collectEnabledLoadedRoomSessionConnectors(
+  pluginRunner: RoomSessionConnectorBootstrapRunnerV1,
+): Promise<Array<{ pluginId: string; connectorId: string }>> {
+  const registrations = pluginRunner.getPluginSessionConnectors();
+  const verified = await Promise.all(registrations.map(async (registration) => {
+    try {
+      const installation = await pluginRunner.getStore().getPlugin(registration.pluginId);
+      if (!installation.enabled || installation.id !== registration.pluginId) return null;
+      return {
+        pluginId: registration.pluginId,
+        connectorId: registration.sessionConnector.metadata.connectorId,
+      };
+    } catch {
+      // Missing install state is not equivalent to an enabled bundled manifest.
+      return null;
+    }
+  }));
+  return verified.filter(
+    (registration): registration is { pluginId: string; connectorId: string } => registration !== null,
+  );
+}
+
+export async function bootstrapRoomSessionConnectors(
+  input: BootstrapRoomSessionConnectorsInputV1,
+): Promise<RoomSessionConnectorBootstrapStatusV1> {
+  const requiredConnectorIds = await input.resolveRequiredConnectorIds();
+  await input.pluginRunner.init();
+  return evaluateRoomSessionConnectorBootstrap({
+    requiredConnectorIds,
+    loadedConnectorRegistrations: await collectEnabledLoadedRoomSessionConnectors(input.pluginRunner),
+  });
+}
 
 export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
@@ -223,6 +368,11 @@ export class InProcessRuntime
   private pluginRunner?: PluginRunner;
   private pluginStore?: PluginStore;
   private pluginLoader?: PluginLoader;
+  private roomSessionConnectorBootstrapStatus: RoomSessionConnectorBootstrapStatusV1 =
+    evaluateRoomSessionConnectorBootstrap({
+      requiredConnectorIds: [],
+      loadedConnectorRegistrations: [],
+    });
   private routineRunner?: RoutineRunner;
   private routineStore?: RoutineStore;
   private routineScheduler?: RoutineScheduler;
@@ -271,6 +421,35 @@ export class InProcessRuntime
     runtimeLog.log(`Created InProcessRuntime for project ${config.projectId}`);
   }
 
+  private async resolveRequiredRoomSessionConnectorIds(): Promise<readonly string[]> {
+    const settings = await this.taskStore.getSettings();
+    if (!isSessionRoomControlPlaneEnabled(settings)) return [];
+
+    const authorityReader = this.centralCore as unknown as {
+      readRoomHostCompositionOperatorPolicyAuthorityV1?: (scope: {
+        projectId: string;
+        hostId: string;
+      }) => Promise<unknown>;
+    };
+    if (typeof authorityReader.readRoomHostCompositionOperatorPolicyAuthorityV1 !== "function") {
+      return [];
+    }
+
+    try {
+      const authority = await authorityReader.readRoomHostCompositionOperatorPolicyAuthorityV1({
+        projectId: this.config.projectId,
+        hostId: hostname(),
+      });
+      const connectorIds = authority && typeof authority === "object"
+        ? (authority as { policy?: { connectorIds?: unknown } }).policy?.connectorIds
+        : undefined;
+      return normalizeRoomSessionConnectorIds(connectorIds);
+    } catch {
+      // Missing, expired, or unavailable authority is separately withheld by ProjectEngine.
+      return [];
+    }
+  }
+
   /**
    * Start the runtime and initialize all subsystems.
    *
@@ -292,6 +471,7 @@ export class InProcessRuntime
 
     try {
       // 1. Initialize TaskStore (use external if provided, otherwise create new)
+      let centralHostLayer: import("@fusion/core").AsyncDataLayer | undefined;
       const {
         TaskStore,
         PluginStore: PluginStoreClass,
@@ -308,6 +488,7 @@ export class InProcessRuntime
         // InProcessRuntime.start(). When the factory returns a backend result,
         // the engine owns the result's shutdown() for process teardown.
         createTaskStoreForBackend,
+        createGlobalCapacityLegacyAttemptStore,
       } = await import("@fusion/core");
       if (this.config.externalTaskStore) {
         this.taskStore = this.config.externalTaskStore;
@@ -320,6 +501,7 @@ export class InProcessRuntime
         if (backendBoot) {
           this.taskStore = backendBoot.taskStore;
           this.backendShutdown = backendBoot.shutdown;
+          centralHostLayer = backendBoot.hostAsyncLayer;
           runtimeLog.log(
             `TaskStore initialized on PostgreSQL (${backendBoot.backend.mode}) for project ${this.config.projectId}`,
           );
@@ -346,12 +528,85 @@ export class InProcessRuntime
       // via the init() idempotency guard. Safe in legacy mode (messageLayer null).
       if (messageLayer && !this.centralCore.backendMode) {
         try {
-          await this.centralCore.attachBackendLayer(messageLayer);
+          await this.centralCore.attachBackendLayer(centralHostLayer ?? messageLayer);
         } catch (err) {
           runtimeLog.warn(
             `Failed to attach backend layer to CentralCore: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+      }
+
+      let globalCapacityLegacyRecoveryGate: GlobalCapacityLegacyRecoveryGateV1 | undefined;
+      let globalCapacityLegacyDispatchControl: GlobalCapacityLegacyDispatchControlV1 | undefined;
+      if (messageLayer) {
+        try {
+          const authority = await this.centralCore.readGlobalCapacityPolicyAuthorityV1();
+          const attemptStore = createGlobalCapacityLegacyAttemptStore({
+            layer: messageLayer,
+            projectId: this.config.projectId,
+            policy: authority.policy,
+            idFactory: (identity) => [
+              "fusion-global-capacity-legacy-v1",
+              identity.kind,
+              identity.projectId,
+              identity.resourceKind,
+              identity.resourceId,
+              identity.capacityFence,
+              identity.acquireGeneration,
+              randomUUID(),
+            ].join(":"),
+          });
+          const runner = createGlobalCapacityLegacyAttemptRunner({
+            projectId: this.config.projectId,
+            store: attemptStore,
+            ledger: authority.createProjectPorts(this.config.projectId),
+            policy: authority.policy,
+            now: () => new Date().toISOString(),
+          });
+          globalCapacityLegacyDispatchControl = createGlobalCapacityLegacyDispatchControl({
+            projectId: this.config.projectId,
+            runner,
+            leaseTtlMs: authority.policy.leaseTtlMs,
+          });
+          globalCapacityLegacyRecoveryGate = createGlobalCapacityLegacyRecoveryGate({
+            projectId: this.config.projectId,
+            inspection: attemptStore,
+            pause: this.taskStore,
+          });
+          /*
+           * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-07:08:
+           * The runtime wires one project-scoped attempt store to the unscoped
+           * CentralCore policy authority's ledger ports. Executor and triage use
+           * the same dispatch control, so neither path can invent a local cap,
+           * lease TTL, holder identity, or provider-work replay after restart.
+           */
+          runtimeLog.log(`Global capacity recovery gate and dispatch control initialized for project ${this.config.projectId}`);
+        } catch (error) {
+          /*
+           * FNXC:GlobalCapacityLegacyRecoveryGate 2026-07-20-06:10:
+           * A PostgreSQL-backed runtime without a verified central policy or
+           * host-scoped CentralCore must not silently bypass restart fencing.
+           * Inject a gate whose inspection always fails closed; legacy SQLite
+           * remains an explicitly unsupported single-process compatibility path.
+           */
+          const unavailable = error instanceof Error ? error.message : String(error);
+          globalCapacityLegacyRecoveryGate = createGlobalCapacityLegacyRecoveryGate({
+            projectId: this.config.projectId,
+            inspection: {
+              async inspectRecovery(): Promise<never> {
+                throw new Error("global-capacity-recovery-unavailable");
+              },
+            },
+            pause: this.taskStore,
+          });
+          runtimeLog.warn(
+            `Global capacity recovery gate is fail-closed for project ${this.config.projectId}: ${unavailable}`,
+          );
+        }
+      } else {
+        runtimeLog.warn(
+          `Global capacity recovery gate unavailable for SQLite compatibility runtime ${this.config.projectId}; durable cross-project capacity is not enforced`,
+        );
       }
 
       if (messageLayer) {
@@ -383,7 +638,15 @@ export class InProcessRuntime
         taskStore: this.taskStore,
         rootDir: this.config.workingDirectory,
       });
-      await this.pluginRunner.init();
+      this.roomSessionConnectorBootstrapStatus = await bootstrapRoomSessionConnectors({
+        resolveRequiredConnectorIds: () => this.resolveRequiredRoomSessionConnectorIds(),
+        pluginRunner: this.pluginRunner,
+      });
+      if (this.roomSessionConnectorBootstrapStatus.state === "withheld") {
+        runtimeLog.warn(
+          `Room Session Connector bootstrap withheld for ${this.config.projectId}: ${this.roomSessionConnectorBootstrapStatus.reasonCode} (${this.roomSessionConnectorBootstrapStatus.missingConnectorIds.join(", ")})`,
+        );
+      }
       runtimeLog.log(`PluginRunner initialized`);
 
       await yieldEventLoop();
@@ -641,14 +904,16 @@ export class InProcessRuntime
       // 5a-cli. Initialize the CLI Agent Executor runtime (behind the
       // `cliAgentExecutor` experimental flag). Reuses the project's existing core
       // Database; predicates feed the self-healing + stuck-task seams below.
-      if (isExperimentalFeatureEnabled(settings, "cliAgentExecutor") && !this.taskStore.isBackendMode()) {
-        // FNXC:RuntimeSatelliteAsync 2026-06-24-14:00:
-        // CLI Agent Executor runtime requires the sync SQLite Database; skip in
-        // backend mode (the feature is experimental and not yet ported to async).
+      const cliAgentLayer = this.taskStore.getAsyncLayer();
+      if (isExperimentalFeatureEnabled(settings, "cliAgentExecutor") && cliAgentLayer) {
+        // FNXC:CliAgentPostgres 2026-07-21:
+        // The official runtime owns its session cache through the project's
+        // PostgreSQL AsyncDataLayer. Do not reopen or route through the retired
+        // synchronous SQLite constructor.
         try {
-          this.cliAgentRuntime = createCliAgentRuntime({
+          this.cliAgentRuntime = await createCliAgentRuntime({
             fusionDir: this.taskStore.getFusionDir(),
-            db: this.taskStore.getDatabase(),
+            asyncLayer: cliAgentLayer,
             projectId: this.config.projectId,
             hookEndpointUrl: this.resolveCliAgentHookEndpointUrl(),
             onNotification: (info) => {
@@ -750,6 +1015,8 @@ export class InProcessRuntime
         },
         workflowAuthoritativeDispatch: async (task) =>
           (await workflowAuthoritativeDriverRef.current?.maybeRun(task))?.handled ?? false,
+        globalCapacityLegacyRecoveryGate,
+        globalCapacityLegacyDispatchControl,
         onStart: (task, worktreePath) => {
           this.recordActivity();
           runtimeLog.log(`Started executing task ${task.id} in ${worktreePath}`);
@@ -838,11 +1105,8 @@ export class InProcessRuntime
         // ChatStore now supports dual-path: in backend mode it uses the
         // AsyncDataLayer; in SQLite mode it uses the sync Database.
         const chatLayer = this.taskStore.getAsyncLayer();
-        this.chatStore ??= new ChatStore(
-          this.taskStore.getFusionDir(),
-          chatLayer ? null : this.taskStore.getDatabase(),
-          { asyncLayer: chatLayer },
-        );
+        if (!chatLayer) throw new Error("HeartbeatMonitor requires the TaskStore PostgreSQL AsyncDataLayer");
+        this.chatStore ??= new ChatStore(chatLayer);
         this.heartbeatMonitor = new HeartbeatMonitor({
           store: this.agentStore,
           agentStore: this.agentStore, // enables per-agent config resolution
@@ -993,6 +1257,8 @@ export class InProcessRuntime
           stuckTaskDetector: this.stuckTaskDetector,
           agentStore: this.agentStore,
           pluginRunner: this.pluginRunner,
+          globalCapacityLegacyRecoveryGate,
+          globalCapacityLegacyDispatchControl,
           onSpecifyStart: (t) => {
             this.recordActivity();
             runtimeLog.log(`Specifying ${t.id}...`);
@@ -1058,11 +1324,8 @@ export class InProcessRuntime
       // ChatStore dual-path: use async layer in backend mode, sync DB otherwise.
       {
         const chatLayer2 = this.taskStore.getAsyncLayer();
-        this.chatStore ??= new ChatStore(
-          this.taskStore.getFusionDir(),
-          chatLayer2 ? null : this.taskStore.getDatabase(),
-          { asyncLayer: chatLayer2 },
-        );
+        if (!chatLayer2) throw new Error("SelfHealingManager requires the TaskStore PostgreSQL AsyncDataLayer");
+        this.chatStore ??= new ChatStore(chatLayer2);
       }
       this.selfHealingManager = new SelfHealingManager(this.taskStore, {
         rootDir: this.config.workingDirectory,
@@ -1624,6 +1887,19 @@ export class InProcessRuntime
    */
   getPluginRunner(): PluginRunner | undefined {
     return this.pluginRunner;
+  }
+
+  /**
+   * Reports whether all connector IDs selected by the current Room host policy
+   * were installed, enabled, and loaded before ProjectEngine freezes its Room registry.
+   */
+  getRoomSessionConnectorBootstrapStatus(): RoomSessionConnectorBootstrapStatusV1 {
+    return {
+      ...this.roomSessionConnectorBootstrapStatus,
+      requiredConnectorIds: [...this.roomSessionConnectorBootstrapStatus.requiredConnectorIds],
+      loadedConnectorIds: [...this.roomSessionConnectorBootstrapStatus.loadedConnectorIds],
+      missingConnectorIds: [...this.roomSessionConnectorBootstrapStatus.missingConnectorIds],
+    };
   }
 
   /**

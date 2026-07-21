@@ -3,6 +3,7 @@ import {
   BranchConflictError,
   DiffVolumeRegressionError,
   MergeAbortedError,
+  SessionConnectorRegistry,
   SquashAuditError,
   type SquashAuditFindings,
 } from "../index.js";
@@ -25,6 +26,11 @@ const emptySquashAuditFindings: SquashAuditFindings = {
 };
 
 describe("engine public api barrel", () => {
+  it("exports the provider-neutral Session Connector Registry", () => {
+    expect(SessionConnectorRegistry).toBeTypeOf("function");
+    expect(new SessionConnectorRegistry().all()).toEqual([]);
+  });
+
   it.each([
     {
       name: "BranchConflictError",

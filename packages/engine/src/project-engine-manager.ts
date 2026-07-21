@@ -20,6 +20,11 @@ import type {
 } from "@fusion/core";
 import { ProjectEngine } from "./project-engine.js";
 import type { ProjectEngineOptions } from "./project-engine.js";
+import type { RoomHostCompositionProviderV1 } from "./room-host-composition.js";
+import {
+  createRoomHostCompositionOperatorPolicyProvider,
+  type RoomHostCompositionOperatorAdapterRegistryV1,
+} from "./room-host-composition-operator-policy-provider.js";
 import type { ProjectRuntimeConfig } from "./project-runtime.js";
 import { AgentSemaphore } from "./concurrency.js";
 import {
@@ -47,6 +52,23 @@ export interface EngineManagerOptions {
   prReconcileGithubOps?: ProjectEngineOptions["prReconcileGithubOps"];
   getTaskMergeBlocker?: ProjectEngineOptions["getTaskMergeBlocker"];
   onInsightRunProcessed?: ProjectEngineOptions["onInsightRunProcessed"];
+  /**
+   * FNXC:RoomHostComposition 2026-07-20-02:28:
+   * The manager forwards the one host-owned Room composition authority by
+   * identity. It must not derive capacity, provider limits, connector facts, or
+   * raw Room seams from project settings while the provider resolves the bundle.
+   */
+  roomHostCompositionProvider?: RoomHostCompositionProviderV1;
+  /**
+   * Opt-in host-owned registry for a CentralCore Room operator-policy bundle.
+   * It is deliberately separate from raw seams and an already-built provider:
+   * mixing the origins would make the active execution authority ambiguous.
+   */
+  roomHostCompositionOperatorAdapterRegistry?: RoomHostCompositionOperatorAdapterRegistryV1;
+  roomGlobalConcurrencyVerifiedPolicy?: ProjectEngineOptions["roomGlobalConcurrencyVerifiedPolicy"];
+  roomProviderBackpressureVerifiedFactory?: ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"];
+  roomCapabilityRegistryRefreshVerifiedFactory?: ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"];
+  roomTaskDispatchCapacityAdmissionVerifiedFactory?: ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"];
   // FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
   // backend boot so all engines reuse one connection pool (no second embedded PG).
   externalTaskStore?: ProjectEngineOptions["externalTaskStore"];
@@ -85,11 +107,47 @@ export class ProjectEngineManager {
   /** Reconciliation state for background project startup. */
   private reconciliationInterval: ReturnType<typeof setInterval> | null = null;
   private reconciliationStopped = false;
+  private readonly resolvedRoomHostCompositionProvider?: RoomHostCompositionProviderV1;
 
   constructor(
     private centralCore: CentralCore,
     private options: EngineManagerOptions = {},
   ) {
+    const hasRawVerifiedRoomComposition =
+      options.roomGlobalConcurrencyVerifiedPolicy !== undefined
+      || options.roomProviderBackpressureVerifiedFactory !== undefined
+      || options.roomCapabilityRegistryRefreshVerifiedFactory !== undefined
+      || options.roomTaskDispatchCapacityAdmissionVerifiedFactory !== undefined;
+    if (
+      options.roomHostCompositionOperatorAdapterRegistry !== undefined
+      && options.roomHostCompositionProvider !== undefined
+    ) {
+      throw new Error(
+        "ProjectEngineManager rejects an explicit Room host composition provider with an operator adapter registry",
+      );
+    }
+    if (
+      options.roomHostCompositionOperatorAdapterRegistry !== undefined
+      && hasRawVerifiedRoomComposition
+    ) {
+      throw new Error(
+        "ProjectEngineManager rejects an operator adapter registry with raw verified Room composition seams",
+      );
+    }
+    /*
+    FNXC:RoomHostCompositionOperatorManager 2026-07-20-09:32:
+    The manager may construct the CentralCore-backed provider only when a host
+    explicitly supplies its live adapter registry. It does not enable a default
+    policy, infer adapter facts, or silently merge this authority with legacy
+    raw seams; missing/expired policy or unverified adapters remain withheld.
+    */
+    this.resolvedRoomHostCompositionProvider = options.roomHostCompositionProvider
+      ?? (options.roomHostCompositionOperatorAdapterRegistry === undefined
+        ? undefined
+        : createRoomHostCompositionOperatorPolicyProvider({
+          authorityReader: centralCore,
+          adapterRegistry: options.roomHostCompositionOperatorAdapterRegistry,
+        }));
     // Dynamic getter so live changes to globalMaxConcurrent take effect immediately
     this.globalSemaphore = new AgentSemaphore(() => this.currentGlobalLimit);
 
@@ -550,6 +608,11 @@ export class ProjectEngineManager {
       prReconcileGithubOps: this.options.prReconcileGithubOps,
       getTaskMergeBlocker: this.options.getTaskMergeBlocker,
       onInsightRunProcessed: this.options.onInsightRunProcessed,
+      roomHostCompositionProvider: this.resolvedRoomHostCompositionProvider,
+      roomGlobalConcurrencyVerifiedPolicy: this.options.roomGlobalConcurrencyVerifiedPolicy,
+      roomProviderBackpressureVerifiedFactory: this.options.roomProviderBackpressureVerifiedFactory,
+      roomCapabilityRegistryRefreshVerifiedFactory: this.options.roomCapabilityRegistryRefreshVerifiedFactory,
+      roomTaskDispatchCapacityAdmissionVerifiedFactory: this.options.roomTaskDispatchCapacityAdmissionVerifiedFactory,
       // FNXC:SqliteFinalRemoval 2026-06-26-11:20: forward the shared external
       // TaskStore so engines reuse the central boot's connection pool instead
       // of starting a second embedded PostgreSQL on the same data dir.

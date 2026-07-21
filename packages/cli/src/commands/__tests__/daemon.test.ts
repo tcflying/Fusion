@@ -50,6 +50,9 @@ const mocks = vi.hoisted(() => {
   const pluginLoaderInstances: any[] = [];
   const projectEngineInstances: any[] = [];
   const listenCalls: ListenCall[] = [];
+  const roomRbacAsyncLayer = { projectId: "project-1" };
+  const roomRbacRegistry = { source: "durable-room-rbac-registry" };
+  const createPostgresRoomRbacRegistry = vi.fn(() => roomRbacRegistry);
 
   // GlobalSettingsStore mock
   let globalSettingsData: Record<string, unknown> = {};
@@ -103,6 +106,7 @@ const mocks = vi.hoisted(() => {
       }),
       emit: emitter.emit.bind(emitter),
       getActiveMergingTask: vi.fn().mockReturnValue(undefined),
+      getAsyncLayer: vi.fn(() => roomRbacAsyncLayer),
     };
   }
 
@@ -197,6 +201,8 @@ const mocks = vi.hoisted(() => {
     centralInstances.push(instance);
     return instance;
   });
+
+  const createTaskStoreForBackend = vi.fn().mockResolvedValue(undefined);
 
   const createServerMock = vi.fn().mockImplementation(() => ({
     listen: vi.fn((port: number, host?: string) => {
@@ -320,6 +326,8 @@ const mocks = vi.hoisted(() => {
     const pluginLoader = {
       loadPlugin: vi.fn().mockResolvedValue(undefined),
       loadAllPlugins: vi.fn().mockResolvedValue({ loaded: 0, errors: 0 }),
+      getPluginSkills: vi.fn().mockReturnValue([]),
+      stopAllPlugins: vi.fn().mockResolvedValue(undefined),
       stopPlugin: vi.fn().mockResolvedValue(undefined),
       reloadPlugin: vi.fn().mockResolvedValue(undefined),
       getPluginRoutes: vi.fn().mockReturnValue([]),
@@ -340,6 +348,7 @@ const mocks = vi.hoisted(() => {
     set: vi.fn(),
     remove: vi.fn(),
     get: vi.fn(),
+    setModelRuntime: vi.fn(),
   };
 
   const modelRegistry = {
@@ -348,7 +357,14 @@ const mocks = vi.hoisted(() => {
     refresh: vi.fn(),
   };
 
+  /*
+  FNXC:CliTests 2026-07-16-10:25:
+  pi 0.80.8 made the real registry factory create a ModelRuntime and call authStorage.setModelRuntime. Daemon startup tests must bypass that runtime path and bind provider registration to this shared model registry.
+  */
+  const createFusionModelRegistryMock = vi.fn(async () => modelRegistry);
+
   const refreshAllCustomProviderModels = vi.fn().mockResolvedValue({ refreshed: 0, failed: 0, skipped: 0 });
+  const createSkillsAdapterMock = vi.fn().mockReturnValue(undefined);
 
   const agentSemaphoreCtor = vi.fn().mockImplementation(function () {
     return {
@@ -456,6 +472,38 @@ const mocks = vi.hoisted(() => {
     return engine;
   });
 
+  const projectEngineManagerCtor = vi.fn().mockImplementation(function (
+    centralCore: { listProjects: () => Promise<readonly { id: string; path: string }[]> },
+    options: Record<string, unknown>,
+  ) {
+    const engines = new Map<string, { start: () => Promise<void>; stop: () => Promise<void> }>();
+    return {
+      startAll: vi.fn(async () => {
+        const projects = await centralCore.listProjects();
+        for (const project of projects) {
+          const engine = projectEngineCtor(
+            { projectId: project.id, workingDirectory: project.path, isolationMode: "in-process", maxConcurrent: 4, maxWorktrees: 10 },
+            centralCore,
+            { ...options, projectId: project.id },
+          ) as { start: () => Promise<void>; stop: () => Promise<void> };
+          await engine.start();
+          engines.set(project.id, engine);
+        }
+      }),
+      getEngine: vi.fn((id: string) => engines.get(id)),
+      getAllEngines: vi.fn(() => engines),
+      getStore: vi.fn((id: string) => engines.get(id)?.getTaskStore()),
+      has: vi.fn((id: string) => engines.has(id)),
+      ensureEngine: vi.fn(async (id: string) => engines.get(id)),
+      stopAll: vi.fn(async () => {
+        for (const engine of engines.values()) await engine.stop();
+        engines.clear();
+      }),
+      onProjectAccessed: vi.fn(),
+      startReconciliation: vi.fn(),
+    };
+  });
+
   return {
     taskStores,
     automationStores,
@@ -470,14 +518,19 @@ const mocks = vi.hoisted(() => {
     missionAutopilotInstances,
     missionExecutionLoopInstances,
     notifierInstances,
+    pluginLoaderInstances,
     projectEngineInstances,
     listenCalls,
+    roomRbacAsyncLayer,
+    roomRbacRegistry,
+    createPostgresRoomRbacRegistry,
     globalSettingsStoreInstance,
     globalSettingsData,
     taskStoreCtor,
     automationStoreCtor,
     agentStoreCtor,
     centralCoreCtor,
+    createTaskStoreForBackend,
     createServerMock,
     triageCtor,
     executorCtor,
@@ -491,6 +544,7 @@ const mocks = vi.hoisted(() => {
     pluginStoreCtor,
     pluginLoaderCtor,
     projectEngineCtor,
+    projectEngineManagerCtor,
     agentSemaphoreCtor,
     heartbeatMonitorCtor,
     heartbeatTriggerSchedulerCtor,
@@ -499,7 +553,9 @@ const mocks = vi.hoisted(() => {
     processAndAuditInsightExtractionMock,
     authStorage,
     modelRegistry,
+    createFusionModelRegistryMock,
     refreshAllCustomProviderModels,
+    createSkillsAdapterMock,
     reset() {
       taskStores.length = 0;
       automationStores.length = 0;
@@ -519,6 +575,8 @@ const mocks = vi.hoisted(() => {
       projectEngineInstances.length = 0;
       listenCalls.length = 0;
       globalSettingsData = {};
+      createTaskStoreForBackend.mockReset();
+      createTaskStoreForBackend.mockResolvedValue(undefined);
       syncInsightExtractionAutomationMock.mockReset();
       syncInsightExtractionAutomationMock.mockResolvedValue(undefined);
       processAndAuditInsightExtractionMock.mockClear();
@@ -538,6 +596,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
   AutomationStore: mocks.automationStoreCtor,
   AgentStore: mocks.agentStoreCtor,
   CentralCore: mocks.centralCoreCtor,
+  createTaskStoreForBackend: mocks.createTaskStoreForBackend,
   PluginStore: mocks.pluginStoreCtor,
   PluginLoader: mocks.pluginLoaderCtor,
   GlobalSettingsStore: vi.fn().mockImplementation(function () {
@@ -556,6 +615,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
     };
   }),
   getTaskMergeBlocker: vi.fn().mockReturnValue(null),
+  createPostgresRoomRbacRegistry: mocks.createPostgresRoomRbacRegistry,
   syncInsightExtractionAutomation: mocks.syncInsightExtractionAutomationMock,
   INSIGHT_EXTRACTION_SCHEDULE_NAME: "Memory Insight Extraction",
   processAndAuditInsightExtraction: mocks.processAndAuditInsightExtractionMock,
@@ -574,47 +634,19 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
   GitHubClient: vi.fn().mockImplementation(function () {
     return {};
   }),
-  createSkillsAdapter: vi.fn().mockReturnValue(undefined),
+  createSkillsAdapter: mocks.createSkillsAdapterMock,
   getProjectSettingsPath: vi.fn().mockReturnValue("/tmp/project/.fusion/settings.json"),
   loadTlsCredentialsFromEnv: vi.fn().mockReturnValue(undefined),
   refreshAllCustomProviderModels: mocks.refreshAllCustomProviderModels,
-  // FNXC:CliTests 2026-07-13-09:40: Missing dashboard barrel exports added for mock completeness (scripts/check-mock-completeness.mjs gate).
-  registerGithubTrackingHook: vi.fn(),
 }));
 
 vi.mock("@fusion/engine", async (importOriginal) => {
   const { createCliEngineMock } = await import("../../test/mockCoreEngine");
   return createCliEngineMock(() => importOriginal<typeof import("@fusion/engine")>(), {
     createFusionAuthStorage: vi.fn(() => mocks.authStorage),
+    createFusionModelRegistry: mocks.createFusionModelRegistryMock,
     ProjectEngine: mocks.projectEngineCtor,
-    ProjectEngineManager: vi.fn().mockImplementation(function (centralCore: any, options: any) {
-    const engines = new Map<string, any>();
-    return {
-      startAll: vi.fn(async () => {
-        const projects = await centralCore.listProjects();
-        for (const project of projects) {
-          const engine = mocks.projectEngineCtor(
-            { projectId: project.id, workingDirectory: project.path, isolationMode: "in-process", maxConcurrent: 4, maxWorktrees: 10 },
-            centralCore,
-            { ...options, projectId: project.id },
-          );
-          await engine.start();
-          engines.set(project.id, engine);
-        }
-      }),
-      getEngine: vi.fn((id: string) => engines.get(id)),
-      getAllEngines: vi.fn(() => engines),
-      getStore: vi.fn((id: string) => engines.get(id)?.getTaskStore()),
-      has: vi.fn((id: string) => engines.has(id)),
-      ensureEngine: vi.fn(async (id: string) => engines.get(id)),
-      stopAll: vi.fn(async () => {
-        for (const engine of engines.values()) await engine.stop();
-        engines.clear();
-      }),
-      onProjectAccessed: vi.fn(),
-      startReconciliation: vi.fn(),
-    };
-  }),
+    ProjectEngineManager: mocks.projectEngineManagerCtor,
   PeerExchangeService: vi.fn().mockImplementation(function () {
     return {
       start: vi.fn(),
@@ -661,7 +693,7 @@ vi.mock("@fusion/engine", async (importOriginal) => {
   });
 });
 vi.mock("@earendil-works/pi-coding-agent", () => ({
-  AuthStorage: {
+  LegacyCredentialStorage: {
     create: vi.fn(() => mocks.authStorage),
   },
   DefaultPackageManager: vi.fn().mockImplementation(function () {
@@ -764,6 +796,8 @@ describe("runDaemon", () => {
   });
   const originalCwd = process.cwd;
   const originalExit = process.exit;
+  const originalRoomControlPlanePublicOrigin = process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+  const originalRoomControlPlaneAllowLoopbackHttp = process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP;
 
   let signalHandlers: Record<"SIGINT" | "SIGTERM", Array<() => void>>;
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -782,6 +816,8 @@ describe("runDaemon", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.reset();
+    delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+    delete process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP;
 
     signalHandlers = { SIGINT: [], SIGTERM: [] };
 
@@ -807,6 +843,16 @@ describe("runDaemon", () => {
     processOnSpy.mockRestore();
     process.cwd = originalCwd;
     process.exit = originalExit;
+    if (originalRoomControlPlanePublicOrigin === undefined) {
+      delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+    } else {
+      process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN = originalRoomControlPlanePublicOrigin;
+    }
+    if (originalRoomControlPlaneAllowLoopbackHttp === undefined) {
+      delete process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP;
+    } else {
+      process.env.FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP = originalRoomControlPlaneAllowLoopbackHttp;
+    }
   });
 
   it("initializes stores, starts engine services, and creates a headless server with daemon auth", async () => {
@@ -828,6 +874,32 @@ describe("runDaemon", () => {
 
     expect(mocks.triageInstances[0].start).toHaveBeenCalledTimes(1);
     expect(mocks.schedulerInstances[0].start).toHaveBeenCalledTimes(1);
+
+    await triggerSignal("SIGINT");
+  });
+
+  /*
+   * FNXC:PluginSkillsPostgres 2026-07-14-17:47:
+   * `fn daemon` skill discovery is metadata-only. Its request-scoped loader must not persist synthetic plugin starts, stops, or errors.
+   */
+  it("keeps request-scoped plugin skill discovery read-only", async () => {
+    await runDaemon({});
+    const adapterOptions = mocks.createSkillsAdapterMock.mock.calls.at(-1)?.[0] as {
+      getPluginSkills?: (rootDir: string, resolvedProjectStore: (typeof mocks.taskStores)[number]) => Promise<unknown[]>;
+    };
+    const resolvedProjectStore = mocks.taskStores[0];
+    resolvedProjectStore.getPluginStore().listPlugins.mockResolvedValue([
+      { id: "enabled-plugin", updatedAt: "2026-07-14T00:00:00.000Z" },
+    ]);
+    mocks.pluginLoaderCtor.mockClear();
+
+    await expect(adapterOptions.getPluginSkills?.("/repo-secondary", resolvedProjectStore)).resolves.toEqual([]);
+    expect(mocks.pluginLoaderCtor).toHaveBeenCalledWith({
+      pluginStore: resolvedProjectStore.getPluginStore(),
+      taskStore: resolvedProjectStore,
+      persistRuntimeState: false,
+    });
+    expect(mocks.pluginLoaderInstances.at(-1)?.stopAllPlugins).toHaveBeenCalledOnce();
 
     await triggerSignal("SIGINT");
   });
@@ -1031,6 +1103,132 @@ describe("runDaemon", () => {
     expect(mocks.cronRunnerInstances[0].stop).toHaveBeenCalledTimes(1);
     expect(listenCall.server.close).toHaveBeenCalledTimes(1);
     expect(mocks.taskStores[0].close).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not mount a dead Room authorizer when the daemon lacks an explicit durable RBAC configuration", async () => {
+    await runDaemon({ token: "fn_no_room_rbac_config" });
+
+    const serverOptions = mocks.createServerMock.mock.calls.at(-1)![1] as {
+      roomControlPlaneAuthorizeProject?: unknown;
+      roomControlPlaneRbac?: unknown;
+    };
+    expect(serverOptions.roomControlPlaneAuthorizeProject).toBeUndefined();
+    expect(serverOptions.roomControlPlaneRbac).toBeUndefined();
+
+    await triggerSignal("SIGINT");
+  });
+
+  it("injects a durable registry resolver only with an explicit public origin and never promotes the daemon bearer to a Room principal", async () => {
+    process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN = "https://dashboard.example";
+    const token = "fn_room_durable_registry";
+    try {
+      await runDaemon({ token });
+
+      const serverOptions = mocks.createServerMock.mock.calls.at(-1)![1] as {
+        roomControlPlaneAuthorizeProject?: unknown;
+        roomControlPlaneRbac?: {
+          publicOrigin?: unknown;
+          allowLoopbackHttp?: unknown;
+          resolveRegistry?: (input: { projectId: string; request: unknown }) => unknown;
+        };
+      };
+      expect(serverOptions.roomControlPlaneAuthorizeProject).toBeUndefined();
+      expect(serverOptions.roomControlPlaneRbac).toMatchObject({
+        publicOrigin: "https://dashboard.example",
+        allowLoopbackHttp: false,
+      });
+      expect(await serverOptions.roomControlPlaneRbac?.resolveRegistry?.({ projectId: "project-1", request: {} }))
+        .toBe(mocks.roomRbacRegistry);
+      expect(await serverOptions.roomControlPlaneRbac?.resolveRegistry?.({ projectId: "untrusted-project", request: {} }))
+        .toBeUndefined();
+      expect(mocks.createPostgresRoomRbacRegistry).toHaveBeenCalledWith(mocks.roomRbacAsyncLayer);
+
+      await triggerSignal("SIGINT");
+    } finally {
+      delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
+    }
+  });
+
+  it("boots CentralCore from the backend factory's unscoped host layer", async () => {
+    const projectLayer = { projectId: "project-1" };
+    const hostLayer = { projectId: undefined, close: vi.fn() };
+    const backendShutdown = vi.fn().mockResolvedValue(undefined);
+    mocks.createTaskStoreForBackend.mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: projectLayer,
+      hostAsyncLayer: hostLayer,
+      shutdown: backendShutdown,
+    });
+
+    await runDaemon({});
+
+    expect(mocks.createTaskStoreForBackend).toHaveBeenCalledWith({ rootDir: "/repo" });
+    expect(mocks.centralCoreCtor).toHaveBeenCalledWith(undefined, {
+      asyncLayer: hostLayer,
+    });
+    expect(mocks.centralCoreCtor).not.toHaveBeenCalledWith(undefined, {
+      asyncLayer: projectLayer,
+    });
+
+    await triggerSignal("SIGINT");
+    expect(backendShutdown).toHaveBeenCalledTimes(1);
+    expect(hostLayer.close).not.toHaveBeenCalled();
+  });
+
+  it("passes the Windows host composition registry into ProjectEngineManager before startAll", async () => {
+    await runDaemon({});
+
+    const managerOptions = mocks.projectEngineManagerCtor.mock.calls.at(-1)?.[1] as {
+      roomHostCompositionOperatorAdapterRegistry?: { resolve?: unknown };
+    };
+    const manager = mocks.projectEngineManagerCtor.mock.results.at(-1)?.value as {
+      startAll: ReturnType<typeof vi.fn>;
+    };
+    expect(managerOptions.roomHostCompositionOperatorAdapterRegistry).toEqual(
+      expect.objectContaining({ resolve: expect.any(Function) }),
+    );
+    expect(manager.startAll).toHaveBeenCalledTimes(1);
+    expect(mocks.projectEngineManagerCtor.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      manager.startAll.mock.invocationCallOrder[0],
+    );
+
+    await triggerSignal("SIGINT");
+  });
+
+  it("binds the backend factory's canonical host layer into the Windows registry", async () => {
+    const hostLayer = { projectId: undefined };
+    mocks.createTaskStoreForBackend.mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: { projectId: "project-1" },
+      hostAsyncLayer: hostLayer,
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await runDaemon({});
+
+    const managerOptions = mocks.projectEngineManagerCtor.mock.calls.at(-1)?.[1] as {
+      roomHostCompositionOperatorAdapterRegistry?: {
+        resolve?: (input: unknown) => Promise<unknown>;
+      };
+    };
+    expect(managerOptions.roomHostCompositionOperatorAdapterRegistry?.resolve?.({
+      authorityRecord: {
+        policy: {
+          adapterBindings: {
+            capabilityObservationAdapterId: "windows-happier-capability-v1",
+            providerAdmissionSnapshotAdapterId: "windows-happier-provider-admission-v1",
+            capacityTelemetryAdapterId: "windows-happier-capacity-telemetry-v1",
+            roomWorkerAuthorityAdapterId: "windows-room-worker-authority-v1",
+          },
+        },
+      },
+      roomContext: { connectorIds: ["happier"] },
+    })).toEqual({
+      state: "withheld",
+      reason: "windows_provider_admission_telemetry_unavailable",
+    });
+
+    await triggerSignal("SIGINT");
   });
 
   it("enables HybridExecutor with env override and shuts down before engine stop", async () => {

@@ -47,6 +47,7 @@ import {
 
 const BUNDLED_PLUGIN_ID = "fusion-plugin-dependency-graph";
 const HERMES_PLUGIN_ID = "fusion-plugin-hermes-runtime";
+const HAPPIER_PLUGIN_ID = "fusion-plugin-happier-runtime";
 const CURSOR_PLUGIN_ID = "fusion-plugin-cursor-runtime";
 const GROK_PLUGIN_ID = "fusion-plugin-grok-runtime";
 const ROADMAP_PLUGIN_ID = "fusion-plugin-roadmap";
@@ -191,6 +192,7 @@ describe("ensureBundledPluginInstalled (host-agnostic shared helper)", () => {
     expect(BUNDLED_PLUGIN_IDS).toContain(REPORTS_PLUGIN_ID);
     expect(BUNDLED_PLUGIN_IDS).toContain(LINEAR_IMPORT_PLUGIN_ID);
     expect(BUNDLED_PLUGIN_IDS).toContain(HERMES_PLUGIN_ID);
+    expect(BUNDLED_PLUGIN_IDS).toContain(HAPPIER_PLUGIN_ID);
     expect(BUNDLED_PLUGIN_IDS).toContain(GROK_PLUGIN_ID);
   });
 

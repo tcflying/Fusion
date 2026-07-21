@@ -78,7 +78,8 @@ export function removeWorkerRootWithRetry(workerRoot: string, retries = 8, delay
   }
 
   const message = lastError instanceof Error ? lastError.message : String(lastError);
-  console.warn(`[vitest-teardown] failed to remove worker root ${workerRoot} after ${retries} attempts: ${message}`);
+  process.exitCode = 1;
+  throw new Error(`[vitest-teardown] failed to remove worker root ${workerRoot} after ${retries} attempts: ${message}`);
 }
 
 export default function setup(): () => Promise<void> {
@@ -107,7 +108,10 @@ export default function setup(): () => Promise<void> {
     // FN-6360: macOS can report transient EBUSY/ENOTEMPTY while SQLite WALs or
     // redirected temp dirs are still closing. Retry boundedly so a brief busy-fd
     // race does not leak the per-invocation fusion-test-workers-* root.
-    removeWorkerRootWithRetry(workerRoot);
-    removeLegacyTopLevelHomeRoots();
+    try {
+      removeWorkerRootWithRetry(workerRoot);
+    } finally {
+      removeLegacyTopLevelHomeRoots();
+    }
   };
 }

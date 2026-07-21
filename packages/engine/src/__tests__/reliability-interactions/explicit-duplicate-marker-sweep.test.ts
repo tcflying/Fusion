@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import { makeReliabilityFixture, type ReliabilityFixture } from "./_helpers.js";
+// FNXC:SqliteRemoval 2026-07-14: hasPg guard added — makeReliabilityFixture requires PG after SQLite removal (VAL-REMOVAL-005).
+import { hasGit, hasPg, makeReliabilityFixture, type ReliabilityFixture } from "./_helpers.js";
 
 const FULL_SPEC = `# Task: FN-7000 - Example\n\n## Mission\nThis spec mentions duplicate handling, but it is not a redirect marker.\n`;
 
@@ -14,6 +16,12 @@ async function createPromptTask(
   fx: ReliabilityFixture,
   input: { id: string; column: "triage" | "todo" | "in-review"; title?: string; prompt: string },
 ) {
+  /*
+  FNXC:ExplicitDuplicateMarkerSweep 2026-07-16-11:25:
+  The production marker parser intentionally accepts only canonical FN-#### ids.
+  Each test configures the PG fixture's taskPrefix to FN so allocated ids produce
+  a valid marker instead of DUPLICATE: KB-### and genuinely exercise deletion.
+  */
   const task = await fx.store.createTask({
     title: input.title ?? input.id,
     description: `${input.id} description`,
@@ -27,7 +35,8 @@ async function createPromptTask(
   return task;
 }
 
-describe("reliability interactions: explicit duplicate marker sweep", () => {
+const canRun = hasGit && hasPg;
+(canRun ? describe : describe.skip)("reliability interactions: explicit duplicate marker sweep", () => {
   const fixtures: ReliabilityFixture[] = [];
 
   afterEach(async () => {
@@ -38,7 +47,7 @@ describe("reliability interactions: explicit duplicate marker sweep", () => {
   });
 
   it("resolves an FN-5217-style stuck marker task during maintenance", async () => {
-    const fx = await makeReliabilityFixture();
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
     fixtures.push(fx);
 
     const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
@@ -46,18 +55,21 @@ describe("reliability interactions: explicit duplicate marker sweep", () => {
 
     await (fx.manager as any).runMaintenance();
 
-    await expect(fx.store.getTask(duplicate.id)).rejects.toThrow(`Task ${duplicate.id} not found`);
+    const parkedDuplicate = await fx.store.getTask(duplicate.id);
+    expect(parkedDuplicate).toMatchObject({ paused: true, pausedReason: "duplicate-decision-required", sourceMetadata: expect.objectContaining({ nearDuplicateOf: canonical.id, duplicateSource: "triage-marker" }) });
+    const liveTasks = await fx.store.listTasks({ includeArchived: false });
+    expect(liveTasks.map((task) => task.id)).toContain(duplicate.id);
     expect((await fx.store.getTask(canonical.id)).column).toBe("todo");
     const activity = await fx.store.getActivityLog({ type: "task:auto-archived-duplicate", limit: 20 });
     expect(activity.find((entry) => entry.taskId === duplicate.id)).toEqual(
       expect.objectContaining({
-        metadata: expect.objectContaining({ canonicalTaskId: canonical.id, source: "explicit-marker-sweep" }),
+        metadata: expect.objectContaining({ canonicalTaskId: canonical.id, source: "triage-marker-flagged" }),
       }),
     );
   });
 
   it("does not disturb unrelated in-review tasks when autoMerge is false", async () => {
-    const fx = await makeReliabilityFixture({ settings: { autoMerge: false } });
+    const fx = await makeReliabilityFixture({ settings: { autoMerge: false, taskPrefix: "FN" } });
     fixtures.push(fx);
 
     await fx.store.updateTask(fx.task.id, {
@@ -75,21 +87,110 @@ describe("reliability interactions: explicit duplicate marker sweep", () => {
     expect(untouched.status).toBe("failed");
   });
 
-  it("leaves marker tasks alone when the canonical target is missing", async () => {
-    const fx = await makeReliabilityFixture();
+  it.each(["missing", "done", "archived", "soft-deleted"] as const)("cleans an inactive %s canonical marker instead of parking a hidden decision", async (state) => {
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
     fixtures.push(fx);
 
-    const duplicate = await createPromptTask(fx, { id: "FN-5301", column: "triage", prompt: "DUPLICATE: FN-9999\n" });
+    let canonicalId = "FN-9999";
+    if (state !== "missing") {
+      const canonical = await fx.store.createTask({ title: "Inactive canonical", description: "canonical", column: state === "soft-deleted" ? "triage" : state });
+      canonicalId = canonical.id;
+      if (state === "soft-deleted") {
+        await fx.store.deleteTask(canonical.id, { removeLineageReferences: true });
+      }
+    }
+    const duplicate = await createPromptTask(fx, { id: "FN-5301", column: "triage", prompt: duplicateStub(canonicalId) });
+    const promptPath = join(fx.rootDir, ".fusion", "tasks", duplicate.id, "PROMPT.md");
 
     await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
 
-    expect((await fx.store.getTask(duplicate.id)).column).toBe("triage");
-    const activity = await fx.store.getActivityLog({ type: "task:auto-archived-duplicate", limit: 20 });
-    expect(activity.find((entry) => entry.taskId === duplicate.id)).toBeUndefined();
+    const updated = await fx.store.getTask(duplicate.id);
+    expect(updated.paused).not.toBe(true);
+    expect(updated.pausedReason ?? null).toBeNull();
+    expect(updated.status ?? null).toBeNull();
+    expect(existsSync(promptPath)).toBe(false);
+  });
+
+  it.each([
+    ["user pause", { userPaused: true, paused: true, pausedReason: "manual" }],
+    ["implicit user pause", { paused: true, pausedReason: null }],
+    ["unrelated pause", { paused: true, pausedReason: "awaiting-approval" }],
+  ])("preserves a %s while an inactive marker is encountered", async (_label, pause) => {
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
+    fixtures.push(fx);
+    const duplicate = await createPromptTask(fx, { id: "FN-5301", column: "triage", prompt: duplicateStub("FN-9999") });
+    await fx.store.updateTask(duplicate.id, pause);
+    const promptPath = join(fx.rootDir, ".fusion", "tasks", duplicate.id, "PROMPT.md");
+
+    await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
+
+    const updated = await fx.store.getTask(duplicate.id);
+    expect(updated.paused).toBe(true);
+    expect(updated.pausedReason ?? null).toBe(pause.pausedReason ?? null);
+    expect(existsSync(promptPath)).toBe(true);
+  });
+
+  it("does not re-pause a same-canonical Keep acknowledgement during maintenance", async () => {
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
+    fixtures.push(fx);
+
+    const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
+    const duplicate = await createPromptTask(fx, { id: "FN-5302", column: "triage", prompt: duplicateStub(canonical.id) });
+    const promptPath = join(fx.rootDir, ".fusion", "tasks", duplicate.id, "PROMPT.md");
+    await fx.store.updateTask(duplicate.id, {
+      sourceMetadataPatch: { nearDuplicateOf: canonical.id.toLowerCase(), duplicateSource: "triage-marker", nearDuplicateDismissed: true },
+    });
+
+    await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
+
+    const updated = await fx.store.getTask(duplicate.id);
+    expect(updated.paused).not.toBe(true);
+    expect(updated.pausedReason ?? null).toBeNull();
+    expect(updated.sourceMetadata).toEqual(expect.objectContaining({ nearDuplicateOf: canonical.id.toLowerCase(), nearDuplicateDismissed: true }));
+    expect(existsSync(promptPath)).toBe(false);
+  });
+
+  it("still prompts when a marker names a different active canonical", async () => {
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
+    fixtures.push(fx);
+
+    const originalCanonical = await fx.store.createTask({ title: "Original canonical", description: "original", column: "todo" });
+    const canonical = await fx.store.createTask({ title: "New canonical", description: "new", column: "todo" });
+    const duplicate = await createPromptTask(fx, { id: "FN-5303", column: "triage", prompt: duplicateStub(canonical.id) });
+    await fx.store.updateTask(duplicate.id, {
+      sourceMetadataPatch: { nearDuplicateOf: originalCanonical.id, duplicateSource: "triage-marker", nearDuplicateDismissed: true },
+    });
+
+    await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
+
+    expect(await fx.store.getTask(duplicate.id)).toMatchObject({
+      paused: true,
+      pausedReason: "duplicate-decision-required",
+      sourceMetadata: expect.objectContaining({ nearDuplicateOf: canonical.id, nearDuplicateDismissed: false }),
+    });
+  });
+
+  it("preserves a user pause while cleaning an acknowledged marker", async () => {
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "prompt" } });
+    fixtures.push(fx);
+
+    const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
+    const duplicate = await createPromptTask(fx, { id: "FN-5304", column: "triage", prompt: duplicateStub(canonical.id) });
+    const promptPath = join(fx.rootDir, ".fusion", "tasks", duplicate.id, "PROMPT.md");
+    await fx.store.updateTask(duplicate.id, {
+      paused: true,
+      pausedReason: "manual",
+      sourceMetadataPatch: { nearDuplicateOf: canonical.id, duplicateSource: "triage-marker", nearDuplicateDismissed: true },
+    });
+
+    await (fx.manager as any).resolveExplicitDuplicateMarkerTasks();
+
+    expect(await fx.store.getTask(duplicate.id)).toMatchObject({ paused: true, pausedReason: "manual" });
+    expect(existsSync(promptPath)).toBe(true);
   });
 
   it("leaves full specs untouched", async () => {
-    const fx = await makeReliabilityFixture();
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "delete" } });
     fixtures.push(fx);
 
     const duplicate = await createPromptTask(fx, { id: "FN-5302", column: "todo", prompt: FULL_SPEC });
@@ -100,7 +201,7 @@ describe("reliability interactions: explicit duplicate marker sweep", () => {
   });
 
   it("honors the disable flag", async () => {
-    const fx = await makeReliabilityFixture({ settings: { resolveExplicitDuplicateMarkerEnabled: false } as never });
+    const fx = await makeReliabilityFixture({ settings: { resolveExplicitDuplicateMarkerEnabled: false, taskPrefix: "FN" } as never });
     fixtures.push(fx);
 
     const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
@@ -112,7 +213,7 @@ describe("reliability interactions: explicit duplicate marker sweep", () => {
   });
 
   it("caps work at 50 tasks per sweep", async () => {
-    const fx = await makeReliabilityFixture();
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "delete" } });
     fixtures.push(fx);
 
     const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });
@@ -136,7 +237,7 @@ describe("reliability interactions: explicit duplicate marker sweep", () => {
   }, 20_000);
 
   it("fails open when one delete throws and continues processing later tasks", async () => {
-    const fx = await makeReliabilityFixture();
+    const fx = await makeReliabilityFixture({ settings: { taskPrefix: "FN", triageDuplicateResolution: "delete" } });
     fixtures.push(fx);
 
     const canonical = await fx.store.createTask({ title: "Canonical", description: "canonical", column: "todo" });

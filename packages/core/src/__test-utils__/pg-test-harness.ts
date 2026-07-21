@@ -40,9 +40,10 @@
  */
 
 import { exec } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe as vitestDescribe } from "vitest";
 import postgres from "postgres";
@@ -268,6 +269,353 @@ function adminExecAsync(statement: string, timeoutMs = 15_000): Promise<void> {
 }
 
 /**
+ * FNXC:PgTestTemplateDb 2026-07-16-17:40:
+ * Slow-test fix: applying the full Fusion schema baseline on every fresh test
+ * database cost ~530ms per test file. With ~23 pg-gate files fanned across
+ * forks against one PostgreSQL server, those DDL applies serialize and dominate
+ * gate wall-time (mission-store.pg alone measured 6s isolated / 28s under load).
+ *
+ * Instead we apply the schema ONCE per worker module instance into a reusable
+ * template database, then create each test database with `CREATE DATABASE ... TEMPLATE`
+ * — a fast server-side file copy that skips re-running the DDL. Dead-pid templates
+ * left by crashed/prior runs are swept before creating a new one.
+ *
+ * FNXC:PgTestTemplateDb 2026-07-17-14:34:
+ * Vitest's `pool: "threads"` plus module isolation gives dashboard files separate
+ * harness module registries while they share one process pid. A pid-only template
+ * name let those independent memos concurrently drop and create the same database.
+ * A shared template guarded only during creation is insufficient because this
+ * module-local copy mutex cannot serialize cross-module `CREATE DATABASE ... TEMPLATE`
+ * calls against one source. Give each module instance a nonce-bearing template so
+ * creation and copying always use disjoint sources; the dead-pid sweep keeps every
+ * live sibling's template and reclaims only orphaned process-owned templates.
+ */
+const SCHEMA_TEMPLATE_PREFIX = "fusion_schema_template";
+const schemaTemplateInstanceNonce = randomUUID().replace(/-/g, "").slice(0, 12);
+const schemaTemplateName = `${SCHEMA_TEMPLATE_PREFIX}_${process.pid}_${schemaTemplateInstanceNonce}`;
+
+/** The per-module template database name, disjoint across same-pid module registries. */
+function templateDbName(): string {
+  return schemaTemplateName;
+}
+
+/*
+FNXC:PgTestTemplateDb 2026-07-19-17:20:
+Slow-test fix (gate reliability): the per-module nonce template applied the full
+Fusion schema baseline (~530ms of DDL) once PER isolated test file. With ~24
+pg-gate files fanned across forks against one PostgreSQL server, those baselines
+run concurrently, the DDL/CREATE DATABASE calls serialize server-side, and the
+per-file `beforeAll` blew past the 15s hookTimeout nondeterministically (observed
+18/23 then 5/23 then 8/23 files failing across back-to-back runs). Raising the
+timeout is forbidden appeasement, so instead we remove the redundant work: apply
+the baseline exactly ONCE per vitest invocation into a run-shared, read-only
+"golden" template, then build each per-module template as a fast server-side
+`CREATE DATABASE ... TEMPLATE golden` copy. Concurrent copies from one
+connection-free template are safe (empirically verified); only active sessions on
+a template trigger "source database is being accessed". Per-module templates and
+their drop/half-built/exists lifecycle hooks are preserved so module isolation
+and the template-concurrency regression tests keep their exact semantics.
+
+The golden template is named with the vitest MAIN-process pid
+(FUSION_PG_TEMPLATE_OWNER_PID, exported by globalSetup and inherited by every
+fork) plus the shared run token, so all forks of one run resolve the SAME golden
+name and the existing dead-pid sweep reclaims it once the run's main process
+exits. Cross-fork build coordination uses a Postgres advisory lock keyed on the
+golden name; readiness is tracked by a marker table in the maintenance database
+so the readiness check never opens a session on the golden template.
+*/
+/** Schema-qualified readiness marker table; a compile-time constant, safe to inline in SQL. */
+const GOLDEN_MARKER_QUALIFIED = "public._fusion_golden_templates";
+
+/** Lowercase-alnum, bounded suffix safe for a database identifier. */
+function sanitizeTemplateToken(raw: string): string {
+  const cleaned = raw.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return cleaned.length > 0 ? cleaned.slice(-16) : "default";
+}
+
+/**
+ * Identity shared across every fork of a single vitest invocation. Both come
+ * from globalSetup (vitest-teardown.ts): the owner pid is the main vitest
+ * process pid; the run token derives from the per-invocation worker root. When
+ * either is absent (a direct harness import with no globalSetup), the golden
+ * template degrades to a process-local identity so isolated unit tests still
+ * work — they simply do not share a golden across processes.
+ */
+function goldenTemplateOwnerPid(): number {
+  const raw = process.env.FUSION_PG_TEMPLATE_OWNER_PID?.trim();
+  if (raw && /^\d+$/.test(raw)) {
+    const pid = Number.parseInt(raw, 10);
+    if (Number.isFinite(pid) && pid > 0) return pid;
+  }
+  return process.pid;
+}
+
+function goldenTemplateRunToken(): string {
+  const workerRoot = process.env.FUSION_TEST_WORKER_ROOT?.trim();
+  if (workerRoot) return sanitizeTemplateToken(basename(workerRoot));
+  const runToken = process.env.FUSION_TEST_RUN_TOKEN?.trim();
+  if (runToken) return sanitizeTemplateToken(runToken);
+  return sanitizeTemplateToken(schemaTemplateInstanceNonce);
+}
+
+/**
+ * Golden template name. The `<ownerPid>` segment keeps `parseTemplatePid`
+ * working so the dead-pid sweep reclaims a finished run's golden; the `golden`
+ * marker in the alnum suffix keeps it disjoint from per-module templates that
+ * share the same pid namespace.
+ */
+function goldenTemplateName(): string {
+  return `${SCHEMA_TEMPLATE_PREFIX}_${goldenTemplateOwnerPid()}_golden${goldenTemplateRunToken()}`;
+}
+
+/** Extract the pid embedded in a template DB name, or null if it doesn't match. */
+function parseTemplatePid(dbName: string): number | null {
+  const match = new RegExp(`^${SCHEMA_TEMPLATE_PREFIX}_(\\d+)(?:_[a-z0-9]+)?$`).exec(dbName);
+  if (!match) return null;
+  const pid = Number.parseInt(match[1], 10);
+  return Number.isFinite(pid) ? pid : null;
+}
+
+/**
+ * FNXC:PgTestTemplateDb 2026-07-16-17:40:
+ * A template left behind by a crashed/finished process is only reclaimable if
+ * its owning pid is gone. `process.kill(pid, 0)` probes liveness without
+ * signalling: ESRCH => dead (sweepable); EPERM => alive under another user
+ * (keep). Treat any non-ESRCH error as alive so we never drop a live template.
+ */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * Open a short-lived admin connection to the maintenance ("postgres") database
+ * on the same server, run `fn`, and always close. Used for template lifecycle
+ * (listing/sweeping/creating template DBs) where we need query results back —
+ * unlike `adminExecAsync`, which fires psql and returns no rows.
+ */
+async function withMaintenanceSql<T>(
+  fn: (client: ReturnType<typeof postgres>) => Promise<T>,
+): Promise<T> {
+  const maintUrl = new URL(PG_TEST_URL_BASE);
+  maintUrl.pathname = "/postgres";
+  const client = postgres(maintUrl.toString(), {
+    max: 1,
+    prepare: false,
+    onnotice: () => {},
+  });
+  try {
+    return await fn(client);
+  } finally {
+    await client.end({ timeout: 5 }).catch(() => {});
+  }
+}
+
+/** Test-only lifecycle controls for deterministic template-state regression tests. */
+export const __pgTestTemplateTestHooks = {
+  templateName: templateDbName,
+  async templateExists(): Promise<boolean> {
+    const templateName = templateDbName();
+    return withMaintenanceSql(async (client) => {
+      const rows = await client<{ exists: boolean }[]>`
+        SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = ${templateName}) AS exists
+      `;
+      return rows[0]?.exists === true;
+    });
+  },
+  async dropTemplate(): Promise<void> {
+    const templateName = templateDbName();
+    await withMaintenanceSql(async (client) => {
+      await client.unsafe(`DROP DATABASE IF EXISTS "${templateName}" WITH (FORCE)`);
+    });
+  },
+  async createHalfBuiltTemplate(): Promise<void> {
+    const templateName = templateDbName();
+    await withMaintenanceSql(async (client) => {
+      await client.unsafe(`DROP DATABASE IF EXISTS "${templateName}" WITH (FORCE)`);
+      await client.unsafe(`CREATE DATABASE "${templateName}"`);
+    });
+  },
+};
+
+/*
+ * FNXC:PgTestTemplateDb 2026-07-17-22:25:
+ * Do not register module-local `beforeExit` cleanup. Vitest can reach a transient
+ * beforeExit state while sibling isolated module registries still copy from their
+ * templates, so that handler races and drops live sources. The dead-pid sweep in
+ * ensureSchemaTemplate reclaims templates after the owning worker actually exits.
+ */
+
+/**
+ * FNXC:PgTestTemplateDb 2026-07-16-17:40:
+ * CREATE DATABASE ... TEMPLATE connects to the source template and errors if
+ * any other session is attached ("source database is being accessed by other
+ * users"). Each module instance now owns a disjoint nonce-bearing template;
+ * concurrent calls within that instance still share its source, so serialize
+ * its template-copy step through a chained mutex.
+ */
+let createFromTemplateChain: Promise<unknown> = Promise.resolve();
+function serializeTemplateCopy<T>(fn: () => Promise<T>): Promise<T> {
+  const run = createFromTemplateChain.then(fn, fn);
+  createFromTemplateChain = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+/**
+ * FNXC:PgTestTemplateDb 2026-07-19-17:20:
+ * Ensure the run-shared golden template exists with the full Fusion schema
+ * baseline applied, and return its name. Memoized per module instance so the
+ * advisory-lock round trip happens at most once per module; the ~530ms baseline
+ * apply happens at most once per vitest invocation across ALL forks.
+ *
+ * On entry it sweeps templates orphaned by crashed/finished processes (dead pid)
+ * plus stale golden marker rows, then builds the golden template under a
+ * Postgres advisory lock keyed on the golden name so only one fork applies the
+ * baseline while siblings block, then reuse. A marker row in the maintenance DB
+ * records readiness so the check never opens a session on the golden template
+ * (which would break concurrent `CREATE DATABASE ... TEMPLATE golden` copies).
+ * On failure the memo is cleared so a later call can rebuild.
+ */
+let goldenTemplateReady: Promise<string> | null = null;
+function ensureGoldenTemplate(): Promise<string> {
+  if (goldenTemplateReady) return goldenTemplateReady;
+  const ready = (async (): Promise<string> => {
+    const goldenName = goldenTemplateName();
+    // The advisory lock is a SESSION lock on this maintenance connection, so the
+    // whole build (including the baseline apply on a separate connection) must
+    // run inside ONE withMaintenanceSql call — closing the connection releases
+    // the lock. A sibling fork blocks on pg_advisory_lock until the winner has
+    // fully built the golden template and recorded its ready marker.
+    await withMaintenanceSql(async (client) => {
+      // Ensure the readiness marker table exists before any read/write of it.
+      await client.unsafe(
+        `CREATE TABLE IF NOT EXISTS ${GOLDEN_MARKER_QUALIFIED} (name text PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now())`,
+      );
+      // Sweep templates orphaned by crashed/finished processes and drop marker
+      // rows whose golden database no longer exists.
+      const rows = await client<{ datname: string }[]>`
+        SELECT datname FROM pg_database
+        WHERE datname LIKE ${SCHEMA_TEMPLATE_PREFIX + "\\_%"}
+      `;
+      for (const row of rows) {
+        if (row.datname === goldenName) continue;
+        const pid = parseTemplatePid(row.datname);
+        if (pid !== null && isPidAlive(pid)) continue;
+        await client
+          .unsafe(`DROP DATABASE IF EXISTS "${row.datname}" WITH (FORCE)`)
+          .catch(() => {});
+      }
+      await client.unsafe(
+        `DELETE FROM ${GOLDEN_MARKER_QUALIFIED} WHERE name NOT IN (SELECT datname FROM pg_database)`,
+      ).catch(() => {});
+
+      // Serialize the build across forks; the winner applies the baseline while
+      // the rest block here, then observe the ready marker and skip the build.
+      await client`SELECT pg_advisory_lock(hashtext(${goldenName}))`;
+      try {
+        const readyRows = await client.unsafe<{ ready: boolean }[]>(
+          `SELECT EXISTS(
+            SELECT 1 FROM ${GOLDEN_MARKER_QUALIFIED} m
+            JOIN pg_database d ON d.datname = m.name
+            WHERE m.name = $1
+          ) AS ready`,
+          [goldenName],
+        );
+        if (readyRows[0]?.ready === true) return;
+
+        // Not ready (missing or half-built): rebuild from scratch under the lock.
+        await client.unsafe(`DROP DATABASE IF EXISTS "${goldenName}" WITH (FORCE)`).catch(() => {});
+        await client.unsafe(`DELETE FROM ${GOLDEN_MARKER_QUALIFIED} WHERE name = $1`, [goldenName]);
+        await client.unsafe(`CREATE DATABASE "${goldenName}"`);
+
+        // Apply the baseline on a separate connection to the golden database
+        // while this maintenance session keeps holding the advisory lock, then
+        // close it so the golden template has no open sessions before copies.
+        const goldenUrl = `${PG_TEST_URL_BASE}/${goldenName}`;
+        const schemaBackend: ResolvedBackend = {
+          mode: "external",
+          runtimeUrl: goldenUrl,
+          migrationUrl: goldenUrl,
+          migrationUrlOverridden: false,
+        };
+        const schemaConnections = await createConnectionSetFromUrl(schemaBackend, {
+          poolMax: 1,
+          connectTimeoutSeconds: 5,
+        });
+        try {
+          await applySchemaBaseline(schemaConnections.migration);
+        } finally {
+          await schemaConnections.close();
+        }
+
+        // Record readiness only after a fully successful build.
+        await client.unsafe(
+          `INSERT INTO ${GOLDEN_MARKER_QUALIFIED} (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`,
+          [goldenName],
+        );
+      } finally {
+        await client`SELECT pg_advisory_unlock(hashtext(${goldenName}))`;
+      }
+    });
+    return goldenName;
+  })();
+  ready.catch(() => {
+    if (goldenTemplateReady === ready) goldenTemplateReady = null;
+  });
+  goldenTemplateReady = ready;
+  return ready;
+}
+
+/**
+ * FNXC:PgTestTemplateDb 2026-07-19-17:20:
+ * Ensure this module instance's per-module schema-template database exists, and
+ * return its name. Built as a fast server-side `CREATE DATABASE ... TEMPLATE
+ * golden` copy of the run-shared golden template (see `ensureGoldenTemplate`)
+ * instead of re-running the schema baseline, so the expensive DDL apply happens
+ * once per run rather than once per file. Memoized per module instance so the
+ * copy happens exactly once for that instance. The per-module template and its
+ * drop/half-built/exists lifecycle hooks are retained for module isolation.
+ * On failure the memo is cleared so a later call can rebuild.
+ */
+let schemaTemplateReady: Promise<string> | null = null;
+function ensureSchemaTemplate(): Promise<string> {
+  if (schemaTemplateReady) return schemaTemplateReady;
+  const ready = (async (): Promise<string> => {
+    const goldenName = await ensureGoldenTemplate();
+    const templateName = templateDbName();
+    await serializeTemplateCopy(async () => {
+      await withMaintenanceSql(async (client) => {
+        // Terminate any stale session on the golden source before copying; the
+        // module copy mutex ensures this never interrupts a sibling copy.
+        await client`
+          SELECT pg_terminate_backend(pid)
+          FROM pg_stat_activity
+          WHERE datname = ${goldenName} AND pid <> pg_backend_pid()
+        `;
+        await client
+          .unsafe(`DROP DATABASE IF EXISTS "${templateName}" WITH (FORCE)`)
+          .catch(() => {});
+        await client.unsafe(`CREATE DATABASE "${templateName}" TEMPLATE "${goldenName}"`);
+      });
+    });
+    return templateName;
+  })();
+  ready.catch(() => {
+    // Allow a later call to rebuild the template after a transient failure.
+    if (schemaTemplateReady === ready) schemaTemplateReady = null;
+  });
+  schemaTemplateReady = ready;
+  return ready;
+}
+
+/**
  * FNXC:TestMigrationTail 2026-06-24-16:00:
  * Create a fresh, isolated PostgreSQL database with the Fusion schema applied,
  * construct a backend-mode TaskStore against it, and return the harness.
@@ -278,38 +626,65 @@ function adminExecAsync(statement: string, timeoutMs = 15_000): Promise<void> {
  *
  * @param options.poolMax - Connection pool size (default 5).
  * @param options.prefix - Database name prefix for diagnostics (default "fusion_test").
+ * @param options.copyFromGolden - When true, copy the test database DIRECTLY
+ *   from the run-shared golden template instead of building/copying a
+ *   per-module template first. This halves per-database DDL (one CREATE
+ *   DATABASE instead of two), which materially de-contends the pg-gate on
+ *   high-core machines. Use it for shared-harness files that create a single
+ *   database and do not exercise the per-module template lifecycle hooks.
  */
 export async function createTaskStoreForTest(options?: {
   readonly poolMax?: number;
   readonly prefix?: string;
+  readonly copyFromGolden?: boolean;
 }): Promise<PgTestHarness> {
   const poolMax = options?.poolMax ?? 5;
   const prefix = options?.prefix ?? "fusion_test";
 
   const dbName = uniqueDbName(prefix);
-  try {
-    await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch {
-    // may not exist — safe to ignore
-  }
-  await adminExecAsync(`CREATE DATABASE "${dbName}"`);
+
+  // FNXC:PgTestTemplateDb 2026-07-19-17:20:
+  // Create the test database as a fast server-side copy of a pre-baked template.
+  // `copyFromGolden` copies straight from the run-shared golden template (one
+  // CREATE DATABASE); otherwise it copies from this module instance's per-module
+  // template (retained for the template-lifecycle hooks/regression tests).
+  // Concurrent CREATE DATABASE ... TEMPLATE copies from one connection-free
+  // source are safe; only an active session on the source triggers "source
+  // database is being accessed".
+  const template = options?.copyFromGolden
+    ? await ensureGoldenTemplate()
+    : await ensureSchemaTemplate();
+  await serializeTemplateCopy(async () => {
+    /*
+     * FNXC:PgTestTemplateDb 2026-07-17-22:34:
+     * PostgreSQL can retain a just-closed baseline connection briefly. Terminate
+     * stale template sessions immediately before copying; the module-local copy
+     * mutex ensures this never interrupts a sibling copy using the same source.
+     */
+    await withMaintenanceSql(async (client) => {
+      await client`
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = ${template} AND pid <> pg_backend_pid()
+      `;
+    });
+    try {
+      await adminExecAsync(`DROP DATABASE IF EXISTS "${dbName}"`);
+    } catch {
+      // may not exist — safe to ignore
+    }
+    await adminExecAsync(`CREATE DATABASE "${dbName}" TEMPLATE "${template}"`);
+  });
   const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
 
-  // Apply schema baseline via a dedicated migration connection.
+  // The database already carries the full schema (copied from the template),
+  // so open the runtime connection pool and construct the AsyncDataLayer.
   const schemaBackend: ResolvedBackend = {
     mode: "external",
     runtimeUrl: testUrl,
     migrationUrl: testUrl,
     migrationUrlOverridden: false,
   };
-  const schemaConnections = await createConnectionSetFromUrl(schemaBackend, {
-    poolMax: 1,
-    connectTimeoutSeconds: 5,
-  });
-  await applySchemaBaseline(schemaConnections.migration);
-  await schemaConnections.close();
-
-  // Open the runtime connection pool and construct the AsyncDataLayer.
   const connections = await createConnectionSetFromUrl(schemaBackend, {
     poolMax,
     connectTimeoutSeconds: 5,
@@ -529,7 +904,16 @@ export function createSharedPgTaskStoreTestHarness(options?: {
     },
     beforeAll: async () => {
       if (harness) return;
-      harness = await createTaskStoreForTest({ ...options, prefix: options?.prefix ?? "fusion_shared" });
+      // FNXC:PgTestTemplateDb 2026-07-19-17:20:
+      // The shared harness creates exactly ONE database per file and never uses
+      // the per-module template lifecycle hooks, so copy straight from the
+      // run-shared golden template to halve per-file CREATE DATABASE DDL and
+      // de-contend the pg-gate on high-core machines.
+      harness = await createTaskStoreForTest({
+        ...options,
+        prefix: options?.prefix ?? "fusion_shared",
+        copyFromGolden: true,
+      });
       store = harness.store;
     },
     beforeEach: async () => {

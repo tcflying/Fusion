@@ -17,10 +17,12 @@ import {
   pgSchema,
   text,
   integer,
+  bigint,
   jsonb,
   primaryKey,
   foreignKey,
   unique,
+  uniqueIndex,
   check,
   index,
 } from "drizzle-orm/pg-core";
@@ -220,6 +222,7 @@ export const projectPluginStates = centralSchema.table("project_plugin_states", 
   enabled: integer("enabled").notNull().default(0),
   state: text("state").notNull().default("installed"),
   error: text("error"),
+  settings: jsonb("settings").notNull().default({}),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
@@ -306,6 +309,126 @@ export const taskClaims = centralSchema.table("task_claims", {
   index("idxTaskClaimsOwner").on(t.ownerNodeId),
 ]);
 
+export const globalCapacityState = centralSchema.table("global_capacity_state", {
+  id: text("id").primaryKey(),
+  revision: bigint("revision", { mode: "number" }).notNull().default(0),
+  policyHash: text("policy_hash").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const globalCapacityPolicyAuthority = centralSchema.table("global_capacity_policy_authority", {
+  id: text("id").primaryKey(),
+  policyJson: jsonb("policy_json").notNull(),
+  policyHash: text("policy_hash").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const roomHostCompositionOperatorPolicyAuthority = centralSchema.table("room_host_composition_operator_policy_authority", {
+  projectId: text("project_id").notNull(),
+  hostId: text("host_id").notNull(),
+  bundleId: text("bundle_id").notNull(),
+  issuer: text("issuer").notNull(),
+  policyJson: jsonb("policy_json").notNull(),
+  policyHash: text("policy_hash").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  issuedAt: text("issued_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  revokedAt: text("revoked_at"),
+  revokedReason: text("revoked_reason"),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.hostId], name: "room_host_composition_operator_policy_authority_primary" }),
+  index("idx_room_host_composition_operator_policy_authority_active").on(t.projectId, t.hostId, t.expiresAt),
+]);
+
+export const globalCapacityClaims = centralSchema.table("global_capacity_claims", {
+  id: text("id").notNull(),
+  projectId: text("project_id").notNull(),
+  resourceKind: text("resource_kind").notNull(),
+  resourceId: text("resource_id").notNull(),
+  workClass: text("work_class").notNull(),
+  slots: integer("slots").notNull(),
+  holderId: text("holder_id").notNull(),
+  leaseId: text("lease_id").notNull(),
+  fence: bigint("fence", { mode: "number" }).notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  releasedAt: text("released_at"),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id], name: "global_capacity_claims_primary" }),
+  uniqueIndex("idx_global_capacity_claims_active_resource").on(t.projectId, t.resourceKind, t.resourceId),
+  index("idx_global_capacity_claims_active").on(t.projectId, t.resourceKind, t.workClass, t.expiresAt, t.id),
+]);
+
+export const globalCapacityOperations = centralSchema.table("global_capacity_operations", {
+  projectId: text("project_id").notNull(),
+  commandKind: text("command_kind").notNull(),
+  operationId: text("operation_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  action: text("action").notNull(),
+  reason: text("reason").notNull(),
+  claimId: text("claim_id"),
+  fence: bigint("fence", { mode: "number" }),
+  occurredAt: text("occurred_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.commandKind, t.operationId], name: "global_capacity_operations_primary" }),
+  index("idx_global_capacity_operations_claim").on(t.projectId, t.claimId, t.commandKind, t.occurredAt),
+]);
+
+export const globalCapacityLegacyAttempts = centralSchema.table("global_capacity_legacy_attempts", {
+  id: text("id").notNull(),
+  projectId: text("project_id").notNull(),
+  resourceKind: text("resource_kind").notNull(),
+  resourceId: text("resource_id").notNull(),
+  state: text("state").notNull(),
+  workClass: text("work_class").notNull(),
+  slots: integer("slots").notNull(),
+  holderId: text("holder_id").notNull(),
+  leaseId: text("lease_id").notNull(),
+  capacityFence: bigint("capacity_fence", { mode: "number" }).notNull(),
+  claimId: text("claim_id").notNull(),
+  acquireOperationId: text("acquire_operation_id").notNull(),
+  acquireGeneration: integer("acquire_generation").notNull(),
+  lastWithheldOperationId: text("last_withheld_operation_id"),
+  renewOperationId: text("renew_operation_id").notNull(),
+  renewGeneration: integer("renew_generation").notNull(),
+  lastRenewalOperationId: text("last_renewal_operation_id"),
+  releaseOperationId: text("release_operation_id").notNull(),
+  preparedAt: text("prepared_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  admittedAt: text("admitted_at"),
+  workStartedAt: text("work_started_at"),
+  workStartReceiptId: text("work_start_receipt_id"),
+  workFinishedAt: text("work_finished_at"),
+  releasedAt: text("released_at"),
+  supersededAt: text("superseded_at"),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id], name: "global_capacity_legacy_attempts_primary" }),
+  uniqueIndex("idx_global_capacity_legacy_attempts_active_resource").on(t.projectId, t.resourceKind, t.resourceId),
+  index("idx_global_capacity_legacy_attempts_resource_history").on(t.projectId, t.resourceKind, t.resourceId, t.capacityFence),
+]);
+
+/** FNXC:SettingsBackups 2026-07-16-15:00: a unique central name makes a shared-cluster routine impossible to duplicate per project. */
+export const globalRoutines = centralSchema.table("global_routines", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  agentId: text("agent_id").notNull().default(""),
+  triggerType: text("trigger_type").notNull(),
+  triggerConfig: jsonb("trigger_config").notNull(),
+  command: text("command"),
+  enabled: integer("enabled").notNull().default(1),
+  lastRunAt: text("last_run_at"),
+  lastRunResult: jsonb("last_run_result"),
+  nextRunAt: text("next_run_at"),
+  runCount: integer("run_count").notNull().default(0),
+  runHistory: jsonb("run_history").notNull().default([]),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
 // ── Schema version meta ──────────────────────────────────────────────
 export const centralMeta = centralSchema.table("__meta", {
   key: text("key").primaryKey(),
@@ -321,5 +444,7 @@ export const centralTableNames = [
   "central_activity_log", "global_concurrency", "central_settings",
   "peer_nodes", "settings_sync_state", "managed_docker_nodes",
   "plugin_installs", "project_plugin_states", "mesh_shared_snapshots",
-  "mesh_write_queue", "secrets_global", "task_claims", "__meta",
+  "mesh_write_queue", "secrets_global", "task_claims", "global_routines", "global_capacity_state",
+  "global_capacity_policy_authority", "global_capacity_claims", "global_capacity_operations",
+  "global_capacity_legacy_attempts", "room_host_composition_operator_policy_authority", "__meta",
 ] as const;

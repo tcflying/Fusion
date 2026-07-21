@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Task, Column, ColumnId, TaskCreateInput, MergeResult, GithubIssueAction, AgentLogEntry } from "@fusion/core";
-import { normalizeColumn } from "@fusion/core";
+import { normalizeColumnId } from "@fusion/core";
 import * as api from "../api";
 import { subscribeSse } from "../sse-bus";
 import { clearCache, readCache, SWR_CACHE_KEYS, SWR_TASKS_MAX_AGE_MS, writeCache } from "../utils/swrCache";
@@ -10,10 +10,21 @@ import { recordResumeEvent } from "../utils/resumeInstrumentation";
 const loggedTaskCacheHitProjects = new Set<string>();
 const TASK_VIEW_REENTRY_FRESHNESS_MS = SWR_TASKS_MAX_AGE_MS;
 
+/*
+FNXC:WorkflowColumns 2026-07-19-2b:05 (U12 / R2 / R11):
+Every task the dashboard ingests — initial list, SWR revalidation, and each SSE event — passes
+through here, so this one line decided whether custom columns exist in the UI at all. It used
+`normalizeColumn`, which keeps only the six legacy ids and rewrites everything else to `triage`:
+a card sitting in a user-authored `Merging` column rendered in Triage, and dragging it appeared to
+do nothing. The move handler below already worked around this for its own `to` id ("normalizeColumn
+alone would drop custom ids"), which fixed the symptom for one event and left the ingest path lossy.
+`normalizeColumnId` sanitizes structurally (non-string/empty -> fallback) and passes real ids
+through; membership belongs to the task's resolved workflow, not to a client-side enum.
+*/
 function normalizeTask(task: Task): Task {
   return {
     ...task,
-    column: normalizeColumn((task as Task & { column?: unknown }).column),
+    column: normalizeColumnId((task as Task & { column?: unknown }).column),
     dependencies: Array.isArray(task.dependencies) ? task.dependencies : [],
     steps: Array.isArray(task.steps) ? task.steps : [],
     log: Array.isArray((task as Task & { log?: unknown }).log)
@@ -32,17 +43,17 @@ function filterActiveTasks(tasks: Task[]): Task[] {
 
 type AgentLogActivityEvent = Pick<AgentLogEntry, "taskId" | "timestamp" | "type" | "agent">;
 
-function clearInReviewStallForFreshAgentLog(task: Task, entry: AgentLogActivityEvent): Task {
-  if (task.id !== entry.taskId || task.column !== "in-review") return task;
+function hasFreshAgentLog(task: Task, entry: AgentLogActivityEvent): boolean {
+  if (task.id !== entry.taskId) return false;
   const logTimestampMs = Date.parse(entry.timestamp);
   const taskUpdatedAtMs = Date.parse(task.updatedAt);
-  if (
-    Number.isFinite(logTimestampMs) &&
-    Number.isFinite(taskUpdatedAtMs) &&
-    logTimestampMs <= taskUpdatedAtMs
-  ) {
-    return task;
-  }
+  return Number.isFinite(logTimestampMs)
+    && Number.isFinite(taskUpdatedAtMs)
+    && logTimestampMs > taskUpdatedAtMs;
+}
+
+function clearInReviewStallForFreshAgentLog(task: Task, entry: AgentLogActivityEvent): Task {
+  if (task.column !== "in-review" || !hasFreshAgentLog(task, entry)) return task;
   if (!task.inReviewStall && !task.inReviewStalled && !task.stalledReview) return task;
 
   /*
@@ -55,6 +66,27 @@ function clearInReviewStallForFreshAgentLog(task: Task, entry: AgentLogActivityE
     inReviewStalled: undefined,
     stalledReview: undefined,
   };
+}
+
+function addRecentPlannerActivityForFreshAgentLog(task: Task, entry: AgentLogActivityEvent): Task {
+  if (
+    task.column !== "triage"
+    || task.status === "planning"
+    || entry.agent !== "triage"
+    || !hasFreshAgentLog(task, entry)
+  ) {
+    return task;
+  }
+
+  /*
+  FNXC:TaskActivity 2026-07-28-12:00:
+  A Planning card's border and pulsing badge must agree with the live planner
+  timeline. A fresh triage log can arrive before its status row, so retain this
+  client-only render signal until an authoritative task update replaces the row.
+  */
+  return task.recentAgentActivityAt === entry.timestamp
+    ? task
+    : { ...task, recentAgentActivityAt: entry.timestamp };
 }
 
 /**
@@ -687,8 +719,9 @@ export function useTasks(options?: UseTasksOptions) {
         let changed = false;
         const next = prev.map((task) => {
           const cleared = clearInReviewStallForFreshAgentLog(task, entry);
-          if (cleared !== task) changed = true;
-          return cleared;
+          const updated = addRecentPlannerActivityForFreshAgentLog(cleared, entry);
+          if (updated !== task) changed = true;
+          return updated;
         });
         return changed ? next : prev;
       });

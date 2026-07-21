@@ -40,6 +40,20 @@ function createStore(overrides?: { tasks?: Task[] }) {
     off: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({ globalPause: false, enginePaused: false }),
     listTasks: vi.fn().mockResolvedValue(overrides?.tasks ?? []),
+    /*
+    FNXC:EngineTests 2026-07-17-06:20:
+    Graph entry captures a tool-failure log cursor (getAgentLogCount + updateTask) before the
+    soft-delete short-circuit. Stub both so execute() can reach the deletedAt refuse path.
+    */
+    getAgentLogCount: vi.fn().mockResolvedValue(0),
+    getAgentLogs: vi.fn().mockResolvedValue([]),
+    // FNXC:TaskVerificationRequest 2026-07-19-04:30: execute() polls pending verification requests.
+    getTaskVerificationRequestAsync: vi.fn().mockResolvedValue(null),
+    claimTaskVerificationRequest: vi.fn().mockResolvedValue(null),
+    finishTaskVerificationRequest: vi.fn().mockResolvedValue(undefined),
+    // FNXC:TaskVerificationRequest 2026-07-19-12:00: match createMockStore() in executor-test-helpers.ts.
+    createTaskVerificationRequest: vi.fn().mockResolvedValue(undefined),
+    updateTask: vi.fn().mockResolvedValue({}),
   } as any;
   return store;
 }

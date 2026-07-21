@@ -128,6 +128,7 @@ describe("GET /api/plugins/registry", () => {
     expect(res.status).toBe(200);
     const plugins = (res.body as { plugins: Array<{ id: string; canInstall: boolean }> }).plugins;
     expect(plugins.find((plugin) => plugin.id === "fusion-plugin-hermes-runtime")).toMatchObject({ canInstall: true });
+    expect(plugins.find((plugin) => plugin.id === "fusion-plugin-happier-runtime")).toMatchObject({ canInstall: true });
     expect(plugins.find((plugin) => plugin.id === "fusion-plugin-agent-browser")).toMatchObject({ canInstall: false });
     expect(plugins.find((plugin) => plugin.id === "fusion-plugin-slack-bridge")).toMatchObject({ canInstall: false });
   });

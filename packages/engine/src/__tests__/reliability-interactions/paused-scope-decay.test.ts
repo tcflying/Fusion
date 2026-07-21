@@ -180,4 +180,65 @@ describe("reliability interactions: paused scope decay", () => {
     expect(byId.get("FN-APPROVAL")?.pausedReason).toBe("awaiting-approval");
     expect(byId.get("FN-CONTROL")?.column).toBe("todo");
   });
+
+  it("symptom verification: preserves a global-capacity recovery hold even when board-stall recovery ignores the age gate", async () => {
+    const now = Date.now();
+    const capacityRecoveryHold = makeTask("FN-CAPACITY-HOLD", {
+      column: "in-progress",
+      paused: true,
+      pausedReason: "global-capacity-recovery:v1:external-work-may-have-started",
+      userPaused: false,
+      executionStartedAt: new Date(now - 31 * 60_000).toISOString(),
+      columnMovedAt: new Date(now - 1_000).toISOString(),
+    });
+    const capacityFollower = makeTask("FN-CAPACITY-FOLLOWER", { column: "todo", blockedBy: "FN-CAPACITY-HOLD" });
+    const controlPaused = makeTask("FN-CAPACITY-CONTROL", {
+      column: "in-progress",
+      paused: true,
+      pausedReason: "ordinary-scope-decay",
+      executionStartedAt: new Date(now - 31 * 60_000).toISOString(),
+      columnMovedAt: new Date(now - 1_000).toISOString(),
+    });
+    const controlFollower = makeTask("FN-CAPACITY-CONTROL-FOLLOWER", { column: "todo", blockedBy: "FN-CAPACITY-CONTROL" });
+    const { store, byId } = makeStore([capacityRecoveryHold, capacityFollower, controlPaused, controlFollower], { pausedScopeDecayMs: 60_000 });
+    const manager = new SelfHealingManager(store, { rootDir: process.cwd(), getExecutingTaskIds: () => new Set() });
+
+    const count = await manager.autoReboundPausedScopeDecay({ ignoreAgeGate: true });
+
+    expect(count).toBe(1);
+    expect(store.moveTask).not.toHaveBeenCalledWith("FN-CAPACITY-HOLD", "todo", expect.anything());
+    expect(byId.get("FN-CAPACITY-HOLD")).toMatchObject({
+      column: "in-progress",
+      paused: true,
+      pausedReason: "global-capacity-recovery:v1:external-work-may-have-started",
+      userPaused: false,
+    });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-CAPACITY-CONTROL", "todo", expect.anything());
+  });
+
+  it("preserves a global-capacity recovery hold in PR-conflict auto-reclaim without treating it as a user pause", async () => {
+    const capacityRecoveryHold = makeTask("FN-CAPACITY-PR-HOLD", {
+      column: "in-progress",
+      paused: true,
+      pausedReason: "global-capacity-recovery:v1:release-pending",
+      userPaused: false,
+      branch: "fusion/FN-CAPACITY-PR-HOLD",
+      worktree: "/tmp/capacity-pr-hold",
+      prInfos: [{ number: 101, mergeable: "conflicting" } as any],
+    });
+    const { store, byId } = makeStore([capacityRecoveryHold]);
+    const manager = new SelfHealingManager(store, { rootDir: process.cwd(), getExecutingTaskIds: () => new Set() });
+
+    await expect(manager.reclaimPrConflictForTask("FN-CAPACITY-PR-HOLD")).resolves.toEqual({
+      outcome: "skipped",
+      reason: "global-capacity-recovery-hold",
+    });
+    expect(store.updateTask).not.toHaveBeenCalled();
+    expect(store.moveTask).not.toHaveBeenCalled();
+    expect(byId.get("FN-CAPACITY-PR-HOLD")).toMatchObject({
+      paused: true,
+      pausedReason: "global-capacity-recovery:v1:release-pending",
+      userPaused: false,
+    });
+  });
 });

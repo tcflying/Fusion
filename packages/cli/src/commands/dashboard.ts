@@ -41,6 +41,7 @@ import {
   CliInputAttributionLog,
   CliConfirmAdvanceRegistry,
   CliRelaunchRegistry,
+  createDaemonRoomControlPlaneAuthorizer,
   GitHubClient,
   createSkillsAdapter,
   getCliPackageVersion,
@@ -60,13 +61,15 @@ import {
   HeartbeatTriggerScheduler,
   type WakeContext,
   ProjectEngineManager,
+  createWindowsNativeRoomHostCompositionAdapterRegistry,
   PeerExchangeService,
   HybridExecutor,
   shouldUseHybridExecutor,
   setHostExtensionPaths,
   createFusionAuthStorage,
+  createFusionModelRegistry,
 } from "@fusion/engine";
-import { DefaultPackageManager, ModelRegistry, SettingsManager, discoverAndLoadExtensions, createExtensionRuntime } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, SettingsManager, discoverAndLoadExtensions, createExtensionRuntime } from "@earendil-works/pi-coding-agent";
 import {
   getMergeStrategy,
   getTaskBranchName,
@@ -80,7 +83,7 @@ import { promptForPort } from "./port-prompt.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
+import { getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import {
   ensureClaudeSkillsForAllProjectsOnStartup,
@@ -735,6 +738,10 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // launch URL (as `?token=...`) so the user can click once and the browser
   // stores it to localStorage for subsequent loads.
   const dashboardAuthToken = await resolveDashboardAuthToken(opts);
+  const roomControlPlaneAuthorizeProject: NonNullable<Parameters<typeof createServer>[1]>["roomControlPlaneAuthorizeProject"] =
+    dashboardAuthToken && !opts.noAuth && !opts.noEngine
+      ? createDaemonRoomControlPlaneAuthorizer(dashboardAuthToken)
+      : undefined;
 
   // Single sink/logger pair for all dashboard command diagnostics.
   // In TTY mode this routes to DashboardTUI; in non-TTY mode it falls back to console.*.
@@ -887,9 +894,11 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // dashboardBackendShutdown
   // registered below for embedded-cluster teardown.
   let dashboardBackendShutdown: (() => Promise<void>) | undefined;
+  let dashboardHostAsyncLayer: import("@fusion/core").AsyncDataLayer | undefined;
   const dashboardBackendBoot = await createTaskStoreForBackend({ rootDir: cwd });
   if (dashboardBackendBoot) {
     store = dashboardBackendBoot.taskStore;
+    dashboardHostAsyncLayer = dashboardBackendBoot.hostAsyncLayer;
     dashboardBackendShutdown = dashboardBackendBoot.shutdown;
   } else {
     store = new TaskStore(cwd);
@@ -906,18 +915,20 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // after them.
   const noEngine = opts.noEngine === true;
 
-  // FNXC:CentralCoreBackendMode 2026-06-26-13:20:
-  // CentralCore must receive the same AsyncDataLayer the resolved TaskStore
-  // uses, otherwise registerProject/listProjects fall back to the deleted
-  // SQLite CentralDatabase path and throw "Cannot read properties of null
-  // (reading 'transaction')" in backend mode. This mirrors serve.ts:292 which
-  // passes { asyncLayer: centralBootResult.asyncLayer } to the CentralCore
-  // constructor. Without this, the dashboard boots but project registration
-  // is completely broken (POST /api/projects returns 500), blocking the
-  // kanban board and all dashboard UI flows.
+  /*
+  FNXC:DashboardHostCentralLayer 2026-07-20-09:47:
+  CentralCore owns host-wide policy, nodes, and global capacity; it must use
+  the startup factory's unscoped sibling layer, not the project-bound TaskStore
+  layer. Both share the same pool, while the fallback remains only for legacy
+  boot shapes that cannot provide a host layer. This keeps CentralCore policy
+  reads valid without widening any project data boundary.
+  */
+  const dashboardCentralAsyncLayer = dashboardHostAsyncLayer
+    ?? store.getAsyncLayer()
+    ?? undefined;
   const centralCoreInitPromise = !noEngine
     ? (async () => {
-        const core = new CentralCore(undefined, { asyncLayer: store.getAsyncLayer() ?? undefined });
+        const core = new CentralCore(undefined, { asyncLayer: dashboardCentralAsyncLayer });
         try { await core.init(); } catch { /* non-fatal — fallback defaults */ }
         return core;
       })()
@@ -1434,8 +1445,6 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
            */
           if (store.isBackendMode()) {
             logSink.log("[plugins] Schema initialization skipped — backend mode (PostgreSQL Drizzle migrations)");
-          } else {
-            await store.getDatabase().runPluginSchemaInits(schemaHooks);
           }
         } catch (err) {
           logSink.log(
@@ -1646,7 +1655,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   Dashboard status polling, model discovery, and execution-facing auth reads must share the engine auth store so expired Claude OAuth credentials refresh once and legacy Claude/Codex credentials keep working.
   */
   const authStorage = createFusionAuthStorage();
-  const modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
+  const modelRegistry = await createFusionModelRegistry(authStorage);
   registerBuiltInZaiProvider(modelRegistry, (message) => logSink.log(message, "extensions"));
   registerBuiltInGrokProvider(modelRegistry, (message) => logSink.log(message, "extensions"));
   const dashboardAuthStorage = wrapAuthStorageWithApiKeyProviders(authStorage, modelRegistry);
@@ -1979,6 +1988,16 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
     const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
+    /*
+     * FNXC:WindowsNativeRoomHostComposition 2026-07-21-02:17:
+     * Engine-enabled dashboard startup builds one registry from the canonical
+     * unscoped bootstrap layer; --no-engine never constructs a manager or registry.
+     */
+    const roomHostCompositionOperatorAdapterRegistry =
+      createWindowsNativeRoomHostCompositionAdapterRegistry({
+        hostAsyncLayer: dashboardHostAsyncLayer,
+      });
+
     const engineManager = new ProjectEngineManager(centralCoreForEngine, {
       cliPackageVersion,
       getMergeStrategy,
@@ -1989,6 +2008,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       prNodeGithubOps: createPrNodeGithubOps(githubClient),
       prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
       getTaskMergeBlocker,
+      roomHostCompositionOperatorAdapterRegistry,
     });
 
     // Start engines for all registered projects in the background. The
@@ -2233,6 +2253,9 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       },
       skillsAdapter,
       https: loadTlsCredentialsFromEnv(),
+      ...(roomControlPlaneAuthorizeProject
+        ? { roomControlPlaneAuthorizeProject }
+        : {}),
       daemon: dashboardAuthToken ? { token: dashboardAuthToken } : undefined,
       noAuth: opts.noAuth,
       runtimeLogger,
@@ -2338,7 +2361,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     // instance for peer exchange and mDNS discovery.
     //
     try {
-      centralCoreForMesh = new CentralCore(undefined, { asyncLayer: store.getAsyncLayer() ?? undefined });
+      centralCoreForMesh = new CentralCore(undefined, { asyncLayer: dashboardCentralAsyncLayer });
       await centralCoreForMesh.init();
 
       peerExchangeService = new PeerExchangeService(centralCoreForMesh);

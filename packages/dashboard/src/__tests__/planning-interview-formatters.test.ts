@@ -65,6 +65,25 @@ describe("planning deepening checkpoint helpers", () => {
       "UX and interaction details",
       "Testing and verification",
     ]);
+    expect(question.planPreview).toEqual({
+      title: summaryWithSurfaces.title,
+      description: summaryWithSurfaces.description,
+      keyDeliverables: summaryWithSurfaces.keyDeliverables,
+    });
+  });
+
+  it("includes an empty deliverables preview instead of an unchecked payload", () => {
+    const question = buildDeepeningCheckpointQuestion([], {
+      ...summaryWithSurfaces,
+      keyDeliverables: [],
+    });
+
+    expect(question.planPreview).toEqual({
+      title: summaryWithSurfaces.title,
+      description: summaryWithSurfaces.description,
+      keyDeliverables: [],
+    });
+    expect(question.options?.[0]?.id).toBe(PLANNING_DEEPEN_PROCEED_OPTION_ID);
   });
 
   it("falls back to safe default themes when no conversation themes are inferred", () => {
@@ -321,5 +340,13 @@ describe("planning interview formatter Other answers", () => {
       "A: Ask a different scoping question (user's own answer)",
     );
     expect(formatInterviewQA([{ question: confirmQuestion, response }])).toContain("Comment: Need product input");
+  });
+
+  it("reasserts the infinite, high-impact next-question contract with every answer", () => {
+    const prompt = formatResponseForAgent(singleSelectQuestion, { strategy: "discovery" });
+
+    expect(prompt).toContain("exactly one new, high-impact question");
+    expect(prompt).toContain("does not repeat a prior question");
+    expect(prompt).toContain("only the user can validate it");
   });
 });

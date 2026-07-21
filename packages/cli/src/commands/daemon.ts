@@ -14,7 +14,6 @@ import {
   CentralCore,
   TaskStore,
   PluginLoader,
-  PluginStore,
   getTaskMergeBlocker,
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
   processAndAuditInsightExtraction,
@@ -27,8 +26,9 @@ import {
   reconcileClaudeCliPaths,
   registerBuiltInGrokProvider,
   registerBuiltInZaiProvider,
+  createPostgresRoomRbacRegistry,
 } from "@fusion/core";
-import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
+import type { AutomationRunResult, RoomRbacRegistry, ScheduledTask } from "@fusion/core";
 import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
@@ -37,10 +37,11 @@ import {
   shouldUseHybridExecutor,
   setHostExtensionPaths,
   createFusionAuthStorage,
+  createFusionModelRegistry,
 } from "@fusion/engine";
+import { setHostTaskStore, clearHostTaskStores } from "../extension.js";
 import {
   DefaultPackageManager,
-  ModelRegistry,
   SettingsManager,
   discoverAndLoadExtensions,
   createExtensionRuntime,
@@ -76,12 +77,14 @@ import {
 } from "./llama-cpp-extension.js";
 import { resolveSelfExtension } from "./self-extension.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
+import { getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
+import { startMigrationHoldingServer } from "./migration-holding-server.js";
 import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled } from "../plugins/bundled-plugin-install.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
+import { createWindowsNativeRoomHostCompositionAdapterRegistry } from "../room-windows-host-composition-adapter-registry.js";
 
 const DIAGNOSTIC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 let daemonStartTime = 0;
@@ -191,6 +194,40 @@ export interface DaemonOptions {
   project?: string;
 }
 
+const ROOM_CONTROL_PLANE_PUBLIC_ORIGIN_ENV = "FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN";
+const ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP_ENV = "FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP";
+type RoomControlPlaneServerOptions = NonNullable<Parameters<typeof createServer>[1]>;
+
+/*
+FNXC:RoomControlPlaneDaemonRbac 2026-07-19-19:52:
+The daemon bearer authenticates the daemon transport only and must never become a Room actor.
+Room routes are enabled only when an operator explicitly configures a public browser origin and
+every eligible already-started project exposes a durable PostgreSQL Room RBAC registry. Freeze
+those registries at daemon composition time: an untrusted HTTP request may read its registry but
+must never start, create, or select a ProjectEngine as part of authorization.
+*/
+function createDaemonRoomControlPlaneRbacOptions(
+  engineManager: Pick<ProjectEngineManager, "getEngine">,
+  projectIds: readonly string[],
+): RoomControlPlaneServerOptions["roomControlPlaneRbac"] | undefined {
+  const publicOrigin = process.env[ROOM_CONTROL_PLANE_PUBLIC_ORIGIN_ENV]?.trim();
+  if (!publicOrigin) return undefined;
+
+  const registries = new Map<string, RoomRbacRegistry>();
+  for (const projectId of projectIds) {
+    const layer = engineManager.getEngine(projectId)?.getTaskStore().getAsyncLayer();
+    if (!layer) continue;
+    registries.set(projectId, createPostgresRoomRbacRegistry(layer));
+  }
+  if (registries.size === 0) return undefined;
+
+  return {
+    publicOrigin,
+    allowLoopbackHttp: process.env[ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP_ENV] === "1",
+    resolveRegistry: ({ projectId }) => registries.get(projectId),
+  };
+}
+
 export async function runDaemon(opts: DaemonOptions = {}) {
   daemonStartTime = Date.now();
 
@@ -262,14 +299,54 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const selectedHost = opts.host ?? "127.0.0.1";
   const cwd = await resolveRuntimeProjectPath();
 
+  /*
+  FNXC:MigrationHoldingPage 2026-07-19-12:10:
+  A daemon with an explicit port has an operator-reachable HTTP address while
+  engine startup may run the SQLite→PostgreSQL cutover, so bind the holding
+  server before starting engines and forward runtime progress. Port 0 is
+  deliberately excluded: no browser can know the ephemeral URL before listen.
+  */
+  const migrationHoldingServer = selectedPort > 0
+    ? await startMigrationHoldingServer({
+        port: selectedPort,
+        host: selectedHost,
+        log: (message) => console.log(`[daemon] ${message}`),
+      })
+    : null;
+
   // ── CentralCore: global coordination + ntfy project ID lookup ─────────
   let ntfyProjectId: string | undefined;
   let sharedCentralCore: CentralCore | null = null;
+  let centralBootResult: {
+    taskStore: import("@fusion/core").TaskStore;
+    asyncLayer: import("@fusion/core").AsyncDataLayer;
+    hostAsyncLayer: import("@fusion/core").AsyncDataLayer;
+    shutdown: () => Promise<void>;
+  } | null = null;
   try {
-    sharedCentralCore = new CentralCore();
-    await sharedCentralCore.init();
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    centralBootResult = await createTaskStoreForBackend({ rootDir: cwd });
+    if (centralBootResult) {
+      /*
+      FNXC:HostBootstrap 2026-07-20-05:16:
+      Daemon CentralCore coordinates all projects, so it receives the factory's
+      unscoped sibling layer rather than the cwd TaskStore's project-bound
+      layer. Both layers share one PostgresConnections set; shutdown remains
+      owned by the boot result, never by this host-layer consumer.
+      */
+      sharedCentralCore = new CentralCore(undefined, {
+        asyncLayer: centralBootResult.hostAsyncLayer,
+      });
+      await sharedCentralCore.init();
+    }
   } catch {
-    // Central DB unavailable or project not registered — backward compatible
+    await sharedCentralCore?.close().catch(() => undefined);
+    sharedCentralCore = null;
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
+    }
+    // Backend bootstrap failure preserves the legacy SQLite fallback below.
   }
 
   // ── ProjectEngineManager: uniform engine lifecycle for all projects ──
@@ -344,6 +421,17 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
   const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
+  /*
+  FNXC:WindowsRoomHostComposition 2026-07-20-22:45:
+  Construct the host-owned registry before ProjectEngineManager.startAll(). The
+  only current daemon fact is the canonical unscoped backend layer; missing
+  provider and dispatch telemetry remain withheld by the registry instead of
+  being guessed from project settings, connector labels, or the daemon bearer.
+  */
+  const roomHostCompositionOperatorAdapterRegistry =
+    createWindowsNativeRoomHostCompositionAdapterRegistry({
+      hostAsyncLayer: centralBootResult?.hostAsyncLayer,
+    });
   const engineManager = new ProjectEngineManager(sharedCentralCore, {
     cliPackageVersion,
     getMergeStrategy,
@@ -355,6 +443,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
+    roomHostCompositionOperatorAdapterRegistry,
   });
 
   await engineManager.startAll();
@@ -463,6 +552,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   );
 
   const store = primaryEngine.getTaskStore();
+  /*
+  FNXC:MergeQueue 2026-07-15-11:40:
+  Share the daemon primary TaskStore with the host pi extension so agent fn_* tools reuse the engine pool (no dual-boot).
+  */
+  setHostTaskStore(primaryCwd, store);
 
   const getGlobalSettingsStore = () => {
     const candidate = store as { getGlobalSettingsStore?: () => { getSettings: () => Promise<unknown> } };
@@ -545,28 +639,12 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   // Auto-load all enabled plugins so runtime UI (NewAgentDialog, AgentDetailView)
   // can discover installed runtimes like Hermes and OpenClaw.
   try {
+    /*
+    FNXC:PluginPostgresSchema 2026-07-14-21:48:
+    PluginLoader initializes each plugin's schema before publishing that plugin as loaded. Daemon startup must not replay every loaded schema contract as a second batch after loadAllPlugins.
+    */
     const { loaded, errors } = await pluginLoader.loadAllPlugins();
     console.log(`[plugins] Loaded ${loaded} plugins (${errors} errors)`);
-
-    const schemaHooks = pluginLoader.getPluginSchemaInitHooks();
-    if (schemaHooks.length > 0) {
-      try {
-        /*
-         * FNXC:SqliteFinalRemoval 2026-06-25-16:25:
-         * Skip SQLite-specific plugin schema init in backend mode (PostgreSQL
-         * uses Drizzle migrations for schema management).
-         */
-        if (store.isBackendMode()) {
-          console.log("[plugins] Schema initialization skipped — backend mode (PostgreSQL Drizzle migrations)");
-        } else {
-          await store.getDatabase().runPluginSchemaInits(schemaHooks);
-        }
-      } catch (err) {
-        console.error(
-          `[plugins] Schema initialization failed: ${err instanceof Error ? err.message : err}`,
-        );
-      }
-    }
   } catch (err) {
     console.error(
       `[plugins] Failed to load plugins: ${err instanceof Error ? err.message : err}`
@@ -580,7 +658,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const automationStore = primaryEngine.getAutomationStore();
 
   const authStorage = createFusionAuthStorage();
-  const modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
+  const modelRegistry = await createFusionModelRegistry(authStorage);
   registerBuiltInZaiProvider(modelRegistry, (message) => console.log(`[extensions] ${message}`));
   registerBuiltInGrokProvider(modelRegistry, (message) => console.log(`[extensions] ${message}`));
   const dashboardAuthStorage = wrapAuthStorageWithApiKeyProviders(authStorage, modelRegistry);
@@ -699,11 +777,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     extensionsResult.runtime.pendingProviderRegistrations = [];
     mergeBuiltInZaiProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
     mergeBuiltInGrokProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
-    modelRegistry.refresh();
+    await modelRegistry.refresh();
 
     try {
       const globalSettings = await store.getGlobalSettingsStore().getSettings();
-      registerCustomProviders(
+      await registerCustomProviders(
         modelRegistry,
         globalSettings.customProviders,
         (message) => console.log(`[custom-providers] ${message}`),
@@ -716,7 +794,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     const message = error instanceof Error ? error.message : String(error);
     console.log(`[extensions] Failed to discover extensions: ${message}`);
     createExtensionRuntime();
-    modelRegistry.refresh();
+    await modelRegistry.refresh();
   }
 
   void syncStartupModels({
@@ -733,12 +811,15 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       return;
     }
 
-    reregisterCustomProviders(
+    void reregisterCustomProviders(
       modelRegistry,
       previousProviders,
       currentProviders,
       (message) => console.log(`[custom-providers] ${message}`),
-    );
+    ).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[custom-providers] Failed to refresh custom providers: ${message}`);
+    });
   });
 
   // ── Skills adapter for skills discovery and execution toggling ─────────────
@@ -746,11 +827,12 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     string,
     { enabledKey: string; skills: ReturnType<PluginLoader["getPluginSkills"]> }
   >();
-  const getProjectScopedPluginSkills = async (rootDir: string): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
+  const getProjectScopedPluginSkills = async (rootDir: string, resolvedProjectStore?: TaskStore): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
     const normalizedRootDir = pathResolve(rootDir);
-    const stateStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
+    const targetStore = resolvedProjectStore ?? (normalizedRootDir === pathResolve(store.getRootDir()) ? store : undefined);
+    if (!targetStore) return [];
+    const stateStore = targetStore.getPluginStore();
     await stateStore.init();
-    try {
       const enabledPlugins = await stateStore.listPlugins({ enabled: true });
       const enabledKey = enabledPlugins
         .map((plugin) => `${plugin.id}:${plugin.updatedAt}`)
@@ -775,12 +857,18 @@ export async function runDaemon(opts: DaemonOptions = {}) {
         return skills;
       }
 
-      const scopedPluginStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
-      const scopedTaskStore = new TaskStore(normalizedRootDir);
-      const scopedPluginLoader = new PluginLoader({ pluginStore: scopedPluginStore, taskStore: scopedTaskStore });
+      const scopedPluginStore = targetStore.getPluginStore();
+      /*
+       * FNXC:PluginSkillsPostgres 2026-07-14-17:47:
+       * Request-scoped skill discovery is read-only across every CLI server surface. Loading and stopping plugins here must not rewrite durable runtime state for the target project.
+       */
+      const scopedPluginLoader = new PluginLoader({
+        pluginStore: scopedPluginStore,
+        taskStore: targetStore,
+        persistRuntimeState: false,
+      });
       try {
         await scopedPluginStore.init();
-        await scopedTaskStore.init();
         const { errors } = await scopedPluginLoader.loadAllPlugins();
         if (errors > 0) {
           console.warn(`[plugins] Project-scoped plugin skill loading for ${normalizedRootDir} had ${errors} error(s)`);
@@ -790,12 +878,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
         return skills;
       } finally {
         await scopedPluginLoader.stopAllPlugins();
-        scopedPluginStore.close();
-        scopedTaskStore.close();
       }
-    } finally {
-      stateStore.close();
-    }
   };
 
   const skillsAdapter = packageManager
@@ -815,6 +898,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   setInterval(() => {
     logDiagnostics(daemonDbHealthCheck ?? undefined);
   }, DIAGNOSTIC_INTERVAL_MS).unref?.();
+
+  const roomControlPlaneRbac = createDaemonRoomControlPlaneRbacOptions(
+    engineManager,
+    projects.map((project) => project.id),
+  );
 
   const app = createServer(store, {
     engine: primaryEngine,
@@ -836,7 +924,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       : undefined,
     pluginStore,
     pluginLoader,
-    pluginRunner: pluginLoader,
+    /*
+    FNXC:GrokCliRouting 2026-07-15-10:17:
+    Pass the engine PluginRunner (getRuntimeById), not the bare PluginLoader, so chat/merge/PR routes can resolve grok-cli/no-key via the Grok runtime. PluginLoader stays on pluginLoader for install/load APIs.
+    */
+    pluginRunner: primaryEngine.getPluginRunner?.(),
     onProjectFirstAccessed: (projectId: string) => engineManager.onProjectAccessed(projectId),
     onProjectRegistered: ({ path }) => {
       maybeInstallClaudeSkillForNewProject(path);
@@ -907,11 +999,14 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       }
     },
     headless: true,
+    ...(roomControlPlaneRbac ? { roomControlPlaneRbac } : {}),
     daemon: { token: daemonToken },
     skillsAdapter,
     https: loadTlsCredentialsFromEnv(),
   });
 
+  // The holding server owns a fixed daemon port only through engine/store boot.
+  await migrationHoldingServer?.close();
   const server = app.listen(selectedPort, selectedHost);
 
   await new Promise<void>((resolve, reject) => {
@@ -940,14 +1035,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       centralCore = null;
     }
   }
-  let localNodeId: string | undefined;
-
   try {
     if (centralCore) {
       const nodes = await centralCore.listNodes();
       const localNode = nodes.find((node) => node.type === "local");
       if (localNode) {
-        localNodeId = localNode.id;
         await centralCore.updateNode(localNode.id, { status: "online" });
       }
     }
@@ -992,12 +1084,32 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     if (shuttingDown) return;
     shuttingDown = true;
 
-    // Stop all project engines uniformly
+    /*
+    FNXC:PostgresResourceLifecycle 2026-07-14-21:48:
+    CentralCore adopts an engine TaskStore layer but retains ownership of its original embedded backend lifecycle. Persist the local-node offline state while the adopted pool is live, then stop engine-owned stores, and only then close CentralCore so its retained backend lifecycle cannot terminate PostgreSQL under a live engine.
+    */
+    if (centralCore) {
+      try {
+        await centralCore.markLocalNodeOffline();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.warn(`[daemon] Failed to set local node offline: ${message}`);
+      }
+    }
+
+    // Stop all project engines uniformly; their runtimes own their TaskStores.
     if (hybridExecutor) {
       await hybridExecutor.shutdown();
     }
 
     await engineManager.stopAll();
+
+    /*
+    FNXC:PostgresResourceLifecycle 2026-07-14-22:07:
+    Preserve the command-level TaskStore close barrier before CentralCore releases its retained backend. Runtime shutdown normally closes this store first; the idempotent explicit close also covers partial-start and test-owned runtimes.
+    */
+    clearHostTaskStores();
+    await store.close();
 
     // Stop peer exchange service
     if (peerExchangeService) {
@@ -1009,20 +1121,16 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       }
     }
 
-    if (centralCore && localNodeId) {
-      try {
-        await centralCore.updateNode(localNodeId, { status: "offline" });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[daemon] Failed to set local node offline: ${message}`);
-      }
-    }
-
     if (centralCore) {
       await centralCore.close().catch(() => {
         // best-effort
       });
       centralCore = null;
+    }
+
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
     }
 
     try {
@@ -1031,7 +1139,6 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       // best-effort
     }
 
-    store.close();
     process.exit(signal ? (SIGNAL_EXIT_CODES[signal] ?? 128) : 0);
   };
 

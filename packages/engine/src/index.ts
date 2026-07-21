@@ -1,5 +1,14 @@
 export { AgentLogger, type AgentLoggerOptions, summarizeToolArgs } from "./agent-logger.js";
+export * from "./session-connector-registry.js";
+export * from "./session-connector-ingestion.js";
+export * from "./room-session-connector-ingestion-persistence.js";
+export * from "./room-delivery-coordinator.js";
+export * from "./room-existing-session-spine.js";
+export * from "./room-existing-session-preflight.js";
+export * from "./room-evolution-runtime.js";
+export * from "./project-room-command-gateway.js";
 export { reloadExemptTools, addToExemptTools, getExemptToolNames } from "./agent-action-gate.js";
+export type { AgentActionGateContext } from "./agent-action-gate.js";
 export { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
 export {
   wrapAuthStorageWithApiKeyProviders,
@@ -25,14 +34,28 @@ export {
   createTaskShowTool,
   createTaskSearchTool,
   createTaskReadTools,
+  createListAgentsTool,
+  createDelegateTaskTool,
+  createTaskAssignTool,
+  createGetAgentConfigTool,
+  createWebFetchTool,
+  createGoalRetrievalTools,
+  createMissionTools,
+  createIdeationTools,
+  createMemoryTools,
+  createResearchTools,
   createArtifactListTool,
   createArtifactRegisterTool,
   createArtifactViewTool,
   createChatArtifactTools,
   createChatTaskDocumentTools,
+  createChatTaskLogsReadTool,
   createTaskDocumentReadTool,
   createTaskDocumentWriteTool,
   createTaskLogTool,
+  createTaskLogsReadTool,
+  normalizeAgentLogPaging,
+  renderAgentLogEntries,
   createSendMessageTool,
   createReadMessagesTool,
   createAskQuestionTool,
@@ -45,6 +68,7 @@ export {
   createWorkflowSettingsTool,
   createTraitListTool,
   createWorkflowAuthoringTools,
+  createAgentTask,
   taskCreateParams,
   taskListParams,
   taskShowParams,
@@ -56,9 +80,11 @@ export {
   chatArtifactRegisterParams,
   chatTaskDocumentReadParams,
   chatTaskDocumentWriteParams,
+  chatTaskLogsReadParams,
   taskDocumentReadParams,
   taskDocumentWriteParams,
   taskLogParams,
+  taskLogsReadParams,
   askQuestionParams,
   workflowListParams,
   workflowGetParams,
@@ -69,6 +95,41 @@ export {
   workflowDeleteParams,
   workflowSettingsParams,
   traitListParams,
+  listAgentsParams,
+  delegateTaskParams,
+  taskAssignParams,
+  getAgentConfigParams,
+  webFetchParams,
+  memorySearchParams,
+  memoryGetParams,
+  goalListParams,
+  goalShowParams,
+  missionListParams,
+  missionShowParams,
+  missionCreateParams,
+  missionUpdateParams,
+  missionDeleteParams,
+  milestoneAddParams,
+  milestoneUpdateParams,
+  milestoneDeleteParams,
+  sliceAddParams,
+  sliceActivateParams,
+  sliceDeleteParams,
+  featureAddParams,
+  featureUpdateParams,
+  featureDeleteParams,
+  featureLinkTaskParams,
+  researchRunParams,
+  researchListParams,
+  researchGetParams,
+  researchCancelParams,
+  researchRetryParams,
+  /*
+  FNXC:ChatAgentTools 2026-07-15-00:00:
+  Dashboard chat needs these coordination factories re-exported so its shared
+  toolset can match the safe heartbeat productivity surface for pi and Grok
+  plugin runtimes without importing the engine's internal module path.
+  */
   executeApprovedAgentProvisioning,
   createWorkflowValidateTool,
   validateWorkflowIrDryRun,
@@ -76,10 +137,14 @@ export {
 } from "./agent-tools.js";
 export {
   POSTGRES_MIGRATION_HELP_URL,
+  POSTGRES_MIGRATION_COMPLETE_NOTICE_KIND,
   POSTGRES_MIGRATION_NOTICE_KIND,
   deliverPostgresMigrationNoticeIfNeeded,
+  deliverPostgresMigrationCompleteNoticeIfNeeded,
   isPostgresMigrationNoticeVersion,
   type DeliverPostgresMigrationNoticeArgs,
+  type DeliverPostgresMigrationCompleteNoticeArgs,
+  type PostgresMigrationCompleteNoticeResult,
   type PostgresMigrationNoticeLog,
   type PostgresMigrationNoticeResult,
 } from "./postgres-migration-notice.js";
@@ -390,19 +455,6 @@ export {
   generateSyntheticRunId,
 } from "./run-audit.js";
 export {
-  observeWorkflowParity,
-  WORKFLOW_INTERPRETER_DUAL_OBSERVE_FLAG,
-  type WorkflowParityObserverInput,
-  type WorkflowParityObserverLegacyRunResult,
-  type WorkflowParityObserverShadowRunResult,
-} from "./workflow-parity-observer.js";
-export {
-  WorkflowAuthoritativeDriver,
-  type WorkflowAuthoritativeDriverDeps,
-  type WorkflowAuthoritativeDriverResult,
-  type WorkflowAuthoritativeDriverStore,
-} from "./workflow-authoritative-driver.js";
-export {
   auditSquashMerge,
   formatSquashAuditReport,
   type SquashAuditFindings,
@@ -412,7 +464,7 @@ export {
   type SquashAuditRecentMainCommit,
 } from "./merger-squash-audit.js";
 export { reviewStep, type ReviewType, type ReviewVerdict, type ReviewResult, type ReviewOptions } from "./reviewer.js";
-export { createFnAgent, promptWithFallback, describeModel, setHostExtensionPaths, getHostExtensionPaths, type AgentOptions, type AgentResult } from "./pi.js";
+export { createFnAgent, promptWithFallback, describeModel, setHostExtensionPaths, getHostExtensionPaths, wrapToolsWithActionGate, type AgentOptions, type AgentResult } from "./pi.js";
 export { resolveMcpServersForRuntime, resolveMcpServersForStore, type ResolvedMcpServersForRuntime } from "./mcp-resolution.js";
 export { discoverMcpServers, type DiscoverMcpServersOptions, type DiscoverMcpServersResult } from "./mcp-discovery-service.js";
 export { runtimeSupportsMcp, logMcpForwardingSkipped } from "./mcp-runtime-support.js";
@@ -748,6 +800,31 @@ export {
   type OverseerHumanControlTask,
   type OverseerHumanControlSettings,
 } from "./overseer-human-control-policy.js";
+// FNXC:PlannerOversight 2026-07-13-23:05: session-advisor (OMP advisor parity) public surface.
+export {
+  OverseerAdvisorRuntime,
+  type OverseerAdvisorAgent,
+  type OverseerAdvisorRuntimeHost,
+  type OverseerAdvisorRuntimeOptions,
+} from "./overseer-advisor-runtime.js";
+export {
+  OverseerAdvisorService,
+  createParsingOverseerAgent,
+  type OverseerAdvisorServiceOptions,
+  type OverseerAdvisorModelConfig,
+} from "./overseer-advisor-service.js";
+export {
+  OverseerAdviseRecorder,
+  parseAdvisorReplyForAdvice,
+  extractAdvisorAssistantText,
+  OVERSEER_ADVISOR_SYSTEM_PROMPT,
+  OVERSEER_ADVISOR_REPLY_CONTRACT,
+} from "./overseer-advise-tool.js";
+export {
+  discoverOverseerWatchdogFiles,
+  formatOverseerWatchdogPromptBlocks,
+} from "./overseer-watchdog.js";
+export { formatOverseerSessionDelta, isOverseerSelfAdvisoryText } from "./overseer-session-delta.js";
 export {
   decidePlannerRecovery,
   PLANNER_RECOVERY_MAX_ATTEMPTS,
@@ -797,6 +874,18 @@ export { StuckTaskDetector, type StuckTaskDetectorOptions, type DisposableSessio
 export { HeartbeatMonitor, HeartbeatTriggerScheduler, type WakeContext } from "./agent-heartbeat.js";
 export { TokenCapDetector, type TokenCapCheckResult } from "./token-cap-detector.js";
 export { SelfHealingManager, type SelfHealingOptions, type RebindResult } from "./self-healing.js";
+/*
+FNXC:MergeReliability 2026-07-15-21:45 (FN-8004 follow-up):
+Exported for the dashboard's manual Retry gate, which must share ONE definition of "orphaned
+merge-active stamp" with SelfHealingManager.recoverStaleMergingStatus. Two copies is how the
+manual path drifted into refusing every merge-active status while the sweep cleared it.
+*/
+export {
+  ACTIVE_MERGE_STATUSES,
+  DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS,
+  isMergeActiveStatus,
+  isStaleMergeActiveStatus,
+} from "./merge-active-status.js";
 export { PluginRunner, type PluginRunnerOptions } from "./plugin-runner.js";
 export {
   registerPluginTraits,
@@ -844,8 +933,20 @@ export {
   type AgentPromptResult,
   type AgentRuntime,
   type AgentRuntimeOptions,
+  type AgentRuntimeNativeSessionBinding,
+  createCliSessionNativeSessionBinding,
+  resolveTaskHappierCliSessionId,
   type AgentSessionResult,
 } from "./agent-runtime.js";
+export {
+  bindTaskHappierDirectSession,
+  readTaskHappierDirectSessionBinding,
+  TaskHappierDirectSessionConflictError,
+  TaskHappierDirectSessionIntegrityError,
+  type HappierDirectSessionEnsureMetadata,
+  type HappierDirectSessionProviderId,
+  type TaskHappierDirectSessionBinding,
+} from "./happier-direct-session-binding.js";
 export { askAcpOnce, type AskAcpOnceOptions, type AskAcpOnceResult } from "./cli-agent-ask.js";
 export {
   resolveRuntime,
@@ -873,7 +974,119 @@ export {
   type ResolvedSessionResult,
 } from "./agent-session-helpers.js";
 export { ProjectManager } from "./project-manager.js";
-export { ProjectEngine, type ProjectEngineOptions } from "./project-engine.js";
+export {
+  ProjectEngine,
+  type ProjectEngineOptions,
+  type RoomControllerFactory,
+  type RoomControllerFactoryContext,
+  type RoomControllerLifecycle,
+  type RoomRunAuditDispatcherFactory,
+  type RoomRunAuditDispatcherFactoryContext,
+  type RoomRunAuditDispatcherLifecycle,
+} from "./project-engine.js";
+export {
+  PASSIVE_ROOM_WORKER,
+  RoomController,
+  type RoomControllerCheckpointStore,
+  type RoomControllerLeaseStore,
+  type RoomControllerOptions,
+  type RoomControllerRoomStore,
+  type RoomTaskDispatcher,
+  type RoomWorker,
+  type RoomWorkerRunInput,
+} from "./room-controller.js";
+export * from "./room-global-concurrency-runtime.js";
+export type {
+  RoomCompositionDependenciesV1,
+  RoomHostCompositionAuthorityV1,
+  RoomHostCompositionContextV1,
+  RoomHostCompositionProviderV1,
+  RoomHostCompositionResolutionV1,
+  RoomVerifiedCompositionV1,
+} from "./room-host-composition.js";
+export * from "./room-host-composition-operator-policy-provider.js";
+export * from "./room-windows-host-composition-adapter-registry.js";
+export {
+  DEFAULT_ROOM_SEMANTIC_CONTROLLER_INBOX_MAX_ACTIONS,
+  RoomSemanticControllerInboxProcessor,
+  RoomSemanticControllerInboxProcessorError,
+  type ProcessRoomSemanticControllerInboxInput,
+  type RoomSemanticControllerInboxProcessSummary,
+  type RoomSemanticControllerInboxProcessorOptions,
+  type RoomSemanticControllerInboxStopReason,
+  type RoomSemanticControllerInboxStore,
+} from "./room-semantic-controller-inbox-processor.js";
+export {
+  DEFAULT_ROOM_TASK_RECOVERY_ACTION_MAX_ACTIONS,
+  DEFAULT_ROOM_TASK_RECOVERY_ACTION_RETRY_DELAY_MS,
+  RoomTaskRecoveryActionProcessor,
+  RoomTaskRecoveryActionProcessorError,
+  type ProcessRoomTaskRecoveryActionsInput,
+  type RoomTaskRecoveryActionConsumer,
+  type RoomTaskRecoveryActionConsumerContextV1,
+  type RoomTaskRecoveryActionProcessSummary,
+  type RoomTaskRecoveryActionProcessorOptions,
+  type RoomTaskRecoveryActionStopReason,
+  type RoomTaskRecoveryActionStore,
+} from "./room-task-recovery-action-processor.js";
+export {
+  createRoomTaskRecoveryPlanConsumer,
+  RoomTaskRecoveryPlanConsumerError,
+  type RoomTaskRecoveryActionConsumerContext,
+  type RoomTaskRecoveryPlanConsumer,
+  type RoomTaskRecoveryPlanStore,
+} from "./room-task-recovery-plan-consumer.js";
+export * from "./fusion-room-workspace-primitives.js";
+export * from "./fusion-room-workspace-runtime.js";
+export * from "./room-terminalization-coordinator.js";
+export * from "./room-evolution-promotion-commit-coordinator.js";
+export * from "./room-evolution-promotion-ledger-adapter.js";
+export * from "./room-evolution-hypothesis-commit-coordinator.js";
+export * from "./room-message-authority-guard.js";
+export * from "./room-evolution-isolated-candidate-coordinator.js";
+export * from "./room-evolution-isolated-candidate-ledger-adapter.js";
+export * from "./room-evolution-git-worktree-port.js";
+export * from "./room-strategy-version-runtime-coordinator.js";
+export * from "./room-control-plane-read-service.js";
+export * from "./room-evolution-canary-ledger-adapter.js";
+export * from "./room-evolution-canary-rollback-coordinator.js";
+export * from "./room-evolution-capacity-reservation.js";
+export * from "./room-adaptive-scheduling-policy.js";
+export * from "./room-global-concurrency-accounting.js";
+export * from "./room-provider-backpressure-controller.js";
+export * from "./room-runtime-observability-bridge.js";
+export * from "./room-evidence-eval-store-bridge.js";
+export * from "./room-live-event-cursor.js";
+export * from "./room-independent-arbitration-coordinator.js";
+export * from "./room-independent-arbitration-ledger-adapter.js";
+export * from "./room-candidate-fanout-blind-review-coordinator.js";
+export * from "./room-deterministic-evidence-gate-coordinator.js";
+export * from "./room-candidate-synthesis-coordinator.js";
+export * from "./room-candidate-synthesis-ledger-adapter.js";
+export * from "./room-connector-runtime-observation-reporter.js";
+export * from "./room-session-connector-runtime-observation-port.js";
+export * from "./room-workspace-coordinator.js";
+export {
+  planRoomDependencyDispatch,
+  RoomDependencyDispatchGraphError,
+  type RoomDependencyDispatchBlockerV1,
+  type RoomDependencyDispatchCandidateV1,
+  type RoomDependencyDispatchPlanV1,
+  type RoomDependencyDispatchWaitV1,
+} from "./room-dependency-dispatch.js";
+export {
+  RoomDependencyDispatchCoordinator,
+  RoomDependencyDispatchCoordinatorError,
+  type DispatchReadyRoomTasksInput,
+  type DispatchReadyRoomTasksResult,
+  type RoomDependencyDispatchCoordinatorOptions,
+  type RoomTaskDispatchStore,
+} from "./room-dependency-dispatch-coordinator.js";
+export {
+  RoomRunAuditDispatcher,
+  type RoomRunAuditDispatcherOptions,
+  type RoomRunAuditOutboxStore,
+} from "./room-run-audit-dispatcher.js";
 export { ProjectEngineManager, type EngineManagerOptions } from "./project-engine-manager.js";
 export {
   acquireEngineSingleton,
@@ -1063,6 +1276,8 @@ export {
   genericCliAdapter,
   type CliAdapterDescriptor,
 } from "./cli-agent/adapters/index.js";
+export { installBaselineArchiveWorktreeDisposer } from "./archive-worktree-disposer-install.js";
+
 // CLI Agent Executor — task ↔ session orchestration (U7).
 export {
   CliTaskSession,
@@ -1073,3 +1288,5 @@ export {
   type ResolvedCliExecutorConfig,
   type LaunchCliTaskSessionOptions,
 } from "./cli-agent/task-session.js";
+export * from "./room-blind-review-coordinator.js";
+export * from "./room-candidate-fanout-blind-review-coordinator.js";

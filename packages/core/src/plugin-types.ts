@@ -12,6 +12,10 @@
  */
 
 import type { Database } from "./db.js";
+import type {
+  SessionConnectorV1,
+  SessionConnectorWriteAuthorizerV1,
+} from "./room-contracts/session-connector.js";
 import type { TaskStore } from "./store.js";
 import type { PlanningQuestion, Task, WorkflowStepMode, WorkflowStepToolMode } from "./types.js";
 import type {
@@ -54,6 +58,8 @@ export interface PluginManifest {
   settingsSchema?: Record<string, PluginSettingSchema>;
   /** Optional agent runtime metadata for discovery (runtime factory is in FusionPlugin.runtime) */
   runtime?: PluginRuntimeManifestMetadata;
+  /** Optional provider-neutral Session Connector metadata for discovery. */
+  sessionConnector?: PluginSessionConnectorManifestMetadata;
   /** Optional skill metadata used for discovery UIs. */
   skills?: Array<{ skillId: string; name: string }>;
   /** Optional workflow step metadata used for discovery UIs. */
@@ -293,6 +299,11 @@ export interface PluginContext {
   createInteractiveAiSession?: CreateInteractiveAiSessionFactory;
   /** Optional host capability to resolve a project-scoped TaskStore by projectId. */
   resolveProjectTaskStore?: (projectId: string) => Promise<TaskStore>;
+  /**
+   * Host-owned, request-scoped external-write verifier. It is present only for
+   * Session Connector factory construction; plugin settings cannot replace it.
+   */
+  sessionConnectorWriteAuthorizer?: SessionConnectorWriteAuthorizerV1;
 }
 
 /**
@@ -311,6 +322,30 @@ export type PluginOnLoad = (ctx: PluginContext) => Promise<void> | void;
 export type PluginOnUnload = (ctx: PluginContext) => Promise<void> | void;
 /** Lifecycle hook: called during database schema initialization */
 export type PluginOnSchemaInit = (db: Database) => Promise<void> | void;
+/**
+ * Declarative PostgreSQL schema owned by a plugin.
+ *
+ * FNXC:PluginPostgresContract 2026-07-14-18:32:
+ * PostgreSQL plugins declare idempotent project-schema DDL without receiving
+ * the host's privileged migration connection. Fusion validates this immutable
+ * plan before onLoad and executes it through a short-lived migration-only
+ * capability, keeping ordinary plugin runtime code on the forced-RLS role.
+ *
+ * FNXC:PluginPostgresContract 2026-07-14-22:42:
+ * ALTER TABLE is intentionally limited to adding ordinary columns or setting
+ * their defaults/nullability. Fusion alone owns project_id, keys, RLS,
+ * policies, triggers, grants, ownership, and table identity.
+ */
+export interface PluginPostgresSchemaDefinition {
+  /** Monotonically increasing plugin schema version for diagnostics. */
+  version: number;
+  /** Stable snake_case namespace prefix for every referenced table (must end in `_`). */
+  tablePrefix: string;
+  /** One idempotent CREATE TABLE/INDEX or host-approved additive ALTER TABLE statement per item. */
+  statements: readonly string[];
+}
+/** PostgreSQL-native schema hook. It receives no database handle. */
+export type PluginOnPostgresSchemaInit = () => PluginPostgresSchemaDefinition;
 /** Lifecycle hook: called when a task is created */
 export type PluginOnTaskCreated = (task: Task, ctx: PluginContext) => Promise<void> | void;
 /** Lifecycle hook: called when a task moves between columns */
@@ -605,6 +640,29 @@ export interface PluginRuntimeRegistration {
   metadata: PluginRuntimeManifestMetadata;
   /** Factory function that creates the runtime instance */
   factory: PluginRuntimeFactory;
+}
+
+/** Discovery metadata for a plugin-provided Session Connector. */
+export interface PluginSessionConnectorManifestMetadata {
+  /** Stable connector id used by Room bindings and the connector registry. */
+  connectorId: string;
+  /** Human-readable connector name. */
+  name: string;
+  /** Short description of the owned connection surface. */
+  description?: string;
+  /** Semantic version of the connector implementation. */
+  version?: string;
+}
+
+/** Factory for a project/runtime-scoped Session Connector instance. */
+export type PluginSessionConnectorFactory = (
+  ctx: PluginContext,
+) => Promise<SessionConnectorV1> | SessionConnectorV1;
+
+/** Plugin contribution pairing connector discovery metadata and its factory. */
+export interface PluginSessionConnectorRegistration {
+  metadata: PluginSessionConnectorManifestMetadata;
+  factory: PluginSessionConnectorFactory;
 }
 
 export type CliProviderType = "cli" | "oauth" | "api_key" | "custom";
@@ -1123,6 +1181,7 @@ export interface FusionPlugin {
     onTaskCompleted?: PluginOnTaskCompleted;
     onError?: PluginOnError;
     onSchemaInit?: PluginOnSchemaInit;
+    onPostgresSchemaInit?: PluginOnPostgresSchemaInit;
     onAgentRunStart?: PluginOnAgentRunStart;
     onAgentRunEnd?: PluginOnAgentRunEnd;
   };
@@ -1134,6 +1193,8 @@ export interface FusionPlugin {
   dashboardViews?: PluginDashboardViewDefinition[];
   /** Agent runtime registration for providing custom runtime implementations */
   runtime?: PluginRuntimeRegistration;
+  /** Provider-neutral native Session Connector registration. */
+  sessionConnector?: PluginSessionConnectorRegistration;
   /** CLI-backed provider metadata and integration hooks. */
   cliProviders?: CliProviderContribution[];
   /** Plugin-contributed skills surfaced by the skill resolver. */

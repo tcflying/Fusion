@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { hasGit, makeReliabilityFixture } from "./_helpers.js";
+// FNXC:SqliteRemoval 2026-07-14: hasPg guard added — makeReliabilityFixture requires PG after SQLite removal (VAL-REMOVAL-005).
+import { hasGit, hasPg, makeReliabilityFixture } from "./_helpers.js";
 
-const describeIfGit = hasGit ? describe : describe.skip;
+const describeIfGit = hasGit && hasPg ? describe : describe.skip;
 
 describeIfGit("reliability interactions: self-defeating dep reconciliation", () => {
   const fixtures: Array<Awaited<ReturnType<typeof makeReliabilityFixture>>> = [];
@@ -21,7 +22,8 @@ describeIfGit("reliability interactions: self-defeating dep reconciliation", () 
     });
     fixtures.push(fx);
 
-    fx.store.getDatabase().prepare("UPDATE tasks SET title = ? WHERE id = ?").run("Finalize FN-100: close loop", fx.task.id);
+    await fx.store.listTasks({ column: "todo", slim: true });
+    await fx.seedRawTaskColumns(fx.task.id, { title: "Finalize FN-100: close loop" });
 
     const recovered = await fx.manager.reconcileSelfDefeatingDependencies();
     expect(recovered).toBe(1);
@@ -32,7 +34,7 @@ describeIfGit("reliability interactions: self-defeating dep reconciliation", () 
       updated?.log.some((entry) => JSON.stringify(entry).includes("Auto-reconciled self-defeating dependency")),
     ).toBe(true);
 
-    const events = fx.store.getRunAuditEvents({
+    const events = await fx.store.getRunAuditEventsAsync({
       taskId: fx.task.id,
       domain: "database",
       mutationType: "task:auto-reconciled-self-defeating-dep",
@@ -76,7 +78,7 @@ describeIfGit("reliability interactions: self-defeating dep reconciliation", () 
     });
     fixtures.push(fx);
 
-    fx.store.getDatabase().prepare("UPDATE tasks SET title = ? WHERE id = ?").run("Finalize FN-100", fx.task.id);
+    await fx.seedRawTaskColumns(fx.task.id, { title: "Finalize FN-100" });
 
     const recovered = await fx.manager.reconcileSelfDefeatingDependencies();
     expect(recovered).toBe(0);

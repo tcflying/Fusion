@@ -95,13 +95,20 @@ const PG_AVAILABLE =
 
 const pgDescribe = PG_AVAILABLE ? describe : describe.skip;
 
+/** FNXC:MultiProjectIsolation 2026-07-16-00:05: the project every harness row is owned by. */
+const TEST_PROJECT_ID = "proj_test_u14";
+
 function uniqueDbName(): string {
   return `fusion_u14_test_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/*
+FNXC:PgTestAuthFix 2026-07-14-00:00:
+The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+*/
 function adminExec(statement: string): void {
   execSync(
-    `psql -h localhost -p 5432 -U ${process.env.USER ?? "postgres"} -d postgres -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
+    `psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`,
     { stdio: "pipe", env: process.env },
   );
 }
@@ -137,13 +144,35 @@ async function setupCtx(): Promise<TestCtx> {
   await applySchemaBaseline(schemaConnections.migration);
   await schemaConnections.close();
 
+  /*
+  FNXC:MultiProjectIsolation 2026-07-16-00:05:
+  Bind the layer to a project, as production does. createConnectionSetFromUrl sets the
+  `fusion.project_id` GUC per connection when given a projectId, and falls back to
+  `fusion.project_bypass=on` when not; an unbound harness therefore ran with RLS bypassed and
+  wrote blank project_ids that the migration-0006 trigger rewrote to '__legacy_unscoped__', so
+  helpers scoping on `layer.projectId ?? ""` never found the rows they had just written. That is
+  a shape production forbids -- AgentStore.backendProjectId throws on an unbound id -- so the
+  tests, not the product, were wrong.
+  */
   const connections = await createConnectionSetFromUrl(schemaBackend, {
     poolMax: 5,
     connectTimeoutSeconds: 5,
+    projectId: TEST_PROJECT_ID,
   });
-  const layer = createAsyncDataLayer(connections);
+  const layer = createAsyncDataLayer(connections, { projectId: TEST_PROJECT_ID });
 
-  const adminSql = postgres(testUrl, { max: 2, prepare: false, onnotice: () => {} });
+  /*
+  FNXC:MultiProjectIsolation 2026-07-16-00:05:
+  The admin connection seeds and inspects rows the bound layer then reads, so it must sit in the
+  SAME partition. Without the GUC its writes are blank, the migration-0006 trigger stamps them
+  __legacy_unscoped__, and the bound layer scoping on TEST_PROJECT_ID cannot see its own fixtures.
+  */
+  const adminSql = postgres(testUrl, {
+    max: 2,
+    prepare: false,
+    onnotice: () => {},
+    connection: { "fusion.project_id": TEST_PROJECT_ID },
+  });
   const adminDb = drizzle(adminSql);
   return { dbName, testUrl, layer, adminSql, adminDb };
 }
@@ -309,12 +338,12 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     expect(doc2.content).toBe("v2 content");
 
     // Read back.
-    const read = await getTaskDocument(ctx.layer.db, "KB-DOC-RT", "design");
+    const read = await getTaskDocument(ctx.layer.db, "KB-DOC-RT", "design", TEST_PROJECT_ID);
     expect(read?.revision).toBe(2);
     expect(read?.content).toBe("v2 content");
 
     // List shows the document.
-    const docs = await listTaskDocuments(ctx.layer.db, "KB-DOC-RT");
+    const docs = await listTaskDocuments(ctx.layer.db, "KB-DOC-RT", TEST_PROJECT_ID);
     expect(docs).toHaveLength(1);
   });
 
@@ -340,7 +369,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     expect(read?.title).toBe("round-trip artifact");
     expect(read?.metadata).toEqual({ source: "test" });
 
-    const list = await getArtifacts(ctx.layer.db, "KB-ART-RT");
+    const list = await getArtifacts(ctx.layer.db, "KB-ART-RT", TEST_PROJECT_ID);
     expect(list).toHaveLength(1);
   });
 
@@ -363,7 +392,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     ctx = await setupCtx();
     await insertTaskRow(ctx.layer, makeMinimalTask("KB-ACT"), { lineageId: null });
 
-    await recordActivityLogEntry(ctx.layer.db, {
+    await recordActivityLogEntry(ctx.layer.db, ctx.layer.projectId ?? "", {
       type: "task:moved",
       taskId: "KB-ACT",
       taskTitle: "Test Task",
@@ -371,7 +400,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
       metadata: { from: "todo", to: "in-progress" },
     });
 
-    const entries = await getActivityLog(ctx.layer.db, { type: "task:moved" });
+    const entries = await getActivityLog(ctx.layer.db, ctx.layer.projectId ?? "", { type: "task:moved" });
     expect(entries).toHaveLength(1);
     expect(entries[0]?.taskId).toBe("KB-ACT");
     expect(entries[0]?.metadata).toEqual({ from: "todo", to: "in-progress" });
@@ -396,7 +425,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
       });
     });
 
-    const events = await queryRunAuditEvents(ctx.layer.db, { taskId: "KB-AUDIT" });
+    const events = await queryRunAuditEvents(ctx.layer, { taskId: "KB-AUDIT" });
     expect(events).toHaveLength(1);
     expect(events[0]?.mutationType).toBe("task:create");
     expect(events[0]?.metadata).toEqual({ foo: "bar" });
@@ -611,7 +640,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
 
   it("usage events round-trip (emit + query)", async () => {
     ctx = await setupCtx();
-    const inserted = await emitUsageEvent(ctx.layer.db, {
+    const inserted = await emitUsageEvent(ctx.layer.db, ctx.layer.projectId ?? "", {
       kind: "tool_call",
       taskId: "KB-USAGE",
       agentId: "agent-1",
@@ -621,7 +650,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
     });
     expect(inserted).toBe(true);
 
-    const events = await queryUsageEvents(ctx.layer.db, { taskId: "KB-USAGE" });
+    const events = await queryUsageEvents(ctx.layer.db, ctx.layer.projectId ?? "", { taskId: "KB-USAGE" });
     expect(events).toHaveLength(1);
     expect(events[0]?.toolName).toBe("edit");
     expect(events[0]?.meta).toEqual({ duration: 42 });
@@ -629,7 +658,7 @@ pgDescribe("U14 taskstore-remaining (PostgreSQL)", () => {
 
   it("usage events fail-soft on unknown kind", async () => {
     ctx = await setupCtx();
-    const inserted = await emitUsageEvent(ctx.layer.db, {
+    const inserted = await emitUsageEvent(ctx.layer.db, ctx.layer.projectId ?? "", {
       // @ts-expect-error — intentionally invalid kind
       kind: "bogus_kind",
     });

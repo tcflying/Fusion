@@ -9,10 +9,14 @@ import {
   RESEARCH_EVENT_TYPES,
   ResearchLifecycleError,
   buildResearchDocumentKey,
+  resolveResearchFindingId,
+  promoteResearchFinding,
   type ResearchRunListOptions,
   type ResearchRunStatus,
 } from "@fusion/core";
 import { ApiError, badRequest, notFound } from "./api-error.js";
+import { getScopedStore as resolveScopedRequestStore } from "./routes/context.js";
+import type { ServerOptions } from "./server.js";
 
 const DEFAULT_AVAILABILITY = {
   available: true,
@@ -36,12 +40,6 @@ function rethrowAsApiError(error: unknown, fallback = "Internal server error"): 
   throw new ApiError(500, fallback, { code: "INTERNAL_ERROR" });
 }
 
-function getProjectId(req: Request): string | undefined {
-  if (typeof req.query.projectId === "string" && req.query.projectId.trim()) return req.query.projectId;
-  if (req.body && typeof req.body === "object" && typeof req.body.projectId === "string" && req.body.projectId.trim()) return req.body.projectId;
-  return undefined;
-}
-
 function toRunListItem(run: ResearchRun) {
   return {
     id: run.id,
@@ -61,16 +59,14 @@ function toRunDetail(run: ResearchRun) {
   };
 }
 
-function getFindingId(finding: NonNullable<ResearchRun["results"]>["findings"][number], index: number): string {
-  const maybeFinding = finding as { id?: unknown };
-  const explicitId = typeof maybeFinding.id === "string" ? maybeFinding.id.trim() : "";
-  return explicitId || `finding-${index + 1}`;
+function getFindingId(finding: NonNullable<ResearchRun["results"]>["findings"][number]): string {
+  return resolveResearchFindingId(finding);
 }
 
 function getFindingById(run: ResearchRun, findingId: string) {
   const findings = run.results?.findings ?? [];
-  for (const [index, finding] of findings.entries()) {
-    if (getFindingId(finding, index) === findingId) {
+  for (const finding of findings) {
+    if (getFindingId(finding) === findingId) {
       return { finding, findingId };
     }
   }
@@ -134,21 +130,28 @@ async function addFindingAttachment(
   }
 }
 
-export function createResearchRouter(store: TaskStore): Router {
+export function createResearchRouter(store: TaskStore, options?: ServerOptions): Router {
   const router = Router();
   const requestContext = new AsyncLocalStorage<TaskStore>();
 
   router.use((req: Request, _res: Response, next: NextFunction) => {
-    const projectId = getProjectId(req);
-    if (!projectId) {
-      requestContext.run(store, () => next());
-      return;
-    }
-
-    import("./project-store-resolver.js")
-      .then(({ getOrCreateProjectStore }) => getOrCreateProjectStore(projectId))
+    // FNXC:CentralProjectIdentity 2026-07-13-23:54:
+    // Resolve an explicit central-registry project id via the shared seam
+    // (request id → registered launch project id → raw launch store last resort).
+    // FNXC:CentralProjectIdentity 2026-07-14-00:15:
+    // Catch-and-FORWARD via next(): rethrowAsApiError throws, and a throw inside this
+    // detached promise chain escapes Express (not the request's synchronous call
+    // stack), so a store-resolution failure would hang the request. Mirror the
+    // insights/goals routers' pattern.
+    resolveScopedRequestStore(req, store, options)
       .then((scopedStore) => requestContext.run(scopedStore, () => next()))
-      .catch((error) => rethrowAsApiError(error, "Failed to resolve project store"));
+      .catch((error) => {
+        try {
+          rethrowAsApiError(error, "Failed to resolve project store");
+        } catch (apiError) {
+          next(apiError);
+        }
+      });
   });
 
   // FNXC:ResearchStore 2026-06-27-12:20:
@@ -376,6 +379,31 @@ export function createResearchRouter(store: TaskStore): Router {
       }
       const message = error instanceof Error ? error.message : "Failed to create task from research finding";
       res.status(500).json({ error: message });
+    }
+  });
+
+  router.post("/runs/:runId/findings/:findingId/promote", async (req, res) => {
+    try {
+      const scopedStore = requestContext.getStore();
+      if (!scopedStore) throw new ApiError(500, "Task store context not available");
+      const sliceId = typeof req.body?.sliceId === "string" ? req.body.sliceId.trim() : "";
+      if (!sliceId) throw badRequest("sliceId is required");
+      const missionStore = scopedStore.getMissionStore();
+      if (!("addResearchFeature" in missionStore)) throw new ApiError(409, "Research promotion requires the PostgreSQL mission store");
+      const promoted = await promoteResearchFinding(getStore() as never, missionStore, {
+        runId: req.params.runId,
+        findingId: req.params.findingId,
+        sliceId,
+        title: typeof req.body?.title === "string" ? req.body.title : undefined,
+        description: typeof req.body?.description === "string" ? req.body.description : undefined,
+        acceptanceCriteria: typeof req.body?.acceptanceCriteria === "string" ? req.body.acceptanceCriteria : undefined,
+      });
+      let feature = promoted.feature;
+      if (typeof req.body?.taskId === "string" && req.body.taskId.trim()) feature = await missionStore.linkFeatureToTask(feature.id, req.body.taskId.trim());
+      if (req.body?.triage === true) feature = await missionStore.triageFeature(feature.id);
+      res.status(promoted.reused ? 200 : 201).json({ runId: promoted.runId, findingId: promoted.findingId, feature, sliceId, citations: promoted.citations, reused: promoted.reused, taskId: feature.taskId ?? null, status: feature.status });
+    } catch (error) {
+      rethrowAsApiError(error, "Failed to promote research finding");
     }
   });
 

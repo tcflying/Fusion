@@ -16,7 +16,13 @@ vi.mock("../../pi.js", () => ({
 }));
 
 import { aiMergeTask } from "../../merger.js";
-import { git, hasGit, makeReliabilityFixture } from "./_helpers.js";
+/*
+FNXC:PgMigrationQuarantine 2026-07-18-04:10:
+VAL-REMOVAL-005 reliability fixtures use PostgreSQL AsyncDataLayer storage. Read
+run audits through getRunAuditEventsAsync so each assertion observes committed
+backend events rather than the removed synchronous SQLite read surface.
+*/
+import { git, hasGit, hasPg, makeReliabilityFixture } from "./_helpers.js";
 
 async function setupReuseTask(taskId: string, baseBranch: "main" | "master") {
   const fixture = await makeReliabilityFixture({
@@ -53,7 +59,7 @@ async function setupReuseTask(taskId: string, baseBranch: "main" | "master") {
 }
 
 describe("reliability interaction: integration-worktree-state telemetry", () => {
-  it.skipIf(!hasGit)("captures dirty user checkout while successful reuse merge leaves user files untouched", async () => {
+  it.skipIf(!hasGit || !hasPg)("captures dirty user checkout while successful reuse merge leaves user files untouched", async () => {
     const { fixture } = await setupReuseTask("FN-5351-RI-STATE-1", "main");
     try {
       const { rootDir, store, task } = fixture;
@@ -67,7 +73,7 @@ describe("reliability interaction: integration-worktree-state telemetry", () => 
       expect(result.merged).toBe(true);
       expect((await store.getTask(task.id))?.column).toBe("done");
 
-      const audits = store.getRunAuditEvents({ taskId: task.id });
+      const audits = await store.getRunAuditEventsAsync({ taskId: task.id });
       const state = audits.find((event) => event.mutationType === "merge:integration-worktree-state");
       expect(state?.metadata).toMatchObject({
         integrationMode: "reuse-task-worktree",
@@ -85,14 +91,14 @@ describe("reliability interaction: integration-worktree-state telemetry", () => 
     }
   }, 30_000);
 
-  it.skipIf(!hasGit)("emits autostash audit and continues merging when reused task worktree is dirty", async () => {
+  it.skipIf(!hasGit || !hasPg)("emits autostash audit and continues merging when reused task worktree is dirty", async () => {
     const { fixture, worktreePath } = await setupReuseTask("FN-5351-RI-STATE-2", "main");
     try {
       const { rootDir, store, task } = fixture;
       git(worktreePath, "sh -c 'printf dirty > DIRTY.txt'");
       await aiMergeTask(store, rootDir, task.id).catch(() => undefined);
 
-      const audits = store.getRunAuditEvents({ taskId: task.id });
+      const audits = await store.getRunAuditEventsAsync({ taskId: task.id });
       const autostash = audits.find((event) => event.mutationType === "merge:reuse-handoff-autostash");
       expect(autostash?.metadata).toMatchObject({ worktreePath });
       expect(typeof autostash?.metadata?.stashSha).toBe("string");
@@ -110,14 +116,14 @@ describe("reliability interaction: integration-worktree-state telemetry", () => 
     }
   }, 30_000);
 
-  it.skipIf(!hasGit)("uses resolved master branch names in all new telemetry payloads", async () => {
+  it.skipIf(!hasGit || !hasPg)("uses resolved master branch names in all new telemetry payloads", async () => {
     const { fixture } = await setupReuseTask("FN-5351-RI-STATE-3", "master");
     try {
       const { rootDir, store, task } = fixture;
       const result = await aiMergeTask(store, rootDir, task.id);
       expect(result.merged).toBe(true);
 
-      const audits = store.getRunAuditEvents({ taskId: task.id }).filter((event) =>
+      const audits = (await store.getRunAuditEventsAsync({ taskId: task.id })).filter((event) =>
         ["merge:integration-worktree-state", "merge:cwd-integration-fallback-refused", "merge:integration-ref-advance"].includes(event.mutationType),
       );
       const state = audits.find((event) => event.mutationType === "merge:integration-worktree-state");

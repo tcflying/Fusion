@@ -16,6 +16,7 @@ import {
   isGrokApiKeyFusionVisible,
   isTestModeActive,
   resolveExecutionSettingsModel,
+  resolveExecutorFallbackModel,
   resolveMergerSettingsModel,
   resolvePhaseThinkingLevel,
   resolveProjectDefaultModel,
@@ -267,8 +268,12 @@ export function resolveTitleSummarizerThinkingLevel(settings: Partial<Settings> 
  * thinking → global merger thinking → project default thinking override → global
  * default thinking. Unset at every level preserves prior default-only behavior.
  */
-export function resolveMergerThinkingLevel(settings: Partial<Settings> | undefined): string | undefined {
+export function resolveMergerThinkingLevel(
+  settings: Partial<Settings> | undefined,
+  taskThinkingLevel?: ThinkingLevel | string,
+): string | undefined {
   return firstThinkingLevel(
+    taskThinkingLevel,
     settings?.mergerThinkingLevel,
     settings?.mergerGlobalThinkingLevel,
     settings?.defaultThinkingLevelOverride,
@@ -285,6 +290,7 @@ export function resolveExecutorFallbackThinkingLevel(
   settings: Partial<Settings> | undefined,
 ): string | undefined {
   return firstThinkingLevel(
+    settings?.executionFallbackThinkingLevel,
     settings?.fallbackThinkingLevel,
     resolveExecutorThinkingLevel(taskThinkingLevel, settings),
   );
@@ -320,8 +326,18 @@ export function resolveTitleSummarizerFallbackThinkingLevel(settings: Partial<Se
   );
 }
 
-export function resolveMergerFallbackThinkingLevel(settings: Partial<Settings> | undefined): string | undefined {
-  return firstThinkingLevel(settings?.fallbackThinkingLevel, resolveMergerThinkingLevel(settings));
+/*
+FNXC:Settings-MergerModel 2026-07-16-00:00:
+Merger recovery sessions use a lane-specific thinking level when configured, then preserve the former global-fallback and merger-primary inheritance order.
+*/
+export function resolveMergerFallbackThinkingLevel(settings: Partial<Settings> | undefined, taskThinkingLevel?: string | null): string | undefined {
+  return firstThinkingLevel(
+    // FNXC:Settings-MergerModel 2026-07-16-00:00: A task's merger thinking selection governs both the primary and fallback merger session, so fallback must not re-inherit a project/global lane value.
+    taskThinkingLevel,
+    settings?.mergerFallbackThinkingLevel,
+    settings?.fallbackThinkingLevel,
+    resolveMergerThinkingLevel(settings),
+  );
 }
 
 function hasCompleteRuntimeModel(
@@ -337,6 +353,69 @@ function stripGrokCliModelProviderPrefix(modelId: string | undefined): string | 
   return normalized.startsWith(grokCliPrefix)
     ? normalized.slice(grokCliPrefix.length)
     : normalized;
+}
+
+const OMP_CLI_PROVIDER_ID = "omp-cli";
+
+function isOmpCliSelection(runtimeOptions: AgentRuntimeOptions): boolean {
+  return runtimeOptions.defaultProvider === OMP_CLI_PROVIDER_ID
+    || runtimeOptions.fallbackProvider === OMP_CLI_PROVIDER_ID;
+}
+
+function stripOmpCliModelProviderPrefix(modelId: string | undefined): string | undefined {
+  const normalized = modelId?.trim();
+  if (!normalized) return normalized;
+  const ompCliPrefix = `${OMP_CLI_PROVIDER_ID}/`;
+  return normalized.startsWith(ompCliPrefix)
+    ? normalized.slice(ompCliPrefix.length)
+    : normalized;
+}
+
+/*
+FNXC:OmpAcp 2026-07-18-09:00:
+FN-8262: `omp-cli/*` models are dynamically discovered from `omp models` and are never registered in pi's execution registry, so route primary and fallback selections to the bundled `omp` ACP runtime before pi resolves a model. Test mode must short-circuit to mock without looking up OMP; an unavailable explicit `runtimeHint: "omp"` must report the OMP plugin remediation rather than pi's misleading model-not-found error.
+*/
+function buildMissingOmpRuntimeError(): Error {
+  return new Error(
+    "Oh My Pi (omp) models require the bundled OMP runtime plugin. "
+    + "Install and enable the OMP Runtime plugin (fusion-plugin-omp-runtime) and ensure the `omp` binary is installed and authenticated (`omp acp`, credentials under ~/.omp).",
+  );
+}
+
+function deriveOmpRuntimeHint(
+  runtimeOptions: AgentRuntimeOptions,
+  pluginRunner: PluginRunner | undefined,
+): string | undefined {
+  if (!isOmpCliSelection(runtimeOptions)) return undefined;
+  try {
+    if (pluginRunner?.getRuntimeById("omp")) return "omp";
+  } catch {
+    throw buildMissingOmpRuntimeError();
+  }
+  throw buildMissingOmpRuntimeError();
+}
+
+function applyOmpCliRuntimeOptions(runtimeOptions: AgentRuntimeOptions): AgentRuntimeOptions {
+  if (runtimeOptions.defaultProvider === OMP_CLI_PROVIDER_ID) {
+    return {
+      ...runtimeOptions,
+      defaultModelId: stripOmpCliModelProviderPrefix(runtimeOptions.defaultModelId),
+    };
+  }
+
+  if (runtimeOptions.fallbackProvider === OMP_CLI_PROVIDER_ID) {
+    return {
+      ...runtimeOptions,
+      defaultProvider: runtimeOptions.fallbackProvider,
+      defaultModelId: stripOmpCliModelProviderPrefix(runtimeOptions.fallbackModelId),
+      defaultThinkingLevel: runtimeOptions.fallbackThinkingLevel ?? runtimeOptions.defaultThinkingLevel,
+      fallbackProvider: undefined,
+      fallbackModelId: undefined,
+      fallbackThinkingLevel: undefined,
+    };
+  }
+
+  return runtimeOptions;
 }
 
 function buildMissingGrokRuntimeError(): Error {
@@ -497,6 +576,19 @@ export function resolveImplicitPlanningFallbackModel(
   // (hasDistinctFallback requires the models to differ). Leave both fields
   // undefined so the existing terminal behavior is preserved cleanly.
   if (resolvedModel.provider === primaryProvider && resolvedModel.modelId === primaryModelId) {
+    /*
+    FNXC:TriageModelFallback 2026-07-14-15:54:
+    A project default override can also become the resolved planning primary. When that makes the first implicit fallback a self-swap, try the distinct inherited global default pair before declaring that no fallback exists. This preserves the one-swap ceiling while allowing an authenticated global provider to recover a project-override auth failure.
+    */
+    const inheritedGlobalProvider = settings?.defaultProvider;
+    const inheritedGlobalModelId = settings?.defaultModelId;
+    if (
+      inheritedGlobalProvider
+      && inheritedGlobalModelId
+      && (inheritedGlobalProvider !== primaryProvider || inheritedGlobalModelId !== primaryModelId)
+    ) {
+      return { provider: inheritedGlobalProvider, modelId: inheritedGlobalModelId };
+    }
     return { provider: undefined, modelId: undefined };
   }
 
@@ -546,19 +638,28 @@ export function resolveHeartbeatSessionModels(
   }
 
   const executionSettingsModel = resolveExecutionSettingsModel(settings);
-  const resolvedModel = pickSettingsThenRuntimeModel(executionSettingsModel, assignedAgentRuntimeConfig);
+  const executorFallbackModel = resolveExecutorFallbackModel(settings);
+  const assignedRuntimeModel = extractRuntimeModel(assignedAgentRuntimeConfig);
+  /*
+  FNXC:AgentHeartbeat 2026-07-14-16:13:
+  Durable-agent heartbeats must use the complete model assigned to that agent. Shared project execution defaults are only a fallback for an absent or incomplete assignment; otherwise one broken project override can park every heterogeneous agent under the same unrelated provider.
+  */
+  const resolvedModel = hasCompleteRuntimeModel(assignedRuntimeModel)
+    ? assignedRuntimeModel
+    : pickSettingsThenRuntimeModel(executionSettingsModel, assignedAgentRuntimeConfig);
 
   return {
     defaultProvider: resolvedModel.provider,
     defaultModelId: resolvedModel.modelId,
-    fallbackProvider: undefined,
-    fallbackModelId: undefined,
+    fallbackProvider: executorFallbackModel.provider,
+    fallbackModelId: executorFallbackModel.modelId,
   };
 }
 
 export function resolveMergerSessionModel(
   settings: Partial<Settings> | undefined,
   assignedAgentRuntimeConfig?: Record<string, unknown>,
+  task?: { mergerModelProvider?: string | null; mergerModelId?: string | null },
 ): { provider: string | undefined; modelId: string | undefined } {
   if (isTestModeActive(settings)) {
     return {
@@ -573,7 +674,10 @@ export function resolveMergerSessionModel(
   not execution/planning/validator. Session fallback still uses the shared global
   fallbackProvider/fallbackModelId pair at createResolvedAgentSession call sites.
   */
-  const mergerModel = resolveMergerSettingsModel(settings);
+  /* FNXC:Settings-MergerModel 2026-07-16-12:00: task pair → settings → global/default; partial task pairs inherit settings. */
+  const mergerModel = task?.mergerModelProvider && task?.mergerModelId
+    ? { provider: task.mergerModelProvider, modelId: task.mergerModelId }
+    : resolveMergerSettingsModel(settings);
   return pickSettingsThenRuntimeModel(mergerModel, assignedAgentRuntimeConfig);
 }
 
@@ -598,6 +702,11 @@ export async function createResolvedAgentSession(
     ? runtimeOptionsRaw.skills
     : skillNamesFromSelection;
 
+  /*
+  FNXC:ChatSkills 2026-07-20-10:30:
+  createResolvedAgentSession must preserve additionalSkillPaths into runtime.createSession.
+  Plugin skill names alone never deliver bodies; chat, step, and cron lanes require both halves of the #2017 contract (FN-8443 / #2364).
+  */
   const runtimeOptions: AgentRuntimeOptions = {
     ...runtimeOptionsRaw,
     ...(mergedSkillNames.length > 0 ? { skills: mergedSkillNames } : {}),
@@ -605,7 +714,9 @@ export async function createResolvedAgentSession(
   // FNXC:McpConfig 2026-06-25-22:06:
   // createResolvedAgentSession is the common lane helper for executor, reviewer, validator, workflow model-node, summarization, and merger-adjacent paths that pass MCP through this seam. Preserve `mcpServers` verbatim here; runtime-resolution/pi own support-gated forwarding and content-free skip logging.
 
-  const useMockRuntime = isMockProviderId(runtimeOptions.defaultProvider);
+  const testModeActive = settings ? isTestModeActive(settings) : false;
+  const mockProviderActive = isMockProviderId(runtimeOptions.defaultProvider);
+  const useMockRuntime = mockProviderActive || testModeActive;
   const effectiveRuntimeOptions = useMockRuntime
     ? {
       ...runtimeOptions,
@@ -635,10 +746,21 @@ export async function createResolvedAgentSession(
   const autoGrokRuntimeHint = !useMockRuntime && !runtimeHint
     ? deriveGrokRuntimeHintForNoVisibleKey(runtimeOptions, pluginRunner)
     : undefined;
-  const effectiveRuntimeHint = autoGrokRuntimeHint ?? runtimeHint;
+  const autoOmpRuntimeHint = !useMockRuntime && !runtimeHint
+    ? deriveOmpRuntimeHint(runtimeOptions, pluginRunner)
+    : undefined;
+  const effectiveRuntimeHint = autoGrokRuntimeHint ?? autoOmpRuntimeHint ?? runtimeHint;
+  const usesOmpRuntime = effectiveRuntimeHint === "omp" && isOmpCliSelection(runtimeOptions);
+  if (usesOmpRuntime) {
+    // resolveRuntime intentionally falls back to pi for an unavailable hint; OMP
+    // selections must fail here instead so pi never attempts registry resolution.
+    deriveOmpRuntimeHint(runtimeOptions, pluginRunner);
+  }
   const effectiveRuntimeOptionsWithModel: AgentRuntimeOptions = autoGrokRuntimeHint
     ? applyGrokCliNoKeyRuntimeOptions(effectiveRuntimeOptions)
-    : effectiveRuntimeOptions;
+    : usesOmpRuntime
+      ? applyOmpCliRuntimeOptions(effectiveRuntimeOptions)
+      : effectiveRuntimeOptions;
 
   const resolved = useMockRuntime
     ? {
@@ -660,23 +782,34 @@ export async function createResolvedAgentSession(
   // FNXC:GrokAcp 2026-07-12-06:30:
   // Gate customTools for non-pi runtimes before createSession so ACP/CLI
   // bridges (e.g. Grok loopback MCP) execute already-gated closures.
+  /*
+  FNXC:MergeQueue 2026-07-15-11:08:
+  Always forward sessionPurpose into runtime.createSession so pi host-extension policy can suppress dual-store fn_* tools on merger sessions (FN-7956 hang: wedged fn_task_show).
+  */
   const sessionCreateOptions: AgentRuntimeOptions =
     shouldWrapCustomToolsForRuntime(resolved.runtimeId)
       ? {
           ...effectiveRuntimeOptionsWithModel,
+          sessionPurpose,
           customTools: wrapCustomToolsForPluginRuntime(
             effectiveRuntimeOptionsWithModel.customTools,
             effectiveRuntimeOptionsWithModel,
             { runtimeId: resolved.runtimeId, sessionPurpose },
           ),
         }
-      : effectiveRuntimeOptionsWithModel;
+      : {
+          ...effectiveRuntimeOptionsWithModel,
+          sessionPurpose,
+        };
   const result = await resolved.runtime.createSession(sessionCreateOptions);
 
-  const testModeActive = settings ? isTestModeActive(settings) : false;
-  const mockProviderActive = isMockProviderId(runtimeOptions.defaultProvider);
   const noModelResolved = !mockProviderActive && !testModeActive && (!runtimeOptions.defaultProvider || !runtimeOptions.defaultModelId);
   const runtimeBuiltInFallbackModel = noModelResolved ? resolved.runtime.describeModel(result.session) : undefined;
+  const fusionToolBridgeError = (result.session as { fusionToolBridgeError?: { reasonCode?: unknown } }).fusionToolBridgeError;
+  const fusionToolBridgeReasonCode = fusionToolBridgeError?.reasonCode === "mcp-schema-server-missing"
+    || fusionToolBridgeError?.reasonCode === "bridge-start-failed"
+    ? fusionToolBridgeError.reasonCode
+    : undefined;
   if (noModelResolved) {
     /*
     FNXC:ModelResolution 2026-07-10-00:00:
@@ -700,9 +833,25 @@ export async function createResolvedAgentSession(
         mockProviderActive,
         testModeActive,
         ...(noModelResolved ? { noModelResolved: true, runtimeBuiltInFallbackModel } : {}),
+        /*
+        FNXC:FusionToolBridgeDiagnostics 2026-07-20-08:00:
+        Plugin bridge failures are session-visible, but they also need one durable
+        engine signal. Record only fixed reason codes and requested counts here;
+        tool schemas, paths, error prose, and credentials must never enter run-audit.
+        */
+        ...(fusionToolBridgeReasonCode
+          ? {
+              fusionToolBridgeFailed: true,
+              fusionToolBridgeReasonCode,
+              expectedToolCount: Array.isArray(effectiveRuntimeOptionsWithModel.customTools)
+                ? effectiveRuntimeOptionsWithModel.customTools.length
+                : 0,
+            }
+          : {}),
         ...(effectiveRuntimeHint ? { runtimeHint: effectiveRuntimeHint } : {}),
         ...(autoGrokRuntimeHint ? { reason: "grok-cli-no-visible-key" } : {}),
-        ...(!autoGrokRuntimeHint && "fallbackReason" in resolved && resolved.fallbackReason ? { reason: resolved.fallbackReason } : {}),
+        ...(autoOmpRuntimeHint ? { reason: "omp-cli-runtime" } : {}),
+        ...(!autoGrokRuntimeHint && !autoOmpRuntimeHint && "fallbackReason" in resolved && resolved.fallbackReason ? { reason: resolved.fallbackReason } : {}),
       },
     });
   } catch (err) {

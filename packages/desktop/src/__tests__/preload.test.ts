@@ -50,6 +50,18 @@ describe("preload", () => {
     expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith("app:getServerPort");
   });
 
+  it("electronAPI delegates system-browser OAuth opens to the validated IPC channel", async () => {
+    await importPreloadModule();
+    const api = getExposed<{ openExternal: (url: string) => Promise<boolean> }>("electronAPI");
+
+    await api?.openExternal("https://auth.openai.com/oauth/authorize");
+
+    expect(mocks.ipcRenderer.invoke).toHaveBeenCalledWith(
+      "shell:openExternal",
+      "https://auth.openai.com/oauth/authorize",
+    );
+  });
+
   it("electronAPI launch mode methods delegate to IPC", async () => {
     await importPreloadModule();
     const api = getExposed<{

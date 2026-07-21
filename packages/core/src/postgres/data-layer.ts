@@ -86,6 +86,14 @@ export type DrizzleDb = PostgresJsDatabase<Record<string, never>>;
  */
 export type DbTransaction = PostgresJsTransaction<Record<string, never>, Record<string, never>>;
 
+type TransactionRunAuditScope = string | null;
+
+/*
+FNXC:RunAuditProjectScope 2026-07-18-02:04:
+Run-audit writes inside a project-bound transaction must inherit that transaction's project identity. A bare transaction may only write a project audit when the caller supplies projectId explicitly; NULL project_id is reserved for the explicit global/admin seam.
+*/
+const transactionRunAuditScopes = new WeakMap<object, TransactionRunAuditScope>();
+
 /**
  * Transaction configuration. Maps the SQLite transaction modes onto PostgreSQL.
  *
@@ -98,11 +106,38 @@ export type DbTransaction = PostgresJsTransaction<Record<string, never>, Record<
  *   `SERIALIZABLE` only when the write path genuinely requires it — most
  *   paths do not, and SERIALIZABLE introduces retryable serialization
  *   failures that callers must handle.
+ *
+ * FNXC:AsyncDataLayer 2026-07-21-00:48:
+ * A caller may set server-enforced statement and lock limits for one
+ * transaction. The limits are installed with PostgreSQL's transaction-local
+ * set_config(..., true) before the callback runs, so commit or rollback
+ * restores the pooled session setting and timeout errors follow the normal
+ * transaction rollback path without Promise.race or client abandonment.
+ *
+ * FNXC:AsyncDataLayer 2026-07-21-01:17:
+ * Timeout options may cross an untyped runtime boundary. Validate them as
+ * finite positive safe integer millisecond values before opening the SQL
+ * transaction, so invalid values cannot reach PostgreSQL and omitted options
+ * retain the pre-timeout plain-transaction behavior.
  */
 export interface TransactionOptions {
   readonly isolationLevel?: "read uncommitted" | "read committed" | "repeatable read" | "serializable";
   readonly accessMode?: "read only" | "read write";
   readonly deferrable?: boolean;
+  /** Optional finite positive safe integer statement timeout for this transaction, in milliseconds. */
+  readonly statementTimeoutMs?: number;
+  /** Optional finite positive safe integer lock-acquisition timeout for this transaction, in milliseconds. */
+  readonly lockTimeoutMs?: number;
+}
+
+function assertValidTransactionTimeoutMs(
+  optionName: "statementTimeoutMs" | "lockTimeoutMs",
+  timeoutMs: unknown,
+): void {
+  if (timeoutMs === undefined) return;
+  if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError(`${optionName} must be a finite positive safe integer in milliseconds`);
+  }
 }
 
 /**
@@ -187,7 +222,9 @@ export interface AsyncDataLayer {
  * schemas.
  */
 export interface RunAuditEventInput {
+  readonly id?: string;
   readonly timestamp?: string;
+  readonly projectId?: string;
   readonly taskId?: string;
   readonly agentId: string;
   readonly runId: string;
@@ -201,6 +238,7 @@ export interface RunAuditEventInput {
 export interface RunAuditEvent {
   readonly id: string;
   readonly timestamp: string;
+  readonly projectId: string | null;
   readonly taskId: string | null;
   readonly agentId: string;
   readonly runId: string;
@@ -208,6 +246,84 @@ export interface RunAuditEvent {
   readonly mutationType: string;
   readonly target: string;
   readonly metadata: Record<string, unknown> | null;
+}
+
+type RunAuditComparablePayload = Omit<RunAuditEvent, "id">;
+
+export class RunAuditEventConflictError extends Error {
+  readonly code = "run_audit_event_conflict" as const;
+  readonly eventId: string;
+  readonly differingFields: readonly (keyof RunAuditComparablePayload)[];
+  readonly existing: RunAuditEvent;
+  readonly attempted: RunAuditEvent;
+
+  constructor(
+    eventId: string,
+    existing: RunAuditEvent,
+    attempted: RunAuditEvent,
+    differingFields: readonly (keyof RunAuditComparablePayload)[],
+  ) {
+    super(
+      `Run-audit event ${eventId} already exists with a different payload (${differingFields.join(", ")}).`,
+    );
+    this.name = "RunAuditEventConflictError";
+    this.eventId = eventId;
+    this.existing = existing;
+    this.attempted = attempted;
+    this.differingFields = differingFields;
+  }
+}
+
+export class RunAuditEventProjectScopeError extends Error {
+  readonly code = "run_audit_event_project_scope_required" as const;
+
+  constructor(message = "Run-audit writes require a project-bound transaction or explicit projectId") {
+    super(message);
+    this.name = "RunAuditEventProjectScopeError";
+  }
+}
+
+function normalizeRunAuditJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeRunAuditJson(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, normalizeRunAuditJson(nested)]),
+    );
+  }
+  return value ?? null;
+}
+
+function comparableRunAuditPayload(event: RunAuditEvent): RunAuditComparablePayload {
+  return {
+    timestamp: event.timestamp,
+    projectId: event.projectId ?? null,
+    taskId: event.taskId ?? null,
+    agentId: event.agentId,
+    runId: event.runId,
+    domain: event.domain,
+    mutationType: event.mutationType,
+    target: event.target,
+    metadata: normalizeRunAuditJson(event.metadata ?? null) as Record<string, unknown> | null,
+  };
+}
+
+function diffRunAuditPayload(
+  existing: RunAuditEvent,
+  attempted: RunAuditEvent,
+): Array<keyof RunAuditComparablePayload> {
+  const left = comparableRunAuditPayload(existing);
+  const right = comparableRunAuditPayload(attempted);
+  const differing: Array<keyof RunAuditComparablePayload> = [];
+  for (const key of Object.keys(left) as Array<keyof RunAuditComparablePayload>) {
+    if (JSON.stringify(left[key]) !== JSON.stringify(right[key])) {
+      differing.push(key);
+    }
+  }
+  return differing;
 }
 
 /**
@@ -231,18 +347,19 @@ export function createAsyncDataLayer(
   // any caller). We cast to the schema-typed view so callers get
   // compile-time table references via `layer.db`.
   const db = connections.runtime as unknown as DrizzleDb;
+  const projectId = options?.projectId;
 
   return {
     db,
-    projectId: options?.projectId,
-    async transaction<T>(fn: (tx: DbTransaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
-      return runInTransaction(db, fn, options);
+    projectId,
+    async transaction<T>(fn: (tx: DbTransaction) => Promise<T>, transactionOptions?: TransactionOptions): Promise<T> {
+      return runInTransaction(db, fn, transactionOptions, projectId);
     },
-    async transactionImmediate<T>(fn: (tx: DbTransaction) => Promise<T>, options?: TransactionOptions): Promise<T> {
+    async transactionImmediate<T>(fn: (tx: DbTransaction) => Promise<T>, transactionOptions?: TransactionOptions): Promise<T> {
       return runInTransaction(db, fn, {
         accessMode: "read write",
-        ...options,
-      });
+        ...transactionOptions,
+      }, projectId);
     },
     async ping(): Promise<void> {
       await connections.ping();
@@ -272,7 +389,11 @@ async function runInTransaction<T>(
   db: DrizzleDb,
   fn: (tx: DbTransaction) => Promise<T>,
   options?: TransactionOptions,
+  projectId?: string,
 ): Promise<T> {
+  assertValidTransactionTimeoutMs("statementTimeoutMs", options?.statementTimeoutMs);
+  assertValidTransactionTimeoutMs("lockTimeoutMs", options?.lockTimeoutMs);
+
   const config: {
     isolationLevel?: TransactionOptions["isolationLevel"];
     accessMode?: TransactionOptions["accessMode"];
@@ -290,9 +411,49 @@ async function runInTransaction<T>(
     config.accessMode !== undefined ||
     config.deferrable !== undefined;
   return db.transaction(
-    async (tx) => fn(tx as unknown as DbTransaction),
+    async (tx) => {
+      const transaction = tx as unknown as DbTransaction;
+      transactionRunAuditScopes.set(transaction, projectId ?? null);
+      try {
+        const localTimeoutSettings: SQL[] = [];
+        if (options?.statementTimeoutMs !== undefined) {
+          localTimeoutSettings.push(
+            sql`set_config('statement_timeout', ${`${options.statementTimeoutMs}ms`}, true)`,
+          );
+        }
+        if (options?.lockTimeoutMs !== undefined) {
+          localTimeoutSettings.push(
+            sql`set_config('lock_timeout', ${`${options.lockTimeoutMs}ms`}, true)`,
+          );
+        }
+        if (localTimeoutSettings.length > 0) {
+          await transaction.execute(sql`SELECT ${sql.join(localTimeoutSettings, sql`, `)}`);
+        }
+        return await fn(transaction);
+      } finally {
+        transactionRunAuditScopes.delete(transaction);
+      }
+    },
     hasConfig ? config : undefined,
   );
+}
+
+function resolveRunAuditProjectId(
+  tx: DbTransaction,
+  inputProjectId: string | undefined,
+): string {
+  const hasTransactionScope = transactionRunAuditScopes.has(tx);
+  const transactionProjectId = transactionRunAuditScopes.get(tx);
+  if (hasTransactionScope && transactionProjectId) {
+    if (inputProjectId && inputProjectId !== transactionProjectId) {
+      throw new RunAuditEventProjectScopeError(
+        `Run-audit write attempted to override bound projectId ${transactionProjectId} with ${inputProjectId}`,
+      );
+    }
+    return transactionProjectId;
+  }
+  if (inputProjectId) return inputProjectId;
+  throw new RunAuditEventProjectScopeError();
 }
 
 /**
@@ -317,11 +478,29 @@ export async function recordRunAuditEventWithinTransaction(
   tx: DbTransaction,
   input: RunAuditEventInput,
 ): Promise<RunAuditEvent> {
-  const id = randomUUID();
+  const projectId = resolveRunAuditProjectId(tx, input.projectId);
+  return persistRunAuditEventWithinTransaction(tx, input, projectId);
+}
+
+/** Explicit admin seam for the rare audit facts that are intentionally global. */
+export async function recordGlobalRunAuditEventWithinTransaction(
+  tx: DbTransaction,
+  input: Omit<RunAuditEventInput, "projectId">,
+): Promise<RunAuditEvent> {
+  return persistRunAuditEventWithinTransaction(tx, input, null);
+}
+
+async function persistRunAuditEventWithinTransaction(
+  tx: DbTransaction,
+  input: RunAuditEventInput,
+  projectId: string | null,
+): Promise<RunAuditEvent> {
+  const id = input.id ?? randomUUID();
   const timestamp = input.timestamp ?? new Date().toISOString();
-  const event: RunAuditEvent = {
+  const attempted: RunAuditEvent = {
     id,
     timestamp,
+    projectId,
     taskId: input.taskId ?? null,
     agentId: input.agentId,
     runId: input.runId,
@@ -330,20 +509,63 @@ export async function recordRunAuditEventWithinTransaction(
     target: input.target,
     metadata: input.metadata ?? null,
   };
-
+  /*
+   * FNXC:SessionRoomAudit 2026-07-17-00:50:
+   * Room lifecycle audits now supply a caller-stable id and a bound projectId.
+   * The id makes bounded retry safe against duplicate inserts, and the explicit
+   * project column is the authority for cross-project isolation; metadata is
+   * only a backfill source for older rows, never the live partition key.
+   */
   await tx.insert(schema.project.runAuditEvents).values({
-    id: event.id,
-    timestamp: event.timestamp,
-    taskId: event.taskId,
-    agentId: event.agentId,
-    runId: event.runId,
-    domain: event.domain,
-    mutationType: event.mutationType,
-    target: event.target,
-    metadata: event.metadata,
+    id,
+    timestamp,
+    projectId,
+    taskId: input.taskId ?? null,
+    agentId: input.agentId,
+    runId: input.runId,
+    domain: input.domain,
+    mutationType: input.mutationType,
+    target: input.target,
+    metadata: input.metadata ?? null,
+  }).onConflictDoNothing({
+    target: schema.project.runAuditEvents.id,
   });
-
-  return event;
+  const stored = await tx
+    .select()
+    .from(schema.project.runAuditEvents)
+    .where(eq(schema.project.runAuditEvents.id, id))
+    .limit(1)
+    .then((rows) => rows[0]);
+  if (!stored) {
+    throw new Error(`Run audit insert for ${id} did not persist a readable row`);
+  }
+  const persisted: RunAuditEvent = {
+    id: stored.id,
+    timestamp: stored.timestamp,
+    projectId: stored.projectId,
+    taskId: stored.taskId,
+    agentId: stored.agentId,
+    runId: stored.runId,
+    domain: stored.domain,
+    mutationType: stored.mutationType,
+    target: stored.target,
+    metadata: stored.metadata as Record<string, unknown> | null,
+  };
+  /*
+   * FNXC:RunAuditIdempotency 2026-07-18-02:04:
+   * A caller-stable id with no timestamp treats the first persisted timestamp
+   * as canonical. Retries compare every caller-controlled field while reusing
+   * that timestamp, so clock movement alone cannot turn a safe retry into a
+   * false payload conflict.
+   */
+  const comparableAttempted = input.id && input.timestamp === undefined
+    ? { ...attempted, timestamp: persisted.timestamp }
+    : attempted;
+  const differingFields = diffRunAuditPayload(persisted, comparableAttempted);
+  if (differingFields.length > 0) {
+    throw new RunAuditEventConflictError(id, persisted, comparableAttempted, differingFields);
+  }
+  return persisted;
 }
 
 /**
@@ -359,7 +581,10 @@ export async function recordRunAuditEvent(
   input: RunAuditEventInput,
 ): Promise<RunAuditEvent> {
   return layer.transactionImmediate(async (tx) =>
-    recordRunAuditEventWithinTransaction(tx, input),
+    recordRunAuditEventWithinTransaction(tx, {
+      ...input,
+      projectId: layer.projectId ?? input.projectId,
+    }),
   );
 }
 
@@ -399,6 +624,21 @@ export function projectTable(tableName: string): SQL {
  * candidate scan, and the search scans — see the FNXC:MultiProjectIsolation
  * markers in the task-store helpers.
  */
+/*
+FNXC:ProjectDataIsolation 2026-07-14-18:30:
+Migration 0006 forces every project-owned write through fusion_assign_project_id, which rewrites NULL/empty project_id to current_setting('fusion.project_id') or the explicit __legacy_unscoped__ quarantine. Application reads that still filter project_id = '' never see those rows. Normalize empty/missing bindings to the same sentinel used by the trigger so write+read paths stay lockstep for unbound compatibility stores and bound runtimes alike.
+*/
+export const LEGACY_UNSCOPED_PROJECT_ID = "__legacy_unscoped__";
+
+/**
+ * FNXC:ProjectDataIsolation 2026-07-14-18:30:
+ * Resolve the ownership partition written/read for a project-scoped row. Empty, null, and whitespace map to {@link LEGACY_UNSCOPED_PROJECT_ID} so application code matches the 0006 insert trigger instead of silently partitioning writes and reads differently.
+ */
+export function projectOwnershipPartition(projectId?: string | null): string {
+  const trimmed = projectId?.trim();
+  return trimmed || LEGACY_UNSCOPED_PROJECT_ID;
+}
+
 export function taskProjectScope(layer: Pick<AsyncDataLayer, "projectId">): SQL | undefined {
   return layer.projectId ? eq(schema.project.tasks.projectId, layer.projectId) : undefined;
 }
@@ -410,4 +650,29 @@ export function archivedTaskProjectScope(
   return layer.projectId
     ? eq(schema.project.archivedTasks.projectId, layer.projectId)
     : undefined;
+}
+
+/**
+ * FNXC:MultiProjectIsolation 2026-07-15-21:40:
+ * As {@link taskProjectScope}, but for any project-schema column and a raw project id rather
+ * than a bound layer. Same contract: a bound id scopes the read, an unbound one (undefined or
+ * blank) is a no-op that reads across projects.
+ *
+ * Exists because helpers that take `projectId: string` are called as `layer.projectId ?? ""`,
+ * which turns "no scope" into a literal `''` scope. That never matches anything: the
+ * `fusion_assign_project_id` BEFORE INSERT trigger (migration 0006) rewrites a written `''` to
+ * the session's `fusion.project_id` or `__legacy_unscoped__`, so reads filtering on `''` look
+ * for a value the database never stores. Writes normalize; reads must not invent a scope.
+ *
+ * Blank is treated as unbound rather than as the legacy sentinel deliberately: an unbound layer
+ * is documented as a project-agnostic / analytics reader, so it reads everything, exactly as the
+ * `taskProjectScope` no-op already does. Restricting it to `__legacy_unscoped__` rows would make
+ * an unscoped analytics read silently partial instead.
+ */
+export function projectScopeFor(
+  column: SQL | Parameters<typeof eq>[0],
+  projectId: string | undefined,
+): SQL | undefined {
+  const scope = projectId?.trim();
+  return scope ? eq(column, scope) : undefined;
 }

@@ -1,14 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertCircle, Gauge } from "lucide-react";
-import type { ActivityAnalytics, ColorTheme, LiveSnapshot, SignalsAnalytics, ThemeMode, TokenAnalytics, ToolAnalytics } from "@fusion/core";
-import { api, withProjectId } from "../../api/legacy";
+import type { ActivityAnalytics, ColorTheme, SignalsAnalytics, ThemeMode, TokenAnalytics, ToolAnalytics, TaskVerificationRequest } from "@fusion/core";
+import { api, fetchCodebaseMetrics, withProjectId, type CodebaseMetrics } from "../../api/legacy";
+import { formatBytes } from "../../utils/formatBytes";
 import { DateRangePicker, defaultPresets, rangeFromPreset, type DateRange } from "./DateRangePicker";
 import { LoadingSpinner } from "../LoadingSpinner";
+import { TaskVerificationStatus } from "../TaskVerificationStatus";
 import { TokensArea } from "./areas/TokensArea";
 import { ToolsArea } from "./areas/ToolsArea";
 import { ActivityArea } from "./areas/ActivityArea";
 import { ProductivityArea } from "./areas/ProductivityArea";
+import { ReviewArtifactsArea } from "./areas/ReviewArtifactsArea";
 import { TeamArea } from "./areas/TeamArea";
 import { WorkflowArea } from "./areas/WorkflowArea";
 import { EcosystemArea } from "./areas/EcosystemArea";
@@ -18,7 +21,8 @@ import { SignalsArea } from "./areas/SignalsArea";
 import { SystemStatsArea } from "./areas/SystemStatsArea";
 import { SystemControlsArea } from "./areas/SystemControlsArea";
 import { PluginManager } from "../PluginManager";
-import { MissionControlPanel } from "./MissionControlPanel";
+import { MissionControlPanel, useLiveSnapshot } from "./MissionControlPanel";
+import { countLiveAgentsWorking, countLiveInProgressTasks } from "./liveSnapshotMetrics";
 import { CommandCenterControls } from "./CommandCenterControls";
 import { ReliabilityView } from "../ReliabilityView";
 import { NodesView } from "../NodesView";
@@ -39,6 +43,7 @@ type SubViewId =
   | "tools"
   | "activity"
   | "productivity"
+  | "review-artifacts"
   | "team"
   | "workflows"
   | "ecosystem"
@@ -83,6 +88,7 @@ function useSubViews(nodesEnabled: boolean): SubView[] {
     { id: "tools", label: t("commandCenter.tabs.tools", "Tools") },
     { id: "activity", label: t("commandCenter.tabs.activity", "Activity") },
     { id: "productivity", label: t("commandCenter.tabs.productivity", "Productivity") },
+    { id: "review-artifacts", label: t("commandCenter.tabs.reviewArtifacts", "Review artifacts") },
     { id: "team", label: t("commandCenter.tabs.team", "Team") },
     { id: "workflows", label: t("commandCenter.tabs.workflows", "Workflows") },
     { id: "ecosystem", label: t("commandCenter.tabs.ecosystem", "Ecosystem") },
@@ -93,6 +99,11 @@ function useSubViews(nodesEnabled: boolean): SubView[] {
     { id: "plugins", label: t("commandCenter.tabs.plugins", "Plugins") },
     ...(nodesEnabled ? [{ id: "nodes" as const, label: t("commandCenter.tabs.nodes", "Nodes") }] : []),
     { id: "reliability", label: t("commandCenter.tabs.reliability", "Reliability") },
+    /*
+    FNXC:Navigation 2026-08-01-00:00:
+    FN-8352 removes Ideation from Command Center because its experimental
+    top-level navigation view is now the single canonical host.
+    */
     { id: "mission-control", label: t("commandCenter.tabs.missionControl", "Mission Control") },
   ];
 }
@@ -102,6 +113,7 @@ interface OverviewStatCard {
   label: string;
   value: string;
   subLabel?: string;
+  testId?: string;
 }
 
 /*
@@ -158,45 +170,46 @@ function OverviewTab({
   const tools = useAnalyticsArea<ToolAnalytics>("/command-center/tools", range, { projectId });
   const activity = useAnalyticsArea<ActivityAnalytics>("/command-center/activity", range, { projectId });
   const signals = useAnalyticsArea<SignalsAnalytics>("/command-center/signals", range, { projectId });
-  const [liveSnapshot, setLiveSnapshot] = useState<LiveSnapshot | null>(null);
-  const [liveSnapshotLoading, setLiveSnapshotLoading] = useState(true);
+  const { snapshot: liveSnapshot, isLoading: liveSnapshotLoading } = useLiveSnapshot(projectId);
+  const [codebaseMetrics, setCodebaseMetrics] = useState<CodebaseMetrics | null>(null);
+  const [verificationRequests, setVerificationRequests] = useState<TaskVerificationRequest[]>([]);
 
   useEffect(() => {
     let cancelled = false;
-    setLiveSnapshotLoading(true);
-    void (async () => {
-      try {
-        const result = await api<LiveSnapshot>(withProjectId("/command-center/live", projectId));
-        if (!cancelled) {
-          setLiveSnapshot(result);
-        }
-      } catch {
-        if (!cancelled) {
-          setLiveSnapshot(null);
-        }
-      } finally {
-        if (!cancelled) {
-          setLiveSnapshotLoading(false);
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    const refresh = () => void api<{ requests: TaskVerificationRequest[] }>(withProjectId("/command-center/verification-requests", projectId))
+      .then((response) => { if (!cancelled) setVerificationRequests(response.requests); })
+      .catch(() => { if (!cancelled) setVerificationRequests([]); });
+    refresh();
+    const timer = window.setInterval(refresh, OVERVIEW_TOKEN_REFRESH_MS);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setCodebaseMetrics(null);
+    if (!projectId) return () => { cancelled = true; };
+    void fetchCodebaseMetrics(projectId).then(
+      (result) => { if (!cancelled) setCodebaseMetrics(result); },
+      () => { if (!cancelled) setCodebaseMetrics(null); },
+    );
+    return () => { cancelled = true; };
   }, [projectId]);
 
   const tokenTotal = tokens.data?.totals?.totalTokens ?? 0;
   const toolCalls = tools.data?.toolCalls ?? 0;
   const activeNodes = activity.data?.activeNodes ?? 0;
   const activeAgents = activity.data?.activeAgents ?? 0;
+  const liveAgentsWorking = countLiveAgentsWorking(liveSnapshot);
   const sessionsCount = activity.data?.sessions ?? 0;
   const agentRunsTotal = activity.data?.agentRuns?.total ?? 0;
   const tasksDone = activity.data?.funnel?.doneInRange ?? 0;
   /*
-  FNXC:CommandCenter 2026-06-18-00:00:
-  The Live activity snapshot "tasks in progress" metric must reflect current board state from /command-center/live columns, not the date-range SDLC funnel entered count, because cumulative transitions inflate with history and do not decrease when tasks leave in-progress.
+  FNXC:LiveActivity 2026-08-03-00:00:
+  FN-8429 requires the Overview's live metrics to share Mission Control's
+  SSE-plus-poll snapshot and in-progress aliases. Date-range analytics remain
+  historical; they must not overwrite current board work with funnel entries.
   */
-  const inProgressTasks = liveSnapshot?.columns.find((column) => column.column === "in-progress")?.count ?? 0;
+  const inProgressTasks = countLiveInProgressTasks(liveSnapshot?.columns);
   const uniqueModels = tokens.data?.groups?.length ?? 0;
   const tokensByModelData = useMemo<BarDatum[]>(
     () =>
@@ -267,6 +280,42 @@ function OverviewTab({
       : `${tools.data.autonomyRatio.toFixed(1)}:1`
     : "—";
 
+  /*
+  FNXC:CommandCenter 2026-07-16-10:45:
+  Codebase tokens and Disk size are project-intrinsic local metrics, not agent-usage analytics. Keep their cards in loading, core-error, empty, and populated Overview branches so a new project can inspect its context and apparent footprint without sending code to a service.
+  */
+  const projectMetricCards: OverviewStatCard[] = [
+    {
+      id: "codebaseTokens",
+      testId: "cc-overview-codebase-tokens",
+      label: t("commandCenter.overview.codebaseTokens", "Codebase tokens"),
+      value: codebaseMetrics ? formatCount(codebaseMetrics.tokenEstimate) : "—",
+      subLabel: codebaseMetrics?.truncated
+        ? t("commandCenter.overview.metricsPartial", "Approx. (partial)")
+        : codebaseMetrics ? t("commandCenter.overview.codebaseTokensHint", "Local estimate calibrated to cl100k_base") : undefined,
+    },
+    {
+      id: "diskSize",
+      testId: "cc-overview-disk-size",
+      label: t("commandCenter.overview.diskSize", "Disk size"),
+      value: codebaseMetrics ? formatBytes(codebaseMetrics.diskBytes) : "—",
+      subLabel: codebaseMetrics?.truncated
+        ? t("commandCenter.overview.metricsPartial", "Approx. (partial)")
+        : codebaseMetrics ? t("commandCenter.overview.diskSizeHint", "Apparent local size") : undefined,
+    },
+  ];
+  const renderStatGrid = (items: OverviewStatCard[]) => (
+    <div className="cc-stat-grid">
+      {items.map((card) => (
+        <div key={card.id} className="card cc-stat-card" data-testid={card.testId ?? `command-center-stat-${card.id}`}>
+          <div className="cc-stat-label">{card.label}</div>
+          <div key={card.value} className={`cc-stat-value ${card.id === "tokens" ? "cc-token-count-live" : ""}`}>{card.value}</div>
+          {card.subLabel ? <span className="cc-stat-sub">{card.subLabel}</span> : null}
+        </div>
+      ))}
+    </div>
+  );
+
   const cards: OverviewStatCard[] = [
     {
       id: "tokens",
@@ -298,35 +347,59 @@ function OverviewTab({
   FNXC:CommandCenter 2026-06-22-20:55:
   The Overview's AI-engine controls are a SINGLE instance: the CommandCenterControls "AI engine" card (Stop AI Engine) now also hosts the "View Board"/"View Agents" shortcuts (threaded onChangeView). The earlier duplicate `.cc-overview-engine-panel` (a second AI Engine row) was removed — the buttons moved into the first instance.
   */
+  /*
+  FNXC:CommandCenter 2026-07-19-14:00:
+  FN-8406 makes System the sole Command Center report home. Overview keeps only
+  operational controls and analytics, avoiding a duplicate report affordance.
+  */
   const controlsSection = (
-    <>
-      <CommandCenterControls
-        projectId={projectId}
-        colorTheme={colorTheme}
-        themeMode={themeMode}
-        shadcnCustomColors={shadcnCustomColors}
-        resolvedThemeMode={resolvedThemeMode}
-        onColorThemeChange={onColorThemeChange}
-        onThemeModeChange={onThemeModeChange}
-        onShadcnCustomColorsChange={onShadcnCustomColorsChange}
-        onChangeView={onChangeView}
-      />
-    </>
+    <CommandCenterControls
+      projectId={projectId}
+      colorTheme={colorTheme}
+      themeMode={themeMode}
+      shadcnCustomColors={shadcnCustomColors}
+      resolvedThemeMode={resolvedThemeMode}
+      onColorThemeChange={onColorThemeChange}
+      onThemeModeChange={onThemeModeChange}
+      onShadcnCustomColorsChange={onShadcnCustomColorsChange}
+      onChangeView={onChangeView}
+    />
   );
   const throughputSection = (
     <div className="cc-overview-throughput" data-testid="command-center-throughput">
       <SdlcFunnel range={range} projectId={projectId} />
     </div>
   );
+  /*
+  FNXC:TaskVerificationRequest 2026-07-30-17:40:
+  Verification is operational state, not analytics. Render it in every settled
+  Overview branch so an otherwise new project still exposes executor outcomes.
+  */
+  const verificationSection = verificationRequests.length > 0 ? (
+    <section className="cc-verification-requests card" data-testid="command-center-verification-requests">
+      <div className="cc-overview-chart-header">
+        <h3 className="cc-area-section-title">Task verification</h3>
+        <p>Latest executor-owned verification requests</p>
+      </div>
+      {verificationRequests.map((request) => (
+        <div key={request.requestId} className="cc-verification-requests__item">
+          <span className="cc-verification-requests__task">{request.taskId}</span>
+          <TaskVerificationStatus request={request} compact />
+        </div>
+      ))}
+    </section>
+  ) : null;
 
   if (isInitialLoading) {
     return (
       <div className="cc-overview">
         {controlsSection}
+        {renderStatGrid(projectMetricCards)}
         <div className="cc-loading" data-testid="command-center-overview-loading">
           <div className="cc-chart-skeleton" />
           <p><LoadingSpinner label={t("commandCenter.loading", "Loading dashboard...")} /></p>
         </div>
+        {verificationSection}
         {throughputSection}
       </div>
     );
@@ -336,10 +409,12 @@ function OverviewTab({
     return (
       <div className="cc-overview">
         {controlsSection}
+        {renderStatGrid(projectMetricCards)}
         <div className="cc-error" data-testid="command-center-overview-error" role="alert">
           <AlertCircle size={24} />
           <p>{coreError}</p>
         </div>
+        {verificationSection}
         {throughputSection}
       </div>
     );
@@ -349,10 +424,12 @@ function OverviewTab({
     return (
       <div className="cc-overview">
         {controlsSection}
+        {renderStatGrid(projectMetricCards)}
         <div className="cc-empty" data-testid="command-center-empty">
           <Gauge size={28} />
           <p>{t("commandCenter.empty", "No usage data yet. Run some agents to populate the Dashboard.")}</p>
         </div>
+        {verificationSection}
         {throughputSection}
       </div>
     );
@@ -361,15 +438,7 @@ function OverviewTab({
   return (
     <div className="cc-overview">
       {controlsSection}
-      <div className="cc-stat-grid">
-        {cards.map((card) => (
-          <div key={card.id} className="card cc-stat-card" data-testid={`command-center-stat-${card.id}`}>
-            <div className="cc-stat-label">{card.label}</div>
-            <div key={card.value} className={`cc-stat-value ${card.id === "tokens" ? "cc-token-count-live" : ""}`}>{card.value}</div>
-            {card.subLabel ? <span className="cc-stat-sub">{card.subLabel}</span> : null}
-          </div>
-        ))}
-      </div>
+      {renderStatGrid([...projectMetricCards, ...cards])}
       {/*
       FNXC:CommandCenter 2026-06-18-00:00:
       The Overview should feel like a living software factory, so the live strip now surfaces animated pulses for tasks in progress, agents working, open signals, and a compact throughput trend from existing activity analytics without adding a new endpoint.
@@ -388,7 +457,7 @@ function OverviewTab({
             <span className="cc-live-metric-label">{t("commandCenter.overview.tasksInProgress", "tasks in progress")}</span>
           </span>
           <span className="cc-live-metric" data-testid="command-center-live-agents-working">
-            <span className="cc-live-metric-value">{formatCount(activeAgents)}</span>
+            <span className="cc-live-metric-value">{liveSnapshotLoading ? "—" : formatCount(liveAgentsWorking)}</span>
             <span className="cc-live-metric-label">{t("commandCenter.overview.agentsWorking", "agents working")}</span>
           </span>
           <span className="cc-live-metric" data-testid="command-center-live-tokens">
@@ -408,6 +477,7 @@ function OverviewTab({
           />
         </div>
       </div>
+      {verificationSection}
       {hasOverviewChartData ? (
         /*
         FNXC:CommandCenter 2026-06-18-00:00:
@@ -574,6 +644,8 @@ export function CommandCenter({
         return <ActivityArea range={range} projectId={projectId} />;
       case "productivity":
         return <ProductivityArea range={range} projectId={projectId} />;
+      case "review-artifacts":
+        return <ReviewArtifactsArea projectId={projectId} addToast={addToast} />;
       case "team":
         return <TeamArea range={range} projectId={projectId} addToast={addToast} />;
       case "workflows":

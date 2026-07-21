@@ -26,8 +26,8 @@ import type {
   PluginUiSlotDefinition,
   PluginUiContributionDefinition,
   PluginDashboardViewDefinition,
-  PluginOnSchemaInit,
   PluginRuntimeRegistration,
+  PluginSessionConnectorRegistration,
   CliProviderContribution,
   PluginInstallation,
   PluginManifest,
@@ -40,6 +40,7 @@ import type {
   PluginSetupHooks,
   PluginSetupCheckResult,
 } from "./plugin-types.js";
+import type { LoadedPluginSchemaContract } from "./postgres/plugin-schema-hook.js";
 import type { WorkflowExtensionContribution } from "./workflow-extension-types.js";
 import { normalizePluginUiContributionDefinition, validatePluginManifest } from "./plugin-types.js";
 import { createLogger } from "./logger.js";
@@ -158,6 +159,8 @@ export interface PluginLoaderOptions {
   pluginDirs?: string[];
   /** npm prefix for resolving packages */
   npmPrefix?: string;
+  /** Persist started/stopped/error runtime state transitions (default true). */
+  persistRuntimeState?: boolean;
 }
 
 /**
@@ -206,11 +209,21 @@ export class PluginLoader extends EventEmitter<{
 
   /** Absolute plugin package roots keyed by plugin id. */
   private pluginRoots: Map<string, string> = new Map();
+  private pluginSchemaContracts: Map<string, LoadedPluginSchemaContract> = new Map();
 
   private readonly log = createLogger("plugin-loader");
 
   constructor(private options: PluginLoaderOptions) {
     super();
+  }
+
+  private async updatePluginState(
+    pluginId: string,
+    state: PluginInstallation["state"],
+    error?: string,
+  ): Promise<void> {
+    if (this.options.persistRuntimeState === false) return;
+    await this.options.pluginStore.updatePluginState(pluginId, state, error);
   }
 
   private getProjectRoot(): string {
@@ -341,7 +354,7 @@ export class PluginLoader extends EventEmitter<{
 
         if (["blocked", "error", "unavailable"].includes(scanResult.verdict)) {
           const errorMessage = `Security scan ${scanResult.verdict}: ${scanResult.summary}`;
-          await this.options.pluginStore.updatePluginState(pluginId, "error", errorMessage);
+          await this.updatePluginState(pluginId, "error", errorMessage);
           this.emit("plugin:error", { pluginId, error: new Error(errorMessage) });
           throw new Error(errorMessage);
         }
@@ -377,13 +390,23 @@ export class PluginLoader extends EventEmitter<{
       // Resolve dependencies
       await this.resolveDependencies(plugin);
 
+      /*
+      FNXC:PluginPostgresContract 2026-07-14-18:32:
+      Schema compatibility and DDL must finish before started state, map
+      publication, or onLoad. A SQLite-only third-party plugin therefore fails
+      without leaving subscriptions, timers, or other onLoad side effects.
+      */
+      const schemaContract = this.options.taskStore.preflightPluginSchema(pluginId, plugin.hooks);
+      if (schemaContract) await this.options.taskStore.runPluginSchemaInits([schemaContract]);
+
       // Update state to started
-      await this.options.pluginStore.updatePluginState(pluginId, "started");
+      await this.updatePluginState(pluginId, "started");
 
       // Update plugin state locally and store
       plugin.state = "started";
       this.plugins.set(pluginId, plugin);
       this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      if (schemaContract) this.pluginSchemaContracts.set(pluginId, schemaContract);
 
       // Call onLoad hook
       const ctx = await this.createContext(plugin);
@@ -393,8 +416,9 @@ export class PluginLoader extends EventEmitter<{
         // onLoad failed - clean up and propagate error
         this.plugins.delete(pluginId);
         this.pluginRoots.delete(pluginId);
+        this.pluginSchemaContracts.delete(pluginId);
         const errorMsg = loadErr instanceof Error ? loadErr.message : String(loadErr);
-        await this.options.pluginStore.updatePluginState(
+        await this.updatePluginState(
           pluginId,
           "error",
           `onLoad failed: ${errorMsg}`,
@@ -414,10 +438,11 @@ export class PluginLoader extends EventEmitter<{
       // (it may have been added above before the onLoad hook)
       this.plugins.delete(pluginId);
       this.pluginRoots.delete(pluginId);
+      this.pluginSchemaContracts.delete(pluginId);
 
       // Error isolation: set error state but don't crash
       const errorMsg = err instanceof Error ? err.message : String(err);
-      await this.options.pluginStore.updatePluginState(
+      await this.updatePluginState(
         pluginId,
         "error",
         errorMsg,
@@ -588,6 +613,7 @@ export class PluginLoader extends EventEmitter<{
 
     // Snapshot old plugin for rollback
     const snapshot = { ...oldPlugin };
+    const oldSchemaContract = this.pluginSchemaContracts.get(pluginId);
 
     try {
       // Re-import the plugin module
@@ -603,11 +629,15 @@ export class PluginLoader extends EventEmitter<{
       }
 
       // Update plugin state
+      const schemaContract = this.options.taskStore.preflightPluginSchema(pluginId, newPlugin.hooks);
+      if (schemaContract) await this.options.taskStore.runPluginSchemaInits([schemaContract]);
       newPlugin.state = "started";
 
       // Replace in plugins map
       this.plugins.set(pluginId, newPlugin);
       this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      if (schemaContract) this.pluginSchemaContracts.set(pluginId, schemaContract);
+      else this.pluginSchemaContracts.delete(pluginId);
 
       // Create fresh context and call onLoad
       const ctx = await this.createContext(newPlugin);
@@ -635,6 +665,8 @@ export class PluginLoader extends EventEmitter<{
         // Restore old plugin
         this.plugins.set(pluginId, snapshot);
         this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+        if (oldSchemaContract) this.pluginSchemaContracts.set(pluginId, oldSchemaContract);
+        else this.pluginSchemaContracts.delete(pluginId);
 
         // Attempt to reactivate old plugin
         const ctx = await this.createContext(snapshot);
@@ -645,7 +677,7 @@ export class PluginLoader extends EventEmitter<{
         );
 
         // Update store state back to started
-        await this.options.pluginStore.updatePluginState(pluginId, "started");
+        await this.updatePluginState(pluginId, "started");
 
         this.log.warn(`Rollback successful for ${pluginId}`);
       } catch (rollbackErr) {
@@ -657,12 +689,13 @@ export class PluginLoader extends EventEmitter<{
 
         this.plugins.delete(pluginId);
         this.pluginRoots.delete(pluginId);
+        this.pluginSchemaContracts.delete(pluginId);
 
         const originalError = err instanceof Error ? err.message : String(err);
         const rollbackError = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
         const combinedError = `Reload failed and rollback failed: ${originalError}; ${rollbackError}`;
 
-        await this.options.pluginStore.updatePluginState(
+        await this.updatePluginState(
           pluginId,
           "error",
           combinedError,
@@ -871,12 +904,12 @@ export class PluginLoader extends EventEmitter<{
       this.log.error(`Error in onUnload for ${pluginId}:`, err);
     }
 
-    // Update state
-    await this.options.pluginStore.updatePluginState(pluginId, "stopped");
+    await this.updatePluginState(pluginId, "stopped");
 
     // Remove from loaded plugins
     this.plugins.delete(pluginId);
     this.pluginRoots.delete(pluginId);
+    this.pluginSchemaContracts.delete(pluginId);
 
     // Invalidate module cache for clean re-import
     this.invalidateModuleCache(pluginPath);
@@ -943,7 +976,7 @@ export class PluginLoader extends EventEmitter<{
 
         // Update plugin state to error
         try {
-          await this.options.pluginStore.updatePluginState(
+          await this.updatePluginState(
             pluginId,
             "error",
             err instanceof Error ? err.message : String(err),
@@ -1281,14 +1314,8 @@ export class PluginLoader extends EventEmitter<{
   /**
    * Get all schema initialization hooks from loaded plugins.
    */
-  getPluginSchemaInitHooks(): Array<{ pluginId: string; hook: PluginOnSchemaInit }> {
-    const hooks: Array<{ pluginId: string; hook: PluginOnSchemaInit }> = [];
-    for (const [pluginId, plugin] of this.plugins) {
-      if (plugin.hooks.onSchemaInit) {
-        hooks.push({ pluginId, hook: plugin.hooks.onSchemaInit });
-      }
-    }
-    return hooks;
+  getPluginSchemaInitHooks(): LoadedPluginSchemaContract[] {
+    return [...this.pluginSchemaContracts.values()];
   }
 
   /**
@@ -1303,6 +1330,23 @@ export class PluginLoader extends EventEmitter<{
       }
     }
     return runtimes;
+  }
+
+  /** Get provider-neutral Session Connector registrations from loaded plugins. */
+  getPluginSessionConnectors(): Array<{
+    pluginId: string;
+    sessionConnector: PluginSessionConnectorRegistration;
+  }> {
+    const connectors: Array<{
+      pluginId: string;
+      sessionConnector: PluginSessionConnectorRegistration;
+    }> = [];
+    for (const [pluginId, plugin] of this.plugins) {
+      if (plugin.sessionConnector) {
+        connectors.push({ pluginId, sessionConnector: plugin.sessionConnector });
+      }
+    }
+    return connectors;
   }
 
   /**

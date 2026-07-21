@@ -30,11 +30,12 @@ import { setImmediate as setImmediateCb } from "node:timers";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getTaskMergeBlocker, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkflowColumnsEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, parseExplicitDuplicateMarker, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, resolveWorkflowIrForTask, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult } from "@fusion/core";
+import { IN_REVIEW_STALL_DEADLOCK_LOG_PREFIX, IN_REVIEW_STALL_LOG_PREFIX, IN_REVIEW_STALL_TERMINAL_LOG_PREFIX, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, countRecentIdenticalStallEntries, detectDependencyCycle, detectSelfDefeatingDependency, evaluateNoCommitsNoOpFinalize, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, getInReviewStalledSignal, getInReviewStallReason, getPrimaryPrInfo, getStalePausedReviewSignal, getStalePausedTodoSignal, getTaskHardMergeBlocker, getTaskMergeBlocker, isEphemeralAgent, isMergeRequestContractShadowEnabled, isWorkflowColumnsEnabled, isWorkspaceTask, isSharedBranchGroupMemberIntegration, isNearDuplicateCanonicalInactive, parseExplicitDuplicateMarker, flagTriageDuplicate, isTriageDuplicateKeepAcknowledged, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, resolveWorkflowIrForTask, resolveReboundTarget, planLegacyAdoption, AWAITING_APPROVAL_PAUSE_REASON, type Agent, type AgentStore, type ChatStore, type MessageStore, type TaskStore, type Settings, type Task, type MergeDetails, type TaskPriority, type MergeResult, type WorkflowStepResult } from "@fusion/core";
+import { finalizePlanningSegment } from "@fusion/core";
 import type { MeshLeaseManager } from "./mesh-lease-manager.js";
 import { createLogger, schedulerLog } from "./logger.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
-import { RemovalReason, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
+import { RemovalReason, classifyTaskWorktree, getRegisteredWorktreeBranchMap, getRegisteredWorktreePaths, isUsableTaskWorktree, relocateReclaimableWorktreeIntoRoot, removeWorktree, resolveWorktreeBackend, scanIdleWorktrees, scanOrphanedBranches } from "./worktree-pool.js";
 import {
   classifyMissingWorktreeSessionStartFailure,
   extractMissingWorktreePathFromSessionStartFailure,
@@ -50,6 +51,8 @@ import {
   HEARTBEAT_ERROR_RETRY_EXHAUSTED_PAUSE_REASON,
   HEARTBEAT_ERROR_UNRECOVERABLE_PAUSE_REASON,
   isHeartbeatErrorRecoverable,
+  isModelUnavailablePark,
+  isModelUnavailableParkRecoveryEligible,
   readHeartbeatErrorRetryCount,
   resetHeartbeatErrorRecoveryMetadata,
   resolveErrorRecoveryLimit,
@@ -59,6 +62,7 @@ import { createRunAuditor, generateSyntheticRunId, type DatabaseMutationType, ty
 import { finalizeProvenAutoMergeTask, validateWorkflowDoneMergeProof } from "./auto-merge-finalization.js";
 import { AutoRecoveryDispatcher } from "./auto-recovery.js";
 import { activeSessionRegistry, executingTaskLock } from "./active-session-registry.js";
+import { isTaskStillInPlanningStage } from "./replan-target.js";
 /*
 FNXC:Workspace 2026-06-22-14:10 (Phase D review G — cycle dissolved):
 `isRepoLanded` is the CANONICAL per-repo landed predicate (Phase C, exported A6). It now lives in
@@ -69,11 +73,12 @@ self-healing — a real import cycle. Importing from the predicate module breaks
 import { isRepoLanded } from "./workspace-land-predicate.js";
 import { findAlreadyMergedTaskCommit, getCommitTaskOwnership } from "./already-merged-detector.js";
 import { getTaskCompletionBlockerForStore } from "./task-completion.js";
+import { shouldReclaimWedgedMerge } from "./merge-reclaim-policy.js";
 
-export const COMPLETED_BLOCKED_PAUSE_REASON = "completed-work-blocked";
 import { advanceIntegrationBranchRef } from "./merger-ref-update-advance.js";
 import { isAiMergeContainerDir, resolveAiMergeRootPath, resolveLegacyAiMergeRootPath, resolveWorktreesDir } from "./worktree-paths.js";
 import { canonicalFusionBranchName, resolveTaskWorkingBranch } from "./worktree-names.js";
+import { preservedWorktreeTargetPathForTask } from "./worktree-pinning.js";
 import { resolveIntegrationBranch } from "./integration-branch.js";
 import { resolveBranchGroupMergeRouting } from "./group-merge-coordinator.js";
 import type { OwnedLandedClassification } from "./merger.js";
@@ -92,52 +97,79 @@ import { DependencyBlockedTodoReporter } from "./dependency-blocked-todo-reporte
 import { filterPathsByIgnoreList, getUnmetSchedulingDependencies, isCoordinationOnlyTask, pathsOverlap, shouldHoldActiveFileScopeLease } from "./scheduler.js";
 import { evaluateParkedAgentTaskLink, PARKED_AGENT_LINK_FRESH_RUN_MS } from "./task-agent-sync.js";
 
+export {
+  COMPLETED_BLOCKED_PAUSE_REASON,
+  STALE_TEMP_MERGE_WORKTREE_MS,
+  DONE_TASK_TEMP_WORKTREE_GRACE_MS,
+  MIN_TEMP_WORKTREE_REAP_AGE_MS,
+  STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS,
+  COMPLETION_HANDOFF_LIMBO_GRACE_MS,
+  MAX_COMPLETION_HANDOFF_LIMBO_RECOVERIES,
+  MAX_POST_DONE_NONCONTINUABLE_WEDGE_RECOVERIES,
+  VALIDATOR_RUN_STALE_MAX_AGE_MS,
+  MAX_WORKTREE_SESSION_RETRIES,
+  PAUSE_ABORT_PARK_ERROR_MARKER,
+  PAUSE_ABORT_PARK_OPERATOR_MARKER,
+  MAX_AUTO_MERGE_RETRIES,
+  MAX_TRANSIENT_MERGE_RECOVERIES,
+} from "./self-healing-constants.js";
+import {
+  COMPLETED_BLOCKED_PAUSE_REASON,
+  STALE_TEMP_MERGE_WORKTREE_MS,
+  DONE_TASK_TEMP_WORKTREE_GRACE_MS,
+  MIN_TEMP_WORKTREE_REAP_AGE_MS,
+  STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS,
+  COMPLETION_HANDOFF_LIMBO_GRACE_MS,
+  MAX_COMPLETION_HANDOFF_LIMBO_RECOVERIES,
+  MAX_POST_DONE_NONCONTINUABLE_WEDGE_RECOVERIES,
+  MAX_WORKTREE_SESSION_RETRIES,
+  PAUSE_ABORT_PARK_ERROR_MARKER,
+  PAUSE_ABORT_PARK_OPERATOR_MARKER,
+  MAX_TRANSIENT_MERGE_RECOVERIES,
+} from "./self-healing-constants.js";
+export { isBranchAheadOfBase } from "./self-healing-branch.js";
+import { isBranchAheadOfBase } from "./self-healing-branch.js";
+
+export {
+  OPTIONAL_STEP_REVISION_KEY_MARKER,
+  normalizeOptionalStepRevisionKey,
+  optionalStepRevisionKey,
+  countOptionalStepRevisionAttempts,
+  optionalStepRevisionLogOutcome,
+} from "./self-healing-optional-step-revision.js";
+import {
+  optionalStepRevisionKey,
+  countOptionalStepRevisionAttempts,
+  optionalStepRevisionLogOutcome,
+} from "./self-healing-optional-step-revision.js";
+
+export {
+  extractTaskIdFromTempMergeDir,
+  getErrorMessage,
+  isTaskNotFoundError,
+  buildResumeLimboStepSignature,
+  formatRecoveryTimestamp,
+  matchGlob,
+  matchesScope,
+} from "./self-healing-path-utils.js";
+import {
+  extractTaskIdFromTempMergeDir,
+  getErrorMessage,
+  isTaskNotFoundError,
+  buildResumeLimboStepSignature,
+  formatRecoveryTimestamp,
+  matchesScope,
+} from "./self-healing-path-utils.js";
+
+
 const log = createLogger("self-healing");
-const OPTIONAL_STEP_REVISION_KEY_MARKER = "Workflow revision key:";
-
-function normalizeOptionalStepRevisionKey(value: string | undefined): string {
-  return (value ?? "").trim().toLowerCase();
-}
-
-function optionalStepRevisionKey(nodeId: string | undefined, stepName: string | undefined): string {
-  return normalizeOptionalStepRevisionKey(nodeId) || normalizeOptionalStepRevisionKey(stepName) || "pre-merge-optional-step";
-}
-
-function countOptionalStepRevisionAttempts(task: Pick<Task, "log">, key: string, stepName: string | undefined): number {
-  const normalizedKey = normalizeOptionalStepRevisionKey(key);
-  const normalizedStepName = normalizeOptionalStepRevisionKey(stepName);
-  return (task.log ?? []).filter((entry) => {
-    const action = entry.action ?? "";
-    const outcome = entry.outcome ?? "";
-    if (!/attempt \d+\//.test(action)) return false;
-    const markerIndex = outcome.indexOf(OPTIONAL_STEP_REVISION_KEY_MARKER);
-    if (markerIndex >= 0) {
-      const markerValue = outcome.slice(markerIndex + OPTIONAL_STEP_REVISION_KEY_MARKER.length).split(/\r?\n/, 1)[0]?.trim();
-      return normalizeOptionalStepRevisionKey(markerValue) === normalizedKey;
-    }
-    if (!normalizedStepName) return false;
-    return normalizeOptionalStepRevisionKey(outcome).includes(`step: ${normalizedStepName}`);
-  }).length;
-}
-
-function optionalStepRevisionLogOutcome(details: string, key: string): string {
-  return `${details}\n${OPTIONAL_STEP_REVISION_KEY_MARKER} ${key}`;
-}
-
 const worktreeMetadataReconcileLog = createLogger("worktree-metadata-reconcile");
 const execAsync = promisify(exec);
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 const DONE_TASK_INTEGRITY_SWEEP_LIMIT = 50;
 const BOARD_STALL_NOTIFICATION_COOLDOWN_MS = 60 * 60_000;
 const DB_CORRUPTION_NOTIFICATION_COOLDOWN_MS = 60 * 60 * 1000;
-export const STALE_TEMP_MERGE_WORKTREE_MS = 2 * 60 * 60 * 1000;
-export const DONE_TASK_TEMP_WORKTREE_GRACE_MS = 10 * 60 * 1000;
-export const MIN_TEMP_WORKTREE_REAP_AGE_MS = DONE_TASK_TEMP_WORKTREE_GRACE_MS;
-export const STALE_ACTIVE_BRANCH_EXECUTION_GRACE_MS = 10 * 60_000;
 const PHANTOM_EXECUTOR_BINDING_AGE_MULTIPLIER = 3;
-export const COMPLETION_HANDOFF_LIMBO_GRACE_MS = 5 * 60_000;
-export const MAX_COMPLETION_HANDOFF_LIMBO_RECOVERIES = 3;
-export const MAX_POST_DONE_NONCONTINUABLE_WEDGE_RECOVERIES = 3;
 const MAX_NO_PROGRESS_RESUME_ATTEMPTS = 2;
 
 type WorkflowRecoveryRoute =
@@ -145,22 +177,12 @@ type WorkflowRecoveryRoute =
   | { kind: "work-item-resume"; reason: "pause-abort-review-progress" | "pause-abort-manual-merge-hold" }
   | { kind: "no-action"; reason: "not-pause-abort" | "unsafe-or-not-routable" };
 
-function extractTaskIdFromTempMergeDir(dirname: string): string | null {
-  const match = /^fusion-ai-merge-(fn-\d+)-[a-z0-9]+$/i.exec(dirname);
-  return match?.[1]?.toUpperCase() ?? null;
-}
 
 function resolveRepoLocalAiMergeRoot(rootDir: string, settings?: Pick<Settings, "worktreesDir">): string {
   return resolveAiMergeRootPath(rootDir, settings);
 }
 
-function getErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
-function isTaskNotFoundError(err: unknown): boolean {
-  return /\btask\s+fn-\d+\s+not found\b/i.test(getErrorMessage(err));
-}
 
 type BranchGroupLandingRecorder = {
   recordBranchGroupMemberLanded?: (groupId: string, payload: {
@@ -206,17 +228,7 @@ async function classifyOwnedLandedEvidenceForSelfHealing(rootDir: string, task: 
   return classifyOwnedLandedEvidence(rootDir, task, { mergeTargetBranch });
 }
 
-function buildResumeLimboStepSignature(task: Task): string {
-  return JSON.stringify({
-    currentStep: task.currentStep ?? null,
-    steps: Array.isArray(task.steps) ? task.steps.map((step) => step.status) : [],
-  });
-}
 
-function formatRecoveryTimestamp(date = new Date()): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`;
-}
 
 async function preserveWorktreeChanges(repoDir: string, worktreePath: string, taskId: string): Promise<string | null> {
   try {
@@ -237,52 +249,7 @@ async function preserveWorktreeChanges(repoDir: string, worktreePath: string, ta
   }
 }
 
-function matchGlob(path: string, pattern: string): boolean {
-  if (pattern.includes("**")) {
-    const regexPattern = pattern
-      .replace(/\./g, "\\.")
-      .replace(/\*\*/g, "<<<DOUBLESTAR>>>")
-      .replace(/\*/g, "[^/]*")
-      .replace(/<<<DOUBLESTAR>>>/g, ".*");
-    const regex = new RegExp(`^${regexPattern}$`);
-    return regex.test(path);
-  }
 
-  const lastSlash = pattern.lastIndexOf("/");
-  if (lastSlash !== -1) {
-    const patternDir = pattern.slice(0, lastSlash);
-    const patternFile = pattern.slice(lastSlash + 1);
-    const pathDir = path.lastIndexOf("/") !== -1 ? path.slice(0, path.lastIndexOf("/")) : "";
-    const pathFile = path.lastIndexOf("/") !== -1 ? path.slice(path.lastIndexOf("/")) : path;
-
-    if (patternDir.includes("*")) {
-      const dirRegex = new RegExp(`^${patternDir.replace(/\./g, "\\.").replace(/\*/g, "[^/]*")}$`);
-      if (!dirRegex.test(pathDir)) return false;
-    } else if (!pathDir.endsWith(patternDir) && patternDir !== pathDir) {
-      return false;
-    }
-
-    return matchGlob(pathFile, patternFile);
-  }
-
-  const fileName = path.lastIndexOf("/") !== -1 ? path.slice(path.lastIndexOf("/") + 1) : path;
-  const regexPattern = pattern.replace(/\./g, "\\.").replace(/\*/g, "[^/]*");
-  const regex = new RegExp(`^${regexPattern}$`);
-  return regex.test(fileName) || regex.test(path);
-}
-
-function matchesScope(filePath: string, scopePatterns: string[]): boolean {
-  for (const pattern of scopePatterns) {
-    if (matchGlob(filePath, pattern)) return true;
-    const dirPattern = pattern.replace(/\/\*+$/, "");
-    if (dirPattern !== pattern && filePath.startsWith(dirPattern + "/")) return true;
-    if (pattern.endsWith("/") && filePath.startsWith(pattern)) return true;
-    const patternDir = pattern.lastIndexOf("/") >= 0 ? pattern.slice(0, pattern.lastIndexOf("/")) : "";
-    const fileDir = filePath.lastIndexOf("/") >= 0 ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
-    if (patternDir && fileDir === patternDir) return true;
-  }
-  return false;
-}
 
 export interface SelfHealingOptions {
   /** Project root directory (parent of .worktrees/) */
@@ -330,6 +297,10 @@ export interface SelfHealingOptions {
    * Used to avoid recovering active triage sessions.
    */
   getPlanningTaskIds?: () => Set<string>;
+  /** True only while the executor owns a graph Plan Review session for this task. */
+  hasActivePlanningWorkflowSession?: (taskId: string) => boolean;
+  /** Atomically fence planner ownership while advanced triage recovery runs. */
+  reserveAdvancedTriageRecovery?: (taskId: string) => (() => void) | undefined;
   /**
    * Evict tasks from the triage processor's `processing` set that have been
    * there longer than the staleness threshold (hung promises from stuck kills).
@@ -366,6 +337,19 @@ export interface SelfHealingOptions {
    * Used to avoid clearing a transient merge status mid-merge.
    */
   getActiveMergeTaskId?: () => string | null;
+  /**
+   * Wall-clock ms when the current active merge session was claimed
+   * (`activeMergeTaskId` set). Used to reclaim wedged merges without trusting
+   * `task.updatedAt` (overseer/logEntry refresh that field continuously).
+   */
+  getActiveMergeStartedAtMs?: () => number | null;
+  /**
+   * Force-abort the in-process active merge for `taskId` (AbortController +
+   * session dispose + clear identity) so drainMergeQueue can settle even when
+   * the agent ignores cooperative abort. Returns true when this task was the
+   * active owner and abort was issued.
+   */
+  abortActiveMerge?: (taskId: string, reason: string) => boolean;
   /*
   FNXC:Workspace 2026-06-22-16:40 (Phase D P1 TOCTOU — merge-queue dispatch blind spot):
   Returns true if the task is ANYWHERE in ProjectEngine's in-memory merge pipeline — queued in
@@ -433,8 +417,23 @@ const ORPHANED_EXECUTION_RECOVERY_GRACE_MS = 60_000;
  * never races a task mid-transition out of in-progress.
  */
 const LEAKED_WORKTREE_SLOT_GRACE_MS = 60_000;
-export const VALIDATOR_RUN_STALE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-const ACTIVE_MERGE_STATUSES = new Set(["merging", "merging-pr", "merging-fix"]);
+/*
+FNXC:MergeQueue 2026-07-15-09:50:
+AI merge sets status="reviewing" during the clean-room review pass (merger-ai mergeAndReview). That is still live merge activity. Without it here, recoverInterruptedMergingTasks ignored hung review-phase merges and the single-flight pump stayed wedged while the board showed no merging badge.
+*/
+/*
+FNXC:MergeQueue 2026-07-15-10:40:
+Include landing (post-approve advance/cleanup) with reviewing so a hung worktree remove cannot leave the single-flight pump un-reclaimable while the board shows no merging badge.
+*/
+/*
+FNXC:MergeReliability 2026-07-15-21:45 (FN-8004 follow-up):
+Moved to the leaf `merge-active-status.ts` and re-exported so the dashboard's manual Retry gate
+shares ONE definition with this sweep. Previously the manual gate hardcoded its own stricter view
+and refused to retry ANY merge-active status, so an orphaned `landing` stamp was un-retryable by
+hand while this sweep cleared it automatically minutes later.
+*/
+import { ACTIVE_MERGE_STATUSES, DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS, isStaleMergeActiveStatus } from "./merge-active-status.js";
+export { ACTIVE_MERGE_STATUSES, DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS, isMergeActiveStatus, isStaleMergeActiveStatus } from "./merge-active-status.js";
 const NON_TERMINAL_STEP_STATUSES = new Set(["pending", "in-progress"]);
 const STRANDED_COMPLETED_TODO_ACTIVE_STATUSES = new Set([
   "in-progress",
@@ -470,7 +469,6 @@ const ORPHANED_WITH_WORKTREE_GRACE_MS = 300_000;
  * forever; when exhausted the task stays in `in-review` for human inspection.
  */
 const MAX_TASK_DONE_RETRIES = 3;
-export const MAX_WORKTREE_SESSION_RETRIES = 3;
 const RECONCILE_SCOPE_OVERRIDE_MERGE_ACTIVE_STATUS_SET = new Set<string>(MERGE_ACTIVE_MISSING_WORKTREE_STATUSES);
 /**
  * FNXC:WorkflowLifecycle 2026-06-20-00:00: single source of truth for the
@@ -480,22 +478,10 @@ const RECONCILE_SCOPE_OVERRIDE_MERGE_ACTIVE_STATUS_SET = new Set<string>(MERGE_A
  * silently drifting if the message text is ever edited (greptile review on
  * PR #1687: a string-coupled predicate breaks with no compile-time signal).
  */
-export const PAUSE_ABORT_PARK_ERROR_MARKER = "Workflow graph failure surfaced after paused";
-export const PAUSE_ABORT_PARK_OPERATOR_MARKER = "operator action required";
 /**
  * FNXC:AutoMergeRetries 2026-06-17-04:20:
  * Keep this export as the historical default seed for tests and dashboard fallback alignment, but SelfHealingManager must call resolveMaxAutoMergeRetries(settings) at decision points so configured projects do not recover or stall at the old fixed value.
  */
-export const MAX_AUTO_MERGE_RETRIES = 3;
-/**
- * FN-5627 follow-up: bounded budget for self-healing transient-merge-failure
- * recovery. After this many cycles of `recoverTransientMergeFailures` resetting
- * `mergeRetries` and re-enqueueing the same task, the task is considered
- * genuinely stuck and stays parked as `failed` for manual review. Tracked via
- * `task.mergeDetails.transientRecoveryCount`.
- */
-export const MAX_TRANSIENT_MERGE_RECOVERIES = 2;
-
 // FN-5627: classifier extracted to `transient-merge-error-classifier.ts`
 // to avoid pulling `createLogger` into modules that mock `../logger.js`
 // (notification-service tests in particular). Re-exported here for callers
@@ -504,7 +490,8 @@ import { classifyTransientMergeError } from "./transient-merge-error-classifier.
 export { classifyTransientMergeError } from "./transient-merge-error-classifier.js";
 const MAX_STARVATION_DROPS = 3;
 const DEADLOCK_RECOVERY_COOLDOWN_MS = 15 * 60_000;
-const DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS = 5 * 60_000;
+// DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS now lives in ./merge-active-status.js (imported above)
+// so the manual Retry gate and this sweep cannot drift apart (FN-8004 follow-up).
 const DEFAULT_STALE_MERGING_FANOUT_MIN_AGE_MS = 15 * 60_000;
 const DEFAULT_UNBACKED_MERGING_FANOUT_GRACE_MS = 60_000;
 const DURABLE_ERROR_RECOVERY_BASE_COOLDOWN_MS = 30_000;
@@ -615,19 +602,34 @@ export async function autoRecoverWorktreeSessionStartFailure(
   const attemptLabel = resetRetryBudget
     ? `retry budget reset from ${task.worktreeSessionRetryCount ?? 0}/${MAX_WORKTREE_SESSION_RETRIES}`
     : `attempt ${nextCount}/${MAX_WORKTREE_SESSION_RETRIES}`;
+  /*
+  FNXC:WorkflowLifecycleTraits 2026-07-19-06:30 (U6 / KTD-10):
+  Requeue the recovered card to the workflow's TRAIT-derived backlog column (hold →
+  intake → first), not the literal "todo". builtin:coding resolves to `todo` (its
+  hold column) so the log + move stay byte-identical; a custom workflow that renamed
+  or omitted `todo` lands its recovered card in a valid backlog column instead of
+  stranding it. One IR resolution per recovered task (a rare failure path, not a
+  sweep loop) so this stays within the no-per-task-resolution-in-enumeration rule.
+  */
+  let reboundColumn = "todo";
+  try {
+    reboundColumn = resolveReboundTarget(await resolveWorkflowIrForTask(store, task.id)) ?? "todo";
+  } catch {
+    // Keep the legacy literal on any IR-resolution failure.
+  }
   await store.logEntry(
     task.id,
     noProgress
-      ? `Auto-recovered (no-progress): session-start refused unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo (${attemptLabel}, failure: ${failureExcerpt})`
+      ? `Auto-recovered (no-progress): session-start refused unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to ${reboundColumn} (${attemptLabel}, failure: ${failureExcerpt})`
       : hasMismatchedLiveWorktree && !forceClearWorktreeMetadata
-        ? `Auto-recovered: stale resume referenced unusable worktree (${missingWorktreePath}) while live task worktree is ${staleWorktree} — cleared stale session metadata and requeued to todo (${attemptLabel}, failure: ${failureExcerpt})`
-        : `Auto-recovered: retry/verification session targeted unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to todo (${attemptLabel}, failure: ${failureExcerpt})`,
+        ? `Auto-recovered: stale resume referenced unusable worktree (${missingWorktreePath}) while live task worktree is ${staleWorktree} — cleared stale session metadata and requeued to ${reboundColumn} (${attemptLabel}, failure: ${failureExcerpt})`
+        : `Auto-recovered: retry/verification session targeted unusable worktree${staleWorktree ? ` (${staleWorktree})` : ""} — cleared stale session metadata and requeued to ${reboundColumn} (${attemptLabel}, failure: ${failureExcerpt})`,
   );
   if (noProgress) {
     // #1411: backward recovery move — recoveryRehome skips order-derived adjacency.
-    await store.moveTask(task.id, "todo", { moveSource: "engine", recoveryRehome: true });
+    await store.moveTask(task.id, reboundColumn, { moveSource: "engine", recoveryRehome: true });
   } else {
-    await store.moveTask(task.id, "todo", { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
+    await store.moveTask(task.id, reboundColumn, { preserveProgress: true, moveSource: "engine", recoveryRehome: true });
   }
   return { outcome: "requeue-todo", retries: nextCount, classification };
 }
@@ -715,61 +717,6 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-export async function isBranchAheadOfBase(
-  task: Task,
-  rootDir: string,
-  preferredBaseRef?: string,
-): Promise<{ aheadCount: number; baseRef: string } | null> {
-  const branchName = resolveTaskWorkingBranch(task);
-
-  try {
-    await execAsync(`git rev-parse --verify ${shellQuote(branchName)}`, {
-      cwd: rootDir,
-      timeout: 30_000,
-    });
-  } catch {
-    return null;
-  }
-
-  const requestedBaseRef = preferredBaseRef || task.mergeDetails?.mergeTargetBranch || await resolveIntegrationBranch(rootDir, undefined);
-  let resolvedBaseRef = requestedBaseRef;
-
-  try {
-    await execAsync(`git rev-parse --verify ${shellQuote(requestedBaseRef)}`, {
-      cwd: rootDir,
-      timeout: 30_000,
-    });
-  } catch {
-    const remoteRef = `origin/${requestedBaseRef}`;
-    try {
-      await execAsync(`git rev-parse --verify ${shellQuote(remoteRef)}`, {
-        cwd: rootDir,
-        timeout: 30_000,
-      });
-      resolvedBaseRef = remoteRef;
-    } catch {
-      return null;
-    }
-  }
-
-  try {
-    const { stdout } = await execAsync(
-      `git rev-list --count ${shellQuote(resolvedBaseRef)}..${shellQuote(branchName)}`,
-      { cwd: rootDir, timeout: 30_000 },
-    );
-    const aheadCount = Number.parseInt(stdout.trim(), 10);
-    if (!Number.isFinite(aheadCount)) {
-      return null;
-    }
-    return { aheadCount, baseRef: resolvedBaseRef };
-  } catch (err: unknown) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    log.warn(
-      `Failed to compare ${branchName} against ${resolvedBaseRef} for ${task.id}: ${errorMessage}`,
-    );
-    return null;
-  }
-}
 
 function parseShortstat(output: string): Pick<LandedTaskCommit, "filesChanged" | "insertions" | "deletions"> {
   const normalized = output.trim().replace(/\n/g, " ");
@@ -818,6 +765,16 @@ export class SelfHealingManager {
   private workspacePartialLandDrops: Map<string, number> = new Map();
   private orphanWorktreeRemovalFailures: Map<string, number> = new Map();
   private finalizeUnprovenWarned = new Set<string>();
+  /*
+   * FNXC:Lifecycle 2026-07-16-10:30:
+   * FN-8141 dedup: `task:reconcile-stranded-completed-no-action` is emitted at most once per taskId
+   * while a failure-provenance block persists, so the sweeps don't spam run-audit every housekeeping
+   * cycle. Cleared on stop(); a fresh clean execution that clears the block re-arms emission naturally
+   * because the task leaves the promotable state before returning to it.
+   */
+  private strandedCompletedFailureProvenanceWarned = new Set<string>();
+  /* FNXC:SymbolLock 2026-07-30-14:20: idle symbol-lock sweeps emit one no-action audit until a stale lock re-arms the diagnostic. */
+  private symbolLockNoActionAudited = false;
   private metaResolvedSkipAuditMemo = new Map<string, string>();
   private metaStalledSkipAuditMemo = new Map<string, string>();
   private preservedQueuedOverlapLogged = new Map<string, string>();
@@ -849,6 +806,24 @@ export class SelfHealingManager {
     "token_budget_exceeded",
     AWAITING_APPROVAL_PAUSE_REASON,
   ]);
+
+  /*
+   * FNXC:GlobalCapacityRecovery 2026-07-20-06:19:
+   * A global-capacity recovery pause means the external work boundary is uncertain.
+   * Scope-decay and board-stall recovery must not turn that system hold into a runnable
+   * task; retain the reason prefix without setting userPaused, because an operator must
+   * reconcile the durable capacity attempt rather than merely resume a user pause.
+   */
+  private static readonly GLOBAL_CAPACITY_RECOVERY_PAUSE_REASON_PREFIX = "global-capacity-recovery:v1:";
+
+  private static isGlobalCapacityRecoveryPauseReason(pausedReason: string | undefined): boolean {
+    return pausedReason?.startsWith(SelfHealingManager.GLOBAL_CAPACITY_RECOVERY_PAUSE_REASON_PREFIX) === true;
+  }
+
+  private static isPausedScopeDecayExcludedReason(pausedReason: string | undefined): boolean {
+    return SelfHealingManager.PAUSED_SCOPE_DECAY_EXCLUDED_REASONS.has(pausedReason ?? "")
+      || SelfHealingManager.isGlobalCapacityRecoveryPauseReason(pausedReason);
+  }
 
   constructor(
     private store: TaskStore,
@@ -918,6 +893,11 @@ export class SelfHealingManager {
     return this.options.getActiveMergeTaskId?.() ?? null;
   }
 
+  /** The configured staleness floor shared by automatic recovery and manual Retry. */
+  public getStaleMergingStatusMinAgeMs(): number {
+    return this.options.staleMergingStatusMinAgeMs ?? DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS;
+  }
+
   private async isMergeLaneOwned(taskId: string): Promise<boolean> {
     if (this.options.getActiveMergeTaskId?.() === taskId) return true;
 
@@ -977,13 +957,11 @@ export class SelfHealingManager {
     return handedOff;
   }
 
-  private hasRecentWorktreeIncompleteDetected(taskId: string, graceMs: number): boolean {
+  private async hasRecentWorktreeIncompleteDetected(taskId: string, graceMs: number): Promise<boolean> {
     if (!Number.isFinite(graceMs) || graceMs <= 0) return false;
-    const storeWithRunAudit = this.store as { getRunAuditEvents?: (filter: { taskId: string; mutationType: string; limit: number }) => Array<{ timestamp?: string | null }> };
-    if (typeof storeWithRunAudit.getRunAuditEvents !== "function") return false;
     let events: Array<{ timestamp?: string | null }> = [];
     try {
-      events = storeWithRunAudit.getRunAuditEvents({ taskId, mutationType: "worktree:incomplete-detected", limit: 20 }) ?? [];
+      events = await this.store.getRunAuditEventsAsync({ taskId, mutationType: "worktree:incomplete-detected", limit: 20 });
     } catch {
       return false;
     }
@@ -1072,7 +1050,7 @@ export class SelfHealingManager {
 
     const anchorMs = input.stalenessAnchor ? Date.parse(input.stalenessAnchor) : Number.NaN;
     const stalenessMs = Number.isFinite(anchorMs) ? Math.max(0, Date.now() - anchorMs) : Number.POSITIVE_INFINITY;
-    const noRecentActivity = stalenessMs >= input.graceMs && !this.hasRecentWorktreeIncompleteDetected(task.id, input.graceMs);
+    const noRecentActivity = stalenessMs >= input.graceMs && !(await this.hasRecentWorktreeIncompleteDetected(task.id, input.graceMs));
 
     const ok = sessionDead && worktreeUnusable && noRecentActivity;
     return {
@@ -1115,6 +1093,68 @@ export class SelfHealingManager {
       log.warn(`[${stage}] ${task.id}: no-action audit emission failed: ${message}`);
     }
     log.log(`[${stage}] ${task.id}: triple-proof not satisfied — no action (operator-decides)`);
+  }
+
+  /*
+   * FNXC:Lifecycle 2026-07-16-10:30:
+   * FN-8141 — a stranded-completed promoter must respect failure provenance. Before promoting an
+   * all-steps-done/skipped candidate to in-review, verify its MOST RECENT execution-outcome in the
+   * durable task log was not a failure/refusal park; a park bounced to `todo`/`in-progress` by the
+   * pause-abort machinery must not be laundered into `in-review`. Slim listings strip `log`, so the
+   * full task is fetched only for candidates that already cleared the cheap step/status filters.
+   * On block, emits `task:reconcile-stranded-completed-no-action` once per taskId (deduped) and
+   * withholds promotion. Escape hatch: an operator retrying/moving the task starts a fresh execution
+   * whose clean completion marker supersedes the failure park, clearing the block with no code change.
+   * Fail-closed: if the full task cannot be read this cycle, withhold promotion rather than risk
+   * laundering a failed park.
+   */
+  private async isStrandedCompletedPromotionBlockedByFailureProvenance(
+    taskId: string,
+    sweep: "stuck-in-progress" | "stranded-todo",
+  ): Promise<boolean> {
+    let fullTask: Task;
+    try {
+      fullTask = await this.store.getTask(taskId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.warn(`[stranded-completed-provenance] ${taskId}: full-task fetch failed (${message}) — withholding ${sweep} promotion this cycle`);
+      return true;
+    }
+
+    const evaluation = evaluateCompletedPromotionFailureProvenance(fullTask);
+    if (!evaluation.blocked) {
+      // Provenance cleared (fresh clean execution or never-failed): re-arm the dedup so a later
+      // re-failure is reported again.
+      this.strandedCompletedFailureProvenanceWarned.delete(taskId);
+      return false;
+    }
+
+    if (!this.strandedCompletedFailureProvenanceWarned.has(taskId)) {
+      this.strandedCompletedFailureProvenanceWarned.add(taskId);
+      try {
+        await createRunAuditor(this.store, {
+          runId: generateSyntheticRunId("self-healing-stranded-completed-provenance", taskId),
+          agentId: "self-healing",
+          taskId,
+          taskLineageId: fullTask.lineageId,
+          phase: "stranded-completed-provenance",
+        }).database({
+          type: "task:reconcile-stranded-completed-no-action" as DatabaseMutationType,
+          target: taskId,
+          metadata: {
+            taskId,
+            reason: evaluation.reason ?? "failure-provenance",
+            sweep,
+            ...(evaluation.markerAction ? { marker: evaluation.markerAction } : {}),
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        log.warn(`[stranded-completed-provenance] ${taskId}: no-action audit emission failed: ${message}`);
+      }
+    }
+    log.log(`[stranded-completed-provenance] ${taskId}: withholding ${sweep} promotion — most recent execution ended in a failure/refusal park (operator-decides)`);
+    return true;
   }
 
   private async listActiveHeartbeatTaskIds(): Promise<Set<string>> {
@@ -1351,19 +1391,28 @@ export class SelfHealingManager {
 
     // Each recovery step is isolated — one failure doesn't prevent subsequent steps.
     const steps: Array<{ name: string; fn: () => Promise<unknown> }> = [
+      // FNXC:LegacyAdoption 2026-07-19-04:20 (U9b / KTD-8): adoption runs FIRST. Every step
+      // below reasons about `task.status` and column, so a pre-cutover row must be adopted
+      // into the post-cutover vocabulary before any of them classify it — otherwise a
+      // legacy `planning`/`needs-replan` row is judged by recovery rules that no longer
+      // have a writer for that status.
+      { name: "adopt-legacy-task-rows", fn: () => this.adoptLegacyTaskRows().then(() => undefined) },
       { name: "no-progress-no-task-done", fn: () => this.recoverNoProgressNoTaskDoneFailures().then(() => undefined) },
       { name: "completed-tasks", fn: () => this.recoverCompletedTasks().then(() => undefined) },
       { name: "recover-stranded-completed-todo", fn: () => this.recoverStrandedCompletedTodoTasks().then(() => undefined) },
+      { name: "recover-advanced-triage", fn: () => this.recoverAdvancedTriageTasks().then(() => undefined) },
       { name: "stale-incomplete-review", fn: () => this.recoverStaleIncompleteReviewTasks().then(() => undefined) },
       { name: "failed-pre-merge-steps", fn: () => this.recoverReviewTasksWithFailedPreMergeSteps().then(() => undefined) },
       { name: "missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures().then(() => undefined) },
       { name: "interrupted-merging", fn: () => this.recoverInterruptedMergingTasks().then(() => undefined) },
+      { name: "wedged-active-merge", fn: () => this.recoverWedgedActiveMerge().then(() => undefined) },
       { name: "transient-merge-failures", fn: () => this.recoverTransientMergeFailures().then(() => undefined) },
       { name: "done-merge-metadata", fn: () => this.recoverDoneTaskMergeMetadata().then(() => undefined) },
       { name: "reconcile-done-task-integrity", fn: () => this.reconcileDoneTaskIntegrity().then(() => undefined) },
       // FN-5092: must run BEFORE any merger pickup path so the merger queue is
       // not stalled by a leaked `status: "merging"` on an already-done task.
       { name: "reconcile-stale-merger-status", fn: () => this.reconcileStaleMergerStatus().then(() => undefined) },
+      { name: "reconcile-stale-duplicate-decision", fn: () => this.reconcileStaleDuplicateDecisionPause().then(() => undefined) },
       { name: "recover-already-merged-review", fn: () => this.recoverAlreadyMergedReviewTasks().then(() => undefined) },
       { name: "recover-post-done-noncontinuable-wedge", fn: () => this.recoverPostDoneNonContinuableWedge().then(() => undefined) },
       { name: "recover-completion-handoff-limbo", fn: () => this.recoverCompletionHandoffLimbo().then(() => undefined) },
@@ -1377,6 +1426,7 @@ export class SelfHealingManager {
       { name: "approved-triage", fn: () => this.recoverApprovedTriageTasks().then(() => undefined) },
       { name: "recover-starved-refinement", fn: () => this.recoverStarvedRefinementTriageTasks().then(() => undefined) },
       { name: "orphaned-planning", fn: () => this.recoverOrphanedPlanningTasks().then(() => undefined) },
+       { name: "orphaned-planning-segments", fn: () => this.finalizeOrphanedPlanningSegments().then(() => undefined) },
       { name: "reset-durable-agent-error-state-on-startup", fn: () => this.resetDurableAgentErrorStateOnStartup().then(() => undefined) },
       { name: "recover-orphaned-agents", fn: () => this.recoverOrphanedAgents().then(() => undefined) },
       { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns().then(() => undefined) },
@@ -1397,6 +1447,7 @@ export class SelfHealingManager {
       { name: "clear-stale-blocked-by", fn: () => this.clearStaleBlockedBy().then(() => undefined) },
       { name: "reconcile-self-defeating-deps", fn: () => this.reconcileSelfDefeatingDependencies().then(() => undefined) },
       { name: "reconcile-dependency-blocking-leases", fn: () => this.reconcileDependencyBlockingLeases().then(() => undefined) },
+      { name: "reconcile-stale-symbol-locks", fn: () => this.reconcileStaleSymbolLocks().then(() => undefined) },
       { name: "reconcile-completed-blocked", fn: () => this.reconcileCompletedBlockedTasks().then(() => undefined) },
       { name: "reconcile-in-review-unmet-dependencies", fn: () => this.reconcileInReviewUnmetDependencies().then(() => undefined) },
       { name: "reconcile-engine-downtime-active-timing", fn: () => this.reconcileEngineDowntimeActiveTiming().then(() => undefined) },
@@ -1427,8 +1478,10 @@ export class SelfHealingManager {
     }
   }
 
-  async reconcileEngineDowntimeActiveTiming(): Promise<{ shiftedTaskIds: string[]; downtimeMs: number }> {
-    const result = await this.store.reconcileActiveTimingForEngineDowntime();
+  async reconcileEngineDowntimeActiveTiming(
+    opts?: { engineLastActiveAtOverride?: string },
+  ): Promise<{ shiftedTaskIds: string[]; downtimeMs: number }> {
+    const result = await this.store.reconcileActiveTimingForEngineDowntime(new Date(), opts);
     const shifted = result.shiftedTaskIds.length > 0;
     const auditor = createRunAuditor(this.store, {
       runId: generateSyntheticRunId("reconcile-engine-downtime-active-timing", "global"),
@@ -1478,6 +1531,7 @@ export class SelfHealingManager {
     }
 
     this.finalizeUnprovenWarned.clear();
+    this.strandedCompletedFailureProvenanceWarned.clear();
     this.metaResolvedSkipAuditMemo.clear();
     this.metaStalledSkipAuditMemo.clear();
     this.preservedQueuedOverlapLogged.clear();
@@ -1870,6 +1924,82 @@ export class SelfHealingManager {
     const updatedAt = task.updatedAt ? Date.parse(task.updatedAt) : 0;
     if (!Number.isFinite(updatedAt) || updatedAt <= 0) return false;
     return Date.now() - updatedAt >= timeoutMs;
+  }
+
+  /*
+  FNXC:MergeQueue 2026-07-15-09:50:
+  Do not use task.updatedAt as the sole stall clock for an in-flight merge. Overseer "progressing" lines and other logEntry writes refresh updatedAt while the merger agent is completely wedged (e.g. hung fn_task_show), so age gates never fire. Prefer last merger agent-log timestamp, then active-merge claim wall clock, then updatedAt only as last resort.
+  */
+  private async getLastMergerAgentActivityMs(taskId: string): Promise<number | null> {
+    if (typeof this.store.getAgentLogs !== "function") return null;
+    try {
+      const logs = await this.store.getAgentLogs(taskId, { limit: 80 });
+      if (!Array.isArray(logs) || logs.length === 0) return null;
+      for (let i = logs.length - 1; i >= 0; i--) {
+        const entry = logs[i] as { agent?: string; timestamp?: string };
+        if (entry.agent !== "merger" || !entry.timestamp) continue;
+        const ms = Date.parse(entry.timestamp);
+        if (Number.isFinite(ms) && ms > 0) return ms;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async measureActiveMergeSilenceMs(taskId: string): Promise<number | null> {
+    const now = Date.now();
+    const lastMergerMs = await this.getLastMergerAgentActivityMs(taskId);
+    if (lastMergerMs != null) return now - lastMergerMs;
+    const startedAt = this.options.getActiveMergeStartedAtMs?.() ?? null;
+    if (startedAt != null && Number.isFinite(startedAt) && startedAt > 0) {
+      return now - startedAt;
+    }
+    return null;
+  }
+
+  /*
+  FNXC:MergeQueue 2026-07-15-10:05:
+  Status-aware silence reclaim via shouldReclaimWedgedMerge: reviewing reclaims after stuckTimeout;
+  merging* requires a higher silence floor so monorepo single-bash verify is not false-reclaimed;
+  null/other with live owner reclaims as a dead pump.
+  */
+  private async isActiveMergeWedged(
+    taskId: string,
+    timeoutMs: number,
+    status?: string | null,
+  ): Promise<{ wedged: boolean; silenceMs: number | null }> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { wedged: false, silenceMs: null };
+    const activeId = this.options.getActiveMergeTaskId?.() ?? null;
+    if (activeId !== taskId) return { wedged: false, silenceMs: null };
+
+    const silenceMs = await this.measureActiveMergeSilenceMs(taskId);
+    if (silenceMs == null) return { wedged: false, silenceMs: null };
+
+    let resolvedStatus = status;
+    if (resolvedStatus === undefined) {
+      const task = await this.store.getTask(taskId).catch(() => null);
+      resolvedStatus = task?.status ?? null;
+    }
+
+    return {
+      wedged: shouldReclaimWedgedMerge({
+        status: resolvedStatus,
+        silenceMs,
+        stuckTimeoutMs: timeoutMs,
+      }),
+      silenceMs,
+    };
+  }
+
+  private async isPastInterruptedMergeGraceAsync(task: Task, timeoutMs: number): Promise<boolean> {
+    const activeId = this.options.getActiveMergeTaskId?.() ?? null;
+    if (activeId === task.id) {
+      // Live owner: status-aware merger silence / claim-age, not updatedAt (overseer noise).
+      const { wedged } = await this.isActiveMergeWedged(task.id, timeoutMs, task.status);
+      return wedged;
+    }
+    return this.isPastInterruptedMergeGrace(task, timeoutMs);
   }
 
   private async findLandedTaskCommit(
@@ -2435,6 +2565,10 @@ export class SelfHealingManager {
           },
         },
         {
+          name: "reconcile-stale-symbol-locks",
+          fn: () => this.reconcileStaleSymbolLocks(),
+        },
+        {
           name: "reconcile-phantom-committed-reservations",
           fn: async () => {
             /*
@@ -2488,18 +2622,9 @@ export class SelfHealingManager {
               log.log("Maintenance batch 1 step \"prune-operational-logs\" skipped — operationalLogRetentionDays is not enabled");
               return;
             }
-            /*
-             * FNXC:SqliteFinalRemoval 2026-06-25-16:15:
-             * pruneOperationalLogs uses SQLite-specific DELETE on operational
-             * log tables. In backend mode, PostgreSQL autovacuum handles
-             * bloat; the operational-log pruning path is skipped until a PG
-             * equivalent is wired.
-             */
-            if (this.store.isBackendMode()) {
-              log.log("Maintenance batch 1 step \"prune-operational-logs\" skipped — backend mode (PostgreSQL autovacuum)");
-              return;
-            }
-            const { deletedTotal, deletedByTable } = this.store.pruneOperationalLogs(days * 86_400_000);
+            // FNXC:PostgresRetention 2026-07-14-17:16: Autovacuum cannot replace
+            // retention; await project-scoped deletes on the PostgreSQL layer.
+            const { deletedTotal, deletedByTable } = await this.store.pruneOperationalLogsAsync(days * 86_400_000);
             const detail = Object.entries(deletedByTable)
               .filter(([, n]) => n > 0)
               .map(([t, n]) => `${t}=${n}`)
@@ -2515,7 +2640,7 @@ export class SelfHealingManager {
               log.log("Maintenance batch 1 step \"prune-agent-log-files\" skipped — agentLogFileRetentionDays is not enabled");
               return;
             }
-            const { prunedFiles, prunedEntries, freedBytes } = this.store.pruneAgentLogFiles(days);
+            const { prunedFiles, prunedEntries, freedBytes } = await this.store.pruneAgentLogFilesAsync(days);
             log.log(`Maintenance batch 1 step "prune-agent-log-files" succeeded — files=${prunedFiles} entries=${prunedEntries} bytes=${freedBytes}`);
           },
         },
@@ -2572,16 +2697,19 @@ export class SelfHealingManager {
           },
           { name: "recover-completed-tasks", fn: () => this.recoverCompletedTasks() },
           { name: "recover-stranded-completed-todo", fn: () => this.recoverStrandedCompletedTodoTasks() },
+          { name: "recover-advanced-triage", fn: () => this.recoverAdvancedTriageTasks() },
           { name: "recover-stale-incomplete-review", fn: () => this.recoverStaleIncompleteReviewTasks() },
           { name: "recover-failed-pre-merge-steps", fn: () => this.recoverReviewTasksWithFailedPreMergeSteps() },
           { name: "recover-missing-worktree-review-failures", fn: () => this.recoverMissingWorktreeReviewFailures() },
           { name: "recover-interrupted-merging", fn: () => this.recoverInterruptedMergingTasks() },
+          { name: "recover-wedged-active-merge", fn: () => this.recoverWedgedActiveMerge() },
           { name: "recover-transient-merge-failures", fn: () => this.recoverTransientMergeFailures() },
           { name: "recover-done-merge-metadata", fn: () => this.recoverDoneTaskMergeMetadata() },
           { name: "recover-stale-merging-status", fn: () => this.recoverStaleMergingStatus() },
           { name: "finalize-noop-review", fn: () => this.finalizeNoOpReviewTasks() },
           { name: "reconcile-done-task-integrity", fn: () => this.reconcileDoneTaskIntegrity() },
           { name: "reconcile-stale-merger-status", fn: () => this.reconcileStaleMergerStatus() },
+          { name: "reconcile-stale-duplicate-decision", fn: () => this.reconcileStaleDuplicateDecisionPause() },
           { name: "recover-mergeable-review", fn: () => this.recoverMergeableReviewTasks() },
           // FNXC:Workspace 2026-06-22-09:30 (Phase D U1) — workspace-mode reconcilers.
           { name: "reconcile-workspace-partial-lands", fn: () => this.reconcileWorkspacePartialLands() },
@@ -2604,6 +2732,7 @@ export class SelfHealingManager {
           { name: "resolve-explicit-duplicate-markers", fn: () => this.resolveExplicitDuplicateMarkerTasks() },
           { name: "recover-starved-refinement", fn: () => this.recoverStarvedRefinementTriageTasks() },
           { name: "recover-orphaned-planning", fn: () => this.recoverOrphanedPlanningTasks() },
+           { name: "finalize-orphaned-planning-segments", fn: () => this.finalizeOrphanedPlanningSegments() },
           { name: "recover-ghost-review", fn: () => this.recoverGhostReviewTasks() },
           { name: "recover-orphaned-agents", fn: () => this.recoverOrphanedAgents() },
           { name: "recover-stale-heartbeat-runs", fn: () => this.recoverStaleHeartbeatRuns() },
@@ -2794,7 +2923,13 @@ export class SelfHealingManager {
         !t.paused &&
         !executingIds.has(t.id) &&
         t.steps.length > 0 &&
-        t.steps.every((s) => s.status === "done" || s.status === "skipped"),
+        t.steps.every((s) => s.status === "done" || s.status === "skipped") &&
+        // FNXC:Lifecycle 2026-07-16-21:40:
+        // FN-8141 — do not auto-recover a skip-bypass-tainted task: its steps were skipped
+        // after a bulk-step-completion refusal with no accepted fn_task_done, so promoting it
+        // to in-review would launder unreviewed work. It stays in-progress until an accepted
+        // fn_task_done or operator retry clears the taint.
+        !evaluateSkipBypassTaint(t).blocked,
       );
 
       if (stuckCompleted.length === 0) return 0;
@@ -2809,6 +2944,11 @@ export class SelfHealingManager {
         const latestExecutingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
         if (latestExecutingIds.has(task.id)) {
           log.log(`${task.id} started executing concurrently — skipping recovery this cycle`);
+          continue;
+        }
+        // FN-8141: never promote a stuck-in-progress task whose most recent execution ended in a
+        // failure/refusal park — honor the honest failure instead of laundering it into in-review.
+        if (await this.isStrandedCompletedPromotionBlockedByFailureProvenance(task.id, "stuck-in-progress")) {
           continue;
         }
         log.log(`Recovering completed task ${task.id}: ${task.title || task.description?.slice(0, 60) || "(untitled)"}`);
@@ -2850,6 +2990,14 @@ export class SelfHealingManager {
          * FN-6461 keeps skipped-to-completion no-commits tasks out of the stranded-todo promoter so a finalize guard demotion cannot loop back into in-review before an operator fixes the incomplete work.
          */
         if (evaluateNoCommitsNoOpFinalize(task).blocked) return false;
+        /*
+         * FNXC:Lifecycle 2026-07-16-21:40:
+         * FN-8141 — the stranded-todo promoter was the exact path that laundered FN-8141 into
+         * in-review. A skip-bypass-tainted task (steps skipped after a bulk-step-completion
+         * refusal with no accepted fn_task_done) must not promote here; the bounded
+         * requeue/park machinery converges it to a human instead.
+         */
+        if (evaluateSkipBypassTaint(task).blocked) return false;
         if (task.error) return false;
         if (task.status && STRANDED_COMPLETED_TODO_ACTIVE_STATUSES.has(task.status)) return false;
         if (task.reviewState?.refreshStatus === "refreshing") return false;
@@ -2865,6 +3013,11 @@ export class SelfHealingManager {
         const latestExecutingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
         if (latestExecutingIds.has(task.id)) {
           log.log(`${task.id} started executing concurrently — skipping stranded todo recovery this cycle`);
+          continue;
+        }
+        // FN-8141: never promote a stranded-todo task whose most recent execution ended in a
+        // failure/refusal park — the pause-abort bounce to todo must not launder the failure.
+        if (await this.isStrandedCompletedPromotionBlockedByFailureProvenance(task.id, "stranded-todo")) {
           continue;
         }
 
@@ -2884,6 +3037,128 @@ export class SelfHealingManager {
   }
 
   /**
+   * Re-home workflow-graph tasks stranded in the planner column after the
+   * executor aborted its own column-boundary move. A worktree plus a durable
+   * graph pin is the proof that this is advanced execution state, not an
+   * ordinary triage card. Completed work goes through the normal review
+   * recovery seam; incomplete remediation resumes at its pinned column.
+   */
+  async recoverAdvancedTriageTasks(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+
+      const tasks = await this.store.listTasks({ column: "triage", slim: true });
+      const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
+      const planningIds = this.options.getPlanningTaskIds?.() ?? new Set<string>();
+      const hasForeignPathOwner = (task: Task) => {
+        if (!task.worktree) return false;
+        const owner = activeSessionRegistry.lookupByPath(task.worktree);
+        return owner != null && owner.taskId !== task.id;
+      };
+      const candidates = tasks.filter((task) =>
+        task.column === "triage"
+        && task.status == null
+        && !task.paused
+        && !task.error
+        && Boolean(task.worktree)
+        && Boolean(task.workflowIrPinNodeId)
+        && !executingIds.has(task.id)
+        && !planningIds.has(task.id)
+        && this.options.isTaskActive?.(task.id) !== true
+        && this.options.getActiveMergeTaskId?.() !== task.id
+        && !hasForeignPathOwner(task),
+      );
+
+      let recovered = 0;
+      for (const snapshot of candidates) {
+        const releaseReservation = this.options.reserveAdvancedTriageRecovery?.(snapshot.id);
+        if (this.options.reserveAdvancedTriageRecovery && !releaseReservation) continue;
+        try {
+          const live = await this.store.getTask(snapshot.id);
+          if (
+            live.column !== "triage"
+            || live.status != null
+            || live.paused
+            || live.error
+            || !live.worktree
+            || !live.workflowIrPinNodeId
+            || (this.options.getExecutingTaskIds?.() ?? new Set<string>()).has(live.id)
+            || this.options.isTaskActive?.(live.id) === true
+            || this.options.getActiveMergeTaskId?.() === live.id
+            || hasForeignPathOwner(live)
+          ) {
+            continue;
+          }
+
+          // A prior aborted graph can leave its own registry claim behind after every
+          // executable/planning/merge owner has gone away. The durable task row and the
+          // liveness callbacks above prove that claim is stale; clear it so completed
+          // recovery can reuse the preserved worktree instead of rejecting its own path.
+          const pathOwner = activeSessionRegistry.lookupByPath(live.worktree);
+          if (pathOwner?.taskId === live.id) {
+            activeSessionRegistry.unregisterPath(live.worktree);
+          }
+
+          const steps = live.steps ?? [];
+          const complete = steps.length > 0
+            && steps.every((step) => step.status === "done" || step.status === "skipped");
+          if (complete) {
+            if (!this.options.recoverCompletedTask) continue;
+            if (await this.options.recoverCompletedTask(live)) recovered++;
+            continue;
+          }
+
+          const resumeColumn = live.workflowIrPinColumnId;
+          if (!resumeColumn || resumeColumn === "triage") continue;
+          const moved = await this.store.moveTaskIf(live.id, resumeColumn, (current) =>
+            current.column === "triage"
+            && current.status == null
+            && !current.paused
+            && !current.error
+            && current.worktree === live.worktree
+            && current.workflowIrPinNodeId === live.workflowIrPinNodeId
+            && current.workflowIrPinColumnId === resumeColumn
+            && !(this.options.getExecutingTaskIds?.() ?? new Set<string>()).has(current.id)
+            && !(this.options.getPlanningTaskIds?.() ?? new Set<string>()).has(current.id)
+            && this.options.isTaskActive?.(current.id) !== true
+            && this.options.getActiveMergeTaskId?.() !== current.id
+            && !hasForeignPathOwner(current),
+          {
+            moveSource: "engine",
+            workflowMoveSource: "self-healing-advanced-triage",
+            workflowMoveMetadata: {
+              reason: "graph-boundary-self-abort-recovery",
+              pinnedNodeId: live.workflowIrPinNodeId,
+            },
+            recoveryRehome: true,
+            bypassGuards: true,
+            preserveProgress: true,
+            preserveWorktree: true,
+            preserveResumeState: true,
+          });
+          if (!moved.moved) continue;
+          await this.store.logEntry(
+            live.id,
+            `Auto-recovered workflow task stranded in triage — resumed at pinned ${resumeColumn} column`,
+          );
+          recovered++;
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          log.warn(`Failed to recover advanced triage task ${snapshot.id}: ${errorMessage}`);
+        } finally {
+          releaseReservation?.();
+        }
+      }
+      return recovered;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Advanced triage recovery failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  /**
    * Clear stale transient merge statuses when no active merger owns the task.
    *
    * @returns Number of tasks unblocked by clearing stale status
@@ -2893,7 +3168,7 @@ export class SelfHealingManager {
       const settings = await this.store.getSettings();
       if (settings.globalPause || settings.enginePaused) return 0;
 
-      const minAgeMs = this.options.staleMergingStatusMinAgeMs ?? DEFAULT_STALE_MERGING_STATUS_MIN_AGE_MS;
+      const minAgeMs = this.getStaleMergingStatusMinAgeMs();
       if (!Number.isFinite(minAgeMs) || minAgeMs <= 0) return 0;
 
       const now = Date.now();
@@ -2901,12 +3176,15 @@ export class SelfHealingManager {
       const tasks = await this.store.listTasks({ column: "in-review", slim: true });
       const stale = tasks.filter((task) => {
         if (task.column !== "in-review" || task.paused) return false;
-        if (!task.status || (task.status !== "merging" && task.status !== "merging-pr")) return false;
-        if (activeMergeTaskId && activeMergeTaskId === task.id) return false;
-
-        const updatedAtMs = task.updatedAt ? Date.parse(task.updatedAt) : Number.NaN;
-        if (!Number.isFinite(updatedAtMs)) return false;
-        return now - updatedAtMs >= minAgeMs;
+        /*
+        FNXC:MergeReliability 2026-07-15-21:45 (FN-8004 follow-up):
+        Staleness now comes from the shared `isStaleMergeActiveStatus` leaf, which the dashboard's
+        manual Retry gate also calls. Inlining the rule here is what let the manual path drift into
+        refusing every merge-active status. Covers: merge-active stamp, no live in-process owner
+        (reclaimed instead by recoverWedgedActiveMerge / recoverInterruptedMergingTasks via
+        merger-silence clocks), and `updatedAt` untouched for minAgeMs.
+        */
+        return isStaleMergeActiveStatus(task, { activeMergeTaskId, nowMs: now, minAgeMs });
       });
 
       if (stale.length === 0) return 0;
@@ -2943,6 +3221,134 @@ export class SelfHealingManager {
       const errorMessage = err instanceof Error ? err.message : String(err);
       log.error(`Stale merging status recovery failed: ${errorMessage}`);
       return 0;
+    }
+  }
+
+  /*
+  FNXC:MergeQueue 2026-07-15-09:50:
+  Reclaim the in-process single-flight merge owner when it is wedged with no merger agent progress. Covers:
+  - status="reviewing" (AI merge review pass) that recoverStaleMergingStatus skipped because getActiveMergeTaskId still pointed at the owner
+  - status already cleared/null while activeMergeTaskId + mergeRunning still hold the pump (board shows no merging badge, nothing starts)
+  - overseer logEntry noise keeping updatedAt fresh so status-age gates never fire
+  Uses merger agent-log silence (preferred) or active-merge claim wall clock — never updatedAt alone.
+  */
+  async recoverWedgedActiveMerge(): Promise<number> {
+    try {
+      const settings = await this.store.getSettings();
+      if (settings.globalPause || settings.enginePaused) return 0;
+      const timeoutMs = settings.taskStuckTimeoutMs;
+      if (!timeoutMs || timeoutMs <= 0) return 0;
+
+      const activeId = this.options.getActiveMergeTaskId?.() ?? null;
+      if (!activeId) return 0;
+
+      const task = await this.store.getTask(activeId).catch(() => null);
+      const { wedged, silenceMs } = await this.isActiveMergeWedged(activeId, timeoutMs, task?.status ?? null);
+      if (!wedged) {
+        return 0;
+      }
+
+      if (task?.paused) {
+        // Pause should already abort; if identity remains, force-clear the lane.
+        const aborted = this.options.abortActiveMerge?.(activeId, "wedged-active-merge-while-paused") ?? false;
+        if (aborted) {
+          log.warn(`Force-aborted wedged active merge ${activeId} that remained after pause`);
+          await this.emitWedgedActiveMergeAudit(activeId, {
+            reason: "wedged-active-merge-while-paused",
+            silenceMs,
+            limitMs: timeoutMs,
+            status: task.status ?? null,
+          });
+          return 1;
+        }
+        return 0;
+      }
+
+      if (task && task.column !== "in-review") {
+        const aborted = this.options.abortActiveMerge?.(activeId, "wedged-active-merge-left-in-review") ?? false;
+        if (aborted) {
+          log.warn(`Force-aborted wedged active merge ${activeId}: task column is ${task.column}`);
+          await this.emitWedgedActiveMergeAudit(activeId, {
+            reason: "wedged-active-merge-left-in-review",
+            silenceMs,
+            limitMs: timeoutMs,
+            status: task.status ?? null,
+            column: task.column,
+          });
+          return 1;
+        }
+        return 0;
+      }
+
+      log.warn(`Reclaiming wedged active merge ${activeId} (no merger agent progress past stuck timeout)`);
+      this.options.abortActiveMerge?.(activeId, "wedged-active-merge-no-merger-progress");
+      this.options.clearMergeActive?.(activeId);
+      if (task) {
+        if (task.status && ACTIVE_MERGE_STATUSES.has(task.status)) {
+          await this.store.updateTask(activeId, { status: null, error: null }).catch(() => undefined);
+        }
+        await this.store
+          .logEntry(
+            activeId,
+            "Auto-recovered: wedged active merge reclaimed after merger agent silence — merge will be retried",
+          )
+          .catch(() => undefined);
+      }
+      await this.emitWedgedActiveMergeAudit(activeId, {
+        reason: "wedged-active-merge-no-merger-progress",
+        silenceMs,
+        limitMs: timeoutMs,
+        status: task?.status ?? null,
+      });
+      if (task && allowsAutoMergeProcessing(task, settings) && !task.paused && task.column === "in-review") {
+        try {
+          this.options.enqueueMerge?.(activeId);
+        } catch (enqueueErr: unknown) {
+          log.warn(
+            `Failed to re-enqueue ${activeId} after wedged-active-merge recovery: ${enqueueErr instanceof Error ? enqueueErr.message : String(enqueueErr)}`,
+          );
+        }
+      }
+      return 1;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      log.error(`Wedged active merge recovery failed: ${errorMessage}`);
+      return 0;
+    }
+  }
+
+  private async emitWedgedActiveMergeAudit(
+    taskId: string,
+    metadata: {
+      reason: string;
+      silenceMs: number | null;
+      limitMs: number;
+      status: string | null;
+      column?: string;
+    },
+  ): Promise<void> {
+    try {
+      await this.store.recordRunAuditEvent({
+        taskId,
+        agentId: "self-healing",
+        runId: generateSyntheticRunId("wedged-active-merge", taskId),
+        domain: "database",
+        // Ids/outcomes-only: reason enum-ish string, silence/limit counts, status — never prose/prompt.
+        mutationType: "task:reconcile-wedged-active-merge",
+        target: taskId,
+        metadata: {
+          taskId,
+          reason: metadata.reason,
+          silenceMs: metadata.silenceMs ?? undefined,
+          limitMs: metadata.limitMs,
+          status: metadata.status,
+          column: metadata.column,
+        },
+      });
+    } catch (err: unknown) {
+      log.warn(
+        `Failed to audit wedged active merge reclaim for ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -2987,6 +3393,9 @@ export class SelfHealingManager {
     if (settings.globalPause || settings.enginePaused) return withPerPr({ outcome: "skipped", reason: "engine-paused" });
     if (!task.branch || !task.worktree) return withPerPr({ outcome: "skipped", reason: "missing-branch-or-worktree" });
     if (task.userPaused) return withPerPr({ outcome: "skipped", reason: "user-paused" });
+    if (SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason)) {
+      return withPerPr({ outcome: "skipped", reason: "global-capacity-recovery-hold" });
+    }
     if (task.checkedOutBy) return withPerPr({ outcome: "skipped", reason: "checked-out" });
     if (task.pausedReason === "worktrunk_operation_failed") return withPerPr({ outcome: "skipped", reason: "worktrunk-paused" });
     if (activeSessionRegistry.isPathActive(task.worktree)) return withPerPr({ outcome: "skipped", reason: "active-session" });
@@ -3211,7 +3620,10 @@ export class SelfHealingManager {
       // per-task override preserves that for override-less tasks while letting
       // explicit autoMerge:true tasks recover.
       const candidates = [...todoCandidates, ...inProgressCandidates, ...inReviewPausedCandidates]
-        .filter((task) => allowsAutoMergeProcessing(task, settings));
+        .filter((task) =>
+          allowsAutoMergeProcessing(task, settings)
+          && !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason),
+        );
       const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
       const activeTaskIds = await this.listActiveHeartbeatTaskIds();
 
@@ -3588,6 +4000,32 @@ export class SelfHealingManager {
           const preservedCommitCount = inspection.kind === "fully-subsumed"
             ? 0
             : inspection.taskAttributedCommitCount;
+          const placement = await relocateReclaimableWorktreeIntoRoot({
+            rootDir: this.options.rootDir,
+            sourcePath: inspection.livePath,
+            targetPath: preservedWorktreeTargetPathForTask(task.id, inspection.livePath, settings, this.options.rootDir),
+            taskId: task.id,
+            settings,
+            isPathActive: (path) =>
+              activeSessionRegistry.isPathActive(path)
+              || executingTaskLock.has(task.id)
+              || executingIds.has(task.id)
+              || activeTaskIds.has(task.id.toUpperCase()),
+          });
+          if (placement.kind === "deferred-live") {
+            await this.store.logEntry(
+              task.id,
+              `[recovery] deferred relocation of active preserved worktree ${placement.path}`,
+            );
+            continue;
+          }
+          const reclaimedWorktreePath = placement.path;
+          if (placement.relocated) {
+            await this.store.logEntry(
+              task.id,
+              `[recovery] relocated preserved worktree from ${inspection.livePath} to ${reclaimedWorktreePath}`,
+            );
+          }
           const stepSignature = buildResumeLimboStepSignature(task);
           const hasActiveSessionSignal = Boolean(task.checkedOutBy) || activeTaskIds.has(task.id.toUpperCase());
           const hasPriorSnapshot = typeof task.resumeLimboTipSha === "string" && typeof task.resumeLimboStepSignature === "string";
@@ -3612,6 +4050,7 @@ export class SelfHealingManager {
               preserveResumeState: true,
             });
             await this.store.updateTask(task.id, {
+              ...(placement.relocated ? { worktree: reclaimedWorktreePath } : {}),
               resumeLimboCount: 0,
               resumeLimboTipSha: inspection.tipSha,
               resumeLimboStepSignature: stepSignature,
@@ -3652,7 +4091,7 @@ export class SelfHealingManager {
           }
 
           await this.store.updateTask(task.id, {
-            worktree: inspection.livePath,
+            worktree: reclaimedWorktreePath,
             branch: task.branch,
             paused: false,
             pausedReason: undefined,
@@ -3664,7 +4103,7 @@ export class SelfHealingManager {
           });
           await this.store.logEntry(
             task.id,
-            `[recovery] ${wasPausedBranchConflict ? "reclaim-paused-review" : "reclaim-self-owned"} ${task.id} at ${inspection.livePath} (${preservedCommitCount} commits preserved, tip ${inspection.tipSha.slice(0, 12)})`,
+            `[recovery] ${wasPausedBranchConflict ? "reclaim-paused-review" : "reclaim-self-owned"} ${task.id} at ${reclaimedWorktreePath} (${preservedCommitCount} commits preserved, tip ${inspection.tipSha.slice(0, 12)})`,
           );
 
           if (task.column === "in-review") {
@@ -3696,7 +4135,7 @@ export class SelfHealingManager {
               metadata: {
                 taskId: task.id,
                 branch: task.branch,
-                worktreePath: inspection.livePath,
+                worktreePath: reclaimedWorktreePath,
                 existingTipSha: inspection.tipSha,
                 strandedCommitCount: inspection.kind === "fully-subsumed" ? 0 : inspection.strandedCommits.length,
                 subsumed: inspection.kind === "fully-subsumed",
@@ -4664,7 +5103,7 @@ export class SelfHealingManager {
     const reboundedIds: string[] = [];
     for (const task of tasks) {
       if (task.column !== "in-progress" || task.paused !== true) continue;
-      if (SelfHealingManager.PAUSED_SCOPE_DECAY_EXCLUDED_REASONS.has(task.pausedReason ?? "")) continue;
+      if (SelfHealingManager.isPausedScopeDecayExcludedReason(task.pausedReason)) continue;
       const followerCount = followersByHolder.get(task.id) ?? 0;
       if (followerCount <= 0) continue;
 
@@ -5138,45 +5577,28 @@ export class SelfHealingManager {
 
   async reconcileSoftDeletedColumnDrift(): Promise<{ reconciled: number }> {
     try {
-      // FNXC:RuntimeSatelliteAsync 2026-06-24-22:00:
-      // In backend mode, the sync SQLite database is not available. The
-      // column-drift reconciliation uses direct SQL against the sync DB.
-      // Backend mode does not need this reconciliation (PostgreSQL enforces
-      // constraints at the DB level), so skip it.
-      if (this.store.isBackendMode()) return { reconciled: 0 };
       const settings = await this.store.getSettings();
       if (settings.globalPause || settings.enginePaused) return { reconciled: 0 };
 
-      const db = this.store.getDatabase();
-      // FN-5147 invariant: only rows with deletedAt are eligible, so live
-      // in-review tasks (including autoMerge: false workflows) are never moved.
-      const candidates = db.prepare("SELECT id, \"column\" AS column FROM tasks WHERE deletedAt IS NOT NULL AND \"column\" != 'archived'").all() as Array<{ id: string; column: Task["column"] }>;
-      if (candidates.length === 0) return { reconciled: 0 };
-
-      let reconciled = 0;
-      const now = new Date().toISOString();
+      /*
+      FNXC:PostgresSoftDeleteRepair 2026-07-16-00:00:
+      FN-8104 retires the unreachable SQLite reconcile fallback that FN-8103
+      temporarily allowlisted. Production repair remains PostgreSQL-only while
+      preserving the per-row durable audit contract.
+      */
       const auditor = createRunAuditor(this.store, {
         runId: generateSyntheticRunId("fn5566-soft-delete-column", "global"),
         agentId: "self-healing",
         phase: "reconcile-soft-delete-column-drift",
       });
-
-      for (const candidate of candidates) {
-        db.prepare("UPDATE tasks SET \"column\" = 'archived', updatedAt = ? WHERE id = ?").run(now, candidate.id);
+      return this.store.reconcileSoftDeletedColumnDriftBackend(async (candidate) => {
         await auditor.database({
           type: "task:soft-delete-column-reconciled",
           target: candidate.id,
-          metadata: { previousColumn: candidate.column },
+          metadata: { previousColumn: candidate.previousColumn },
         });
-        log.log(`[self-heal] reconcile-soft-delete-column-drift: ${candidate.id} previous=${candidate.column} → archived`);
-        reconciled++;
-      }
-
-      if (reconciled > 0) {
-        db.bumpLastModified();
-      }
-
-      return { reconciled };
+        log.log(`[self-heal] reconcile-soft-delete-column-drift: ${candidate.id} previous=${candidate.previousColumn} → archived`);
+      });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       log.warn(`reconcileSoftDeletedColumnDrift: failed: ${message}`);
@@ -5448,6 +5870,34 @@ export class SelfHealingManager {
       log.error(`Stale blockedBy sweep failed: ${errorMessage}`);
       return 0;
     }
+  }
+
+  /**
+   * FNXC:SymbolLock 2026-07-30-14:20:
+   * Crash recovery expires only locks whose owner is terminal/missing or whose
+   * lease elapsed. It is intentionally orthogonal to scheduler admission and
+   * never changes a task, worktree, semaphore, or verification state.
+   */
+  async reconcileStaleSymbolLocks(): Promise<number> {
+    const result = await this.store.reconcileStaleSymbolLocks();
+    if (result.reconciled.length > 0) {
+      this.symbolLockNoActionAudited = false;
+      await this.store.recordRunAuditEvent({
+        agentId: "self-healing", runId: "symbol-lock-reconcile", domain: "database",
+        mutationType: "symbol-lock:reconcile-stale", target: "symbol-locks",
+        metadata: { count: result.reconciled.length, symbolKeys: result.reconciled, outcome: "reconciled" },
+      });
+      return result.reconciled.length;
+    }
+    if (!this.symbolLockNoActionAudited) {
+      this.symbolLockNoActionAudited = true;
+      await this.store.recordRunAuditEvent({
+        agentId: "self-healing", runId: "symbol-lock-reconcile", domain: "database",
+        mutationType: "symbol-lock:reconcile-stale-no-action", target: "symbol-locks",
+        metadata: { count: 0, outcome: "no-action" },
+      });
+    }
+    return 0;
   }
 
   async reconcileDependencyBlockingLeases(): Promise<number> {
@@ -6096,6 +6546,150 @@ export class SelfHealingManager {
   }
 
   /**
+   * FNXC:NearDuplicateDetection 2026-07-17-20:10:
+   * FN-8356 reconciles only triage-marker duplicate-decision pauses whose canonical is no longer
+   * actionable. Its audit payload is ids/outcomes-only so stale-decision recovery never stores
+   * prompt or decision prose; active canonicals and user-owned pauses remain untouched.
+   */
+  async reconcileStaleDuplicateDecisionPause(): Promise<number> {
+    try {
+      const tasks = await this.store.listTasks({ slim: true, includeArchived: false, limit: 500 });
+      const candidates = tasks.filter((task) =>
+        task.paused === true
+        && task.userPaused !== true
+        && task.pausedReason === "duplicate-decision-required"
+        && task.sourceMetadata?.duplicateSource === "triage-marker"
+        && typeof task.sourceMetadata?.nearDuplicateOf === "string",
+      );
+
+      let cleared = 0;
+      for (const task of candidates.slice(0, 50)) {
+        try {
+          const canonicalId = task.sourceMetadata!.nearDuplicateOf as string;
+          const canonical = await this.store.getTask(canonicalId).catch(() => null);
+          if (!isNearDuplicateCanonicalInactive(canonical ?? undefined)) continue;
+
+          await this.store.updateTask(task.id, {
+            paused: false,
+            pausedReason: null,
+            status: null,
+            sourceMetadataPatch: { nearDuplicateDismissed: true },
+          });
+          await createRunAuditor(this.store, {
+            runId: generateSyntheticRunId("reconcile-stale-duplicate-decision", task.id),
+            agentId: "self-healing",
+            taskId: task.id,
+            taskLineageId: task.lineageId,
+            phase: "reconcile-stale-duplicate-decision",
+          }).database({
+            type: "task:reconcile-stale-duplicate-decision" as DatabaseMutationType,
+            target: task.id,
+            metadata: {
+              taskId: task.id,
+              canonicalId,
+              canonicalColumn: canonical?.column ?? null,
+              canonicalDeleted: Boolean(canonical?.deletedAt),
+              priorPausedReason: "duplicate-decision-required",
+            },
+          });
+          cleared += 1;
+        } catch (error) {
+          log.warn(`reconcileStaleDuplicateDecisionPause: failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      return cleared;
+    } catch (error) {
+      log.error(`reconcileStaleDuplicateDecisionPause failed: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
+
+  /*
+  FNXC:LegacyAdoption 2026-07-19-04:20 (U9b / R10 / KTD-8):
+  Startup adoption sweep — the live CONSUMER of the KTD-8 adoption table. U9 landed the
+  table and the census that keeps it complete, but nothing ever called it, so no
+  pre-cutover row was actually adopted: `planning` / `needs-replan` /
+  `plan-review-unavailable` rows kept a legacy status whose writers U3 deleted, and the
+  graph had no owning node to re-enter. That is the "frozen row" this exists to prevent.
+
+  Runs at STARTUP (not steady state): adoption is a once-per-upgrade concern, and
+  `legacyAdoptedAt` makes it idempotent so a restart loop cannot re-clear a status a human
+  re-set or re-park a row an operator un-parked. `planLegacyAdoption` is shared with the
+  store-open reconcile so the two cannot drift.
+
+  User pauses are never disturbed — an operator park outranks adoption.
+
+  FNXC:LegacyAdoption 2026-07-19-09:00 (PR #2335 review):
+  Paginates until the active census is drained instead of scanning only the newest 500
+  rows. `listTasks` orders by (created_at, id), so a capped single fetch would re-read the
+  same newest page on every restart and leave older legacy rows frozen forever — the exact
+  R10 failure this sweep exists to prevent. Offset pagination is stable: adoption patches
+  never change created_at and adopted rows stay in the active list. Each page stays bounded
+  (500) so startup never materializes the whole table at once; `legacyAdoptedAt` keeps the
+  drained sweep idempotent across restarts.
+  */
+  async adoptLegacyTaskRows(): Promise<number> {
+    try {
+      const now = new Date().toISOString();
+      const pageSize = 500;
+      let offset = 0;
+      let adopted = 0;
+
+      for (;;) {
+        const tasks = await this.store.listTasks({ slim: true, includeArchived: false, limit: pageSize, offset });
+        for (const task of tasks) {
+          // An operator park is authoritative; adoption must not reach through it.
+          if (task.userPaused === true) continue;
+
+          const plan = planLegacyAdoption(
+            {
+              status: task.status,
+              reviewLevel: task.reviewLevel,
+              enabledWorkflowSteps: task.enabledWorkflowSteps,
+              legacyAdoptedAt: task.legacyAdoptedAt,
+            },
+            now,
+          );
+          if (plan.action === "skip" || !plan.patch) continue;
+
+          try {
+            await this.store.updateTask(task.id, plan.patch);
+            await createRunAuditor(this.store, {
+              runId: generateSyntheticRunId("reconcile-legacy-adoption", task.id),
+              agentId: "self-healing",
+              taskId: task.id,
+              taskLineageId: task.lineageId,
+              phase: "reconcile-legacy-adoption",
+            }).database({
+              type: plan.auditType ?? "task:reconcile-legacy-adoption",
+              target: task.id,
+              // ids/counts/outcomes only — `reason` is a fixed adoption-table note, never row prose.
+              metadata: {
+                taskId: task.id,
+                action: plan.action,
+                priorStatus: task.status ?? null,
+                column: task.column,
+                backfilledStepCount: plan.patch.enabledWorkflowSteps?.length ?? 0,
+                reason: plan.reason,
+              },
+            });
+            adopted += 1;
+          } catch (error) {
+            log.warn(`adoptLegacyTaskRows: failed for ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (tasks.length < pageSize) break;
+        offset += tasks.length;
+      }
+      if (adopted > 0) log.log(`Legacy adoption sweep adopted ${adopted} pre-cutover row(s)`);
+      return adopted;
+    } catch (error) {
+      log.error(`adoptLegacyTaskRows failed: ${error instanceof Error ? error.message : String(error)}`);
+      return 0;
+    }
+  }
+
+  /**
    * Backward lifecycle move gated on triple proof (FN-5335).
    * When the unproven fallback predicate fails, emits `task:finalize-no-op-review-no-action` and skips lifecycle mutation.
    *
@@ -6112,6 +6706,7 @@ export class SelfHealingManager {
         t.column === "in-review" &&
         allowsAutoMergeProcessing(t, settings) &&
         !t.paused &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(t.pausedReason) &&
         // FNXC:AutoMergeHold 2026-07-09-17:10: FN-7750 intentionally keeps the pure branchContext-shape predicate here. Stale shared-group members must stay OUT of solo no-op finalize even when their group is not live; only the positive auto-merge-off exemption gates use the live-group predicate.
         !isSharedBranchGroupMemberIntegration(t) &&
         // FNXC:Workspace 2026-06-22-14:10 (Phase D review A — workspace single-commit-finalize gate):
@@ -6313,6 +6908,7 @@ export class SelfHealingManager {
       const tasks = await this.store.listTasks({ column: "done", slim: true });
       const candidates = tasks.filter((task) =>
         task.column === "done" &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         (!task.mergeDetails?.commitSha || task.mergeDetails.commitSha.trim().length === 0) &&
         (task.modifiedFiles?.length ?? 0) > 0,
       ).slice(0, DONE_TASK_INTEGRITY_SWEEP_LIMIT);
@@ -7467,13 +8063,18 @@ export class SelfHealingManager {
       if (!timeoutMs || timeoutMs <= 0) return 0;
 
       const tasks = await this.store.listTasks({ column: "in-review", slim: true });
-      const candidates = tasks.filter((task) =>
+      const statusCandidates = tasks.filter((task) =>
         task.column === "in-review" &&
         allowsAutoMergeProcessing(task, settings) &&
         !task.paused &&
-        Boolean(task.status && ACTIVE_MERGE_STATUSES.has(task.status)) &&
-        this.isPastInterruptedMergeGrace(task, timeoutMs),
+        Boolean(task.status && ACTIVE_MERGE_STATUSES.has(task.status)),
       );
+      const candidates: Task[] = [];
+      for (const task of statusCandidates) {
+        if (await this.isPastInterruptedMergeGraceAsync(task, timeoutMs)) {
+          candidates.push(task);
+        }
+      }
 
       if (candidates.length === 0) return 0;
 
@@ -7482,6 +8083,13 @@ export class SelfHealingManager {
       let recovered = 0;
       for (const task of candidates) {
         try {
+          /*
+          FNXC:MergeQueue 2026-07-15-09:50:
+          If this task still owns the in-process active merge, force-abort first. Cooperative abort alone left mergeRunning=true when the agent ignored the signal; abortActiveMerge + raceMergeWithAbort free the single-flight drain so re-enqueue can actually start.
+          */
+          if (this.options.getActiveMergeTaskId?.() === task.id) {
+            this.options.abortActiveMerge?.(task.id, "recover-interrupted-merging-wedged-owner");
+          }
           /*
           FNXC:Workspace 2026-06-22-09:30 (Phase D U1, KTD1 — P0 workspace gate):
           A workspace task lands PER-REPO and `landWorkspaceTask` sets status:"merging". The
@@ -8668,6 +9276,7 @@ export class SelfHealingManager {
         task.status === "failed" &&
         task.scopeOverride !== true &&
         task.mergeDetails?.mergeConfirmed !== true &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         !executingIds.has(task.id),
       );
 
@@ -8843,6 +9452,7 @@ export class SelfHealingManager {
         task.status === "failed" &&
         (task.mergeRetries ?? 0) >= maxAutoMergeRetries &&
         task.mergeDetails?.mergeConfirmed !== true &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         !executingIds.has(task.id),
       );
 
@@ -9458,6 +10068,7 @@ export class SelfHealingManager {
         task.column === "in-review" &&
         Boolean(task.branch) &&
         task.mergeDetails?.mergeConfirmed !== true &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         !executingIds.has(task.id),
       );
 
@@ -10569,8 +11180,20 @@ export class SelfHealingManager {
   }
 
   /*
+  FNXC:AgentLifecyclePause 2026-07-19-00:00:
+  FN-8362: Startup heartbeat recovery changes only durable agent state and
+  metadata. It must never read or mutate an assigned task's paused, userPaused,
+  pausedByAgentId, or pausedReason fields; task safety parks remain separately
+  owned by their reason-specific writers.
+
   FNXC:AgentHeartbeat 2026-07-12-17:26:
   FN-7884: Engine restart is an explicit operator retry boundary for durable heartbeat agents. Startup recovery must immediately clear recoverable `error` and `error-retry-exhausted` parks, reset shared heartbeatErrorRecovery/durableErrorRecovery budget state, and re-arm heartbeats without steady-state staleness/cooldown/exhaustion gates; operator-actionable, stale-module, user-paused, error-unrecoverable, disabled, ephemeral, and actively executing agents remain suppressed.
+
+  FNXC:AgentHeartbeat 2026-07-14-16:13:
+  Startup must also recover a `heartbeat-model-unavailable` park when its recorded failing provider differs from the agent's complete assigned runtime model. This repairs agents falsely parked by the former shared-project-model precedence while preserving genuine assigned-provider authentication failures for operator action.
+
+  FNXC:AgentHeartbeat 2026-07-15-08:50:
+  Startup now recovers every `heartbeat-model-unavailable` park (not only misattributed providers). Engine restart is treated like operator Retry: false model-unavailable/credential-probe parks clear immediately, and genuine missing credentials re-park on the next failing heartbeat.
   */
   async resetDurableAgentErrorStateOnStartup(): Promise<number> {
     const agentStore = this.options.agentStore;
@@ -10584,7 +11207,8 @@ export class SelfHealingManager {
       for (const agent of allAgents) {
         const isErrorRetryExhaustedPark =
           agent.state === "paused" && agent.pauseReason === HEARTBEAT_ERROR_RETRY_EXHAUSTED_PAUSE_REASON;
-        if (agent.state !== "error" && !isErrorRetryExhaustedPark) {
+        const isModelUnavailableParked = isModelUnavailablePark(agent);
+        if (agent.state !== "error" && !isErrorRetryExhaustedPark && !isModelUnavailableParked) {
           continue;
         }
         if (isEphemeralAgent(agent)) {
@@ -10597,7 +11221,7 @@ export class SelfHealingManager {
         if (this.options.hasActiveAgentExecution?.(agent.id) === true) {
           continue;
         }
-        if (!isHeartbeatErrorRecoverable(agent) || isStaleWorktreeModuleResolutionError(agent.lastError ?? "")) {
+        if ((!isModelUnavailableParked && !isHeartbeatErrorRecoverable(agent)) || isStaleWorktreeModuleResolutionError(agent.lastError ?? "")) {
           log.warn(`Startup durable-agent error reset suppressed for ${agent.id}: unrecoverable or stale-module error requires existing recovery path`);
           continue;
         }
@@ -10644,6 +11268,12 @@ export class SelfHealingManager {
     return resetCount;
   }
 
+  /*
+  FNXC:AgentLifecyclePause 2026-07-19-00:00:
+  Error auto-recovery, retry-exhaustion, and unrecoverable-error parking are
+  agent-only transitions. Assigned task pause state is never cascaded or
+  cleared by this sweep, including when a heartbeat is re-armed.
+  */
   async recoverOrphanedAgents(): Promise<number> {
     const agentStore = this.options.agentStore;
     if (!agentStore) {
@@ -10666,6 +11296,9 @@ export class SelfHealingManager {
       /*
       FNXC:AgentHeartbeat 2026-07-12-20:10:
       An agent parked paused/"error-unrecoverable" whose lastError NOW classifies as recoverable (e.g. transient OAuth token-rotation 401s that were misclassified operator-actionable before isTransientAuthCredentialError existed) must not stay parked forever waiting for a human. Re-admit exactly those parked agents to the error-recovery sweep; user pauses and every other pauseReason are untouched. The shared retry budget, cooldown, and staleness gates below still apply.
+
+      FNXC:AgentHeartbeat 2026-07-15-08:50:
+      Also re-admit stale paused/heartbeat-model-unavailable parks when shared retry budget remains. Manual Retry already proves many of these are false positives; the timer path is the fast recovery, and this sweep is the backstop when timers were cleared on park.
       */
       const isReclassifiedRecoverableParkedError = (agent: Agent): boolean =>
         agent.state === "paused"
@@ -10676,7 +11309,13 @@ export class SelfHealingManager {
         if (isEphemeralAgent(agent)) {
           return false;
         }
-        if (agent.state !== "running" && agent.state !== "error" && !isReclassifiedRecoverableParkedError(agent)) {
+        const isModelUnavailableRecoveryCandidate = isModelUnavailableParkRecoveryEligible(agent, errorRecoveryLimit);
+        if (
+          agent.state !== "running"
+          && agent.state !== "error"
+          && !isReclassifiedRecoverableParkedError(agent)
+          && !isModelUnavailableRecoveryCandidate
+        ) {
           return false;
         }
         /*
@@ -10710,7 +11349,11 @@ export class SelfHealingManager {
           return false;
         }
 
-        if (agent.state === "error" || isReclassifiedRecoverableParkedError(agent)) {
+        if (
+          agent.state === "error"
+          || isReclassifiedRecoverableParkedError(agent)
+          || isModelUnavailableRecoveryCandidate
+        ) {
           const runtimeConfig = (agent.runtimeConfig ?? {}) as Record<string, unknown>;
           if (runtimeConfig.enabled === false) {
             return false;
@@ -10718,7 +11361,7 @@ export class SelfHealingManager {
           if (this.options.hasActiveAgentExecution?.(agent.id) === true) {
             return false;
           }
-          const isRecoverableHeartbeatError = isHeartbeatErrorRecoverable(agent);
+          const isRecoverableHeartbeatError = isHeartbeatErrorRecoverable(agent) || isModelUnavailableRecoveryCandidate;
           const isStaleMissingModule = isStaleWorktreeModuleResolutionError(agent.lastError ?? "");
           const isUnrecoverableHeartbeatError = !isRecoverableHeartbeatError && !isStaleMissingModule;
 
@@ -10751,14 +11394,23 @@ export class SelfHealingManager {
       for (const agent of orphaned) {
         const updatedAt = Date.parse(agent.updatedAt ?? "");
         const stuckForMs = Math.max(0, now - updatedAt);
-        // Reclassified "error-unrecoverable" parked agents run the same recovery
-        // branch as error-state agents: shared budget, cooldown, audit, restart.
-        const isErrorRecoveryCandidate = agent.state === "error" || isReclassifiedRecoverableParkedError(agent);
+        // Reclassified "error-unrecoverable" and heartbeat-model-unavailable parked
+        // agents run the same recovery branch as error-state agents: shared budget,
+        // cooldown, audit, restart.
+        const isErrorRecoveryCandidate =
+          agent.state === "error"
+          || isReclassifiedRecoverableParkedError(agent)
+          || isModelUnavailablePark(agent);
         try {
           if (isErrorRecoveryCandidate) {
             const recoveryState = this.getDurableAgentRecoveryState(agent);
             const isStaleMissingModule = isStaleWorktreeModuleResolutionError(agent.lastError ?? "");
-            const isUnrecoverableHeartbeatError = !isHeartbeatErrorRecoverable(agent) && !isStaleMissingModule;
+            // Model-unavailable parks are intentionally operator-actionable by lastError text
+            // but still budget-retryable; do not reclassify them as error-unrecoverable here.
+            const isUnrecoverableHeartbeatError =
+              !isModelUnavailablePark(agent)
+              && !isHeartbeatErrorRecoverable(agent)
+              && !isStaleMissingModule;
             if (isUnrecoverableHeartbeatError) {
               /*
               FNXC:AgentHeartbeat 2026-07-12-18:34:
@@ -10848,8 +11500,12 @@ export class SelfHealingManager {
                 limit: errorRecoveryLimit,
                 source: "self-healing",
               });
-              await agentStore.updateAgentState(agent.id, "paused");
-              await agentStore.updateAgent(agent.id, { pauseReason: HEARTBEAT_ERROR_RETRY_EXHAUSTED_PAUSE_REASON });
+              // Keep heartbeat-model-unavailable labeling when that park exhausted so
+              // operators still see credential/model guidance rather than a generic label.
+              if (!isModelUnavailablePark(agent)) {
+                await agentStore.updateAgentState(agent.id, "paused");
+                await agentStore.updateAgent(agent.id, { pauseReason: HEARTBEAT_ERROR_RETRY_EXHAUSTED_PAUSE_REASON });
+              }
               log.warn(`Suppressed durable-agent auto-restart for ${agent.id}: retry budget exhausted`);
               continue;
             }
@@ -10858,8 +11514,8 @@ export class SelfHealingManager {
           await agentStore.updateAgentState(agent.id, "active");
           await agentStore.updateAgent(agent.id, {
             lastError: undefined,
-            // Clear the "error-unrecoverable" park marker when a reclassified
-            // parked agent is re-admitted; harmless no-op for error-state agents.
+            // Clear error-unrecoverable / heartbeat-model-unavailable park markers when
+            // a parked agent is re-admitted; harmless no-op for bare error-state agents.
             pauseReason: undefined,
           });
 
@@ -11384,8 +12040,16 @@ export class SelfHealingManager {
 
       let recovered = 0;
       for (const task of orphanedApproved) {
+        // FNXC:Triage 2026-07-29-12:00:
+        // FN-8361 candidates come from a stale board snapshot. Do not enter delayed
+        // recovery after scheduler advancement; triage revalidates every later write.
+        const live = await this.store.getTask(task.id).catch(() => null);
+        // Narrow test/legacy adapters can return an unrelated fixture row; only use a
+        // re-read when it identifies the requested candidate.
+        const recoveryTask = live?.id === task.id ? live : task;
+        if (!isTaskStillInPlanningStage(recoveryTask)) continue;
         log.log(`Recovering specified triage task ${task.id}: ${task.title || task.description?.slice(0, 60) || "(untitled)"}`);
-        const success = await recoverFn(task);
+        const success = await recoverFn(recoveryTask);
         if (success) recovered++;
       }
 
@@ -11430,31 +12094,57 @@ export class SelfHealingManager {
           processedMarkers += 1;
 
           const canonicalTask = await this.store.getTask(marker.canonicalId).catch(() => null);
-          if (
-            !canonicalTask ||
-            canonicalTask.deletedAt ||
-            canonicalTask.id.toLowerCase() === task.id.toLowerCase()
-          ) {
+          if (canonicalTask?.id.toLowerCase() === task.id.toLowerCase()) {
             continue;
           }
 
-          await this.store.deleteTask(task.id, {
-            removeLineageReferences: true,
-            auditContext: {
-              agentId: "self-healing",
-              runId: generateSyntheticRunId("self-heal-explicit-duplicate", task.id),
-            },
-          });
-          await this.store.recordActivity({
-            type: "task:auto-archived-duplicate",
-            taskId: task.id,
-            taskTitle: task.title ?? "",
-            details: `Duplicate of ${canonicalTask.id} — closed`,
-            metadata: {
-              canonicalTaskId: canonicalTask.id,
-              source: "explicit-marker-sweep",
-            },
-          });
+          /*
+          FNXC:NearDuplicateDetection 2026-07-17-20:10:
+          FN-8356 keeps maintenance from re-parking a marker against a missing, deleted, done,
+          or archived canonical. Such a decision has no detail-banner action, so cleanup restores
+          eligible work to planning while preserving explicit, implicit, and unrelated system pauses.
+          */
+          const canClearInactiveMarker = task.userPaused !== true
+            && (task.paused !== true || task.pausedReason === "duplicate-decision-required")
+            && (task.pausedReason == null || task.pausedReason === "duplicate-decision-required");
+          if (!canonicalTask || isNearDuplicateCanonicalInactive(canonicalTask)) {
+            if (canClearInactiveMarker) {
+              rmSync(promptPath, { force: true });
+              await this.store.updateTask(task.id, { paused: false, pausedReason: null, status: null });
+              resolved += 1;
+            }
+            continue;
+          }
+
+          const resolution = settings.triageDuplicateResolution ?? "prompt";
+          /*
+          FNXC:DuplicateIntake 2026-07-20-12:00:
+          FN-8440 forbids self-healing from re-arming a duplicate-decision-required hold after
+          an operator kept this exact task/canonical pair. Keep cleanup is bounded by the same
+          pause guard as inactive-marker recovery so manual and unrelated pauses are never cleared.
+          */
+          if (resolution === "prompt" && isTriageDuplicateKeepAcknowledged(task.sourceMetadata, canonicalTask.id)) {
+            if (canClearInactiveMarker) {
+              rmSync(promptPath, { force: true });
+              await this.store.updateTask(task.id, {
+                paused: false,
+                pausedReason: null,
+                status: null,
+                sourceMetadataPatch: { nearDuplicateDismissed: true },
+              });
+              resolved += 1;
+            }
+            continue;
+          }
+          if (resolution === "delete") {
+            await this.store.deleteTask(task.id, { removeLineageReferences: true, auditContext: { agentId: "self-healing", runId: generateSyntheticRunId("self-heal-explicit-duplicate", task.id) } });
+          } else if (resolution === "prompt") {
+            await flagTriageDuplicate(this.store, task.id, canonicalTask.id);
+            await this.store.updateTask(task.id, { paused: true, pausedReason: "duplicate-decision-required", status: null });
+          } else {
+            rmSync(promptPath, { force: true });
+            await this.store.updateTask(task.id, { paused: false, pausedReason: null, status: null, sourceMetadataPatch: { nearDuplicateOf: canonicalTask.id, nearDuplicateScore: 1, duplicateSource: "triage-marker", nearDuplicateDismissed: true } });
+          }
           log.log(`[self-healing] resolved explicit duplicate marker ${task.id} → ${canonicalTask.id}`);
           resolved += 1;
         } catch (error) {
@@ -11589,6 +12279,63 @@ export class SelfHealingManager {
    * Recovery clears the status back to `null` so the next triage poll picks
    * them up for a fresh planning attempt.
    */
+  /**
+   * FNXC:TaskTiming 2026-08-01-10:00:
+   * A planning anchor is safe because triage ownership and graph Plan Review are
+   * exclusive. Recovery finalizes only when neither in-process owner is live;
+   * the atomic null-check makes restart and repeated maintenance idempotent.
+   */
+  async finalizeOrphanedPlanningSegments(): Promise<number> {
+    const planningIds = this.options.getPlanningTaskIds?.() ?? new Set<string>();
+    const tasks = await this.store.listTasks({});
+    let finalized = 0;
+    for (const task of tasks) {
+      if (!task.planningStartedAt || planningIds.has(task.id) || this.options.hasActivePlanningWorkflowSession?.(task.id)) continue;
+      let applied = false;
+      const endMs = Date.now();
+      if (typeof this.store.updateTaskAtomic === "function") {
+        await this.store.updateTaskAtomic(task.id, (live) => {
+          if (!live.planningStartedAt || planningIds.has(live.id) || this.options.hasActivePlanningWorkflowSession?.(live.id)) return null;
+          const patch = finalizePlanningSegment(live, endMs);
+          applied = patch.planningStartedAt === null;
+          return patch;
+        });
+      } else {
+        const live = await this.store.getTask(task.id);
+        if (live?.planningStartedAt && !planningIds.has(live.id) && !this.options.hasActivePlanningWorkflowSession?.(live.id)) {
+          const patch = finalizePlanningSegment(live, endMs);
+          if (patch.planningStartedAt === null) { await this.store.updateTask(task.id, patch); applied = true; }
+        }
+      }
+      if (applied) {
+        finalized++;
+        // FNXC:TaskTiming 2026-08-01-12:00: this recovery is operator-auditable
+        // without persisting duration prose; the atomically finalized task id
+        // and fixed no-live-owner reason are sufficient forensic evidence.
+        await this.store.recordRunAuditEvent?.({
+          taskId: task.id,
+          agentId: "self-healing",
+          runId: generateSyntheticRunId("orphaned-planning-segment", task.id),
+          domain: "database",
+          mutationType: "task:reconcile-orphaned-planning-segment",
+          target: task.id,
+          metadata: { taskId: task.id, finalizedCount: 1, reason: "no-live-planning-owner" },
+        });
+      }
+    }
+    if (finalized === 0) {
+      await this.store.recordRunAuditEvent?.({
+        agentId: "self-healing",
+        runId: generateSyntheticRunId("orphaned-planning-segment", "global"),
+        domain: "database",
+        mutationType: "task:reconcile-orphaned-planning-segment-no-action",
+        target: "planning-segments",
+        metadata: { finalizedCount: 0, reason: "no-eligible-orphan" },
+      });
+    }
+    return finalized;
+  }
+
   async recoverOrphanedPlanningTasks(): Promise<number> {
     try {
       // Evict stale entries from the triage processor's in-memory set before
@@ -11616,7 +12363,24 @@ export class SelfHealingManager {
       for (const task of orphaned) {
         try {
           log.log(`Recovering orphaned planning task ${task.id}: ${task.title || task.description?.slice(0, 60) || "(untitled)"}`);
-          await this.store.updateTask(task.id, { status: null });
+          // FNXC:Triage 2026-07-29-12:00:
+          // FN-8361 closes the stale listTasks → updateTask race: only clear planning
+          // under the TaskStore lock, never overwrite a scheduler-claimed row.
+          let applied = false;
+          if (typeof this.store.updateTaskAtomic === "function") {
+            await this.store.updateTaskAtomic(task.id, (live) => {
+              if (!isTaskStillInPlanningStage(live)) return null;
+              applied = true;
+              return { status: null };
+            });
+          } else {
+            const live = await this.store.getTask(task.id);
+            if (live && isTaskStillInPlanningStage(live)) {
+              await this.store.updateTask(task.id, { status: null });
+              applied = true;
+            }
+          }
+          if (!applied) continue;
           await this.store.logEntry(
             task.id,
             "Auto-recovered orphaned planning task — agent session lost, cleared for re-planning",
@@ -11998,7 +12762,7 @@ export class SelfHealingManager {
       }
 
       if (prunedBranches.length > 0) {
-        const cleared = this.store.clearStaleExecutionStartBranchReferences(prunedBranches);
+        const cleared = await this.store.clearStaleExecutionStartBranchReferences(prunedBranches);
         if (cleared.length > 0) {
           log.log(`Cleared stale baseBranch on ${cleared.length} task(s): ${cleared.join(", ")}`);
         }

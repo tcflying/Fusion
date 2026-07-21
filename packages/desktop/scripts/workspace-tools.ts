@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -42,8 +42,29 @@ export function runWorkspaceBin(command: string, args: string[], cwd: string): P
   });
 }
 
+/*
+ * FNXC:DesktopPostgresMigrations 2026-07-17-18:20:
+ * @fusion/core's build is bare tsc, which never copies the PostgreSQL migration
+ * .sql files into dist — core's schema-applier resolves them from
+ * dist/postgres/migrations at runtime (join(__dirname, "migrations", ...)).
+ * The CLI compensates in packages/cli/tsup.config.ts, but the desktop had no
+ * equivalent, so every packaged desktop build shipped without migrations and
+ * Local mode crashed schema init with ENOENT for 0000_initial.sql after the
+ * embedded Postgres started. Stage the migrations beside the compiled output
+ * whenever the desktop builds core so both dev and the pnpm-deploy staged
+ * closure (core's files field packs dist/**) contain them.
+ */
+const coreMigrationsSrcDir = resolve(workspaceRoot, "packages", "core", "src", "postgres", "migrations");
+
+async function stageCoreMigrations(coreDistDir: string): Promise<void> {
+  const dest = resolve(coreDistDir, "postgres", "migrations");
+  await rm(dest, { recursive: true, force: true });
+  await cp(coreMigrationsSrcDir, dest, { recursive: true });
+}
+
 export async function buildCore(): Promise<void> {
   await runWorkspaceBin("tsc", [], resolve(workspaceRoot, "packages", "core"));
+  await stageCoreMigrations(resolve(workspaceRoot, "packages", "core", "dist"));
 }
 
 // FNXC:DesktopBuild 2026-07-01-19:45:
@@ -70,20 +91,31 @@ async function buildPackage(relativePath: string): Promise<void> {
 // condition kept for the bun-compiled CLI), so a missing dist => the packaged
 // app crashes on Local mode when @fusion/dashboard imports the plugin.
 // routes.ts / runtime-provider-probes.ts / droid-cli-probe.ts / roadmap-routes.ts
-// pull hermes, openclaw, paperclip, cursor, grok, droid and roadmap; dependency-graph
+// pull hermes, openclaw, paperclip, cursor, grok, droid, omp and roadmap; dependency-graph
 // backs a dashboard view. Keep this list in sync with dashboard's static plugin imports.
+//
+// FNXC:DesktopOmpPlugin 2026-07-14-18:55:
+// Oh My Pi (omp) ACP runtime is imported by runtime-provider-probes.ts. Without
+// building its dist, packaged Local mode boots Postgres then fails with
+// ERR_MODULE_NOT_FOUND for @fusion-plugin-examples/omp-runtime/dist/index.js and
+// falls back to the mode chooser.
+export const DASHBOARD_RUNTIME_PLUGIN_PACKAGES = [
+  "plugins/fusion-plugin-dependency-graph",
+  "plugins/fusion-plugin-hermes-runtime",
+  "plugins/fusion-plugin-happier-runtime",
+  "plugins/fusion-plugin-openclaw-runtime",
+  "plugins/fusion-plugin-paperclip-runtime",
+  "plugins/fusion-plugin-cursor-runtime",
+  "plugins/fusion-plugin-grok-runtime",
+  "plugins/fusion-plugin-claude-runtime",
+  "plugins/fusion-plugin-omp-runtime",
+  "plugins/fusion-plugin-droid-runtime",
+  "plugins/fusion-plugin-roadmap",
+] as const;
+
 export async function buildDashboardRuntimePlugins(): Promise<void> {
   await buildPackage("packages/plugin-sdk");
-  await Promise.all([
-    buildPackage("plugins/fusion-plugin-dependency-graph"),
-    buildPackage("plugins/fusion-plugin-hermes-runtime"),
-    buildPackage("plugins/fusion-plugin-openclaw-runtime"),
-    buildPackage("plugins/fusion-plugin-paperclip-runtime"),
-    buildPackage("plugins/fusion-plugin-cursor-runtime"),
-    buildPackage("plugins/fusion-plugin-grok-runtime"),
-    buildPackage("plugins/fusion-plugin-droid-runtime"),
-    buildPackage("plugins/fusion-plugin-roadmap"),
-  ]);
+  await Promise.all(DASHBOARD_RUNTIME_PLUGIN_PACKAGES.map((relativePath) => buildPackage(relativePath)));
 }
 
 export async function buildDashboard(): Promise<void> {
@@ -143,6 +175,72 @@ export const desktopDeployDir = process.env.FUSION_DESKTOP_DEPLOY_DIR
   ? resolve(process.env.FUSION_DESKTOP_DEPLOY_DIR)
   : resolve(packageRoot, "deploy");
 
+export type EmbeddedPostgresDesktopPlatform = "darwin" | "linux" | "win32";
+
+/**
+ * FNXC:DesktopEmbeddedPostgres 2026-07-14-09:30:
+ * These are the native Postgres payloads shipped by each desktop release job.
+ * macOS and Linux jobs cross-build x64 and ARM64 from one staged closure;
+ * Windows is x64-only because embedded-postgres has no Windows ARM64 binary.
+ */
+export function requiredEmbeddedPostgresPackages(
+  platform: EmbeddedPostgresDesktopPlatform,
+): readonly string[] {
+  switch (platform) {
+    case "darwin":
+      return ["@embedded-postgres/darwin-x64", "@embedded-postgres/darwin-arm64"];
+    case "linux":
+      return ["@embedded-postgres/linux-x64", "@embedded-postgres/linux-arm64"];
+    case "win32":
+      return ["@embedded-postgres/windows-x64"];
+  }
+}
+
+/**
+ * FNXC:DesktopEmbeddedPostgres 2026-07-14-09:30:
+ * A desktop build is incomplete unless the staged production closure contains
+ * embedded-postgres plus every native executable needed by the artifacts that
+ * job emits. Fail before electron-builder so a host-only optional-dependency
+ * install cannot silently produce an app that crashes on another architecture.
+ */
+export async function verifyEmbeddedPostgresPayloads(
+  deployDir = desktopDeployDir,
+  platform: EmbeddedPostgresDesktopPlatform = process.platform as EmbeddedPostgresDesktopPlatform,
+): Promise<void> {
+  if (platform !== "darwin" && platform !== "linux" && platform !== "win32") {
+    throw new Error(`Unsupported desktop platform for embedded Postgres: ${platform}`);
+  }
+
+  const executableSuffix = platform === "win32" ? ".exe" : "";
+  const requiredPaths = [
+    resolve(deployDir, "node_modules", "embedded-postgres", "package.json"),
+    ...requiredEmbeddedPostgresPackages(platform).flatMap((packageName) => {
+      const packageRoot = resolve(deployDir, "node_modules", ...packageName.split("/"));
+      return [
+        resolve(packageRoot, "package.json"),
+        resolve(packageRoot, "native", "bin", `initdb${executableSuffix}`),
+        resolve(packageRoot, "native", "bin", `pg_ctl${executableSuffix}`),
+        resolve(packageRoot, "native", "bin", `postgres${executableSuffix}`),
+      ];
+    }),
+  ];
+
+  const missing: string[] = [];
+  for (const requiredPath of requiredPaths) {
+    try {
+      await stat(requiredPath);
+    } catch {
+      missing.push(requiredPath);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Desktop embedded Postgres payload is incomplete for ${platform}: ${missing.join(", ")}. ` +
+        "Run pnpm install with pnpm-workspace.yaml supportedArchitectures before packaging.",
+    );
+  }
+}
+
 export async function stageDesktopDeploy(): Promise<void> {
   console.log("[desktop:build] Staging complete production closure via pnpm deploy...");
   await rm(desktopDeployDir, { recursive: true, force: true });
@@ -164,7 +262,32 @@ export async function stageDesktopDeploy(): Promise<void> {
     ? config.replace(/output:\s*dist-electron/, "output: ../dist-electron")
     : `directories:\n  output: ../dist-electron\n${config}`;
   await writeFile(stagedConfig, patched);
+
+  /*
+   * FNXC:DesktopPostgresMigrations 2026-07-17-18:20:
+   * pnpm deploy copies whatever is in core's dist at stage time. If core was
+   * last built by a bare `tsc` outside this package's scripts (e.g. root
+   * `pnpm build`), dist may lack the migration .sql files even though buildCore()
+   * above stages them. Re-stage them directly into the deployed closure
+   * (idempotent) and fail fast if the baseline migration is still missing, so a
+   * packaged app can never ship unable to initialize its embedded database.
+   */
+  await stageCoreMigrations(resolve(desktopDeployDir, "node_modules", "@fusion", "core", "dist"));
+  await verifyCoreMigrationsStaged();
+  await verifyEmbeddedPostgresPayloads();
   console.log(`[desktop:build] Deploy staged at ${desktopDeployDir}`);
+}
+
+export async function verifyCoreMigrationsStaged(deployDir = desktopDeployDir): Promise<void> {
+  const baseline = resolve(deployDir, "node_modules", "@fusion", "core", "dist", "postgres", "migrations", "0000_initial.sql");
+  try {
+    await stat(baseline);
+  } catch {
+    throw new Error(
+      `Desktop staged closure is missing @fusion/core PostgreSQL migrations (${baseline}). ` +
+        "Packaged Local mode cannot initialize its embedded database without them.",
+    );
+  }
 }
 
 export async function buildDashboardClient(): Promise<void> {

@@ -72,7 +72,8 @@ export interface WorkflowLegacySeams {
   execute: (task: TaskDetail, context: Record<string, unknown>) => Promise<WorkflowNodeResult>;
   review: (task: TaskDetail, context: Record<string, unknown>) => Promise<WorkflowNodeResult>;
   "review-handoff"?: (task: TaskDetail, context: Record<string, unknown>) => Promise<WorkflowNodeResult>;
-  merge: (task: TaskDetail, context: Record<string, unknown>) => Promise<WorkflowNodeResult>;
+  /** FNXC:WorkflowCancellation 2026-07-15-10:42: `signal` carries graph cancellation into the legacy merge seam, which — like the merge primitive — otherwise blocks on its own 30-minute timeout and cannot observe a hard-cancel. Optional so seam fakes need not implement it. */
+  merge: (task: TaskDetail, context: Record<string, unknown>, signal?: AbortSignal) => Promise<WorkflowNodeResult>;
   schedule: (task: TaskDetail, context: Record<string, unknown>) => Promise<WorkflowNodeResult>;
   /**
    * Step-inversion (KTD-2/KTD-4, U3): run exactly the foreach-active step inside
@@ -216,11 +217,16 @@ export type WorkflowCustomNodeRunner = (
   context: Record<string, unknown>,
 ) => Promise<WorkflowNodeResult>;
 
+/*
+FNXC:WorkflowCancellation 2026-07-15-10:42:
+`signal` is the graph walk's cancellation signal, taken from the node's own `WorkflowNodeExecutionContext.signal`. It was previously dropped here, leaving primitives unable to observe a graph abort — see {@link WorkflowPrimitiveContext.signal} for the 30-minute merge stall that caused. Every call site must forward its exec-context signal; a primitive that receives `undefined` cannot be cancelled.
+*/
 function primitiveContextForNode(
   node: WorkflowIrNode,
   task: TaskDetail,
   context: Record<string, unknown>,
   attempt?: number,
+  signal?: AbortSignal,
 ): WorkflowPrimitiveContext {
   return primitiveNodeContext(
     {
@@ -241,6 +247,7 @@ function primitiveContextForNode(
           ? context["workflow:effective-principal-id"]
           : undefined,
     },
+    signal,
   );
 }
 
@@ -351,7 +358,7 @@ export function createPrimitivePromptLikeHandler(
         node.id,
       );
       const result = await primitives.runTaskStep(
-        primitiveContextForNode(node, context.task, context.context),
+        primitiveContextForNode(node, context.task, context.context, undefined, context.signal),
         context.task,
         active.stepIndex,
       );
@@ -367,7 +374,7 @@ export function createPrimitivePromptLikeHandler(
     }
     if (seam) {
       context.context[SEAM_GOVERNING_NODE_CONTEXT_KEY] = node.id;
-      const primitiveCtx = primitiveContextForNode(node, context.task, context.context);
+      const primitiveCtx = primitiveContextForNode(node, context.task, context.context, undefined, context.signal);
       if (seam === "planning") {
         const result = await primitives.runPlanningSession(primitiveCtx, context.task);
         return { outcome: result.outcome, value: result.value, contextPatch: result.contextPatch };
@@ -546,7 +553,7 @@ export function createPrimitiveStepReviewHandler(primitives: WorkflowRuntimePrim
     let primitivePatch: Record<string, unknown> | undefined;
     for (let attempt = 0; attempt <= STEP_REVIEW_UNAVAILABLE_RETRY_CAP; attempt++) {
       const primitiveResult = await primitives.runReview(
-        primitiveContextForNode(node, ctx.task, ctx.context, attempt + 1),
+        primitiveContextForNode(node, ctx.task, ctx.context, attempt + 1, ctx.signal),
         ctx.task,
         {
           type: config.type,
@@ -624,7 +631,8 @@ export function createDefaultNodeHandlers(
   | "pr-respond"
   | "pr-merge"
   | "ask-user"
-  | "exit-gate",
+  | "exit-gate"
+  | "hold",
   WorkflowNodeHandler
 > {
   const promptLike = deps?.primitives
@@ -679,9 +687,23 @@ export function createDefaultNodeHandlers(
       primitives: deps?.primitives,
       seams,
       buildPrimitiveContext: (node, ctx, attempt) =>
-        primitiveContextForNode(node, ctx.task, ctx.context, attempt),
+        primitiveContextForNode(node, ctx.task, ctx.context, attempt, ctx.signal),
     }),
     "manual-merge-hold": async () => ({ outcome: "failure", value: "manual-required" }),
+    /*
+    FNXC:WorkflowHoldNode 2026-07-19-12:05:
+    `hold` had NO default handler, so every hold node threw "No handler
+    registered for node kind: hold" and burned the node's retry budget before
+    reporting a bogus execution error. That made `builtin:pr-workflow`
+    unrunnable past `pr-create` (its `await-review` is a hold) and would have
+    done the same to `builtin:stepwise-coding`'s `rework-hold` on the rework
+    path. A hold node is a PARK, not work: it waits for an external release
+    (`config.release` = "manual" | "external-event") that arrives as a later
+    dispatch, so entry must park the card in place exactly like
+    `manual-merge-hold` — the outcome-labelled release edges are traversed by the
+    resuming run, never by the run that entered the hold.
+    */
+    hold: async () => ({ outcome: "failure", value: "manual-required" }),
     "retry-backoff": async () => ({ outcome: "success" }),
     "recovery-router": async (_node, ctx) => ({
       outcome: "success",

@@ -103,11 +103,25 @@ import {
  * CentralCore operations. When an AsyncDataLayer is injected, CentralCore
  * delegates to these helpers against the central schema via the SHARED
  * connection pool (the same one TaskStore and the satellite stores use — NOT
- * a separate connection). The SQLite CentralDatabase path is preserved as the
- * legacy fallback for FUSION_NO_EMBEDDED_PG mode.
+ * a separate connection). Layer-less construction bootstraps PostgreSQL.
  */
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
 import * as asyncCentralCore from "./async-central-core.js";
+import {
+  createGlobalCapacityPolicyAuthorityStore,
+  loadGlobalCapacityPolicyAuthority,
+  type GlobalCapacityPolicyAuthorityRecordV1,
+  type GlobalCapacityPolicyAuthorityV1,
+  type InstallGlobalCapacityPolicyAuthorityInputV1,
+  type UpdateGlobalCapacityPolicyAuthorityInputV1,
+} from "./global-capacity-policy-authority.js";
+import {
+  createRoomHostCompositionOperatorPolicyAuthorityStore,
+  type InstallRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  type RevokeRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  type RoomHostCompositionOperatorPolicyAuthorityRecordV1,
+  type RoomHostCompositionOperatorPolicyAuthorityScopeV1,
+} from "./room-host-composition-operator-policy-authority.js";
 import {
   deriveRunningAgentCounts,
   getRunningAgentCountSource,
@@ -176,6 +190,14 @@ export interface EnsureProjectForPathInput {
   isolationMode?: IsolationMode;
   nodeId?: string;
   settings?: ProjectSettings;
+  /*
+  FNXC:ProjectSetup 2026-07-18-04:30:
+  Operator-confirmed "create anyway without a git repo" when git is not
+  installed on the host. Skips ensureGitRepositoryForProjectPath entirely so
+  registration succeeds on a plain directory; the repo can be initialized
+  later once git exists.
+  */
+  skipGitInit?: boolean;
 }
 
 export interface EnsureProjectForPathResult {
@@ -191,9 +213,8 @@ export interface CentralCoreOptions {
    * FNXC:CentralCore 2026-06-26-12:30:
    * When an AsyncDataLayer is injected, CentralCore operates in "backend mode":
    * all data access delegates to PostgreSQL via Drizzle against the central
-   * schema and no SQLite CentralDatabase is constructed. When absent, the
-   * legacy SQLite path is byte-identical to pre-migration. This mirrors the
-   * TaskStore/PluginStore/AgentStore dual-path pattern.
+   * schema and no SQLite CentralDatabase is constructed. When absent, init()
+   * creates and owns an unscoped PostgreSQL layer.
    */
   asyncLayer?: AsyncDataLayer;
 }
@@ -206,6 +227,8 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   private discoveryConfig: DiscoveryConfig | null = null;
   private readonly discoveredNodes = new Map<string, DiscoveredNode>();
   private readonly ensureGitRepositoryForProjectPath: typeof ensureGitRepositoryForProjectPath;
+  private ownedBackendShutdown: (() => Promise<void>) | null = null;
+  private ownedBackendReleaseConnections: (() => Promise<void>) | null = null;
 
   /**
    * FNXC:CentralCore 2026-06-26-12:30:
@@ -235,6 +258,18 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   async attachBackendLayer(layer: AsyncDataLayer): Promise<void> {
     if (!layer) {
       throw new Error("attachBackendLayer requires a non-null AsyncDataLayer");
+    }
+    // Release a central-only pool before adopting the runtime's shared layer.
+    if (this.ownedBackendReleaseConnections) {
+      /*
+       * FNXC:CentralPostgresLifecycle 2026-07-14-17:39:
+       * Release the central-only pool when adopting a TaskStore layer, but keep
+       * ownership of the embedded postmaster until CentralCore closes. The
+       * TaskStore lifecycle may only be an observer of that same process, so a
+       * full shutdown here would terminate PostgreSQL underneath its live pool.
+       */
+      await this.ownedBackendReleaseConnections();
+      this.ownedBackendReleaseConnections = null;
     }
     // Close any open SQLite handle from a prior legacy init().
     if (this.db) {
@@ -306,22 +341,30 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     }
 
     /*
-     * FNXC:SqliteFinalRemoval 2026-06-26-10:55:
-     * The legacy non-backend (SQLite) CentralDatabase path is removed
-     * (VAL-REMOVAL-005). The CentralDatabase class body is deleted; constructing
-     * it would throw. In the runtime serve path, CentralCore is constructed
-     * before the backend is resolved, then attachBackendLayer() is called once
-     * the TaskStore's AsyncDataLayer is available (InProcessRuntime.start).
-     *
-     * Non-backend init() is now a graceful no-op: it creates the global dir but
-     * leaves this.db = null and marks the instance initialized. Data methods
-     * check `this.db` before use and return empty/degrade when null (see
-     * readPathsUseDb guard). The serve command and reconciliation loop proceed
-     * with empty results; once attachBackendLayer injects the AsyncDataLayer,
-     * init() re-runs in backend mode and bootstraps against PostgreSQL.
+     * FNXC:CentralPostgresCutover 2026-07-14-17:14:
+     * Layer-less CentralCore instances are common in project/node CLI commands
+     * and dashboard route fallbacks. A no-op initialization made every read
+     * empty and every write fail after CentralDatabase was removed. Bootstrap
+     * an unscoped PostgreSQL layer here so every public construction path uses
+     * the central schema even before a project TaskStore exists.
      */
     await mkdir(this.globalDir, { recursive: true });
-    this.initialized = true;
+    const { createCentralBackendLayer } = await import("./postgres/startup-factory.js");
+    const backend = await createCentralBackendLayer({ globalSettingsDir: this.globalDir });
+    try {
+      await asyncCentralCore.ensureBackendBootstrap(backend.asyncLayer);
+      (this as { asyncLayer: AsyncDataLayer | null }).asyncLayer = backend.asyncLayer;
+      this.ownedBackendShutdown = backend.shutdown;
+      this.ownedBackendReleaseConnections = backend.releaseConnections;
+      this.initialized = true;
+    } catch (error) {
+      /*
+      FNXC:PostgresResourceLifecycle 2026-07-14-18:02:
+      A layer-less CentralCore owns the central backend it creates. Bootstrap failure must release both its pool and embedded lifecycle before the rejected init escapes, because callers cannot close an instance that never initialized successfully.
+      */
+      await backend.shutdown().catch(() => undefined);
+      throw error;
+    }
   }
 
   /**
@@ -333,6 +376,10 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       this.stopDiscovery();
     }
 
+    await this.markLocalNodeOffline().catch((error) => {
+      console.warn("[central-core] Failed to persist local node offline during close", error);
+    });
+
     // FNXC:CentralCore 2026-06-26-12:30: In backend mode there is no SQLite
     // CentralDatabase to close; the shared connection pool is owned by the
     // TaskStore/startup factory. CentralCore does not close the pool.
@@ -340,8 +387,27 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       this.db.close();
       this.db = null;
     }
+    if (this.ownedBackendShutdown) {
+      await this.ownedBackendShutdown();
+      this.ownedBackendShutdown = null;
+      this.ownedBackendReleaseConnections = null;
+      (this as { asyncLayer: AsyncDataLayer | null }).asyncLayer = null;
+    }
     this.initialized = false;
     this.removeAllListeners();
+  }
+
+  /** Persist the local mesh node's terminal state before its backend closes. */
+  async markLocalNodeOffline(): Promise<void> {
+    if (!this.initialized) return;
+    /*
+    FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
+    Mesh shutdown state must be committed before project engines release the PostgreSQL pool that CentralCore adopted. Keep this operation on the central authority so dashboard, server, and manager shutdown paths cannot reorder the write behind backend closure.
+    */
+    const localNode = await this.getLocalNode();
+    if (localNode && localNode.status !== "offline") {
+      await this.updateNode(localNode.id, { status: "offline" });
+    }
   }
 
   /**
@@ -536,7 +602,9 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     if (input.identity?.id) {
       const byId = await this.getProject(input.identity.id);
       if (!byId) {
-        const gitRepository = await this.ensureGitRepositoryForProjectPath(input.path);
+        const gitRepository = input.skipGitInit
+          ? undefined
+          : await this.ensureGitRepositoryForProjectPath(input.path);
         const reattached = await this.registerProject({
           id: input.identity.id,
           name: input.name ?? basename(input.path),
@@ -554,7 +622,9 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       return { project: byId, reattached: false, outcome: "existing" };
     }
 
-    const gitRepository = await this.ensureGitRepositoryForProjectPath(input.path);
+    const gitRepository = input.skipGitInit
+      ? undefined
+      : await this.ensureGitRepositoryForProjectPath(input.path);
     const registered = await this.registerProject({
       name: input.name ?? basename(input.path),
       path: input.path,
@@ -3264,6 +3334,64 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     this.emit("concurrency:changed", state);
   }
 
+  /**
+   * FNXC:GlobalCapacityPolicyAuthority 2026-07-20-04:20:
+   * Global capacity policy is a central PostgreSQL host contract, not a
+   * project or user setting. These methods deliberately reject non-backend
+   * CentralCore instances and delegate validation, hashing, and state
+   * synchronization to the dedicated authority store without installing a
+   * fallback policy.
+   */
+  async readGlobalCapacityPolicyAuthorityV1(): Promise<GlobalCapacityPolicyAuthorityV1> {
+    return loadGlobalCapacityPolicyAuthority({ layer: this.requireGlobalCapacityPolicyAuthorityLayer() });
+  }
+
+  async installGlobalCapacityPolicyAuthorityV1(
+    input: InstallGlobalCapacityPolicyAuthorityInputV1,
+  ): Promise<GlobalCapacityPolicyAuthorityRecordV1> {
+    return createGlobalCapacityPolicyAuthorityStore({
+      layer: this.requireGlobalCapacityPolicyAuthorityLayer(),
+    }).install(input);
+  }
+
+  async updateGlobalCapacityPolicyAuthorityV1(
+    input: UpdateGlobalCapacityPolicyAuthorityInputV1,
+  ): Promise<GlobalCapacityPolicyAuthorityRecordV1> {
+    return createGlobalCapacityPolicyAuthorityStore({
+      layer: this.requireGlobalCapacityPolicyAuthorityLayer(),
+    }).update(input);
+  }
+
+  /**
+   * FNXC:RoomHostCompositionOperatorAuthority 2026-07-20-09:18:
+   * This is a separate central authority from global capacity: it scopes a
+   * finite Room adapter bundle to one project and concrete host. No dashboard
+   * or project setting may manufacture a bundle when this record is absent.
+   */
+  async readRoomHostCompositionOperatorPolicyAuthorityV1(
+    scope: RoomHostCompositionOperatorPolicyAuthorityScopeV1,
+  ): Promise<RoomHostCompositionOperatorPolicyAuthorityRecordV1> {
+    return createRoomHostCompositionOperatorPolicyAuthorityStore({
+      layer: this.requireRoomHostCompositionOperatorPolicyAuthorityLayer(),
+    }).read(scope);
+  }
+
+  async installRoomHostCompositionOperatorPolicyAuthorityV1(
+    input: InstallRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  ): Promise<RoomHostCompositionOperatorPolicyAuthorityRecordV1> {
+    return createRoomHostCompositionOperatorPolicyAuthorityStore({
+      layer: this.requireRoomHostCompositionOperatorPolicyAuthorityLayer(),
+    }).install(input);
+  }
+
+  async revokeRoomHostCompositionOperatorPolicyAuthorityV1(
+    input: RevokeRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  ): Promise<RoomHostCompositionOperatorPolicyAuthorityRecordV1> {
+    return createRoomHostCompositionOperatorPolicyAuthorityStore({
+      layer: this.requireRoomHostCompositionOperatorPolicyAuthorityLayer(),
+    }).revoke(input);
+  }
+
   // ── Utility Methods ─────────────────────────────────────────────────────
 
   /**
@@ -3402,6 +3530,22 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       throw new Error("backendHandle is only available in backend mode (asyncLayer injected)");
     }
     return this.asyncLayer.db;
+  }
+
+  private requireGlobalCapacityPolicyAuthorityLayer(): AsyncDataLayer {
+    this.ensureInitialized();
+    if (!this.asyncLayer) {
+      throw new Error("Global capacity policy authority is only available in backend mode (asyncLayer injected)");
+    }
+    return this.asyncLayer;
+  }
+
+  private requireRoomHostCompositionOperatorPolicyAuthorityLayer(): AsyncDataLayer {
+    this.ensureInitialized();
+    if (!this.asyncLayer) {
+      throw new Error("Room host composition operator authority is only available in backend mode (asyncLayer injected)");
+    }
+    return this.asyncLayer;
   }
 
   private async assertProjectNodeMappingTargetsExist(projectId: string, nodeId: string): Promise<void> {

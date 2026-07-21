@@ -20,7 +20,9 @@ import {extractTaskIdTokens, normalizeTitleForTaskId} from "../task-title-id-dri
 import {buildBootstrapPrompt} from "../mesh-task-replication.js";
 import {validateFileScopeInPromptContent} from "../task-store/file-scope.js";
 import {__setTaskActivityLogLimitsForTesting, isBootstrapPromptStub, rewriteHeadingLine, rewriteMissionSection} from "../task-store/comments.js";
+import {applyOriginalDescription} from "../original-description-policy.js";
 import {normalizeTaskReviewState} from "../task-store/review-state.js";
+import {hasOwnDeclaredSymbols, normalizeDeclaredSymbols, extractDeclaredSymbolsFromPrompt, resolveTaskSymbolsForTask} from "../task-symbol-resolution.js";
 
 export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updates: Parameters<TaskStore["updateTask"]>[1], runContext?: RunMutationContext,): Promise<Task> {
     {
@@ -35,6 +37,7 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
 
       const dir = store.taskDir(id);
       const task = await store.readTaskJson(dir);
+      const wasFailed = task.status === "failed";
 
       // Capture title/description before mutation so the PROMPT.md stub
       // detector below can compare against the exact wrapper bytes that the
@@ -364,6 +367,14 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       } else if (updates.graphResumeRetryCount !== undefined) {
         task.graphResumeRetryCount = updates.graphResumeRetryCount;
       }
+      if (updates.consecutiveToolFailureRetryCount === null) task.consecutiveToolFailureRetryCount = null;
+      else if (updates.consecutiveToolFailureRetryCount !== undefined) task.consecutiveToolFailureRetryCount = updates.consecutiveToolFailureRetryCount;
+      if (updates.executorEscalationAttempted === null) task.executorEscalationAttempted = null;
+      else if (updates.executorEscalationAttempted !== undefined) task.executorEscalationAttempted = updates.executorEscalationAttempted;
+      if (updates.toolFailureDetectorLogCursor === null) task.toolFailureDetectorLogCursor = null;
+      else if (updates.toolFailureDetectorLogCursor !== undefined) task.toolFailureDetectorLogCursor = updates.toolFailureDetectorLogCursor;
+      if (updates.toolFailureRetryExhaustedAuditEmitted === null) task.toolFailureRetryExhaustedAuditEmitted = null;
+      else if (updates.toolFailureRetryExhaustedAuditEmitted !== undefined) task.toolFailureRetryExhaustedAuditEmitted = updates.toolFailureRetryExhaustedAuditEmitted;
       if (updates.resumeLimboTipSha === null) {
         task.resumeLimboTipSha = undefined;
       } else if (updates.resumeLimboTipSha !== undefined) {
@@ -389,6 +400,11 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       } else if (updates.postReviewFixCount !== undefined) {
         task.postReviewFixCount = updates.postReviewFixCount;
       }
+      if (updates.planReviewReplanCount === null) {
+        task.planReviewReplanCount = undefined;
+      } else if (updates.planReviewReplanCount !== undefined) {
+        task.planReviewReplanCount = updates.planReviewReplanCount;
+      }
       if (updates.recoveryRetryCount === null) {
         task.recoveryRetryCount = undefined;
       } else if (updates.recoveryRetryCount !== undefined) {
@@ -398,6 +414,40 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         task.taskDoneRetryCount = undefined;
       } else if (updates.taskDoneRetryCount !== undefined) {
         task.taskDoneRetryCount = updates.taskDoneRetryCount;
+      }
+      // FNXC:Lifecycle 2026-07-16-21:40: FN-8141 skip-bypass taint marker; null clears the taint.
+      if (updates.bulkCompletionRefusalAt === null) {
+        task.bulkCompletionRefusalAt = undefined;
+      } else if (updates.bulkCompletionRefusalAt !== undefined) {
+        task.bulkCompletionRefusalAt = updates.bulkCompletionRefusalAt;
+      }
+      /*
+      FNXC:WorkflowIrPin 2026-07-19-03:10 (U9b / KTD-3):
+      Node entry SETS the pin; node settle CLEARS it (null). Both directions must be writable
+      through updateTask or the pin either never lands or outlives its node and reports drift
+      against a node the task already left.
+      */
+      if (updates.workflowIrPin === null) {
+        task.workflowIrPin = undefined;
+      } else if (updates.workflowIrPin !== undefined) {
+        task.workflowIrPin = updates.workflowIrPin;
+      }
+      if (updates.workflowIrPinNodeId === null) {
+        task.workflowIrPinNodeId = undefined;
+      } else if (updates.workflowIrPinNodeId !== undefined) {
+        task.workflowIrPinNodeId = updates.workflowIrPinNodeId;
+      }
+      if (updates.workflowIrPinColumnId === null) {
+        task.workflowIrPinColumnId = undefined;
+      } else if (updates.workflowIrPinColumnId !== undefined) {
+        task.workflowIrPinColumnId = updates.workflowIrPinColumnId;
+      }
+      // FNXC:LegacyAdoption 2026-07-19-03:10 (U9b / KTD-8): stamped once by adoption; null is
+      // reserved for tests/operator repair that need to force re-adoption.
+      if (updates.legacyAdoptedAt === null) {
+        task.legacyAdoptedAt = undefined;
+      } else if (updates.legacyAdoptedAt !== undefined) {
+        task.legacyAdoptedAt = updates.legacyAdoptedAt;
       }
       if (updates.worktreeSessionRetryCount === null) {
         task.worktreeSessionRetryCount = undefined;
@@ -494,6 +544,10 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       } else if (updates.planningModelId !== undefined) {
         task.planningModelId = updates.planningModelId;
       }
+      if (updates.mergerModelProvider === null) task.mergerModelProvider = undefined;
+      else if (updates.mergerModelProvider !== undefined) task.mergerModelProvider = updates.mergerModelProvider;
+      if (updates.mergerModelId === null) task.mergerModelId = undefined;
+      else if (updates.mergerModelId !== undefined) task.mergerModelId = updates.mergerModelId;
       if (updates.validatorThinkingLevel === null) {
         task.validatorThinkingLevel = undefined;
       } else if (updates.validatorThinkingLevel !== undefined) {
@@ -504,6 +558,8 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       } else if (updates.planningThinkingLevel !== undefined) {
         task.planningThinkingLevel = updates.planningThinkingLevel as import("../types.js").ThinkingLevel;
       }
+      if (updates.mergerThinkingLevel === null) task.mergerThinkingLevel = undefined;
+      else if (updates.mergerThinkingLevel !== undefined) task.mergerThinkingLevel = updates.mergerThinkingLevel as import("../types.js").ThinkingLevel;
       if (updates.thinkingLevel === null) {
         task.thinkingLevel = undefined;
       } else if (updates.thinkingLevel !== undefined) {
@@ -513,6 +569,15 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         task.executionMode = undefined;
       } else if (updates.executionMode !== undefined) {
         task.executionMode = updates.executionMode as import("../types.js").ExecutionMode;
+      }
+      /*
+      FNXC:PlannerOversight 2026-07-14-18:11:
+      sessionAdvisorEnabled: null clears to inherit project default; boolean sets override.
+      */
+      if (updates.sessionAdvisorEnabled === null) {
+        task.sessionAdvisorEnabled = undefined;
+      } else if (updates.sessionAdvisorEnabled !== undefined) {
+        task.sessionAdvisorEnabled = updates.sessionAdvisorEnabled;
       }
       if (updates.error === null) {
         task.error = undefined;
@@ -538,6 +603,16 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         task.cumulativeActiveMs = undefined;
       } else if (updates.cumulativeActiveMs !== undefined) {
         task.cumulativeActiveMs = updates.cumulativeActiveMs;
+      }
+      if (updates.cumulativePlanningMs === null) {
+        task.cumulativePlanningMs = undefined;
+      } else if (updates.cumulativePlanningMs !== undefined) {
+        task.cumulativePlanningMs = updates.cumulativePlanningMs;
+      }
+      if (updates.planningStartedAt === null) {
+        task.planningStartedAt = undefined;
+      } else if (updates.planningStartedAt !== undefined) {
+        task.planningStartedAt = updates.planningStartedAt;
       }
       if (updates.executionStartedAt === null) {
         task.executionStartedAt = undefined;
@@ -641,6 +716,14 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
       } else if (updates.modifiedFiles !== undefined) {
         task.modifiedFiles = updates.modifiedFiles;
       }
+      /* FNXC:SymbolLock 2026-07-31-10:00: present undefined is an explicit clear; only absent declarations may hydrate from a prompt write. */
+      if (hasOwnDeclaredSymbols(updates)) {
+        const normalized = normalizeDeclaredSymbols(Array.isArray(updates.declaredSymbols) ? updates.declaredSymbols : []);
+        task.declaredSymbols = normalized.length ? normalized : undefined;
+      } else if (updates.prompt !== undefined) {
+        const normalized = normalizeDeclaredSymbols(extractDeclaredSymbolsFromPrompt(updates.prompt));
+        task.declaredSymbols = normalized.length ? normalized : undefined;
+      }
       if (updates.missionId === null) {
         task.missionId = undefined;
       } else if (updates.missionId !== undefined) {
@@ -685,6 +768,20 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
         });
       } else {
         await store.atomicWriteTaskJson(dir, task);
+      }
+
+      /*
+      FNXC:MissionSymbolAdmission 2026-08-01-00:00:
+      A workflow failure may park in the current in-progress column rather than
+      move out of it. Release that task's durable symbols on the status edge as
+      well as moveTask's column-exit path, allowing engine reconciliation to
+      record failure provenance without incorrectly completing the feature.
+      */
+      if (store.backendMode && !wasFailed && task.status === "failed") {
+        const symbols = resolveTaskSymbolsForTask(task);
+        if (symbols.resolvable) {
+          await store.releaseSymbolLocks(symbols.symbols, id);
+        }
       }
 
       // Update cache if watcher is active
@@ -742,7 +839,11 @@ export async function updateTaskUnlockedImpl(store: TaskStore, id: string, updat
                 next = rewriteHeadingLine(next, heading);
               }
               if (updates.description !== undefined) {
+                // FNXC:OriginalDescriptionInPrompt 2026-07-14-23:35:
+                // Keep ## Mission and ## Original Description in sync with task.description
+                // on real specs so operator edits stay visible at the top of PROMPT.md.
                 next = rewriteMissionSection(next, task.description);
+                next = applyOriginalDescription(next, task.description ?? "");
               }
               if (next !== existingPrompt) {
                 await writeFile(promptPath, next);

@@ -18,6 +18,7 @@ import {
   resolveValidatorSessionModel,
   resolveValidatorThinkingLevel,
   resolveValidatorFallbackThinkingLevel,
+  wrapCustomToolsForPluginRuntime,
 } from "../agent-session-helpers.js";
 
 const { resolveRuntimeMock } = vi.hoisted(() => ({
@@ -32,6 +33,20 @@ vi.mock("../runtime-resolution.js", async () => {
   };
 });
 
+
+describe("non-pi custom tool wrapping", () => {
+  it("preserves chat fusion tool names without an action-gate context", () => {
+    const tools = [
+      { name: "fn_task_list", description: "List tasks", parameters: {}, execute: async () => ({}) },
+      { name: "fn_delegate_task", description: "Delegate a task", parameters: {}, execute: async () => ({}) },
+      { name: "fn_list_agents", description: "List agents", parameters: {}, execute: async () => ({}) },
+      { name: "fn_web_fetch", description: "Fetch a URL", parameters: {}, execute: async () => ({}) },
+    ] as any;
+
+    expect(wrapCustomToolsForPluginRuntime(tools, {}, { runtimeId: "grok", sessionPurpose: "heartbeat" })?.map((tool) => tool.name))
+      .toEqual(tools.map((tool: { name: string }) => tool.name));
+  });
+});
 
 describe("resolve model-lane thinking levels", () => {
   it("applies node/task > workflow execution lane > global lane > project default lane > global default precedence", () => {
@@ -109,6 +124,8 @@ describe("resolve model-lane thinking levels", () => {
     expect(resolveTitleSummarizerFallbackThinkingLevel({ defaultThinkingLevelOverride: "medium", defaultThinkingLevel: "minimal" })).toBe("medium");
     expect(resolveTitleSummarizerFallbackThinkingLevel({ defaultThinkingLevel: "minimal" })).toBe("minimal");
 
+    expect(resolveMergerFallbackThinkingLevel({ mergerFallbackThinkingLevel: "xhigh", fallbackThinkingLevel: "high", mergerThinkingLevel: "medium" }, "minimal")).toBe("minimal");
+    expect(resolveMergerFallbackThinkingLevel({ mergerFallbackThinkingLevel: "xhigh", fallbackThinkingLevel: "high", mergerThinkingLevel: "medium" })).toBe("xhigh");
     expect(resolveMergerFallbackThinkingLevel({ fallbackThinkingLevel: "high", defaultThinkingLevel: "low" })).toBe("high");
     expect(resolveMergerFallbackThinkingLevel({ defaultThinkingLevelOverride: "medium", defaultThinkingLevel: "low" })).toBe("medium");
     expect(resolveMergerFallbackThinkingLevel({ defaultThinkingLevel: "low" })).toBe("low");
@@ -229,7 +246,7 @@ describe("resolve session model parity", () => {
     });
   });
 
-  it("does not let a stale complete runtime model mask newer task or settings models", () => {
+  it("does not let a stale complete runtime model mask newer task or settings models outside heartbeat", () => {
     const staleRuntimeConfig = { model: "openai-codex/gpt-5.3-codex" };
 
     expect(resolveExecutorSessionModel("task-provider", "task-model", settings, staleRuntimeConfig)).toEqual({
@@ -248,12 +265,6 @@ describe("resolve session model parity", () => {
       provider: "anthropic",
       modelId: "claude-sonnet-4-5",
     });
-    expect(resolveHeartbeatSessionModels(settings, staleRuntimeConfig)).toEqual({
-      defaultProvider: "openai",
-      defaultModelId: "gpt-4.1",
-      fallbackProvider: undefined,
-      fallbackModelId: undefined,
-    });
     expect(resolveValidatorSessionModel("validator-task-provider", "validator-task-model", settings, staleRuntimeConfig)).toEqual({
       provider: "validator-task-provider",
       modelId: "validator-task-model",
@@ -269,6 +280,23 @@ describe("resolve session model parity", () => {
     expect(resolveMergerSessionModel(settings, staleRuntimeConfig)).toEqual({
       provider: "google",
       modelId: "gemini-2.5-pro",
+    });
+  });
+
+  it("uses the durable agent's complete assigned model for heartbeat instead of shared execution settings", () => {
+    expect(resolveHeartbeatSessionModels(
+      {
+        defaultProviderOverride: "anthropic",
+        defaultModelIdOverride: "claude-sonnet-5",
+        defaultProvider: "openai-codex",
+        defaultModelId: "gpt-5.5",
+      },
+      { modelProvider: "grok-cli", modelId: "grok-4.5", model: "grok-cli/grok-4.5" },
+    )).toEqual({
+      defaultProvider: "grok-cli",
+      defaultModelId: "grok-4.5",
+      fallbackProvider: undefined,
+      fallbackModelId: undefined,
     });
   });
 
@@ -312,6 +340,13 @@ describe("resolve session model parity", () => {
       defaultProvider: "anthropic",
       defaultModelId: "claude-sonnet-4-5",
     }, staleRuntimeConfig)).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
+  });
+
+  it("prefers a complete per-task merger pair, ignores partial pairs, and still forces test mode", () => {
+    const settings = { mergerProvider: "settings-provider", mergerModelId: "settings-model" };
+    expect(resolveMergerSessionModel(settings, undefined, { mergerModelProvider: "task-provider", mergerModelId: "task-model" })).toEqual({ provider: "task-provider", modelId: "task-model" });
+    expect(resolveMergerSessionModel(settings, undefined, { mergerModelProvider: "partial-provider" })).toEqual({ provider: "settings-provider", modelId: "settings-model" });
+    expect(resolveMergerSessionModel({ ...settings, testMode: true }, undefined, { mergerModelProvider: "task-provider", mergerModelId: "task-model" })).toEqual({ provider: "mock", modelId: "scripted" });
   });
 
   it("prefers the dedicated merger lane over default and other AI role lanes", () => {
@@ -391,7 +426,7 @@ describe("resolve session model parity", () => {
   });
 });
 
-describe("project model override precedence invariant", () => {
+describe("non-heartbeat project model override precedence invariant", () => {
   const staleRuntimeConfig = { model: "stale-provider/stale-model" };
   const partialRuntimeConfigs: Array<Record<string, unknown>> = [
     { modelProvider: "stale-provider" },
@@ -429,18 +464,6 @@ describe("project model override precedence invariant", () => {
           validatorModelId: "project-validator-model",
         }, runtimeConfig),
       expected: { provider: "project-validator-provider", modelId: "project-validator-model" },
-    },
-    {
-      label: "heartbeat execution lane",
-      settings: { executionProvider: "project-heartbeat-provider", executionModelId: "project-heartbeat-model" },
-      resolve: (runtimeConfig?: Record<string, unknown>) => {
-        const resolved = resolveHeartbeatSessionModels({
-          executionProvider: "project-heartbeat-provider",
-          executionModelId: "project-heartbeat-model",
-        }, runtimeConfig);
-        return { provider: resolved.defaultProvider, modelId: resolved.defaultModelId };
-      },
-      expected: { provider: "project-heartbeat-provider", modelId: "project-heartbeat-model" },
     },
     {
       label: "merger default lane",
@@ -597,6 +620,81 @@ describe("createResolvedAgentSession", () => {
     );
   });
 
+  it("forwards plugin skill names and body paths to runtime session factory", async () => {
+    const createSessionMock = vi.fn().mockResolvedValue({
+      session: { prompt: vi.fn() },
+      sessionFile: "session.json",
+    });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "pi",
+        name: "Default PI Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "mock/model"),
+      },
+      runtimeId: "pi",
+      wasConfigured: false,
+    });
+
+    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+    const additionalSkillPaths = ["/tmp/plugin-skills/foo", "/tmp/plugin-skills"];
+    await createResolvedAgentSession({
+      sessionPurpose: "executor",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      skillSelection: {
+        projectRootDir: "/tmp/project",
+        sessionPurpose: "executor",
+        requestedSkillNames: ["plugin-foo"],
+      },
+      additionalSkillPaths,
+    });
+
+    expect(createSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      skills: ["plugin-foo"],
+      additionalSkillPaths,
+    }));
+  });
+
+  it("forwards sessionPurpose into runtime.createSession for host-extension policy", async () => {
+    /*
+    FNXC:MergeQueue 2026-07-15-11:20:
+    FN-7956 fix requires sessionPurpose "merger" to reach createFnAgent so host extensions are skipped.
+    */
+    const mockSession = { prompt: vi.fn() } as any;
+    const createSessionMock = vi.fn().mockResolvedValue({
+      session: mockSession,
+      sessionFile: "session.json",
+    });
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "pi",
+        name: "Default PI Runtime",
+        createSession: createSessionMock,
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "mock/model"),
+      },
+      runtimeId: "pi",
+      wasConfigured: false,
+    });
+
+    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+
+    await createResolvedAgentSession({
+      sessionPurpose: "merger",
+      pluginRunner: undefined,
+      cwd: "/tmp/project",
+      systemPrompt: "merge",
+    });
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionPurpose: "merger",
+      }),
+    );
+  });
+
   it("emits session:runtime-resolved when runAuditor is provided", async () => {
     const mockSession = { prompt: vi.fn() } as any;
     const createSessionMock = vi.fn().mockResolvedValue({ session: mockSession });
@@ -629,6 +727,43 @@ describe("createResolvedAgentSession", () => {
         testModeActive: true,
       },
     });
+  });
+
+  it("records an ids-only bridge failure outcome in session:runtime-resolved", async () => {
+    const auditDatabaseMock = vi.fn().mockResolvedValue(undefined);
+    resolveRuntimeMock.mockResolvedValue({
+      runtime: {
+        id: "grok",
+        name: "Grok Runtime",
+        createSession: vi.fn().mockResolvedValue({
+          session: { fusionToolBridgeError: { reasonCode: "mcp-schema-server-missing" } },
+        }),
+        promptWithFallback: vi.fn(),
+        describeModel: vi.fn(() => "grok/grok-4.5"),
+      },
+      runtimeId: "grok",
+      wasConfigured: true,
+    });
+    const { createResolvedAgentSession } = await import("../agent-session-helpers.js");
+
+    await createResolvedAgentSession({
+      sessionPurpose: "triage",
+      cwd: "/tmp/project",
+      systemPrompt: "system",
+      defaultProvider: "xai",
+      defaultModelId: "grok-4.5",
+      customTools: [{ name: "fn_task_list", description: "", parameters: {}, execute: async () => ({}) }] as any,
+      runAuditor: { database: auditDatabaseMock } as any,
+    });
+
+    expect(auditDatabaseMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: "session:runtime-resolved",
+      metadata: expect.objectContaining({
+        fusionToolBridgeFailed: true,
+        fusionToolBridgeReasonCode: "mcp-schema-server-missing",
+        expectedToolCount: 1,
+      }),
+    }));
   });
 
   it("succeeds when runAuditor is omitted", async () => {
@@ -924,6 +1059,24 @@ describe("resolveImplicitPlanningFallbackModel (FN-7719)", () => {
     ).toEqual({
       provider: undefined,
       modelId: undefined,
+    });
+  });
+
+  it("uses the inherited global default when a project override equals the planning primary", () => {
+    expect(
+      resolveImplicitPlanningFallbackModel(
+        {
+          defaultProviderOverride: "anthropic",
+          defaultModelIdOverride: "claude-sonnet-5",
+          defaultProvider: "openai-codex",
+          defaultModelId: "gpt-5.5",
+        },
+        "anthropic",
+        "claude-sonnet-5",
+      ),
+    ).toEqual({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
     });
   });
 

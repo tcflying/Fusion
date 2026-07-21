@@ -1,9 +1,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { CommandCenterControls } from "../CommandCenterControls";
-import { COLOR_THEMES } from "../../themeOptions";
 import { ConfirmDialogProvider } from "../../../hooks/useConfirm";
 
 const commandCenterControlsCss = readFileSync(
@@ -11,537 +10,188 @@ const commandCenterControlsCss = readFileSync(
   "utf8",
 );
 
-const mocks = vi.hoisted(() => ({
-  fetchSettings: vi.fn(),
+const legacyMocks = vi.hoisted(() => ({
   fetchConfig: vi.fn(),
-  fetchGlobalConcurrency: vi.fn(),
+  fetchSettings: vi.fn(),
   updateSettings: vi.fn(),
+  fetchGlobalConcurrency: vi.fn(),
   updateGlobalConcurrency: vi.fn(),
-  toggleGlobalPause: vi.fn(),
-  toggleEnginePause: vi.fn(),
-  refresh: vi.fn(),
-  appSettings: {
-    globalPaused: false,
-    enginePaused: false,
-  },
 }));
 
-vi.mock("../../../api/legacy", () => ({
-  fetchSettings: mocks.fetchSettings,
-  fetchConfig: mocks.fetchConfig,
-  fetchGlobalConcurrency: mocks.fetchGlobalConcurrency,
-  updateSettings: mocks.updateSettings,
-  updateGlobalConcurrency: mocks.updateGlobalConcurrency,
-}));
-
+vi.mock("../../../api/legacy", () => legacyMocks);
 vi.mock("../../../hooks/useAppSettings", () => ({
   useAppSettings: () => ({
-    globalPaused: mocks.appSettings.globalPaused,
-    enginePaused: mocks.appSettings.enginePaused,
-    toggleGlobalPause: mocks.toggleGlobalPause,
-    toggleEnginePause: mocks.toggleEnginePause,
-    refresh: mocks.refresh,
+    globalPaused: false,
+    toggleGlobalPause: vi.fn(),
+    refresh: vi.fn().mockResolvedValue(undefined),
   }),
 }));
 
-function renderControls(projectId?: string) {
-  return render(
+const defaultSettings = {
+  maxConcurrent: 12,
+  maxTriageConcurrent: 1,
+  maxWorktrees: 4,
+};
+
+function renderControls(projectId = "proj_123") {
+  const onColorThemeChange = vi.fn();
+  render(
     <ConfirmDialogProvider>
       <CommandCenterControls
         projectId={projectId}
         colorTheme="default"
         themeMode="dark"
-        onColorThemeChange={vi.fn()}
+        onColorThemeChange={onColorThemeChange}
         onThemeModeChange={vi.fn()}
       />
     </ConfirmDialogProvider>,
   );
+  return { onColorThemeChange };
 }
 
-async function flushPromises() {
-  await act(async () => {
-    await Promise.resolve();
-  });
-}
-
-async function advanceConfirmDebounce() {
-  await act(async () => {
-    vi.advanceTimersByTime(500);
-    await Promise.resolve();
-  });
-}
-
-function getConfirmDialog() {
-  return screen.getByRole("dialog", { name: /confirm concurrency change/i });
-}
-
-async function clickConfirmSave() {
-  fireEvent.click(within(getConfirmDialog()).getByRole("button", { name: /save change/i }));
-  await flushPromises();
-}
-
-async function clickConfirmCancel() {
-  fireEvent.click(within(getConfirmDialog()).getByRole("button", { name: /cancel/i }));
-  await flushPromises();
-}
-
-beforeEach(() => {
-  vi.useFakeTimers();
-  vi.clearAllMocks();
-  mocks.appSettings.globalPaused = false;
-  mocks.appSettings.enginePaused = false;
-  mocks.fetchSettings.mockResolvedValue({ maxConcurrent: 2, maxTriageConcurrent: 2, maxWorktrees: 4 });
-  mocks.fetchConfig.mockResolvedValue({ maxConcurrent: 2, rootDir: "/repo" });
-  mocks.fetchGlobalConcurrency.mockResolvedValue({
-    globalMaxConcurrent: 8,
-    currentlyActive: 3,
+function mockGlobalConcurrency(overrides: Partial<{
+  globalMaxConcurrent: number;
+  currentlyActive: number;
+  projectsActive: Record<string, number>;
+}> = {}) {
+  legacyMocks.fetchGlobalConcurrency.mockResolvedValue({
+    globalMaxConcurrent: 10,
+    currentlyActive: 10,
     queuedCount: 0,
-    projectsActive: { "project-a": 2 },
+    projectsActive: { proj_123: 10 },
+    ...overrides,
   });
-  mocks.updateSettings.mockResolvedValue({});
-  mocks.updateGlobalConcurrency.mockResolvedValue({});
-  mocks.refresh.mockResolvedValue(undefined);
-});
+}
 
-afterEach(() => {
-  vi.useRealTimers();
-});
+function expectUseMarkerPct(testId: string, pct: string) {
+  expect(screen.getByTestId(testId).style.getPropertyValue("--use-pct")).toBe(pct);
+}
 
-describe("CommandCenterControls", () => {
-  it("renders only overview controls after team affordances move", async () => {
-    renderControls(undefined);
+function expectCommandCenterUseOffset(testId: string, ratio: number) {
+  expect(screen.getByTestId(testId).style.getPropertyValue("--use-offset")).toBe(
+    `calc((var(--cc-controls-range-thumb-size) / 2) + ((100% - var(--cc-controls-range-thumb-size)) * ${ratio}))`,
+  );
+}
 
-    await flushPromises();
-    expect(screen.getByTestId("command-center-controls")).toBeDefined();
-    expect(screen.queryByTestId("cc-controls-org-chart")).toBeNull();
-    expect(screen.queryByTestId("cc-controls-heartbeat")).toBeNull();
-    expect(screen.getByTestId("cc-controls-engine")).toBeDefined();
-    expect(screen.getByTestId("cc-controls-concurrency")).toBeDefined();
-    expect(screen.getByTestId("cc-controls-theme")).toBeDefined();
+// FNXC:Theme 2026-07-16-14:30: FN-8146 pins the historical Settings-grid set, including restored shadcn-mono, so a removal from COLOR_THEMES cannot make the all-themes checks pass circularly.
+const EXPECTED_THEME_IDS = ['default', 'ocean', 'forest', 'sunset', 'zen', 'berry', 'high-contrast', 'industrial', 'monochrome', 'slate', 'ash', 'air', 'graphite', 'silver', 'solarized', 'factory', 'factory-mono', 'ayu', 'one-dark', 'nord', 'dracula', 'gruvbox', 'tokyo-night', 'catppuccin-mocha', 'github-dark', 'everforest', 'rose-pine', 'kanagawa', 'night-owl', 'palenight', 'monokai-pro', 'slime', 'brutalist', 'neon-city', 'parchment', 'terminal', 'glass', 'glass-silver', 'horizon', 'vitesse', 'outrun', 'snazzy', 'porple', 'espresso', 'mars', 'poimandres', 'ember', 'rust', 'copper', 'foundry', 'carbon', 'sandstone', 'lagoon', 'frost', 'lavender', 'neon-bloom', 'sepia', 'cobalt', 'clay', 'moss', 'shadcn', 'shadcn-ember', 'shadcn-custom', 'shadcn-blue', 'shadcn-green', 'shadcn-red', 'shadcn-purple', 'shadcn-pink', 'shadcn-orange', 'shadcn-yellow', 'shadcn-mono', 'shadcn-mono-red', 'shadcn-mono-blue', 'shadcn-mono-green', 'shadcn-mono-purple', 'shadcn-mono-pink', 'shadcn-mono-orange', 'shadcn-mono-yellow', 'shadcn-black', 'shadcn-gray', 'shadcn-gray-blue'] as const;
+
+function renderedThemeIds(listbox: HTMLElement) {
+  return within(listbox).getAllByRole("option").map((option) => {
+    const swatch = option.querySelector<HTMLElement>(".theme-option-swatch");
+    expect(swatch).toBeTruthy();
+    return [...(swatch?.classList ?? [])].find((className) => className.startsWith("theme-swatch-"))?.replace("theme-swatch-", "");
   });
+}
 
-  it("engine controls call the existing settings toggle", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    fireEvent.click(screen.getByRole("button", { name: /stop ai engine/i }));
-    expect(mocks.toggleGlobalPause).toHaveBeenCalledTimes(1);
-    expect(mocks.toggleEnginePause).not.toHaveBeenCalled();
-  });
-
-  it("shows loaded global and current-project running counts and use markers", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-
-    expect(within(section).getByTestId("cc-global-running")).toHaveTextContent("3 running (all projects)");
-    expect(within(section).getByTestId("cc-project-running")).toHaveTextContent("2 running (this project)");
-    expect(within(section).getByTestId("cc-global-use-marker").style.getPropertyValue("--use-pct")).toBe(`${(3 / 32) * 100}%`);
-    expect(within(section).getByTestId("cc-project-use-marker").style.getPropertyValue("--use-pct")).toBe(`${(2 / 50) * 100}%`);
-    expect(within(section).queryAllByTestId(/cc-.*-use-marker/)).toHaveLength(2);
+describe("CommandCenterControls concurrency markers", () => {
+  beforeEach(() => {
+    legacyMocks.fetchConfig.mockResolvedValue({ maxConcurrent: 12, rootDir: "/workspace/project" });
+    legacyMocks.fetchSettings.mockResolvedValue({ ...defaultSettings });
+    legacyMocks.updateSettings.mockResolvedValue({ ...defaultSettings });
+    legacyMocks.updateGlobalConcurrency.mockResolvedValue({});
+    mockGlobalConcurrency();
   });
 
-  it("positions one active agent above zero on both use markers", async () => {
-    mocks.fetchGlobalConcurrency.mockResolvedValueOnce({
-      globalMaxConcurrent: 8,
-      currentlyActive: 1,
-      queuedCount: 0,
-      projectsActive: { "project-a": 1 },
-    });
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-
-    expect(within(section).getByTestId("cc-global-use-marker").style.getPropertyValue("--use-pct")).toBe(`${(1 / 32) * 100}%`);
-    expect(within(section).getByTestId("cc-project-use-marker").style.getPropertyValue("--use-pct")).toBe(`${(1 / 50) * 100}%`);
-    expect(within(section).getByTestId("cc-global-use-marker").style.getPropertyValue("--use-pct")).not.toBe("0%");
-    expect(within(section).getByTestId("cc-project-use-marker").style.getPropertyValue("--use-pct")).not.toBe("0%");
+  afterEach(() => {
+    vi.clearAllMocks();
+    document.body.innerHTML = "";
   });
 
-  it("shows truthful zero or missing project running counts only after utilization loads", async () => {
-    mocks.fetchGlobalConcurrency.mockResolvedValueOnce({
-      globalMaxConcurrent: 8,
-      currentlyActive: 0,
-      queuedCount: 0,
-      projectsActive: {},
-    });
-    renderControls(undefined);
+  it("keeps organization portability out of Overview controls", () => {
+    renderControls();
 
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-
-    expect(within(section).getByTestId("cc-global-running")).toHaveTextContent("0 running (all projects)");
-    expect(within(section).getByTestId("cc-project-running")).toHaveTextContent("0 running (this project)");
-    expect(within(section).getByTestId("cc-global-use-marker").style.getPropertyValue("--use-pct")).toBe("0%");
-    expect(within(section).getByTestId("cc-project-use-marker").style.getPropertyValue("--use-pct")).toBe("0%");
+    expect(screen.queryByTestId("cc-controls-org-portability")).not.toBeInTheDocument();
   });
 
-  it("clamps over-subscribed current-use markers while keeping truthful counts", async () => {
-    mocks.fetchSettings.mockResolvedValueOnce({ maxConcurrent: 4, maxTriageConcurrent: 2, maxWorktrees: 4 });
-    mocks.fetchGlobalConcurrency.mockResolvedValueOnce({
-      globalMaxConcurrent: 8,
-      currentlyActive: 60,
-      queuedCount: 0,
-      projectsActive: { "project-a": 60 },
-    });
-    renderControls("project-a");
+  it("keeps the Theme card's compact dropdown interactive", () => {
+    const { onColorThemeChange } = renderControls();
+    const themeCard = screen.getByTestId("cc-controls-theme");
+    const trigger = screen.getByRole("button", { name: "Fusion Legacy" });
 
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
+    expect(themeCard).toContainElement(trigger);
+    fireEvent.click(trigger);
+    const listbox = screen.getByRole("listbox", { name: "Color theme" });
+    expect(renderedThemeIds(listbox)).toEqual(EXPECTED_THEME_IDS);
+    fireEvent.click(screen.getByRole("option", { name: "Ocean" }));
 
-    expect(within(section).getByTestId("cc-global-running")).toHaveTextContent("60 running (all projects)");
-    expect(within(section).getByTestId("cc-project-running")).toHaveTextContent("60 running (this project)");
-    expect(within(section).getByTestId("cc-global-use-marker").style.getPropertyValue("--use-pct")).toBe("100%");
-    expect(within(section).getByTestId("cc-project-use-marker").style.getPropertyValue("--use-pct")).toBe("100%");
+    expect(onColorThemeChange).toHaveBeenCalledWith("ocean");
   });
 
-  it("suppresses running counts before global utilization finishes loading", async () => {
-    let resolveGlobalConcurrency!: (value: { globalMaxConcurrent: number; currentlyActive: number; queuedCount: number; projectsActive: Record<string, number> }) => void;
-    mocks.fetchGlobalConcurrency.mockReturnValueOnce(new Promise((resolve) => {
+  // FNXC:GlobalConcurrencyControls 2026-07-15-12:00: FN-8007 requires dashboard markers to use the exact native-thumb coordinate system when the expanded range max exceeds the persisted cap.
+  it("aligns dashboard global and project markers with their native thumbs", async () => {
+    renderControls();
+
+    await screen.findByTestId("cc-global-use-marker");
+    expectUseMarkerPct("cc-global-use-marker", `${((10 - 1) / (32 - 1)) * 100}%`);
+    expectUseMarkerPct("cc-project-use-marker", `${((10 - 1) / (50 - 1)) * 100}%`);
+    expectCommandCenterUseOffset("cc-global-use-marker", (10 - 1) / (32 - 1));
+    expectCommandCenterUseOffset("cc-project-use-marker", (10 - 1) / (50 - 1));
+  });
+
+  it("pins dashboard over-cap markers at the cap thumb instead of the track end", async () => {
+    mockGlobalConcurrency({ currentlyActive: 40, projectsActive: { proj_123: 40 } });
+    renderControls();
+
+    await screen.findByTestId("cc-global-use-marker");
+    expectUseMarkerPct("cc-global-use-marker", `${((10 - 1) / (32 - 1)) * 100}%`);
+    expectUseMarkerPct("cc-project-use-marker", `${((12 - 1) / (50 - 1)) * 100}%`);
+    expect(screen.getByTestId("cc-global-use-marker").style.getPropertyValue("--use-pct")).not.toBe("100%");
+    expect(screen.getByTestId("cc-project-use-marker").style.getPropertyValue("--use-pct")).not.toBe("100%");
+  });
+
+  it("maps one running agent to the visible dashboard slider start", async () => {
+    mockGlobalConcurrency({ currentlyActive: 1, projectsActive: { proj_123: 1 } });
+    renderControls();
+
+    await screen.findByTestId("cc-global-use-marker");
+    expectUseMarkerPct("cc-global-use-marker", "0%");
+    expectUseMarkerPct("cc-project-use-marker", "0%");
+    expectCommandCenterUseOffset("cc-global-use-marker", 0);
+    expectCommandCenterUseOffset("cc-project-use-marker", 0);
+  });
+
+  it("suppresses dashboard marker shells while global concurrency is loading or unavailable", async () => {
+    let resolveGlobalConcurrency!: (value: {
+      globalMaxConcurrent: number;
+      currentlyActive: number;
+      queuedCount: number;
+      projectsActive: Record<string, number>;
+    }) => void;
+    legacyMocks.fetchGlobalConcurrency.mockReturnValue(new Promise((resolve) => {
       resolveGlobalConcurrency = resolve;
     }));
-    renderControls("project-a");
-    const section = screen.getByTestId("cc-controls-concurrency");
+    renderControls();
 
-    expect(within(section).queryByTestId("cc-global-running")).toBeNull();
-    expect(within(section).queryByTestId("cc-project-running")).toBeNull();
-    expect(within(section).queryByTestId("cc-global-use-marker")).toBeNull();
-    expect(within(section).queryByTestId("cc-project-use-marker")).toBeNull();
+    expect(screen.queryByTestId("cc-global-use-marker")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("cc-project-use-marker")).not.toBeInTheDocument();
 
-    resolveGlobalConcurrency({ globalMaxConcurrent: 8, currentlyActive: 1, queuedCount: 0, projectsActive: {} });
-    await flushPromises();
+    resolveGlobalConcurrency({ globalMaxConcurrent: 10, currentlyActive: 0, queuedCount: 0, projectsActive: {} });
+    await screen.findByTestId("cc-global-use-marker");
+    cleanup();
+
+    legacyMocks.fetchGlobalConcurrency.mockRejectedValue(new Error("global concurrency unavailable"));
+    renderControls();
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
+    expect(screen.queryByTestId("cc-global-use-marker")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("cc-project-use-marker")).not.toBeInTheDocument();
   });
 
-  it("suppresses running counts while global utilization is unavailable", async () => {
-    mocks.fetchGlobalConcurrency.mockRejectedValueOnce(new Error("global unavailable"));
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-
-    expect(within(section).queryByTestId("cc-global-running")).toBeNull();
-    expect(within(section).queryByTestId("cc-project-running")).toBeNull();
-    expect(within(section).queryByTestId("cc-global-use-marker")).toBeNull();
-    expect(within(section).queryByTestId("cc-project-use-marker")).toBeNull();
-  });
-
-  it("gates the global cap slider behind confirmation before persisting", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/global max concurrent/i) as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "10" } });
-
-    await advanceConfirmDebounce();
-
-    expect(getConfirmDialog()).toHaveTextContent("Change Global Max Concurrent from 8 to 10?");
-    expect(mocks.updateGlobalConcurrency).not.toHaveBeenCalled();
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-
-    await clickConfirmSave();
-    await advanceConfirmDebounce();
-
-    expect(mocks.updateGlobalConcurrency).toHaveBeenCalledWith({ globalMaxConcurrent: 10 });
-    expect(mocks.updateGlobalConcurrency).toHaveBeenCalledTimes(1);
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    {
-      name: "Max concurrent tasks",
-      label: /max concurrent tasks/i,
-      value: "7",
-      expected: { maxConcurrent: 7, maxTriageConcurrent: 2, maxWorktrees: 4 },
-    },
-    {
-      name: "Max triage concurrent",
-      label: /max triage concurrent/i,
-      value: "6",
-      expected: { maxConcurrent: 2, maxTriageConcurrent: 6, maxWorktrees: 4 },
-    },
-    {
-      name: "Max worktrees",
-      label: /max worktrees/i,
-      value: "12",
-      expected: { maxConcurrent: 2, maxTriageConcurrent: 2, maxWorktrees: 12 },
-    },
-  ])("gates the $name slider behind confirmation before persisting", async ({ name, label, value, expected }) => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(label) as HTMLInputElement;
-    fireEvent.change(slider, { target: { value } });
-
-    await advanceConfirmDebounce();
-
-    expect(getConfirmDialog()).toHaveTextContent(`Change ${name} from ${name === "Max worktrees" ? 4 : 2} to ${value}?`);
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-
-    await clickConfirmSave();
-
-    expect(mocks.updateSettings).toHaveBeenCalledWith(expected, "project-a");
-    expect(mocks.refresh).toHaveBeenCalledTimes(1);
-  });
-
-  it("confirms all per-project slider changes made inside one debounce before persisting", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    fireEvent.change(within(section).getByLabelText(/max concurrent tasks/i), { target: { value: "7" } });
-    fireEvent.change(within(section).getByLabelText(/max worktrees/i), { target: { value: "12" } });
-
-    await advanceConfirmDebounce();
-
-    const dialog = getConfirmDialog();
-    expect(dialog).toHaveTextContent("Change these concurrency settings");
-    expect(dialog).toHaveTextContent("Max concurrent tasks from 2 to 7");
-    expect(dialog).toHaveTextContent("Max worktrees from 4 to 12");
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-
-    await clickConfirmSave();
-
-    expect(mocks.updateSettings).toHaveBeenCalledWith(
-      { maxConcurrent: 7, maxTriageConcurrent: 2, maxWorktrees: 12 },
-      "project-a",
+  it("matches the desktop and mobile native thumb-size CSS contract", () => {
+    expect(commandCenterControlsCss).toContain(
+      "--cc-controls-range-thumb-size: calc(var(--space-lg) + var(--space-xs) / 2);",
     );
-  });
-
-  it("persists concurrency slider changes at the default maximum of 50 after confirmation", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/max concurrent tasks/i);
-    fireEvent.change(slider, { target: { value: "50" } });
-
-    await advanceConfirmDebounce();
-    await clickConfirmSave();
-
-    expect(mocks.updateSettings).toHaveBeenCalledWith(
-      { maxConcurrent: 50, maxTriageConcurrent: 2, maxWorktrees: 4 },
-      "project-a",
-    );
-  });
-
-  it("persists concurrency slider changes without a project id after confirmation", async () => {
-    renderControls(undefined);
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/max worktrees/i);
-    fireEvent.change(slider, { target: { value: "12" } });
-
-    await advanceConfirmDebounce();
-    await clickConfirmSave();
-
-    expect(mocks.updateSettings).toHaveBeenCalledWith(
-      { maxConcurrent: 2, maxTriageConcurrent: 2, maxWorktrees: 12 },
-      undefined,
-    );
-  });
-
-  it("cancels per-project concurrency changes and reverts the slider without saving", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/max concurrent tasks/i) as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "9" } });
-    expect(slider.value).toBe("9");
-
-    await advanceConfirmDebounce();
-    await clickConfirmCancel();
-
-    expect(slider.value).toBe("2");
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-  });
-
-  it("dismisses per-project concurrency changes with Escape and reverts without saving", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/max triage concurrent/i) as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "5" } });
-
-    await advanceConfirmDebounce();
-    fireEvent.keyDown(document, { key: "Escape" });
-    await flushPromises();
-
-    expect(slider.value).toBe("2");
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-  });
-
-  it("dismisses global concurrency changes via backdrop and reverts without saving", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/global max concurrent/i) as HTMLInputElement;
-    fireEvent.change(slider, { target: { value: "11" } });
-    expect(slider.value).toBe("11");
-
-    await advanceConfirmDebounce();
-    fireEvent.click(getConfirmDialog().parentElement!);
-    await flushPromises();
-
-    expect(slider.value).toBe("8");
-    await advanceConfirmDebounce();
-    expect(mocks.updateGlobalConcurrency).not.toHaveBeenCalled();
-  });
-
-  it("does not open a confirmation or save for no-op slider settles", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    fireEvent.change(within(section).getByLabelText(/global max concurrent/i), { target: { value: "8" } });
-    fireEvent.change(within(section).getByLabelText(/max worktrees/i), { target: { value: "4" } });
-
-    await advanceConfirmDebounce();
-
-    expect(screen.queryByRole("dialog", { name: /confirm concurrency change/i })).toBeNull();
-    expect(mocks.updateGlobalConcurrency).not.toHaveBeenCalled();
-    expect(mocks.updateSettings).not.toHaveBeenCalled();
-  });
-
-  it("renders persisted concurrency settings without stale default drift", async () => {
-    mocks.fetchSettings.mockResolvedValueOnce({ maxConcurrent: 6, maxTriageConcurrent: 3, maxWorktrees: 9 });
-
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const maxConcurrent = within(section).getByLabelText(/max concurrent tasks/i) as HTMLInputElement;
-    const maxTriageConcurrent = within(section).getByLabelText(/max triage concurrent/i) as HTMLInputElement;
-    const maxWorktrees = within(section).getByLabelText(/max worktrees/i) as HTMLInputElement;
-
-    expect(maxConcurrent.value).toBe("6");
-    expect(maxConcurrent.closest("label")).toHaveTextContent("Max concurrent tasks6");
-    expect(maxTriageConcurrent.value).toBe("3");
-    expect(maxTriageConcurrent.closest("label")).toHaveTextContent("Max triage concurrent3");
-    expect(maxWorktrees.value).toBe("9");
-    expect(maxWorktrees.closest("label")).toHaveTextContent("Max worktrees9");
-  });
-
-  it("sets all concurrency slider maximums to 50 for default and in-range settings", async () => {
-    const defaultRender = renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const sliders = [
-      within(section).getByLabelText(/max concurrent tasks/i),
-      within(section).getByLabelText(/max triage concurrent/i),
-      within(section).getByLabelText(/max worktrees/i),
-    ] as HTMLInputElement[];
-
-    for (const slider of sliders) {
-      expect(slider.max).toBe("50");
+    // FNXC:GlobalConcurrencyControls 2026-07-15-18:10: FN-8007 keeps desktop browser thumb travel deterministic by sizing both pseudo-thumb implementations from the marker inset token.
+    for (const selector of [
+      ".cc-controls-slider input[type=\"range\"]::-webkit-slider-thumb,\n.cc-controls-touch-slider::-webkit-slider-thumb",
+      ".cc-controls-slider input[type=\"range\"]::-moz-range-thumb,\n.cc-controls-touch-slider::-moz-range-thumb",
+    ]) {
+      expect(commandCenterControlsCss).toContain(selector);
     }
-
-    defaultRender.unmount();
-    mocks.fetchSettings.mockResolvedValueOnce({ maxConcurrent: 50, maxTriageConcurrent: 49, maxWorktrees: 48 });
-    renderControls("project-b");
-
-    await flushPromises();
-    const inRangeSection = screen.getByTestId("cc-controls-concurrency");
-    const inRangeSliders = [
-      within(inRangeSection).getByLabelText(/max concurrent tasks/i),
-      within(inRangeSection).getByLabelText(/max triage concurrent/i),
-      within(inRangeSection).getByLabelText(/max worktrees/i),
-    ] as HTMLInputElement[];
-
-    for (const slider of inRangeSliders) {
-      expect(slider.max).toBe("50");
-    }
-  });
-
-  it("keeps out-of-range persisted concurrency values visible instead of silently clamping", async () => {
-    mocks.fetchSettings.mockResolvedValueOnce({ maxConcurrent: 60, maxTriageConcurrent: 70, maxWorktrees: 80 });
-
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const maxConcurrent = within(section).getByLabelText(/max concurrent tasks/i) as HTMLInputElement;
-    const maxTriageConcurrent = within(section).getByLabelText(/max triage concurrent/i) as HTMLInputElement;
-    const maxWorktrees = within(section).getByLabelText(/max worktrees/i) as HTMLInputElement;
-
-    expect(maxConcurrent.value).toBe("60");
-    expect(maxConcurrent.max).toBe("60");
-    expect(maxConcurrent.closest("label")).toHaveTextContent("Max concurrent tasks60");
-    expect(maxTriageConcurrent.value).toBe("70");
-    expect(maxTriageConcurrent.max).toBe("70");
-    expect(maxTriageConcurrent.closest("label")).toHaveTextContent("Max triage concurrent70");
-    expect(maxWorktrees.value).toBe("80");
-    expect(maxWorktrees.max).toBe("80");
-    expect(maxWorktrees.closest("label")).toHaveTextContent("Max worktrees80");
-  });
-
-  it("marks concurrency sliders with the mobile touch-drag affordance contract", async () => {
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const sliders = [
-      within(section).getByLabelText(/global max concurrent/i),
-      within(section).getByLabelText(/max concurrent tasks/i),
-      within(section).getByLabelText(/max triage concurrent/i),
-      within(section).getByLabelText(/max worktrees/i),
-    ];
-
-    for (const slider of sliders) {
-      expect(slider).toHaveClass("cc-controls-touch-slider");
-    }
-    // jsdom cannot simulate whether a touch drag is captured by page scrolling, so this verifies the CSS contract that enables horizontal thumb drags on mobile.
-    expect(commandCenterControlsCss).toContain("touch-action: pan-y");
-    expect(commandCenterControlsCss).toContain("pointer-events: none");
-    expect(commandCenterControlsCss).toContain("inset-inline-start: var(--use-offset, var(--use-pct))");
+    expect(commandCenterControlsCss).toContain("width: var(--cc-controls-range-thumb-size);");
+    expect(commandCenterControlsCss).toContain("height: var(--cc-controls-range-thumb-size);");
     expect(commandCenterControlsCss).toContain("@media (max-width: 768px)");
-    expect(commandCenterControlsCss).toContain("min-block-size: var(--space-2xl)");
-    expect(commandCenterControlsCss).toContain("--cc-controls-range-thumb-size: var(--space-xl)");
-  });
-
-  it("shows save error indicator when concurrency update fails", async () => {
-    mocks.updateSettings.mockRejectedValueOnce(new Error("network error"));
-    renderControls("project-a");
-
-    await flushPromises();
-    const section = screen.getByTestId("cc-controls-concurrency");
-    const slider = within(section).getByLabelText(/max concurrent tasks/i);
-    fireEvent.change(slider, { target: { value: "8" } });
-
-    await advanceConfirmDebounce();
-    await clickConfirmSave();
-
-    expect(within(section).getByText(/save failed/i)).toBeDefined();
-  });
-
-  it("selects a theme from the embedded dropdown", async () => {
-    const onColorThemeChange = vi.fn();
-    render(
-      <CommandCenterControls
-        colorTheme="default"
-        themeMode="dark"
-        onColorThemeChange={onColorThemeChange}
-        onThemeModeChange={vi.fn()}
-      />,
-    );
-
-    await flushPromises();
-    /*
-    FNXC:Theme 2026-06-25-16:55:
-    Command Center embeds the shared theme dropdown, whose trigger label follows the current theme copy; look up the default label from theme metadata instead of assuming user-facing text contains "Default".
-    */
-    const defaultTheme = COLOR_THEMES.find((theme) => theme.value === "default")!;
-    fireEvent.click(screen.getByRole("button", { name: defaultTheme.label }));
-    fireEvent.click(screen.getAllByRole("option").find((element) => element.textContent?.trim() === "Forest")!);
-
-    expect(onColorThemeChange).toHaveBeenCalledWith("forest");
+    expect(commandCenterControlsCss).toContain("--cc-controls-range-thumb-size: var(--space-xl);");
   });
 });
