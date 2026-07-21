@@ -142,6 +142,7 @@ const mocks = vi.hoisted(() => {
   const existsSync = vi.fn((path: string) => existingPaths.has(path));
 
   const spawn = vi.fn(() => state.electronChild);
+  const createTaskStoreForBackend = vi.fn(async () => null);
 
   return {
     state,
@@ -157,6 +158,8 @@ const mocks = vi.hoisted(() => {
     taskStoreCtor: vi.fn(function () {
       return store;
     }),
+    createTaskStoreForBackend,
+    createWindowsNativeRoomHostCompositionAdapterRegistry: vi.fn(() => ({ source: "windows-host" })),
     centralCoreCtor: vi.fn(function () {
       return centralCore;
     }),
@@ -191,6 +194,7 @@ vi.mock("@fusion/core", () => ({
 
 vi.mock("@fusion/engine", () => ({
   ProjectEngineManager: mocks.projectEngineManagerCtor,
+  createWindowsNativeRoomHostCompositionAdapterRegistry: mocks.createWindowsNativeRoomHostCompositionAdapterRegistry,
 }));
 
 vi.mock("../ensure-project-registered.js", () => ({
@@ -214,6 +218,7 @@ describe("runDesktop", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.createTaskStoreForBackend.mockResolvedValue(null);
 
     process.env.FUSION_ELECTRON_BINARY = "electron-bin";
     delete process.env.FUSION_DESKTOP_ENTRY;
@@ -273,7 +278,10 @@ describe("runDesktop", () => {
     expect(mocks.ensureCwdProjectRegistered).toHaveBeenCalledWith(
       expect.objectContaining({ cwd: "/repo", central: mocks.centralCore, autoRegister: true }),
     );
-    expect(mocks.projectEngineManagerCtor).toHaveBeenCalledWith(mocks.centralCore);
+    expect(mocks.projectEngineManagerCtor).toHaveBeenCalledWith(
+      mocks.centralCore,
+      expect.objectContaining({ roomHostCompositionOperatorAdapterRegistry: expect.anything() }),
+    );
     expect(mocks.engineManager.startAll).toHaveBeenCalled();
     expect(mocks.engineManager.ensureEngine).toHaveBeenCalledWith("project-1");
     expect(mocks.createServer).toHaveBeenCalledWith(
@@ -297,6 +305,28 @@ describe("runDesktop", () => {
           FUSION_SERVER_PORT: "4545",
         }),
       }),
+    );
+
+    mocks.state.electronChild.emit("exit", 0);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it("uses the backend boot's unscoped host layer for CentralCore", async () => {
+    const hostAsyncLayer = { scope: "host" };
+    mocks.createTaskStoreForBackend.mockResolvedValueOnce({
+      taskStore: mocks.store,
+      hostAsyncLayer,
+      shutdown: vi.fn(async () => undefined),
+    });
+
+    await runDesktop();
+
+    expect(mocks.centralCoreCtor).toHaveBeenCalledWith(undefined, { asyncLayer: hostAsyncLayer });
+    const registry = mocks.createWindowsNativeRoomHostCompositionAdapterRegistry.mock.results.at(-1)?.value;
+    expect(mocks.createWindowsNativeRoomHostCompositionAdapterRegistry).toHaveBeenCalledWith({ hostAsyncLayer });
+    expect(mocks.projectEngineManagerCtor).toHaveBeenCalledWith(
+      mocks.centralCore,
+      { roomHostCompositionOperatorAdapterRegistry: registry },
     );
 
     mocks.state.electronChild.emit("exit", 0);

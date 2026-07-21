@@ -529,6 +529,7 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
     expect(boot).not.toBeNull();
     try {
       const layer = boot!.taskStore.getAsyncLayer()!;
+      const hostLayer = boot!.hostAsyncLayer;
       /*
       FNXC:CentralProjectIdentity 2026-07-13-22:00:
       A rootDir-only boot of a REGISTERED project must bind its layer to the
@@ -536,6 +537,15 @@ pgDescribe("startup-factory: external PostgreSQL boot (integration)", () => {
       central.projects.
       */
       expect(layer.projectId, "rootDir-only boot must bind to the registered project id").toBe("proj_stamp_test");
+      /*
+      FNXC:HostBootstrap 2026-07-20-05:16:
+      A host-wide CentralCore must not inherit the registered project's scope,
+      but it must use the same runtime connection rather than create another
+      PostgreSQL pool.
+      */
+      expect(hostLayer).not.toBe(layer);
+      expect(hostLayer.projectId).toBeUndefined();
+      expect(hostLayer.db).toBe(layer.db);
       const rows = (await layer.db.execute(
         `SELECT id, project_id FROM project.tasks ORDER BY id`,
       )) as unknown as Array<{ id: string; project_id: string | null }>;

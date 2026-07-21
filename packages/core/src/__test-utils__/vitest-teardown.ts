@@ -78,7 +78,8 @@ export function removeWorkerRootWithRetry(workerRoot: string, retries = 8, delay
   }
 
   const message = lastError instanceof Error ? lastError.message : String(lastError);
-  console.warn(`[vitest-teardown] failed to remove worker root ${workerRoot} after ${retries} attempts: ${message}`);
+  process.exitCode = 1;
+  throw new Error(`[vitest-teardown] failed to remove worker root ${workerRoot} after ${retries} attempts: ${message}`);
 }
 
 export default function setup(): () => Promise<void> {
@@ -97,15 +98,6 @@ export default function setup(): () => Promise<void> {
     // orphaned root alive. Teardown still owns this root by absolute path.
   }
   process.env.FUSION_TEST_WORKER_ROOT = workerRoot;
-  /*
-  FNXC:PgTestTemplateDb 2026-07-19-17:20:
-  Publish the vitest MAIN-process pid so every fork resolves the SAME run-shared
-  "golden" PostgreSQL schema template (see pg-test-harness.ts). Forks inherit
-  this env at spawn (globalSetup runs before workers start), and the pid segment
-  keeps the existing dead-pid template sweep able to reclaim the golden once this
-  run's main process exits.
-  */
-  process.env.FUSION_PG_TEMPLATE_OWNER_PID = String(process.pid);
 
   return async function teardown() {
     try {
@@ -113,12 +105,13 @@ export default function setup(): () => Promise<void> {
     } catch {
       // Ignore — cleanup below is best-effort and uses an absolute path.
     }
-    /*
-    FNXC:TestIsolation 2026-07-14-21:40:
-    Prefer injectable in-process removeWorkerRootWithRetry so unit tests can assert EBUSY/ENOTEMPTY retry semantics via __setWorkerRootRmSyncForTests.
-    Dashboard hang root causes were open SSE/undici handles (fixed via __resetSseBus + quarantines), not rmSync itself — restore sync cleanup for deterministic isolation and test hooks.
-    */
-    removeWorkerRootWithRetry(workerRoot);
-    removeLegacyTopLevelHomeRoots();
+    // FN-6360: macOS can report transient EBUSY/ENOTEMPTY while SQLite WALs or
+    // redirected temp dirs are still closing. Retry boundedly so a brief busy-fd
+    // race does not leak the per-invocation fusion-test-workers-* root.
+    try {
+      removeWorkerRootWithRetry(workerRoot);
+    } finally {
+      removeLegacyTopLevelHomeRoots();
+    }
   };
 }

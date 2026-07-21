@@ -10,6 +10,7 @@ import {
   type RoomRbacProjectActionV1,
   type RoomRbacRegistry,
 } from "@fusion/core";
+import { ApiError } from "./api-error.js";
 import type {
   RoomControlPlaneAuthorizationDecision,
   RoomControlPlaneAuthorizationInput,
@@ -40,6 +41,8 @@ export interface RoomControlPlaneRbacAuthorizerOptions {
   readonly publicOrigin: string;
   /** Explicit development-only escape hatch for an HTTP origin on the local loopback interface. */
   readonly allowLoopbackHttp?: boolean;
+  /** Server-owned daemon transport gate required before trusted-device administration is exposed. */
+  readonly authorizeDaemonTransport?: (request: Request) => boolean | Promise<boolean>;
 }
 
 type RoomRbacAction = RoomRbacPolicy.RoomRbacActionV1;
@@ -239,48 +242,6 @@ export function createRoomControlPlaneRbacAuthorizer(
   }
   const publicOrigin = resolveConfiguredPublicOrigin(options.publicOrigin, options.allowLoopbackHttp === true);
 
-  const issueTrustedDeviceSession: RoomControlPlaneTrustedDeviceSessionIssuer["issueTrustedDeviceSession"] = async (input) => {
-    const registry = await resolveRegistry(options.resolveRegistry, input);
-    if (!hasRegistryPairingMethods(registry)) throw new Error("Room control-plane trusted-device registry is unavailable.");
-    const issuedAt = new Date();
-    const expiresAt = new Date(issuedAt.getTime() + TRUSTED_DEVICE_SESSION_TTL_MS);
-    const credential = createTrustedRoomDeviceCredential();
-    const result = await registry.issueTrustedDeviceSession({
-      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
-      projectId: input.projectId,
-      sessionId: randomUUID(),
-      principalId: input.principalId,
-      deviceId: input.deviceId,
-      credential,
-      issuedAt: issuedAt.toISOString(),
-      expiresAt: expiresAt.toISOString(),
-      idempotencyKey: randomUUID(),
-    });
-    return {
-      credential,
-      sessionId: result.session.sessionId,
-      principalId: result.session.principalId,
-      deviceId: result.session.deviceId,
-      expiresAt: result.session.expiresAt,
-    };
-  };
-  const revokeTrustedDeviceSession: RoomControlPlaneTrustedDeviceSessionIssuer["revokeTrustedDeviceSession"] = async (input) => {
-    const registry = await resolveRegistry(options.resolveRegistry, input);
-    if (!hasRegistryPairingMethods(registry)) throw new Error("Room control-plane trusted-device registry is unavailable.");
-    const result = await registry.revokeTrustedDeviceSession({
-      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
-      projectId: input.projectId,
-      sessionId: input.sessionId,
-      expectedSessionVersion: input.expectedSessionVersion,
-      revokedAt: new Date().toISOString(),
-      idempotencyKey: randomUUID(),
-    });
-    return {
-      sessionId: result.session.sessionId,
-      revokedAt: result.session.revokedAt,
-      sessionVersion: result.session.sessionVersion,
-    };
-  };
   const authorizeProject: RoomControlPlaneRouteDependencies["authorizeProject"] = async (input): Promise<RoomControlPlaneAuthorizationDecision> => {
     const credential = readTrustedDeviceCookie(input.request, publicOrigin, input.access === "write");
     if (credential === null) return denied("trusted-device-cookie-required");
@@ -346,7 +307,74 @@ export function createRoomControlPlaneRbacAuthorizer(
       return denied("rbac-registry-unavailable");
     }
   };
-  authorizeProject.issueTrustedDeviceSession = issueTrustedDeviceSession;
-  authorizeProject.revokeTrustedDeviceSession = revokeTrustedDeviceSession;
+  if (typeof options.authorizeDaemonTransport === "function") {
+    /*
+    FNXC:RoomControlPlaneRbac 2026-07-19-23:20:
+    Pairing administration is available only behind the server-owned daemon transport gate.
+    The HTTP body never chooses the new device principal or identifier; both are derived after
+    the durable owner/admin session has authorized the project-scoped pairing operation.
+    */
+    const authorizeDeviceAdministration = async (request: Request, projectId: string): Promise<string> => {
+      if (!await options.authorizeDaemonTransport!(request)) {
+        throw new ApiError(403, "Room device session access denied", { code: "ROOM_DEVICE_SESSION_ACCESS_DENIED" });
+      }
+      const decision = await authorizeProject({
+        request,
+        projectId,
+        access: "write",
+        resource: "room",
+        roomId: null,
+        operation: "create",
+      });
+      if (!decision.allowed) {
+        throw new ApiError(403, "Room device session access denied", { code: "ROOM_DEVICE_SESSION_ACCESS_DENIED" });
+      }
+      return decision.actorId;
+    };
+    authorizeProject.issueTrustedDeviceSession = async (input) => {
+      const principalId = await authorizeDeviceAdministration(input.request, input.projectId);
+      const registry = await resolveRegistry(options.resolveRegistry, input);
+      if (!hasRegistryPairingMethods(registry)) throw new Error("Room control-plane trusted-device registry is unavailable.");
+      const issuedAt = new Date();
+      const expiresAt = new Date(issuedAt.getTime() + TRUSTED_DEVICE_SESSION_TTL_MS);
+      const credential = createTrustedRoomDeviceCredential();
+      const result = await registry.issueTrustedDeviceSession({
+        contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+        projectId: input.projectId,
+        sessionId: randomUUID(),
+        principalId,
+        deviceId: randomUUID(),
+        credential,
+        issuedAt: issuedAt.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+        idempotencyKey: randomUUID(),
+      });
+      return {
+        credential,
+        sessionId: result.session.sessionId,
+        principalId: result.session.principalId,
+        deviceId: result.session.deviceId,
+        expiresAt: result.session.expiresAt,
+      };
+    };
+    authorizeProject.revokeTrustedDeviceSession = async (input) => {
+      await authorizeDeviceAdministration(input.request, input.projectId);
+      const registry = await resolveRegistry(options.resolveRegistry, input);
+      if (!hasRegistryPairingMethods(registry)) throw new Error("Room control-plane trusted-device registry is unavailable.");
+      const result = await registry.revokeTrustedDeviceSession({
+        contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+        projectId: input.projectId,
+        sessionId: input.sessionId,
+        expectedSessionVersion: input.expectedSessionVersion,
+        revokedAt: new Date().toISOString(),
+        idempotencyKey: randomUUID(),
+      });
+      return {
+        sessionId: result.session.sessionId,
+        revokedAt: result.session.revokedAt,
+        sessionVersion: result.session.sessionVersion,
+      };
+    };
+  }
   return authorizeProject;
 }

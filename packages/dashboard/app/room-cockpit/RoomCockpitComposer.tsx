@@ -289,7 +289,10 @@ export function RoomCockpitComposer({
   const [mode, setMode] = useState<RoomCockpitComposerTargetModeV1>(initialTargetMode);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(initialGroupId ?? null);
   const [selectedSeatIds, setSelectedSeatIds] = useState<ReadonlySet<string>>(
-    () => new Set(initialSelectedSeatIds.flatMap((seatId) => readText(seatId))),
+    () => new Set(initialSelectedSeatIds.flatMap((seatId) => {
+      const normalized = readText(seatId);
+      return normalized ? [normalized] : [];
+    })),
   );
   const [body, setBody] = useState("");
   const [submitting, setSubmitting] = useState(false);

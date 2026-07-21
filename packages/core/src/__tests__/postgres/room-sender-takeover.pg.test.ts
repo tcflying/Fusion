@@ -8,14 +8,18 @@ import {
   type StoredRoomLeaseV1,
 } from "../../async-room-lease-store.js";
 import {
-  AsyncRoomStore,
   type BeginRoomDeliveryAttemptInput,
 } from "../../async-room-store.js";
+import {
+  AsyncRoomStore,
+  type DeferPendingRoomDeliveryInput,
+} from "../../index.js";
 import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
 import { createAsyncDataLayer, type AsyncDataLayer } from "../../postgres/data-layer.js";
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
-import { roomBindings, roomSeats } from "../../postgres/schema/room.js";
+import { runAuditEvents } from "../../postgres/schema/project.js";
+import { roomBindings, roomOutboxAttempts, roomSeats } from "../../postgres/schema/room.js";
 
 interface EmbeddedTestContext {
   readonly dataDir: string;
@@ -293,6 +297,150 @@ describe("Session Room sender lease and native IDE takeover", () => {
     expect(await fixture.roomStore.getDelivery(fixture.outboxId)).toMatchObject({ state: "pending" });
   });
 
+  /*
+  FNXC:SessionRoomDelivery 2026-07-19-19:54:
+  A sender that has not begun its external write must durably defer the pending
+  outbox row under its exact lease and attempt fence. The retry window survives
+  a new store instance, while stale authority cannot alter the unsent payload.
+  */
+  it("durably defers an unsent pending delivery only for the current sender and attempt", async () => {
+    const fixture = await createRoomSenderFixture("pre-send-deferral");
+    const initial = await fixture.roomStore.getDelivery(fixture.outboxId);
+    if (!initial) throw new Error("pre-send deferral fixture did not create an outbox delivery");
+    const automatic = await fixture.leaseStore.acquireLease({
+      leaseId: "lease-pre-send-deferral-auto",
+      roomId: fixture.roomId,
+      kind: "sender",
+      resourceId: fixture.bindingId,
+      holderId: "room-worker-pre-send-deferral-auto",
+      hostId: HOST_ID,
+      expectedEpoch: null,
+      now: "2026-07-17T12:08:00.000Z",
+      expiresAt: "2026-07-17T12:20:00.000Z",
+    });
+    expect(automatic).toMatchObject({ ok: true, lease: { epoch: 1 } });
+    if (!automatic.ok) throw new Error("pre-send deferral sender lease was not acquired");
+
+    await expect(fixture.roomStore.deferPendingDelivery({
+      outboxId: fixture.outboxId,
+      expectedAttemptCount: 1,
+      senderFence: senderFence(automatic.lease),
+      nextAttemptAt: "2026-07-17T12:08:10.000Z",
+      reasonCode: "provider_backpressure",
+      now: "2026-07-17T12:08:01.000Z",
+      audit: { runId: "room-run-pre-send-deferral-stale-attempt", agentId: automatic.lease.holderId },
+    })).rejects.toMatchObject({ code: "delivery_attempt_conflict" });
+    expect(await fixture.roomStore.getDelivery(fixture.outboxId)).toEqual(initial);
+
+    await fixture.leaseStore.releaseLease({
+      ...senderFence(automatic.lease),
+      now: "2026-07-17T12:08:02.000Z",
+    });
+    const replacement = await fixture.leaseStore.acquireLease({
+      leaseId: "lease-pre-send-deferral-replacement",
+      roomId: fixture.roomId,
+      kind: "sender",
+      resourceId: fixture.bindingId,
+      holderId: "room-worker-pre-send-deferral-replacement",
+      hostId: HOST_ID,
+      expectedEpoch: 1,
+      now: "2026-07-17T12:08:03.000Z",
+      expiresAt: "2026-07-17T12:20:00.000Z",
+    });
+    expect(replacement).toMatchObject({ ok: true, lease: { epoch: 2 } });
+    if (!replacement.ok) throw new Error("pre-send deferral replacement lease was not acquired");
+
+    await expect(fixture.roomStore.deferPendingDelivery({
+      outboxId: fixture.outboxId,
+      expectedAttemptCount: 0,
+      senderFence: senderFence(automatic.lease),
+      nextAttemptAt: "2026-07-17T12:08:10.000Z",
+      reasonCode: "provider_backpressure",
+      now: "2026-07-17T12:08:04.000Z",
+      audit: { runId: "room-run-pre-send-deferral-stale-sender", agentId: automatic.lease.holderId },
+    })).rejects.toMatchObject({ code: "stale_lease_fence" });
+    expect(await fixture.roomStore.getDelivery(fixture.outboxId)).toEqual(initial);
+
+    const currentSenderDeferral: DeferPendingRoomDeliveryInput = {
+      outboxId: fixture.outboxId,
+      expectedAttemptCount: 0,
+      senderFence: senderFence(replacement.lease),
+      nextAttemptAt: "2026-07-17T12:08:10.000Z",
+      reasonCode: "provider_backpressure",
+      now: "2026-07-17T12:08:05.000Z",
+      audit: {
+        runId: "room-run-pre-send-deferral",
+        agentId: replacement.lease.holderId,
+        taskId: "task-pre-send-deferral",
+      },
+    };
+    const deferred = await fixture.roomStore.deferPendingDelivery(currentSenderDeferral);
+    expect(deferred).toMatchObject({
+      state: "pending",
+      attemptCount: 0,
+      idempotencyKey: initial.idempotencyKey,
+      payloadHash: initial.payloadHash,
+      logicalMessageId: initial.logicalMessageId,
+      localMessageId: initial.localMessageId,
+      lastErrorCode: "provider_backpressure",
+      nextAttemptAt: "2026-07-17T12:08:10.000Z",
+      updatedAt: "2026-07-17T12:08:05.000Z",
+    });
+    expect((await fixture.layer.db.select().from(roomOutboxAttempts))
+      .filter((attempt) => attempt.outboxId === fixture.outboxId)).toEqual([]);
+
+    const audit = (await fixture.layer.db.select().from(runAuditEvents))
+      .find((event) => event.runId === "room-run-pre-send-deferral");
+    expect(audit).toMatchObject({
+      taskId: "task-pre-send-deferral",
+      agentId: replacement.lease.holderId,
+      domain: "database",
+      mutationType: "room:connector-delivery-deferred",
+      target: fixture.outboxId,
+      metadata: expect.objectContaining({
+        roomId: fixture.roomId,
+        bindingId: fixture.bindingId,
+        payloadHash: initial.payloadHash,
+        attempt: 0,
+        fromState: "pending",
+        reasonCode: "provider_backpressure",
+        nextAttemptAt: "2026-07-17T12:08:10.000Z",
+      }),
+    });
+    expect(JSON.stringify(audit?.metadata)).not.toContain("Continue native Session pre-send-deferral.");
+
+    const recoveredStore = new AsyncRoomStore(fixture.layer);
+    await expect(beginDeliveryWithSenderFence(recoveredStore, {
+      outboxId: fixture.outboxId,
+      attemptId: "attempt-pre-send-deferral-too-early",
+      reconciliationFromCursor: null,
+      now: "2026-07-17T12:08:09.000Z",
+      senderFence: senderFence(replacement.lease),
+    })).rejects.toMatchObject({ code: "delivery_state_conflict" });
+    expect(await beginDeliveryWithSenderFence(recoveredStore, {
+      outboxId: fixture.outboxId,
+      attemptId: "attempt-pre-send-deferral-due",
+      reconciliationFromCursor: null,
+      now: "2026-07-17T12:08:10.000Z",
+      senderFence: senderFence(replacement.lease),
+    })).toMatchObject({ state: "dispatching", attemptCount: 1 });
+    await expect(recoveredStore.deferPendingDelivery({
+      outboxId: fixture.outboxId,
+      expectedAttemptCount: 1,
+      senderFence: senderFence(replacement.lease),
+      nextAttemptAt: "2026-07-17T12:08:12.000Z",
+      reasonCode: "provider_backpressure",
+      now: "2026-07-17T12:08:11.000Z",
+      audit: { runId: "room-run-pre-send-deferral-dispatching", agentId: replacement.lease.holderId },
+    })).rejects.toMatchObject({ code: "delivery_state_conflict" });
+    expect(await recoveredStore.getDelivery(fixture.outboxId)).toMatchObject({
+      state: "dispatching",
+      attemptCount: 1,
+      idempotencyKey: initial.idempotencyKey,
+      payloadHash: initial.payloadHash,
+    });
+  });
+
   it("allows concurrent observation without a sender lease but fences provider writes", async () => {
     const fixture = await createRoomSenderFixture("observer-fence");
     const acquired = await fixture.leaseStore.acquireLease({
@@ -558,6 +706,13 @@ describe("Session Room sender lease and native IDE takeover", () => {
     });
     expect(automatic).toMatchObject({ ok: true, lease: { epoch: 1 } });
     if (!automatic.ok) throw new Error("automated sender lease was not acquired");
+    await beginDeliveryWithSenderFence(fixture.roomStore, {
+      outboxId: fixture.outboxId,
+      attemptId: "attempt-stale-auto-before-human-takeover",
+      reconciliationFromCursor: null,
+      now: "2026-07-17T12:04:05.000Z",
+      senderFence: senderFence(automatic.lease),
+    });
     expect(await fixture.leaseStore.releaseLease({
       ...senderFence(automatic.lease),
       now: "2026-07-17T12:04:10.000Z",
@@ -578,13 +733,19 @@ describe("Session Room sender lease and native IDE takeover", () => {
     expect(await fixture.leaseStore.getActiveLease("sender", fixture.bindingId))
       .toMatchObject({ holderId: "native-ide-human-1", epoch: 2 });
 
-    await expect(beginDeliveryWithSenderFence(fixture.roomStore, {
+    await expect(fixture.roomStore.completeDeliveryAttempt({
       outboxId: fixture.outboxId,
-      attemptId: "attempt-stale-auto-after-human-takeover",
-      reconciliationFromCursor: null,
-      now: "2026-07-17T12:04:12.000Z",
+      attemptId: "attempt-stale-auto-before-human-takeover",
       senderFence: senderFence(automatic.lease),
+      outcome: "confirmed",
+      connectorAcknowledgementId: "ack-stale-auto-after-human-takeover",
+      nativeMessageId: "native-stale-auto-after-human-takeover",
+      nativeCursor: "cursor-stale-auto-after-human-takeover",
+      errorCode: null,
+      nextAttemptAt: null,
+      now: "2026-07-17T12:04:12.000Z",
     })).rejects.toMatchObject({ code: "stale_lease_fence" });
+    expect(await fixture.roomStore.getDelivery(fixture.outboxId)).toMatchObject({ state: "dispatching" });
   });
 
   it("keeps an ambiguous send visibly uncertain during takeover without resend or silent success", async () => {
@@ -612,6 +773,7 @@ describe("Session Room sender lease and native IDE takeover", () => {
     await fixture.roomStore.completeDeliveryAttempt({
       outboxId: fixture.outboxId,
       attemptId: "attempt-ambiguous-before-takeover",
+      senderFence: senderFence(automatic.lease),
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
       nativeMessageId: null,

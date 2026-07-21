@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import { validateRoomProtocolMessage } from "../room-contracts/protocol-message.js";
 import { hashRoomValue } from "../room-integrity.js";
 import { getRoomProtocolDefinition } from "../room-protocol-definitions.js";
-import { routeRoomSemanticMessage } from "../room-semantic-routing.js";
+import {
+  buildRoomSemanticLoopFingerprint,
+  routeRoomSemanticMessage,
+} from "../room-semantic-routing.js";
 
 function hash(value: string): string {
   return hashRoomValue(value);
@@ -224,6 +227,113 @@ describe("Room semantic routing", () => {
     });
   });
 
+  /*
+  FNXC:SessionRoomSemanticRouting 2026-07-19-03:57:
+  An active Session can cover several protocol roles. Keep roleId as the v1
+  canonical/default identity while origin authorization and responder selection
+  use the full declared roleIds set.
+  */
+  it("authorizes a multi-role seat as both the origin and a required responder", () => {
+    const protocol = getRoomProtocolDefinition("implementation", 1);
+    if (!protocol) throw new Error("Missing built-in implementation protocol");
+    const message = validMessage();
+    const seats = [
+      {
+        seatId: "seat-reviewer",
+        bindingId: "binding-reviewer-2",
+        roleId: "implementer",
+        roleIds: ["implementer", "implementation_verifier"],
+        groupIds: ["reviewers"],
+      },
+      {
+        seatId: "seat-implementer",
+        bindingId: "binding-implementer-1",
+        roleId: "implementer",
+        groupIds: ["implementers"],
+      },
+      {
+        seatId: "seat-verifier-2",
+        bindingId: "binding-verifier-3",
+        roleId: "implementer",
+        roleIds: ["implementer", "implementation_verifier"],
+        groupIds: ["reviewers"],
+      },
+    ];
+
+    const routed = routeRoomSemanticMessage({
+      message,
+      protocol,
+      seats,
+      history: [],
+      authoritativeState: authoritativeState(message),
+    });
+
+    expect(routed.ok).toBe(true);
+    if (!routed.ok || routed.value.outcome !== "route") {
+      throw new Error("Expected a multi-role route");
+    }
+    expect(routed.value.recipientSeatIds).toEqual(["seat-implementer", "seat-verifier-2"]);
+    expect(routed.value.requiredResponderSeatIds).toEqual([
+      "seat-implementer",
+      "seat-verifier-2",
+    ]);
+  });
+
+  it("keeps roleId canonical for legacy seats and rejects role sets that omit it", () => {
+    const protocol = getRoomProtocolDefinition("implementation", 1);
+    if (!protocol) throw new Error("Missing built-in implementation protocol");
+    const message = validMessage();
+    const legacySeats = [
+      {
+        seatId: "seat-reviewer",
+        bindingId: "binding-reviewer-2",
+        roleId: "implementation_verifier",
+        groupIds: ["reviewers"],
+      },
+      {
+        seatId: "seat-implementer",
+        bindingId: "binding-implementer-1",
+        roleId: "implementer",
+        groupIds: ["implementers"],
+      },
+      {
+        seatId: "seat-verifier-2",
+        bindingId: "binding-verifier-3",
+        roleId: "implementation_verifier",
+        groupIds: ["reviewers"],
+      },
+    ];
+
+    const legacyRoute = routeRoomSemanticMessage({
+      message,
+      protocol,
+      seats: legacySeats,
+      history: [],
+      authoritativeState: authoritativeState(message),
+    });
+    expect(legacyRoute.ok).toBe(true);
+    if (!legacyRoute.ok || legacyRoute.value.outcome !== "route") {
+      throw new Error("Expected legacy roleId routing to remain compatible");
+    }
+    expect(legacyRoute.value.recipientSeatIds).toEqual(["seat-implementer", "seat-verifier-2"]);
+
+    const inconsistentRoleSet = legacySeats.map((seat) => (
+      seat.seatId === "seat-reviewer"
+        ? { ...seat, roleIds: ["implementer"] }
+        : seat
+    ));
+    expect(routeRoomSemanticMessage({
+      message,
+      protocol,
+      seats: inconsistentRoleSet,
+      history: [],
+      authoritativeState: authoritativeState(message),
+    })).toMatchObject({
+      ok: false,
+      issues: [expect.objectContaining({ code: "invalid_routing_input" })],
+    });
+  });
+
   it("does not require every broadcast recipient unless the protocol explicitly says so", () => {
     const protocol = getRoomProtocolDefinition("implementation", 1);
     if (!protocol) throw new Error("Missing built-in implementation protocol");
@@ -263,6 +373,7 @@ describe("Room semantic routing", () => {
       sequence: 1,
       nodeId: message.nodeId,
       intent: message.intent,
+      semanticLoopFingerprint: buildRoomSemanticLoopFingerprint(message),
       semanticHash: message.semanticHash,
       evidenceStateHash: message.evidenceStateHash,
       decisionStateHash: message.decisionStateHash,
@@ -282,6 +393,22 @@ describe("Room semantic routing", () => {
       audit: { repeatedSemanticCount: 2, recipientCount: 1, requiredResponderCount: 1 },
     });
     expect(Object.isFrozen(broken.value)).toBe(true);
+
+    const distinctContent = {
+      ...message,
+      messageId: "message-new-evidence",
+      content: "The retry bound is two because the evidence log now contains a third failure.",
+      contentHash: hash("The retry bound is two because the evidence log now contains a third failure."),
+    };
+    const distinct = routeRoomSemanticMessage({
+      message: distinctContent,
+      protocol,
+      seats,
+      history: equivalentHistory,
+      authoritativeState: authoritativeState(distinctContent),
+    });
+    expect(distinct.ok && distinct.value.outcome).toBe("route");
+    expect(distinct.ok ? distinct.value.audit.repeatedSemanticCount : null).toBe(1);
 
     for (const changedHistory of [
       [{ ...equivalentHistory[0]!, evidenceStateHash: hash("evidence-state-2") }],

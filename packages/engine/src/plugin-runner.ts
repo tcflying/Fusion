@@ -1258,7 +1258,10 @@ export class PluginRunner {
    * @param pluginId - The plugin ID to create context for
    * @returns The plugin context, or null if the plugin is not loaded
    */
-  async createRuntimeContext(pluginId: string): Promise<PluginContext | null> {
+  async createRuntimeContext(
+    pluginId: string,
+    hostExtensions: Pick<PluginContext, "sessionConnectorWriteAuthorizer"> = {},
+  ): Promise<PluginContext | null> {
     const plugin = this.options.pluginLoader.getPlugin(pluginId);
     if (!plugin) {
       this.log.warn(`Plugin "${pluginId}" not loaded, cannot create runtime context`);
@@ -1274,6 +1277,9 @@ export class PluginRunner {
       emitEvent: (event: string, data: unknown) => {
         this.log.log(`[plugin:${pluginId}] Event: ${event}`, data);
       },
+      ...(hostExtensions.sessionConnectorWriteAuthorizer
+        ? { sessionConnectorWriteAuthorizer: hostExtensions.sessionConnectorWriteAuthorizer }
+        : {}),
     };
   }
 

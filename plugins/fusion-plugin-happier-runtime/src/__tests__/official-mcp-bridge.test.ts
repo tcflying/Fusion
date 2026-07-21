@@ -173,6 +173,54 @@ describe("Happier official MCP bridge", () => {
     expect(legacy.ensureDirectSession).not.toHaveBeenCalled();
   });
 
+  it("preflights a persisted Session through read-only official MCP calls without creating a link or provider turn", async () => {
+    const legacy = legacyExtensionDependencies();
+    const client = officialMcpClient();
+    const settings = {
+      executable: "happier",
+      activeServerId: "server-1",
+      happierSessionBindings: [{
+        canonicalSessionUri: URI,
+        happierSessionId: IDENTITY.happierSessionId,
+        serverProfileId: IDENTITY.serverProfileId,
+        machineId: IDENTITY.machineId,
+        takeoverConfirmedAt: "2026-07-19T19:29:00.000Z",
+      }],
+    } as unknown as HappierCliSettings;
+    const connector = new HappierSessionConnector({
+      settings,
+      dependencies: {
+        ...legacy,
+        openMcpClient: vi.fn(async () => client),
+      } as unknown as Partial<HappierSessionConnectorDependencies>,
+      now: () => "2026-07-20T14:02:00.000Z",
+    });
+
+    await expect(connector.preflightExisting({
+      contractVersion: 1,
+      canonicalSessionUri: URI,
+      requiredHostId: IDENTITY.hostId,
+      requiredMachineId: IDENTITY.machineId!,
+    })).resolves.toMatchObject({
+      ok: true,
+      value: {
+        identity: IDENTITY,
+        providerTurnStarted: false,
+        checkedAt: "2026-07-20T14:02:00.000Z",
+      },
+    });
+    expect(client.callTool).toHaveBeenCalledTimes(2);
+    expect(client.callTool).toHaveBeenNthCalledWith(1, {
+      name: "session_list",
+      arguments: {},
+    });
+    expect(client.callTool).toHaveBeenNthCalledWith(2, {
+      name: "session_status_get",
+      arguments: { sessionId: IDENTITY.happierSessionId },
+    });
+    expect(legacy.ensureDirectSession).not.toHaveBeenCalled();
+  });
+
   it("rejects an unpersisted identity before opening official MCP status", async () => {
     const openMcpClient = vi.fn(async () => officialMcpClient());
     const connector = new HappierSessionConnector({

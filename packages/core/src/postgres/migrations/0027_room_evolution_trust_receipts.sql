@@ -257,7 +257,7 @@ ALTER TABLE project.room_evolution_gate_results
       AND evaluation_artifact_hash ~ '^sha256:[a-f0-9]{64}$'
       AND metrics_hash ~ '^sha256:[a-f0-9]{64}$'
     )
-  ),
+  ) NOT VALID,
   ADD CONSTRAINT room_evolution_gate_results_candidate_binding_fkey
     FOREIGN KEY (candidate_binding_id, project_id, scope_key, candidate_binding_version)
     REFERENCES project.room_evolution_trusted_bindings(id, project_id, scope_key, binding_version)
@@ -361,7 +361,7 @@ ALTER TABLE project.room_evolution_promotion_decisions
       AND canary_id IS NOT NULL
       AND rollback_target_candidate_version_id IS NOT NULL
     )
-  ),
+  ) NOT VALID,
   ADD CONSTRAINT room_evolution_promotions_success_outcome_fkey
     FOREIGN KEY (canary_success_outcome_id, project_id, scope_key)
     REFERENCES project.room_evolution_canary_success_outcomes(id, project_id, scope_key)

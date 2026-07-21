@@ -1,10 +1,16 @@
 import {
   SESSION_CONNECTOR_CAPABILITIES,
   addRoomSeat,
+  assignRoomRoles,
   attachRoomBinding,
   buildRoomConnectorLocalMessageId,
+  createRoomCapabilitySnapshot,
   createRoomAggregate,
+  getRoomProtocolDefinition,
   hashRoomValue,
+  normalizeRoomRoleAssignmentConstraints,
+  transitionRoomRoleAssignment as transitionRoomRoleAssignmentPolicy,
+  type ActivateRoomRoleAssignmentInputV1,
   type BeginRoomDeliveryAttemptInput,
   type CompleteRoomDeliveryAttemptInput,
   type CreateRoomAggregateInput,
@@ -14,6 +20,7 @@ import {
   type RecordRoomConnectorIngestionModeInput,
   type RecordRoomConnectorStatusInput,
   type RecordRoomConnectorTranscriptBatchInput,
+  type RecordRoomPhaseGateEvidenceInputV1,
   type RoomAggregateV1,
   type RoomAuthorityEnvelopeV1,
   type RoomBindingRecordV1,
@@ -25,6 +32,12 @@ import {
   type RoomInboxReceiptV1,
   type RoomMessageIntent,
   type RoomOutboxRecordV1,
+  type RoomPhaseGateEvidenceProjectionV1,
+  type RoomRoleAssignmentProjectionV1,
+  type RoomTurnRecordV1,
+  type RouteRoomProtocolMessageInputV1,
+  type RouteRoomProtocolMessageResultV1,
+  type TransitionRoomRoleAssignmentCommandInputV1,
   type RouteOperatorMessageResultV1,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorCapabilityName,
@@ -42,6 +55,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   RoomExistingSessionSpine as ProductionRoomExistingSessionSpine,
+  type RoomRoleAssignmentConfigurationV1,
 } from "../room-existing-session-spine.js";
 import { SessionConnectorRegistry } from "../session-connector-registry.js";
 
@@ -292,15 +306,42 @@ class DurableExistingSessionRoomStore {
   private readonly ingestionStates = new Map<string, RoomConnectorIngestionStateV1>();
   readonly createInputs: CreateRoomWithExistingBindingsInput[] = [];
   readonly routeInputs: RoomControllerCommandEnvelopeV1[] = [];
+  readonly semanticRouteInputs: RouteRoomProtocolMessageInputV1[] = [];
   readonly beginDeliveryInputs: BeginRoomDeliveryAttemptInput[] = [];
+  readonly activationInputs: {
+    readonly input: ActivateRoomRoleAssignmentInputV1;
+    readonly context: RoomCommandContext;
+  }[] = [];
+  readonly phaseTransitionInputs: {
+    readonly input: TransitionRoomRoleAssignmentCommandInputV1;
+    readonly context: RoomCommandContext;
+  }[] = [];
+  readonly phaseGateEvidenceInputs: {
+    readonly input: RecordRoomPhaseGateEvidenceInputV1;
+    readonly context: RoomCommandContext;
+  }[] = [];
+  failNextEntryActivation = false;
+  private readonly activeRoleAssignments = new Map<string, RoomRoleAssignmentProjectionV1>();
+  private readonly phaseGateEvidence = new Map<
+    string,
+    { readonly evidence: RecordRoomPhaseGateEvidenceInputV1["evidence"] }
+  >();
+  private readonly phaseTransitionResults = new Map<
+    string,
+    {
+      readonly commandHash: string;
+      readonly projection: RoomRoleAssignmentProjectionV1;
+    }
+  >();
   private eventCursor = 0;
 
   async createRoomWithExistingBindings(
     input: CreateRoomWithExistingBindingsInput,
-    _context: RoomCommandContext,
+    context: RoomCommandContext,
   ): Promise<RoomAggregateV1> {
     this.createInputs.push(input);
-    if (this.rooms.has(input.room.id)) throw new Error(`Room ${input.room.id} already exists`);
+    const existing = this.rooms.get(input.room.id);
+    if (existing) return existing;
     let aggregate = createRoomAggregate({
       ...input.room,
       projectId: PROJECT_ID,
@@ -324,8 +365,30 @@ class DurableExistingSessionRoomStore {
       room: { ...aggregate.room, aggregateVersion: 0 },
       membershipVersion: 1,
     };
+    // FNXC:SessionRoomExistingSpine 2026-07-18:
+    // Mirror the production store's externally observable atomic boundary. The
+    // fake may use the existing role helper internally, but it must remove all
+    // Room state if the entry authorization cannot commit with creation.
     this.rooms.set(input.room.id, committed);
-    return committed;
+    if (!input.entryRoleAssignment) return committed;
+    try {
+      await this.activateRoomRoleAssignment({
+        roomId: input.room.id,
+        expectedAggregateVersion: committed.room.aggregateVersion,
+        idempotencyKey: `room-existing-session:${input.room.id}:role-assignment:entry`,
+        capabilitySnapshot: input.entryRoleAssignment.capabilitySnapshot,
+        constraints: input.entryRoleAssignment.constraints,
+        now: input.now,
+      }, {
+        ...context,
+        causationId: context.eventId,
+      });
+    } catch (error) {
+      this.rooms.delete(input.room.id);
+      this.activeRoleAssignments.delete(input.room.id);
+      throw error;
+    }
+    return this.requireRoomAggregate(input.room.id);
   }
 
   async createRoom(
@@ -366,6 +429,256 @@ class DurableExistingSessionRoomStore {
 
   async getRoom(roomId: string): Promise<RoomAggregateV1 | undefined> {
     return this.rooms.get(roomId);
+  }
+
+  async routeRoomProtocolMessage(
+    input: RouteRoomProtocolMessageInputV1,
+  ): Promise<RouteRoomProtocolMessageResultV1> {
+    this.semanticRouteInputs.push(input);
+    const current = this.requireRoomAggregate(input.roomId);
+    if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new Error(`Room ${input.roomId} aggregate version drifted before semantic protocol route`);
+    }
+    return {
+      replayed: false,
+      message: { id: "semantic-route-message" },
+      protocolMessage: { protocolMessageId: "semantic-route-protocol-message" },
+      targets: [],
+      deliveries: [],
+      controllerAction: null,
+      event: { id: "semantic-route-event" },
+    } as unknown as RouteRoomProtocolMessageResultV1;
+  }
+
+  async getActiveRoomRoleAssignment(roomId: string): Promise<RoomRoleAssignmentProjectionV1 | null> {
+    return this.activeRoleAssignments.get(roomId) ?? null;
+  }
+
+  async activateRoomRoleAssignment(
+    input: ActivateRoomRoleAssignmentInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomRoleAssignmentProjectionV1> {
+    this.activationInputs.push({ input, context });
+    if (this.failNextEntryActivation) {
+      this.failNextEntryActivation = false;
+      throw new Error("Simulated process interruption before entry role-assignment commit");
+    }
+    const current = this.requireRoomAggregate(input.roomId);
+    if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new Error(`Room ${input.roomId} aggregate version drifted before entry role assignment`);
+    }
+    const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+    const entryPhase = protocol?.phases[0];
+    if (!protocol || !entryPhase) throw new Error("Expected deterministic entry protocol phase");
+    const snapshot = createRoomCapabilitySnapshot(input.capabilitySnapshot);
+    const constraints = normalizeRoomRoleAssignmentConstraints(input.constraints);
+    if (!snapshot.ok || !constraints.ok) throw new Error("Expected preflighted role assignment inputs");
+    const assignment = assignRoomRoles({
+      protocol,
+      phaseId: entryPhase.id,
+      capabilitySnapshot: snapshot.value,
+      constraints: constraints.value,
+      producerBindingIds: [],
+    });
+    if (!assignment.ok) throw new Error("Expected deterministic entry role assignment to be satisfiable");
+    const committed = this.advanceRoomAggregate(current, input.now);
+    const projection: RoomRoleAssignmentProjectionV1 = {
+      id: `role-assignment:${input.roomId}:r1`,
+      roomId: input.roomId,
+      revision: 1,
+      state: "active",
+      protocolId: protocol.id,
+      protocolVersion: protocol.version,
+      phaseId: entryPhase.id,
+      capabilitySnapshot: snapshot.value,
+      constraints: constraints.value,
+      assignment: assignment.value,
+      authoritativeProducerBindingIds: assignment.value.producerBindingIds,
+      aggregateVersion: committed.room.aggregateVersion,
+      createdAt: input.now,
+      supersededAt: null,
+    };
+    this.rooms.set(input.roomId, committed);
+    this.activeRoleAssignments.set(input.roomId, projection);
+    return projection;
+  }
+
+  async transitionRoomRoleAssignment(
+    input: TransitionRoomRoleAssignmentCommandInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomRoleAssignmentProjectionV1> {
+    this.phaseTransitionInputs.push({ input, context });
+    const snapshot = createRoomCapabilitySnapshot(input.capabilitySnapshot);
+    const constraints = normalizeRoomRoleAssignmentConstraints(input.constraints);
+    if (!snapshot.ok || !constraints.ok) throw new Error("Expected preflighted role transition inputs");
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      boundaryTurnId: input.boundaryTurnId,
+      targetPhaseId: input.targetPhaseId,
+      phaseGateEvidenceId: input.phaseGateEvidenceId,
+      capabilitySnapshot: snapshot.value,
+      constraints: constraints.value,
+    });
+    const resultKey = `${input.roomId}\u0000${input.idempotencyKey}`;
+    const replay = this.phaseTransitionResults.get(resultKey);
+    if (replay) {
+      if (replay.commandHash !== commandHash) {
+        throw new Error(`Idempotency key ${input.idempotencyKey} was already used for a different Room command`);
+      }
+      return replay.projection;
+    }
+
+    const current = this.requireRoomAggregate(input.roomId);
+    if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new Error(`Room ${input.roomId} aggregate version drifted before role transition`);
+    }
+    const boundaryTurn = current.turns.find((turn) => turn.id === input.boundaryTurnId);
+    const laterTurnStarted = boundaryTurn
+      ? current.turns.some((turn) => turn.sequence > boundaryTurn.sequence && turn.startedAt !== null)
+      : false;
+    if (
+      current.activeTurnId !== null
+      || !boundaryTurn
+      || laterTurnStarted
+      || !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)
+    ) {
+      throw new Error(`Turn ${input.boundaryTurnId} has not reached a safe role-assignment boundary`);
+    }
+    const active = this.activeRoleAssignments.get(input.roomId);
+    if (!active) throw new Error(`Room ${input.roomId} has no active role assignment`);
+    const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+    if (!protocol) throw new Error("Expected deterministic Room protocol");
+    const phaseGateEvidence = this.phaseGateEvidence.get(input.phaseGateEvidenceId);
+    if (!phaseGateEvidence) {
+      throw new Error(`Room ${input.roomId} has no immutable phase-gate evidence ${input.phaseGateEvidenceId}`);
+    }
+    if (phaseGateEvidence.evidence.turnId !== input.boundaryTurnId) {
+      throw new Error(`Phase-gate evidence ${input.phaseGateEvidenceId} does not bind the requested completed turn`);
+    }
+    const transition = transitionRoomRoleAssignmentPolicy({
+      protocol,
+      currentAssignment: active.assignment,
+      currentCapabilitySnapshot: active.capabilitySnapshot,
+      targetPhaseId: input.targetPhaseId,
+      verifiedTransitionGateId: phaseGateEvidence.evidence.gateId,
+      atTurnBoundary: true,
+      capabilitySnapshot: snapshot.value,
+      constraints: constraints.value,
+      authoritativeProducerBindingIds: active.authoritativeProducerBindingIds,
+    });
+    if (!transition.ok) throw new Error("Expected deterministic phase transition to be satisfiable");
+    const committed = this.advanceRoomAggregate(current, input.now);
+    const projection: RoomRoleAssignmentProjectionV1 = {
+      id: `role-assignment:${input.roomId}:r${active.revision + 1}`,
+      roomId: input.roomId,
+      revision: active.revision + 1,
+      state: "active",
+      protocolId: protocol.id,
+      protocolVersion: protocol.version,
+      phaseId: input.targetPhaseId,
+      capabilitySnapshot: snapshot.value,
+      constraints: constraints.value,
+      assignment: transition.value,
+      authoritativeProducerBindingIds: transition.value.producerBindingIds,
+      aggregateVersion: committed.room.aggregateVersion,
+      createdAt: input.now,
+      supersededAt: null,
+    };
+    this.rooms.set(input.roomId, committed);
+    this.activeRoleAssignments.set(input.roomId, projection);
+    this.phaseTransitionResults.set(resultKey, { commandHash, projection });
+    return projection;
+  }
+
+  async recordRoomPhaseGateEvidence(
+    input: RecordRoomPhaseGateEvidenceInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomPhaseGateEvidenceProjectionV1> {
+    this.phaseGateEvidenceInputs.push({ input, context });
+    const current = this.requireRoomAggregate(input.roomId);
+    if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new Error(`Room ${input.roomId} aggregate version drifted before phase-gate evidence recording`);
+    }
+    const boundaryTurn = current.turns.find((turn) => turn.id === input.evidence.turnId);
+    if (!boundaryTurn || !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)) {
+      throw new Error(`Turn ${input.evidence.turnId} has not reached a safe role-assignment boundary`);
+    }
+    const replay = this.phaseGateEvidence.get(input.evidence.id);
+    if (replay) {
+      if (hashRoomValue(replay.evidence) !== hashRoomValue(input.evidence)) {
+        throw new Error(`Phase-gate evidence ${input.evidence.id} was already recorded differently`);
+      }
+      return {
+        id: input.evidence.id,
+        roomId: input.roomId,
+        evidence: replay.evidence,
+        evidenceHash: hashRoomValue(replay.evidence),
+        producerLineage: {
+          source: "durable_room_producer_lineage_ledger",
+          sourceRecordId: "deterministic-fake-role-assignment",
+          sourceHash: hashRoomValue("deterministic-fake-role-assignment"),
+          protocolId: replay.evidence.protocolId,
+          protocolVersion: replay.evidence.protocolVersion,
+          protocolHash: replay.evidence.protocolHash,
+          turnId: replay.evidence.turnId,
+          candidateId: replay.evidence.candidateId,
+          candidateHash: replay.evidence.candidateHash,
+          producerBindingIds: replay.evidence.producerBindingIds,
+        },
+        evidenceNotBefore: input.now,
+        createdAt: input.now,
+      };
+    }
+    this.phaseGateEvidence.set(input.evidence.id, { evidence: input.evidence });
+    this.rooms.set(input.roomId, this.advanceRoomAggregate(current, input.now));
+    return {
+      id: input.evidence.id,
+      roomId: input.roomId,
+      evidence: input.evidence,
+      evidenceHash: hashRoomValue(input.evidence),
+      producerLineage: {
+        source: "durable_room_producer_lineage_ledger",
+        sourceRecordId: "deterministic-fake-role-assignment",
+        sourceHash: hashRoomValue("deterministic-fake-role-assignment"),
+        protocolId: input.evidence.protocolId,
+        protocolVersion: input.evidence.protocolVersion,
+        protocolHash: input.evidence.protocolHash,
+        turnId: input.evidence.turnId,
+        candidateId: input.evidence.candidateId,
+        candidateHash: input.evidence.candidateHash,
+        producerBindingIds: input.evidence.producerBindingIds,
+      },
+      evidenceNotBefore: input.now,
+      createdAt: input.now,
+    };
+  }
+
+  completeTurnForRoleTransition(
+    roomId: string,
+    turnId: string,
+    protocolPhaseId: string,
+  ): RoomAggregateV1 {
+    const current = this.requireRoomAggregate(roomId);
+    const committed = this.advanceRoomAggregate(current, NOW);
+    const turn: RoomTurnRecordV1 = {
+      contractVersion: 1,
+      id: turnId,
+      roomId,
+      sequence: Math.max(0, ...current.turns.map((candidate) => candidate.sequence)) + 1,
+      protocolPhaseId,
+      membershipVersion: committed.membershipVersion,
+      state: "completed",
+      startedAt: NOW,
+      endedAt: NOW,
+    };
+    const withBoundary: RoomAggregateV1 = {
+      ...committed,
+      activeTurnId: null,
+      turns: [...committed.turns, turn],
+    };
+    this.rooms.set(roomId, withBoundary);
+    return withBoundary;
   }
 
   async routeOperatorMessage(
@@ -686,6 +999,23 @@ class DurableExistingSessionRoomStore {
     return delivery;
   }
 
+  private requireRoomAggregate(roomId: string): RoomAggregateV1 {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new Error(`Room ${roomId} is not durable`);
+    return room;
+  }
+
+  private advanceRoomAggregate(current: RoomAggregateV1, now: string): RoomAggregateV1 {
+    return {
+      ...current,
+      room: {
+        ...current.room,
+        aggregateVersion: current.room.aggregateVersion + 1,
+        updatedAt: now,
+      },
+    };
+  }
+
   private initialIngestionState(roomId: string, bindingId: string): RoomConnectorIngestionStateV1 {
     return {
       contractVersion: 1,
@@ -763,7 +1093,29 @@ interface RoomExistingSessionSpineApi {
   createRoomWithExistingSessions(input: {
     readonly room: Omit<CreateRoomAggregateInput, "projectId" | "now">;
     readonly sessions: readonly ExactExistingSessionSeatRequest[];
+    readonly roleAssignment: RoomRoleAssignmentConfigurationV1;
   }): Promise<RoomAggregateV1>;
+  transitionRoleAssignmentAtCompletedTurnBoundary(input: {
+    readonly roomId: string;
+    readonly expectedAggregateVersion: number;
+    readonly boundaryTurnId: string;
+    readonly targetPhaseId: string;
+    readonly phaseGateEvidenceId: string;
+    readonly idempotencyKey: string;
+    readonly roleAssignment: RoomRoleAssignmentConfigurationV1;
+  }): Promise<RoomRoleAssignmentProjectionV1>;
+  recordPhaseGateEvidenceAtCompletedTurnBoundary(input: {
+    readonly roomId: string;
+    readonly expectedAggregateVersion: number;
+    readonly idempotencyKey: string;
+    readonly evidence: RecordRoomPhaseGateEvidenceInputV1["evidence"];
+  }): Promise<RoomPhaseGateEvidenceProjectionV1>;
+  routeStructuredProtocolMessage(input: {
+    readonly roomId: string;
+    readonly expectedAggregateVersion: number;
+    readonly idempotencyKey: string;
+    readonly message: unknown;
+  }): Promise<RouteRoomProtocolMessageResultV1>;
   sendToSeat(input: {
     readonly roomId: string;
     readonly seatId: string;
@@ -826,6 +1178,68 @@ function createInput() {
       requiredMachineId: session.identity.machineId!,
       idempotencyKey: `ensure:${session.identity.providerId}:${session.identity.nativeSessionId}`,
     })),
+    roleAssignment: roleAssignmentConfiguration(),
+  };
+}
+
+function roleAssignmentConfiguration(revision = 1): RoomRoleAssignmentConfigurationV1 {
+  return {
+    capabilitySnapshot: {
+      contractVersion: 1,
+      snapshotId: `existing-session-spine-capabilities-r${revision}`,
+      revision,
+      capturedAt: NOW,
+      bindings: [
+        {
+          bindingId: EXISTING_SESSIONS[0].bindingId,
+          availability: "eligible",
+          capabilityRevision: `codex-capabilities-r${revision}`,
+          capabilities: [
+            { name: "source_read", state: "verified" },
+            { name: "workspace_write", state: "verified" },
+          ],
+        },
+        {
+          bindingId: EXISTING_SESSIONS[1].bindingId,
+          availability: "eligible",
+          capabilityRevision: `claude-capabilities-r${revision}`,
+          capabilities: [
+            { name: "source_read", state: "verified" },
+            { name: "test", state: "verified" },
+          ],
+        },
+      ],
+    },
+    constraints: {
+      locks: [{ roleId: "implementer", bindingId: EXISTING_SESSIONS[0].bindingId }],
+      forbids: [],
+    },
+  };
+}
+
+function phaseGateEvidenceFixture(boundaryTurnId: string, suffix: string) {
+  const protocol = getRoomProtocolDefinition("implementation", 1);
+  if (!protocol) throw new Error("Implementation protocol must exist for phase-gate evidence");
+  return {
+    contractVersion: 1 as const,
+    id: `phase-gate-existing-spine-${suffix}`,
+    protocolId: protocol.id,
+    protocolVersion: protocol.version,
+    protocolHash: hashRoomValue(protocol),
+    gateId: "plan_ready",
+    phaseId: "plan",
+    turnId: boundaryTurnId,
+    candidateId: `candidate-existing-spine-${suffix}`,
+    candidateHash: hashRoomValue(`candidate-existing-spine-${suffix}`),
+    source: {
+      recordId: `source-existing-spine-${suffix}`,
+      sourceHash: hashRoomValue(`source-existing-spine-${suffix}`),
+      recordedAt: NOW,
+    },
+    verdict: "passed" as const,
+    evaluatorBindingId: EXISTING_SESSIONS[1].bindingId,
+    producerBindingIds: [EXISTING_SESSIONS[0].bindingId],
+    operatorApproval: null,
   };
 }
 
@@ -902,6 +1316,18 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
       hostId: session.identity.hostId,
       generation: 1,
     })));
+    expect(harness.roomStore.createInputs).toEqual([
+      expect.objectContaining({
+        room: expect.objectContaining({ id: ROOM_ID }),
+        entryRoleAssignment: expect.objectContaining({
+          constraints: roleAssignmentConfiguration().constraints,
+        }),
+      }),
+    ]);
+    await expect(harness.roomStore.getActiveRoomRoleAssignment(ROOM_ID)).resolves.toMatchObject({
+      phaseId: "plan",
+      assignment: { phaseId: "plan" },
+    });
     expect(harness.requireVerified).toHaveBeenCalledTimes(2);
     for (const session of EXISTING_SESSIONS) {
       expect(harness.requireVerified).toHaveBeenCalledWith({
@@ -920,6 +1346,252 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
     expect(harness.connector.create).not.toHaveBeenCalled();
     expect(Reflect.has(globalThis, "window")).toBe(false);
     expect(Reflect.has(globalThis, "document")).toBe(false);
+  });
+
+  it("fails closed before connector ensure or Room creation when explicit binding certification is incomplete", async () => {
+    const harness = createHarness();
+    const RoomExistingSessionSpine = requireRoomExistingSessionSpine();
+    const controller = new RoomExistingSessionSpine({
+      projectId: PROJECT_ID,
+      roomStore: harness.roomStore,
+      connectorRegistry: harness.registry,
+      now: () => NOW,
+      ingestionLimits: {
+        historyPageSize: 50,
+        maxHistoryPagesPerReconciliation: 2,
+        maxEvents: 10,
+        maxStreamReconnects: 0,
+        maxDegradedPolls: 0,
+      },
+    });
+    const input = createInput();
+    const incompleteCertification = input.roleAssignment.capabilitySnapshot.bindings[0];
+    if (!incompleteCertification) throw new Error("Expected deterministic Codex capability certification");
+
+    await expect(controller.createRoomWithExistingSessions({
+      ...input,
+      roleAssignment: {
+        ...input.roleAssignment,
+        capabilitySnapshot: {
+          ...input.roleAssignment.capabilitySnapshot,
+          bindings: [incompleteCertification],
+        },
+      },
+    })).rejects.toMatchObject({
+      code: "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID",
+    });
+    expect(harness.connector.ensureExisting).not.toHaveBeenCalled();
+    expect(harness.roomStore.createInputs).toEqual([]);
+    expect(harness.roomStore.activationInputs).toEqual([]);
+    expect(await harness.roomStore.getRoom(ROOM_ID)).toBeUndefined();
+  });
+
+  it("rolls back an interrupted atomic creation before exposing a Room", async () => {
+    const harness = createHarness();
+    harness.roomStore.failNextEntryActivation = true;
+    const RoomExistingSessionSpine = requireRoomExistingSessionSpine();
+    const controller = new RoomExistingSessionSpine({
+      projectId: PROJECT_ID,
+      roomStore: harness.roomStore,
+      connectorRegistry: harness.registry,
+      now: () => NOW,
+      ingestionLimits: {
+        historyPageSize: 50,
+        maxHistoryPagesPerReconciliation: 2,
+        maxEvents: 10,
+        maxStreamReconnects: 0,
+        maxDegradedPolls: 0,
+      },
+    });
+
+    await expect(controller.createRoomWithExistingSessions(createInput())).rejects
+      .toThrow(/interruption before entry role-assignment commit/i);
+    expect(await harness.roomStore.getRoom(ROOM_ID)).toBeUndefined();
+    await expect(harness.roomStore.getActiveRoomRoleAssignment(ROOM_ID)).resolves.toBeNull();
+
+    const retried = await controller.createRoomWithExistingSessions(createInput());
+    expect(retried.room.id).toBe(ROOM_ID);
+    expect(harness.roomStore.createInputs).toHaveLength(2);
+    await expect(harness.roomStore.getActiveRoomRoleAssignment(ROOM_ID)).resolves.toMatchObject({
+      phaseId: "plan",
+      assignment: { phaseId: "plan" },
+    });
+  });
+
+  it("exposes an explicit completed-turn role-transition seam and preserves core gate enforcement", async () => {
+    const harness = createHarness();
+    const RoomExistingSessionSpine = requireRoomExistingSessionSpine();
+    const controller = new RoomExistingSessionSpine({
+      projectId: PROJECT_ID,
+      roomStore: harness.roomStore,
+      connectorRegistry: harness.registry,
+      now: () => NOW,
+      ingestionLimits: {
+        historyPageSize: 50,
+        maxHistoryPagesPerReconciliation: 2,
+        maxEvents: 10,
+        maxStreamReconnects: 0,
+        maxDegradedPolls: 0,
+      },
+    });
+    const created = await controller.createRoomWithExistingSessions(createInput());
+    const transitionInput = {
+      roomId: ROOM_ID,
+      expectedAggregateVersion: created.room.aggregateVersion,
+      boundaryTurnId: "turn-role-transition-plan",
+      targetPhaseId: "implement",
+      phaseGateEvidenceId: "phase-gate-existing-spine-plan-to-implement",
+      idempotencyKey: "role-transition-plan-to-implement",
+      roleAssignment: roleAssignmentConfiguration(2),
+    } as const;
+
+    await expect(controller.transitionRoleAssignmentAtCompletedTurnBoundary(transitionInput)).rejects
+      .toThrow(/safe role-assignment boundary/i);
+    expect(harness.roomStore.phaseTransitionInputs).toHaveLength(1);
+
+    const completedBoundary = harness.roomStore.completeTurnForRoleTransition(
+      ROOM_ID,
+      transitionInput.boundaryTurnId,
+      "plan",
+    );
+    const evidence = await controller.recordPhaseGateEvidenceAtCompletedTurnBoundary({
+      roomId: ROOM_ID,
+      expectedAggregateVersion: completedBoundary.room.aggregateVersion,
+      idempotencyKey: "phase-gate-existing-spine-plan-to-implement",
+      evidence: phaseGateEvidenceFixture(
+        transitionInput.boundaryTurnId,
+        "plan-to-implement",
+      ),
+    });
+    const afterEvidence = await harness.roomStore.getRoom(ROOM_ID);
+    if (!afterEvidence) throw new Error("Room must exist after phase-gate evidence recording");
+    const transitioned = await controller.transitionRoleAssignmentAtCompletedTurnBoundary({
+      ...transitionInput,
+      expectedAggregateVersion: afterEvidence.room.aggregateVersion,
+      phaseGateEvidenceId: evidence.id,
+    });
+
+    expect(transitioned).toMatchObject({
+      phaseId: "implement",
+      state: "active",
+      assignment: { phaseId: "implement" },
+    });
+    expect(harness.roomStore.phaseTransitionInputs).toHaveLength(2);
+    expect(harness.roomStore.phaseTransitionInputs[1]).toEqual(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          roomId: ROOM_ID,
+          boundaryTurnId: transitionInput.boundaryTurnId,
+          targetPhaseId: "implement",
+          phaseGateEvidenceId: evidence.id,
+          idempotencyKey: transitionInput.idempotencyKey,
+        }),
+        context: expect.objectContaining({
+          actorType: "system",
+          actorId: "room-existing-session-spine",
+          causationId: `room-existing-session:${ROOM_ID}:turn:${transitionInput.boundaryTurnId}`,
+        }),
+      }),
+    );
+  });
+
+  it("replays an exact completed-turn phase transition after its aggregate advances", async () => {
+    const harness = createHarness();
+    const RoomExistingSessionSpine = requireRoomExistingSessionSpine();
+    const controller = new RoomExistingSessionSpine({
+      projectId: PROJECT_ID,
+      roomStore: harness.roomStore,
+      connectorRegistry: harness.registry,
+      now: () => NOW,
+      ingestionLimits: {
+        historyPageSize: 50,
+        maxHistoryPagesPerReconciliation: 2,
+        maxEvents: 10,
+        maxStreamReconnects: 0,
+        maxDegradedPolls: 0,
+      },
+    });
+    const created = await controller.createRoomWithExistingSessions(createInput());
+    const boundaryTurnId = "turn-role-transition-exact-replay";
+    const completedBoundary = harness.roomStore.completeTurnForRoleTransition(
+      ROOM_ID,
+      boundaryTurnId,
+      "plan",
+    );
+    const evidence = await controller.recordPhaseGateEvidenceAtCompletedTurnBoundary({
+      roomId: ROOM_ID,
+      expectedAggregateVersion: completedBoundary.room.aggregateVersion,
+      idempotencyKey: "phase-gate-existing-spine-exact-replay",
+      evidence: phaseGateEvidenceFixture(boundaryTurnId, "exact-replay"),
+    });
+    const afterEvidence = await harness.roomStore.getRoom(ROOM_ID);
+    if (!afterEvidence) throw new Error("Room must exist after phase-gate evidence recording");
+    const exactInput = {
+      roomId: ROOM_ID,
+      expectedAggregateVersion: afterEvidence.room.aggregateVersion,
+      boundaryTurnId,
+      targetPhaseId: "implement",
+      phaseGateEvidenceId: evidence.id,
+      idempotencyKey: "role-transition-exact-replay",
+      roleAssignment: roleAssignmentConfiguration(2),
+    } as const;
+
+    expect(created.room.aggregateVersion).toBeLessThan(exactInput.expectedAggregateVersion);
+    const first = await controller.transitionRoleAssignmentAtCompletedTurnBoundary(exactInput);
+    const beforeReplay = await harness.roomStore.getRoom(ROOM_ID);
+    const replayed = await controller.transitionRoleAssignmentAtCompletedTurnBoundary(exactInput);
+    const afterReplay = await harness.roomStore.getRoom(ROOM_ID);
+
+    expect(replayed).toEqual(first);
+    expect(afterReplay).toEqual(beforeReplay);
+    expect(harness.roomStore.phaseTransitionInputs).toHaveLength(2);
+
+    await expect(controller.transitionRoleAssignmentAtCompletedTurnBoundary({
+      ...exactInput,
+      targetPhaseId: "challenge",
+    })).rejects.toThrow(/already used for a different Room command/i);
+    expect(await harness.roomStore.getRoom(ROOM_ID)).toEqual(afterReplay);
+    expect(harness.roomStore.phaseTransitionInputs).toHaveLength(3);
+  });
+
+  it("forwards only an explicit structured protocol envelope into the canonical semantic router", async () => {
+    const harness = createHarness();
+    const RoomExistingSessionSpine = requireRoomExistingSessionSpine();
+    const controller = new RoomExistingSessionSpine({
+      projectId: PROJECT_ID,
+      roomStore: harness.roomStore,
+      connectorRegistry: harness.registry,
+      now: () => NOW,
+      ingestionLimits: {
+        historyPageSize: 50,
+        maxHistoryPagesPerReconciliation: 2,
+        maxEvents: 10,
+        maxStreamReconnects: 0,
+        maxDegradedPolls: 0,
+      },
+    });
+    const created = await controller.createRoomWithExistingSessions(createInput());
+    const input = {
+      roomId: ROOM_ID,
+      expectedAggregateVersion: created.room.aggregateVersion,
+      idempotencyKey: "route-existing-session-structured-protocol-message",
+      // The spine intentionally accepts the adapter's opaque candidate here;
+      // AsyncRoomStore owns protocol-envelope validation and durable routing.
+      message: { adapter: "structured-envelope-candidate" },
+    } as const;
+
+    await expect(controller.routeStructuredProtocolMessage(input)).resolves.toMatchObject({
+      replayed: false,
+      event: { id: "semantic-route-event" },
+    });
+    expect(harness.roomStore.semanticRouteInputs).toEqual([input]);
+
+    await expect(controller.routeStructuredProtocolMessage({
+      ...input,
+      idempotencyKey: "route-existing-session-stale-aggregate",
+      expectedAggregateVersion: input.expectedAggregateVersion - 1,
+    })).rejects.toMatchObject({ code: "ROOM_EXISTING_SESSION_PROTOCOL_ROUTE_CONFLICT" });
+    expect(harness.roomStore.semanticRouteInputs).toEqual([input]);
   });
 
   it("targets immutable bindings, ingests response deltas, and restores durable identities and cursors", async () => {

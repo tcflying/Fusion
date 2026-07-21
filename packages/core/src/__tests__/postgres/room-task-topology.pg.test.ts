@@ -230,8 +230,8 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
       ],
     );
 
-    const childA = childNode("split-child-a");
-    const childB = childNode("split-child-b");
+    const childA = { ...childNode("split-child-a"), assignedSeatIds: ["seat-split-a"] };
+    const childB = { ...childNode("split-child-b"), assignedSeatIds: ["seat-split-b"] };
     graph = await mutate(
       current,
       graph,
@@ -261,6 +261,7 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
       expect(findNode(graph, child.id)).toMatchObject({
         id: child.id,
         parentNodeId: source.id,
+        assignedSeatIds: child.assignedSeatIds,
         state: "ready",
         origin: {
           kind: "split_child",
@@ -819,7 +820,6 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
     const current = await fixture("topology-freeze-command-shape");
     const acceptedSource = node("freeze-accepted-source");
     const cancelledSource = node("freeze-cancelled-source");
-    const runningSource = node("freeze-running-source");
     const retryingSource = node("freeze-retrying-source");
     const mutableSource = node("freeze-mutable-source");
     const mergeLeft = node("freeze-merge-left");
@@ -842,7 +842,6 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
         ...[
           acceptedSource,
           cancelledSource,
-          runningSource,
           retryingSource,
           mutableSource,
           mergeLeft,
@@ -856,7 +855,7 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
         { action: "add_edge", edge: edge("freeze-merge-neighbor", mergeLeft.id, acceptedNeighbor.id, "invalidates") },
       ],
     );
-    const transition = async (nodeId: string, to: "accepted" | "cancelled" | "running" | "retrying", label: string) => {
+    const transition = async (nodeId: string, to: "accepted" | "cancelled" | "retrying", label: string) => {
       graph = await mutate(current, graph, label, [{
         action: "transition_node",
         nodeId,
@@ -868,8 +867,6 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
     };
     await transition(acceptedSource.id, "accepted", "accept-source");
     await transition(cancelledSource.id, "cancelled", "cancel-source");
-    await transition(runningSource.id, "running", "run-source");
-    await transition(retryingSource.id, "running", "run-retrying-source");
     await transition(retryingSource.id, "retrying", "retry-source");
     await transition(acceptedNeighbor.id, "accepted", "accept-neighbor");
     await transition(acceptedParent.id, "accepted", "accept-parent");
@@ -911,7 +908,6 @@ describe("AsyncRoomStore PostgreSQL hierarchical topology commands", () => {
     for (const [candidate, code] of [
       [acceptedSource, "accepted_node_frozen"],
       [cancelledSource, "task_graph_invalid_mutation"],
-      [runningSource, "task_graph_invalid_mutation"],
       [retryingSource, "task_graph_invalid_mutation"],
     ] as const) {
       await reject(`split-frozen-${candidate.id}`, [{

@@ -82,6 +82,22 @@ function graph(
 }
 
 describe("planRoomDependencyDispatch", () => {
+  it("accepts persisted seat assignment while keeping dispatch eligibility dependency-only", () => {
+    const assignedReady: RoomTaskNodeProjectionV1 = {
+      ...taskNode("assigned-ready", "ready", 2),
+      assignedSeatIds: ["seat-codex"],
+    };
+    const projection = graph([assignedReady], [], [assignedReady.id]);
+
+    expect(planRoomDependencyDispatch(projection)).toEqual({
+      roomId: "room-dispatch",
+      aggregateVersion: 4,
+      dagVersion: 2,
+      readyCandidates: [{ nodeId: "assigned-ready", criticalPathRank: 0 }],
+      dependencyWaits: [],
+    });
+  });
+
   it("orders a ready critical-path successor before independent B/D branches", () => {
     const projection = graph(
       [

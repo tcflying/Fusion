@@ -110,13 +110,10 @@ export function registerIpcHandlers(mainWindow: BrowserWindow, tray: Tray, optio
 
   ipcMain.handle("tray:updateStatus", (_event, status: EngineStatus) => updateTrayStatus(tray, status));
   /*
-  FNXC:DesktopOAuth 2026-07-18-04:00:
-  OAuth flows call window.open AFTER awaiting POST /auth/login; when the round
-  trip outlives Chromium's transient user activation (~5s — observed with the
-  OpenAI Codex flow: method-select round-trip + localhost callback server +
-  auth-lock retries), the popup is silently blocked and setWindowOpenHandler
-  never fires, so the system browser never opens. This explicit IPC needs no
-  user activation. http/https only — reject everything else.
+  FNXC:DesktopOAuth 2026-07-21-09:30:
+  An async OAuth login can outlive Chromium's transient user activation, which
+  silently blocks window.open in the desktop app. This explicit IPC needs no
+  user activation and accepts only http(s) URLs.
   */
   ipcMain.handle("shell:openExternal", async (_event, url: unknown) => {
     if (typeof url !== "string") return false;

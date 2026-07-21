@@ -9,6 +9,7 @@ import {
   createRoomAggregate,
   requestRoomBindingReplacement,
   settleRoomTurn,
+  terminalizeRoomLifecycle,
   transitionRoomLifecycle,
 } from "../room-domain.js";
 
@@ -146,6 +147,48 @@ describe("operational Room domain", () => {
         }),
       "terminal_state_immutable",
     );
+  });
+
+  it("keeps a contract-terminalized blocked Room immutable while ordinary blocks remain resumable", () => {
+    const ready = transitionRoomLifecycle(newDraftRoom(), {
+      to: "ready",
+      expectedAggregateVersion: 0,
+      now: NOW,
+    });
+    const running = transitionRoomLifecycle(ready, {
+      to: "running",
+      expectedAggregateVersion: 1,
+      now: NOW,
+    });
+    const terminalBlocked = terminalizeRoomLifecycle(running, {
+      to: "blocked",
+      expectedAggregateVersion: 2,
+      now: "2026-07-18T11:20:00.000Z",
+      terminalization: {
+        contractId: "terminal-contract-blocked",
+        contractHash: "sha256-terminal-contract-blocked",
+        outcome: "blocked",
+        eventId: "event-terminal-blocked",
+        aggregateVersion: 3,
+        terminalizedAt: "2026-07-18T11:20:00.000Z",
+      },
+    });
+
+    expect(terminalBlocked.room.state).toBe("blocked");
+    expect(terminalBlocked.terminalization?.outcome).toBe("blocked");
+    expectDomainErrorCode(
+      () => transitionRoomLifecycle(terminalBlocked, {
+        to: "running",
+        expectedAggregateVersion: 3,
+        now: "2026-07-18T11:21:00.000Z",
+      }),
+      "terminal_state_immutable",
+    );
+    expect(transitionRoomLifecycle(terminalBlocked, {
+      to: "archived",
+      expectedAggregateVersion: 3,
+      now: "2026-07-18T11:22:00.000Z",
+    }).room.state).toBe("archived");
   });
 
   it("supports arbitrary stable participant seats without provider identity leakage", () => {

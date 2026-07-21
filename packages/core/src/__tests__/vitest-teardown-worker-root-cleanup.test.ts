@@ -11,6 +11,7 @@ import setup, {
 
 const createdPaths: string[] = [];
 const originalWorkerRoot = process.env.FUSION_TEST_WORKER_ROOT;
+const originalProcessExitCode = process.exitCode;
 
 function remember(path: string): string {
   createdPaths.push(path);
@@ -34,6 +35,7 @@ function restoreWorkerRootEnv(): void {
 afterEach(() => {
   __setWorkerRootRmSyncForTests(rmSync);
   __setWorkerRootSleepMsSyncForTests(() => {});
+  process.exitCode = originalProcessExitCode;
   restoreWorkerRootEnv();
   for (const path of createdPaths.splice(0).reverse()) {
     rmSync(path, { recursive: true, force: true });
@@ -103,6 +105,59 @@ describe("vitest global teardown worker-root cleanup", () => {
     expect(attempts).toBe(4);
     expect(sleeps).toEqual([75, 75, 75]);
     expect(existsSync(workerRoot)).toBe(false);
+  });
+
+  it("fails the lifecycle teardown when persistent EPERM cleanup exhausts its retry budget", async () => {
+    const teardown = setup();
+    const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
+    makeWorkerChild(workerRoot, "persistent-eperm");
+    let attempts = 0;
+
+    __setWorkerRootRmSyncForTests((path, options) => {
+      if (path === workerRoot) {
+        attempts++;
+        const error = new Error("access denied") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      }
+      rmSync(path, options);
+    });
+    __setWorkerRootSleepMsSyncForTests(() => {});
+
+    await expect(teardown()).rejects.toThrow(
+      `[vitest-teardown] failed to remove worker root ${workerRoot} after 8 attempts: access denied`,
+    );
+
+    expect(attempts).toBe(8);
+    expect(existsSync(workerRoot)).toBe(true);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("still sweeps legacy HOME roots when worker-root cleanup fails", async () => {
+    const teardown = setup();
+    const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
+    makeWorkerChild(workerRoot, "persistent-eperm-legacy-home");
+    const legacyHome = remember(join(tmpdir(), `fn-test-home-after-worker-root-failure-${process.pid}-${Date.now()}`));
+    mkdirSync(legacyHome, { recursive: true });
+    let attempts = 0;
+
+    __setWorkerRootRmSyncForTests((path, options) => {
+      if (path === workerRoot) {
+        attempts++;
+        const error = new Error("access denied") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      }
+      rmSync(path, options);
+    });
+    __setWorkerRootSleepMsSyncForTests(() => {});
+
+    await expect(teardown()).rejects.toThrow(
+      `[vitest-teardown] failed to remove worker root ${workerRoot} after 8 attempts: access denied`,
+    );
+
+    expect(attempts).toBe(8);
+    expect(existsSync(legacyHome)).toBe(false);
   });
 
   it("tolerates ENOENT when the worker root is already gone", async () => {

@@ -12,6 +12,16 @@ const participant: RoomCockpitParticipantV1 = {
   bindingId: "binding-codex-verifier-v2",
   nativeSessionId: "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
   happierSessionId: "happier-session-19f22f6",
+  nativeSessionUrl: "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
+  happierUrl: "http://127.0.0.1:18287/session/happier-session-19f22f6?serverId=server-local",
+  connectorHealth: {
+    state: "authentication_required",
+    checkedAt: "2026-07-19T15:42:10.000Z",
+    authentication: "required",
+    rateLimit: "unknown",
+    reasonCodes: ["authentication_required"],
+    retryAfterMs: null,
+  },
   role: "independent verifier",
   provider: "OpenAI Codex",
   model: "gpt-5.6",
@@ -62,9 +72,20 @@ describe("RoomCockpitParticipantPanel", () => {
     expect(within(card).getByText("binding-codex-verifier-v2")).toBeInTheDocument();
     expect(within(card).getByText("codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d")).toBeInTheDocument();
     expect(within(card).getByText("happier-session-19f22f6")).toBeInTheDocument();
+    expect(within(card).getByRole("link", { name: "Open in Happier" })).toHaveAttribute(
+      "href",
+      "http://127.0.0.1:18287/session/happier-session-19f22f6?serverId=server-local",
+    );
+    expect(within(card).getByRole("link", { name: "Open native session" })).toHaveAttribute(
+      "href",
+      "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
+    );
     expect(within(card).getByText("OpenAI Codex")).toBeInTheDocument();
     expect(within(card).getByText("gpt-5.6")).toBeInTheDocument();
     expect(within(card).getByText("windows-control-node-01")).toBeInTheDocument();
+    expect(within(card).getByText("authentication_required")).toBeInTheDocument();
+    expect(within(card).getByText("required")).toBeInTheDocument();
+    expect(within(card).getByText("No additional reason")).toBeInTheDocument();
     expect(within(card).getAllByText("fresh")).toHaveLength(2);
     expect(within(card).getByText("32768 / 114688 tokens")).toBeInTheDocument();
     expect(within(card).getByText("6.4 events/min")).toBeInTheDocument();
@@ -82,10 +103,20 @@ describe("RoomCockpitParticipantPanel", () => {
       bindingId: 42,
       nativeSessionId: "",
       happierSessionId: null,
+      nativeSessionUrl: "https://untrusted.example/session/anything",
+      happierUrl: "javascript:alert(1)",
       role: null,
       provider: "OpenAI Codex",
       model: { guessed: "gpt-5.6" },
       host: "",
+      connectorHealth: {
+        state: "invented",
+        checkedAt: "soon",
+        authentication: "credential-dump",
+        rateLimit: "unbounded",
+        reasonCodes: ["javascript:alert(1)"],
+        retryAfterMs: -10,
+      },
       heartbeat: { freshness: "invented", lastObservedAt: "soon", recoveryOwner: 11 },
       context: { usedTokens: 8000, limitTokens: "unknown" },
       throughput: { eventsPerMinute: "fast" },
@@ -104,6 +135,8 @@ describe("RoomCockpitParticipantPanel", () => {
     expect(within(card).queryByText("gpt-5.6")).not.toBeInTheDocument();
     expect(within(card).queryByText("42")).not.toBeInTheDocument();
     expect(within(card).queryByRole("meter")).not.toBeInTheDocument();
+    expect(within(card).queryByRole("link", { name: "Open in Happier" })).not.toBeInTheDocument();
+    expect(within(card).queryByRole("link", { name: "Open native session" })).not.toBeInTheDocument();
   });
 
   it("keeps an unavailable panel explicit and preserves responsive and reduced-motion rules", () => {

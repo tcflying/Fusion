@@ -15,6 +15,7 @@ import {
   CentralCore,
   TaskStore,
   PluginLoader,
+  PluginStore,
   getTaskMergeBlocker,
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
   processAndAuditInsightExtraction,
@@ -28,19 +29,19 @@ import {
   registerBuiltInZaiProvider,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
-import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
+import { createDaemonRoomControlPlaneAuthorizer, createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
+  createWindowsNativeRoomHostCompositionAdapterRegistry,
   PeerExchangeService,
   HybridExecutor,
   shouldUseHybridExecutor,
   setHostExtensionPaths,
   createFusionAuthStorage,
-  createFusionModelRegistry,
 } from "@fusion/engine";
-import { setHostTaskStore, clearHostTaskStores } from "../extension.js";
 import {
   DefaultPackageManager,
+  ModelRegistry,
   SettingsManager,
   discoverAndLoadExtensions,
   createExtensionRuntime,
@@ -56,9 +57,8 @@ import {
 import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
-import { getPackageManagerAgentDir } from "./auth-paths.js";
+import { getModelRegistryModelsPath, getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
-import { startMigrationHoldingServer } from "./migration-holding-server.js";
 import {
   ensureClaudeSkillsForAllProjectsOnStartup,
   maybeInstallClaudeSkillForNewProject,
@@ -83,7 +83,6 @@ import { registerCustomProviders, reregisterCustomProviders } from "./custom-pro
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePluginInstalled, ensureBundledPluginInstalled, isBundledPluginId } from "../plugins/bundled-plugin-install.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
-import { phaseTime } from "../startup-phase.js";
 
 const DIAGNOSTIC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 let diagnosticIntervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -272,18 +271,6 @@ export async function runServe(
   const selectedHost = opts.host ?? "127.0.0.1";
   const cwd = await resolveRuntimeProjectPath();
 
-  /*
-  FNXC:MigrationHoldingPage 2026-07-19-12:05:
-  `fn serve` owns a known operator-facing port before its direct backend factory
-  boot. Hold that port through SQLite→PostgreSQL cutover and forward progress,
-  then release it immediately before the real listener binds. Bind failure is soft.
-  */
-  const migrationHoldingServer = await startMigrationHoldingServer({
-    port: selectedPort,
-    host: selectedHost,
-    log: (message) => console.log(`[serve] ${message}`),
-  });
-
   // ── CentralCore: global coordination + ntfy project ID lookup ─────────
   //
   // Created once and reused for:
@@ -298,49 +285,38 @@ export async function runServe(
    * The SQLite CentralDatabase path is removed (VAL-REMOVAL-005). CentralCore
    * needs its AsyncDataLayer attached to function against PostgreSQL. We use
    * the same startup factory the engine uses to resolve the backend, extract
-   * the asyncLayer for CentralCore, then pass the full boot result (including
+   * its unscoped hostAsyncLayer for CentralCore, then pass the full boot result (including
    * the TaskStore) as the externalTaskStore for the cwd project's engine so
    * the connection pool is shared — no second embedded PG instance is started.
    */
-  const { createTaskStoreForBackend } = await import("@fusion/core");
-  /*
-   * FNXC:PostgresFinalCutover 2026-07-14-17:20:
-   * Serve must share one successfully booted PostgreSQL layer between CentralCore and the cwd engine. A backend boot error is fatal; constructing a layerless CentralCore would make project discovery appear empty and split control-plane state.
-   *
-   * FNXC:FasterStartup 2026-07-14-23:55:
-   * Phase labels mirror dashboard so time-to-listen can be compared across surfaces.
-   */
-  const serveStartedAt = Date.now();
-  const logPhase = (message: string, scope = "serve") => console.log(`[${scope}] ${message}`);
-  const centralBootResult = await phaseTime(
-    "backend.factory",
-    () => createTaskStoreForBackend({
-      rootDir: cwd,
-      onMigrationProgress: (event) => migrationHoldingServer?.setMigrationProgress(event),
-    }),
-    logPhase,
-  );
-  /*
-  FNXC:FasterStartup 2026-07-15-12:38:
-  Preserve both the timed backend-factory phase and the host-store injection during rebases. The serve command must report its critical-path duration without allowing host fn_* tools to boot a second TaskStore pool.
-  */
-  setHostTaskStore(cwd, centralBootResult.taskStore);
-  let centralBackendShutdownPromise: Promise<void> | undefined;
-  const shutdownCentralBackendOnce = (): Promise<void> => {
-    centralBackendShutdownPromise ??= centralBootResult.shutdown();
-    return centralBackendShutdownPromise;
-  };
-  sharedCentralCore = new CentralCore(undefined, { asyncLayer: centralBootResult.asyncLayer });
+  let centralBootResult: {
+    taskStore: import("@fusion/core").TaskStore;
+    asyncLayer: import("@fusion/core").AsyncDataLayer;
+    hostAsyncLayer: import("@fusion/core").AsyncDataLayer;
+    shutdown: () => Promise<void>;
+  } | null = null;
+  let centralBackendAvailable = false;
   try {
-    await phaseTime("centralCore.init", () => sharedCentralCore!.init(), logPhase);
-  } catch (error) {
-    /* FNXC:PostgresServeLifecycle 2026-07-14-18:03: A failed shared CentralCore boot occurs before serve installs signal teardown, so release the sole shared TaskStore pool and embedded lifecycle here. */
-    await shutdownCentralBackendOnce().catch(() => undefined);
-    throw error;
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    centralBootResult = await createTaskStoreForBackend({ rootDir: cwd });
+    if (centralBootResult) {
+      // FNXC:HostBootstrap 2026-07-20-05:16: host coordination must use the
+      // factory's unscoped sibling layer; the project-bound TaskStore layer
+      // remains reserved for project data and owns the shared pool lifecycle.
+      sharedCentralCore = new CentralCore(undefined, { asyncLayer: centralBootResult.hostAsyncLayer });
+      await sharedCentralCore.init();
+      centralBackendAvailable = true;
+    }
+  } catch {
+    await sharedCentralCore?.close().catch(() => undefined);
+    sharedCentralCore = null;
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
+    }
+    // FNXC:CliCentralRegistration 2026-07-19-21:46: never route cwd auto-registration through a CentralCore without an AsyncDataLayer.
+    console.warn("[serve] Central PostgreSQL bootstrap failed; CWD auto-registration is disabled for this run.");
   }
-
-  let startupEngineManager: ProjectEngineManager | undefined;
-  try {
 
   // ── ProjectEngineManager: uniform engine lifecycle for all projects ──
   //
@@ -397,13 +373,26 @@ export async function runServe(
     }
   };
 
-  const registered = await ensureCwdProjectRegistered({
-    cwd,
-    central: sharedCentralCore,
-    logPrefix: "serve",
-    autoRegister: !opts.noAutoRegister,
-  });
-  ntfyProjectId = registered?.id;
+  if (!sharedCentralCore) {
+    sharedCentralCore = new CentralCore();
+    try {
+      await sharedCentralCore.init();
+    } catch {
+      // Non-fatal — engine uses fallback defaults
+    }
+  }
+
+  if (sharedCentralCore && (centralBackendAvailable || opts.noAutoRegister)) {
+    const registered = await ensureCwdProjectRegistered({
+      cwd,
+      central: sharedCentralCore,
+      logPrefix: "serve",
+      autoRegister: centralBackendAvailable && !opts.noAutoRegister,
+    });
+    ntfyProjectId = registered?.id;
+  } else if (!centralBackendAvailable) {
+    console.warn("[serve] Central PostgreSQL backend is unavailable; skipped CWD project auto-registration.");
+  }
 
   try {
     registerGithubTrackingHook?.();
@@ -414,7 +403,17 @@ export async function runServe(
   const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
   const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
-  const engineManager = startupEngineManager = new ProjectEngineManager(sharedCentralCore, {
+  /*
+   * FNXC:WindowsNativeRoomHostComposition 2026-07-21-02:17:
+   * Build one registry from the canonical unscoped bootstrap layer and give it
+   * to the manager. Do not infer provider telemetry from settings or labels.
+   */
+  const roomHostCompositionOperatorAdapterRegistry =
+    createWindowsNativeRoomHostCompositionAdapterRegistry({
+      hostAsyncLayer: centralBootResult?.hostAsyncLayer,
+    });
+
+  const engineManager = new ProjectEngineManager(sharedCentralCore, {
     cliPackageVersion,
     getMergeStrategy,
     processPullRequestMerge: (s, wd, taskId, pool) =>
@@ -424,39 +423,17 @@ export async function runServe(
     prNodeGithubOps: createPrNodeGithubOps(githubClient),
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
+    roomHostCompositionOperatorAdapterRegistry,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
     // FNXC:SqliteFinalRemoval 2026-06-26-11:15: share the central boot's TaskStore
     // as the externalTaskStore so the cwd engine reuses the same connection pool
-    // (no second embedded PG).
-    // FNXC:FasterStartup 2026-07-14-23:55: Manager only injects this store when
-    // the project's working directory matches the store root (multi-project safe).
-    externalTaskStore: centralBootResult.taskStore,
+    // (no second embedded PG). When centralBootResult is null (legacy mode), the
+    // engine creates its own TaskStore via createTaskStoreForBackend as before.
+    ...(centralBootResult ? { externalTaskStore: centralBootResult.taskStore } : {}),
   });
 
-  /*
-  FNXC:FasterStartup 2026-07-15-00:20:
-  Apply --paused before any ensureEngine/startAll so recovery, merge enqueue,
-  and deferred OAuth side effects observe enginePaused on the shared factory
-  store (cwd path). Idempotent re-apply on the primary store after ensure.
-  Matches dashboard's pause-before-engine ordering.
-  */
-  if (opts.paused) {
-    await centralBootResult.taskStore.updateSettings({ enginePaused: true });
-    console.log("[engine] Starting in paused mode — automation disabled");
-  }
-
-  /*
-  FNXC:FasterStartup 2026-07-14-23:55:
-  Do not await startAll() before listen — multi-project count must not gate
-  HTTP readiness. Warm the primary project (cwd / flag / default) fully so
-  createServer receives a live engine; other projects continue via startAll
-  + reconciliation in the background.
-  */
-  void engineManager.startAll().catch((err) => {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[serve] Background startAll failed: ${message}`);
-  });
-  engineManager.startReconciliation();
+  // Start engines for all registered projects eagerly
+  await engineManager.startAll();
 
   let hybridExecutor: HybridExecutor | null = null;
   const hybridGate = await shouldUseHybridExecutor(sharedCentralCore);
@@ -485,6 +462,14 @@ export async function runServe(
     }
   })();
 
+  // Start background reconciliation to detect and start engines for projects
+  // registered after startup (without requiring headless node API access).
+  // This ensures project task execution starts from backend runtime alone.
+  // The onProjectFirstAccessed callback in createServer remains as a fast-path
+  // fallback for immediate engine startup on project access, but it is NOT
+  // required for correctness — reconciliation handles all cases.
+  engineManager.startReconciliation();
+
   // ── PeerExchangeService: gossip protocol for mesh peer discovery ──────
   //
   // Periodically exchanges peer information with connected remote nodes
@@ -502,61 +487,52 @@ export async function runServe(
     }
   }
 
+  const startedEngines = [...engineManager.getAllEngines().values()];
   const projects = sharedCentralCore ? await sharedCentralCore.listProjects() : [];
 
   const resolvePrimaryEngine = async (): Promise<{
-    engine: import("@fusion/engine").ProjectEngine;
+    engine: (typeof startedEngines)[number];
     source: "cli-flag" | "default-setting" | "cwd" | "fallback";
   } | null> => {
-    const ensure = async (projectId: string, source: "cli-flag" | "default-setting" | "cwd" | "fallback") => {
-      const engine = await phaseTime(
-        `engine: ensureEngine(${source})`,
-        () => engineManager.ensureEngine(projectId),
-        logPhase,
-      );
-      return { engine, source };
-    };
-
     if (opts.project) {
-      const byIdProject = projects.find((project) => project.id === opts.project);
-      if (byIdProject) {
-        return ensure(byIdProject.id, "cli-flag");
+      const byId = startedEngines.find((engine) => engine.getProjectId() === opts.project);
+      if (byId) {
+        return { engine: byId, source: "cli-flag" };
       }
 
       const projectMatch = projects.find((project) => project.name === opts.project);
       if (projectMatch) {
-        return ensure(projectMatch.id, "cli-flag");
+        const byName = engineManager.getEngine(projectMatch.id);
+        if (byName) {
+          return { engine: byName, source: "cli-flag" };
+        }
       }
 
-      console.error(`[serve] --project "${opts.project}" did not match any registered project`);
+      console.error(`[serve] --project "${opts.project}" did not match any started engine`);
       process.exit(1);
       return null;
     }
 
     const defaultProjectId = await sharedCentralCore?.getDefaultProjectId?.();
     if (defaultProjectId) {
-      try {
-        return await ensure(defaultProjectId, "default-setting");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[serve] defaultProjectId ${defaultProjectId} failed to start — falling through: ${message}`);
+      const defaultEngine = engineManager.getEngine(defaultProjectId);
+      if (defaultEngine) {
+        return { engine: defaultEngine, source: "default-setting" };
       }
+      console.warn(`[serve] defaultProjectId ${defaultProjectId} is set but no engine started for it — falling through`);
     }
 
-    if (ntfyProjectId) {
-      try {
-        return await ensure(ntfyProjectId, "cwd");
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.warn(`[serve] cwd project engine failed to start — falling through: ${message}`);
-      }
+    const cwdEngine = ntfyProjectId ? engineManager.getEngine(ntfyProjectId) : undefined;
+    if (cwdEngine) {
+      return { engine: cwdEngine, source: "cwd" };
     }
 
-    const fallbackProject = projects[0];
-    if (!fallbackProject) {
+    const fallback = startedEngines[0];
+    if (!fallback) {
       return null;
     }
-    return ensure(fallbackProject.id, "fallback");
+
+    return { engine: fallback, source: "fallback" };
   };
 
   const primarySelection = await resolvePrimaryEngine();
@@ -585,10 +561,9 @@ export async function runServe(
   // Set up database health check for diagnostics
   setServeDbHealthCheck(() => store.healthCheck());
 
-  // Re-apply pause on the primary store when it is not the factory/cwd share
-  // (non-cwd --project / fallback). No-op when already set on the shared store.
   if (opts.paused) {
     await store.updateSettings({ enginePaused: true });
+    console.log("[engine] Starting in paused mode — automation disabled");
   }
 
   // ── PluginStore: plugin installation management ─────────────────────
@@ -668,23 +643,35 @@ export async function runServe(
 
   // Auto-load all enabled plugins so runtime UI (NewAgentDialog, AgentDetailView)
   // can discover installed runtimes like Hermes and OpenClaw.
-  /*
-  FNXC:PluginPostgresSchema 2026-07-14-21:48:
-  Optional plugin module-load failures remain nonfatal for serve compatibility. A schema initialization failure from a loaded plugin is instead a fatal storage-integrity error and must escape startup rather than being swallowed by the module-load catch.
-  */
   try {
     const { loaded, errors } = await pluginLoader.loadAllPlugins();
     console.log(`[plugins] Loaded ${loaded} plugins (${errors} errors)`);
+
+    const schemaHooks = pluginLoader.getPluginSchemaInitHooks();
+    if (schemaHooks.length > 0) {
+      try {
+        /*
+         * FNXC:SqliteFinalRemoval 2026-06-25-16:25:
+         * In backend mode (PostgreSQL), plugin schema inits are handled by the
+         * Drizzle schema applier at startup, not the SQLite Database class.
+         * Skip the SQLite-specific runPluginSchemaInits path in backend mode.
+         */
+        if (store.isBackendMode()) {
+          console.log("[plugins] Schema initialization skipped — backend mode (PostgreSQL Drizzle migrations)");
+        } else {
+          await store.getDatabase().runPluginSchemaInits(schemaHooks);
+        }
+      } catch (err) {
+        console.error(
+          `[plugins] Schema initialization failed: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }
   } catch (err) {
     console.error(
       `[plugins] Failed to load plugins: ${err instanceof Error ? err.message : err}`
     );
   }
-
-  /*
-  FNXC:PluginPostgresSchema 2026-07-14-23:31:
-  PluginLoader owns schema execution before each plugin's onLoad hook. Hosts must not replay the collected contracts after loadAllPlugins because duplicate PostgreSQL transactions and advisory-lock acquisition add startup contention without strengthening the fail-closed contract.
-  */
 
   // Get subsystems from the primary engine for the HTTP layer
   const heartbeatMonitor = primaryEngine.getRuntime().getHeartbeatMonitor();
@@ -693,7 +680,7 @@ export async function runServe(
   const automationStore = primaryEngine.getAutomationStore();
 
   const authStorage = createFusionAuthStorage();
-  const modelRegistry = await createFusionModelRegistry(authStorage);
+  const modelRegistry = ModelRegistry.create(authStorage, getModelRegistryModelsPath());
   registerBuiltInZaiProvider(modelRegistry, (message) => console.log(`[extensions] ${message}`));
   registerBuiltInGrokProvider(modelRegistry, (message) => console.log(`[extensions] ${message}`));
   const dashboardAuthStorage = wrapAuthStorageWithApiKeyProviders(authStorage, modelRegistry);
@@ -813,11 +800,11 @@ export async function runServe(
     extensionsResult.runtime.pendingProviderRegistrations = [];
     mergeBuiltInZaiProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
     mergeBuiltInGrokProviderModels(modelRegistry, (message) => console.log(`[extensions] ${message}`));
-    await modelRegistry.refresh();
+    modelRegistry.refresh();
 
     try {
       const globalSettings = await store.getGlobalSettingsStore().getSettings();
-      await registerCustomProviders(
+      registerCustomProviders(
         modelRegistry,
         globalSettings.customProviders,
         (message) => console.log(`[custom-providers] ${message}`),
@@ -831,7 +818,7 @@ export async function runServe(
     const message = error instanceof Error ? error.message : String(error);
     console.log(`[extensions] Failed to discover extensions: ${message}`);
     createExtensionRuntime();
-    await modelRegistry.refresh();
+    modelRegistry.refresh();
   }
 
   void syncStartupModels({
@@ -848,15 +835,12 @@ export async function runServe(
       return;
     }
 
-    void reregisterCustomProviders(
+    reregisterCustomProviders(
       modelRegistry,
       previousProviders,
       currentProviders,
       (message) => console.log(`[custom-providers] ${message}`),
-    ).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[custom-providers] Failed to refresh custom providers: ${message}`);
-    });
+    );
   });
 
   // ── Daemon token resolution ─────────────────────────────────────────────
@@ -886,6 +870,9 @@ export async function runServe(
     }
   }
 
+  const roomControlPlaneAuthorizeProject: NonNullable<Parameters<typeof createServer>[1]>["roomControlPlaneAuthorizeProject"] =
+    daemonToken ? createDaemonRoomControlPlaneAuthorizer(daemonToken) : undefined;
+
   // ── Skills adapter for skills discovery and execution toggling ─────────────
   //
   // Create the skills adapter using the same DefaultPackageManager instance
@@ -894,12 +881,11 @@ export async function runServe(
     string,
     { enabledKey: string; skills: ReturnType<PluginLoader["getPluginSkills"]> }
   >();
-  const getProjectScopedPluginSkills = async (rootDir: string, resolvedProjectStore?: TaskStore): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
+  const getProjectScopedPluginSkills = async (rootDir: string): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
     const normalizedRootDir = pathResolve(rootDir);
-    const targetStore = resolvedProjectStore ?? (normalizedRootDir === pathResolve(store.getRootDir()) ? store : undefined);
-    if (!targetStore) return [];
-    const stateStore = targetStore.getPluginStore();
+    const stateStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
     await stateStore.init();
+    try {
       const enabledPlugins = await stateStore.listPlugins({ enabled: true });
       const enabledKey = enabledPlugins
         .map((plugin) => `${plugin.id}:${plugin.updatedAt}`)
@@ -924,18 +910,12 @@ export async function runServe(
         return skills;
       }
 
-      const scopedPluginStore = targetStore.getPluginStore();
-      /*
-       * FNXC:PluginSkillsPostgres 2026-07-14-17:47:
-       * Request-scoped skill discovery is read-only across every CLI server surface. Loading and stopping plugins here must not rewrite durable runtime state for the target project.
-       */
-      const scopedPluginLoader = new PluginLoader({
-        pluginStore: scopedPluginStore,
-        taskStore: targetStore,
-        persistRuntimeState: false,
-      });
+      const scopedPluginStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
+      const scopedTaskStore = new TaskStore(normalizedRootDir);
+      const scopedPluginLoader = new PluginLoader({ pluginStore: scopedPluginStore, taskStore: scopedTaskStore });
       try {
         await scopedPluginStore.init();
+        await scopedTaskStore.init();
         const { errors } = await scopedPluginLoader.loadAllPlugins();
         if (errors > 0) {
           console.warn(`[plugins] Project-scoped plugin skill loading for ${normalizedRootDir} had ${errors} error(s)`);
@@ -945,7 +925,12 @@ export async function runServe(
         return skills;
       } finally {
         await scopedPluginLoader.stopAllPlugins();
+        scopedPluginStore.close();
+        scopedTaskStore.close();
       }
+    } finally {
+      stateStore.close();
+    }
   };
 
   const skillsAdapter = packageManager
@@ -981,11 +966,7 @@ export async function runServe(
       : undefined,
     pluginStore,
     pluginLoader,
-    /*
-    FNXC:GrokCliRouting 2026-07-15-10:17:
-    Pass the engine PluginRunner (getRuntimeById), not the bare PluginLoader, so chat/merge/PR routes can resolve grok-cli/no-key via the Grok runtime. PluginLoader stays on pluginLoader for install/load APIs.
-    */
-    pluginRunner: primaryEngine.getPluginRunner?.(),
+    pluginRunner: pluginLoader,
     ensureBundledPluginInstalled: ensureBundledPluginInstalledCallback,
     onProjectFirstAccessed: (projectId: string) => engineManager.onProjectAccessed(projectId),
     onProjectRegistered: ({ path }) => {
@@ -1060,12 +1041,11 @@ export async function runServe(
     },
     headless: true,
     skillsAdapter,
+    roomControlPlaneAuthorizeProject,
     daemon: daemonToken ? { token: daemonToken } : undefined,
     https: loadTlsCredentialsFromEnv(),
   });
 
-  // Release the temporary owner before the production listener claims this port.
-  await migrationHoldingServer?.close();
   const server = app.listen(selectedPort, selectedHost);
 
   await new Promise<void>((resolve, reject) => {
@@ -1074,7 +1054,6 @@ export async function runServe(
   });
 
   const actualPort = (server.address() as AddressInfo).port;
-  logPhase(`startup phase time-to-listen: ${Date.now() - serveStartedAt}ms`);
 
   /*
   FNXC:CustomProviders 2026-06-30-00:00:
@@ -1093,23 +1072,13 @@ export async function runServe(
   //
   if (sharedCentralCore) {
     try {
-      const globalSettings = await store.getGlobalSettingsStore().getSettings();
-      /*
-       * FNXC:NodeDiscovery 2026-07-17-12:00:
-       * FN-8202 makes automatic LAN discovery opt-outable at daemon boot;
-       * explicit POST /api/discovery/start requests intentionally still work.
-       */
-      if (globalSettings.localNetworkDiscoveryEnabled === false) {
-        console.warn("[serve] LAN discovery disabled by localNetworkDiscoveryEnabled setting");
-      } else {
-        await sharedCentralCore.startDiscovery({
-          broadcast: true,
-          listen: true,
-          serviceType: "_fusion._tcp",
-          port: actualPort,
-          staleTimeoutMs: 300_000,
-        });
-      }
+      await sharedCentralCore.startDiscovery({
+        broadcast: true,
+        listen: true,
+        serviceType: "_fusion._tcp",
+        port: actualPort,
+        staleTimeoutMs: 300_000,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.warn(`[serve] Failed to start mDNS discovery: ${message}`);
@@ -1122,6 +1091,15 @@ export async function runServe(
   // If it wasn't initialized successfully, create a new one for node registration.
   //
   let centralCore: CentralCore | null = sharedCentralCore;
+  // sharedCentralCore was already init'd; if null, try again for node registration
+  if (!centralCore) {
+    try {
+      centralCore = new CentralCore();
+      await centralCore.init();
+    } catch {
+      centralCore = null;
+    }
+  }
   let localNodeId: string | undefined;
 
   try {
@@ -1168,7 +1146,7 @@ export async function runServe(
   }
   console.log();
 
-  let shutdownPromise: Promise<void> | undefined;
+  let shuttingDown = false;
 
   /*
   FNXC:DaemonSignalExit 2026-07-10-14:00:
@@ -1181,6 +1159,9 @@ export async function runServe(
   const SIGNAL_EXIT_CODES: Record<string, number> = { SIGINT: 130, SIGTERM: 143 };
 
   const shutdown = async (signal?: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
     // Log active handles at shutdown for diagnostics
     const handleTypes: Record<string, number> = {};
     try {
@@ -1199,14 +1180,12 @@ export async function runServe(
       // Ignore errors getting handle types
     }
 
-    if (hybridExecutor) await hybridExecutor.shutdown().catch((error) => {
-      console.warn(`[serve] Hybrid executor shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    if (hybridExecutor) {
+      await hybridExecutor.shutdown();
+    }
 
     // Stop all project engines uniformly
-    await engineManager.stopAll().catch((error) => {
-      console.warn(`[serve] Engine shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    await engineManager.stopAll();
 
     // Stop peer exchange service
     if (peerExchangeService) {
@@ -1242,43 +1221,27 @@ export async function runServe(
       centralCore = null;
     }
 
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
+    }
+
     try {
       server.close();
     } catch {
       // best-effort
     }
 
-    try {
-      stopDiagnosticInterval();
-    } catch (error) {
-      console.warn(`[serve] Diagnostic teardown failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    /*
-     * FNXC:PostgresServeLifecycle 2026-07-14-18:08:
-     * The serve bootstrap owns the TaskStore pool and any embedded PostgreSQL
-     * process because its runtime receives that store externally. Release the
-     * complete boot result after every engine and CentralCore user has stopped.
-     */
-    clearHostTaskStores();
-    await shutdownCentralBackendOnce().catch((error) => {
-      console.warn(`[serve] PostgreSQL shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
+    stopDiagnosticInterval();
+    store.close();
     process.exit(signal ? (SIGNAL_EXIT_CODES[signal] ?? 128) : 0);
   };
 
-  /* FNXC:PostgresServeLifecycle 2026-07-14-19:10: Every shutdown request observes the same promise so repeated signals cannot duplicate pool/postmaster teardown and asynchronous failures are never left as unhandled rejections. */
-  const requestShutdown = (signal?: NodeJS.Signals): void => {
-    shutdownPromise ??= shutdown(signal);
-    void shutdownPromise.catch((error) => {
-      console.error(`[serve] Shutdown failed: ${error instanceof Error ? error.message : String(error)}`);
-    });
-  };
-
   process.on("SIGINT", () => {
-    requestShutdown("SIGINT");
+    void shutdown("SIGINT");
   });
   process.on("SIGTERM", () => {
-    requestShutdown("SIGTERM");
+    void shutdown("SIGTERM");
   });
 
   // Ignore SIGHUP so the server survives SSH session disconnects.
@@ -1288,11 +1251,4 @@ export async function runServe(
   process.on("SIGHUP", () => {
     console.log("[serve] Received SIGHUP (terminal disconnected) — ignoring");
   });
-  } catch (error) {
-    /* FNXC:PostgresServeLifecycle 2026-07-14-19:10: Any startup failure after the shared PostgreSQL boot must unwind partially-started engines and CentralCore before releasing the sole backend owner exactly once. */
-    await startupEngineManager?.stopAll().catch(() => undefined);
-    await sharedCentralCore?.close().catch(() => undefined);
-    await shutdownCentralBackendOnce().catch(() => undefined);
-    throw error;
-  }
 }

@@ -4,12 +4,15 @@ import {
   buildRoomConnectorLocalMessageId,
   hashRoomValue,
   type BeginRoomDeliveryAttemptInput,
+  type CompleteRoomDeliveryAttemptInput,
+  type DeferPendingRoomDeliveryInput,
   type RoomBindingRecordV1,
   type RoomOutboxRecordV1,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorHistoryPageV1,
   type SessionConnectorIdentityV1,
   type SessionConnectorResultV1,
+  type SessionConnectorSendRequestV1,
   type SessionConnectorSendReceiptV1,
   type SessionConnectorV1,
 } from "@fusion/core";
@@ -71,7 +74,8 @@ class MemoryDeliveryStore implements RoomDeliveryCoordinatorStore {
   readonly binding: RoomBindingRecordV1;
   crashOnComplete = false;
   readonly beginCalls: BeginRoomDeliveryAttemptInput[] = [];
-  readonly completeCalls: unknown[] = [];
+  readonly completeCalls: CompleteRoomDeliveryAttemptInput[] = [];
+  readonly deferCalls: DeferPendingRoomDeliveryInput[] = [];
   readonly reconciliationCalls: unknown[] = [];
 
   constructor(
@@ -134,6 +138,21 @@ class MemoryDeliveryStore implements RoomDeliveryCoordinatorStore {
     return this.current;
   }
 
+  async deferPendingDelivery(input: DeferPendingRoomDeliveryInput): Promise<RoomOutboxRecordV1> {
+    this.deferCalls.push(input);
+    if (input.expectedAttemptCount !== this.current.attemptCount) {
+      throw new Error("stale pre-send deferral attempt");
+    }
+    this.current = {
+      ...this.current,
+      state: "pending",
+      lastErrorCode: input.reasonCode,
+      nextAttemptAt: input.nextAttemptAt,
+      updatedAt: input.now,
+    };
+    return this.current;
+  }
+
   async reconcileDelivery(input: Parameters<RoomDeliveryCoordinatorStore["reconcileDelivery"]>[0]): Promise<RoomOutboxRecordV1> {
     this.reconciliationCalls.push(input);
     if (input.expectedAttemptCount !== this.current.attemptCount) {
@@ -185,10 +204,13 @@ function capabilities(): SessionConnectorCapabilitiesV1 {
 function connectorFixture(options: {
   sendResult?: SessionConnectorResultV1<SessionConnectorSendReceiptV1>;
   send?: SessionConnectorV1["send"];
-  history?: (afterCursor: string | null) => SessionConnectorResultV1<SessionConnectorHistoryPageV1>;
+  history?: (
+    afterCursor: string | null,
+  ) => SessionConnectorResultV1<SessionConnectorHistoryPageV1> | Promise<SessionConnectorResultV1<SessionConnectorHistoryPageV1>>;
   capabilities?: () => unknown;
 }) {
   let sendCalls = 0;
+  const sendRequests: SessionConnectorSendRequestV1[] = [];
   const historyCursors: Array<string | null> = [];
   const connector = {
     contractVersion: 1,
@@ -200,6 +222,7 @@ function connectorFixture(options: {
     getStatus: async () => ({ ok: false, error: { code: "unavailable", message: "not used", retryable: false } }),
     send: async (input) => {
       sendCalls += 1;
+      sendRequests.push(input);
       if (options.send) return options.send(input);
       return options.sendResult ?? {
         ok: true,
@@ -248,11 +271,127 @@ function connectorFixture(options: {
     connector,
     registry,
     get sendCalls() { return sendCalls; },
+    get sendRequests() { return sendRequests; },
     historyCursors,
   };
 }
 
 describe("Room connector delivery reconciliation", () => {
+  it("binds every connector send to the exact claimed outbox and sender fence", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture({});
+
+    await expect(dispatchRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      attemptId: "attempt-durable-write-authorization",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      reconciliationFromCursor: null,
+      now: NOW,
+      audit: { runId: "run-durable-write-authorization", agentId: "worker-1" },
+    })).resolves.toMatchObject({ state: "confirmed" });
+
+    expect(fixture.sendRequests).toEqual([
+      expect.objectContaining({
+        deliveryAuthorization: {
+          outboxId: "outbox-1",
+          senderFence: SENDER_FENCE,
+        },
+      }),
+    ]);
+  });
+
+  it("durably defers a provider-withheld pending delivery before claiming or sending", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture({});
+    const providerBackpressure = {
+      admit: async () => ({
+        contractVersion: 1,
+        action: "defer" as const,
+        reason: "provider_capacity_deferred",
+        retryAfterMs: 2_500,
+      }),
+    };
+
+    await expect(dispatchRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      attemptId: "attempt-provider-defer-1",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      reconciliationFromCursor: null,
+      now: NOW,
+      audit: { runId: "run-provider-defer-1", agentId: "worker-1" },
+      providerBackpressure,
+    })).resolves.toMatchObject({
+      state: "pending",
+      lastErrorCode: "provider_capacity_deferred",
+      nextAttemptAt: "2026-07-17T12:00:02.500Z",
+    });
+
+    expect(store.deferCalls).toEqual([
+      expect.objectContaining({
+        outboxId: "outbox-1",
+        expectedAttemptCount: 0,
+        senderFence: SENDER_FENCE,
+        reasonCode: "provider_capacity_deferred",
+        nextAttemptAt: "2026-07-17T12:00:02.500Z",
+        now: NOW,
+        audit: { runId: "run-provider-defer-1", agentId: "worker-1" },
+      }),
+    ]);
+    expect(store.beginCalls).toHaveLength(0);
+    expect(store.completeCalls).toHaveLength(0);
+    expect(fixture.sendCalls).toBe(0);
+  });
+
+  it("bounds an unusably long provider retry hint before durable recovery can retry", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture({});
+    const providerBackpressure = {
+      admit: async () => ({
+        contractVersion: 1,
+        action: "defer" as const,
+        reason: "provider_capacity_deferred",
+        retryAfterMs: 600_000,
+      }),
+    };
+
+    await expect(dispatchRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      attemptId: "attempt-provider-bounded-defer-1",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      reconciliationFromCursor: null,
+      now: NOW,
+      audit: { runId: "run-provider-bounded-defer-1", agentId: "worker-1" },
+      providerBackpressure,
+    })).resolves.toMatchObject({
+      state: "pending",
+      lastErrorCode: "provider_capacity_deferred",
+      nextAttemptAt: "2026-07-17T12:01:00.000Z",
+    });
+
+    expect(store.deferCalls).toEqual([
+      expect.objectContaining({
+        expectedAttemptCount: 0,
+        reasonCode: "provider_capacity_deferred",
+        nextAttemptAt: "2026-07-17T12:01:00.000Z",
+      }),
+    ]);
+    expect(store.beginCalls).toHaveLength(0);
+    expect(store.completeCalls).toHaveLength(0);
+    expect(fixture.sendCalls).toBe(0);
+  });
+
   it("does not start connector.send after Room authority is revoked at the durable claim boundary", async () => {
     const store = new MemoryDeliveryStore();
     const originalBegin = store.beginDeliveryAttempt.bind(store);
@@ -427,6 +566,29 @@ describe("Room connector delivery reconciliation", () => {
     expect(store.reconciliationCalls).toHaveLength(1);
   });
 
+  it("bounds a history read that never settles and keeps the delivery uncertain without sending", async () => {
+    const store = new MemoryDeliveryStore(delivery("delivery_uncertain"));
+    const fixture = connectorFixture({
+      history: () => new Promise<SessionConnectorResultV1<SessionConnectorHistoryPageV1>>(() => undefined),
+    });
+
+    const reconciled = await reconcileAmbiguousRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      historyPageSize: 50,
+      maxHistoryPages: 2,
+      historyReadDeadlineMs: 1,
+      now: NOW,
+      audit: { runId: "run-history-timeout", agentId: "recovery-worker-1" },
+    });
+
+    expect(reconciled).toMatchObject({ state: "delivery_uncertain", lastErrorCode: "history_read_timeout" });
+    expect(fixture.sendCalls).toBe(0);
+    expect(store.reconciliationCalls).toHaveLength(1);
+  });
+
   it("treats a connector transport failure as uncertain instead of rejection or retry", async () => {
     const store = new MemoryDeliveryStore();
     const fixture = connectorFixture({
@@ -462,6 +624,86 @@ describe("Room connector delivery reconciliation", () => {
     expect(store.beginCalls).toHaveLength(1);
     expect(store.beginCalls[0]?.senderFence).toBe(SENDER_FENCE);
     expect(store.completeCalls).toHaveLength(1);
+    expect(store.completeCalls[0]?.senderFence).toEqual(SENDER_FENCE);
+  });
+
+  it("carries the original sender fence through every external-send completion branch", async () => {
+    const branches: ReadonlyArray<{
+      readonly label: string;
+      readonly options: Parameters<typeof connectorFixture>[0];
+    }> = [
+      {
+        label: "connector exception",
+        options: {
+          send: async () => {
+            throw new Error("simulated connector exception");
+          },
+        },
+      },
+      {
+        label: "transport result",
+        options: {
+          sendResult: {
+            ok: false,
+            error: {
+              code: "transport",
+              message: "Acknowledgement channel closed",
+              retryable: true,
+            },
+          },
+        },
+      },
+      {
+        label: "provider rejection",
+        options: {
+          sendResult: {
+            ok: true,
+            value: {
+              outcome: "rejected",
+              connectorAcknowledgementId: "ack-rejected",
+              nativeMessageId: null,
+              cursor: "cursor-rejected",
+              acceptedAt: NOW,
+            },
+          },
+        },
+      },
+      {
+        label: "accepted receipt",
+        options: {
+          sendResult: {
+            ok: true,
+            value: {
+              outcome: "accepted",
+              connectorAcknowledgementId: "ack-accepted",
+              nativeMessageId: "native-accepted",
+              cursor: "cursor-accepted",
+              acceptedAt: NOW,
+            },
+          },
+        },
+      },
+    ];
+
+    for (const branch of branches) {
+      const store = new MemoryDeliveryStore();
+      const fixture = connectorFixture(branch.options);
+      await dispatchRoomDelivery({
+        store,
+        registry: fixture.registry,
+        identity: IDENTITY,
+        outboxId: "outbox-1",
+        attemptId: `attempt-sender-fence-${branch.label.replaceAll(" ", "-")}`,
+        senderFence: SENDER_FENCE,
+        content: "Only this payload may be delivered.",
+        reconciliationFromCursor: "cursor-before-send",
+        now: NOW,
+        audit: { runId: `run-sender-fence-${branch.label}`, agentId: "worker-1" },
+      });
+
+      expect(store.completeCalls, branch.label).toHaveLength(1);
+      expect(store.completeCalls[0]?.senderFence, branch.label).toEqual(SENDER_FENCE);
+    }
   });
 
   it("keeps delivery uncertain when history contains multiple matching local ids", async () => {
@@ -648,6 +890,25 @@ describe("Room connector delivery reconciliation", () => {
       maxHistoryPages: 2,
       now: NOW,
       audit: { runId: "run-oversized-page", agentId: "worker-1" },
+    })).rejects.toMatchObject({ code: "invalid_reconciliation_bound" });
+    expect(fixture.historyCursors).toHaveLength(0);
+    expect(store.reconciliationCalls).toHaveLength(0);
+  });
+
+  it("rejects an invalid history read deadline before reading", async () => {
+    const store = new MemoryDeliveryStore(delivery("delivery_uncertain"));
+    const fixture = connectorFixture({});
+
+    await expect(reconcileAmbiguousRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      historyPageSize: 50,
+      maxHistoryPages: 2,
+      historyReadDeadlineMs: 0,
+      now: NOW,
+      audit: { runId: "run-invalid-history-deadline", agentId: "worker-1" },
     })).rejects.toMatchObject({ code: "invalid_reconciliation_bound" });
     expect(fixture.historyCursors).toHaveLength(0);
     expect(store.reconciliationCalls).toHaveLength(0);

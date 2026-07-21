@@ -10,6 +10,12 @@ import * as enginePublicApi from "../index.js";
 
 interface RoomControllerStore {
   listRunnableRooms(): Promise<readonly RoomAggregateV1[]>;
+  assertWorkerAuthority?(input: {
+    readonly roomId: string;
+    readonly lease: StoredRoomLeaseV1;
+    readonly expectedAggregateVersion: number;
+    readonly now: string;
+  }): Promise<unknown>;
 }
 
 interface RoomWorkerLeaseStore {
@@ -71,6 +77,7 @@ interface RoomWorkerRunInput {
   readonly room: RoomAggregateV1;
   readonly lease: StoredRoomLeaseV1;
   readonly signal: AbortSignal;
+  readonly assertAuthority: () => Promise<unknown>;
   readonly assertLeaseAuthority: () => Promise<StoredRoomLeaseV1>;
 }
 
@@ -82,6 +89,23 @@ interface RoomControllerOptions {
   readonly leaseStore: RoomWorkerLeaseStore;
   readonly worker: {
     runRoom(input: RoomWorkerRunInput): Promise<void>;
+  };
+  readonly taskDispatcher?: {
+    dispatchReadyTasks(input: {
+      readonly room: RoomAggregateV1;
+      readonly lease: StoredRoomLeaseV1;
+      readonly canContinue?: () => boolean;
+    }): Promise<{
+      readonly room: RoomAggregateV1;
+      readonly claimedNodeIds: readonly string[];
+      readonly skippedNodeIds: readonly string[];
+    }>;
+  };
+  readonly hostCompositionAuthorityGuard?: {
+    assertCurrent(): Promise<
+      | { readonly state: "current" }
+      | { readonly state: "withheld"; readonly reason: string }
+    >;
   };
   readonly now: () => string;
   readonly createLeaseId: (roomId: string, workerId: string) => string;
@@ -380,6 +404,211 @@ describe("RoomController backend lifecycle", () => {
     expect(vi.mocked(leaseStore.acquireLease).mock.invocationCallOrder[0]).toBeLessThan(
       runRoom.mock.invocationCallOrder[0]!,
     );
+  });
+
+  it("releases a newly acquired lease and never launches work when the live host composition authority is withheld", async () => {
+    const runRoom = vi.fn(async () => undefined);
+    const leaseStore = createLeaseStore();
+    const hostCompositionAuthorityGuard = {
+      assertCurrent: vi.fn(async () => ({
+        state: "withheld" as const,
+        reason: "operator_policy_revoked",
+      })),
+    };
+    const RoomController = requireRoomController(
+      "live host composition revocation requires the production RoomController export",
+    );
+    const controller = new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: {
+        listRunnableRooms: vi.fn(async () => [runningRoom()]),
+      },
+      leaseStore,
+      worker: { runRoom },
+      hostCompositionAuthorityGuard,
+      recordRunAuditEvent: async () => undefined,
+      now: () => "2026-07-17T12:00:00.000Z",
+      createLeaseId: () => "lease-worker-1-incarnation-1",
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 1_000,
+    });
+    controllers.push(controller);
+
+    await controller.start();
+
+    expect(hostCompositionAuthorityGuard.assertCurrent).toHaveBeenCalledOnce();
+    expect(leaseStore.acquireLease).toHaveBeenCalledOnce();
+    expect(leaseStore.releaseLease).toHaveBeenCalledOnce();
+    expect(runRoom).not.toHaveBeenCalled();
+  });
+
+  it("stops an already-running worker before its next lease renewal when the host composition authority is revoked", async () => {
+    vi.useFakeTimers();
+    let authorityState: "current" | "withheld" = "current";
+    const workerSignals: AbortSignal[] = [];
+    const runRoom = vi.fn(async ({ signal }: RoomWorkerRunInput) => {
+      workerSignals.push(signal);
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    });
+    const leaseStore = createLeaseStore();
+    const hostCompositionAuthorityGuard = {
+      assertCurrent: vi.fn(async () => authorityState === "current"
+        ? { state: "current" as const }
+        : { state: "withheld" as const, reason: "operator_policy_revoked" }),
+    };
+    const RoomController = requireRoomController(
+      "live host composition revocation must stop the production RoomController worker",
+    );
+    const controller = new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: {
+        listRunnableRooms: vi.fn(async () => [runningRoom()]),
+      },
+      leaseStore,
+      worker: { runRoom },
+      hostCompositionAuthorityGuard,
+      recordRunAuditEvent: async () => undefined,
+      now: () => "2026-07-17T12:00:00.000Z",
+      createLeaseId: () => "lease-worker-1-incarnation-1",
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 1_000,
+    });
+    controllers.push(controller);
+
+    await controller.start();
+    expect(runRoom).toHaveBeenCalledOnce();
+    authorityState = "withheld";
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(leaseStore.renewLease).not.toHaveBeenCalled();
+    expect(leaseStore.releaseLease).toHaveBeenCalledOnce();
+    expect(workerSignals[0]?.aborted).toBe(true);
+  });
+
+  it("starts the recovery worker at the final version after dispatch claims", async () => {
+    const initialRoom = runningRoom();
+    const dispatchedRoom: RoomAggregateV1 = {
+      ...initialRoom,
+      room: {
+        ...initialRoom.room,
+        aggregateVersion: initialRoom.room.aggregateVersion + 2,
+        updatedAt: "2026-07-17T12:00:04.000Z",
+      },
+    };
+    const callOrder: string[] = [];
+    const leaseStore = createLeaseStore();
+    const dispatcher = {
+      dispatchReadyTasks: vi.fn(async (input) => {
+        callOrder.push("dispatch");
+        expect(input.room.room.aggregateVersion).toBe(initialRoom.room.aggregateVersion);
+        expect(input.canContinue?.()).toBe(true);
+        const renewedLease = await input.renewLease(input.lease);
+        return {
+          room: dispatchedRoom,
+          lease: renewedLease,
+          claimedNodeIds: ["node-a", "node-b"],
+          skippedNodeIds: [],
+        };
+      }),
+    };
+    const assertWorkerAuthority = vi.fn(async (input: {
+      readonly expectedAggregateVersion: number;
+      readonly lease: StoredRoomLeaseV1;
+    }) => {
+      callOrder.push("authority");
+      expect(input.expectedAggregateVersion).toBeOneOf([
+        initialRoom.room.aggregateVersion,
+        dispatchedRoom.room.aggregateVersion,
+      ]);
+      return {
+        lease: input.lease,
+        posture: {
+          lifecycleState: "running" as const,
+          aggregateVersion: input.expectedAggregateVersion,
+          humanPaused: false,
+          approvalState: "none" as const,
+        },
+      };
+    });
+    const runRoom = vi.fn(async (input: RoomWorkerRunInput) => {
+      callOrder.push("run");
+      expect(input.room.room.aggregateVersion).toBe(dispatchedRoom.room.aggregateVersion);
+      expect(input.lease.expiresAt).toBe("2026-07-17T12:01:05.000Z");
+      await input.assertAuthority();
+      await new Promise<void>((resolve) => input.signal.addEventListener("abort", () => resolve(), {
+        once: true,
+      }));
+    });
+    const RoomController = requireRoomController(
+      "pre-worker dispatch requires the production RoomController export",
+    );
+    const controller = new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: {
+        listRunnableRooms: vi.fn(async () => [initialRoom]),
+        assertWorkerAuthority,
+      },
+      leaseStore,
+      worker: { runRoom },
+      taskDispatcher: dispatcher,
+      recordRunAuditEvent: async (event: { readonly mutationType: string }) => {
+        if (event.mutationType === "room:worker-lease-acquired") callOrder.push("lease-audit");
+      },
+      now: () => "2026-07-17T12:00:05.000Z",
+      createLeaseId: () => "lease-worker-1-incarnation-1",
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 1_000,
+    });
+    controllers.push(controller);
+
+    await controller.start();
+
+    expect(dispatcher.dispatchReadyTasks).toHaveBeenCalledTimes(1);
+    expect(leaseStore.renewLease).toHaveBeenCalledTimes(1);
+    expect(runRoom).toHaveBeenCalledTimes(1);
+    expect(callOrder.indexOf("lease-audit")).toBeLessThan(callOrder.indexOf("dispatch"));
+    expect(callOrder.indexOf("authority")).toBeLessThan(callOrder.indexOf("dispatch"));
+    expect(callOrder.slice(0, callOrder.indexOf("run")).lastIndexOf("authority")).toBeGreaterThan(
+      callOrder.indexOf("dispatch"),
+    );
+    expect(assertWorkerAuthority).toHaveBeenCalledWith(expect.objectContaining({
+      expectedAggregateVersion: dispatchedRoom.room.aggregateVersion,
+    }));
+  });
+
+  it("fails closed when task dispatch lacks a current projection authority check", () => {
+    const RoomController = requireRoomController(
+      "task dispatch must require the production RoomController export",
+    );
+
+    expect(() => new RoomController({
+      projectId: "project-1",
+      workerId: "worker-1",
+      hostId: "host-1",
+      roomStore: { listRunnableRooms: vi.fn(async () => [runningRoom()]) },
+      leaseStore: createLeaseStore(),
+      worker: { runRoom: async () => undefined },
+      taskDispatcher: {
+        dispatchReadyTasks: async ({ room, lease }) => ({
+          room,
+          lease,
+          claimedNodeIds: [],
+          skippedNodeIds: [],
+        }),
+      },
+      recordRunAuditEvent: async () => undefined,
+      now: () => "2026-07-17T12:00:00.000Z",
+      createLeaseId: () => "lease-worker-1-incarnation-1",
+      leaseDurationMs: 60_000,
+      pollIntervalMs: 1_000,
+    })).toThrow("taskDispatcher requires roomStore.assertWorkerAuthority");
   });
 
   /*

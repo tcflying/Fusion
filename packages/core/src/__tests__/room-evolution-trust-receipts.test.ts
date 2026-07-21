@@ -37,6 +37,9 @@ import { hashRoomValue } from "../room-integrity.js";
 const PROJECT_ID = "project-evolution-trust";
 const ROOM_ID = "room-evolution-trust";
 const CREATED_AT = "2026-07-19T19:30:00.000Z";
+const CANARY_CREATED_AT = "2026-07-19T19:30:01.000Z";
+const CANARY_SUCCESS_AT = "2026-07-19T19:30:02.000Z";
+const PROMOTION_DECIDED_AT = "2026-07-19T19:30:03.000Z";
 const EXPIRES_AT = "2026-07-20T19:30:00.000Z";
 const SCOPE = {
   projectId: PROJECT_ID,
@@ -331,7 +334,9 @@ function verifiedGate(
   };
 }
 
-function canary(): AppendRoomEvolutionCanaryInputV1 {
+function canary(
+  overrides: Partial<AppendRoomEvolutionCanaryInputV1> = {},
+): AppendRoomEvolutionCanaryInputV1 {
   return {
     scope: SCOPE,
     id: "canary-trust-1",
@@ -339,11 +344,12 @@ function canary(): AppendRoomEvolutionCanaryInputV1 {
     candidateVersionId: "candidate-trust-next",
     allocationVersion: 1,
     allocation: { roomIds: ["room-canary-a"], fraction: 0.1 },
-    successCriteria: { quality: { min: 0.9 } },
+    successCriteria: { quality: { min: 0.9 }, hardGateResultIds: ["gate-trust-1"] },
     failureCriteria: { correctionRate: { max: 0.05 } },
     state: "running",
     rollbackTargetCandidateVersionId: "candidate-trust-baseline",
-    createdAt: CREATED_AT,
+    createdAt: CANARY_CREATED_AT,
+    ...overrides,
   };
 }
 
@@ -367,7 +373,7 @@ function canarySuccess(
     metrics: { quality: 0.96, correctionRate: 0.01 },
     evidence: [evidence("canary-success")],
     evidenceHash: hash("canary-success"),
-    completedAt: CREATED_AT,
+    completedAt: CANARY_SUCCESS_AT,
     ...overrides,
   };
 }
@@ -392,7 +398,7 @@ function verifiedPromotion(
       evidence: [evidence("promotion-trust")],
       evidenceHash: hash("promotion-trust"),
       rollbackTargetCandidateVersionId: "candidate-trust-baseline",
-      decidedAt: CREATED_AT,
+      decidedAt: PROMOTION_DECIDED_AT,
     },
     canarySuccessOutcomeId: "canary-success-trust-1",
     decisionBindingId: "trust-evaluator",
@@ -431,6 +437,137 @@ async function seedVerifiedGraph(ledger: AsyncRoomEvolutionLedger): Promise<void
 }
 
 describe("AsyncRoomEvolutionLedger trusted evolution receipts", () => {
+  it("refuses a canary plan without an explicit durable hard-gate identity", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+
+    await expect(ledger.appendCanary(canary({
+      id: "canary-trust-missing-hard-gate",
+      successCriteria: { quality: { min: 0.9 } },
+    }))).rejects.toMatchObject({ code: "policy_violation" });
+  });
+
+  it("refuses an optimization-only gate before allocating a canary", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+    await ledger.appendVerifiedGateResult(verifiedGate({
+      gate: gate({ id: "gate-trust-optimization", gateClass: "optimization" }),
+    }));
+
+    await expect(ledger.appendCanary(canary({
+      id: "canary-trust-optimization-only",
+      successCriteria: { quality: { min: 0.9 }, hardGateResultIds: ["gate-trust-optimization"] },
+    }))).rejects.toMatchObject({ code: "policy_violation" });
+  });
+
+  it("refuses a hard-gate record that postdates the canary plan", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+    await ledger.appendVerifiedGateResult(verifiedGate({
+      gate: gate({
+        id: "gate-trust-future",
+        completedAt: "2026-07-19T19:31:00.000Z",
+      }),
+    }));
+
+    await expect(ledger.appendCanary(canary({
+      id: "canary-trust-future-hard-gate",
+      successCriteria: { quality: { min: 0.9 }, hardGateResultIds: ["gate-trust-future"] },
+    }))).rejects.toMatchObject({ code: "policy_violation" });
+  });
+
+  it("refuses a hard-gate record that is not already complete before the canary plan", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+    await ledger.appendVerifiedGateResult(verifiedGate({
+      gate: gate({
+        id: "gate-trust-same-plan-instant",
+        completedAt: CANARY_CREATED_AT,
+      }),
+    }));
+
+    await expect(ledger.appendCanary(canary({
+      id: "canary-trust-same-instant-hard-gate",
+      successCriteria: { quality: { min: 0.9 }, hardGateResultIds: ["gate-trust-same-plan-instant"] },
+    }))).rejects.toMatchObject({ code: "policy_violation" });
+  });
+
+  it("refuses a successful canary receipt that swaps the hard-gate identity after planning", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+    await ledger.appendVerifiedGateResult(verifiedGate({
+      gate: gate({ id: "gate-trust-other-hard" }),
+    }));
+
+    await expect(ledger.appendCanarySuccessOutcome(canarySuccess({
+      id: "canary-success-trust-swapped-hard-gate",
+      gateResultIds: ["gate-trust-other-hard"],
+    }))).rejects.toMatchObject({ code: "invalid_reference" });
+  });
+
+  it("refuses a canary success receipt that is not later than its durable plan", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+
+    await expect(ledger.appendCanarySuccessOutcome(canarySuccess({
+      id: "canary-success-trust-same-plan-instant",
+      completedAt: CANARY_CREATED_AT,
+    }))).rejects.toMatchObject({ code: "invalid_reference" });
+  });
+
+  it("refuses a promotion decision that is not later than its durable canary success receipt", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+    await ledger.appendCanarySuccessOutcome(canarySuccess());
+    const promotion = verifiedPromotion();
+
+    await expect(ledger.appendVerifiedPromotionDecision({
+      ...promotion,
+      decision: {
+        ...promotion.decision,
+        id: "promotion-trust-same-success-instant",
+        decidedAt: CANARY_SUCCESS_AT,
+      },
+    })).rejects.toMatchObject({ code: "invalid_reference" });
+  });
+
+  it("refuses canary success when the planned hard-gate evaluator binding was revoked after planning", async () => {
+    const persistence = new InMemoryEvolutionLedgerPersistence();
+    const ledger = new AsyncRoomEvolutionLedger(persistence);
+    await seedVerifiedGraph(ledger);
+    await ledger.appendTrustedBinding(trustedBinding({
+      id: "trust-success-evaluator",
+      actorId: "actor-success-evaluator",
+      purpose: "independent_evaluator",
+      roomBindingId: "binding-evaluator",
+      roleId: "evaluator",
+    }));
+    await ledger.appendTrustedBindingRevocation({
+      scope: SCOPE,
+      id: "trust-evaluator-revocation-after-plan",
+      trustedBindingId: "trust-evaluator",
+      revokedByPrincipalId: "owner-principal",
+      revokerGrantId: "grant-owner",
+      reason: "The planned hard-gate evaluator is no longer trusted.",
+      evidence: [evidence("trust-evaluator-revocation-after-plan")],
+      evidenceHash: hash("trust-evaluator-revocation-after-plan"),
+      revokedAt: "2026-07-19T19:31:00.000Z",
+    });
+
+    await expect(ledger.appendCanarySuccessOutcome(canarySuccess({
+      id: "canary-success-revoked-planned-hard-gate",
+      evaluatorBindingId: "trust-success-evaluator",
+      completedAt: "2026-07-19T19:32:00.000Z",
+    }))).rejects.toMatchObject({ code: "trusted_binding_revoked" });
+  });
+
   it("persists and read-backs an independent canary success before a promotion can reference it", async () => {
     const persistence = new InMemoryEvolutionLedgerPersistence();
     const ledger = new AsyncRoomEvolutionLedger(persistence);

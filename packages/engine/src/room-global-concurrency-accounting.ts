@@ -2,20 +2,27 @@ export const ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION = 1 as const;
 
 export type RoomGlobalConcurrencyWorkClassV1 = "normal" | "verifier" | "recovery";
 
-export type RoomGlobalConcurrencyAccountingActionV1 = "acquired" | "released" | "held" | "rejected";
+export type RoomGlobalConcurrencyAccountingActionV1 = "acquired" | "renewed" | "released" | "held" | "rejected";
 
 export type RoomGlobalConcurrencyAccountingReasonV1 =
   | "capacity_admitted"
+  | "capacity_policy_unavailable"
   | "capacity_stale"
   | "capacity_unknown"
+  | "claim_expired"
+  | "claim_not_found"
   | "claim_conflict"
   | "claim_scope_mismatch"
   | "global_capacity_exhausted"
   | "invalid_request"
   | "invalid_snapshot"
   | "legacy_task_triage_reserve_protected"
+  | "legacy_room_migration_pending"
+  | "idempotency_conflict"
+  | "policy_mismatch"
   | "project_isolation"
   | "reserved_capacity_protected"
+  | "renewal_regression"
   | "snapshot_unavailable"
   | "stale_fence"
   | "store_failure"
@@ -95,6 +102,19 @@ export interface RoomGlobalConcurrencyReleaseInputV1 {
   readonly asOf: string;
 }
 
+export interface RoomGlobalConcurrencyRenewInputV1 {
+  readonly contractVersion: typeof ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION;
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly claimId: string;
+  readonly operationId: string;
+  readonly holderId: string;
+  readonly leaseId: string;
+  readonly fence: number;
+  readonly asOf: string;
+  readonly expiresAt: string;
+}
+
 export interface RecoverDanglingRoomGlobalConcurrencyClaimsInputV1 {
   readonly contractVersion: typeof ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION;
   readonly projectId: string;
@@ -138,6 +158,12 @@ export interface RoomGlobalConcurrencyReleaseStoreCommandV1 extends RoomGlobalCo
   readonly claim: RoomGlobalConcurrencyClaimV1 | null;
 }
 
+export interface RoomGlobalConcurrencyRenewStoreCommandV1 extends RoomGlobalConcurrencyStoreCommandBaseV1 {
+  readonly kind: "renew";
+  readonly request: RoomGlobalConcurrencyRenewInputV1;
+  readonly claim: RoomGlobalConcurrencyClaimV1;
+}
+
 export interface RoomGlobalConcurrencyRecoverDanglingStoreCommandV1 extends RoomGlobalConcurrencyStoreCommandBaseV1 {
   readonly kind: "recover_dangling";
   readonly projectId: string;
@@ -149,20 +175,21 @@ export interface RoomGlobalConcurrencyRecoverDanglingStoreCommandV1 extends Room
 
 export type RoomGlobalConcurrencyClaimStoreCommandV1 =
   | RoomGlobalConcurrencyAcquireStoreCommandV1
+  | RoomGlobalConcurrencyRenewStoreCommandV1
   | RoomGlobalConcurrencyReleaseStoreCommandV1
   | RoomGlobalConcurrencyRecoverDanglingStoreCommandV1;
 
 export type RoomGlobalConcurrencyClaimStoreResultV1 =
   | {
       readonly ok: true;
-      readonly action: "acquired" | "released" | "recovered";
+      readonly action: "acquired" | "renewed" | "released" | "recovered";
       readonly replayed: boolean;
       readonly claimId: string;
       readonly fence: number;
     }
   | {
       readonly ok: false;
-      readonly reason: "claim_not_found" | "idempotency_conflict" | "snapshot_stale" | "stale_fence" | "store_rejected";
+      readonly reason: "claim_not_found" | "claim_expired" | "idempotency_conflict" | "renewal_regression" | "snapshot_stale" | "stale_fence" | "store_rejected";
     };
 
 export interface RoomGlobalConcurrencyClaimStorePortV1 {
@@ -369,6 +396,21 @@ function validateReleaseInput(input: unknown): input is RoomGlobalConcurrencyRel
     && canonicalTimestamp(input.asOf);
 }
 
+function validateRenewInput(input: unknown): input is RoomGlobalConcurrencyRenewInputV1 {
+  if (!isRecord(input)) return false;
+  return input.contractVersion === ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION
+    && canonicalString(input.projectId)
+    && canonicalString(input.roomId)
+    && canonicalString(input.claimId)
+    && canonicalString(input.operationId)
+    && canonicalString(input.holderId)
+    && canonicalString(input.leaseId)
+    && positiveSafeInteger(input.fence)
+    && canonicalTimestamp(input.asOf)
+    && canonicalTimestamp(input.expiresAt)
+    && laterThan(input.expiresAt, input.asOf);
+}
+
 function validateRecoveryInput(input: unknown): input is RecoverDanglingRoomGlobalConcurrencyClaimsInputV1 {
   if (!isRecord(input)) return false;
   return input.contractVersion === ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION
@@ -387,6 +429,12 @@ function sameAcquireClaim(claim: RoomGlobalConcurrencyClaimV1, input: RoomGlobal
     && claim.leaseId === input.leaseId
     && claim.fence === input.fence
     && claim.expiresAt === input.expiresAt;
+}
+
+function sameRenewClaim(claim: RoomGlobalConcurrencyClaimV1, input: RoomGlobalConcurrencyRenewInputV1): boolean {
+  return claim.holderId === input.holderId
+    && claim.leaseId === input.leaseId
+    && claim.fence === input.fence;
 }
 
 function capacityReason(
@@ -415,17 +463,16 @@ function storeFailureResult(
   action: "held" | "rejected",
   result: RoomGlobalConcurrencyClaimStoreResultV1,
 ): RoomGlobalConcurrencyMutationResultV1 {
-  const reason: RoomGlobalConcurrencyAccountingReasonV1 = result.ok
-    ? "store_rejected"
-    : result.reason === "stale_fence"
-      ? "stale_fence"
-      : "store_rejected";
-  return mutation(action, reason);
+  if (result.ok) return mutation(action, "store_rejected");
+  if (result.reason === "stale_fence") return mutation(action, "stale_fence");
+  if (result.reason === "claim_expired") return mutation(action, "claim_expired");
+  if (result.reason === "renewal_regression") return mutation(action, "renewal_regression");
+  return mutation(action, "store_rejected");
 }
 
 function isMatchingStoreSuccess(
   result: RoomGlobalConcurrencyClaimStoreResultV1,
-  action: "acquired" | "released" | "recovered",
+  action: "acquired" | "renewed" | "released" | "recovered",
   claimId: string,
   fence: number,
 ): result is Extract<RoomGlobalConcurrencyClaimStoreResultV1, { readonly ok: true }> {
@@ -525,6 +572,59 @@ export class RoomGlobalConcurrencyAccounting {
       return mutation("released", "capacity_admitted", result.replayed, result.claimId, result.fence);
     } catch {
       return mutation("rejected", "store_failure");
+    }
+  }
+
+  /*
+  FNXC:RoomGlobalConcurrencyRenewal 2026-07-19-18:43:
+  A worker lease renewal remains insufficient authority while its active global
+  capacity claim retains an older expiry. Renew only the same project, Room,
+  holder, lease, and fence; an old request may replay but can never shorten a
+  claim that a newer worker renewal already extended.
+  */
+  public async renew(input: RoomGlobalConcurrencyRenewInputV1): Promise<RoomGlobalConcurrencyMutationResultV1> {
+    if (!validateRenewInput(input)) return mutation("rejected", "invalid_request");
+
+    let rawSnapshot: RoomGlobalConcurrencySnapshotV1;
+    try {
+      rawSnapshot = await this.ports.snapshotPort.readSnapshot({
+        contractVersion: ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION,
+        projectId: input.projectId,
+        asOf: input.asOf,
+      });
+    } catch {
+      return mutation("held", "snapshot_unavailable");
+    }
+
+    const inspected = inspectSnapshot(rawSnapshot, input.asOf);
+    if (!inspected.ok) return mutation("held", "invalid_snapshot");
+    if (inspected.value.stale) return mutation("held", "capacity_stale");
+    if (inspected.value.snapshot.totalSlots === null) return mutation("held", "capacity_unknown");
+
+    const existing = inspected.value.snapshot.roomClaims.find((claim) => claim.claimId === input.claimId);
+    if (!existing) return mutation("rejected", "claim_not_found");
+    if (existing.projectId !== input.projectId) return mutation("rejected", "project_isolation");
+    if (existing.roomId !== input.roomId) return mutation("rejected", "claim_scope_mismatch");
+    if (!sameRenewClaim(existing, input)) return mutation("rejected", "stale_fence");
+    if (laterThan(existing.expiresAt, input.expiresAt)) {
+      return mutation("renewed", "capacity_admitted", true, existing.claimId, existing.fence);
+    }
+
+    const command: RoomGlobalConcurrencyRenewStoreCommandV1 = Object.freeze({
+      contractVersion: ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION,
+      kind: "renew",
+      expectedSnapshotId: inspected.value.snapshot.snapshotId,
+      claimId: input.claimId,
+      fence: input.fence,
+      request: Object.freeze({ ...input }),
+      claim: existing,
+    });
+    try {
+      const result = await this.ports.claimStore.apply(command);
+      if (!isMatchingStoreSuccess(result, "renewed", input.claimId, input.fence)) return storeFailureResult("held", result);
+      return mutation("renewed", "capacity_admitted", result.replayed, result.claimId, result.fence);
+    } catch {
+      return mutation("held", "store_failure");
     }
   }
 

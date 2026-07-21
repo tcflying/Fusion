@@ -1,5 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { hostname } from "node:os";
 import type {
   TaskStore,
   Task,
@@ -15,11 +16,18 @@ import type {
   CliSession,
   NotificationPayload,
 } from "@fusion/core";
-import { AsyncCentralClaimStore, ChatStore, isEphemeralAgent } from "@fusion/core";
+import {
+  ChatStore,
+  createCentralDatabase,
+  isEphemeralAgent,
+  isSessionRoomControlPlaneEnabled,
+  MissionStore,
+} from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
 import type { PrMonitor, PrComment } from "../pr-monitor.js";
 import type { PrInfo } from "@fusion/core";
 import { TaskExecutor, type TaskExecutorOptions } from "../executor.js";
+import { WorkflowAuthoritativeDriver } from "../workflow-authoritative-driver.js";
 import { buildPrNodeDeps } from "../pr-nodes.js";
 import { isExperimentalFeatureEnabled } from "@fusion/core";
 import { createCliAgentRuntime, type BootstrappedCliAgentRuntime } from "../cli-agent/runtime.js";
@@ -48,6 +56,17 @@ import { PluginRunner } from "../plugin-runner.js";
 import { MissionAutopilot } from "../mission-autopilot.js";
 import { MissionExecutionLoop } from "../mission-execution-loop.js";
 import { TriageProcessor } from "../triage.js";
+import {
+  createGlobalCapacityLegacyRecoveryGate,
+  type GlobalCapacityLegacyRecoveryGateV1,
+} from "../global-capacity-legacy-recovery-gate.js";
+import {
+  createGlobalCapacityLegacyAttemptRunner,
+} from "../global-capacity-legacy-attempt-runner.js";
+import {
+  createGlobalCapacityLegacyDispatchControl,
+  type GlobalCapacityLegacyDispatchControlV1,
+} from "../global-capacity-legacy-dispatch-control.js";
 import { EphemeralWorkerManager } from "../ephemeral-worker-manager.js";
 import { validateProjectNodeMapping } from "../node-dispatch-validation.js";
 import { attachAgentLinkSync } from "../task-agent-sync.js";
@@ -55,6 +74,133 @@ import { createRunAuditor, generateSyntheticRunId } from "../run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
+
+export type RoomSessionConnectorBootstrapStateV1 = "not_required" | "ready" | "withheld";
+
+export interface RoomSessionConnectorBootstrapStatusV1 {
+  readonly state: RoomSessionConnectorBootstrapStateV1;
+  readonly reasonCode: "required_session_connector_not_loaded" | null;
+  readonly requiredConnectorIds: readonly string[];
+  readonly loadedConnectorIds: readonly string[];
+  readonly missingConnectorIds: readonly string[];
+}
+
+export interface RoomSessionConnectorBootstrapInputV1 {
+  readonly requiredConnectorIds: readonly string[];
+  readonly loadedConnectorRegistrations: readonly Readonly<{
+    pluginId: string;
+    connectorId: string;
+  }>[];
+}
+
+export interface RoomSessionConnectorBootstrapRunnerV1 {
+  init(): Promise<void>;
+  getPluginSessionConnectors(): readonly Readonly<{
+    pluginId: string;
+    sessionConnector: Readonly<{
+      metadata: Readonly<{
+        connectorId: string;
+      }>;
+    }>;
+  }>[];
+  getStore(): Readonly<{
+    getPlugin(pluginId: string): Promise<Readonly<{
+      id: string;
+      enabled: boolean;
+    }>>;
+  }>;
+}
+
+export interface BootstrapRoomSessionConnectorsInputV1 {
+  readonly resolveRequiredConnectorIds: () => Promise<readonly string[]>;
+  readonly pluginRunner: RoomSessionConnectorBootstrapRunnerV1;
+}
+
+function normalizeRoomSessionConnectorIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) return [];
+  return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))]
+    .sort((left, right) => left.localeCompare(right));
+}
+
+/*
+ * FNXC:RoomSessionConnectorBootstrap 2026-07-20-22:39:
+ * A bundled manifest or persisted install record is not authority to use a
+ * Session Connector. A Room-selected connector is usable only when its
+ * installed plugin is still enabled and has loaded a registration; the check
+ * completes before ProjectEngine can freeze the Room registry or start provider delivery.
+ */
+export function evaluateRoomSessionConnectorBootstrap(
+  input: RoomSessionConnectorBootstrapInputV1,
+): RoomSessionConnectorBootstrapStatusV1 {
+  const requiredConnectorIds = normalizeRoomSessionConnectorIds(input.requiredConnectorIds);
+  const loadedConnectorIds = normalizeRoomSessionConnectorIds(
+    input.loadedConnectorRegistrations.map((registration) => registration.connectorId),
+  );
+  const missingConnectorIds = requiredConnectorIds.filter(
+    (connectorId) => !loadedConnectorIds.includes(connectorId),
+  );
+
+  if (requiredConnectorIds.length === 0) {
+    return {
+      state: "not_required",
+      reasonCode: null,
+      requiredConnectorIds,
+      loadedConnectorIds,
+      missingConnectorIds,
+    };
+  }
+
+  if (missingConnectorIds.length > 0) {
+    return {
+      state: "withheld",
+      reasonCode: "required_session_connector_not_loaded",
+      requiredConnectorIds,
+      loadedConnectorIds,
+      missingConnectorIds,
+    };
+  }
+
+  return {
+    state: "ready",
+    reasonCode: null,
+    requiredConnectorIds,
+    loadedConnectorIds,
+    missingConnectorIds,
+  };
+}
+
+async function collectEnabledLoadedRoomSessionConnectors(
+  pluginRunner: RoomSessionConnectorBootstrapRunnerV1,
+): Promise<Array<{ pluginId: string; connectorId: string }>> {
+  const registrations = pluginRunner.getPluginSessionConnectors();
+  const verified = await Promise.all(registrations.map(async (registration) => {
+    try {
+      const installation = await pluginRunner.getStore().getPlugin(registration.pluginId);
+      if (!installation.enabled || installation.id !== registration.pluginId) return null;
+      return {
+        pluginId: registration.pluginId,
+        connectorId: registration.sessionConnector.metadata.connectorId,
+      };
+    } catch {
+      // Missing install state is not equivalent to an enabled bundled manifest.
+      return null;
+    }
+  }));
+  return verified.filter(
+    (registration): registration is { pluginId: string; connectorId: string } => registration !== null,
+  );
+}
+
+export async function bootstrapRoomSessionConnectors(
+  input: BootstrapRoomSessionConnectorsInputV1,
+): Promise<RoomSessionConnectorBootstrapStatusV1> {
+  const requiredConnectorIds = await input.resolveRequiredConnectorIds();
+  await input.pluginRunner.init();
+  return evaluateRoomSessionConnectorBootstrap({
+    requiredConnectorIds,
+    loadedConnectorRegistrations: await collectEnabledLoadedRoomSessionConnectors(input.pluginRunner),
+  });
+}
 
 export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
@@ -208,7 +354,7 @@ export class InProcessRuntime
   private usageLimitPauser?: UsageLimitPauser;
   private selfHealingManager?: SelfHealingManager;
   private leaseManager?: MeshLeaseManager;
-  private leaseCentralClaimStore?: AsyncCentralClaimStore;
+  private leaseCentralClaimStore?: ReturnType<typeof createCentralDatabase>;
   private agentStore?: AgentStore;
   private heartbeatMonitor?: HeartbeatMonitor;
   private triggerScheduler?: HeartbeatTriggerScheduler;
@@ -222,6 +368,11 @@ export class InProcessRuntime
   private pluginRunner?: PluginRunner;
   private pluginStore?: PluginStore;
   private pluginLoader?: PluginLoader;
+  private roomSessionConnectorBootstrapStatus: RoomSessionConnectorBootstrapStatusV1 =
+    evaluateRoomSessionConnectorBootstrap({
+      requiredConnectorIds: [],
+      loadedConnectorRegistrations: [],
+    });
   private routineRunner?: RoutineRunner;
   private routineStore?: RoutineStore;
   private routineScheduler?: RoutineScheduler;
@@ -244,8 +395,6 @@ export class InProcessRuntime
   ) => Promise<import("@fusion/core").MergeResult>;
   private clearMergeActive?: (taskId: string) => void;
   private activeMergeTaskIdProvider?: () => string | null;
-  private activeMergeStartedAtMsProvider?: () => number | null;
-  private activeMergeAborter?: (taskId: string, reason: string) => boolean;
   /**
    * FNXC:Workspace 2026-06-22-16:40 (Phase D P1 TOCTOU): predicate that reports whether a task is
    * anywhere in ProjectEngine's in-memory merge pipeline (queued OR dequeued-and-merging). Set by
@@ -272,6 +421,35 @@ export class InProcessRuntime
     runtimeLog.log(`Created InProcessRuntime for project ${config.projectId}`);
   }
 
+  private async resolveRequiredRoomSessionConnectorIds(): Promise<readonly string[]> {
+    const settings = await this.taskStore.getSettings();
+    if (!isSessionRoomControlPlaneEnabled(settings)) return [];
+
+    const authorityReader = this.centralCore as unknown as {
+      readRoomHostCompositionOperatorPolicyAuthorityV1?: (scope: {
+        projectId: string;
+        hostId: string;
+      }) => Promise<unknown>;
+    };
+    if (typeof authorityReader.readRoomHostCompositionOperatorPolicyAuthorityV1 !== "function") {
+      return [];
+    }
+
+    try {
+      const authority = await authorityReader.readRoomHostCompositionOperatorPolicyAuthorityV1({
+        projectId: this.config.projectId,
+        hostId: hostname(),
+      });
+      const connectorIds = authority && typeof authority === "object"
+        ? (authority as { policy?: { connectorIds?: unknown } }).policy?.connectorIds
+        : undefined;
+      return normalizeRoomSessionConnectorIds(connectorIds);
+    } catch {
+      // Missing, expired, or unavailable authority is separately withheld by ProjectEngine.
+      return [];
+    }
+  }
+
   /**
    * Start the runtime and initialize all subsystems.
    *
@@ -293,7 +471,9 @@ export class InProcessRuntime
 
     try {
       // 1. Initialize TaskStore (use external if provided, otherwise create new)
+      let centralHostLayer: import("@fusion/core").AsyncDataLayer | undefined;
       const {
+        TaskStore,
         PluginStore: PluginStoreClass,
         PluginLoader: PluginLoaderClass,
         MessageStore: MessageStoreClass,
@@ -301,11 +481,14 @@ export class InProcessRuntime
         // createTaskStoreForBackend is the startup factory that boots a
         // PostgreSQL-backed TaskStore. Post default-flip: it boots embedded PG
         // by default when DATABASE_URL is unset (the zero-config production
-        // path) and external PG when DATABASE_URL is set. The engine is the primary construction site for `fn serve`
+        // path), external PG when DATABASE_URL is set, and returns null only
+        // when the operator opted out via FUSION_NO_EMBEDDED_PG=1 (legacy
+        // SQLite). The engine is the primary construction site for `fn serve`
         // / dashboard: every project's TaskStore flows through
         // InProcessRuntime.start(). When the factory returns a backend result,
         // the engine owns the result's shutdown() for process teardown.
         createTaskStoreForBackend,
+        createGlobalCapacityLegacyAttemptStore,
       } = await import("@fusion/core");
       if (this.config.externalTaskStore) {
         this.taskStore = this.config.externalTaskStore;
@@ -314,15 +497,19 @@ export class InProcessRuntime
         const backendBoot = await createTaskStoreForBackend({
           rootDir: this.config.workingDirectory,
           projectId: this.config.projectId,
-          onMigrationProgress: this.config.onMigrationProgress,
         });
-        // FNXC:PostgresFinalCutover 2026-07-14-17:20: Engine runtimes must fail
-        // startup when PostgreSQL cannot boot; constructing a SQLite TaskStore is no longer valid.
-        this.taskStore = backendBoot.taskStore;
-        this.backendShutdown = backendBoot.shutdown;
-        runtimeLog.log(
-          `TaskStore initialized on PostgreSQL (${backendBoot.backend.mode}) for project ${this.config.projectId}`,
-        );
+        if (backendBoot) {
+          this.taskStore = backendBoot.taskStore;
+          this.backendShutdown = backendBoot.shutdown;
+          centralHostLayer = backendBoot.hostAsyncLayer;
+          runtimeLog.log(
+            `TaskStore initialized on PostgreSQL (${backendBoot.backend.mode}) for project ${this.config.projectId}`,
+          );
+        } else {
+          this.taskStore = new TaskStore(this.config.workingDirectory);
+          await this.taskStore.init();
+          runtimeLog.log(`TaskStore initialized for project ${this.config.projectId}`);
+        }
       }
 
       // Initialize MessageStore early so TaskExecutor receives send_message capability.
@@ -330,12 +517,6 @@ export class InProcessRuntime
       // In backend mode, pass the AsyncDataLayer so MessageStore delegates to the
       // async helpers; otherwise pass the sync SQLite Database (legacy path).
       const messageLayer = this.taskStore.getAsyncLayer();
-      if (!messageLayer) {
-        throw new Error("PostgreSQL TaskStore did not expose its AsyncDataLayer");
-      }
-      // FNXC:PostgresMeshClaims 2026-07-14-17:31: Cross-node checkout and
-      // recovery share the central.task_claims table through the project pool.
-      this.leaseCentralClaimStore = new AsyncCentralClaimStore(messageLayer);
 
       // FNXC:CentralCore 2026-06-26-13:30:
       // In backend mode, attach the TaskStore's AsyncDataLayer to the shared
@@ -347,7 +528,7 @@ export class InProcessRuntime
       // via the init() idempotency guard. Safe in legacy mode (messageLayer null).
       if (messageLayer && !this.centralCore.backendMode) {
         try {
-          await this.centralCore.attachBackendLayer(messageLayer);
+          await this.centralCore.attachBackendLayer(centralHostLayer ?? messageLayer);
         } catch (err) {
           runtimeLog.warn(
             `Failed to attach backend layer to CentralCore: ${err instanceof Error ? err.message : String(err)}`,
@@ -355,7 +536,84 @@ export class InProcessRuntime
         }
       }
 
-      this.messageStore = new MessageStoreClass(null, { asyncLayer: messageLayer });
+      let globalCapacityLegacyRecoveryGate: GlobalCapacityLegacyRecoveryGateV1 | undefined;
+      let globalCapacityLegacyDispatchControl: GlobalCapacityLegacyDispatchControlV1 | undefined;
+      if (messageLayer) {
+        try {
+          const authority = await this.centralCore.readGlobalCapacityPolicyAuthorityV1();
+          const attemptStore = createGlobalCapacityLegacyAttemptStore({
+            layer: messageLayer,
+            projectId: this.config.projectId,
+            policy: authority.policy,
+            idFactory: (identity) => [
+              "fusion-global-capacity-legacy-v1",
+              identity.kind,
+              identity.projectId,
+              identity.resourceKind,
+              identity.resourceId,
+              identity.capacityFence,
+              identity.acquireGeneration,
+              randomUUID(),
+            ].join(":"),
+          });
+          const runner = createGlobalCapacityLegacyAttemptRunner({
+            projectId: this.config.projectId,
+            store: attemptStore,
+            ledger: authority.createProjectPorts(this.config.projectId),
+            policy: authority.policy,
+            now: () => new Date().toISOString(),
+          });
+          globalCapacityLegacyDispatchControl = createGlobalCapacityLegacyDispatchControl({
+            projectId: this.config.projectId,
+            runner,
+            leaseTtlMs: authority.policy.leaseTtlMs,
+          });
+          globalCapacityLegacyRecoveryGate = createGlobalCapacityLegacyRecoveryGate({
+            projectId: this.config.projectId,
+            inspection: attemptStore,
+            pause: this.taskStore,
+          });
+          /*
+           * FNXC:GlobalCapacityLegacyDispatch 2026-07-20-07:08:
+           * The runtime wires one project-scoped attempt store to the unscoped
+           * CentralCore policy authority's ledger ports. Executor and triage use
+           * the same dispatch control, so neither path can invent a local cap,
+           * lease TTL, holder identity, or provider-work replay after restart.
+           */
+          runtimeLog.log(`Global capacity recovery gate and dispatch control initialized for project ${this.config.projectId}`);
+        } catch (error) {
+          /*
+           * FNXC:GlobalCapacityLegacyRecoveryGate 2026-07-20-06:10:
+           * A PostgreSQL-backed runtime without a verified central policy or
+           * host-scoped CentralCore must not silently bypass restart fencing.
+           * Inject a gate whose inspection always fails closed; legacy SQLite
+           * remains an explicitly unsupported single-process compatibility path.
+           */
+          const unavailable = error instanceof Error ? error.message : String(error);
+          globalCapacityLegacyRecoveryGate = createGlobalCapacityLegacyRecoveryGate({
+            projectId: this.config.projectId,
+            inspection: {
+              async inspectRecovery(): Promise<never> {
+                throw new Error("global-capacity-recovery-unavailable");
+              },
+            },
+            pause: this.taskStore,
+          });
+          runtimeLog.warn(
+            `Global capacity recovery gate is fail-closed for project ${this.config.projectId}: ${unavailable}`,
+          );
+        }
+      } else {
+        runtimeLog.warn(
+          `Global capacity recovery gate unavailable for SQLite compatibility runtime ${this.config.projectId}; durable cross-project capacity is not enforced`,
+        );
+      }
+
+      if (messageLayer) {
+        this.messageStore = new MessageStoreClass(null, { asyncLayer: messageLayer });
+      } else {
+        this.messageStore = new MessageStoreClass(this.taskStore.getDatabase());
+      }
 
       await yieldEventLoop();
 
@@ -364,10 +622,9 @@ export class InProcessRuntime
       // In backend mode, pass the AsyncDataLayer so PluginStore delegates to the
       // async helpers; otherwise use the legacy SQLite path.
       const pluginLayer = this.taskStore.getAsyncLayer();
-      if (!pluginLayer) {
-        throw new Error("PostgreSQL TaskStore did not expose the plugin AsyncDataLayer");
-      }
-      this.pluginStore = new PluginStoreClass(this.config.workingDirectory, { asyncLayer: pluginLayer });
+      this.pluginStore = pluginLayer
+        ? new PluginStoreClass(this.config.workingDirectory, { asyncLayer: pluginLayer })
+        : new PluginStoreClass(this.config.workingDirectory);
       await this.pluginStore.init();
 
       this.pluginLoader = new PluginLoaderClass({
@@ -381,7 +638,15 @@ export class InProcessRuntime
         taskStore: this.taskStore,
         rootDir: this.config.workingDirectory,
       });
-      await this.pluginRunner.init();
+      this.roomSessionConnectorBootstrapStatus = await bootstrapRoomSessionConnectors({
+        resolveRequiredConnectorIds: () => this.resolveRequiredRoomSessionConnectorIds(),
+        pluginRunner: this.pluginRunner,
+      });
+      if (this.roomSessionConnectorBootstrapStatus.state === "withheld") {
+        runtimeLog.warn(
+          `Room Session Connector bootstrap withheld for ${this.config.projectId}: ${this.roomSessionConnectorBootstrapStatus.reasonCode} (${this.roomSessionConnectorBootstrapStatus.missingConnectorIds.join(", ")})`,
+        );
+      }
       runtimeLog.log(`PluginRunner initialized`);
 
       await yieldEventLoop();
@@ -470,8 +735,6 @@ export class InProcessRuntime
         agentStoreForReflection = new AgentStoreClass({
           rootDir: this.taskStore.getFusionDir(),
           taskStore: this.taskStore,
-          claimStore: this.leaseCentralClaimStore,
-          projectId: this.config.projectId,
           ...(agentLayer ? { asyncLayer: agentLayer } : {}),
         });
         await agentStoreForReflection.init();
@@ -502,19 +765,22 @@ export class InProcessRuntime
 
       // 5. Initialize Scheduler
       /*
-       * FNXC:PostgresMissionRuntime 2026-07-14-17:20:
-       * Resolve one mission store for autopilot, scheduler, and validator-loop
-       * behavior. Each consumer awaits the sync-or-async union, so backend mode
-       * no longer disables mission execution or feature reconciliation.
+       * FNXC:SqliteFinalRemoval 2026-06-24-15:55:
+       * In backend mode (PostgreSQL), getMissionStore() throws because the
+       * MissionStore has not been converted to async yet. Catch the error and
+       * degrade gracefully: mission autopilot and mission execution loop are
+       * disabled until the MissionStore is fully converted to the async path.
        */
-      let missionStore:
-        | import("@fusion/core").MissionStore
-        | import("@fusion/core").AsyncMissionStore
-        | undefined;
+      let missionStore: import("@fusion/core").MissionStore | undefined;
       // FNXC:MissionStore 2026-06-28-12:45:
-      // MissionAutopilot, Scheduler, and MissionExecutionLoop all await the
-      // MissionStore | AsyncMissionStore contract, so one resolved instance
-      // drives every mission lifecycle surface in both backends.
+      // MissionAutopilot's STORE-access path was ported to drive BOTH backends —
+      // it types its store as `MissionStore | AsyncMissionStore` and awaits every
+      // call (mirrors the ResearchOrchestrator union+await port). So the autopilot
+      // is constructed from `autopilotMissionStore`, resolved in BOTH backends with
+      // NO `instanceof MissionStore` gate; the autopilot LOOP (watch/recover/
+      // recompute/persist) now runs in PG mode. The sync-only `missionStore` below
+      // stays gated for the Scheduler + MissionExecutionLoop, whose slice EXECUTION
+      // and validator-loop paths are NOT yet ported to async (out of scope).
       let autopilotMissionStore:
         | import("@fusion/core").MissionStore
         | import("@fusion/core").AsyncMissionStore
@@ -523,10 +789,9 @@ export class InProcessRuntime
         const resolvedMissionStore = this.taskStore.getMissionStore();
         // Union store for the autopilot — works in both SQLite and PG backends.
         autopilotMissionStore = resolvedMissionStore;
-        // FNXC:PostgresMissionRuntime 2026-07-14-17:20:
-        // Scheduler and validator execution await the MissionStore union, so
-        // PostgreSQL receives the same mission recovery/validation lifecycle.
-        missionStore = resolvedMissionStore;
+        // Sync-only narrowing for the Scheduler + MissionExecutionLoop, which still
+        // call the store synchronously and are skipped in PG backend mode.
+        missionStore = resolvedMissionStore instanceof MissionStore ? resolvedMissionStore : undefined;
       } catch (msErr) {
         runtimeLog.warn(
           `MissionStore unavailable (${this.taskStore.isBackendMode() ? "backend mode" : "init error"}); mission autopilot disabled:`,
@@ -549,15 +814,15 @@ export class InProcessRuntime
               ? {
                   notifyValidationComplete: async (featureId: string) => {
                     // Pass the feature's linked taskId to handleTaskCompletion, not the featureId
-                    const feature = await missionStore.getFeature(featureId);
+                    const feature = missionStore.getFeature(featureId);
                     if (!feature?.taskId) {
                       return;
                     }
-                    const slice = await missionStore.getSlice(feature.sliceId);
-                    const milestone = slice ? await missionStore.getMilestone(slice.milestoneId) : undefined;
+                    const slice = missionStore.getSlice(feature.sliceId);
+                    const milestone = slice ? missionStore.getMilestone(slice.milestoneId) : undefined;
                     const missionId = milestone?.missionId;
                     if (missionId) {
-                      const mission = await missionStore.getMission(missionId);
+                      const mission = missionStore.getMission(missionId);
                       if (mission?.autopilotEnabled && !missionAutopilot.isWatching(missionId)) {
                         missionAutopilot.watchMission(missionId);
                       }
@@ -571,6 +836,29 @@ export class InProcessRuntime
             agentStore: this.agentStore,
           })
         : undefined;
+
+      // FN-4823/FN-4819 §2.5: central-claim-aware recovery when central DB is reachable;
+      // fallback to local-only recovery remains in MeshLeaseManager for single-node contexts.
+      //
+      // FNXC:CentralCore 2026-06-26-13:00:
+      // In backend mode (PostgreSQL), do NOT construct the legacy SQLite
+      // CentralDatabase for mesh lease recovery. The sync CentralClaimStore
+      // contract cannot be satisfied by the async PostgreSQL helpers without a
+      // blocking bridge, and the single-node embedded-PG default does not need
+      // cross-node claim coordination. MeshLeaseManager falls back to its
+      // local-only recovery path (the centralClaimStore=undefined guard). The
+      // SQLite path remains for FUSION_NO_EMBEDDED_PG (legacy) mode.
+      if (this.taskStore.isBackendMode()) {
+        this.leaseCentralClaimStore = undefined;
+      } else {
+        try {
+          this.leaseCentralClaimStore = createCentralDatabase(this.centralCore.getGlobalDir());
+          this.leaseCentralClaimStore.init();
+        } catch (error) {
+          runtimeLog.warn(`Failed to initialize central claim store for mesh lease recovery: ${error instanceof Error ? error.message : String(error)}`);
+          this.leaseCentralClaimStore = undefined;
+        }
+      }
 
       this.leaseManager = new MeshLeaseManager({
         taskStore: this.taskStore,
@@ -587,13 +875,6 @@ export class InProcessRuntime
         maxConcurrent: this.config.maxConcurrent,
         maxWorktrees: this.config.maxWorktrees,
         semaphore: this.projectSemaphore,
-        // FNXC:GlobalConcurrencyControls 2026-07-17-00:00: Feed the triage service's
-        // live pre-planning in-flight count into the scheduler's stale-semaphore
-        // recovery so a triage session holding a slot before it writes
-        // status:"planning" is never mistaken for a leaked slot. Read lazily —
-        // triageProcessor is constructed after the scheduler but exists by the
-        // time the first scheduling pass runs.
-        getInFlightTopLevelCount: () => this.triageProcessor?.getProcessingTaskIds().size ?? 0,
         agentStore: this.agentStore,
         hasActiveAgentExecution: (agentId: string) => this.heartbeatMonitor?.getTrackedAgents().includes(agentId) ?? false,
         missionStore,
@@ -621,22 +902,16 @@ export class InProcessRuntime
       await yieldEventLoop();
 
       // 5a-cli. Initialize the CLI Agent Executor runtime (behind the
-      // `cliAgentExecutor` experimental flag). Reuses the project's existing
-      // PostgreSQL data layer; predicates feed self-healing + stuck-task seams.
-      if (isExperimentalFeatureEnabled(settings, "cliAgentExecutor")) {
-        /*
-         * FNXC:CliAgentPostgres 2026-07-14-12:00:
-         * The experimental executor is a supported PostgreSQL runtime surface;
-         * enabling it must not silently disable sessions after the cutover.
-         */
+      // `cliAgentExecutor` experimental flag). Reuses the project's existing core
+      // Database; predicates feed the self-healing + stuck-task seams below.
+      if (isExperimentalFeatureEnabled(settings, "cliAgentExecutor") && !this.taskStore.isBackendMode()) {
+        // FNXC:RuntimeSatelliteAsync 2026-06-24-14:00:
+        // CLI Agent Executor runtime requires the sync SQLite Database; skip in
+        // backend mode (the feature is experimental and not yet ported to async).
         try {
-          const asyncLayer = this.taskStore.getAsyncLayer();
-          if (!asyncLayer) {
-            throw new Error("CLI Agent Executor requires the PostgreSQL data layer");
-          }
-          this.cliAgentRuntime = await createCliAgentRuntime({
+          this.cliAgentRuntime = createCliAgentRuntime({
             fusionDir: this.taskStore.getFusionDir(),
-            asyncLayer,
+            db: this.taskStore.getDatabase(),
             projectId: this.config.projectId,
             hookEndpointUrl: this.resolveCliAgentHookEndpointUrl(),
             onNotification: (info) => {
@@ -715,6 +990,7 @@ export class InProcessRuntime
       }
 
       const prNodeGithubOps = this.config.prNodeGithubOps;
+      const workflowAuthoritativeDriverRef: { current?: WorkflowAuthoritativeDriver } = {};
       const executorOptions: TaskExecutorOptions = {
         semaphore: this.projectSemaphore,
         pool: this.worktreePool,
@@ -729,16 +1005,16 @@ export class InProcessRuntime
         // GitHub ops (createPr/mergePr/respond) + the engine-owned store. The CLI
         // layer never holds a store reference; the engine binds it here. Absent
         // ops → undefined → the pr-* node kinds fail closed.
-        /*
-         * FNXC:GrokCliRouting 2026-07-15-09:58:
-         * Thread this.pluginRunner into buildPrNodeDeps so pr-respond agent sessions share chat/executor Grok CLI plugin-runtime injection.
-         */
         prNodes: prNodeGithubOps
-          ? buildPrNodeDeps(() => this.taskStore, prNodeGithubOps, this.pluginRunner)
+          ? buildPrNodeDeps(() => this.taskStore, prNodeGithubOps)
           : undefined,
         onSliceComplete: (slice) => {
           void this.scheduler.onSliceComplete(slice);
         },
+        workflowAuthoritativeDispatch: async (task) =>
+          (await workflowAuthoritativeDriverRef.current?.maybeRun(task))?.handled ?? false,
+        globalCapacityLegacyRecoveryGate,
+        globalCapacityLegacyDispatchControl,
         onStart: (task, worktreePath) => {
           this.recordActivity();
           runtimeLog.log(`Started executing task ${task.id} in ${worktreePath}`);
@@ -781,6 +1057,10 @@ export class InProcessRuntime
         this.config.workingDirectory,
         executorOptions
       );
+      workflowAuthoritativeDriverRef.current = new WorkflowAuthoritativeDriver({
+        store: this.taskStore,
+        executor: this.executor,
+      });
       if (this.mergeRequester) {
         this.executor.setMergeRequester(this.mergeRequester);
       }
@@ -819,10 +1099,15 @@ export class InProcessRuntime
         // Already started — nothing to do
       }
       if (!this.heartbeatMonitor && this.agentStore) {
+        // FNXC:RuntimeSatelliteAsync 2026-06-24-21:40:
+        // ChatStore now supports dual-path: in backend mode it uses the
+        // AsyncDataLayer; in SQLite mode it uses the sync Database.
         const chatLayer = this.taskStore.getAsyncLayer();
-        if (!chatLayer) throw new Error("Heartbeat ChatStore requires the project PostgreSQL AsyncDataLayer");
-        /* FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Engine chat services share the authoritative project PostgreSQL layer and never reopen SQLite. */
-        this.chatStore ??= new ChatStore(chatLayer);
+        this.chatStore ??= new ChatStore(
+          this.taskStore.getFusionDir(),
+          chatLayer ? null : this.taskStore.getDatabase(),
+          { asyncLayer: chatLayer },
+        );
         this.heartbeatMonitor = new HeartbeatMonitor({
           store: this.agentStore,
           agentStore: this.agentStore, // enables per-agent config resolution
@@ -973,6 +1258,8 @@ export class InProcessRuntime
           stuckTaskDetector: this.stuckTaskDetector,
           agentStore: this.agentStore,
           pluginRunner: this.pluginRunner,
+          globalCapacityLegacyRecoveryGate,
+          globalCapacityLegacyDispatchControl,
           onSpecifyStart: (t) => {
             this.recordActivity();
             runtimeLog.log(`Specifying ${t.id}...`);
@@ -1034,10 +1321,15 @@ export class InProcessRuntime
       await yieldEventLoop();
 
       // 7. Initialize SelfHealingManager
+      // FNXC:RuntimeSatelliteAsync 2026-06-24-21:42:
+      // ChatStore dual-path: use async layer in backend mode, sync DB otherwise.
       {
         const chatLayer2 = this.taskStore.getAsyncLayer();
-        if (!chatLayer2) throw new Error("Self-healing ChatStore requires the project PostgreSQL AsyncDataLayer");
-        this.chatStore ??= new ChatStore(chatLayer2);
+        this.chatStore ??= new ChatStore(
+          this.taskStore.getFusionDir(),
+          chatLayer2 ? null : this.taskStore.getDatabase(),
+          { asyncLayer: chatLayer2 },
+        );
       }
       this.selfHealingManager = new SelfHealingManager(this.taskStore, {
         rootDir: this.config.workingDirectory,
@@ -1049,21 +1341,13 @@ export class InProcessRuntime
         clearPhantomExecutorBinding: (taskId: string, options?: { preserveWorktrees?: boolean }) => this.executor?.clearPhantomExecutorBinding(taskId, options),
         listWorktreeHolders: () => this.executor?.listWorktreeHolders() ?? [],
         recoverApprovedTriageTask: (task) => this.triageProcessor?.recoverApprovedTask(task) ?? Promise.resolve(false),
-        getPlanningTaskIds: () => this.triageProcessor?.getPlanningTaskIds() ?? new Set<string>(),
-        // FNXC:TaskTiming 2026-08-01-12:00: orphan planning recovery must defer
-        // while executor-owned graph Plan Review holds the sole planning anchor.
-        hasActivePlanningWorkflowSession: (taskId) => this.executor?.hasActivePlanningWorkflowSession(taskId) ?? false,
-        reserveAdvancedTriageRecovery: (taskId) => this.triageProcessor?.tryReserveAdvancedRecovery(taskId),
+        getPlanningTaskIds: () => this.triageProcessor?.getProcessingTaskIds() ?? new Set<string>(),
         evictStaleTriageProcessing: () => this.triageProcessor?.evictStaleProcessing() ?? new Set<string>(),
         enqueueMerge: this.mergeEnqueuer ? (taskId: string) => this.mergeEnqueuer?.(taskId) ?? false : undefined,
         requeueForAutoMerge: this.mergeEnqueuer ? (taskId: string) => this.mergeEnqueuer?.(taskId) ?? false : undefined,
         isTaskActive: (taskId: string) => this.executor.isTaskActive(taskId),
         clearMergeActive: this.clearMergeActive ? (taskId: string) => this.clearMergeActive?.(taskId) : undefined,
         getActiveMergeTaskId: () => this.activeMergeTaskIdProvider?.() ?? null,
-        getActiveMergeStartedAtMs: () => this.activeMergeStartedAtMsProvider?.() ?? null,
-        abortActiveMerge: this.activeMergeAborter
-          ? (taskId: string, reason: string) => this.activeMergeAborter?.(taskId, reason) ?? false
-          : undefined,
         // FNXC:Workspace 2026-06-22-16:40 (Phase D P1 TOCTOU): undefined provider → "not pending"
         // (graceful when unwired; existing guards still apply). In production it is always wired.
         isMergePending: this.mergePendingProvider ? (taskId: string) => this.mergePendingProvider?.(taskId) ?? false : undefined,
@@ -1153,18 +1437,17 @@ export class InProcessRuntime
 
       // Mission crash recovery: restore autopilot state for missions that were active before crash
       /*
-       * FNXC:PostgresMissionRuntime 2026-07-14-17:20:
-       * Crash recovery and scheduler reconciliation use the same union store in
-       * both backends; initialization errors remain fail-soft for engine boot.
+       * FNXC:SqliteFinalRemoval 2026-06-24-16:00:
+       * In backend mode, getMissionStore() throws (MissionStore not yet async).
+       * Wrap in try/catch to degrade gracefully — mission crash recovery is
+       * skipped, same as mission autopilot above.
        */
-      let activeMissionStore:
-        | import("@fusion/core").MissionStore
-        | import("@fusion/core").AsyncMissionStore
-        | undefined;
+      let activeMissionStore: import("@fusion/core").MissionStore | undefined;
       // FNXC:MissionStore 2026-06-28-12:45: autopilot crash-recovery now runs in BOTH
       // backends. `recoverMissions` accepts the `MissionStore | AsyncMissionStore`
       // union and awaits every store call, so resolve the store WITHOUT an instanceof
-      // gate here. Scheduler reconciliation now awaits that same union.
+      // gate here. The sync-only `activeMissionStore` below still gates the
+      // scheduler-driven `reconcileAllMissionFeatures` (not yet ported to async).
       let activeAutopilotMissionStore:
         | import("@fusion/core").MissionStore
         | import("@fusion/core").AsyncMissionStore
@@ -1172,7 +1455,12 @@ export class InProcessRuntime
       try {
         const resolvedActive = this.taskStore.getMissionStore();
         activeAutopilotMissionStore = resolvedActive;
-        activeMissionStore = resolvedActive;
+        activeMissionStore = resolvedActive instanceof MissionStore ? resolvedActive : undefined;
+        // FNXC:MissionStore 2026-06-27-16:30 (review): log the PG-mode degrade for the
+        // scheduler-driven feature reconciliation that stays sync-only.
+        if (!activeMissionStore) {
+          runtimeLog.warn("[runtime] scheduler feature reconciliation skipped: sync MissionStore not available in PG backend mode");
+        }
       } catch (error) {
         activeMissionStore = undefined;
         activeAutopilotMissionStore = undefined;
@@ -1221,17 +1509,6 @@ export class InProcessRuntime
       runtimeLog.log(`InProcessRuntime started for project ${this.config.projectId}`);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
-      /*
-      FNXC:RuntimeStartupWiring 2026-07-14-18:18:
-      A failed partial startup must unwind every initialized subsystem and the owned PostgreSQL backend before surfacing the original startup error. The normal stop path is deliberately safe against partially initialized fields.
-      */
-      try {
-        await this.stop();
-      } catch (cleanupError) {
-        runtimeLog.warn(
-          `Failed to fully unwind partial runtime startup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-        );
-      }
       this.setStatus("errored");
       runtimeLog.error(`Failed to start InProcessRuntime:`, err.message);
       this.emit("error", err);
@@ -1266,13 +1543,6 @@ export class InProcessRuntime
     this.setStatus("stopping");
     runtimeLog.log(`Stopping InProcessRuntime for project ${this.config.projectId}`);
 
-    /*
-    FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
-    Runtime shutdown owns the startup-factory backend handle. Capture and clear it before any subsystem cleanup so concurrent/retried stop calls cannot invoke it twice, then release it from finally even when settings, plugins, or worktree cleanup fails. The first subsystem error remains the observable stop failure; backend cleanup is best-effort and never masks it.
-    */
-    const backendShutdown = this.backendShutdown;
-    this.backendShutdown = undefined;
-    let stopError: Error | undefined;
     try {
       // 1. Remove concurrency change listener (if we registered one)
       if (this.concurrencyChangedListener && typeof this.centralCore.off === "function") {
@@ -1290,7 +1560,7 @@ export class InProcessRuntime
       // runtime's own PTYs only — never the dashboard / port 4040).
       if (this.cliAgentRuntime) {
         try {
-          await this.cliAgentRuntime.dispose();
+          this.cliAgentRuntime.dispose();
           runtimeLog.log("CLI Agent Executor runtime disposed");
         } catch (cliErr) {
           runtimeLog.warn(
@@ -1391,7 +1661,6 @@ export class InProcessRuntime
       if (this.executor) {
         try {
           await this.executor.abortAllInFlight("engine stop");
-          this.executor.disposeStoreLifecycleDisposers();
           runtimeLog.log("Aborted in-flight executor AI sessions");
         } catch (err) {
           runtimeLog.warn(`Failed to abort in-flight executor AI sessions: ${err}`);
@@ -1450,28 +1719,39 @@ export class InProcessRuntime
         }
       }
 
-      this.leaseCentralClaimStore = undefined;
+      if (this.leaseCentralClaimStore) {
+        this.leaseCentralClaimStore.close();
+        this.leaseCentralClaimStore = undefined;
+      }
 
-      this.setStatus("stopped");
-      runtimeLog.log(`InProcessRuntime stopped for project ${this.config.projectId}`);
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      stopError = err;
-      this.setStatus("errored");
-      runtimeLog.error(`Error during shutdown:`, err.message);
-      this.emit("error", err);
-    } finally {
-      if (backendShutdown) {
+      // FNXC:RuntimeStartupWiring 2026-06-24-10:00:
+      // When the runtime booted a PostgreSQL-backed TaskStore via
+      // createTaskStoreForBackend, release the connection pool and stop the
+      // embedded PostgreSQL process (if one was started) now that every
+      // subsystem has drained. Best-effort: a failure is logged but does not
+      // mask the (already-clean) stop. On the legacy SQLite path this is a
+      // no-op (backendShutdown is undefined and the TaskStore closes its own
+      // SQLite database lazily).
+      if (this.backendShutdown) {
         try {
-          await backendShutdown();
+          await this.backendShutdown();
         } catch (err) {
           runtimeLog.warn(
             `Backend shutdown failed: ${err instanceof Error ? err.message : err}`,
           );
         }
+        this.backendShutdown = undefined;
       }
+
+      this.setStatus("stopped");
+      runtimeLog.log(`InProcessRuntime stopped for project ${this.config.projectId}`);
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.setStatus("errored");
+      runtimeLog.error(`Error during shutdown:`, err.message);
+      this.emit("error", err);
+      throw err;
     }
-    if (stopError) throw stopError;
   }
 
   /**
@@ -1511,14 +1791,6 @@ export class InProcessRuntime
 
   setActiveMergeTaskIdProvider(getActiveMergeTaskId: () => string | null): void {
     this.activeMergeTaskIdProvider = getActiveMergeTaskId;
-  }
-
-  setActiveMergeStartedAtMsProvider(getActiveMergeStartedAtMs: () => number | null): void {
-    this.activeMergeStartedAtMsProvider = getActiveMergeStartedAtMs;
-  }
-
-  setActiveMergeAborter(abortActiveMerge: (taskId: string, reason: string) => boolean): void {
-    this.activeMergeAborter = abortActiveMerge;
   }
 
   setMergePendingProvider(isMergePending: (taskId: string) => boolean): void {
@@ -1589,14 +1861,6 @@ export class InProcessRuntime
   }
 
   /**
-   * FNXC:PlannerOversight 2026-07-13-23:05:
-   * Expose TaskExecutor so ProjectEngine can wire session-advisor log flush.
-   */
-  getExecutor(): TaskExecutor | undefined {
-    return this.executor;
-  }
-
-  /**
    * Get the AgentStore instance (if initialized).
    * Returns undefined before start() or if init fails.
    */
@@ -1627,6 +1891,19 @@ export class InProcessRuntime
    */
   getPluginRunner(): PluginRunner | undefined {
     return this.pluginRunner;
+  }
+
+  /**
+   * Reports whether all connector IDs selected by the current Room host policy
+   * were installed, enabled, and loaded before ProjectEngine freezes its Room registry.
+   */
+  getRoomSessionConnectorBootstrapStatus(): RoomSessionConnectorBootstrapStatusV1 {
+    return {
+      ...this.roomSessionConnectorBootstrapStatus,
+      requiredConnectorIds: [...this.roomSessionConnectorBootstrapStatus.requiredConnectorIds],
+      loadedConnectorIds: [...this.roomSessionConnectorBootstrapStatus.loadedConnectorIds],
+      missingConnectorIds: [...this.roomSessionConnectorBootstrapStatus.missingConnectorIds],
+    };
   }
 
   /**

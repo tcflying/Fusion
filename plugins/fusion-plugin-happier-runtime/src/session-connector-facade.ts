@@ -4,14 +4,70 @@
  * MCP implementation. No child process is opened until a connector operation runs.
  */
 
-import type { SessionConnectorV1 } from "@fusion/core";
+import type {
+  SessionConnectorIdentityV1,
+  SessionConnectorPreflightExistingRequestV1,
+  SessionConnectorPreflightExistingResultV1,
+  SessionConnectorProviderTelemetrySourceV1,
+  SessionConnectorProviderTelemetryV1,
+  SessionConnectorProviderTelemetryWithheldReasonV1,
+  SessionConnectorResultV1,
+  SessionConnectorRuntimeSnapshotSourceV1,
+  SessionConnectorV1,
+} from "@fusion/core";
+import { SESSION_CONNECTOR_PROVIDER_TELEMETRY_CONTRACT_VERSION } from "@fusion/core";
 import {
   HAPPIER_SESSION_CONNECTOR_ID,
   HAPPIER_SESSION_CONNECTOR_VERSION,
 } from "./session-connector-contract.js";
-import type { HappierSessionConnectorOptions } from "./session-connector.js";
+import type {
+  HappierPluginWriteAuthorization,
+  HappierSessionConnectorOptions,
+} from "./session-connector.js";
 
-export class HappierSessionConnector implements SessionConnectorV1 {
+const pluginWriteAuthorizers = new WeakMap<object, HappierPluginWriteAuthorization>();
+
+/**
+ * @internal Keeps the Engine-owned write authority in the runtime-factory
+ * closure while the normal facade constructor remains read-only and lazy.
+ */
+export function createHappierSessionConnectorWithHostWriteAuthorization(
+  options: HappierSessionConnectorOptions,
+  verifier: HappierPluginWriteAuthorization,
+): HappierSessionConnector {
+  const connector = new HappierSessionConnector(options);
+  pluginWriteAuthorizers.set(connector, verifier);
+  return connector;
+}
+
+function providerTelemetryIdentity(identity: SessionConnectorIdentityV1): SessionConnectorIdentityV1 {
+  return Object.freeze({
+    connectorId: identity.connectorId,
+    providerId: identity.providerId,
+    nativeSessionId: identity.nativeSessionId,
+    happierSessionId: identity.happierSessionId,
+    serverProfileId: identity.serverProfileId,
+    machineId: identity.machineId,
+    hostId: identity.hostId,
+  });
+}
+
+function providerTelemetryWithheld(
+  identity: SessionConnectorIdentityV1,
+  reason: SessionConnectorProviderTelemetryWithheldReasonV1,
+): SessionConnectorResultV1<SessionConnectorProviderTelemetryV1> {
+  return {
+    ok: true,
+    value: Object.freeze({
+      contractVersion: SESSION_CONNECTOR_PROVIDER_TELEMETRY_CONTRACT_VERSION,
+      state: "withheld" as const,
+      identity: providerTelemetryIdentity(identity),
+      reason,
+    }),
+  };
+}
+
+export class HappierSessionConnector implements SessionConnectorV1, SessionConnectorRuntimeSnapshotSourceV1, SessionConnectorProviderTelemetrySourceV1 {
   readonly contractVersion = 1;
   readonly id = HAPPIER_SESSION_CONNECTOR_ID;
   readonly version: string;
@@ -24,6 +80,24 @@ export class HappierSessionConnector implements SessionConnectorV1 {
 
   getCapabilities(...args: Parameters<SessionConnectorV1["getCapabilities"]>): ReturnType<SessionConnectorV1["getCapabilities"]> {
     return this.implementation().then((connector) => connector.getCapabilities(...args));
+  }
+
+  preflightExisting(
+    input: SessionConnectorPreflightExistingRequestV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorPreflightExistingResultV1>> {
+    return this.implementation().then((connector) => {
+      if (typeof connector.preflightExisting !== "function") {
+        return {
+          ok: false as const,
+          error: {
+            code: "unavailable" as const,
+            message: "The loaded Happier connector does not support read-only existing-Session preflight",
+            retryable: false,
+          },
+        };
+      }
+      return connector.preflightExisting(input);
+    });
   }
 
   ensureExisting(...args: Parameters<SessionConnectorV1["ensureExisting"]>): ReturnType<SessionConnectorV1["ensureExisting"]> {
@@ -70,9 +144,62 @@ export class HappierSessionConnector implements SessionConnectorV1 {
     return this.implementation().then((connector) => connector.getDeepLinks(...args));
   }
 
+  /*
+   * FNXC:HappierRuntimeSnapshotFacade 2026-07-20-11:32:
+   * The production PluginRunner registers this lazy facade, not the eagerly
+   * loaded MCP connector. Forward the optional local runtime snapshot capability
+   * so the Room observation port can see the explicitly accountless model
+   * snapshot. A legacy implementation remains fail-closed and cannot turn the
+   * absence of this extension into model, account, quota, or scheduling proof.
+   */
+  getRuntimeSnapshot(
+    ...args: Parameters<SessionConnectorRuntimeSnapshotSourceV1["getRuntimeSnapshot"]>
+  ): ReturnType<SessionConnectorRuntimeSnapshotSourceV1["getRuntimeSnapshot"]> {
+    return this.implementation().then((connector) => {
+      const snapshotSource = connector as Partial<SessionConnectorRuntimeSnapshotSourceV1>;
+      if (typeof snapshotSource.getRuntimeSnapshot !== "function") {
+        return {
+          ok: false,
+          error: {
+            code: "unavailable",
+            message: "Happier local runtime snapshot extension is unavailable",
+            retryable: false,
+            safeDetails: {
+              bridge: "local_happier_mcp_extension",
+              state: "happier_local_runtime_snapshot_extension_required",
+            },
+          },
+        };
+      }
+      return snapshotSource.getRuntimeSnapshot(...args);
+    });
+  }
+
+  /*
+   * FNXC:HappierProviderTelemetryFacade 2026-07-21-03:00:
+   * PluginRunner exposes this lazy facade, so the opt-in local telemetry read
+   * must project only Core's canonical value contract. A failed import or
+   * legacy connector remains safely withheld and cannot imply provider readiness.
+   */
+  getProviderTelemetry(
+    identity: SessionConnectorIdentityV1,
+  ): Promise<SessionConnectorResultV1<SessionConnectorProviderTelemetryV1>> {
+    return this.implementation().then((connector) => {
+      const telemetrySource = connector as Partial<SessionConnectorProviderTelemetrySourceV1>;
+      return typeof telemetrySource.getProviderTelemetry === "function"
+        ? telemetrySource.getProviderTelemetry(identity)
+        : providerTelemetryWithheld(identity, "connector_telemetry_unsupported");
+    }).catch(() => providerTelemetryWithheld(identity, "telemetry_unavailable"));
+  }
+
   private implementation(): Promise<SessionConnectorV1> {
     this.implementationPromise ??= import("./session-connector.js")
-      .then(({ HappierSessionConnector: OfficialMcpConnector }) => new OfficialMcpConnector(this.options));
+      .then(({ HappierSessionConnector: OfficialMcpConnector, createHappierSessionConnectorWithHostWriteAuthorization: createAuthorizedConnector }) => {
+        const verifier = pluginWriteAuthorizers.get(this);
+        return verifier
+          ? createAuthorizedConnector(this.options, verifier)
+          : new OfficialMcpConnector(this.options);
+      });
     return this.implementationPromise;
   }
 }

@@ -112,10 +112,14 @@ function cookie(credential: string): Record<string, string> {
   };
 }
 
-function authorizerFor(registry: RoomRbacRegistry) {
+function authorizerFor(
+  registry: RoomRbacRegistry,
+  options: { readonly withDaemonTransport?: boolean } = {},
+) {
   return createRoomControlPlaneRbacAuthorizer({
     resolveRegistry: async () => registry,
     publicOrigin: PUBLIC_ORIGIN,
+    ...(options.withDaemonTransport ? { authorizeDaemonTransport: async () => true } : {}),
   });
 }
 
@@ -145,11 +149,18 @@ describe("Room control-plane RBAC authorizer", () => {
     );
   });
 
+  it("does not expose trusted-device administration when the server transport gate is absent", () => {
+    const authorize = authorizerFor(createInMemoryRoomRbacRegistry());
+
+    expect(authorize.issueTrustedDeviceSession).toBeUndefined();
+    expect(authorize.revokeTrustedDeviceSession).toBeUndefined();
+  });
+
   it("allows Origin-less Room reads while still rejecting mismatched fetch metadata and HTTP outside the explicit loopback switch", async () => {
     const registry = createInMemoryRoomRbacRegistry();
     const { credential } = await issueSession(registry);
     await grant(registry, { grantId: "same-origin-operator", role: "operator", roomId: null });
-    const authorize = authorizerFor(registry);
+    const authorize = authorizerFor(registry, { withDaemonTransport: true });
 
     await expect(authorize(authorizationInput({
       roomId: null,
@@ -240,7 +251,7 @@ describe("Room control-plane RBAC authorizer", () => {
     const registry = createInMemoryRoomRbacRegistry();
     const trustedDevice = await issueSession(registry);
     await grant(registry, { grantId: "owner-without-origin", role: "owner", roomId: null });
-    const authorize = authorizerFor(registry);
+    const authorize = authorizerFor(registry, { withDaemonTransport: true });
 
     await expect(authorize(authorizationInput({
       roomId: null,
@@ -263,17 +274,17 @@ describe("Room control-plane RBAC authorizer", () => {
 
   it("exposes a durable trusted-device issuer without treating its daemon bearer as a Room principal", async () => {
     const registry = createInMemoryRoomRbacRegistry();
-    await grant(registry, { grantId: "issued-device-owner", role: "owner", roomId: null, principalId: "pairing-principal" });
-    const authorize = authorizerFor(registry);
+    const owner = await issueSession(registry, { principalId: "pairing-principal" });
+    await grant(registry, { grantId: "issued-device-owner", role: "owner", roomId: null, principalId: owner.principalId });
+    const authorize = authorizerFor(registry, { withDaemonTransport: true });
 
     const issued = await authorize.issueTrustedDeviceSession?.({
-      request: authorizationInput().request,
+      request: authorizationInput({ headers: cookie(owner.credential) }).request,
       projectId: PROJECT_A,
-      principalId: "pairing-principal",
-      deviceId: "pairing-device",
     });
 
-    expect(issued).toMatchObject({ principalId: "pairing-principal", deviceId: "pairing-device" });
+    expect(issued).toMatchObject({ principalId: "pairing-principal" });
+    expect(issued?.deviceId).not.toBe("pairing-device");
     expect(issued?.credential).toMatch(/^[A-Za-z0-9_-]{43,}$/u);
     await expect(authorize(authorizationInput({
       roomId: null,
@@ -284,17 +295,16 @@ describe("Room control-plane RBAC authorizer", () => {
 
   it("revokes a durable trusted-device session so its Cookie cannot authorize a later Room read", async () => {
     const registry = createInMemoryRoomRbacRegistry();
-    await grant(registry, { grantId: "revoked-device-owner", role: "owner", roomId: null, principalId: "revoked-principal" });
-    const authorize = authorizerFor(registry);
+    const owner = await issueSession(registry, { principalId: "revoked-principal" });
+    await grant(registry, { grantId: "revoked-device-owner", role: "owner", roomId: null, principalId: owner.principalId });
+    const authorize = authorizerFor(registry, { withDaemonTransport: true });
     const issued = await authorize.issueTrustedDeviceSession?.({
-      request: authorizationInput().request,
+      request: authorizationInput({ headers: cookie(owner.credential) }).request,
       projectId: PROJECT_A,
-      principalId: "revoked-principal",
-      deviceId: "revoked-device",
     });
 
     const revoked = await authorize.revokeTrustedDeviceSession?.({
-      request: authorizationInput().request,
+      request: authorizationInput({ headers: cookie(owner.credential) }).request,
       projectId: PROJECT_A,
       sessionId: issued?.sessionId ?? "missing-session",
       expectedSessionVersion: 1,
@@ -459,5 +469,108 @@ describe("Room control-plane RBAC authorizer", () => {
         "sec-fetch-site": "cross-site",
       },
     }))).resolves.toEqual({ allowed: false, reason: "trusted-device-cookie-required" });
+  });
+
+  it("does not expose trusted-device administration without a server transport gate", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    const owner = await issueSession(registry, { principalId: "pairing-owner" });
+    await grant(registry, {
+      grantId: "pairing-owner-grant",
+      role: "owner",
+      roomId: null,
+      principalId: owner.principalId,
+    });
+
+    const authorize = authorizerFor(registry);
+
+    expect(authorize.issueTrustedDeviceSession).toBeUndefined();
+    expect(authorize.revokeTrustedDeviceSession).toBeUndefined();
+  });
+
+  it("derives a paired device identity from an authenticated owner instead of request claims", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    const owner = await issueSession(registry, { principalId: "pairing-owner" });
+    await grant(registry, {
+      grantId: "pairing-owner-grant",
+      role: "owner",
+      roomId: null,
+      principalId: owner.principalId,
+    });
+    const authorize = createRoomControlPlaneRbacAuthorizer({
+      resolveRegistry: async () => registry,
+      publicOrigin: PUBLIC_ORIGIN,
+      authorizeDaemonTransport: async () => true,
+    } as unknown as Parameters<typeof createRoomControlPlaneRbacAuthorizer>[0]);
+
+    const issued = await authorize.issueTrustedDeviceSession?.({
+      request: authorizationInput({ headers: cookie(owner.credential) }).request,
+      projectId: PROJECT_A,
+      principalId: "forged-owner",
+      deviceId: "forged-device",
+    } as never);
+
+    expect(issued).toMatchObject({ principalId: owner.principalId });
+    expect(issued?.deviceId).not.toBe("forged-device");
+  });
+
+  it("denies operator pairing and cross-project session revocation before a registry mutation", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    const operator = await issueSession(registry, { principalId: "pairing-operator" });
+    await grant(registry, {
+      grantId: "pairing-operator-grant",
+      role: "operator",
+      roomId: null,
+      principalId: operator.principalId,
+    });
+    const foreignCredential = createTrustedRoomDeviceCredential();
+    await registry.issueTrustedDeviceSession({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: PROJECT_B,
+      sessionId: "foreign-device-session",
+      principalId: "foreign-owner",
+      deviceId: "foreign-device",
+      credential: foreignCredential,
+      issuedAt: timestamp(-60_000),
+      expiresAt: timestamp(60 * 60_000),
+      idempotencyKey: "foreign-device-session",
+    });
+    const authorize = createRoomControlPlaneRbacAuthorizer({
+      resolveRegistry: async () => registry,
+      publicOrigin: PUBLIC_ORIGIN,
+      authorizeDaemonTransport: async () => true,
+    } as unknown as Parameters<typeof createRoomControlPlaneRbacAuthorizer>[0]);
+
+    await expect(authorize.issueTrustedDeviceSession?.({
+      request: authorizationInput({ headers: cookie(operator.credential) }).request,
+      projectId: PROJECT_A,
+      principalId: operator.principalId,
+      deviceId: "operator-selected-device",
+    } as never)).rejects.toMatchObject({ details: { code: "ROOM_DEVICE_SESSION_ACCESS_DENIED" } });
+    await expect(authorize.revokeTrustedDeviceSession?.({
+      request: authorizationInput({ headers: cookie(operator.credential) }).request,
+      projectId: PROJECT_B,
+      sessionId: "foreign-device-session",
+      expectedSessionVersion: 1,
+    })).rejects.toMatchObject({ details: { code: "ROOM_DEVICE_SESSION_ACCESS_DENIED" } });
+  });
+
+  it("fails closed for first bootstrap until an owner/admin device is provisioned outside the public Room API", async () => {
+    const registry = createInMemoryRoomRbacRegistry();
+    const authorize = createRoomControlPlaneRbacAuthorizer({
+      resolveRegistry: async () => registry,
+      publicOrigin: PUBLIC_ORIGIN,
+      authorizeDaemonTransport: async () => true,
+    } as unknown as Parameters<typeof createRoomControlPlaneRbacAuthorizer>[0]);
+
+    await expect(authorize.issueTrustedDeviceSession?.({
+      request: authorizationInput({
+        headers: {
+          host: "dashboard.example",
+          origin: PUBLIC_ORIGIN,
+          "sec-fetch-site": "same-origin",
+        },
+      }).request,
+      projectId: PROJECT_A,
+    } as never)).rejects.toMatchObject({ details: { code: "ROOM_DEVICE_SESSION_ACCESS_DENIED" } });
   });
 });

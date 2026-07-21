@@ -434,6 +434,48 @@ export const roomEvolutionHypotheses = roomSchema.table("room_evolution_hypothes
   `),
 ]);
 
+/*
+FNXC:RoomEvolutionLegacyProvenance 2026-07-19-21:40:
+0022 records that advertised promotion or canary success without the 0027 trust
+receipts remain auditable but are quarantined and cannot be elevated into new
+acceptance proof. The audit snapshot itself is append-only at the database.
+*/
+export const roomEvolutionLegacyProvenanceQuarantines = roomSchema.table("room_evolution_legacy_provenance_quarantines", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  recordKind: text("record_kind").notNull(),
+  recordId: text("record_id").notNull(),
+  quarantineReason: text("quarantine_reason").notNull(),
+  sourceMigrationVersion: text("source_migration_version").notNull(),
+  legacySnapshot: jsonb("legacy_snapshot").notNull(),
+  quarantinedAt: text("quarantined_at").notNull(),
+}, (t) => [
+  unique("room_evolution_legacy_provenance_quarantines_record_unique")
+    .on(t.projectId, t.scopeKey, t.recordKind, t.recordId),
+  index("idx_room_evolution_legacy_provenance_quarantines_scope")
+    .on(t.projectId, t.scopeKey, t.recordKind, t.quarantinedAt),
+  check("room_evolution_legacy_provenance_quarantines_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (
+        ${t.scopeKind} = 'room'
+        AND ${t.roomId} IS NOT NULL
+        AND btrim(${t.roomId}) <> ''
+        AND ${t.scopeKey} = ('room:' || ${t.roomId})
+      )
+    )
+  )`),
+  check("room_evolution_legacy_provenance_quarantines_kind_check", sql`${t.recordKind} IN ('gate_result','canary','promotion_decision')`),
+  check("room_evolution_legacy_provenance_quarantines_source_check", sql`${t.sourceMigrationVersion} = '0022'`),
+  check("room_evolution_legacy_provenance_quarantines_snapshot_check", sql`jsonb_typeof(${t.legacySnapshot}) = 'object'`),
+  check("room_evolution_legacy_provenance_quarantines_nonblank_check", sql`
+    btrim(${t.recordId}) <> ''
+    AND btrim(${t.quarantineReason}) <> ''
+    AND btrim(${t.quarantinedAt}) <> ''
+  `),
+]);
+
 /* FNXC:RoomEvolutionTrustReceipts 2026-07-19: identity/role/binding evidence is
 append-only and points at the actual Room binding generation, not an actor string. */
 export const roomEvolutionTrustedBindings = roomSchema.table("room_evolution_trusted_bindings", {
@@ -1286,6 +1328,196 @@ export const roomEvolutionRollbacks = roomSchema.table("room_evolution_rollbacks
   check("room_evolution_rollbacks_nonblank_check", sql`
     btrim(${t.reason}) <> ''
     AND btrim(${t.executedAt}) <> ''
+  `),
+]);
+
+/*
+FNXC:RoomEvolutionExecutionRecovery 2026-07-19-21:36:
+These tables are a durable execution-intent and effect-outbox boundary only.
+They bind request/effect payload hashes, claims, recovery attempts, and outcomes
+without asserting that an Engine, provider, source candidate, or policy change ran.
+*/
+export const roomEvolutionExecutionRuns = roomSchema.table("room_evolution_execution_runs", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  experimentId: text("experiment_id").notNull(),
+  candidateVersionId: text("candidate_version_id").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  request: jsonb("request").notNull(),
+  requestHash: text("request_hash").notNull(),
+  state: text("state").notNull(),
+  effectCount: integer("effect_count").notNull(),
+  completedEffectCount: integer("completed_effect_count").notNull().default(0),
+  failedEffectCount: integer("failed_effect_count").notNull().default(0),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  completedAt: text("completed_at"),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_evolution_execution_runs_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.experimentId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExperiments.id, roomEvolutionExperiments.projectId, roomEvolutionExperiments.scopeKey],
+    name: "room_evolution_execution_runs_experiment_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.candidateVersionId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionCandidateVersions.id, roomEvolutionCandidateVersions.projectId, roomEvolutionCandidateVersions.scopeKey],
+    name: "room_evolution_execution_runs_candidate_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_execution_runs_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_execution_runs_idempotency_unique").on(t.projectId, t.scopeKey, t.idempotencyKey),
+  index("idx_room_evolution_execution_runs_scope_state").on(t.projectId, t.scopeKey, t.state, t.updatedAt),
+  check("room_evolution_execution_runs_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (${t.scopeKind} = 'room' AND ${t.roomId} IS NOT NULL AND ${t.scopeKey} = ('room:' || ${t.roomId}))
+    )
+  )`),
+  check("room_evolution_execution_runs_payload_check", sql`jsonb_typeof(${t.request}) = 'object'`),
+  check("room_evolution_execution_runs_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_execution_runs_state_check", sql`${t.state} IN ('pending','running','succeeded','failed')`),
+  check("room_evolution_execution_runs_counts_check", sql`
+    ${t.effectCount} BETWEEN 1 AND 2147483647
+    AND ${t.completedEffectCount} BETWEEN 0 AND ${t.effectCount}
+    AND ${t.failedEffectCount} BETWEEN 0 AND ${t.effectCount}
+    AND ${t.completedEffectCount} + ${t.failedEffectCount} <= ${t.effectCount}
+  `),
+  check("room_evolution_execution_runs_terminal_check", sql`
+    (${t.state} IN ('pending','running') AND ${t.completedAt} IS NULL)
+    OR (${t.state} IN ('succeeded','failed') AND ${t.completedAt} IS NOT NULL)
+  `),
+  check("room_evolution_execution_runs_nonblank_check", sql`
+    btrim(${t.experimentId}) <> ''
+    AND btrim(${t.candidateVersionId}) <> ''
+    AND btrim(${t.idempotencyKey}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+    AND btrim(${t.updatedAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionEffectOutbox = roomSchema.table("room_evolution_effect_outbox", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  runId: text("run_id").notNull(),
+  effectKey: text("effect_key").notNull(),
+  effectKind: text("effect_kind").notNull(),
+  payload: jsonb("payload").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  state: text("state").notNull(),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  maxAttempts: integer("max_attempts").notNull(),
+  nextEligibleAt: text("next_eligible_at"),
+  claimToken: text("claim_token"),
+  claimExpiresAt: text("claim_expires_at"),
+  claimedByWorkerId: text("claimed_by_worker_id"),
+  claimedAt: text("claimed_at"),
+  lastErrorCode: text("last_error_code"),
+  completedAt: text("completed_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.runId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExecutionRuns.id, roomEvolutionExecutionRuns.projectId, roomEvolutionExecutionRuns.scopeKey],
+    name: "room_evolution_effect_outbox_run_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_effect_outbox_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_effect_outbox_run_key_unique").on(t.projectId, t.scopeKey, t.runId, t.effectKey),
+  index("idx_room_evolution_effect_outbox_claimable").on(t.projectId, t.scopeKey, t.state, t.nextEligibleAt, t.claimExpiresAt),
+  check("room_evolution_effect_outbox_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (${t.scopeKind} = 'room' AND ${t.roomId} IS NOT NULL AND ${t.scopeKey} = ('room:' || ${t.roomId}))
+    )
+  )`),
+  check("room_evolution_effect_outbox_payload_check", sql`jsonb_typeof(${t.payload}) = 'object'`),
+  check("room_evolution_effect_outbox_hash_check", sql`${t.payloadHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_effect_outbox_state_check", sql`${t.state} IN ('pending','claimed','retry_scheduled','succeeded','failed')`),
+  check("room_evolution_effect_outbox_attempts_check", sql`
+    ${t.attemptCount} BETWEEN 0 AND ${t.maxAttempts}
+    AND ${t.maxAttempts} BETWEEN 1 AND 2147483647
+  `),
+  check("room_evolution_effect_outbox_state_shape_check", sql`
+    (${t.state} = 'pending'
+      AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.claimedByWorkerId} IS NULL AND ${t.claimedAt} IS NULL
+      AND ${t.nextEligibleAt} IS NOT NULL AND ${t.completedAt} IS NULL
+      AND ${t.lastErrorCode} IS NULL)
+    OR (${t.state} = 'claimed'
+      AND ${t.claimToken} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL
+      AND ${t.claimedByWorkerId} IS NOT NULL AND ${t.claimedAt} IS NOT NULL
+      AND ${t.nextEligibleAt} IS NULL AND ${t.completedAt} IS NULL)
+    OR (${t.state} = 'retry_scheduled'
+      AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.claimedByWorkerId} IS NULL AND ${t.claimedAt} IS NULL
+      AND ${t.nextEligibleAt} IS NOT NULL AND ${t.completedAt} IS NULL
+      AND ${t.lastErrorCode} IS NOT NULL)
+    OR (${t.state} IN ('succeeded','failed')
+      AND ${t.claimToken} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.claimedByWorkerId} IS NULL AND ${t.claimedAt} IS NULL
+      AND ${t.nextEligibleAt} IS NULL AND ${t.completedAt} IS NOT NULL)
+  `),
+  check("room_evolution_effect_outbox_nonblank_check", sql`
+    btrim(${t.runId}) <> ''
+    AND btrim(${t.effectKey}) <> ''
+    AND btrim(${t.effectKind}) <> ''
+    AND btrim(${t.createdAt}) <> ''
+    AND btrim(${t.updatedAt}) <> ''
+  `),
+]);
+
+export const roomEvolutionExecutionOutcomes = roomSchema.table("room_evolution_execution_outcomes", {
+  id: text("id").primaryKey(),
+  ...evolutionScopeColumns(),
+  runId: text("run_id").notNull(),
+  effectId: text("effect_id").notNull(),
+  claimToken: text("claim_token").notNull(),
+  attemptCount: integer("attempt_count").notNull(),
+  kind: text("kind").notNull(),
+  payload: jsonb("payload").notNull(),
+  payloadHash: text("payload_hash").notNull(),
+  errorCode: text("error_code"),
+  recordedAt: text("recorded_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.runId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionExecutionRuns.id, roomEvolutionExecutionRuns.projectId, roomEvolutionExecutionRuns.scopeKey],
+    name: "room_evolution_execution_outcomes_run_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.effectId, t.projectId, t.scopeKey],
+    foreignColumns: [roomEvolutionEffectOutbox.id, roomEvolutionEffectOutbox.projectId, roomEvolutionEffectOutbox.scopeKey],
+    name: "room_evolution_execution_outcomes_effect_fkey",
+  }).onDelete("restrict"),
+  unique("room_evolution_execution_outcomes_id_scope_unique").on(t.id, t.projectId, t.scopeKey),
+  unique("room_evolution_execution_outcomes_effect_claim_unique").on(t.projectId, t.scopeKey, t.effectId, t.claimToken),
+  index("idx_room_evolution_execution_outcomes_run_time").on(t.projectId, t.scopeKey, t.runId, t.recordedAt),
+  check("room_evolution_execution_outcomes_scope_check", sql`(
+    btrim(${t.projectId}) <> ''
+    AND (
+      (${t.scopeKind} = 'project' AND ${t.roomId} IS NULL AND ${t.scopeKey} = ('project:' || ${t.projectId}))
+      OR (${t.scopeKind} = 'room' AND ${t.roomId} IS NOT NULL AND ${t.scopeKey} = ('room:' || ${t.roomId}))
+    )
+  )`),
+  check("room_evolution_execution_outcomes_payload_check", sql`jsonb_typeof(${t.payload}) = 'object'`),
+  check("room_evolution_execution_outcomes_hash_check", sql`${t.payloadHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_evolution_execution_outcomes_kind_check", sql`${t.kind} IN ('claim_expired','retry_scheduled','succeeded','failed')`),
+  check("room_evolution_execution_outcomes_error_shape_check", sql`
+    (${t.kind} = 'succeeded' AND ${t.errorCode} IS NULL)
+    OR (${t.kind} <> 'succeeded' AND ${t.errorCode} IS NOT NULL)
+  `),
+  check("room_evolution_execution_outcomes_attempt_check", sql`${t.attemptCount} BETWEEN 1 AND 2147483647`),
+  check("room_evolution_execution_outcomes_nonblank_check", sql`
+    btrim(${t.runId}) <> ''
+    AND btrim(${t.effectId}) <> ''
+    AND btrim(${t.claimToken}) <> ''
+    AND btrim(${t.recordedAt}) <> ''
   `),
 ]);
 
@@ -2726,6 +2958,382 @@ export const roomProviderBackpressureReservations = roomSchema.table("room_provi
   `),
 ]);
 
+/**
+ * FNXC:RoomProviderCleanupLedger 2026-07-20-00:18:
+ * A provider reservation that was admitted after its caller timed out cannot be
+ * released by a replacement Room worker. Keep an immutable, room-scoped cleanup
+ * action until the original reservation expires; the cleanup worker may only
+ * record that expiry, never forge the original provider-release fence.
+ */
+export const roomProviderBackpressureCleanupActions = roomSchema.table("room_provider_backpressure_cleanup_actions", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  roomId: text("room_id").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  outboxId: text("outbox_id"),
+  outboxBindingId: text("outbox_binding_id"),
+  outboxAttemptId: text("outbox_attempt_id"),
+  outboxAttemptCount: integer("outbox_attempt_count"),
+  reservationId: text("reservation_id").notNull(),
+  requestId: text("request_id").notNull(),
+  claimId: text("claim_id").notNull(),
+  originalLeaseId: text("original_lease_id").notNull(),
+  originalLeaseHolderId: text("original_lease_holder_id").notNull(),
+  originalLeaseHostId: text("original_lease_host_id").notNull(),
+  originalLeaseEpoch: bigint("original_lease_epoch", { mode: "number" }).notNull(),
+  expectedAggregateVersion: bigint("expected_aggregate_version", { mode: "number" }).notNull(),
+  reservationExpiresAt: text("reservation_expires_at").notNull(),
+  completionKind: text("completion_kind").notNull(),
+  state: text("state").notNull(),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  claimToken: text("claim_token"),
+  claimLeaseId: text("claim_lease_id"),
+  claimLeaseEpoch: bigint("claim_lease_epoch", { mode: "number" }),
+  claimedAt: text("claimed_at"),
+  claimExpiresAt: text("claim_expires_at"),
+  lastErrorCode: text("last_error_code"),
+  completedAt: text("completed_at"),
+  outboxUnblockedAt: text("outbox_unblocked_at"),
+  outboxFinalizedAt: text("outbox_finalized_at"),
+  outboxFinalizationOutcome: text("outbox_finalization_outcome"),
+  outboxFinalizationReason: text("outbox_finalization_reason"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_provider_backpressure_cleanup_actions_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.reservationId, t.projectId],
+    foreignColumns: [roomProviderBackpressureReservations.id, roomProviderBackpressureReservations.projectId],
+    name: "room_provider_backpressure_cleanup_actions_reservation_project_fkey",
+  }).onDelete("restrict"),
+  unique("room_provider_backpressure_cleanup_actions_id_project_unique").on(t.id, t.projectId),
+  unique("room_provider_backpressure_cleanup_actions_idempotency_unique").on(t.projectId, t.roomId, t.idempotencyKey),
+  unique("room_provider_backpressure_cleanup_actions_reservation_kind_unique").on(t.projectId, t.reservationId, t.completionKind),
+  index("idx_room_provider_backpressure_cleanup_actions_claimable")
+    .on(t.projectId, t.roomId, t.state, t.reservationExpiresAt, t.claimExpiresAt, t.createdAt),
+  check("room_provider_backpressure_cleanup_actions_completion_kind_check", sql`${t.completionKind} IN ('pre_send_not_started','pre_claim_not_started','late_admission_not_started')`),
+  /*
+  FNXC:RoomProviderPreClaimTargetShape 2026-07-20-22:48:
+  The durable ledger must distinguish an exact claimed attempt from an exact
+  pending generation. Pre-claim evidence has no attempt row, while targetless
+  evidence preserves only the historical inert outbox-id form without binding
+  or attempt identity for pre-send/late-admission cleanup records.
+  */
+  check("room_provider_backpressure_cleanup_actions_target_shape_check", sql`
+    (
+      ${t.completionKind} = 'pre_claim_not_started'
+      AND ${t.outboxId} IS NOT NULL
+      AND ${t.outboxBindingId} IS NOT NULL
+      AND ${t.outboxAttemptId} IS NULL
+      AND ${t.outboxAttemptCount} BETWEEN 0 AND 2147483647
+    )
+    OR (
+      ${t.completionKind} = 'pre_send_not_started'
+      AND (
+        (
+          ${t.outboxBindingId} IS NULL
+          AND ${t.outboxAttemptId} IS NULL
+          AND ${t.outboxAttemptCount} IS NULL
+        )
+        OR (
+          ${t.outboxId} IS NOT NULL
+          AND ${t.outboxBindingId} IS NOT NULL
+          AND ${t.outboxAttemptId} IS NOT NULL
+          AND ${t.outboxAttemptCount} BETWEEN 1 AND 2147483647
+        )
+      )
+    )
+    OR (
+      ${t.completionKind} = 'late_admission_not_started'
+      AND ${t.outboxBindingId} IS NULL
+      AND ${t.outboxAttemptId} IS NULL
+      AND ${t.outboxAttemptCount} IS NULL
+    )
+  `),
+  check("room_provider_backpressure_cleanup_actions_state_check", sql`${t.state} IN ('pending','claimed','expired','released')`),
+  check("room_provider_backpressure_cleanup_actions_attempt_count_check", sql`${t.attemptCount} BETWEEN 0 AND 2147483647`),
+  check("room_provider_backpressure_cleanup_actions_original_epoch_check", sql`${t.originalLeaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_provider_backpressure_cleanup_actions_claim_epoch_check", sql`${t.claimLeaseEpoch} IS NULL OR ${t.claimLeaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_provider_backpressure_cleanup_actions_version_check", sql`${t.expectedAggregateVersion} BETWEEN 0 AND 9007199254740991`),
+  check("room_provider_backpressure_cleanup_actions_state_shape_check", sql`
+    (${t.state} = 'pending'
+      AND ${t.claimToken} IS NULL AND ${t.claimLeaseId} IS NULL AND ${t.claimLeaseEpoch} IS NULL
+      AND ${t.claimedAt} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.lastErrorCode} IS NULL AND ${t.completedAt} IS NULL)
+    OR (${t.state} = 'claimed'
+      AND ${t.claimToken} IS NOT NULL AND ${t.claimLeaseId} IS NOT NULL AND ${t.claimLeaseEpoch} IS NOT NULL
+      AND ${t.claimedAt} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL
+      AND ${t.lastErrorCode} IS NULL AND ${t.completedAt} IS NULL)
+    OR (${t.state} = 'expired'
+      AND ${t.claimToken} IS NULL AND ${t.claimLeaseId} IS NULL AND ${t.claimLeaseEpoch} IS NULL
+      AND ${t.claimedAt} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.lastErrorCode} = 'reservation_expired_unreleased' AND ${t.completedAt} IS NOT NULL)
+    OR (${t.state} = 'released'
+      AND ${t.claimToken} IS NULL AND ${t.claimLeaseId} IS NULL AND ${t.claimLeaseEpoch} IS NULL
+      AND ${t.claimedAt} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.lastErrorCode} IS NULL AND ${t.completedAt} IS NOT NULL)
+  `),
+  check("room_provider_backpressure_cleanup_actions_outbox_finalization_shape_check", sql`
+    (${t.outboxFinalizedAt} IS NULL
+      AND ${t.outboxFinalizationOutcome} IS NULL
+      AND ${t.outboxFinalizationReason} IS NULL
+      AND ${t.outboxUnblockedAt} IS NULL)
+    OR (${t.outboxFinalizedAt} IS NOT NULL
+      AND ${t.outboxFinalizationOutcome} = 'unblocked'
+      AND ${t.outboxFinalizationReason} IS NULL
+      AND ${t.outboxUnblockedAt} = ${t.outboxFinalizedAt})
+    OR (${t.outboxFinalizedAt} IS NOT NULL
+      AND ${t.outboxFinalizationOutcome} = 'withheld'
+      AND ${t.outboxFinalizationReason} IS NOT NULL
+      AND ${t.outboxUnblockedAt} IS NULL)
+  `),
+  check("room_provider_backpressure_cleanup_actions_time_check", sql`
+    ${t.reservationExpiresAt} > ${t.createdAt}
+    AND (${t.claimExpiresAt} IS NULL OR ${t.claimedAt} IS NULL OR ${t.claimExpiresAt} > ${t.claimedAt})
+    AND (${t.completedAt} IS NULL OR ${t.completedAt} >= ${t.createdAt})
+  `),
+  check("room_provider_backpressure_cleanup_actions_nonblank_check", sql`
+    btrim(${t.id}) <> '' AND btrim(${t.projectId}) <> '' AND btrim(${t.roomId}) <> ''
+    AND btrim(${t.idempotencyKey}) <> '' AND btrim(${t.reservationId}) <> ''
+    AND btrim(${t.requestId}) <> '' AND btrim(${t.claimId}) <> ''
+    AND btrim(${t.originalLeaseId}) <> '' AND btrim(${t.originalLeaseHolderId}) <> ''
+    AND btrim(${t.originalLeaseHostId}) <> '' AND btrim(${t.reservationExpiresAt}) <> ''
+    AND btrim(${t.completionKind}) <> '' AND btrim(${t.state}) <> ''
+    AND btrim(${t.createdAt}) <> '' AND btrim(${t.updatedAt}) <> ''
+    AND (${t.outboxId} IS NULL OR btrim(${t.outboxId}) <> '')
+    AND (${t.outboxBindingId} IS NULL OR btrim(${t.outboxBindingId}) <> '')
+    AND (${t.outboxAttemptId} IS NULL OR btrim(${t.outboxAttemptId}) <> '')
+    AND (${t.outboxAttemptCount} IS NULL OR ${t.outboxAttemptCount} BETWEEN 0 AND 2147483647)
+    AND (${t.claimToken} IS NULL OR btrim(${t.claimToken}) <> '')
+    AND (${t.claimLeaseId} IS NULL OR btrim(${t.claimLeaseId}) <> '')
+    AND (${t.claimedAt} IS NULL OR btrim(${t.claimedAt}) <> '')
+    AND (${t.claimExpiresAt} IS NULL OR btrim(${t.claimExpiresAt}) <> '')
+    AND (${t.lastErrorCode} IS NULL OR btrim(${t.lastErrorCode}) <> '')
+    AND (${t.completedAt} IS NULL OR btrim(${t.completedAt}) <> '')
+    AND (${t.outboxUnblockedAt} IS NULL OR btrim(${t.outboxUnblockedAt}) <> '')
+    AND (${t.outboxFinalizedAt} IS NULL OR btrim(${t.outboxFinalizedAt}) <> '')
+    AND (${t.outboxFinalizationOutcome} IS NULL OR btrim(${t.outboxFinalizationOutcome}) <> '')
+    AND (${t.outboxFinalizationReason} IS NULL OR btrim(${t.outboxFinalizationReason}) <> '')
+  `),
+]);
+
+/*
+FNXC:RoomProviderAdmissionRecoveryReceipt 2026-07-21-01:31:
+The Core receipt is immutable evidence that the standard sender-fenced timeout
+path was actually admitted into the durable control plane. Restart recovery
+must compare this historical identity rather than trusting an Engine marker.
+*/
+export const roomProviderAdmissionRecoveryReceipts = roomSchema.table("room_provider_admission_recovery_receipts", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  roomId: text("room_id").notNull(),
+  outboxId: text("outbox_id").notNull(),
+  outboxBindingId: text("outbox_binding_id").notNull(),
+  outboxAttemptCount: integer("outbox_attempt_count").notNull(),
+  gateAttemptId: text("gate_attempt_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  senderLeaseId: text("sender_lease_id").notNull(),
+  senderLeaseHolderId: text("sender_lease_holder_id").notNull(),
+  senderLeaseHostId: text("sender_lease_host_id").notNull(),
+  senderLeaseEpoch: bigint("sender_lease_epoch", { mode: "number" }).notNull(),
+  issuedAt: text("issued_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_provider_admission_recovery_receipt_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.outboxId],
+    foreignColumns: [roomOutbox.id],
+    name: "room_provider_admission_recovery_receipt_outbox_fkey",
+  }).onDelete("restrict"),
+  unique("room_provider_admission_recovery_receipt_id_project_unique").on(t.id, t.projectId),
+  unique("room_provider_admission_recovery_receipt_gate_attempt_unique")
+    .on(t.projectId, t.roomId, t.gateAttemptId),
+  unique("room_provider_admission_recovery_receipt_target_unique")
+    .on(t.projectId, t.roomId, t.outboxId, t.outboxAttemptCount),
+  index("idx_room_provider_admission_recovery_receipt_target")
+    .on(t.projectId, t.roomId, t.outboxId, t.outboxAttemptCount),
+  check("room_provider_admission_recovery_receipt_request_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_provider_admission_recovery_receipt_attempt_count_check", sql`${t.outboxAttemptCount} BETWEEN 0 AND 2147483647`),
+  check("room_provider_admission_recovery_receipt_sender_epoch_check", sql`${t.senderLeaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_provider_admission_recovery_receipt_nonblank_check", sql`
+    btrim(${t.id}) <> '' AND btrim(${t.projectId}) <> '' AND btrim(${t.roomId}) <> ''
+    AND btrim(${t.outboxId}) <> '' AND btrim(${t.outboxBindingId}) <> ''
+    AND btrim(${t.gateAttemptId}) <> '' AND btrim(${t.requestHash}) <> ''
+    AND btrim(${t.senderLeaseId}) <> '' AND btrim(${t.senderLeaseHolderId}) <> ''
+    AND btrim(${t.senderLeaseHostId}) <> '' AND btrim(${t.issuedAt}) <> ''
+  `),
+]);
+
+/*
+FNXC:RoomProviderAdmissionTimeoutTombstone 2026-07-20-23:10:
+A provider-admission deadline is not proof that the provider rejected or
+cancelled the request. Persist the exact pending outbox generation and immutable
+gate request under its sender fence before returning timeout. The tombstone can
+then resolve only by binding a verified reservation to the existing pre-claim
+cleanup ledger or by recording an explicit terminal no-permit gate outcome.
+Only recovery-claim ownership expires; no tombstone/proof clock transition can
+reopen delivery while a late permit is still possible.
+*/
+export const roomProviderAdmissionTimeoutTombstones = roomSchema.table("room_provider_admission_timeout_tombstones", {
+  id: text("id").primaryKey(),
+  projectId: text("project_id").notNull(),
+  roomId: text("room_id").notNull(),
+  gateAttemptId: text("gate_attempt_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  outboxId: text("outbox_id").notNull(),
+  outboxBindingId: text("outbox_binding_id").notNull(),
+  outboxAttemptCount: integer("outbox_attempt_count").notNull(),
+  senderLeaseId: text("sender_lease_id").notNull(),
+  senderLeaseHolderId: text("sender_lease_holder_id").notNull(),
+  senderLeaseHostId: text("sender_lease_host_id").notNull(),
+  senderLeaseEpoch: bigint("sender_lease_epoch", { mode: "number" }).notNull(),
+  timeoutErrorCode: text("timeout_error_code").notNull(),
+  recoveryProtocol: text("recovery_protocol").notNull(),
+  recoveryReceiptId: text("recovery_receipt_id"),
+  state: text("state").notNull(),
+  cleanupActionId: text("cleanup_action_id"),
+  reservationId: text("reservation_id"),
+  terminalGateOutcomeId: text("terminal_gate_outcome_id"),
+  terminalGateOutcome: text("terminal_gate_outcome"),
+  terminalAt: text("terminal_at"),
+  claimToken: text("claim_token"),
+  claimLeaseId: text("claim_lease_id"),
+  claimLeaseEpoch: bigint("claim_lease_epoch", { mode: "number" }),
+  claimedAt: text("claimed_at"),
+  claimExpiresAt: text("claim_expires_at"),
+  nextAttemptAt: text("next_attempt_at"),
+  resolvedAt: text("resolved_at"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  foreignKey({
+    columns: [t.roomId, t.projectId],
+    foreignColumns: [operationalRooms.id, operationalRooms.projectId],
+    name: "room_provider_admission_timeout_room_project_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.outboxId],
+    foreignColumns: [roomOutbox.id],
+    name: "room_provider_admission_timeout_outbox_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.cleanupActionId, t.projectId],
+    foreignColumns: [roomProviderBackpressureCleanupActions.id, roomProviderBackpressureCleanupActions.projectId],
+    name: "room_provider_admission_timeout_cleanup_action_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.reservationId, t.projectId],
+    foreignColumns: [roomProviderBackpressureReservations.id, roomProviderBackpressureReservations.projectId],
+    name: "room_provider_admission_timeout_reservation_fkey",
+  }).onDelete("restrict"),
+  foreignKey({
+    columns: [t.recoveryReceiptId, t.projectId],
+    foreignColumns: [roomProviderAdmissionRecoveryReceipts.id, roomProviderAdmissionRecoveryReceipts.projectId],
+    name: "room_provider_admission_timeout_recovery_receipt_fkey",
+  }).onDelete("restrict"),
+  unique("room_provider_admission_timeout_gate_attempt_unique")
+    .on(t.projectId, t.roomId, t.gateAttemptId),
+  unique("room_provider_admission_timeout_target_unique")
+    .on(t.projectId, t.roomId, t.outboxId, t.outboxAttemptCount),
+  unique("room_provider_admission_timeout_recovery_receipt_unique")
+    .on(t.projectId, t.recoveryReceiptId),
+  unique("room_provider_admission_timeout_cleanup_action_unique")
+    .on(t.projectId, t.cleanupActionId),
+  unique("room_provider_admission_timeout_terminal_outcome_unique")
+    .on(t.projectId, t.terminalGateOutcomeId),
+  unique("room_provider_admission_timeout_claim_token_unique")
+    .on(t.projectId, t.claimToken),
+  index("idx_room_provider_admission_timeout_unresolved")
+    .on(t.projectId, t.roomId, t.state, t.createdAt),
+  check("room_provider_admission_timeout_request_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_provider_admission_timeout_attempt_count_check", sql`${t.outboxAttemptCount} BETWEEN 0 AND 2147483647`),
+  check("room_provider_admission_timeout_sender_epoch_check", sql`${t.senderLeaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_provider_admission_timeout_recovery_protocol_check", sql`${t.recoveryProtocol} IN ('opaque','core_sender_fenced_v1')`),
+  check("room_provider_admission_timeout_recovery_receipt_shape_check", sql`
+    (${t.recoveryProtocol} = 'opaque' AND ${t.recoveryReceiptId} IS NULL)
+    OR (${t.recoveryProtocol} = 'core_sender_fenced_v1' AND ${t.recoveryReceiptId} IS NOT NULL)
+  `),
+  check("room_provider_admission_timeout_claim_epoch_check", sql`${t.claimLeaseEpoch} IS NULL OR ${t.claimLeaseEpoch} BETWEEN 1 AND 9007199254740991`),
+  check("room_provider_admission_timeout_state_check", sql`${t.state} IN ('pending','reservation_bound','terminal_outcome_recorded','terminal_outcome_claimed','terminal_without_permit')`),
+  check("room_provider_admission_timeout_terminal_outcome_check", sql`
+    ${t.terminalGateOutcome} IS NULL
+    OR ${t.terminalGateOutcome} IN ('deferred_without_permit','cancelled_without_permit','failed_without_permit','core_sender_fenced_no_reservation')
+  `),
+  check("room_provider_admission_timeout_state_shape_check", sql`
+    (${t.state} = 'pending'
+      AND ${t.cleanupActionId} IS NULL AND ${t.reservationId} IS NULL
+      AND ${t.terminalGateOutcomeId} IS NULL AND ${t.terminalGateOutcome} IS NULL
+      AND ${t.terminalAt} IS NULL
+      AND ${t.claimToken} IS NULL AND ${t.claimLeaseId} IS NULL AND ${t.claimLeaseEpoch} IS NULL
+      AND ${t.claimedAt} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.nextAttemptAt} IS NULL AND ${t.resolvedAt} IS NULL)
+    OR (${t.state} = 'reservation_bound'
+      AND ${t.cleanupActionId} IS NOT NULL AND ${t.reservationId} IS NOT NULL
+      AND ${t.terminalGateOutcomeId} IS NULL AND ${t.terminalGateOutcome} IS NULL
+      AND ${t.terminalAt} IS NULL
+      AND ${t.claimToken} IS NULL AND ${t.claimLeaseId} IS NULL AND ${t.claimLeaseEpoch} IS NULL
+      AND ${t.claimedAt} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.nextAttemptAt} IS NULL AND ${t.resolvedAt} IS NOT NULL)
+    OR (${t.state} = 'terminal_outcome_recorded'
+      AND ${t.cleanupActionId} IS NULL AND ${t.reservationId} IS NULL
+      AND ${t.terminalGateOutcomeId} IS NOT NULL AND ${t.terminalGateOutcome} IS NOT NULL
+      AND ${t.terminalAt} IS NOT NULL
+      AND ${t.claimToken} IS NULL AND ${t.claimLeaseId} IS NULL AND ${t.claimLeaseEpoch} IS NULL
+      AND ${t.claimedAt} IS NULL AND ${t.claimExpiresAt} IS NULL
+      AND ${t.nextAttemptAt} IS NULL AND ${t.resolvedAt} IS NULL)
+    OR (${t.state} = 'terminal_outcome_claimed'
+      AND ${t.cleanupActionId} IS NULL AND ${t.reservationId} IS NULL
+      AND ${t.terminalGateOutcomeId} IS NOT NULL AND ${t.terminalGateOutcome} IS NOT NULL
+      AND ${t.terminalAt} IS NOT NULL
+      AND ${t.claimToken} IS NOT NULL AND ${t.claimLeaseId} IS NOT NULL AND ${t.claimLeaseEpoch} IS NOT NULL
+      AND ${t.claimedAt} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL
+      AND ${t.nextAttemptAt} IS NULL AND ${t.resolvedAt} IS NULL)
+    OR (${t.state} = 'terminal_without_permit'
+      AND ${t.cleanupActionId} IS NULL AND ${t.reservationId} IS NULL
+      AND ${t.terminalGateOutcomeId} IS NOT NULL AND ${t.terminalGateOutcome} IS NOT NULL
+      AND ${t.terminalAt} IS NOT NULL
+      AND ${t.claimToken} IS NOT NULL AND ${t.claimLeaseId} IS NOT NULL AND ${t.claimLeaseEpoch} IS NOT NULL
+      AND ${t.claimedAt} IS NOT NULL AND ${t.claimExpiresAt} IS NOT NULL
+      AND ${t.nextAttemptAt} IS NOT NULL AND ${t.resolvedAt} IS NOT NULL)
+  `),
+  check("room_provider_admission_timeout_time_check", sql`
+    (${t.resolvedAt} IS NULL OR ${t.resolvedAt} >= ${t.createdAt})
+    AND (${t.terminalAt} IS NULL OR ${t.resolvedAt} IS NULL OR ${t.terminalAt} <= ${t.resolvedAt})
+    AND (${t.claimedAt} IS NULL OR ${t.terminalAt} IS NULL OR ${t.claimedAt} >= ${t.terminalAt})
+    AND (${t.claimExpiresAt} IS NULL OR ${t.claimedAt} IS NULL OR ${t.claimExpiresAt} > ${t.claimedAt})
+    AND (${t.resolvedAt} IS NULL OR ${t.claimedAt} IS NULL OR ${t.resolvedAt} >= ${t.claimedAt})
+    AND (${t.nextAttemptAt} IS NULL OR ${t.resolvedAt} IS NULL OR ${t.nextAttemptAt} > ${t.resolvedAt})
+  `),
+  check("room_provider_admission_timeout_nonblank_check", sql`
+    btrim(${t.id}) <> '' AND btrim(${t.projectId}) <> '' AND btrim(${t.roomId}) <> ''
+    AND btrim(${t.gateAttemptId}) <> '' AND btrim(${t.requestHash}) <> ''
+    AND btrim(${t.outboxId}) <> '' AND btrim(${t.outboxBindingId}) <> ''
+    AND btrim(${t.senderLeaseId}) <> '' AND btrim(${t.senderLeaseHolderId}) <> ''
+    AND btrim(${t.senderLeaseHostId}) <> '' AND btrim(${t.timeoutErrorCode}) <> ''
+    AND btrim(${t.recoveryProtocol}) <> ''
+    AND btrim(${t.state}) <> '' AND btrim(${t.createdAt}) <> '' AND btrim(${t.updatedAt}) <> ''
+    AND (${t.recoveryReceiptId} IS NULL OR btrim(${t.recoveryReceiptId}) <> '')
+    AND (${t.cleanupActionId} IS NULL OR btrim(${t.cleanupActionId}) <> '')
+    AND (${t.reservationId} IS NULL OR btrim(${t.reservationId}) <> '')
+    AND (${t.terminalGateOutcomeId} IS NULL OR btrim(${t.terminalGateOutcomeId}) <> '')
+    AND (${t.terminalGateOutcome} IS NULL OR btrim(${t.terminalGateOutcome}) <> '')
+    AND (${t.terminalAt} IS NULL OR btrim(${t.terminalAt}) <> '')
+    AND (${t.claimToken} IS NULL OR btrim(${t.claimToken}) <> '')
+    AND (${t.claimLeaseId} IS NULL OR btrim(${t.claimLeaseId}) <> '')
+    AND (${t.claimedAt} IS NULL OR btrim(${t.claimedAt}) <> '')
+    AND (${t.claimExpiresAt} IS NULL OR btrim(${t.claimExpiresAt}) <> '')
+    AND (${t.nextAttemptAt} IS NULL OR btrim(${t.nextAttemptAt}) <> '')
+    AND (${t.resolvedAt} IS NULL OR btrim(${t.resolvedAt}) <> '')
+  `),
+]);
+
 export const roomProviderBackpressureOperations = roomSchema.table("room_provider_backpressure_operations", {
   projectId: text("project_id").notNull(),
   scopeKey: text("scope_key").notNull(),
@@ -2872,6 +3480,7 @@ export const ROOM_PROJECT_TABLE_NAMES = [
   "room_capability_registry_projections",
   "room_blind_review_registries",
   "room_evolution_hypotheses",
+  "room_evolution_legacy_provenance_quarantines",
   "room_evolution_trusted_bindings",
   "room_evolution_trusted_binding_revocations",
   "room_evolution_candidate_versions",
@@ -2908,6 +3517,7 @@ export const ROOM_PROJECT_TABLE_NAMES = [
   "room_global_concurrency_operations",
   "room_provider_backpressure_states",
   "room_provider_backpressure_reservations",
+  "room_provider_admission_timeout_tombstones",
   "room_provider_backpressure_operations",
   "room_rbac_authorization_states",
   "room_trusted_device_sessions",

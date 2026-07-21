@@ -10,7 +10,11 @@ import {
   HAPPIER_SESSION_CONNECTOR_ID,
   HAPPIER_SESSION_CONNECTOR_VERSION,
 } from "./session-connector-contract.js";
-import { HappierSessionConnector } from "./session-connector-facade.js";
+import {
+  createHappierSessionConnectorWithHostWriteAuthorization,
+  HappierSessionConnector,
+} from "./session-connector-facade.js";
+import type { HappierHostWriteAuthorizationRequest } from "./session-connector.js";
 import { definePlugin } from "@fusion/plugin-sdk";
 import type {
   FusionPlugin,
@@ -53,8 +57,68 @@ function connectorSettings(ctx: PluginContext) {
   };
 }
 
-export const happierSessionConnectorFactory: PluginSessionConnectorFactory = async (ctx) =>
-  new HappierSessionConnector({ settings: connectorSettings(ctx) });
+export function createHappierHostWriteAuthorizationDependency(ctx: PluginContext) {
+  // FNXC:HappierDurableWriteAuthority 2026-07-20-11:46: only the Engine-owned
+  // authorizer can bind an official MCP mutation to a claimed Room outbox/fence.
+  // FNXC:HappierDurableWriteAuthorityScope 2026-07-20-22:20: forward the
+  // canonical Session URI and binding-specific scope to the Engine, then return
+  // only the matching Engine-certified scope. Missing or mismatched grants must
+  // fail before the connector can open official Happier MCP/provider I/O.
+  const authorizer = ctx.sessionConnectorWriteAuthorizer;
+  if (!authorizer) return undefined;
+  return async (request: HappierHostWriteAuthorizationRequest) => {
+    if (!nonEmptyScopeField(request.canonicalSessionUri) || !nonEmptyScopeField(request.scopeFingerprint)) {
+      return { authorized: false as const };
+    }
+    const decision = await authorizer.authorize({
+      contractVersion: 1,
+      connectorId: request.connectorId,
+      operation: request.operation,
+      identity: {
+        connectorId: request.connectorId,
+        providerId: request.providerId,
+        nativeSessionId: request.nativeSessionId,
+        happierSessionId: request.happierSessionId,
+        serverProfileId: request.serverProfileId,
+        machineId: request.machineId,
+        hostId: request.hostId,
+      },
+      canonicalSessionUri: request.canonicalSessionUri,
+      bindingId: request.bindingId,
+      logicalMessageId: request.logicalMessageId,
+      localMessageId: request.localMessageId,
+      idempotencyKey: request.idempotencyKey,
+      contentHash: request.contentHash ?? null,
+      reason: request.reason,
+      deliveryAuthorization: request.deliveryAuthorization,
+      scopeFingerprint: request.scopeFingerprint,
+    });
+    if (!decision.authorized
+      || !nonEmptyScopeField(decision.scopeFingerprint)
+      || decision.scopeFingerprint !== request.scopeFingerprint) {
+      return { authorized: false as const };
+    }
+    return {
+      authorized: true as const,
+      authorizationId: decision.authorizationId,
+      scopeFingerprint: decision.scopeFingerprint,
+    };
+  };
+}
+
+function nonEmptyScopeField(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+export const happierSessionConnectorFactory: PluginSessionConnectorFactory = async (ctx) => {
+  const verifyHostWriteAuthorization = createHappierHostWriteAuthorizationDependency(ctx);
+  const options = {
+    settings: connectorSettings(ctx),
+  };
+  return verifyHostWriteAuthorization
+    ? createHappierSessionConnectorWithHostWriteAuthorization(options, verifyHostWriteAuthorization)
+    : new HappierSessionConnector(options);
+};
 
 const plugin: FusionPlugin = definePlugin({
   manifest: {

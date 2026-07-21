@@ -19,6 +19,7 @@ import {
   buildHappierInvocation,
   createHappierSession,
   ensureHappierDirectSession,
+  buildHappierProcessEnv,
   followHappierDirectSessionTranscriptEvents,
   getHappierDirectSessionCapabilities,
   getHappierSessionHistory,
@@ -173,6 +174,26 @@ describe("Happier CLI settings and invocation", () => {
       executable: "env-happier",
       serverUrl: "http://127.0.0.1:52211",
       timeoutMs: 1200,
+    });
+  });
+
+  it("passes local extension opt-ins explicitly and clears inherited enablement otherwise", () => {
+    expect(buildHappierProcessEnv({
+      enableLocalRuntimeSnapshot: true,
+      enableLocalReconciliationHistory: true,
+    }, {})).toMatchObject({
+      HAPPIER_ENABLE_FUSION_RUNTIME_SNAPSHOT_V1: "1",
+      HAPPIER_ENABLE_FUSION_RECONCILIATION_HISTORY_V1: "1",
+    });
+    expect(buildHappierProcessEnv({
+      enableLocalRuntimeSnapshot: false,
+      enableLocalReconciliationHistory: false,
+    }, {
+      HAPPIER_ENABLE_FUSION_RUNTIME_SNAPSHOT_V1: "1",
+      HAPPIER_ENABLE_FUSION_RECONCILIATION_HISTORY_V1: "1",
+    })).toMatchObject({
+      HAPPIER_ENABLE_FUSION_RUNTIME_SNAPSHOT_V1: "0",
+      HAPPIER_ENABLE_FUSION_RECONCILIATION_HISTORY_V1: "0",
     });
   });
 });

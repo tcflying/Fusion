@@ -12,6 +12,7 @@ import {
   type SessionConnectorIdentityV1,
 } from "@fusion/core";
 import {
+  collectRoomConnectorRuntimeObservation,
   reportRoomConnectorRuntimeObservation,
   type ControlledRoomConnectorRuntimeObservationPortV1,
   type RoomConnectorRuntimeKnownV1,
@@ -224,6 +225,32 @@ function runtimePort(observation: RoomConnectorRuntimeObservationV1) {
 }
 
 describe("Room connector runtime observation reporter", () => {
+  it("collects one trusted concrete binding as a sample without writing a partial registry", async () => {
+    const { port, observe } = runtimePort(runtimeObservation());
+
+    const result = await collectRoomConnectorRuntimeObservation(input(), port);
+
+    expect(result).toMatchObject({
+      ok: true,
+      outcome: "collected",
+      scheduling: "schedulable",
+      sample: {
+        source: "trusted_session_connector",
+        report: {
+          target: {
+            binding: { id: "binding-1" },
+          },
+        },
+      },
+    });
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "project-1",
+      roomId: "room-1",
+      binding: expect.objectContaining({ id: "binding-1" }),
+      asOf: AS_OF,
+    }));
+  });
+
   it("converts a controlled concrete binding observation into the existing durable capability-registry update", async () => {
     const { writer, recordRoomCapabilityRegistry } = writerDouble();
     const { port, observe } = runtimePort(runtimeObservation());
@@ -249,6 +276,27 @@ describe("Room connector runtime observation reporter", () => {
         rateLimit: expect.objectContaining({ state: "clear" }),
       })],
     }));
+  });
+
+  it("persists complete rate-limited evidence while reporting it as not schedulable", async () => {
+    const { writer, recordRoomCapabilityRegistry } = writerDouble();
+    const observation = runtimeObservation();
+    if (observation.health.state !== "known") throw new Error("Expected known health fixture");
+    const { port } = runtimePort({
+      ...observation,
+      health: known({
+        ...observation.health.value,
+        state: "rate_limited",
+        rateLimit: "limited",
+        retryAfterMs: 60_000,
+      }),
+      rateLimit: known({ state: "limited", retryAfterMs: 60_000 }),
+    });
+
+    const result = await reportRoomConnectorRuntimeObservation(input(), port, writer);
+
+    expect(result).toMatchObject({ ok: true, outcome: "reported", scheduling: "not_schedulable" });
+    expect(recordRoomCapabilityRegistry).toHaveBeenCalledTimes(1);
   });
 
   it("fails closed with explicit unknown fields instead of inventing context or latency", async () => {

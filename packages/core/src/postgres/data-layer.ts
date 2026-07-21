@@ -106,11 +106,38 @@ const transactionRunAuditScopes = new WeakMap<object, TransactionRunAuditScope>(
  *   `SERIALIZABLE` only when the write path genuinely requires it — most
  *   paths do not, and SERIALIZABLE introduces retryable serialization
  *   failures that callers must handle.
+ *
+ * FNXC:AsyncDataLayer 2026-07-21-00:48:
+ * A caller may set server-enforced statement and lock limits for one
+ * transaction. The limits are installed with PostgreSQL's transaction-local
+ * set_config(..., true) before the callback runs, so commit or rollback
+ * restores the pooled session setting and timeout errors follow the normal
+ * transaction rollback path without Promise.race or client abandonment.
+ *
+ * FNXC:AsyncDataLayer 2026-07-21-01:17:
+ * Timeout options may cross an untyped runtime boundary. Validate them as
+ * finite positive safe integer millisecond values before opening the SQL
+ * transaction, so invalid values cannot reach PostgreSQL and omitted options
+ * retain the pre-timeout plain-transaction behavior.
  */
 export interface TransactionOptions {
   readonly isolationLevel?: "read uncommitted" | "read committed" | "repeatable read" | "serializable";
   readonly accessMode?: "read only" | "read write";
   readonly deferrable?: boolean;
+  /** Optional finite positive safe integer statement timeout for this transaction, in milliseconds. */
+  readonly statementTimeoutMs?: number;
+  /** Optional finite positive safe integer lock-acquisition timeout for this transaction, in milliseconds. */
+  readonly lockTimeoutMs?: number;
+}
+
+function assertValidTransactionTimeoutMs(
+  optionName: "statementTimeoutMs" | "lockTimeoutMs",
+  timeoutMs: unknown,
+): void {
+  if (timeoutMs === undefined) return;
+  if (typeof timeoutMs !== "number" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError(`${optionName} must be a finite positive safe integer in milliseconds`);
+  }
 }
 
 /**
@@ -364,6 +391,9 @@ async function runInTransaction<T>(
   options?: TransactionOptions,
   projectId?: string,
 ): Promise<T> {
+  assertValidTransactionTimeoutMs("statementTimeoutMs", options?.statementTimeoutMs);
+  assertValidTransactionTimeoutMs("lockTimeoutMs", options?.lockTimeoutMs);
+
   const config: {
     isolationLevel?: TransactionOptions["isolationLevel"];
     accessMode?: TransactionOptions["accessMode"];
@@ -385,6 +415,20 @@ async function runInTransaction<T>(
       const transaction = tx as unknown as DbTransaction;
       transactionRunAuditScopes.set(transaction, projectId ?? null);
       try {
+        const localTimeoutSettings: SQL[] = [];
+        if (options?.statementTimeoutMs !== undefined) {
+          localTimeoutSettings.push(
+            sql`set_config('statement_timeout', ${`${options.statementTimeoutMs}ms`}, true)`,
+          );
+        }
+        if (options?.lockTimeoutMs !== undefined) {
+          localTimeoutSettings.push(
+            sql`set_config('lock_timeout', ${`${options.lockTimeoutMs}ms`}, true)`,
+          );
+        }
+        if (localTimeoutSettings.length > 0) {
+          await transaction.execute(sql`SELECT ${sql.join(localTimeoutSettings, sql`, `)}`);
+        }
         return await fn(transaction);
       } finally {
         transactionRunAuditScopes.delete(transaction);

@@ -46,6 +46,8 @@ describe("runRoomControlPlaneLoadHarness", () => {
       currentActiveSlots: 32,
       newlyAdmittedSlots: 0,
     });
+    expect(first.capacityDecision.issues).toEqual([]);
+    expect(first.capacityDecision.reasonCodes).not.toContain("capability_registry_unavailable");
     expect(first.scenarios).toEqual([
       { id: "attached-64-seats", status: "passed" },
       { id: "active-32-controller-tasks", status: "passed" },

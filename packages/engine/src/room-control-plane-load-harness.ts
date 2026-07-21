@@ -248,6 +248,20 @@ function createGovernorInput(
       },
       connector: { source: "session_connector_observation", state: "healthy" },
     },
+    /*
+     * FNXC:SessionRoomCapacityAdmission 2026-07-19-22:16:
+     * The deterministic load harness must exercise the same fail-closed
+     * capability-registry contract as production admission. Its proof
+     * identities remain explicitly simulated under the result proof boundary.
+     */
+    capabilityRegistry: {
+      source: "durable_room_ledger",
+      registryId: `simulated-room-capability-registry-${input.roomId}`,
+      revision: 1,
+      integrityHash: `sha256:simulated-room-capability-registry-${input.seed}`,
+      observedAt: input.asOf,
+      expiresAt: new Date(Date.parse(input.asOf) + 60_000).toISOString(),
+    },
   };
 }
 

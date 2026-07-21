@@ -23,6 +23,10 @@ import {
   createRoomControlPlaneEngineRouteDependencies,
   type RoomControlPlaneEngineRouteDependenciesOptions,
 } from "./room-control-plane-engine-route-dependencies.js";
+import {
+  createRoomControlPlaneRbacAuthorizer,
+  type RoomControlPlaneRbacAuthorizerOptions,
+} from "./room-control-plane-rbac-authorizer.js";
 import type { RoomControlPlaneRouteDependencies } from "./routes/register-room-control-plane-routes.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
 import { rateLimit, RATE_LIMITS } from "./rate-limit.js";
@@ -243,6 +247,23 @@ export async function resolveScopedStore(
 export type RoomControlPlaneProjectAuthorizer =
   RoomControlPlaneEngineRouteDependenciesOptions["authorizeProject"];
 
+/*
+FNXC:RoomControlPlaneDaemonAuthorization 2026-07-19-18:10:
+Daemon bearer/query validation is transport authentication only. It cannot manufacture a Room
+principal, so this legacy helper preserves its symbol while failing closed until a trusted-device
+RBAC resolver supplies the durable session identity.
+*/
+export function createDaemonRoomControlPlaneAuthorizer(
+  daemonToken: string,
+): RoomControlPlaneProjectAuthorizer {
+  return async ({ request }) => {
+    if (!authenticateUpgradeRequest(daemonToken, request)) {
+      return { allowed: false, reason: "daemon-token-required" };
+    }
+    return { allowed: false, reason: "trusted-device-principal-required" };
+  };
+}
+
 export interface ServerOptions {
   /** Optional ProjectEngine — when provided, subsystems (onMerge, automationStore,
    *  missionAutopilot, missionExecutionLoop, heartbeatMonitor) are derived from it.
@@ -258,6 +279,12 @@ export interface ServerOptions {
    * these routes; the callback is invoked for every Room request.
    */
   roomControlPlaneAuthorizeProject?: RoomControlPlaneProjectAuthorizer;
+  /**
+   * Explicit durable trusted-device RBAC. When set, this real authorizer takes
+   * precedence over the legacy callback and derives the Room actor from the
+   * registry-backed Cookie session for every request.
+   */
+  roomControlPlaneRbac?: RoomControlPlaneRbacAuthorizerOptions;
   /** Optional HybridExecutor orchestration context for multi-project runtime plumbing. */
   hybridExecutor?: import("@fusion/engine").HybridExecutor;
   /**
@@ -567,7 +594,15 @@ export interface ServerOptions {
 function createServerRoomControlPlaneRouteDependencies(
   options?: ServerOptions,
 ): RoomControlPlaneRouteDependencies | undefined {
-  const authorizeProject = options?.roomControlPlaneAuthorizeProject;
+  const daemonToken = resolveDaemonTransportToken(options);
+  const authorizeProject = options?.roomControlPlaneRbac
+    ? daemonToken
+      ? createRoomControlPlaneRbacAuthorizer({
+        ...options.roomControlPlaneRbac,
+        authorizeDaemonTransport: async (request) => authenticateUpgradeRequest(daemonToken, request),
+      })
+      : undefined
+    : options?.roomControlPlaneAuthorizeProject;
   if (typeof authorizeProject !== "function") {
     return undefined;
   }
@@ -576,6 +611,12 @@ function createServerRoomControlPlaneRouteDependencies(
     authorizeProject,
     resolveProjectEngine: ({ projectId }) => options?.engineManager?.getEngine(projectId),
   });
+}
+
+function resolveDaemonTransportToken(options?: ServerOptions): string | undefined {
+  return options?.noAuth
+    ? undefined
+    : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
 }
 
 /** System panel log entry shape (mirrors the CLI log sink's ring buffer). */
@@ -1028,9 +1069,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // that then captures ?token= from the URL and injects a Bearer header on every
   // /api/* call. WebSocket upgrades are gated separately in setupTerminalWebSocket /
   // setupBadgeWebSocket.
-  const daemonToken = options?.noAuth
-    ? undefined
-    : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
+  const daemonToken = resolveDaemonTransportToken(options);
   if (daemonToken) {
     app.use(createAuthMiddleware(daemonToken));
   }

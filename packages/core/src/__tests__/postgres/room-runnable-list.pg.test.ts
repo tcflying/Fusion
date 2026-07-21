@@ -23,6 +23,7 @@ import {
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import { approvalRequests, tasks } from "../../postgres/schema/project.js";
+import { roomTaskNodes } from "../../postgres/schema/room.js";
 import {
   queryRunAuditEvents,
   queryRunAuditEventsAdmin,
@@ -355,6 +356,39 @@ describe("AsyncRoomStore runnable Room discovery", () => {
       humanPaused: true,
       approvalState: "none",
     });
+  }, 60_000);
+
+  it("keeps a node-level approval wait local so independent Room work remains runnable", async () => {
+    const context = await startEmbeddedDatabase();
+    const layer = createAsyncDataLayer(context.connections!, { projectId: "project-1" });
+    const store = new AsyncRoomStore(layer);
+    const running = await createRunningRoom(
+      store,
+      "project-1",
+      "room-node-approval-local",
+      "2026-07-17T12:14:00.000Z",
+      "2026-07-17T12:15:00.000Z",
+      "2026-07-17T12:16:00.000Z",
+    );
+    await layer.db.insert(roomTaskNodes).values({
+      id: "node-waiting-local-approval",
+      projectId: "project-1",
+      roomId: running.room.id,
+      parentNodeId: null,
+      objective: "Wait for a task-scoped operator decision",
+      state: "waiting_approval",
+      progressSignature: "progress:waiting-local-approval",
+    });
+
+    await expect(store.getRecoveryPosture(running.room.id)).resolves.toEqual({
+      lifecycleState: "running",
+      aggregateVersion: running.room.aggregateVersion,
+      humanPaused: false,
+      approvalState: "none",
+    });
+    await expect(store.listRunnableRooms()).resolves.toMatchObject([
+      { room: { id: running.room.id, state: "running" } },
+    ]);
   }, 60_000);
 
   it("preserves pending and denied Room approval posture across restart discovery", async () => {

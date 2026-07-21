@@ -7,7 +7,7 @@ import {
   type RoomEvolutionPromotionDecisionLedgerPortV1,
 } from "../room-evolution-promotion-commit-coordinator.js";
 
-const HASH = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const EVALUATED_AT = "2026-07-19T13:40:00.000Z";
 
 function evaluation(

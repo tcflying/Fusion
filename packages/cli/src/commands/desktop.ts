@@ -8,7 +8,10 @@ import { fileURLToPath } from "node:url";
 import * as os from "node:os";
 import { CentralCore, PluginLoader, createTaskStoreForBackend, type TaskStore } from "@fusion/core";
 import { createServer } from "@fusion/dashboard";
-import { ProjectEngineManager } from "@fusion/engine";
+import {
+  ProjectEngineManager,
+  createWindowsNativeRoomHostCompositionAdapterRegistry,
+} from "@fusion/engine";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 
 const require = createRequire(import.meta.url);
@@ -60,7 +63,13 @@ async function startDashboardRuntime(rootDir: string, paused: boolean, noAuth: b
      * FNXC:DesktopRuntime 2026-06-20-23:39:
      * Desktop local mode must start the same project engine lifecycle as CLI dashboard mode; a desktop window without engines leaves users with a live dashboard that cannot execute tasks.
      */
-    centralCore = new CentralCore();
+    /*
+     * FNXC:DesktopHostBootstrap 2026-07-19-23:40:
+     * `fusion desktop` is a Windows desktop host, so CentralCore must receive the startup factory's
+     * unscoped host layer. Do not substitute the project TaskStore's layer: that would partition
+     * global policy/capacity. The boot result remains responsible for closing the shared pool.
+     */
+    centralCore = new CentralCore(undefined, boot ? { asyncLayer: boot.hostAsyncLayer } : undefined);
     await centralCore.init();
     const cwdRegistered = await ensureCwdProjectRegistered({
       cwd: rootDir,
@@ -68,7 +77,18 @@ async function startDashboardRuntime(rootDir: string, paused: boolean, noAuth: b
       logPrefix: "desktop",
       autoRegister: true,
     });
-    engineManager = new ProjectEngineManager(centralCore);
+    /*
+     * FNXC:WindowsNativeRoomHostComposition 2026-07-21-02:17:
+     * Desktop constructs one manager registry from the canonical unscoped
+     * bootstrap layer, without deriving provider telemetry from settings or labels.
+     */
+    const roomHostCompositionOperatorAdapterRegistry =
+      createWindowsNativeRoomHostCompositionAdapterRegistry({
+        hostAsyncLayer: boot?.hostAsyncLayer,
+      });
+    engineManager = new ProjectEngineManager(centralCore, {
+      roomHostCompositionOperatorAdapterRegistry,
+    });
     await engineManager.startAll();
     engineManager.startReconciliation();
     const cwdEngine = cwdRegistered

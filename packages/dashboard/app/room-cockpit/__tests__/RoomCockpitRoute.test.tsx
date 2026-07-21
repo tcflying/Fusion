@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoomCockpitNavigationEntry } from "../../App";
@@ -100,11 +100,137 @@ const unavailableTelemetryProjection = {
   },
 } satisfies RoomCockpitProjectionV1;
 
+const executionStatus = {
+  contractVersion: 1,
+  projectId: "project-live",
+  state: "execution_started",
+  reasonCodes: [],
+  changedAt: "2026-07-20T02:25:00.000Z",
+  readServiceAvailable: true,
+  liveEventServiceAvailable: true,
+  controllerStarted: true,
+} as const;
+
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function isExecutionStatusRequest(input: RequestInfo | URL): boolean {
+  const path = input instanceof URL
+    ? input.toString()
+    : typeof input === "string"
+      ? input
+      : input.url;
+  return path.startsWith("/api/room-control-plane/status?");
+}
+
+function isExistingSessionPreflightRequest(input: RequestInfo | URL): boolean {
+  const path = input instanceof URL
+    ? input.toString()
+    : typeof input === "string"
+      ? input
+      : input.url;
+  return path.startsWith("/api/rooms/session-preflight?");
+}
+
+function existingSessionPreflightIdentity(session: {
+  readonly connectorId: string;
+  readonly canonicalSessionUri: string;
+  readonly requiredHostId: string;
+  readonly requiredMachineId?: string;
+}, providerId = "happier") {
+  return {
+    connectorId: session.connectorId,
+    providerId,
+    nativeSessionId: "019f22f6-6581-7781-bb37-84cf4d63d81d",
+    happierSessionId: "cmrlz93zb002jg1888442usqo",
+    serverProfileId: "srv_lbLN2rpeYpZBvdYD7njB20g85I8BJsYx",
+    machineId: session.requiredMachineId ?? "windows-machine-1",
+    hostId: session.requiredHostId,
+  };
+}
+
+function existingSessionPreflightResult(session: {
+  readonly connectorId: string;
+  readonly canonicalSessionUri: string;
+  readonly requiredHostId: string;
+  readonly requiredMachineId?: string;
+}, providerTelemetry?: unknown, providerId = "happier") {
+  const identity = existingSessionPreflightIdentity(session, providerId);
+  return {
+    contractVersion: 1,
+    state: "identity_verified" as const,
+    request: {
+      connectorId: session.connectorId,
+      canonicalSessionUri: session.canonicalSessionUri,
+      requiredHostId: session.requiredHostId,
+      ...(session.requiredMachineId === undefined ? {} : { requiredMachineId: session.requiredMachineId }),
+    },
+    identity,
+    checkedAt: "2026-07-20T07:30:00.000Z",
+    providerTurnStarted: false as const,
+    capabilities: [
+      { name: "ensureExisting", state: "verified" },
+      { name: "status", state: "verified" },
+      { name: "history", state: "verified" },
+      { name: "send", state: "verified" },
+    ],
+    health: {
+      state: "healthy",
+      checkedAt: "2026-07-20T07:30:00.000Z",
+      authentication: "authenticated",
+      rateLimit: "clear",
+      reasonCodes: [],
+      retryAfterMs: null,
+    },
+    ...(providerTelemetry === undefined ? {} : { providerTelemetry }),
+  };
+}
+
+function freshCodexProviderTelemetry(
+  identity: ReturnType<typeof existingSessionPreflightIdentity>,
+  overrides: Readonly<Record<string, unknown>> = {},
+) {
+  return {
+    contractVersion: 1,
+    state: "reported",
+    identity,
+    providerId: "codex",
+    source: "happier_persisted_in_band_provider_snapshot",
+    observedAt: "2026-07-21T02:40:00.000Z",
+    expiresAt: "2026-07-21T03:10:00.000Z",
+    freshness: "fresh",
+    limitations: {
+      providerAvailability: "not_inferred",
+      capacity: "not_reported",
+      onDemandProviderRefresh: "not_attempted",
+      accountIdentity: "not_reported",
+      rawSnapshot: "not_reported",
+    },
+    ...overrides,
+  };
+}
+
+function createCockpitFetcher(roomPayload: unknown = { room: projection }, roomStatus = 200) {
+  return vi.fn(async (input: RequestInfo | URL) => (
+    isExecutionStatusRequest(input)
+      ? jsonResponse({ status: executionStatus })
+      : jsonResponse(roomPayload, roomStatus)
+  ));
+}
+
+/** Room projections and project-scoped lifecycle reads are separate requests. */
+function expectProjectionRequestCount(
+  fetchProjection: { readonly mock: { readonly calls: readonly (readonly unknown[])[] } },
+  expectedCount: number,
+): void {
+  const projectionCount = fetchProjection.mock.calls.filter(([input]) => (
+    typeof input === "string" && input.startsWith("/api/rooms/")
+  )).length;
+  expect(projectionCount).toBe(expectedCount);
 }
 
 function NavigationHarness({ available = true }: { readonly available?: boolean }) {
@@ -138,9 +264,13 @@ class ControlledRoomEventSource implements RoomCockpitEventSourceV1 {
     this.onerror?.(new Event("error"));
   }
 
-  emitRoomEvent(payload: unknown, cursor = ""): void {
+  emitRoomEvent(
+    payload: unknown,
+    cursor = "",
+    eventName: "room.event" | "canonical_room_event" = "room.event",
+  ): void {
     const event = { data: JSON.stringify(payload), lastEventId: cursor } as MessageEvent;
-    for (const listener of this.listeners.get("room.event") ?? []) {
+    for (const listener of this.listeners.get(eventName) ?? []) {
       listener(event);
     }
   }
@@ -172,17 +302,36 @@ function roomEvent(cursor: string, overrides: {
   readonly roomId?: string;
   readonly reconciliationRequired?: boolean;
 } = {}) {
+  const projectId = overrides.projectId ?? "project-live";
+  const roomId = overrides.roomId ?? "room-live";
+  const occurredAt = "2026-07-19T19:30:00.000Z";
+  const alerts = overrides.reconciliationRequired ? [{
+    code: "canonical_replay_failed",
+    severity: "critical",
+    scope: { projectId, roomId },
+    cursor,
+    expectedStreamSequence: null,
+    observedStreamSequence: null,
+  }] : [];
+
   return {
-    type: "room_event",
-    scope: {
-      projectId: overrides.projectId ?? "project-live",
-      roomId: overrides.roomId ?? "room-live",
+    contractVersion: 1,
+    type: "canonical_room_event",
+    scope: { projectId, roomId },
+    provenance: {
+      cursor,
+      eventId: `event-${cursor}`,
+      type: "task_progress_observed",
+      occurredAt,
+      correlationId: `correlation-${cursor}`,
+      causationId: null,
     },
-    envelope: { cursor },
-    ...(overrides.reconciliationRequired ? {
-      connection: { state: "degraded" },
-      alerts: [{ code: "canonical_replay_failed" }],
-    } : {}),
+    connection: {
+      state: overrides.reconciliationRequired ? "degraded" : "connected",
+      reason: null,
+      changedAt: occurredAt,
+    },
+    alerts,
   };
 }
 
@@ -251,6 +400,7 @@ function controlledEventSourceFactory(target: ControlledRoomEventSource[]) {
 }
 
 afterEach(() => {
+  cleanup();
   vi.useRealTimers();
 });
 
@@ -323,10 +473,18 @@ describe("RoomCockpitRoute", () => {
 
   it("renders a deliberate empty boundary before a Room is selected and only displays a validated projection", async () => {
     const user = userEvent.setup();
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = createCockpitFetcher();
     const onClose = vi.fn();
 
-    render(<RoomCockpitRoute projectId="project-live" onClose={onClose} fetchProjection={fetchProjection} />);
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={onClose}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
 
     expect(screen.getByRole("heading", { name: "No Room projection yet" })).toBeInTheDocument();
     expect(screen.getByText(/No demo telemetry is shown here/i)).toBeInTheDocument();
@@ -346,9 +504,365 @@ describe("RoomCockpitRoute", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("preflights multiple existing Sessions through the Cockpit without creating or attaching a Room", async () => {
+    const user = userEvent.setup();
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (isExistingSessionPreflightRequest(input)) {
+        const body = JSON.parse(String(init?.body)) as { readonly sessions: readonly {
+          readonly connectorId: string;
+          readonly canonicalSessionUri: string;
+          readonly requiredHostId: string;
+          readonly requiredMachineId?: string;
+        }[] };
+        return jsonResponse({
+          results: body.sessions.map((session, index) => ({
+            commandId: `room-existing-session-preflight:test:${index + 1}`,
+            result: existingSessionPreflightResult(session),
+          })),
+        });
+      }
+      if (isExecutionStatusRequest(input)) return jsonResponse({ status: executionStatus });
+      return jsonResponse({ room: projection });
+    });
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "Preflight old Sessions" })).toBeInTheDocument();
+    expect(screen.getByText(/no attach/i)).toBeInTheDocument();
+    await user.type(
+      screen.getByRole("textbox", { name: "Canonical Session URI 1" }),
+      "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
+    );
+    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), "windows-host-1");
+    await user.click(screen.getByRole("button", { name: "Add Session" }));
+    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 2" }), "claude://sessions/claude-session-2");
+    await user.type(screen.getByRole("textbox", { name: "Required host 2" }), "windows-host-2");
+    await user.type(screen.getByRole("textbox", { name: "Required machine 2" }), "windows-machine-2");
+    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledWith(
+      "/api/rooms/session-preflight?projectId=project-live",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+      }),
+    ));
+    const preflightCall = fetchProjection.mock.calls.find(([input]) => isExistingSessionPreflightRequest(input as RequestInfo | URL));
+    expect(preflightCall?.[1]).toMatchObject({
+      body: JSON.stringify({
+        sessions: [
+          {
+            connectorId: "happier-runtime",
+            canonicalSessionUri: "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
+            requiredHostId: "windows-host-1",
+          },
+          {
+            connectorId: "happier-runtime",
+            canonicalSessionUri: "claude://sessions/claude-session-2",
+            requiredHostId: "windows-host-2",
+            requiredMachineId: "windows-machine-2",
+          },
+        ],
+      }),
+    });
+    expect(await screen.findAllByText("identity verified")).toHaveLength(2);
+    expect(screen.getAllByText("No provider turn was started.")).toHaveLength(2);
+    expect(screen.getAllByText("019f22f6-6581-7781-bb37-84cf4d63d81d")).toHaveLength(2);
+    expect(screen.getAllByText("Provider snapshot withheld")).toHaveLength(2);
+    expect(screen.getAllByText("connector_telemetry_unsupported")).toHaveLength(2);
+  });
+
+  it("renders a fresh persisted Codex provider snapshot without treating it as provider readiness", async () => {
+    const user = userEvent.setup();
+    const session = {
+      connectorId: "happier-runtime",
+      canonicalSessionUri: "codex://threads/provider-telemetry-1",
+      requiredHostId: "windows-host-1",
+    };
+    const identity = existingSessionPreflightIdentity(session, "codex");
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL) => (
+      isExistingSessionPreflightRequest(input)
+        ? jsonResponse({
+          results: [{
+            commandId: "room-existing-session-preflight:provider-snapshot",
+            result: existingSessionPreflightResult(session, freshCodexProviderTelemetry(identity), "codex"),
+          }],
+        })
+        : jsonResponse({ room: projection })
+    ));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 1" }), session.canonicalSessionUri);
+    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), session.requiredHostId);
+    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+
+    expect(await screen.findByText("Fresh persisted Codex snapshot observed")).toBeInTheDocument();
+    expect(screen.getByText("2026-07-21T02:40:00.000Z")).toBeInTheDocument();
+    expect(screen.getByText("2026-07-21T03:10:00.000Z")).toBeInTheDocument();
+    expect(screen.getByText("Does not represent provider availability, capacity, scheduling admission, or send authorization.")).toBeInTheDocument();
+  });
+
+  it("renders a canonical withheld provider snapshot without changing the verified Session result", async () => {
+    const user = userEvent.setup();
+    const session = {
+      connectorId: "happier-runtime",
+      canonicalSessionUri: "codex://threads/provider-telemetry-withheld",
+      requiredHostId: "windows-host-1",
+    };
+    const identity = existingSessionPreflightIdentity(session, "codex");
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL) => (
+      isExistingSessionPreflightRequest(input)
+        ? jsonResponse({
+          results: [{
+            commandId: "room-existing-session-preflight:provider-snapshot-withheld",
+            result: existingSessionPreflightResult(session, {
+              contractVersion: 1,
+              state: "withheld",
+              identity,
+              reason: "telemetry_stale",
+            }, "codex"),
+          }],
+        })
+        : jsonResponse({ room: projection })
+    ));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 1" }), session.canonicalSessionUri);
+    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), session.requiredHostId);
+    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+
+    expect(await screen.findByText("Provider snapshot withheld")).toBeInTheDocument();
+    expect(screen.getByText("telemetry_stale")).toBeInTheDocument();
+    expect(screen.getByText("identity verified")).toBeInTheDocument();
+  });
+
+  it("withholds a telemetry projection whose canonical identity differs from the verified Session", async () => {
+    const user = userEvent.setup();
+    const session = {
+      connectorId: "happier-runtime",
+      canonicalSessionUri: "codex://threads/provider-telemetry-identity-mismatch",
+      requiredHostId: "windows-host-1",
+    };
+    const identity = existingSessionPreflightIdentity(session, "codex");
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL) => (
+      isExistingSessionPreflightRequest(input)
+        ? jsonResponse({
+          results: [{
+            commandId: "room-existing-session-preflight:provider-snapshot-identity-mismatch",
+            result: existingSessionPreflightResult(session, freshCodexProviderTelemetry({
+              ...identity,
+              nativeSessionId: "different-native-session",
+            }), "codex"),
+          }],
+        })
+        : jsonResponse({ room: projection })
+    ));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 1" }), session.canonicalSessionUri);
+    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), session.requiredHostId);
+    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+
+    expect(await screen.findByText("Provider snapshot withheld")).toBeInTheDocument();
+    expect(screen.getByText("telemetry_contract_invalid")).toBeInTheDocument();
+    expect(screen.queryByText("Fresh persisted Codex snapshot observed")).not.toBeInTheDocument();
+    expect(screen.queryByText("different-native-session")).not.toBeInTheDocument();
+    expect(screen.getByText("identity verified")).toBeInTheDocument();
+  });
+
+  it("fails malformed, unknown, extra, and sensitive provider telemetry closed without exposing it", async () => {
+    const user = userEvent.setup();
+    const sessions = [
+      {
+        connectorId: "happier-runtime",
+        canonicalSessionUri: "codex://threads/provider-telemetry-extra",
+        requiredHostId: "windows-host-1",
+      },
+      {
+        connectorId: "happier-runtime",
+        canonicalSessionUri: "codex://threads/provider-telemetry-malformed",
+        requiredHostId: "windows-host-2",
+      },
+      {
+        connectorId: "happier-runtime",
+        canonicalSessionUri: "codex://threads/provider-telemetry-unknown",
+        requiredHostId: "windows-host-3",
+      },
+      {
+        connectorId: "happier-runtime",
+        canonicalSessionUri: "codex://threads/provider-telemetry-zero-ttl",
+        requiredHostId: "windows-host-4",
+      },
+    ] as const;
+    const accountEmail = "provider-account-must-not-render@example.test";
+    const rawError = "raw-provider-error-must-not-render";
+    const telemetry = [
+      freshCodexProviderTelemetry(existingSessionPreflightIdentity(sessions[0], "codex"), {
+        accountEmail,
+        plan: "provider-plan-must-not-render",
+        quotaRemaining: 424242,
+      }),
+      {
+        contractVersion: 1,
+        state: "reported",
+        identity: existingSessionPreflightIdentity(sessions[1], "codex"),
+        providerId: "codex",
+        source: "happier_persisted_in_band_provider_snapshot",
+        observedAt: "2026-07-21T02:40:00.000Z",
+        expiresAt: "2026-07-21T03:10:00.000Z",
+        freshness: "fresh",
+      },
+      {
+        contractVersion: 1,
+        state: "withheld",
+        identity: existingSessionPreflightIdentity(sessions[2], "codex"),
+        reason: "unknown-provider-reason",
+        rawError,
+      },
+      freshCodexProviderTelemetry(existingSessionPreflightIdentity(sessions[3], "codex"), {
+        observedAt: "2026-07-21T02:40:00.000Z",
+        expiresAt: "2026-07-21T02:40:00.000Z",
+      }),
+    ] as const;
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (isExistingSessionPreflightRequest(input)) {
+        const body = JSON.parse(String(init?.body)) as { readonly sessions: readonly typeof sessions[number][] };
+        return jsonResponse({
+          results: body.sessions.map((session, index) => ({
+            commandId: `room-existing-session-preflight:provider-snapshot-invalid:${index + 1}`,
+            result: existingSessionPreflightResult(session, telemetry[index], "codex"),
+          })),
+        });
+      }
+      return jsonResponse({ room: projection });
+    });
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    for (const [index, session] of sessions.entries()) {
+      if (index > 0) await user.click(screen.getByRole("button", { name: "Add Session" }));
+      await user.type(screen.getByRole("textbox", { name: `Canonical Session URI ${index + 1}` }), session.canonicalSessionUri);
+      await user.type(screen.getByRole("textbox", { name: `Required host ${index + 1}` }), session.requiredHostId);
+    }
+    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+
+    expect(await screen.findAllByText("Provider snapshot withheld")).toHaveLength(4);
+    expect(screen.getAllByText("telemetry_contract_invalid")).toHaveLength(4);
+    expect(screen.getAllByText("identity verified")).toHaveLength(4);
+    expect(screen.queryByText(accountEmail)).not.toBeInTheDocument();
+    expect(screen.queryByText("provider-plan-must-not-render")).not.toBeInTheDocument();
+    expect(screen.queryByText("424242")).not.toBeInTheDocument();
+    expect(screen.queryByText(rawError)).not.toBeInTheDocument();
+  });
+
+  it("withholds malformed existing-Session preflight data before it reaches Cockpit fields", async () => {
+    const user = userEvent.setup();
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL) => (
+      isExistingSessionPreflightRequest(input)
+        ? jsonResponse({ results: [{ commandId: "preflight-1", result: { secret: "must-not-reach-browser" } }] })
+        : jsonResponse({ room: projection })
+    ));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 1" }), "codex://threads/room-1");
+    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), "windows-host-1");
+    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("does not satisfy the Cockpit contract");
+    expect(screen.queryByText("must-not-reach-browser")).not.toBeInTheDocument();
+  });
+
+  it("renders the authorized controller lifecycle separately from provider health", async () => {
+    const fetchProjection = createCockpitFetcher();
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    const panel = await screen.findByRole("status", { name: "Room execution control-plane status" });
+    expect(panel).toHaveAttribute("data-execution-state", "execution_started");
+    expect(panel).toHaveTextContent("controller started");
+    expect(panel).toHaveTextContent("Lifecycle evidence only");
+    expect(panel).toHaveTextContent("provider, model, account, quota, and session health are not certified here");
+    expect(fetchProjection).toHaveBeenCalledWith(
+      "/api/room-control-plane/status?projectId=project-live",
+      expect.objectContaining({ headers: { accept: "application/json" } }),
+    );
+  });
+
+  it("withholds a malformed lifecycle response without hiding its valid Room projection", async () => {
+    const fetchProjection = vi.fn(async (input: RequestInfo | URL) => (
+      isExecutionStatusRequest(input)
+        ? jsonResponse({ status: { ...executionStatus, reasonCodes: ["unexpected_reason"] } })
+        : jsonResponse({ room: projection })
+    ));
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
+    const panel = await screen.findByRole("status", { name: "Room execution control-plane status" });
+    expect(panel).toHaveAttribute("data-execution-state", "unavailable");
+    expect(panel).toHaveTextContent("does not satisfy the Cockpit contract");
+  });
+
   it("withholds malformed or unavailable endpoint data and exposes the retry path", async () => {
     const user = userEvent.setup();
-    const fetchProjection = vi.fn(async () => jsonResponse({ error: { code: "ROOM_CONTROL_PLANE_PORT_UNAVAILABLE" } }, 503));
+    const fetchProjection = createCockpitFetcher({ error: { code: "ROOM_CONTROL_PLANE_PORT_UNAVAILABLE" } }, 503);
 
     render(
       <RoomCockpitRoute
@@ -360,16 +874,17 @@ describe("RoomCockpitRoute", () => {
     );
 
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("ROOM_CONTROL_PLANE_PORT_UNAVAILABLE");
+    expect(alert).toHaveTextContent("The Room control-plane projection endpoint is unavailable.");
+    expect(alert).not.toHaveTextContent("ROOM_CONTROL_PLANE_PORT_UNAVAILABLE");
     expect(isRoomCockpitProjection({ roomId: "room-live" })).toBe(false);
 
     await user.click(screen.getByRole("button", { name: "Refresh Room telemetry" }));
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
   });
 
   it("fetches a canonical projection first and uses the scoped Room event stream only to reconcile it", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -381,7 +896,7 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
     await waitFor(() => expect(sources).toHaveLength(1));
     expect(sources[0]?.url).toBe("/api/rooms/room-live/events?projectId=project-live");
 
@@ -389,18 +904,111 @@ describe("RoomCockpitRoute", () => {
       sources[0]?.open();
       sources[0]?.emitRoomEvent(roomEvent("7"), "7");
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
 
     await act(async () => {
       sources[0]?.emitRoomEvent(roomEvent("7"), "7");
       sources[0]?.emitRoomEvent(roomEvent("6"), "6");
     });
-    expect(fetchProjection).toHaveBeenCalledTimes(2);
+    expectProjectionRequestCount(fetchProjection, 2);
+  });
+
+  it("accepts both canonical named-event surfaces once and rejects noncanonical test-only payloads", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = createCockpitFetcher();
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
+    await waitFor(() => expect(sources).toHaveLength(1));
+    const { contractVersion: _contractVersion, ...legacyPayload } = roomEvent("6");
+    await act(async () => {
+      sources[0]?.emitRoomEvent({ ...legacyPayload, type: "room_event" }, "6");
+    });
+    expectProjectionRequestCount(fetchProjection, 1);
+
+    const canonical = roomEvent("7");
+    await act(async () => {
+      sources[0]?.emitRoomEvent(canonical, "7", "canonical_room_event");
+    });
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
+
+    await act(async () => {
+      sources[0]?.emitRoomEvent(canonical, "7", "room.event");
+    });
+    expectProjectionRequestCount(fetchProjection, 2);
+  });
+
+  it("renders only bounded canonical event provenance and withholds body-bearing frames", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = createCockpitFetcher();
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await act(async () => {
+      sources[0]?.emitRoomEvent(roomEvent("7"), "7");
+    });
+
+    const provenance = await screen.findByRole("status", { name: "Last observed Room event provenance" });
+    expect(provenance).toHaveTextContent("event-7");
+    expect(provenance).toHaveTextContent("task_progress_observed");
+    expect(provenance).toHaveTextContent("correlation-7");
+    expect(provenance).toHaveTextContent("No causation recorded");
+
+    const providerBody = "provider-body-must-not-render";
+    await act(async () => {
+      sources[0]?.emitRoomEvent({
+        ...roomEvent("8"),
+        providerBody,
+        error: providerBody,
+      }, "8");
+    });
+
+    expect(screen.getByRole("status", { name: "Last observed Room event provenance" })).toHaveTextContent("event-7");
+    expect(screen.queryByText(providerBody)).not.toBeInTheDocument();
+  });
+
+  it("withholds raw transport error messages from the Cockpit", async () => {
+    const rawTransportError = "authorization=do-not-render";
+    const fetchProjection = vi.fn(async () => {
+      throw new Error(rawTransportError);
+    });
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory([])}
+      />,
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Unable to contact the Room control-plane endpoint.");
+    expect(alert).not.toHaveTextContent(rawTransportError);
   });
 
   it("keeps Cockpit degraded for server degraded, disconnected, and alert reports even if the EventSource opens", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -435,12 +1043,12 @@ describe("RoomCockpitRoute", () => {
       sources[0]?.emitAlert(roomAlert("stream_disconnected", { cursor: "7" }));
     });
     expect(screen.getByRole("alert")).toHaveTextContent(/Room live-event alert stream_disconnected/i);
-    expect(fetchProjection).toHaveBeenCalledTimes(1);
+    expectProjectionRequestCount(fetchProjection, 1);
   });
 
   it("accepts the ordinary server connection frame without a terminal reason", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -459,13 +1067,13 @@ describe("RoomCockpitRoute", () => {
       sources[0]?.open();
       sources[0]?.emitConnection(roomConnection("connected", { cursor: "0", includeReason: false }));
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
     expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
   });
 
   it("ignores malformed and cross-scope server live-health frames", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -509,12 +1117,12 @@ describe("RoomCockpitRoute", () => {
 
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
-    expect(fetchProjection).toHaveBeenCalledTimes(1);
+    expectProjectionRequestCount(fetchProjection, 1);
   });
 
   it("treats zero as a canonical live-health cursor instead of accepting stale progress", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -539,12 +1147,12 @@ describe("RoomCockpitRoute", () => {
       sources[0]?.emitAlert(roomAlert("stream_disconnected", { cursor: "0" }));
     });
     expect(screen.getByRole("alert")).toHaveTextContent(/Room live-event alert stream_disconnected/i);
-    expect(fetchProjection).toHaveBeenCalledTimes(1);
+    expectProjectionRequestCount(fetchProjection, 1);
   });
 
   it("restores Cockpit only after a scoped connected server report and durable projection refresh", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -564,19 +1172,19 @@ describe("RoomCockpitRoute", () => {
       sources[0]?.open();
     });
     expect(screen.getByRole("alert")).toHaveTextContent(/server reports live-event state degraded/i);
-    expect(fetchProjection).toHaveBeenCalledTimes(1);
+    expectProjectionRequestCount(fetchProjection, 1);
 
     await act(async () => {
       sources[0]?.emitConnection(roomConnection("connected", { cursor: "11" }));
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
     expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("continues a bounded canonical replay without marking the cockpit unavailable and closes the replacement stream on pagehide", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -588,13 +1196,13 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
     await waitFor(() => expect(sources).toHaveLength(1));
     await act(async () => {
       sources[0]?.open();
       sources[0]?.emitRoomEvent(roomEvent("17"), "17");
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
 
     await act(async () => {
       sources[0]?.emitReplayContinuation({
@@ -656,9 +1264,50 @@ describe("RoomCockpitRoute", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("ignores late events from a replaced replay source without poisoning the current cursor", async () => {
+    const sources: ControlledRoomEventSource[] = [];
+    const fetchProjection = createCockpitFetcher();
+
+    render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        initialRoomId="room-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+        eventSourceFactory={controlledEventSourceFactory(sources)}
+      />,
+    );
+
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
+    await waitFor(() => expect(sources).toHaveLength(1));
+    await act(async () => {
+      sources[0]?.emitRoomEvent(roomEvent("17"), "17");
+    });
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
+    await act(async () => {
+      sources[0]?.emitReplayContinuation({
+        contractVersion: 1,
+        type: "room_replay_continue",
+        scope: { projectId: "project-live", roomId: "room-live" },
+        cursor: "17",
+      });
+    });
+    await waitFor(() => expect(sources).toHaveLength(2));
+
+    await act(async () => {
+      sources[0]?.emitRoomEvent(roomEvent("999"), "999");
+    });
+    expectProjectionRequestCount(fetchProjection, 2);
+
+    await act(async () => {
+      sources[1]?.emitRoomEvent(roomEvent("18"), "18", "canonical_room_event");
+    });
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 3));
+  });
+
   it("ignores cross-scope live events and tears down an obsolete stream before a project switch", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
     const { rerender } = render(
       <RoomCockpitRoute
         projectId="project-live"
@@ -669,13 +1318,13 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
     await waitFor(() => expect(sources).toHaveLength(1));
     await act(async () => {
       sources[0]?.emitRoomEvent(roomEvent("8", { projectId: "other-project" }), "8");
       sources[0]?.emitRoomEvent(roomEvent("9", { roomId: "other-room" }), "9");
     });
-    expect(fetchProjection).toHaveBeenCalledTimes(1);
+    expectProjectionRequestCount(fetchProjection, 1);
 
     rerender(
       <RoomCockpitRoute
@@ -693,12 +1342,12 @@ describe("RoomCockpitRoute", () => {
     await act(async () => {
       sources[0]?.emitRoomEvent(roomEvent("10"), "10");
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
   });
 
   it("closes the live Room stream on pagehide and ignores a late event", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -710,7 +1359,7 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
     await waitFor(() => expect(sources).toHaveLength(1));
     await act(async () => {
       window.dispatchEvent(new Event("pagehide"));
@@ -718,12 +1367,12 @@ describe("RoomCockpitRoute", () => {
     });
 
     expect(sources[0]?.close).toHaveBeenCalledTimes(1);
-    expect(fetchProjection).toHaveBeenCalledTimes(1);
+    expectProjectionRequestCount(fetchProjection, 1);
   });
 
   it("shows explicit unavailable state and reconnects from the last canonical cursor before restoring the cockpit", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -735,12 +1384,12 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 1));
     await waitFor(() => expect(sources).toHaveLength(1));
     await act(async () => {
       sources[0]?.emitRoomEvent(roomEvent("11"), "11");
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
 
     vi.useFakeTimers();
     await act(async () => {
@@ -759,13 +1408,13 @@ describe("RoomCockpitRoute", () => {
       sources[1]?.open();
       sources[1]?.emitConnection(roomConnection("connected", { cursor: "11" }));
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(3));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 3));
     expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
   });
 
   it("keeps the cockpit unavailable across a closed server stream until the replacement stream reports connected and refreshes", async () => {
     const sources: ControlledRoomEventSource[] = [];
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
 
     render(
       <RoomCockpitRoute
@@ -803,13 +1452,13 @@ describe("RoomCockpitRoute", () => {
     act(() => {
       sources[1]?.emitConnection(roomConnection("connected", { cursor: null }));
     });
-    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(2));
+    await waitFor(() => expectProjectionRequestCount(fetchProjection, 2));
     expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
   });
 
   it("withholds the cockpit when the live EventSource factory itself is unavailable", async () => {
     const user = userEvent.setup();
-    const fetchProjection = vi.fn(async () => jsonResponse({ room: projection }));
+    const fetchProjection = createCockpitFetcher();
     const unavailableFactory = vi.fn(() => {
       throw new Error("Room stream unavailable");
     });

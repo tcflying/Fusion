@@ -222,7 +222,7 @@ function isIdentifier(value: unknown): value is string {
 }
 
 function isHash(value: unknown): value is string {
-  return typeof value === "string" && /^[a-f0-9]{16,128}$/iu.test(value);
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value);
 }
 
 function freeze<T>(value: T, seen = new WeakSet<object>()): T {

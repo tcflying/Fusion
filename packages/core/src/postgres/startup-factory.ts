@@ -192,6 +192,13 @@ export interface BackendBootResult {
   /** The constructed AsyncDataLayer (also reachable via taskStore.getAsyncLayer()). */
   readonly asyncLayer: AsyncDataLayer;
   /**
+   * FNXC:HostBootstrap 2026-07-20-05:16:
+   * CentralCore reads host-wide state and therefore must not inherit a
+   * project partition. This unscoped sibling shares the TaskStore's exact
+   * PostgresConnections and lifecycle; callers must not close it separately.
+   */
+  readonly hostAsyncLayer: AsyncDataLayer;
+  /**
    * Release all backend resources: close the TaskStore (which closes the
    * AsyncDataLayer / connection pool) and stop the embedded PostgreSQL
    * process if one was started. Best-effort; errors are logged, not thrown.
@@ -1147,6 +1154,10 @@ export async function createTaskStoreForBackend(
     });
   }
   const asyncLayer = createAsyncDataLayer(connections, { projectId: resolvedProjectId });
+  // FNXC:HostBootstrap 2026-07-20-05:16: Create the CentralCore layer from the
+  // already-open connection set so host coordination is unscoped without
+  // opening a second pool or changing the TaskStore's project boundary.
+  const hostAsyncLayer = createAsyncDataLayer(connections);
 
   // Step 7: construct the TaskStore in backend mode.
   /*
@@ -1256,6 +1267,7 @@ export async function createTaskStoreForBackend(
     taskStore,
     backend: resolvedBackend,
     asyncLayer,
+    hostAsyncLayer,
     async shutdown() {
       // Close the TaskStore first (releases the AsyncDataLayer / pool), then
       // stop the embedded cluster if one was started. Best-effort: log errors.

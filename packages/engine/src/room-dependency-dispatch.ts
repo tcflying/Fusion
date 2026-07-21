@@ -20,7 +20,7 @@ const GRAPH_KEYS = [
   "readyNodeIds",
   "criticalPathNodeIds",
 ] as const;
-const NODE_KEYS = [
+const NODE_BASE_KEYS = [
   "id",
   "parentNodeId",
   "objective",
@@ -42,6 +42,7 @@ const NODE_KEYS = [
   "origin",
   "terminalLineage",
 ] as const;
+const NODE_KEYS = [...NODE_BASE_KEYS, "assignedSeatIds"] as const;
 const RESOURCE_HINT_KEYS = [
   "estimatedDurationMs",
   "concurrencyClass",
@@ -295,7 +296,18 @@ function validateAndDetachGraph(input: unknown): RoomTaskGraphProjectionV1 {
 }
 
 function validateNode(value: unknown, label: string): RoomTaskNodeProjectionV1 {
-  const node = exactRecord(value, NODE_KEYS, label);
+  const hasAssignedSeatIds = value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.prototype.hasOwnProperty.call(value, "assignedSeatIds");
+  const node = exactRecord(value, hasAssignedSeatIds ? NODE_KEYS : NODE_BASE_KEYS, label);
+  const assignedSeatIds = hasAssignedSeatIds
+    ? stringArray(
+      (node as Record<string, unknown>).assignedSeatIds,
+      `${label}.assignedSeatIds`,
+      true,
+    )
+    : [];
   const state = enumValue(node.state, NODE_STATES, `${label}.state`);
   const acceptedAt = nullableTimestamp(node.acceptedAt, `${label}.acceptedAt`);
   const acceptanceEvidenceIds = stringArray(
@@ -339,6 +351,7 @@ function validateNode(value: unknown, label: string): RoomTaskNodeProjectionV1 {
     id: nonBlankString(node.id, `${label}.id`),
     parentNodeId: nullableString(node.parentNodeId, `${label}.parentNodeId`),
     objective: nonBlankString(node.objective, `${label}.objective`),
+    assignedSeatIds,
     inputRefs: stringArray(node.inputRefs, `${label}.inputRefs`, true),
     outputRefs: stringArray(node.outputRefs, `${label}.outputRefs`, true),
     roleRequirements: stringArray(node.roleRequirements, `${label}.roleRequirements`, true),

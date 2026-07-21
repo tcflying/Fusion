@@ -1,5 +1,25 @@
-import type { RoomProtocolDefinitionV1 } from "./room-contracts/protocol.js";
+import {
+  ROOM_PROTOCOL_TERMINALIZATION_ARTIFACT_REQUIREMENT_PREFIX_V1,
+  ROOM_PROTOCOL_TERMINALIZATION_DELIVERY_REQUIREMENT_PREFIX_V1,
+  validateRoomProtocolNoProgressRecoveryPolicy,
+  type RoomProtocolDefinitionV1,
+  type RoomProtocolNoProgressRecoveryPolicyV1,
+} from "./room-contracts/protocol.js";
 import { validateRoomProtocolDefinition } from "./room-protocol-schema.js";
+
+/*
+FNXC:RoomTerminalization 2026-07-18-00:25:
+Built-in Protocol-v1 definitions make terminal artifact and delivery proof
+explicit with schema-compatible evidence requirement markers. The pure policy
+uses these markers to fail closed until the Room ledger provides matching proof.
+*/
+function terminalArtifactRequirement(artifactId: string): string {
+  return ROOM_PROTOCOL_TERMINALIZATION_ARTIFACT_REQUIREMENT_PREFIX_V1 + artifactId;
+}
+
+function terminalDeliveryRequirement(deliveryId: string): string {
+  return ROOM_PROTOCOL_TERMINALIZATION_DELIVERY_REQUIREMENT_PREFIX_V1 + deliveryId;
+}
 
 const RAW_ROOM_PROTOCOL_DEFINITIONS = [
   /*
@@ -37,7 +57,14 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         id: "decide",
         roleIds: ["decision_verifier"],
         entryGateIds: ["challenge_resolved"],
-        exitGateIds: ["decision_accepted", "analysis_blocked"],
+        exitGateIds: [
+          "decision_accepted",
+          "decision_accepted_with_risks",
+          "analysis_partial_accepted",
+          "analysis_blocked",
+          "analysis_cancelled",
+          "analysis_failed",
+        ],
         timeoutMs: 300_000,
         channelIds: ["decision"],
         contextPackIds: ["decision_evidence"],
@@ -112,7 +139,50 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         kind: "evidence",
         hard: true,
         evaluatorRoleIds: ["decision_verifier"],
-        evidenceRequirements: ["proposal", "source", "resolved_dissent"],
+        evidenceRequirements: [
+          "proposal",
+          "source",
+          "resolved_dissent",
+          terminalArtifactRequirement("decision"),
+          terminalDeliveryRequirement("decision"),
+        ],
+      },
+      {
+        id: "decision_accepted_with_risks",
+        kind: "evidence",
+        hard: true,
+        evaluatorRoleIds: ["decision_verifier"],
+        evidenceRequirements: [
+          "proposal",
+          "source",
+          "accepted_residual_risk",
+          terminalArtifactRequirement("decision"),
+          terminalDeliveryRequirement("decision"),
+        ],
+      },
+      {
+        id: "analysis_partial_accepted",
+        kind: "evidence",
+        hard: true,
+        evaluatorRoleIds: ["decision_verifier"],
+        evidenceRequirements: [
+          "proposal",
+          "source",
+          terminalArtifactRequirement("partial_decision"),
+          terminalDeliveryRequirement("partial_decision"),
+        ],
+      },
+      {
+        id: "analysis_cancelled",
+        kind: "operator_approval",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("cancellation")],
+      },
+      {
+        id: "analysis_failed",
+        kind: "evidence",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("failure")],
       },
     ],
     recoveryActions: [
@@ -148,8 +218,30 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         requireIndependentVerifier: true,
       },
       {
+        outcome: "completed_with_risks",
+        requiredGateIds: ["decision_accepted_with_risks"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
+        outcome: "partial",
+        requiredGateIds: ["analysis_partial_accepted"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
         outcome: "blocked",
         requiredGateIds: ["analysis_blocked"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "cancelled",
+        requiredGateIds: ["analysis_cancelled"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "failed",
+        requiredGateIds: ["analysis_failed"],
         requireIndependentVerifier: false,
       },
     ],
@@ -183,7 +275,14 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         id: "verify",
         roleIds: ["implementation_verifier"],
         entryGateIds: ["candidate_ready"],
-        exitGateIds: ["hard_gates_passed", "implementation_blocked"],
+        exitGateIds: [
+          "hard_gates_passed",
+          "implementation_accepted_with_risks",
+          "implementation_partial_accepted",
+          "implementation_blocked",
+          "implementation_cancelled",
+          "implementation_failed",
+        ],
         timeoutMs: 900_000,
         channelIds: ["implementation_review"],
         contextPackIds: ["implementation_evidence"],
@@ -258,7 +357,49 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         kind: "deterministic",
         hard: true,
         evaluatorRoleIds: ["implementation_verifier"],
-        evidenceRequirements: ["test", "source"],
+        evidenceRequirements: [
+          "test",
+          "source",
+          terminalArtifactRequirement("implementation"),
+          terminalDeliveryRequirement("implementation"),
+        ],
+      },
+      {
+        id: "implementation_accepted_with_risks",
+        kind: "deterministic",
+        hard: true,
+        evaluatorRoleIds: ["implementation_verifier"],
+        evidenceRequirements: [
+          "test",
+          "source",
+          "accepted_residual_risk",
+          terminalArtifactRequirement("implementation"),
+          terminalDeliveryRequirement("implementation"),
+        ],
+      },
+      {
+        id: "implementation_partial_accepted",
+        kind: "deterministic",
+        hard: true,
+        evaluatorRoleIds: ["implementation_verifier"],
+        evidenceRequirements: [
+          "test",
+          "source",
+          terminalArtifactRequirement("partial_implementation"),
+          terminalDeliveryRequirement("partial_implementation"),
+        ],
+      },
+      {
+        id: "implementation_cancelled",
+        kind: "operator_approval",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("cancellation")],
+      },
+      {
+        id: "implementation_failed",
+        kind: "deterministic",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("failure")],
       },
     ],
     recoveryActions: [
@@ -294,8 +435,30 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         requireIndependentVerifier: true,
       },
       {
+        outcome: "completed_with_risks",
+        requiredGateIds: ["implementation_accepted_with_risks"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
+        outcome: "partial",
+        requiredGateIds: ["implementation_partial_accepted"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
         outcome: "blocked",
         requiredGateIds: ["implementation_blocked"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "cancelled",
+        requiredGateIds: ["implementation_cancelled"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "failed",
+        requiredGateIds: ["implementation_failed"],
         requireIndependentVerifier: false,
       },
     ],
@@ -338,7 +501,14 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         id: "confirm_root_cause",
         roleIds: ["root_cause_verifier"],
         entryGateIds: ["falsification_complete"],
-        exitGateIds: ["root_cause_confirmed", "diagnosis_blocked"],
+        exitGateIds: [
+          "root_cause_confirmed",
+          "diagnosis_accepted_with_risks",
+          "diagnosis_partial_accepted",
+          "diagnosis_blocked",
+          "diagnosis_cancelled",
+          "diagnosis_failed",
+        ],
         timeoutMs: 300_000,
         channelIds: ["diagnostic_verdict"],
         contextPackIds: ["diagnostic_evidence"],
@@ -440,7 +610,51 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         kind: "evidence",
         hard: true,
         evaluatorRoleIds: ["root_cause_verifier"],
-        evidenceRequirements: ["hypothesis", "falsification", "runtime"],
+        evidenceRequirements: [
+          "hypothesis",
+          "falsification",
+          "runtime",
+          terminalArtifactRequirement("diagnosis"),
+          terminalDeliveryRequirement("diagnosis"),
+        ],
+      },
+      {
+        id: "diagnosis_accepted_with_risks",
+        kind: "evidence",
+        hard: true,
+        evaluatorRoleIds: ["root_cause_verifier"],
+        evidenceRequirements: [
+          "hypothesis",
+          "falsification",
+          "runtime",
+          "accepted_residual_risk",
+          terminalArtifactRequirement("diagnosis"),
+          terminalDeliveryRequirement("diagnosis"),
+        ],
+      },
+      {
+        id: "diagnosis_partial_accepted",
+        kind: "evidence",
+        hard: true,
+        evaluatorRoleIds: ["root_cause_verifier"],
+        evidenceRequirements: [
+          "hypothesis",
+          "runtime",
+          terminalArtifactRequirement("partial_diagnosis"),
+          terminalDeliveryRequirement("partial_diagnosis"),
+        ],
+      },
+      {
+        id: "diagnosis_cancelled",
+        kind: "operator_approval",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("cancellation")],
+      },
+      {
+        id: "diagnosis_failed",
+        kind: "evidence",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("failure")],
       },
     ],
     recoveryActions: [
@@ -484,8 +698,30 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         requireIndependentVerifier: true,
       },
       {
+        outcome: "completed_with_risks",
+        requiredGateIds: ["diagnosis_accepted_with_risks"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
+        outcome: "partial",
+        requiredGateIds: ["diagnosis_partial_accepted"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
         outcome: "blocked",
         requiredGateIds: ["diagnosis_blocked"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "cancelled",
+        requiredGateIds: ["diagnosis_cancelled"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "failed",
+        requiredGateIds: ["diagnosis_failed"],
         requireIndependentVerifier: false,
       },
     ],
@@ -528,7 +764,14 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         id: "arbitrate",
         roleIds: ["creative_arbiter"],
         entryGateIds: ["revision_ready"],
-        exitGateIds: ["creative_accepted", "creative_review_blocked"],
+        exitGateIds: [
+          "creative_accepted",
+          "creative_accepted_with_risks",
+          "creative_partial_accepted",
+          "creative_review_blocked",
+          "creative_cancelled",
+          "creative_failed",
+        ],
         timeoutMs: 300_000,
         channelIds: ["creative_verdict"],
         contextPackIds: ["creative_evidence"],
@@ -633,7 +876,51 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         kind: "model_review",
         hard: true,
         evaluatorRoleIds: ["creative_arbiter"],
-        evidenceRequirements: ["candidate", "critique", "revision"],
+        evidenceRequirements: [
+          "candidate",
+          "critique",
+          "revision",
+          terminalArtifactRequirement("creative_result"),
+          terminalDeliveryRequirement("creative_result"),
+        ],
+      },
+      {
+        id: "creative_accepted_with_risks",
+        kind: "model_review",
+        hard: true,
+        evaluatorRoleIds: ["creative_arbiter"],
+        evidenceRequirements: [
+          "candidate",
+          "critique",
+          "revision",
+          "accepted_residual_risk",
+          terminalArtifactRequirement("creative_result"),
+          terminalDeliveryRequirement("creative_result"),
+        ],
+      },
+      {
+        id: "creative_partial_accepted",
+        kind: "model_review",
+        hard: true,
+        evaluatorRoleIds: ["creative_arbiter"],
+        evidenceRequirements: [
+          "candidate",
+          "critique",
+          terminalArtifactRequirement("partial_creative_result"),
+          terminalDeliveryRequirement("partial_creative_result"),
+        ],
+      },
+      {
+        id: "creative_cancelled",
+        kind: "operator_approval",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("cancellation")],
+      },
+      {
+        id: "creative_failed",
+        kind: "evidence",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("failure")],
       },
     ],
     recoveryActions: [
@@ -677,8 +964,30 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         requireIndependentVerifier: true,
       },
       {
+        outcome: "completed_with_risks",
+        requiredGateIds: ["creative_accepted_with_risks"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
+        outcome: "partial",
+        requiredGateIds: ["creative_partial_accepted"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
         outcome: "blocked",
         requiredGateIds: ["creative_review_blocked"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "cancelled",
+        requiredGateIds: ["creative_cancelled"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "failed",
+        requiredGateIds: ["creative_failed"],
         requireIndependentVerifier: false,
       },
     ],
@@ -712,7 +1021,14 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         id: "synthesize",
         roleIds: ["synthesizer", "discussion_verifier"],
         entryGateIds: ["deliberation_complete"],
-        exitGateIds: ["synthesis_accepted", "discussion_blocked"],
+        exitGateIds: [
+          "synthesis_accepted",
+          "synthesis_accepted_with_risks",
+          "discussion_partial_accepted",
+          "discussion_blocked",
+          "discussion_cancelled",
+          "discussion_failed",
+        ],
         timeoutMs: 600_000,
         channelIds: ["synthesis"],
         contextPackIds: ["discussion_context"],
@@ -796,7 +1112,49 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         kind: "evidence",
         hard: true,
         evaluatorRoleIds: ["discussion_verifier"],
-        evidenceRequirements: ["proposal", "resolved_dissent", "synthesis"],
+        evidenceRequirements: [
+          "proposal",
+          "resolved_dissent",
+          "synthesis",
+          terminalArtifactRequirement("synthesis"),
+          terminalDeliveryRequirement("synthesis"),
+        ],
+      },
+      {
+        id: "synthesis_accepted_with_risks",
+        kind: "evidence",
+        hard: true,
+        evaluatorRoleIds: ["discussion_verifier"],
+        evidenceRequirements: [
+          "proposal",
+          "accepted_residual_risk",
+          "synthesis",
+          terminalArtifactRequirement("synthesis"),
+          terminalDeliveryRequirement("synthesis"),
+        ],
+      },
+      {
+        id: "discussion_partial_accepted",
+        kind: "evidence",
+        hard: true,
+        evaluatorRoleIds: ["discussion_verifier"],
+        evidenceRequirements: [
+          "proposal",
+          terminalArtifactRequirement("partial_synthesis"),
+          terminalDeliveryRequirement("partial_synthesis"),
+        ],
+      },
+      {
+        id: "discussion_cancelled",
+        kind: "operator_approval",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("cancellation")],
+      },
+      {
+        id: "discussion_failed",
+        kind: "evidence",
+        hard: true,
+        evidenceRequirements: [terminalArtifactRequirement("failure")],
       },
     ],
     recoveryActions: [
@@ -832,16 +1190,117 @@ const RAW_ROOM_PROTOCOL_DEFINITIONS = [
         requireIndependentVerifier: true,
       },
       {
+        outcome: "completed_with_risks",
+        requiredGateIds: ["synthesis_accepted_with_risks"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
+        outcome: "partial",
+        requiredGateIds: ["discussion_partial_accepted"],
+        requireIndependentVerifier: true,
+        allowUnresolvedRiskSeverities: ["low", "medium"],
+      },
+      {
         outcome: "blocked",
         requiredGateIds: ["discussion_blocked"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "cancelled",
+        requiredGateIds: ["discussion_cancelled"],
+        requireIndependentVerifier: false,
+      },
+      {
+        outcome: "failed",
+        requiredGateIds: ["discussion_failed"],
         requireIndependentVerifier: false,
       },
     ],
   },
 ] as const satisfies readonly RoomProtocolDefinitionV1[];
 
+/*
+FNXC:SessionRoomNoProgressRecoveryDefinitions 2026-07-19:
+Protocol-v1 JSON remains schema-compatible while no-progress ladders are a
+versioned companion policy. This prevents an unversioned field addition from
+invalidating persisted protocol migration, while keeping every decision
+explicit, immutable, and tied to one protocol id/version.
+*/
+const RAW_ROOM_PROTOCOL_NO_PROGRESS_RECOVERY_POLICIES = [
+  {
+    protocolId: "analysis-decision",
+    protocolVersion: 1,
+    actions: [
+      {
+        recoveryActionId: "challenge_stalled_analysis",
+        ladderOrder: 1,
+        minimumConsecutiveUnchangedRounds: 2,
+      },
+    ],
+  },
+  {
+    protocolId: "implementation",
+    protocolVersion: 1,
+    actions: [
+      {
+        recoveryActionId: "replace_stalled_implementer",
+        ladderOrder: 1,
+        minimumConsecutiveUnchangedRounds: 2,
+      },
+    ],
+  },
+  {
+    protocolId: "diagnosis",
+    protocolVersion: 1,
+    actions: [
+      {
+        recoveryActionId: "redecompose_stalled_diagnosis",
+        ladderOrder: 1,
+        minimumConsecutiveUnchangedRounds: 2,
+      },
+    ],
+  },
+  {
+    protocolId: "creative-review",
+    protocolVersion: 1,
+    actions: [
+      {
+        recoveryActionId: "shrink_stalled_creative_scope",
+        ladderOrder: 1,
+        minimumConsecutiveUnchangedRounds: 2,
+      },
+    ],
+  },
+  {
+    protocolId: "bounded-discussion",
+    protocolVersion: 1,
+    actions: [
+      {
+        recoveryActionId: "escalate_stalled_discussion",
+        ladderOrder: 1,
+        minimumConsecutiveUnchangedRounds: 2,
+      },
+    ],
+  },
+] as const satisfies readonly RoomProtocolNoProgressRecoveryPolicyV1[];
+
+function protocolIdentity(protocolId: string, version: number): string {
+  return `${protocolId}\u0000${version}`;
+}
+
+function freezeNoProgressRecoveryPolicy(
+  policy: RoomProtocolNoProgressRecoveryPolicyV1,
+): RoomProtocolNoProgressRecoveryPolicyV1 {
+  return Object.freeze({
+    ...policy,
+    actions: Object.freeze(policy.actions.map((action) => Object.freeze({ ...action }))),
+  });
+}
+
 function validateBuiltInProtocol(
   definition: RoomProtocolDefinitionV1,
+  policy: RoomProtocolNoProgressRecoveryPolicyV1,
 ): RoomProtocolDefinitionV1 {
   const result = validateRoomProtocolDefinition(definition);
   if (!result.ok) {
@@ -850,32 +1309,96 @@ function validateBuiltInProtocol(
       .join(", ");
     throw new Error(`Invalid built-in Room protocol '${definition.id}': ${details}`);
   }
+  const recoveryPolicy = validateRoomProtocolNoProgressRecoveryPolicy({
+    protocol: result.value,
+    policy,
+  });
+  if (!recoveryPolicy.ok) {
+    const details = recoveryPolicy.issues
+      .map((issue) => `${issue.path}:${issue.code}`)
+      .join(", ");
+    throw new Error(`Invalid built-in Room recovery policy '${definition.id}': ${details}`);
+  }
   return result.value;
+}
+
+function validateBuiltInProtocolRegistry(
+  definitions: readonly RoomProtocolDefinitionV1[],
+  policies: readonly RoomProtocolNoProgressRecoveryPolicyV1[],
+): {
+  readonly definitions: readonly RoomProtocolDefinitionV1[];
+  readonly policies: readonly RoomProtocolNoProgressRecoveryPolicyV1[];
+} {
+  const definitionsByIdentity = new Map<string, RoomProtocolDefinitionV1>();
+  for (const definition of definitions) {
+    const identity = protocolIdentity(definition.id, definition.version);
+    if (definitionsByIdentity.has(identity)) {
+      throw new Error(
+        `Duplicate protocol identity '${definition.id}' at version ${definition.version}`,
+      );
+    }
+    definitionsByIdentity.set(identity, definition);
+  }
+
+  const policiesByIdentity = new Map<string, RoomProtocolNoProgressRecoveryPolicyV1>();
+  for (const policy of policies) {
+    const identity = protocolIdentity(policy.protocolId, policy.protocolVersion);
+    if (policiesByIdentity.has(identity)) {
+      throw new Error(
+        `Duplicate no-progress recovery policy '${policy.protocolId}' at version ${policy.protocolVersion}`,
+      );
+    }
+    if (!definitionsByIdentity.has(identity)) {
+      throw new Error(
+        `No Room protocol exists for recovery policy '${policy.protocolId}' at version ${policy.protocolVersion}`,
+      );
+    }
+    policiesByIdentity.set(identity, policy);
+  }
+
+  const validatedDefinitions = definitions.map((definition) => {
+    const policy = policiesByIdentity.get(protocolIdentity(definition.id, definition.version));
+    if (!policy) {
+      throw new Error(
+        `Missing no-progress recovery policy for '${definition.id}' at version ${definition.version}`,
+      );
+    }
+    return validateBuiltInProtocol(definition, policy);
+  });
+  return {
+    definitions: Object.freeze(validatedDefinitions),
+    policies: Object.freeze(policies.map(freezeNoProgressRecoveryPolicy)),
+  };
 }
 
 export function validateRoomProtocolDefinitionRegistry(
   definitions: readonly RoomProtocolDefinitionV1[],
 ): readonly RoomProtocolDefinitionV1[] {
-  const validated = definitions.map(validateBuiltInProtocol);
-  const identities = new Set<string>();
-  for (const definition of validated) {
-    const identity = `${definition.id}\u0000${definition.version}`;
-    if (identities.has(identity)) {
-      throw new Error(
-        `Duplicate protocol identity '${definition.id}' at version ${definition.version}`,
-      );
-    }
-    identities.add(identity);
-  }
-  return Object.freeze(validated);
+  const requestedIdentities = new Set(
+    definitions.map((definition) => protocolIdentity(definition.id, definition.version)),
+  );
+  return validateBuiltInProtocolRegistry(
+    definitions,
+    RAW_ROOM_PROTOCOL_NO_PROGRESS_RECOVERY_POLICIES.filter((policy) =>
+      requestedIdentities.has(protocolIdentity(policy.protocolId, policy.protocolVersion)),
+    ),
+  ).definitions;
 }
 
 /*
 FNXC:SessionRoomProtocolDefinitions 2026-07-17-23:47:
 Built-in Room protocols are executable persisted contracts, not compile-time fixtures. Validate and freeze every definition at module load so invalid phase graphs, producer-verifier overlap, unbounded recovery, or unsupported versions fail before a Room can select them.
 */
+const VALIDATED_ROOM_PROTOCOL_CATALOG = validateBuiltInProtocolRegistry(
+  RAW_ROOM_PROTOCOL_DEFINITIONS,
+  RAW_ROOM_PROTOCOL_NO_PROGRESS_RECOVERY_POLICIES,
+);
+
 export const ROOM_PROTOCOL_DEFINITIONS: readonly RoomProtocolDefinitionV1[] =
-  validateRoomProtocolDefinitionRegistry(RAW_ROOM_PROTOCOL_DEFINITIONS);
+  VALIDATED_ROOM_PROTOCOL_CATALOG.definitions;
+
+export const ROOM_PROTOCOL_NO_PROGRESS_RECOVERY_POLICIES: readonly RoomProtocolNoProgressRecoveryPolicyV1[] =
+  VALIDATED_ROOM_PROTOCOL_CATALOG.policies;
 
 export function getRoomProtocolDefinition(
   protocolId: string,
@@ -898,4 +1421,18 @@ export function getLatestRoomProtocolDefinition(
     if (!latest || definition.version > latest.version) latest = definition;
   }
   return latest;
+}
+
+export function getRoomProtocolNoProgressRecoveryPolicy(
+  protocolId: string,
+  version: number,
+): RoomProtocolNoProgressRecoveryPolicyV1 | undefined {
+  if (!Number.isSafeInteger(version) || version <= 0) {
+    throw new TypeError(
+      "getRoomProtocolNoProgressRecoveryPolicy requires an explicit positive integer protocol version",
+    );
+  }
+  return ROOM_PROTOCOL_NO_PROGRESS_RECOVERY_POLICIES.find(
+    (policy) => policy.protocolId === protocolId && policy.protocolVersion === version,
+  );
 }

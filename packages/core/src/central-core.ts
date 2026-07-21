@@ -108,6 +108,21 @@ import {
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
 import * as asyncCentralCore from "./async-central-core.js";
 import {
+  createGlobalCapacityPolicyAuthorityStore,
+  loadGlobalCapacityPolicyAuthority,
+  type GlobalCapacityPolicyAuthorityRecordV1,
+  type GlobalCapacityPolicyAuthorityV1,
+  type InstallGlobalCapacityPolicyAuthorityInputV1,
+  type UpdateGlobalCapacityPolicyAuthorityInputV1,
+} from "./global-capacity-policy-authority.js";
+import {
+  createRoomHostCompositionOperatorPolicyAuthorityStore,
+  type InstallRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  type RevokeRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  type RoomHostCompositionOperatorPolicyAuthorityRecordV1,
+  type RoomHostCompositionOperatorPolicyAuthorityScopeV1,
+} from "./room-host-composition-operator-policy-authority.js";
+import {
   deriveRunningAgentCounts,
   getRunningAgentCountSource,
   type RunningAgentCountSource,
@@ -3319,6 +3334,64 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
     this.emit("concurrency:changed", state);
   }
 
+  /**
+   * FNXC:GlobalCapacityPolicyAuthority 2026-07-20-04:20:
+   * Global capacity policy is a central PostgreSQL host contract, not a
+   * project or user setting. These methods deliberately reject non-backend
+   * CentralCore instances and delegate validation, hashing, and state
+   * synchronization to the dedicated authority store without installing a
+   * fallback policy.
+   */
+  async readGlobalCapacityPolicyAuthorityV1(): Promise<GlobalCapacityPolicyAuthorityV1> {
+    return loadGlobalCapacityPolicyAuthority({ layer: this.requireGlobalCapacityPolicyAuthorityLayer() });
+  }
+
+  async installGlobalCapacityPolicyAuthorityV1(
+    input: InstallGlobalCapacityPolicyAuthorityInputV1,
+  ): Promise<GlobalCapacityPolicyAuthorityRecordV1> {
+    return createGlobalCapacityPolicyAuthorityStore({
+      layer: this.requireGlobalCapacityPolicyAuthorityLayer(),
+    }).install(input);
+  }
+
+  async updateGlobalCapacityPolicyAuthorityV1(
+    input: UpdateGlobalCapacityPolicyAuthorityInputV1,
+  ): Promise<GlobalCapacityPolicyAuthorityRecordV1> {
+    return createGlobalCapacityPolicyAuthorityStore({
+      layer: this.requireGlobalCapacityPolicyAuthorityLayer(),
+    }).update(input);
+  }
+
+  /**
+   * FNXC:RoomHostCompositionOperatorAuthority 2026-07-20-09:18:
+   * This is a separate central authority from global capacity: it scopes a
+   * finite Room adapter bundle to one project and concrete host. No dashboard
+   * or project setting may manufacture a bundle when this record is absent.
+   */
+  async readRoomHostCompositionOperatorPolicyAuthorityV1(
+    scope: RoomHostCompositionOperatorPolicyAuthorityScopeV1,
+  ): Promise<RoomHostCompositionOperatorPolicyAuthorityRecordV1> {
+    return createRoomHostCompositionOperatorPolicyAuthorityStore({
+      layer: this.requireRoomHostCompositionOperatorPolicyAuthorityLayer(),
+    }).read(scope);
+  }
+
+  async installRoomHostCompositionOperatorPolicyAuthorityV1(
+    input: InstallRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  ): Promise<RoomHostCompositionOperatorPolicyAuthorityRecordV1> {
+    return createRoomHostCompositionOperatorPolicyAuthorityStore({
+      layer: this.requireRoomHostCompositionOperatorPolicyAuthorityLayer(),
+    }).install(input);
+  }
+
+  async revokeRoomHostCompositionOperatorPolicyAuthorityV1(
+    input: RevokeRoomHostCompositionOperatorPolicyAuthorityInputV1,
+  ): Promise<RoomHostCompositionOperatorPolicyAuthorityRecordV1> {
+    return createRoomHostCompositionOperatorPolicyAuthorityStore({
+      layer: this.requireRoomHostCompositionOperatorPolicyAuthorityLayer(),
+    }).revoke(input);
+  }
+
   // ── Utility Methods ─────────────────────────────────────────────────────
 
   /**
@@ -3457,6 +3530,22 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       throw new Error("backendHandle is only available in backend mode (asyncLayer injected)");
     }
     return this.asyncLayer.db;
+  }
+
+  private requireGlobalCapacityPolicyAuthorityLayer(): AsyncDataLayer {
+    this.ensureInitialized();
+    if (!this.asyncLayer) {
+      throw new Error("Global capacity policy authority is only available in backend mode (asyncLayer injected)");
+    }
+    return this.asyncLayer;
+  }
+
+  private requireRoomHostCompositionOperatorPolicyAuthorityLayer(): AsyncDataLayer {
+    this.ensureInitialized();
+    if (!this.asyncLayer) {
+      throw new Error("Room host composition operator authority is only available in backend mode (asyncLayer injected)");
+    }
+    return this.asyncLayer;
   }
 
   private async assertProjectNodeMappingTargetsExist(projectId: string, nodeId: string): Promise<void> {

@@ -300,10 +300,16 @@ function createReadService() {
   };
 }
 
-function createProjectEngine(store: TaskStore, service: RoomControlPlaneReadService, liveEventService: unknown = undefined) {
+function createProjectEngine(
+  store: TaskStore,
+  service: RoomControlPlaneReadService,
+  liveEventService: unknown = undefined,
+  executeHandler?: (command: unknown) => Promise<unknown>,
+) {
   const getRoomControlPlaneReadService = vi.fn(() => service);
   const getRoomControlPlaneLiveEventService = vi.fn(() => liveEventService);
-  const executeProjectRoomCommand = vi.fn(async () => {
+  const executeProjectRoomCommand = vi.fn(async (command: unknown) => {
+    if (executeHandler) return await executeHandler(command);
     throw new Error("Room commands are not exercised by this read-only server fixture");
   });
   return {
@@ -466,6 +472,91 @@ describe("Room control-plane server wiring", () => {
     expect(serviceCalls.getTaskGraph).toHaveBeenCalledWith(ROOM_ID);
   });
 
+  it("keeps an old connector compatible when Engine returns canonical withheld provider telemetry", async () => {
+    const connectorId = "legacy-connector";
+    const canonicalSessionUri = "codex://threads/legacy-session";
+    const requiredHostId = "legacy-host";
+    const identity = {
+      connectorId,
+      providerId: "happier",
+      nativeSessionId: "legacy-native-session",
+      happierSessionId: null,
+      serverProfileId: null,
+      machineId: null,
+      hostId: requiredHostId,
+    };
+    const executeHandler = vi.fn(async () => ({
+      type: "room.preflight-existing-session.v1" as const,
+      projectId: PROJECT_ID,
+      commandId: "server-legacy-telemetry:1",
+      actor: { kind: "dashboard_operator" as const, principalId: "operator-room-server" },
+      value: {
+        contractVersion: 1,
+        state: "identity_verified",
+        request: { connectorId, canonicalSessionUri, requiredHostId },
+        identity,
+        checkedAt: "2026-07-21T03:00:00.000Z",
+        providerTurnStarted: false,
+        capabilities: [{ name: "ensureExisting", state: "verified" }],
+        health: {
+          state: "healthy",
+          checkedAt: "2026-07-21T03:00:00.000Z",
+          authentication: "authenticated",
+          rateLimit: "clear",
+          reasonCodes: [],
+          retryAfterMs: null,
+        },
+        providerTelemetry: {
+          contractVersion: 1,
+          state: "withheld",
+          identity,
+          reason: "connector_telemetry_unsupported",
+        },
+      },
+    }));
+    const { service } = createReadService();
+    const { engine, calls: engineCalls } = createProjectEngine(store, service, undefined, executeHandler);
+    const { manager } = createEngineManager(engine);
+    const authorizeProject = vi.fn<RoomControlPlaneProjectAuthorizer>(async () => ({
+      allowed: true,
+      actorId: "operator-room-server",
+    }));
+    const app = createServer(store, {
+      engineManager: manager,
+      roomControlPlaneAuthorizeProject: authorizeProject,
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms/session-preflight?projectId=${PROJECT_ID}`,
+      JSON.stringify({
+        commandId: "server-legacy-telemetry",
+        sessions: [{ connectorId, canonicalSessionUri, requiredHostId }],
+      }),
+      { "content-type": "application/json" },
+    );
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const result = response.body.results[0].result;
+    expect(result.providerTelemetry).toEqual({
+      contractVersion: 1,
+      state: "withheld",
+      identity: result.identity,
+      reason: "connector_telemetry_unsupported",
+    });
+    expect(engineCalls.executeProjectRoomCommand).toHaveBeenCalledWith(expect.objectContaining({
+      type: "room.preflight-existing-session.v1",
+      projectId: PROJECT_ID,
+      commandId: "server-legacy-telemetry:1",
+    }), {
+      kind: "dashboard_operator",
+      principalId: "operator-room-server",
+      authenticated: true,
+    });
+    expect(executeHandler).toHaveBeenCalledOnce();
+  });
+
   it("mounts authenticated canonical Room SSE through the Engine live-event getter and terminates when its subscription closes", async () => {
     const { service } = createReadService();
     const live = createLiveEventService();
@@ -494,6 +585,7 @@ describe("Room control-plane server wiring", () => {
     expect(live.calls.subscribe).toHaveBeenCalledWith({
       projectId: PROJECT_ID,
       roomId: ROOM_ID,
+      actorId: "operator-room-server",
       holdUntilReplayWatermark: true,
       afterCursor: null,
     }, expect.any(Function));
@@ -555,6 +647,107 @@ describe("Room control-plane server wiring", () => {
     expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
   });
 
+  it("does not expose Room metadata or trusted-device pairing when daemon transport authentication is disabled", async () => {
+    const { service } = createReadService();
+    const { engine, calls: engineCalls } = createProjectEngine(store, service);
+    const { manager } = createEngineManager(engine);
+    const app = createServer(store, {
+      engineManager: manager,
+      roomControlPlaneRbac: roomRbacOptions(async () => createInMemoryRoomRbacRegistry()),
+    });
+
+    const metadata = await request(app, "GET", `/api/rooms?projectId=${PROJECT_ID}`);
+    const pairing = await request(
+      app,
+      "POST",
+      `/api/rooms/device-sessions?projectId=${PROJECT_ID}`,
+      JSON.stringify({ projectId: PROJECT_ID, principalId: "forged-owner", deviceId: "forged-device" }),
+      { "content-type": "application/json" },
+    );
+
+    expect(metadata.status).toBe(404);
+    expect(pairing.status).toBe(404);
+    expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
+  });
+
+  it("requires daemon transport and an existing durable owner before pairing a device", async () => {
+    const { service } = createReadService();
+    const { engine } = createProjectEngine(store, service);
+    const { manager } = createEngineManager(engine);
+    const registry = createInMemoryRoomRbacRegistry();
+    const ownerCredential = createTrustedRoomDeviceCredential();
+    const now = new Date();
+    await registry.issueTrustedDeviceSession({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: PROJECT_ID,
+      sessionId: "server-owner-session",
+      principalId: "server-owner",
+      deviceId: "server-owner-device",
+      credential: ownerCredential,
+      issuedAt: new Date(now.getTime() - 60_000).toISOString(),
+      expiresAt: new Date(now.getTime() + 60 * 60_000).toISOString(),
+      idempotencyKey: "server-owner-session",
+    });
+    await registry.grantRole({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: PROJECT_ID,
+      grantId: "server-owner-grant",
+      principalId: "server-owner",
+      role: "owner",
+      roomId: null,
+      grantedAt: now.toISOString(),
+      expectedAuthorizationVersion: 0,
+      idempotencyKey: "server-owner-grant",
+    });
+    const app = createServer(store, {
+      engineManager: manager,
+      roomControlPlaneRbac: roomRbacOptions(async () => registry),
+      daemon: { token: DAEMON_TOKEN },
+    });
+
+    const missingTransport = await request(
+      app,
+      "POST",
+      `/api/rooms/device-sessions?projectId=${PROJECT_ID}`,
+      JSON.stringify({}),
+      { "content-type": "application/json" },
+    );
+    const bearerOnly = await request(
+      app,
+      "POST",
+      `/api/rooms/device-sessions?projectId=${PROJECT_ID}`,
+      undefined,
+      { authorization: `Bearer ${DAEMON_TOKEN}` },
+    );
+    const forgedBody = await request(
+      app,
+      "POST",
+      `/api/rooms/device-sessions?projectId=${PROJECT_ID}`,
+      JSON.stringify({ principalId: "forged-owner", deviceId: "forged-device" }),
+      { ...trustedDeviceHeaders(ownerCredential), "content-type": "application/json", authorization: `Bearer ${DAEMON_TOKEN}` },
+    );
+    const paired = await request(
+      app,
+      "POST",
+      `/api/rooms/device-sessions?projectId=${PROJECT_ID}`,
+      JSON.stringify({}),
+      { ...trustedDeviceHeaders(ownerCredential), "content-type": "application/json", authorization: `Bearer ${DAEMON_TOKEN}` },
+    );
+
+    expect(missingTransport.status).toBe(401);
+    expect(bearerOnly.status).toBe(403);
+    expect(bearerOnly.body).toMatchObject({ details: { code: "ROOM_DEVICE_SESSION_ACCESS_DENIED" } });
+    expect(forgedBody.status).toBe(400);
+    expect(paired.status).toBe(201);
+    expect(paired.body).toMatchObject({
+      session: {
+        deviceId: expect.any(String),
+        expiresAt: expect.any(String),
+      },
+    });
+    expect(paired.body.session).not.toHaveProperty("principalId");
+  });
+
   it("does not start an untrusted project Engine when durable RBAC denies before project context resolution", async () => {
     const onProjectAccessed = vi.fn();
     const manager = {
@@ -564,9 +757,16 @@ describe("Room control-plane server wiring", () => {
     const app = createServer(store, {
       engineManager: manager,
       roomControlPlaneRbac: roomRbacOptions(async () => createInMemoryRoomRbacRegistry()),
+      daemon: { token: DAEMON_TOKEN },
     });
 
-    const response = await request(app, "GET", `/api/rooms?projectId=${PROJECT_ID}`);
+    const response = await request(
+      app,
+      "GET",
+      `/api/rooms?projectId=${PROJECT_ID}`,
+      undefined,
+      { authorization: `Bearer ${DAEMON_TOKEN}` },
+    );
 
     expect(response.status).toBe(403);
     expect(response.body).toMatchObject({ details: { code: "ROOM_PROJECT_ACCESS_DENIED" } });

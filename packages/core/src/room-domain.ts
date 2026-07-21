@@ -16,10 +16,12 @@ import type {
   RoomTurnRecordV1,
   RoomTurnState,
 } from "./room-contracts/storage.js";
+import type { RoomTerminalizationMarkerV1 } from "./room-terminalization-contract.js";
 
 export type RoomDomainErrorCode =
   | "aggregate_version_conflict"
   | "invalid_lifecycle_transition"
+  | "terminalization_required"
   | "terminal_state_immutable"
   | "room_state_conflict"
   | "seat_identity_conflict"
@@ -82,6 +84,8 @@ export interface RoomAggregateV1 {
   readonly bindings: readonly RoomBindingRecordV1[];
   readonly turns: readonly RoomTurnRecordV1[];
   readonly pendingMembershipChanges: readonly PendingRoomMembershipChangeV1[];
+  /** Present only after the controller has committed a hash-bound terminal contract. */
+  readonly terminalization?: RoomTerminalizationMarkerV1;
 }
 
 export interface CreateRoomAggregateInput {
@@ -97,6 +101,10 @@ export interface TransitionRoomLifecycleInput {
   readonly to: RoomLifecycleState;
   readonly expectedAggregateVersion: number;
   readonly now: IsoTimestamp;
+}
+
+export interface TerminalizeRoomLifecycleInput extends TransitionRoomLifecycleInput {
+  readonly terminalization: RoomTerminalizationMarkerV1;
 }
 
 const TERMINAL_OUTCOMES = new Set<RoomLifecycleState>([
@@ -159,6 +167,16 @@ export function transitionRoomLifecycle(
 ): RoomAggregateV1 {
   assertAggregateVersion(aggregate, input.expectedAggregateVersion);
   const from = aggregate.room.state;
+  if (aggregate.terminalization) {
+    if (input.to !== "archived") {
+      throw new RoomDomainError(
+        "terminal_state_immutable",
+        `Room terminal contract ${aggregate.terminalization.contractId} cannot transition to ${input.to}`,
+        { from, to: input.to, terminalizationContractId: aggregate.terminalization.contractId },
+      );
+    }
+    return bumpAggregate(aggregate, input.now, { state: "archived" });
+  }
   if ((TERMINAL_OUTCOMES.has(from) && input.to !== "archived") || from === "archived") {
     throw new RoomDomainError(
       "terminal_state_immutable",
@@ -174,6 +192,47 @@ export function transitionRoomLifecycle(
     );
   }
   return bumpAggregate(aggregate, input.now, { state: input.to });
+}
+
+/**
+ * FNXC:RoomTerminalization 2026-07-18-11:19:
+ * A terminalized `blocked` Room must remain distinct from a resumable approval
+ * block. The marker is carried with the aggregate so replay and checkpoints
+ * keep the controller-only terminal contract immutable after a restart.
+ */
+export function terminalizeRoomLifecycle(
+  aggregate: RoomAggregateV1,
+  input: TerminalizeRoomLifecycleInput,
+): RoomAggregateV1 {
+  assertAggregateVersion(aggregate, input.expectedAggregateVersion);
+  if (aggregate.terminalization) {
+    throw new RoomDomainError(
+      "terminal_state_immutable",
+      `Room already has terminal contract ${aggregate.terminalization.contractId}`,
+      { terminalizationContractId: aggregate.terminalization.contractId },
+    );
+  }
+  if (input.terminalization.outcome !== input.to) {
+    throw new RoomDomainError(
+      "room_state_conflict",
+      "Terminalization marker outcome must exactly match lifecycle outcome",
+      { outcome: input.terminalization.outcome, to: input.to },
+    );
+  }
+  const next = aggregate.room.state === "blocked" && input.to === "blocked"
+    ? bumpAggregate(aggregate, input.now, { state: "blocked" })
+    : transitionRoomLifecycle(aggregate, input);
+  if (input.terminalization.aggregateVersion !== next.room.aggregateVersion) {
+    throw new RoomDomainError(
+      "aggregate_version_conflict",
+      "Terminalization marker aggregate version must match the committed Room version",
+      { expected: next.room.aggregateVersion, actual: input.terminalization.aggregateVersion },
+    );
+  }
+  return {
+    ...next,
+    terminalization: { ...input.terminalization },
+  };
 }
 
 export interface AddRoomSeatInput {

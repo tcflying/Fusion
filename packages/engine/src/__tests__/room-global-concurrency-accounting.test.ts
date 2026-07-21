@@ -8,6 +8,7 @@ import {
   type RoomGlobalConcurrencyClaimStorePortV1,
   type RoomGlobalConcurrencyClaimStoreResultV1,
   type RoomGlobalConcurrencyClaimV1,
+  type RoomGlobalConcurrencyRenewInputV1,
   type RoomGlobalConcurrencyReleaseInputV1,
   type RoomGlobalConcurrencySnapshotPortV1,
   type RoomGlobalConcurrencySnapshotV1,
@@ -91,10 +92,32 @@ function release(overrides: Partial<RoomGlobalConcurrencyReleaseInputV1> = {}): 
   };
 }
 
+function renew(overrides: Partial<RoomGlobalConcurrencyRenewInputV1> = {}): RoomGlobalConcurrencyRenewInputV1 {
+  return {
+    contractVersion: ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION,
+    projectId: PROJECT_A,
+    roomId: ROOM_A,
+    claimId: "room-claim-existing",
+    operationId: "room-renew-operation-1",
+    holderId: "room-worker-a",
+    leaseId: "room-lease-a",
+    fence: 2,
+    asOf: AS_OF,
+    expiresAt: "2026-07-19T14:10:00.000Z",
+    ...overrides,
+  };
+}
+
 function successFor(command: RoomGlobalConcurrencyClaimStoreCommandV1, replayed = false): RoomGlobalConcurrencyClaimStoreResultV1 {
   return {
     ok: true,
-    action: command.kind === "acquire" ? "acquired" : command.kind === "release" ? "released" : "recovered",
+    action: command.kind === "acquire"
+      ? "acquired"
+      : command.kind === "renew"
+        ? "renewed"
+        : command.kind === "release"
+          ? "released"
+          : "recovered",
     replayed,
     claimId: command.claimId,
     fence: command.fence,
@@ -263,6 +286,59 @@ describe("Room global concurrency accounting", () => {
     expect(result).toMatchObject({ action: "released", replayed: true, claimId: "room-claim-existing", fence: 2 });
     expect(fixture.commands).toHaveLength(1);
     expect(fixture.commands[0]).toMatchObject({ kind: "release", expectedSnapshotId: "central-concurrency-snapshot-1" });
+  });
+
+  it("renews the matching fenced claim and treats an older target expiry as an idempotent replay without shortening it", async () => {
+    const fixture = ports(snapshot({ roomClaims: [claim()] }), (command) => successFor(command, true));
+    const accounting = new RoomGlobalConcurrencyAccounting(fixture);
+
+    const extended = await accounting.renew(renew());
+    const olderReplay = await accounting.renew(renew({
+      operationId: "room-renew-operation-stale",
+      expiresAt: "2026-07-19T14:01:00.000Z",
+    }));
+
+    expect(extended).toMatchObject({
+      action: "renewed",
+      replayed: true,
+      claimId: "room-claim-existing",
+      fence: 2,
+    });
+    expect(olderReplay).toMatchObject({
+      action: "renewed",
+      replayed: true,
+      claimId: "room-claim-existing",
+      fence: 2,
+    });
+    expect(fixture.commands).toHaveLength(1);
+    expect(fixture.commands[0]).toMatchObject({
+      kind: "renew",
+      expectedSnapshotId: "central-concurrency-snapshot-1",
+      request: renew(),
+    });
+  });
+
+  it("fails closed before the durable store when a renewal uses a stale claim fence", async () => {
+    const fixture = ports(snapshot({ roomClaims: [claim()] }));
+    const accounting = new RoomGlobalConcurrencyAccounting(fixture);
+
+    const result = await accounting.renew(renew({ fence: 1 }));
+
+    expect(result).toMatchObject({ action: "rejected", reason: "stale_fence" });
+    expect(fixture.commands).toEqual([]);
+  });
+
+  it("preserves a durable renewal expiry failure instead of collapsing it into an unrelated store error", async () => {
+    const fixture = ports(snapshot({ roomClaims: [claim()] }), () => ({
+      ok: false,
+      reason: "renewal_regression",
+    }));
+    const accounting = new RoomGlobalConcurrencyAccounting(fixture);
+
+    const result = await accounting.renew(renew());
+
+    expect(result).toMatchObject({ action: "held", reason: "renewal_regression" });
+    expect(fixture.commands).toHaveLength(1);
   });
 
   it("recovers only expired claims within the requested project and carries their fence to the store", async () => {

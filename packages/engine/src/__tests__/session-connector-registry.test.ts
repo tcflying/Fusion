@@ -286,11 +286,6 @@ describe("provider-neutral Session Connector registry contract", () => {
         host: "unavailable",
         reasonCodes: ["host_unavailable"],
       }],
-      ["capability-health", {
-        state: "degraded",
-        capabilities: healthCapabilities({ send: "unverified" }),
-        reasonCodes: ["capability_not_verified"],
-      }],
     ];
 
     for (const [dimension, healthPatch] of cases) {
@@ -307,6 +302,20 @@ describe("provider-neutral Session Connector registry contract", () => {
       await expect(requireVerified(registry, "history"), dimension).resolves.toBe(connector);
       expect(connector.getHealth, dimension).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("uses identity-bound capability certification instead of an identityless health capability matrix", async () => {
+    const connector = makeConnector({
+      health: () => healthyHealth({
+        capabilities: healthCapabilities({ send: "unavailable" }),
+      }),
+    });
+    const registry = makeRegistry();
+    registry.register(connector);
+
+    await expect(requireVerified(registry, "send")).resolves.toBe(connector);
+    expect(connector.getCapabilities).toHaveBeenCalledWith(IDENTITY);
+    expect(connector.getHealth).toHaveBeenCalledWith(IDENTITY.hostId);
   });
 
   it("rejects stale, future, contradictory, or untimed rate-limit health", async () => {

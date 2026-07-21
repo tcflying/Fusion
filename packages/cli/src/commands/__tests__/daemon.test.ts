@@ -202,6 +202,8 @@ const mocks = vi.hoisted(() => {
     return instance;
   });
 
+  const createTaskStoreForBackend = vi.fn().mockResolvedValue(undefined);
+
   const createServerMock = vi.fn().mockImplementation(() => ({
     listen: vi.fn((port: number, host?: string) => {
       const actualPort = port === 0 ? 5050 : port;
@@ -470,6 +472,38 @@ const mocks = vi.hoisted(() => {
     return engine;
   });
 
+  const projectEngineManagerCtor = vi.fn().mockImplementation(function (
+    centralCore: { listProjects: () => Promise<readonly { id: string; path: string }[]> },
+    options: Record<string, unknown>,
+  ) {
+    const engines = new Map<string, { start: () => Promise<void>; stop: () => Promise<void> }>();
+    return {
+      startAll: vi.fn(async () => {
+        const projects = await centralCore.listProjects();
+        for (const project of projects) {
+          const engine = projectEngineCtor(
+            { projectId: project.id, workingDirectory: project.path, isolationMode: "in-process", maxConcurrent: 4, maxWorktrees: 10 },
+            centralCore,
+            { ...options, projectId: project.id },
+          ) as { start: () => Promise<void>; stop: () => Promise<void> };
+          await engine.start();
+          engines.set(project.id, engine);
+        }
+      }),
+      getEngine: vi.fn((id: string) => engines.get(id)),
+      getAllEngines: vi.fn(() => engines),
+      getStore: vi.fn((id: string) => engines.get(id)?.getTaskStore()),
+      has: vi.fn((id: string) => engines.has(id)),
+      ensureEngine: vi.fn(async (id: string) => engines.get(id)),
+      stopAll: vi.fn(async () => {
+        for (const engine of engines.values()) await engine.stop();
+        engines.clear();
+      }),
+      onProjectAccessed: vi.fn(),
+      startReconciliation: vi.fn(),
+    };
+  });
+
   return {
     taskStores,
     automationStores,
@@ -496,6 +530,7 @@ const mocks = vi.hoisted(() => {
     automationStoreCtor,
     agentStoreCtor,
     centralCoreCtor,
+    createTaskStoreForBackend,
     createServerMock,
     triageCtor,
     executorCtor,
@@ -509,6 +544,7 @@ const mocks = vi.hoisted(() => {
     pluginStoreCtor,
     pluginLoaderCtor,
     projectEngineCtor,
+    projectEngineManagerCtor,
     agentSemaphoreCtor,
     heartbeatMonitorCtor,
     heartbeatTriggerSchedulerCtor,
@@ -539,6 +575,8 @@ const mocks = vi.hoisted(() => {
       projectEngineInstances.length = 0;
       listenCalls.length = 0;
       globalSettingsData = {};
+      createTaskStoreForBackend.mockReset();
+      createTaskStoreForBackend.mockResolvedValue(undefined);
       syncInsightExtractionAutomationMock.mockReset();
       syncInsightExtractionAutomationMock.mockResolvedValue(undefined);
       processAndAuditInsightExtractionMock.mockClear();
@@ -558,6 +596,7 @@ vi.mock("@fusion/core", async (importOriginal) => {
   AutomationStore: mocks.automationStoreCtor,
   AgentStore: mocks.agentStoreCtor,
   CentralCore: mocks.centralCoreCtor,
+  createTaskStoreForBackend: mocks.createTaskStoreForBackend,
   PluginStore: mocks.pluginStoreCtor,
   PluginLoader: mocks.pluginLoaderCtor,
   GlobalSettingsStore: vi.fn().mockImplementation(function () {
@@ -607,34 +646,7 @@ vi.mock("@fusion/engine", async (importOriginal) => {
     createFusionAuthStorage: vi.fn(() => mocks.authStorage),
     createFusionModelRegistry: mocks.createFusionModelRegistryMock,
     ProjectEngine: mocks.projectEngineCtor,
-    ProjectEngineManager: vi.fn().mockImplementation(function (centralCore: any, options: any) {
-    const engines = new Map<string, any>();
-    return {
-      startAll: vi.fn(async () => {
-        const projects = await centralCore.listProjects();
-        for (const project of projects) {
-          const engine = mocks.projectEngineCtor(
-            { projectId: project.id, workingDirectory: project.path, isolationMode: "in-process", maxConcurrent: 4, maxWorktrees: 10 },
-            centralCore,
-            { ...options, projectId: project.id },
-          );
-          await engine.start();
-          engines.set(project.id, engine);
-        }
-      }),
-      getEngine: vi.fn((id: string) => engines.get(id)),
-      getAllEngines: vi.fn(() => engines),
-      getStore: vi.fn((id: string) => engines.get(id)?.getTaskStore()),
-      has: vi.fn((id: string) => engines.has(id)),
-      ensureEngine: vi.fn(async (id: string) => engines.get(id)),
-      stopAll: vi.fn(async () => {
-        for (const engine of engines.values()) await engine.stop();
-        engines.clear();
-      }),
-      onProjectAccessed: vi.fn(),
-      startReconciliation: vi.fn(),
-    };
-  }),
+    ProjectEngineManager: mocks.projectEngineManagerCtor,
   PeerExchangeService: vi.fn().mockImplementation(function () {
     return {
       start: vi.fn(),
@@ -1135,6 +1147,88 @@ describe("runDaemon", () => {
     } finally {
       delete process.env.FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN;
     }
+  });
+
+  it("boots CentralCore from the backend factory's unscoped host layer", async () => {
+    const projectLayer = { projectId: "project-1" };
+    const hostLayer = { projectId: undefined, close: vi.fn() };
+    const backendShutdown = vi.fn().mockResolvedValue(undefined);
+    mocks.createTaskStoreForBackend.mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: projectLayer,
+      hostAsyncLayer: hostLayer,
+      shutdown: backendShutdown,
+    });
+
+    await runDaemon({});
+
+    expect(mocks.createTaskStoreForBackend).toHaveBeenCalledWith({ rootDir: "/repo" });
+    expect(mocks.centralCoreCtor).toHaveBeenCalledWith(undefined, {
+      asyncLayer: hostLayer,
+    });
+    expect(mocks.centralCoreCtor).not.toHaveBeenCalledWith(undefined, {
+      asyncLayer: projectLayer,
+    });
+
+    await triggerSignal("SIGINT");
+    expect(backendShutdown).toHaveBeenCalledTimes(1);
+    expect(hostLayer.close).not.toHaveBeenCalled();
+  });
+
+  it("passes the Windows host composition registry into ProjectEngineManager before startAll", async () => {
+    await runDaemon({});
+
+    const managerOptions = mocks.projectEngineManagerCtor.mock.calls.at(-1)?.[1] as {
+      roomHostCompositionOperatorAdapterRegistry?: { resolve?: unknown };
+    };
+    const manager = mocks.projectEngineManagerCtor.mock.results.at(-1)?.value as {
+      startAll: ReturnType<typeof vi.fn>;
+    };
+    expect(managerOptions.roomHostCompositionOperatorAdapterRegistry).toEqual(
+      expect.objectContaining({ resolve: expect.any(Function) }),
+    );
+    expect(manager.startAll).toHaveBeenCalledTimes(1);
+    expect(mocks.projectEngineManagerCtor.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      manager.startAll.mock.invocationCallOrder[0],
+    );
+
+    await triggerSignal("SIGINT");
+  });
+
+  it("binds the backend factory's canonical host layer into the Windows registry", async () => {
+    const hostLayer = { projectId: undefined };
+    mocks.createTaskStoreForBackend.mockResolvedValueOnce({
+      taskStore: {},
+      asyncLayer: { projectId: "project-1" },
+      hostAsyncLayer: hostLayer,
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    });
+
+    await runDaemon({});
+
+    const managerOptions = mocks.projectEngineManagerCtor.mock.calls.at(-1)?.[1] as {
+      roomHostCompositionOperatorAdapterRegistry?: {
+        resolve?: (input: unknown) => Promise<unknown>;
+      };
+    };
+    expect(managerOptions.roomHostCompositionOperatorAdapterRegistry?.resolve?.({
+      authorityRecord: {
+        policy: {
+          adapterBindings: {
+            capabilityObservationAdapterId: "windows-happier-capability-v1",
+            providerAdmissionSnapshotAdapterId: "windows-happier-provider-admission-v1",
+            capacityTelemetryAdapterId: "windows-happier-capacity-telemetry-v1",
+            roomWorkerAuthorityAdapterId: "windows-room-worker-authority-v1",
+          },
+        },
+      },
+      roomContext: { connectorIds: ["happier"] },
+    })).toEqual({
+      state: "withheld",
+      reason: "windows_provider_admission_telemetry_unavailable",
+    });
+
+    await triggerSignal("SIGINT");
   });
 
   it("enables HybridExecutor with env override and shuts down before engine stop", async () => {

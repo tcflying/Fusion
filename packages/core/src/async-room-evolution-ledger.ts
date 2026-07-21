@@ -983,12 +983,17 @@ export class AsyncRoomEvolutionLedger {
   ): Promise<RoomEvolutionLedgerAppendResult<"room_evolution_canaries", RoomEvolutionCanaryRecordV1>> {
     const normalized = normalizeCanaryInput(input);
     return this.persistence.transaction(async (transaction) => {
+      const hardGateResultIds = requireCanaryHardGateResultIds(
+        normalized.record.successCriteria,
+        "Canary plan",
+      );
       const references = await this.resolveReferences(transaction, normalized.scope, {
         candidateVersionIds: [
           normalized.record.candidateVersionId,
           normalized.record.rollbackTargetCandidateVersionId,
         ],
         experimentIds: [normalized.record.experimentId],
+        gateResultIds: hardGateResultIds,
       });
       const candidate = requireReference(references.candidateVersions, normalized.record.candidateVersionId, "candidate version");
       const experiment = requireReference(references.experiments, normalized.record.experimentId, "experiment");
@@ -998,6 +1003,29 @@ export class AsyncRoomEvolutionLedger {
       if (candidate.rollbackTargetCandidateVersionId !== normalized.record.rollbackTargetCandidateVersionId) {
         throw invalidReference("Canary rollback target is not the candidate's declared rollback lineage");
       }
+      const candidateTrust = requireVerifiedCanaryCandidateTrust(candidate, "Canary plan");
+      const hardGates = requireEligibleHardGateSet({
+        gateResults: references.gateResults,
+        gateResultIds: hardGateResultIds,
+        candidate,
+        experiment,
+        candidateTrust,
+        plannedAt: normalized.record.createdAt,
+        label: "Canary plan",
+      });
+      const trustedBindings = await this.resolveReferences(transaction, normalized.scope, {
+        trustedBindingIds: hardGateTrustedBindingIds(candidateTrust, hardGates),
+      });
+      await assertHardGateBindingTrust({
+        transaction,
+        scope: normalized.scope,
+        candidate,
+        candidateTrust,
+        hardGates,
+        trustedBindings: trustedBindings.trustedBindings,
+        asOf: normalized.record.createdAt,
+        label: "Canary plan",
+      });
       return this.appendRecord(transaction, normalized.scope, {
         table: "room_evolution_canaries",
         record: normalized.record,
@@ -1042,10 +1070,36 @@ export class AsyncRoomEvolutionLedger {
       const candidate = requireReference(references.candidateVersions, normalized.record.candidateVersionId, "candidate version");
       const experiment = requireReference(references.experiments, normalized.record.experimentId, "experiment");
       const canary = requireReference(references.canaries, normalized.record.canaryId, "canary");
+      const plannedHardGateResultIds = requireCanaryHardGateResultIds(
+        canary.successCriteria,
+        "Durable canary plan",
+      );
+      if (!sameIdentifierSet(plannedHardGateResultIds, normalized.record.gateResultIds)) {
+        throw invalidReference("Successful canary outcome must retain exactly the durable canary hard-gate identities");
+      }
+      if (Date.parse(normalized.record.completedAt) <= Date.parse(canary.createdAt)) {
+        throw invalidReference("Successful canary outcome must be later than its durable canary plan");
+      }
+      const candidateTrust = requireVerifiedCanaryCandidateTrust(candidate, "Successful canary outcome");
+      const hardGates = requireEligibleHardGateSet({
+        gateResults: references.gateResults,
+        gateResultIds: plannedHardGateResultIds,
+        candidate,
+        experiment,
+        candidateTrust,
+        plannedAt: canary.createdAt,
+        label: "Successful canary outcome",
+      });
+      const hardGateBindingReferences = await this.resolveReferences(transaction, normalized.scope, {
+        trustedBindingIds: compactIds(
+          ...hardGateTrustedBindingIds(candidateTrust, hardGates),
+          normalized.record.evaluatorBindingId,
+        ),
+      });
       const candidateBinding = await requireTrustedBinding(
         transaction,
         normalized.scope,
-        references.trustedBindings,
+        hardGateBindingReferences.trustedBindings,
         normalized.record.candidateBindingId,
         normalized.record.candidateBindingVersion,
         "candidate_producer",
@@ -1055,7 +1109,7 @@ export class AsyncRoomEvolutionLedger {
       const evaluatorBinding = await requireTrustedBinding(
         transaction,
         normalized.scope,
-        references.trustedBindings,
+        hardGateBindingReferences.trustedBindings,
         normalized.record.evaluatorBindingId,
         normalized.record.evaluatorBindingVersion,
         "independent_evaluator",
@@ -1082,20 +1136,16 @@ export class AsyncRoomEvolutionLedger {
       if (normalized.record.allocationHash !== hashRoomValue(canary.allocation)) {
         throw invalidReference("Successful canary outcome allocation hash does not match the durable canary allocation");
       }
-      for (const gate of references.gateResults) {
-        if (!gate.promotionEligible
-          || gate.outcome !== "passed"
-          || gate.candidateVersionId !== candidate.id
-          || gate.candidateHash !== candidate.candidateHash
-          || gate.candidateBindingId !== candidate.producerBindingId
-          || gate.candidateBindingVersion !== candidate.producerBindingVersion
-          || gate.evaluatorBindingId !== evaluatorBinding.id
-          || gate.evaluatorBindingVersion !== evaluatorBinding.bindingVersion
-          || gate.evaluationArtifactHash === null
-          || gate.metricsHash === null) {
-          throw invalidReference("Successful canary outcome requires durable independent gate attestations for the same candidate");
-        }
-      }
+      await assertHardGateBindingTrust({
+        transaction,
+        scope: normalized.scope,
+        candidate,
+        candidateTrust,
+        hardGates,
+        trustedBindings: hardGateBindingReferences.trustedBindings,
+        asOf: normalized.record.completedAt,
+        label: "Successful canary outcome",
+      });
       const appended = await this.appendRecord(transaction, normalized.scope, {
         table: "room_evolution_canary_success_outcomes",
         record: normalized.record,
@@ -1154,6 +1204,9 @@ export class AsyncRoomEvolutionLedger {
         normalized.canarySuccessOutcomeId,
         "successful canary outcome",
       );
+      if (Date.parse(normalized.record.decidedAt) <= Date.parse(successfulCanary.completedAt)) {
+        throw invalidReference("Promotion decision must be later than its durable successful canary outcome");
+      }
       const decisionBinding = await requireTrustedBinding(
         transaction,
         normalized.scope,
@@ -2335,6 +2388,174 @@ async function requireTrustedBinding(
     );
   }
   return binding;
+}
+
+interface VerifiedCanaryCandidateTrust {
+  readonly candidateHash: string;
+  readonly producerBindingId: string;
+  readonly producerBindingVersion: number;
+}
+
+interface EligibleHardGate {
+  readonly record: RoomEvolutionGateResultRecordV1;
+  readonly evaluatorBindingId: string;
+  readonly evaluatorBindingVersion: number;
+}
+
+/*
+FNXC:EvolutionTrust 2026-07-19-21:32:
+A canary is allowed to receive work only after immutable, independently verified hard gates
+for the exact candidate are pinned into its durable plan. Later gate substitutions, advisory
+metrics, producer-controlled evaluation, and identities that expire or are revoked before
+the success receipt fail closed.
+*/
+function requireCanaryHardGateResultIds(
+  successCriteria: RoomEvolutionJsonObjectV1,
+  label: string,
+): readonly string[] {
+  const value = successCriteria.hardGateResultIds;
+  if (!Array.isArray(value)) {
+    throw new RoomEvolutionLedgerError(
+      "policy_violation",
+      label + " requires an explicit durable hardGateResultIds array before a canary can run",
+    );
+  }
+  const ids = canonicalIds(value, label + " hard gate ids");
+  if (ids.length === 0) {
+    throw new RoomEvolutionLedgerError(
+      "policy_violation",
+      label + " requires at least one durable independent hard gate before a canary can run",
+    );
+  }
+  return ids;
+}
+
+function requireVerifiedCanaryCandidateTrust(
+  candidate: RoomEvolutionCandidateVersionRecordV1,
+  label: string,
+): VerifiedCanaryCandidateTrust {
+  if (candidate.candidateHash === null
+    || candidate.producerBindingId === null
+    || candidate.producerBindingVersion === null) {
+    throw new RoomEvolutionLedgerError(
+      "policy_violation",
+      label + " requires a candidate with a durable verified hash and producer binding",
+    );
+  }
+  return {
+    candidateHash: candidate.candidateHash,
+    producerBindingId: candidate.producerBindingId,
+    producerBindingVersion: candidate.producerBindingVersion,
+  };
+}
+
+function requireEligibleHardGateSet(input: {
+  readonly gateResults: readonly RoomEvolutionGateResultRecordV1[];
+  readonly gateResultIds: readonly string[];
+  readonly candidate: RoomEvolutionCandidateVersionRecordV1;
+  readonly experiment: RoomEvolutionExperimentRecordV1;
+  readonly candidateTrust: VerifiedCanaryCandidateTrust;
+  readonly plannedAt: string;
+  readonly label: string;
+}): readonly EligibleHardGate[] {
+  return input.gateResultIds.map((gateResultId) => {
+    const gate = requireReference(input.gateResults, gateResultId, "hard gate result");
+    if (gate.gateClass !== "hard"
+      || !gate.promotionEligible
+      || gate.outcome !== "passed"
+      || gate.evaluatorKind !== "independent_reviewer") {
+      throw new RoomEvolutionLedgerError(
+        "policy_violation",
+        input.label + " requires a passed, promotion-eligible independent hard gate",
+      );
+    }
+    if (Date.parse(gate.completedAt) >= Date.parse(input.plannedAt)) {
+      throw new RoomEvolutionLedgerError(
+        "policy_violation",
+        input.label + " requires a hard gate completed before its durable plan time",
+      );
+    }
+    if (gate.experimentId !== input.experiment.id
+      || gate.candidateVersionId !== input.candidate.id
+      || gate.candidateProducerActorId !== input.candidate.producedByActorId
+      || gate.candidateHash !== input.candidateTrust.candidateHash
+      || gate.candidateBindingId !== input.candidateTrust.producerBindingId
+      || gate.candidateBindingVersion !== input.candidateTrust.producerBindingVersion
+      || gate.evaluatorBindingId === null
+      || gate.evaluatorBindingVersion === null
+      || gate.evaluationArtifactHash === null
+      || gate.metricsHash === null) {
+      throw invalidReference(input.label + " hard gate must bind the exact verified candidate and evaluator identity");
+    }
+    return {
+      record: gate,
+      evaluatorBindingId: gate.evaluatorBindingId,
+      evaluatorBindingVersion: gate.evaluatorBindingVersion,
+    };
+  });
+}
+
+function hardGateTrustedBindingIds(
+  candidateTrust: VerifiedCanaryCandidateTrust,
+  hardGates: readonly EligibleHardGate[],
+): readonly string[] {
+  return [...new Set([
+    candidateTrust.producerBindingId,
+    ...hardGates.map((hardGate) => hardGate.evaluatorBindingId),
+  ])];
+}
+
+async function assertHardGateBindingTrust(input: {
+  readonly transaction: RoomEvolutionLedgerTransaction;
+  readonly scope: RoomEvolutionLedgerScope;
+  readonly candidate: RoomEvolutionCandidateVersionRecordV1;
+  readonly candidateTrust: VerifiedCanaryCandidateTrust;
+  readonly hardGates: readonly EligibleHardGate[];
+  readonly trustedBindings: readonly RoomEvolutionTrustedBindingRecordV1[];
+  readonly asOf: string;
+  readonly label: string;
+}): Promise<void> {
+  const candidateBinding = await requireTrustedBinding(
+    input.transaction,
+    input.scope,
+    input.trustedBindings,
+    input.candidateTrust.producerBindingId,
+    input.candidateTrust.producerBindingVersion,
+    "candidate_producer",
+    input.asOf,
+    input.label + " candidate",
+  );
+  if (candidateBinding.actorId !== input.candidate.producedByActorId) {
+    throw invalidReference(input.label + " candidate producer binding must match the durable candidate actor");
+  }
+  for (const hardGate of input.hardGates) {
+    const evaluatorBinding = await requireTrustedBinding(
+      input.transaction,
+      input.scope,
+      input.trustedBindings,
+      hardGate.evaluatorBindingId,
+      hardGate.evaluatorBindingVersion,
+      "independent_evaluator",
+      input.asOf,
+      input.label + " hard gate evaluator",
+    );
+    if (hardGate.record.evaluatorActorId !== evaluatorBinding.actorId) {
+      throw invalidReference(input.label + " hard gate evaluator must match the durable trusted binding");
+    }
+    if (sameTrustedBindingPrincipal(candidateBinding, evaluatorBinding)) {
+      throw new RoomEvolutionLedgerError(
+        "self_acceptance_forbidden",
+        input.label + " hard gate evaluator must remain independent from the candidate producer",
+      );
+    }
+  }
+}
+
+function sameIdentifierSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
 }
 
 function trustedBindingWithoutIntegrityHash(binding: RoomEvolutionTrustedBindingRecordV1): Omit<

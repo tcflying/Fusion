@@ -123,6 +123,15 @@ export function resolveHappierCliSettings(
   const happierSessionBindings = Array.isArray(settings?.happierSessionBindings)
     ? settings.happierSessionBindings as readonly HappierSessionBinding[]
     : undefined;
+  const enableLocalRuntimeSnapshot = typeof settings?.enableLocalRuntimeSnapshot === "boolean"
+    ? settings.enableLocalRuntimeSnapshot
+    : process.env.FUSION_HAPPIER_ENABLE_LOCAL_RUNTIME_SNAPSHOT_V1 === "1";
+  const enableLocalReconciliationHistory = typeof settings?.enableLocalReconciliationHistory === "boolean"
+    ? settings.enableLocalReconciliationHistory
+    : process.env.FUSION_HAPPIER_ENABLE_LOCAL_RECONCILIATION_HISTORY_V1 === "1";
+  const enableLocalProviderTelemetry = typeof settings?.enableLocalProviderTelemetry === "boolean"
+    ? settings.enableLocalProviderTelemetry
+    : process.env.FUSION_HAPPIER_ENABLE_LOCAL_PROVIDER_TELEMETRY_V1 === "1";
 
   return {
     executable,
@@ -137,6 +146,9 @@ export function resolveHappierCliSettings(
     profile: nonEmptyString(settings?.profile) ?? nonEmptyString(process.env.HAPPIER_PROFILE),
     ...(backend ? { backend } : {}),
     ...(happierSessionBindings ? { happierSessionBindings } : {}),
+    enableLocalRuntimeSnapshot,
+    enableLocalReconciliationHistory,
+    enableLocalProviderTelemetry,
     timeoutMs: positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     maxOutputBytes: Math.max(
       1,
@@ -162,6 +174,11 @@ export function buildHappierProcessEnv(
     ...(resolved.serverUrl ? { HAPPIER_SERVER_URL: resolved.serverUrl } : {}),
     ...(resolved.publicServerUrl ? { HAPPIER_PUBLIC_SERVER_URL: resolved.publicServerUrl } : {}),
     ...(resolved.webappUrl ? { HAPPIER_WEBAPP_URL: resolved.webappUrl } : {}),
+    // Always override inherited state: a plain upstream Happier executable
+    // must not accidentally expose Fusion's local extension to this process.
+    HAPPIER_ENABLE_FUSION_RUNTIME_SNAPSHOT_V1: resolved.enableLocalRuntimeSnapshot ? "1" : "0",
+    HAPPIER_ENABLE_FUSION_RECONCILIATION_HISTORY_V1: resolved.enableLocalReconciliationHistory ? "1" : "0",
+    HAPPIER_ENABLE_FUSION_PROVIDER_TELEMETRY_V1: resolved.enableLocalProviderTelemetry ? "1" : "0",
   };
 }
 

@@ -1,4 +1,9 @@
-export { createServer, loadTlsCredentialsFromEnv, type ServerOptions } from "./server.js";
+export {
+  createDaemonRoomControlPlaneAuthorizer,
+  createServer,
+  loadTlsCredentialsFromEnv,
+  type ServerOptions,
+} from "./server.js";
 export {
   refreshAllCustomProviderModels,
   refreshCustomProviderModels,

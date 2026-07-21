@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -218,11 +218,11 @@ describe("RoomCockpitView", () => {
     expect(screen.getByText(projection.objective)).toBeInTheDocument();
     expect(screen.getByText("Independent evidence review")).toBeInTheDocument();
     expect(screen.getByText("3 / 7 accepted")).toBeInTheDocument();
-    expect(screen.getByText("6 / 8 active slots")).toBeInTheDocument();
-    expect(screen.getByRole("status", { name: "Runtime capacity telemetry available" })).toHaveTextContent(
-      "Runtime capacity telemetry was observed from the persistent feed.",
+    expect(screen.getByText("6 running task nodes / 8 attached bindings")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Runtime capacity telemetry unavailable" })).toHaveTextContent(
+      "No production runtime capacity observation is connected to this Cockpit.",
     );
-    expect(screen.getByText("3 queued · 4.2 / min")).toBeInTheDocument();
+    expect(screen.getByText("3 pending graph nodes · runtime capacity telemetry unavailable")).toBeInTheDocument();
     expect(screen.getByText("Research independent sources → Review evidence chain")).toBeInTheDocument();
 
     const task = screen.getByRole("button", {
@@ -258,38 +258,71 @@ describe("RoomCockpitView", () => {
     expect(onRequestAccess).toHaveBeenCalledTimes(1);
   });
 
-  it("wires independently validated panels through supplied projections and guarded callbacks", async () => {
-    const user = userEvent.setup();
-    const onGuardedComposerSubmit = vi.fn().mockResolvedValue({ state: "accepted", receiptId: "receipt-001" });
+  it("renders supplied facts without exposing unproven Cockpit controls", () => {
+    const onGuardedComposerSubmit = vi.fn();
     const onGuardedAlertAction = vi.fn();
 
     render(
       <RoomCockpitView
         state="ready"
         projection={connectedProjection}
-        callbacks={{ onGuardedComposerSubmit, onGuardedAlertAction }}
+        callbacks={{ onGuardedComposerSubmit, onGuardedAlertAction } as never}
       />,
     );
 
     expect(screen.getByRole("article", { name: "Participant seat-controller" })).toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Evidence withheld" })).toHaveTextContent("withheld-review-17");
-    expect(screen.getByRole("heading", { name: "Compose Room draft" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Draft composer unavailable" })).toHaveTextContent(
+      "Draft delivery is intentionally unavailable in this structural Cockpit",
+    );
     expect(screen.getByRole("article", { name: "Alert provider-capacity:openai:west: critical" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Draft message" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebalance provider capacity" })).toBeDisabled();
+    expect(onGuardedComposerSubmit).not.toHaveBeenCalled();
+    expect(onGuardedAlertAction).not.toHaveBeenCalled();
+  });
 
-    await user.type(screen.getByRole("textbox", { name: "Draft message" }), "Verify the capacity receipt.");
-    await user.click(screen.getByRole("button", { name: "Submit guarded draft" }));
-    await screen.findByText(/Guard accepted delivery/i);
-    expect(onGuardedComposerSubmit).toHaveBeenCalledWith({
-      body: "Verify the capacity receipt.",
-      target: { mode: "controller", seatIds: ["seat-controller"] },
-    });
+  it("labels the Cockpit as structural evidence and keeps unsupported controls unavailable", async () => {
+    const user = userEvent.setup();
+    const onGuardedComposerSubmit = vi.fn();
+    const onGuardedAlertAction = vi.fn();
 
-    await user.click(screen.getByRole("button", { name: "Rebalance provider capacity" }));
-    await waitFor(() => expect(onGuardedAlertAction).toHaveBeenCalledTimes(1));
-    expect(onGuardedAlertAction).toHaveBeenCalledWith(expect.objectContaining({
-      alertId: "alert-capacity-001",
-      actionId: "rebalance-provider-capacity",
-    }));
+    render(
+      <RoomCockpitView
+        state="ready"
+        projection={connectedProjection}
+        execution={{
+          state: "available",
+          detail: "Authorized lifecycle snapshot.",
+          status: {
+            contractVersion: 1,
+            projectId: "project-structural",
+            state: "execution_started",
+            reasonCodes: [],
+            changedAt: "2026-07-20T13:00:00.000Z",
+            readServiceAvailable: true,
+            liveEventServiceAvailable: true,
+            controllerStarted: true,
+          },
+        }}
+        callbacks={{ onGuardedComposerSubmit, onGuardedAlertAction } as never}
+      />,
+    );
+
+    expect(screen.getByText("Room control plane / canonical structural projection")).toBeInTheDocument();
+    expect(screen.getByText("6 running task nodes / 8 attached bindings")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Runtime capacity telemetry unavailable" })).toHaveTextContent(
+      "No production runtime capacity observation is connected to this Cockpit.",
+    );
+    expect(screen.getByText(/not Windows process, PID, or crash-liveness evidence/i)).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "Draft message" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rebalance provider capacity" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: /Review evidence chain, waiting dependency/i }));
+    expect(screen.getByText("Graph dependency note")).toBeInTheDocument();
+    expect(screen.getByText("Recorded next step (not executed)")).toBeInTheDocument();
+    expect(onGuardedComposerSubmit).not.toHaveBeenCalled();
+    expect(onGuardedAlertAction).not.toHaveBeenCalled();
   });
 
   it("keeps absent data and unproven callbacks visible instead of manufacturing a control surface", () => {
@@ -302,7 +335,7 @@ describe("RoomCockpitView", () => {
 
     expect(screen.getByText("Participant telemetry unavailable.")).toHaveAttribute("role", "status");
     expect(screen.getByRole("status", { name: "Evidence unavailable" })).toHaveTextContent("No verified candidate evidence packet has been projected for this Room.");
-    expect(screen.getByRole("status", { name: "Draft composer unavailable" })).toHaveTextContent("No guarded draft delivery callback is connected for this Room.");
+    expect(screen.getByRole("status", { name: "Draft composer unavailable" })).toHaveTextContent("Draft delivery is intentionally unavailable in this structural Cockpit");
     expect(screen.getByText("Action handler unavailable.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Rebalance provider capacity" })).toBeDisabled();
 
@@ -315,10 +348,10 @@ describe("RoomCockpitView", () => {
     render(<RoomCockpitView state="ready" projection={unavailableCapacityProjection} />);
 
     expect(screen.getByRole("status", { name: "Runtime capacity telemetry unavailable" })).toHaveTextContent(
-      "No persistent runtime telemetry is available from the canonical Room aggregate.",
+      "No production runtime capacity observation is connected to this Cockpit.",
     );
     expect(screen.getAllByText("Unavailable")).toHaveLength(2);
-    expect(screen.getByText("Idle-capacity reasons are unavailable.")).toBeInTheDocument();
+    expect(screen.getByText("Runtime wait and recovery observations are unavailable.")).toBeInTheDocument();
     expect(screen.queryByText("0.0 / min")).not.toBeInTheDocument();
     expect(screen.queryByText("No unassigned capacity reported.")).not.toBeInTheDocument();
 

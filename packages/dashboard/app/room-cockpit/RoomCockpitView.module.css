@@ -182,6 +182,129 @@
   transform: translateY(-1px);
 }
 
+.executionPanel {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.1fr) minmax(300px, 1.45fr);
+  gap: 1px;
+  overflow: hidden;
+  background: var(--room-cockpit-line);
+  border: 1px solid var(--room-cockpit-line);
+}
+
+.executionIdentity,
+.executionFacts,
+.executionReasons,
+.executionBoundary {
+  min-width: 0;
+  background: color-mix(in srgb, var(--room-cockpit-raised) 92%, #000000 8%);
+}
+
+.executionIdentity {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  padding: 14px 16px;
+}
+
+.executionIdentity > p,
+.executionReasons > span,
+.executionBoundary {
+  color: var(--room-cockpit-muted);
+  font-size: 0.69rem;
+  letter-spacing: 0.08em;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.executionIdentity > p {
+  color: var(--room-cockpit-signal);
+  font-weight: 700;
+}
+
+.executionIdentity > strong {
+  color: var(--room-cockpit-ink);
+  font-size: clamp(0.9rem, 1.7vw, 1.05rem);
+  line-height: 1.25;
+}
+
+.executionIdentity > span {
+  color: var(--room-cockpit-muted);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.executionFacts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--room-cockpit-line);
+}
+
+.executionFacts > div {
+  min-width: 0;
+  padding: 13px;
+  background: color-mix(in srgb, var(--room-cockpit-surface) 94%, #000000 6%);
+}
+
+.executionFacts dt {
+  color: var(--room-cockpit-muted);
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.executionFacts dd {
+  margin-top: 7px;
+  overflow-wrap: anywhere;
+  color: var(--room-cockpit-ink);
+  font-size: 0.75rem;
+  line-height: 1.35;
+}
+
+.executionReasons,
+.executionBoundary {
+  grid-column: 1 / -1;
+  padding: 10px 14px;
+}
+
+.executionReasons {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.executionReasons code {
+  padding: 3px 6px;
+  color: var(--room-cockpit-caution);
+  background: color-mix(in srgb, var(--room-cockpit-caution) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--room-cockpit-caution) 38%, transparent);
+  font: inherit;
+  font-size: 0.68rem;
+}
+
+.executionBoundary {
+  color: color-mix(in srgb, var(--room-cockpit-muted) 82%, #ffffff 18%);
+  background: color-mix(in srgb, var(--room-cockpit-surface) 94%, #000000 6%);
+  border-top: 1px solid color-mix(in srgb, var(--room-cockpit-line) 72%, transparent);
+}
+
+.executionPanel[data-execution-state="execution_started"] .executionIdentity > strong {
+  color: var(--room-cockpit-stable);
+}
+
+.executionPanel[data-execution-state="read_only_withheld"] .executionIdentity > strong,
+.executionPanel[data-execution-state="not_enabled"] .executionIdentity > strong,
+.executionPanel[data-execution-state="unavailable"] .executionIdentity > strong {
+  color: var(--room-cockpit-caution);
+}
+
+.executionPanel[data-execution-state="startup_failed"] .executionIdentity > strong,
+.executionPanel[data-execution-state="permission-denied"] .executionIdentity > strong {
+  color: var(--room-cockpit-danger);
+}
+
 .signalTape {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1032,7 +1155,8 @@
   .commandHeader,
   .operationsGrid,
   .intelligenceGrid,
-  .supplementalGrid {
+  .supplementalGrid,
+  .executionPanel {
     grid-template-columns: 1fr;
   }
 
@@ -1118,7 +1242,8 @@
 
   .detailFacts,
   .capacityList,
-  .capacityTelemetryFacts {
+  .capacityTelemetryFacts,
+  .executionFacts {
     grid-template-columns: 1fr;
   }
 

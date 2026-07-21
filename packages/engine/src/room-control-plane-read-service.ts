@@ -1,10 +1,18 @@
 import type {
   AsyncRoomStore,
   RoomAggregateV1,
+  RoomBindingRecordV1,
+  RoomSeatRecordV1,
   RoomSummaryV1,
   RoomTaskGraphProjectionV1,
   RoomTaskNodeProjectionV1,
+  SessionConnectorDeepLinksV1,
+  SessionConnectorHealthReasonCode,
+  SessionConnectorHealthV1,
+  SessionConnectorIdentityV1,
+  SessionConnectorV1,
 } from "@fusion/core";
+import type { SessionConnectorRegistry } from "./session-connector-registry.js";
 
 export type RoomControlPlaneReadServiceErrorCode =
   | "room_control_plane_invalid_project_id"
@@ -29,6 +37,8 @@ export class RoomControlPlaneReadServiceError extends Error {
 export interface RoomControlPlaneReadServiceOptionsV1 {
   readonly projectId: string;
   readonly roomStore: AsyncRoomStore;
+  /** Optional because projection reads remain available while connector runtime is withheld. */
+  readonly connectorRegistry?: Pick<SessionConnectorRegistry, "tryGet">;
 }
 
 export interface RoomControlPlaneListRoomsInputV1 {
@@ -132,6 +142,67 @@ export type RoomCockpitCapacityV1 =
   | RoomCockpitCapacityWithoutRuntimeTelemetryV1
   | RoomCockpitCapacityWithRuntimeTelemetryV1;
 
+/**
+ * Session links are convenience navigation only. The structural seat and
+ * binding record remains the source of truth; unavailable runtime evidence is
+ * represented with null rather than inferred from a provider/session string.
+ */
+export interface RoomCockpitParticipantProjectionV1 {
+  readonly seatId: string;
+  readonly bindingId: string | null;
+  readonly nativeSessionId: string | null;
+  readonly happierSessionId: string | null;
+  readonly happierUrl: string | null;
+  readonly nativeSessionUrl: string | null;
+  /** Connector-certified runtime reachability only; never a provider capacity or quality grant. */
+  readonly connectorHealth: RoomCockpitConnectorHealthProjectionV1;
+  readonly role: string;
+  readonly provider: string | null;
+  readonly model: null;
+  readonly host: string | null;
+  readonly heartbeat: {
+    readonly freshness: "unknown";
+    readonly lastObservedAt: null;
+    readonly recoveryOwner: null;
+  };
+  readonly context: {
+    readonly usedTokens: null;
+    readonly limitTokens: null;
+  };
+  readonly throughput: {
+    readonly eventsPerMinute: null;
+  };
+  readonly limits: {
+    readonly configuredConcurrent: null;
+    readonly effectiveConcurrent: null;
+  };
+  readonly wait: {
+    readonly reason: null;
+    readonly retryAt: null;
+  };
+  readonly leases: {
+    readonly sender: {
+      readonly state: "unknown";
+      readonly holderId: null;
+      readonly expiresAt: null;
+    };
+    readonly workspace: {
+      readonly state: "unknown";
+      readonly holderId: null;
+      readonly expiresAt: null;
+    };
+  };
+}
+
+export interface RoomCockpitConnectorHealthProjectionV1 {
+  readonly state: SessionConnectorHealthV1["state"] | "unknown";
+  readonly checkedAt: string | null;
+  readonly authentication: "authenticated" | "required" | "unknown";
+  readonly rateLimit: "clear" | "limited" | "unknown";
+  readonly reasonCodes: readonly SessionConnectorHealthReasonCode[];
+  readonly retryAfterMs: number | null;
+}
+
 export interface RoomCockpitProjectionV1 {
   readonly roomId: string;
   readonly objective: string;
@@ -193,10 +264,12 @@ export interface RoomCockpitProjectionV1 {
       readonly requiresConfirmation: boolean;
     }[];
   }[];
+  readonly participants: readonly RoomCockpitParticipantProjectionV1[];
 }
 
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_CURSOR_LENGTH = 512;
+export const ROOM_COCKPIT_DEEP_LINK_LOOKUP_TIMEOUT_MS = 1_000;
 const CAPACITY_STRUCTURAL_FIELDS = [
   "theoreticalSlots",
   "configuredSlots",
@@ -210,6 +283,56 @@ const CAPACITY_OBSERVED_FIELDS = [
   "throughputPerMinute",
   "idleReasons",
 ] as const satisfies readonly RoomCockpitCapacityObservedFieldV1[];
+const SAFE_NATIVE_SESSION_PROTOCOLS = new Set(["codex:", "claude:", "opencode:"]);
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+const CONNECTOR_HEALTH_STATES = new Set<string>([
+  "healthy",
+  "degraded",
+  "authentication_required",
+  "rate_limited",
+  "host_unavailable",
+  "unavailable",
+  "unknown",
+]);
+const CONNECTOR_HEALTH_AUTHENTICATION_STATES = new Set<string>([
+  "authenticated",
+  "required",
+  "unknown",
+]);
+const CONNECTOR_HEALTH_RATE_LIMIT_STATES = new Set<string>([
+  "clear",
+  "limited",
+  "unknown",
+]);
+const CONNECTOR_HEALTH_REASON_CODES = new Set<SessionConnectorHealthReasonCode>([
+  "executable_unavailable",
+  "executable_timeout",
+  "executable_not_found",
+  "authentication_required",
+  "authentication_timeout",
+  "authentication_invalid",
+  "server_unreachable",
+  "server_not_probed",
+  "daemon_stopped",
+  "status_timeout",
+  "status_invalid",
+  "backend_unavailable",
+  "backend_timeout",
+  "backend_invalid",
+  "rate_limited",
+  "host_unavailable",
+  "capability_not_verified",
+  "probe_failed",
+]);
+const UNAVAILABLE_SESSION_LINKS = { happierUrl: null, nativeSessionUrl: null } as const;
+const UNAVAILABLE_CONNECTOR_HEALTH: RoomCockpitConnectorHealthProjectionV1 = {
+  state: "unknown",
+  checkedAt: null,
+  authentication: "unknown",
+  rateLimit: "unknown",
+  reasonCodes: [],
+  retryAfterMs: null,
+};
 
 const cockpitTaskStateByCanonicalState: Readonly<Record<RoomTaskNodeProjectionV1["state"], RoomCockpitTaskStateV1>> = {
   pending: "waiting_dependency",
@@ -343,6 +466,247 @@ function mapTask(
   };
 }
 
+function identityFromBinding(binding: RoomBindingRecordV1): SessionConnectorIdentityV1 {
+  return {
+    connectorId: binding.connectorId,
+    providerId: binding.providerId,
+    nativeSessionId: binding.nativeSessionId,
+    happierSessionId: binding.happierSessionId,
+    serverProfileId: binding.serverProfileId,
+    machineId: binding.machineId,
+    hostId: binding.hostId,
+  };
+}
+
+function activeBindingForProjection(
+  aggregate: RoomAggregateV1,
+  seat: RoomSeatRecordV1,
+): RoomBindingRecordV1 | null {
+  if (!seat.activeBindingId) return null;
+  const binding = aggregate.bindings.find((candidate) => candidate.id === seat.activeBindingId);
+  return binding
+    && binding.roomId === aggregate.room.id
+    && binding.seatId === seat.id
+    && binding.state === "attached"
+    ? binding
+    : null;
+}
+
+function matchesBindingIdentity(
+  candidate: SessionConnectorDeepLinksV1,
+  binding: RoomBindingRecordV1,
+): boolean {
+  return candidate.contractVersion === 1
+    && candidate.bindingId === binding.id
+    && candidate.connectorId === binding.connectorId
+    && candidate.providerId === binding.providerId
+    && candidate.nativeSessionId === binding.nativeSessionId
+    && candidate.happierSessionId === binding.happierSessionId
+    && candidate.serverProfileId === binding.serverProfileId
+    && candidate.machineId === binding.machineId
+    && candidate.hostId === binding.hostId;
+}
+
+function safeHappierUrl(value: unknown, binding: RoomBindingRecordV1): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  if (!binding.happierSessionId || !binding.serverProfileId) return null;
+  try {
+    const parsed = new URL(value);
+    const query = [...parsed.searchParams.entries()];
+    const expectedPathSuffix = `/session/${encodeURIComponent(binding.happierSessionId)}`;
+    return (parsed.protocol === "http:" || parsed.protocol === "https:")
+      && parsed.username.length === 0
+      && parsed.password.length === 0
+      && parsed.hash.length === 0
+      && parsed.pathname.endsWith(expectedPathSuffix)
+      && query.length === 1
+      && query[0]?.[0] === "serverId"
+      && query[0]?.[1] === binding.serverProfileId
+      ? parsed.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeNativeSessionUrl(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  try {
+    const parsed = new URL(value);
+    return SAFE_NATIVE_SESSION_PROTOCOLS.has(parsed.protocol)
+      && parsed.username.length === 0
+      && parsed.password.length === 0
+      && parsed.hash.length === 0
+      ? parsed.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function safeIsoTimestamp(value: unknown): string | null {
+  return typeof value === "string"
+    && ISO_TIMESTAMP.test(value)
+    && Number.isFinite(Date.parse(value))
+    ? value
+    : null;
+}
+
+function normalizeConnectorHealth(
+  value: unknown,
+  binding: RoomBindingRecordV1,
+): RoomCockpitConnectorHealthProjectionV1 {
+  if (!isRecord(value) || value.connectorId !== binding.connectorId || value.hostId !== binding.hostId) {
+    return UNAVAILABLE_CONNECTOR_HEALTH;
+  }
+
+  const state = typeof value.state === "string" && CONNECTOR_HEALTH_STATES.has(value.state)
+    ? value.state as RoomCockpitConnectorHealthProjectionV1["state"]
+    : null;
+  const authentication = typeof value.authentication === "string"
+    && CONNECTOR_HEALTH_AUTHENTICATION_STATES.has(value.authentication)
+    ? value.authentication as RoomCockpitConnectorHealthProjectionV1["authentication"]
+    : null;
+  const rateLimit = typeof value.rateLimit === "string" && CONNECTOR_HEALTH_RATE_LIMIT_STATES.has(value.rateLimit)
+    ? value.rateLimit as RoomCockpitConnectorHealthProjectionV1["rateLimit"]
+    : null;
+  const checkedAt = safeIsoTimestamp(value.checkedAt);
+  const reasonCodes = Array.isArray(value.reasonCodes)
+    && value.reasonCodes.every((reason) => typeof reason === "string" && CONNECTOR_HEALTH_REASON_CODES.has(reason as SessionConnectorHealthReasonCode))
+    ? value.reasonCodes as readonly SessionConnectorHealthReasonCode[]
+    : null;
+  const retryAfterMs = value.retryAfterMs === null
+    ? null
+    : typeof value.retryAfterMs === "number" && Number.isFinite(value.retryAfterMs) && value.retryAfterMs >= 0
+      ? value.retryAfterMs
+      : null;
+
+  if (!state || !authentication || !rateLimit || !checkedAt || !reasonCodes || (value.retryAfterMs !== null && retryAfterMs === null)) {
+    return UNAVAILABLE_CONNECTOR_HEALTH;
+  }
+
+  return { state, checkedAt, authentication, rateLimit, reasonCodes, retryAfterMs };
+}
+
+function settleDeepLinkLookup<T>(operation: Promise<T>): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(null), ROOM_COCKPIT_DEEP_LINK_LOOKUP_TIMEOUT_MS);
+    operation.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timeout);
+        resolve(null);
+      },
+    );
+  });
+}
+
+type RoomCockpitSessionConnectorV1 = Pick<SessionConnectorV1, "getDeepLinks" | "getHealth">;
+
+function connectorForBinding(
+  binding: RoomBindingRecordV1,
+  connectorRegistry: Pick<SessionConnectorRegistry, "tryGet"> | undefined,
+): RoomCockpitSessionConnectorV1 | undefined {
+  if (!connectorRegistry) return undefined;
+  try {
+    return connectorRegistry.tryGet(binding.connectorId);
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveConnectorDeepLinks(
+  binding: RoomBindingRecordV1,
+  connector: RoomCockpitSessionConnectorV1 | undefined,
+): Promise<Pick<RoomCockpitParticipantProjectionV1, "happierUrl" | "nativeSessionUrl">> {
+  if (!connector || typeof connector.getDeepLinks !== "function") return UNAVAILABLE_SESSION_LINKS;
+  try {
+    const result = await settleDeepLinkLookup(connector.getDeepLinks({
+      contractVersion: 1,
+      bindingId: binding.id,
+      identity: identityFromBinding(binding),
+    }));
+    if (result === null) return UNAVAILABLE_SESSION_LINKS;
+    if (!result.ok || !matchesBindingIdentity(result.value, binding)) return UNAVAILABLE_SESSION_LINKS;
+    return {
+      happierUrl: safeHappierUrl(result.value.happierUrl, binding),
+      nativeSessionUrl: safeNativeSessionUrl(result.value.nativeSessionUrl),
+    };
+  } catch {
+    return UNAVAILABLE_SESSION_LINKS;
+  }
+}
+
+async function resolveConnectorHealth(
+  binding: RoomBindingRecordV1,
+  connector: RoomCockpitSessionConnectorV1 | undefined,
+): Promise<RoomCockpitConnectorHealthProjectionV1> {
+  if (!connector || typeof connector.getHealth !== "function") return UNAVAILABLE_CONNECTOR_HEALTH;
+  try {
+    const result = await settleDeepLinkLookup(connector.getHealth(binding.hostId));
+    return result === null ? UNAVAILABLE_CONNECTOR_HEALTH : normalizeConnectorHealth(result, binding);
+  } catch {
+    return UNAVAILABLE_CONNECTOR_HEALTH;
+  }
+}
+
+/**
+ * FNXC:RoomCockpitSessionLinks 2026-07-19-23:55:
+ * Operators need one-click navigation from each Room seat into its existing
+ * Happier or provider-native session without copying IDs between IDEs. Only a
+ * connector response whose immutable identity exactly matches the active durable
+ * binding is exposed; missing telemetry and every unverified link stay null.
+ *
+ * FNXC:RoomCockpitConnectorHealth 2026-07-19-23:59:
+ * A Session link alone does not tell the operator whether its connector can
+ * currently reach Happier. The cockpit therefore shows only an identity-bound,
+ * bounded connector health probe. It deliberately retains unknown provider
+ * account, quota, latency, context, tool, and quality facts as unavailable and
+ * never upgrades this display-only result into admission authority.
+ */
+async function mapParticipant(
+  aggregate: RoomAggregateV1,
+  seat: RoomSeatRecordV1,
+  connectorRegistry: Pick<SessionConnectorRegistry, "tryGet"> | undefined,
+): Promise<RoomCockpitParticipantProjectionV1> {
+  const binding = activeBindingForProjection(aggregate, seat);
+  const connector = binding ? connectorForBinding(binding, connectorRegistry) : undefined;
+  const [links, connectorHealth] = binding
+    ? await Promise.all([
+      resolveConnectorDeepLinks(binding, connector),
+      resolveConnectorHealth(binding, connector),
+    ])
+    : [UNAVAILABLE_SESSION_LINKS, UNAVAILABLE_CONNECTOR_HEALTH] as const;
+  return {
+    seatId: seat.id,
+    bindingId: binding?.id ?? null,
+    nativeSessionId: binding?.nativeSessionId ?? null,
+    happierSessionId: binding?.happierSessionId ?? null,
+    ...links,
+    connectorHealth,
+    role: seat.role,
+    provider: binding?.providerId ?? null,
+    model: null,
+    host: binding?.hostId ?? null,
+    heartbeat: { freshness: "unknown", lastObservedAt: null, recoveryOwner: null },
+    context: { usedTokens: null, limitTokens: null },
+    throughput: { eventsPerMinute: null },
+    limits: { configuredConcurrent: null, effectiveConcurrent: null },
+    wait: { reason: null, retryAt: null },
+    leases: {
+      sender: { state: "unknown", holderId: null, expiresAt: null },
+      workspace: { state: "unknown", holderId: null, expiresAt: null },
+    },
+  };
+}
+
 function toCockpitProjection(
   aggregate: RoomAggregateV1,
   graph: RoomTaskGraphProjectionV1,
@@ -393,6 +757,7 @@ function toCockpitProjection(
       kind: edge.kind === "requires" ? "depends_on" : edge.kind,
     })),
     alerts: [],
+    participants: [],
   };
 }
 
@@ -412,6 +777,7 @@ function toCockpitProjection(
 export class RoomControlPlaneReadService {
   private readonly projectId: string;
   private readonly roomStore: AsyncRoomStore;
+  private readonly connectorRegistry: Pick<SessionConnectorRegistry, "tryGet"> | undefined;
 
   constructor(options: RoomControlPlaneReadServiceOptionsV1) {
     if (!isTrimmedIdentifier(options.projectId)) {
@@ -422,6 +788,7 @@ export class RoomControlPlaneReadService {
     }
     this.projectId = options.projectId;
     this.roomStore = options.roomStore;
+    this.connectorRegistry = options.connectorRegistry;
   }
 
   async listRooms(
@@ -470,7 +837,13 @@ export class RoomControlPlaneReadService {
         "Canonical Room and task-graph projections do not share an aggregate version",
       );
     }
-    return freezeDeep(toCockpitProjection(aggregate, graph));
+    const structuralProjection = toCockpitProjection(aggregate, graph);
+    const participants = await Promise.all(
+      aggregate.seats
+        .filter((seat) => seat.state !== "removed")
+        .map((seat) => mapParticipant(aggregate, seat, this.connectorRegistry)),
+    );
+    return freezeDeep({ ...structuralProjection, participants });
   }
 
   private assertProjectScope(projectId: string): void {

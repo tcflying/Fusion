@@ -82,8 +82,19 @@ export interface RoomLiveEventCanonicalReplayPortInputV1 {
   readonly limit: number;
 }
 
+/*
+FNXC:RoomLiveEventReplayContract 2026-07-19-21:31:
+Canonical Room replay is an explicit bounded page. `hasMore` comes from the
+authoritative store and must not be guessed from an event count, otherwise an
+SSE reconnect can silently stop before its durable replay is complete.
+*/
+export interface RoomLiveEventCanonicalReplayPageV1 {
+  readonly events: readonly RoomEventRecordV1[];
+  readonly hasMore: boolean;
+}
+
 export interface RoomLiveEventCanonicalReplayPortV1 {
-  listEvents(input: RoomLiveEventCanonicalReplayPortInputV1): Promise<readonly RoomEventRecordV1[]>;
+  listEventPage(input: RoomLiveEventCanonicalReplayPortInputV1): Promise<RoomLiveEventCanonicalReplayPageV1>;
 }
 
 export interface RoomLiveEventCursorCoordinatorOptionsV1 {
@@ -363,9 +374,9 @@ export class RoomLiveEventCursorCoordinator {
     }
     if (
       options.canonicalReplayPort !== undefined
-      && (options.canonicalReplayPort === null || typeof options.canonicalReplayPort.listEvents !== "function")
+      && (options.canonicalReplayPort === null || typeof options.canonicalReplayPort.listEventPage !== "function")
     ) {
-      throw new Error("canonicalReplayPort must implement listEvents");
+      throw new Error("canonicalReplayPort must implement listEventPage");
     }
     this.canonicalReplayPort = options.canonicalReplayPort ?? null;
   }
@@ -648,13 +659,27 @@ export class RoomLiveEventCursorCoordinator {
     state: ScopeState,
   ): Promise<RoomLiveEventReconnectResultV1> {
     let records: readonly RoomEventRecordV1[];
+    let hasMore: boolean;
     try {
-      records = await this.canonicalReplayPort!.listEvents({
+      const page = await this.canonicalReplayPort!.listEventPage({
         contractVersion: ROOM_LIVE_EVENT_CURSOR_CONTRACT_VERSION,
         scope: cloneScope(input.scope),
         afterCursor: input.afterCursor,
         limit: input.limit,
       });
+      if (
+        !page
+        || typeof page !== "object"
+        || !Array.isArray(page.events)
+        || typeof page.hasMore !== "boolean"
+      ) {
+        throw new LiveEventValidationError(
+          "canonical_replay_invalid",
+          "Canonical replay port returned an invalid event page",
+        );
+      }
+      records = page.events;
+      hasMore = page.hasMore;
       validateCanonicalReplay(records, input.scope, input.afterCursorNumber, input.limit);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Canonical replay port failed without an inspectable error";
@@ -696,7 +721,7 @@ export class RoomLiveEventCursorCoordinator {
       replaySource: "canonical_port" as const,
       events,
       nextCursor: latestReplayed?.cursor ?? input.afterCursor,
-      hasMore: records.length === input.limit,
+      hasMore,
       connection: cloneConnection(state.connection),
       alerts: alertSnapshot(state),
     });

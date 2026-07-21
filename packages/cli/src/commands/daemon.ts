@@ -84,6 +84,7 @@ import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePl
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
+import { createWindowsNativeRoomHostCompositionAdapterRegistry } from "../room-windows-host-composition-adapter-registry.js";
 
 const DIAGNOSTIC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 let daemonStartTime = 0;
@@ -195,6 +196,7 @@ export interface DaemonOptions {
 
 const ROOM_CONTROL_PLANE_PUBLIC_ORIGIN_ENV = "FUSION_ROOM_CONTROL_PLANE_PUBLIC_ORIGIN";
 const ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP_ENV = "FUSION_ROOM_CONTROL_PLANE_ALLOW_LOOPBACK_HTTP";
+type RoomControlPlaneServerOptions = NonNullable<Parameters<typeof createServer>[1]>;
 
 /*
 FNXC:RoomControlPlaneDaemonRbac 2026-07-19-19:52:
@@ -207,7 +209,7 @@ must never start, create, or select a ProjectEngine as part of authorization.
 function createDaemonRoomControlPlaneRbacOptions(
   engineManager: Pick<ProjectEngineManager, "getEngine">,
   projectIds: readonly string[],
-): Parameters<typeof createServer>[1]["roomControlPlaneRbac"] | undefined {
+): RoomControlPlaneServerOptions["roomControlPlaneRbac"] | undefined {
   const publicOrigin = process.env[ROOM_CONTROL_PLANE_PUBLIC_ORIGIN_ENV]?.trim();
   if (!publicOrigin) return undefined;
 
@@ -315,11 +317,36 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   // ── CentralCore: global coordination + ntfy project ID lookup ─────────
   let ntfyProjectId: string | undefined;
   let sharedCentralCore: CentralCore | null = null;
+  let centralBootResult: {
+    taskStore: import("@fusion/core").TaskStore;
+    asyncLayer: import("@fusion/core").AsyncDataLayer;
+    hostAsyncLayer: import("@fusion/core").AsyncDataLayer;
+    shutdown: () => Promise<void>;
+  } | null = null;
   try {
-    sharedCentralCore = new CentralCore();
-    await sharedCentralCore.init();
+    const { createTaskStoreForBackend } = await import("@fusion/core");
+    centralBootResult = await createTaskStoreForBackend({ rootDir: cwd });
+    if (centralBootResult) {
+      /*
+      FNXC:HostBootstrap 2026-07-20-05:16:
+      Daemon CentralCore coordinates all projects, so it receives the factory's
+      unscoped sibling layer rather than the cwd TaskStore's project-bound
+      layer. Both layers share one PostgresConnections set; shutdown remains
+      owned by the boot result, never by this host-layer consumer.
+      */
+      sharedCentralCore = new CentralCore(undefined, {
+        asyncLayer: centralBootResult.hostAsyncLayer,
+      });
+      await sharedCentralCore.init();
+    }
   } catch {
-    // Central DB unavailable or project not registered — backward compatible
+    await sharedCentralCore?.close().catch(() => undefined);
+    sharedCentralCore = null;
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
+    }
+    // Backend bootstrap failure preserves the legacy SQLite fallback below.
   }
 
   // ── ProjectEngineManager: uniform engine lifecycle for all projects ──
@@ -394,6 +421,17 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   const resolvedCliPackageVersion = getCliPackageVersion(import.meta.url);
   const cliPackageVersion = isUnresolvedCliPackageVersion(resolvedCliPackageVersion) ? undefined : resolvedCliPackageVersion;
 
+  /*
+  FNXC:WindowsRoomHostComposition 2026-07-20-22:45:
+  Construct the host-owned registry before ProjectEngineManager.startAll(). The
+  only current daemon fact is the canonical unscoped backend layer; missing
+  provider and dispatch telemetry remain withheld by the registry instead of
+  being guessed from project settings, connector labels, or the daemon bearer.
+  */
+  const roomHostCompositionOperatorAdapterRegistry =
+    createWindowsNativeRoomHostCompositionAdapterRegistry({
+      hostAsyncLayer: centralBootResult?.hostAsyncLayer,
+    });
   const engineManager = new ProjectEngineManager(sharedCentralCore, {
     onMigrationProgress: (event) => migrationHoldingServer?.setMigrationProgress(event),
     cliPackageVersion,
@@ -406,6 +444,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     prReconcileGithubOps: createPrReconcileGithubOps(githubClient),
     getTaskMergeBlocker,
     onInsightRunProcessed: (s: unknown, r: unknown) => onMemoryInsightRunProcessed(s as ScheduledTask, r as AutomationRunResult),
+    roomHostCompositionOperatorAdapterRegistry,
   });
 
   await engineManager.startAll();
@@ -1088,6 +1127,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
         // best-effort
       });
       centralCore = null;
+    }
+
+    if (centralBootResult) {
+      await centralBootResult.shutdown().catch(() => undefined);
+      centralBootResult = null;
     }
 
     try {

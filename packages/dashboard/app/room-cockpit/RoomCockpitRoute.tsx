@@ -7,6 +7,9 @@ import {
   RoomCockpitView,
   type RoomCockpitAlertV1,
   type RoomCockpitConfidenceBandV1,
+  type RoomCockpitExecutionStateV1,
+  type RoomCockpitExecutionStatusV1,
+  type RoomCockpitExecutionSurfaceV1,
   type RoomCockpitHealthStateV1,
   type RoomCockpitTaskEdgeV1,
   type RoomCockpitTaskNodeV1,
@@ -14,10 +17,23 @@ import {
   type RoomCockpitViewStateV1,
 } from "./RoomCockpitView";
 import {
+  RoomCockpitExistingSessionPreflightPanel,
+  type RoomCockpitExistingSessionPreflightCapabilityV1,
+  type RoomCockpitExistingSessionPreflightCommandResultV1,
+  type RoomCockpitExistingSessionPreflightHealthV1,
+  type RoomCockpitExistingSessionPreflightIdentityV1,
+  type RoomCockpitExistingSessionProviderTelemetryV1,
+  type RoomCockpitExistingSessionProviderTelemetryWithheldReasonV1,
+  type RoomCockpitExistingSessionPreflightRequestV1,
+  type RoomCockpitExistingSessionPreflightResultV1,
+  type RoomCockpitExistingSessionPreflightSubmissionV1,
+} from "./RoomCockpitExistingSessionPreflightPanel";
+import {
   connectRoomCockpitLiveEvents,
   getRoomCockpitBrowserEventSourceFactory,
   type RoomCockpitEventSourceFactory,
   type RoomCockpitLiveAlertV1,
+  type RoomCockpitLiveEventProvenanceV1,
 } from "./roomCockpitLiveEvents";
 
 export type RoomCockpitProjectionV1 = EngineRoomCockpitProjectionV1;
@@ -74,6 +90,96 @@ const ROOM_CONFIDENCE_BANDS = new Set<RoomCockpitConfidenceBandV1>([
   "unknown",
 ]);
 
+const ROOM_EXECUTION_STATES = new Set<RoomCockpitExecutionStateV1>([
+  "not_started",
+  "starting",
+  "not_enabled",
+  "read_only_withheld",
+  "execution_started",
+  "stopping",
+  "stopped",
+  "startup_failed",
+]);
+const EXISTING_SESSION_PREFLIGHT_CAPABILITIES = new Set([
+  "ensureExisting",
+  "create",
+  "status",
+  "history",
+  "events",
+  "send",
+  "interrupt",
+  "resume",
+  "takeover",
+  "health",
+  "deepLinks",
+]);
+const EXISTING_SESSION_PREFLIGHT_CAPABILITY_STATES = new Set<RoomCockpitExistingSessionPreflightCapabilityV1["state"]>([
+  "verified",
+  "degraded",
+  "unavailable",
+  "unverified",
+]);
+const EXISTING_SESSION_PREFLIGHT_HEALTH_STATES = new Set<RoomCockpitExistingSessionPreflightHealthV1["state"]>([
+  "healthy",
+  "degraded",
+  "authentication_required",
+  "rate_limited",
+  "host_unavailable",
+  "unavailable",
+  "unknown",
+]);
+const EXISTING_SESSION_PREFLIGHT_AUTHENTICATION_STATES = new Set<RoomCockpitExistingSessionPreflightHealthV1["authentication"]>([
+  "authenticated",
+  "required",
+  "unknown",
+]);
+const EXISTING_SESSION_PREFLIGHT_RATE_LIMIT_STATES = new Set<RoomCockpitExistingSessionPreflightHealthV1["rateLimit"]>([
+  "clear",
+  "limited",
+  "unknown",
+]);
+const EXISTING_SESSION_PREFLIGHT_HEALTH_REASONS = new Set([
+  "executable_unavailable",
+  "executable_timeout",
+  "executable_not_found",
+  "authentication_required",
+  "authentication_timeout",
+  "authentication_invalid",
+  "server_unreachable",
+  "server_not_probed",
+  "daemon_stopped",
+  "status_timeout",
+  "status_invalid",
+  "backend_unavailable",
+  "backend_timeout",
+  "backend_invalid",
+  "rate_limited",
+  "host_unavailable",
+  "capability_not_verified",
+  "probe_failed",
+]);
+const EXISTING_SESSION_PREFLIGHT_WITHHELD_REASONS = new Set([
+  "invalid_request",
+  "connector_unavailable",
+  "read_only_preflight_unsupported",
+  "read_only_preflight_timeout",
+  "session_not_found",
+  "session_ambiguous",
+  "authentication_required",
+  "host_unavailable",
+  "rate_limited",
+  "identity_mismatch",
+  "preflight_contract_invalid",
+  "preflight_unavailable",
+]);
+const EXISTING_SESSION_PROVIDER_TELEMETRY_WITHHELD_REASONS = new Set<RoomCockpitExistingSessionProviderTelemetryWithheldReasonV1>([
+  "connector_telemetry_unsupported",
+  "telemetry_timeout",
+  "telemetry_unavailable",
+  "telemetry_contract_invalid",
+  "telemetry_stale",
+]);
+
 const CAPACITY_STRUCTURAL_FIELDS = [
   "theoreticalSlots",
   "configuredSlots",
@@ -117,6 +223,91 @@ function isNonNegativeInteger(value: unknown): value is number {
 
 function isStringArray(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const canonicalExpected = [...expected].sort();
+  return actual.length === canonicalExpected.length && actual.every((key, index) => key === canonicalExpected[index]);
+}
+
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0) return false;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function isExecutionReasonCode(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_:-]{0,127}$/u.test(value);
+}
+
+/**
+ * FNXC:RoomCockpitExecutionPayload 2026-07-20-10:23:
+ * The browser revalidates the lifecycle-only status response before it reaches
+ * the Cockpit. A malformed or contradictory snapshot is shown as unavailable;
+ * it must never be used to imply provider, model, quota, or session health.
+ */
+export function isRoomCockpitExecutionStatus(
+  value: unknown,
+  projectId: string,
+): value is RoomCockpitExecutionStatusV1 {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "contractVersion",
+      "projectId",
+      "state",
+      "reasonCodes",
+      "changedAt",
+      "readServiceAvailable",
+      "liveEventServiceAvailable",
+      "controllerStarted",
+    ])
+    || value.contractVersion !== 1
+    || value.projectId !== projectId
+    || !ROOM_EXECUTION_STATES.has(value.state as RoomCockpitExecutionStateV1)
+    || !Array.isArray(value.reasonCodes)
+    || value.reasonCodes.length > 32
+    || !value.reasonCodes.every(isExecutionReasonCode)
+    || new Set(value.reasonCodes).size !== value.reasonCodes.length
+    || !isCanonicalUtcTimestamp(value.changedAt)
+    || typeof value.readServiceAvailable !== "boolean"
+    || typeof value.liveEventServiceAvailable !== "boolean"
+    || typeof value.controllerStarted !== "boolean"
+  ) {
+    return false;
+  }
+
+  const state = value.state as RoomCockpitExecutionStateV1;
+  if (
+    (state === "execution_started" && (
+      value.reasonCodes.length > 0
+      || value.readServiceAvailable !== true
+      || value.liveEventServiceAvailable !== true
+      || value.controllerStarted !== true
+    ))
+    || (state === "read_only_withheld" && (
+      value.reasonCodes.length === 0
+      || value.liveEventServiceAvailable !== false
+      || value.controllerStarted !== false
+    ))
+    || (state === "not_enabled" && (
+      value.reasonCodes.length !== 1
+      || value.reasonCodes[0] !== "feature_disabled"
+      || value.liveEventServiceAvailable !== false
+      || value.controllerStarted !== false
+    ))
+    || (state === "stopped" && (
+      value.reasonCodes.length > 0
+      || value.readServiceAvailable !== false
+      || value.liveEventServiceAvailable !== false
+      || value.controllerStarted !== false
+    ))
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function isExpectedFieldList(value: unknown, expected: readonly string[]): value is readonly string[] {
@@ -253,11 +444,13 @@ export function isRoomCockpitProjection(value: unknown): value is RoomCockpitPro
   return true;
 }
 
-function getResponseDetail(payload: unknown, fallback: string): string {
-  if (!isRecord(payload)) return fallback;
-  const error = isRecord(payload.error) ? payload.error : payload;
-  if (typeof error.message === "string" && error.message.trim().length > 0) return error.message;
-  if (typeof error.code === "string" && error.code.trim().length > 0) return error.code;
+function getResponseDetail(_payload: unknown, fallback: string): string {
+  /*
+   * FNXC:RoomCockpitSafeResponseDetails 2026-07-20-21:49:
+   * The Cockpit does not surface arbitrary REST error strings. They can contain
+   * provider diagnostics, authorization material, or implementation detail;
+   * fixed local fallbacks keep the UI actionable without expanding that boundary.
+   */
   return fallback;
 }
 
@@ -265,6 +458,336 @@ function getResponseCode(payload: unknown): string | null {
   if (!isRecord(payload)) return null;
   const error = isRecord(payload.error) ? payload.error : payload;
   return typeof error.code === "string" ? error.code : null;
+}
+
+function isBoundedCanonicalText(value: unknown, maximum = 256): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maximum && value.trim() === value;
+}
+
+function hasExpectedExistingSessionPreflightRequest(
+  value: unknown,
+  expected: RoomCockpitExistingSessionPreflightRequestV1,
+): boolean {
+  const expectedKeys = expected.requiredMachineId === undefined
+    ? ["connectorId", "canonicalSessionUri", "requiredHostId"]
+    : ["connectorId", "canonicalSessionUri", "requiredHostId", "requiredMachineId"];
+  return isRecord(value)
+    && hasExactKeys(value, expectedKeys)
+    && value.connectorId === expected.connectorId
+    && value.canonicalSessionUri === expected.canonicalSessionUri
+    && value.requiredHostId === expected.requiredHostId
+    && (expected.requiredMachineId === undefined || value.requiredMachineId === expected.requiredMachineId);
+}
+
+function cloneExistingSessionPreflightRequest(
+  request: RoomCockpitExistingSessionPreflightRequestV1,
+): RoomCockpitExistingSessionPreflightRequestV1 {
+  return {
+    connectorId: request.connectorId,
+    canonicalSessionUri: request.canonicalSessionUri,
+    requiredHostId: request.requiredHostId,
+    ...(request.requiredMachineId === undefined ? {} : { requiredMachineId: request.requiredMachineId }),
+  };
+}
+
+function normalizeExistingSessionPreflightCapabilities(
+  value: unknown,
+): readonly RoomCockpitExistingSessionPreflightCapabilityV1[] | null {
+  if (!Array.isArray(value) || value.length > EXISTING_SESSION_PREFLIGHT_CAPABILITIES.size) return null;
+  const seen = new Set<string>();
+  const capabilities: RoomCockpitExistingSessionPreflightCapabilityV1[] = [];
+  for (const capability of value) {
+    if (
+      !isRecord(capability)
+      || !hasExactKeys(capability, ["name", "state"])
+      || typeof capability.name !== "string"
+      || !EXISTING_SESSION_PREFLIGHT_CAPABILITIES.has(capability.name)
+      || typeof capability.state !== "string"
+      || !EXISTING_SESSION_PREFLIGHT_CAPABILITY_STATES.has(
+        capability.state as RoomCockpitExistingSessionPreflightCapabilityV1["state"],
+      )
+      || seen.has(capability.name)
+    ) return null;
+    seen.add(capability.name);
+    capabilities.push({
+      name: capability.name,
+      state: capability.state as RoomCockpitExistingSessionPreflightCapabilityV1["state"],
+    });
+  }
+  return capabilities;
+}
+
+function normalizeExistingSessionPreflightHealth(
+  value: unknown,
+): RoomCockpitExistingSessionPreflightHealthV1 | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["state", "checkedAt", "authentication", "rateLimit", "reasonCodes", "retryAfterMs"])
+    || typeof value.state !== "string"
+    || !EXISTING_SESSION_PREFLIGHT_HEALTH_STATES.has(value.state as RoomCockpitExistingSessionPreflightHealthV1["state"])
+    || (value.checkedAt !== null && !isCanonicalUtcTimestamp(value.checkedAt))
+    || typeof value.authentication !== "string"
+    || !EXISTING_SESSION_PREFLIGHT_AUTHENTICATION_STATES.has(
+      value.authentication as RoomCockpitExistingSessionPreflightHealthV1["authentication"],
+    )
+    || typeof value.rateLimit !== "string"
+    || !EXISTING_SESSION_PREFLIGHT_RATE_LIMIT_STATES.has(
+      value.rateLimit as RoomCockpitExistingSessionPreflightHealthV1["rateLimit"],
+    )
+    || !Array.isArray(value.reasonCodes)
+    || value.reasonCodes.length > EXISTING_SESSION_PREFLIGHT_HEALTH_REASONS.size
+  ) return null;
+  const retryAfterMs = value.retryAfterMs;
+  if (
+    retryAfterMs !== null
+    && (typeof retryAfterMs !== "number" || !Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0 || retryAfterMs > 604_800_000)
+  ) return null;
+  const seenReasons = new Set<string>();
+  const reasonCodes: string[] = [];
+  for (const reason of value.reasonCodes) {
+    if (
+      typeof reason !== "string"
+      || !EXISTING_SESSION_PREFLIGHT_HEALTH_REASONS.has(reason)
+      || seenReasons.has(reason)
+    ) return null;
+    seenReasons.add(reason);
+    reasonCodes.push(reason);
+  }
+  return {
+    state: value.state as RoomCockpitExistingSessionPreflightHealthV1["state"],
+    checkedAt: value.checkedAt as string | null,
+    authentication: value.authentication as RoomCockpitExistingSessionPreflightHealthV1["authentication"],
+    rateLimit: value.rateLimit as RoomCockpitExistingSessionPreflightHealthV1["rateLimit"],
+    reasonCodes,
+    retryAfterMs: retryAfterMs as number | null,
+  };
+}
+
+function existingSessionProviderTelemetryWithheld(
+  reason: RoomCockpitExistingSessionProviderTelemetryWithheldReasonV1,
+): RoomCockpitExistingSessionProviderTelemetryV1 {
+  return { contractVersion: 1, state: "withheld", reason };
+}
+
+function hasExpectedExistingSessionPreflightIdentity(
+  value: unknown,
+  expected: RoomCockpitExistingSessionPreflightIdentityV1,
+): boolean {
+  return isRecord(value)
+    && hasExactKeys(value, [
+      "connectorId",
+      "providerId",
+      "nativeSessionId",
+      "happierSessionId",
+      "serverProfileId",
+      "machineId",
+      "hostId",
+    ])
+    && value.connectorId === expected.connectorId
+    && value.providerId === expected.providerId
+    && value.nativeSessionId === expected.nativeSessionId
+    && value.happierSessionId === expected.happierSessionId
+    && value.serverProfileId === expected.serverProfileId
+    && value.machineId === expected.machineId
+    && value.hostId === expected.hostId;
+}
+
+/**
+ * FNXC:RoomCockpitProviderTelemetry 2026-07-21-03:08:
+ * The Cockpit treats provider telemetry as a narrow persisted-snapshot display
+ * contract, not an authorization or readiness signal. Every canonical Core
+ * variant must carry the exact same SessionConnector identity as its outer
+ * preflight result; unknown, extra, stale, or potentially sensitive fields
+ * fail closed while the independently verified Session result remains usable.
+ * A fresh snapshot has a strictly positive lifetime (`observedAt < expiresAt`).
+ */
+function normalizeExistingSessionProviderTelemetry(
+  value: unknown,
+  identity: RoomCockpitExistingSessionPreflightIdentityV1,
+): RoomCockpitExistingSessionProviderTelemetryV1 {
+  if (!isRecord(value) || value.contractVersion !== 1 || typeof value.state !== "string") {
+    return existingSessionProviderTelemetryWithheld("telemetry_contract_invalid");
+  }
+  if (value.state === "withheld") {
+    if (
+      !hasExactKeys(value, ["contractVersion", "state", "identity", "reason"])
+      || !hasExpectedExistingSessionPreflightIdentity(value.identity, identity)
+      || typeof value.reason !== "string"
+      || !EXISTING_SESSION_PROVIDER_TELEMETRY_WITHHELD_REASONS.has(
+        value.reason as RoomCockpitExistingSessionProviderTelemetryWithheldReasonV1,
+      )
+    ) return existingSessionProviderTelemetryWithheld("telemetry_contract_invalid");
+    return existingSessionProviderTelemetryWithheld(
+      value.reason as RoomCockpitExistingSessionProviderTelemetryWithheldReasonV1,
+    );
+  }
+  if (
+    value.state !== "reported"
+    || !hasExactKeys(value, [
+      "contractVersion",
+      "state",
+      "identity",
+      "providerId",
+      "source",
+      "observedAt",
+      "expiresAt",
+      "freshness",
+      "limitations",
+    ])
+    || !hasExpectedExistingSessionPreflightIdentity(value.identity, identity)
+    || value.providerId !== "codex"
+    || value.source !== "happier_persisted_in_band_provider_snapshot"
+    || value.freshness !== "fresh"
+    || !isCanonicalUtcTimestamp(value.observedAt)
+    || !isCanonicalUtcTimestamp(value.expiresAt)
+    || Date.parse(value.observedAt) >= Date.parse(value.expiresAt)
+    || !isRecord(value.limitations)
+    || !hasExactKeys(value.limitations, [
+      "providerAvailability",
+      "capacity",
+      "onDemandProviderRefresh",
+      "accountIdentity",
+      "rawSnapshot",
+    ])
+    || value.limitations.providerAvailability !== "not_inferred"
+    || value.limitations.capacity !== "not_reported"
+    || value.limitations.onDemandProviderRefresh !== "not_attempted"
+    || value.limitations.accountIdentity !== "not_reported"
+    || value.limitations.rawSnapshot !== "not_reported"
+  ) return existingSessionProviderTelemetryWithheld("telemetry_contract_invalid");
+  return {
+    contractVersion: 1,
+    state: "reported",
+    providerId: "codex",
+    source: "happier_persisted_in_band_provider_snapshot",
+    observedAt: value.observedAt,
+    expiresAt: value.expiresAt,
+    freshness: "fresh",
+    limitations: {
+      providerAvailability: "not_inferred",
+      capacity: "not_reported",
+      onDemandProviderRefresh: "not_attempted",
+      accountIdentity: "not_reported",
+      rawSnapshot: "not_reported",
+    },
+  };
+}
+
+function normalizeExistingSessionPreflightResult(
+  value: unknown,
+  expected: RoomCockpitExistingSessionPreflightRequestV1,
+): RoomCockpitExistingSessionPreflightResultV1 | null {
+  if (
+    !isRecord(value)
+    || value.contractVersion !== 1
+    || !hasExpectedExistingSessionPreflightRequest(value.request, expected)
+    || typeof value.state !== "string"
+  ) return null;
+  const request = cloneExistingSessionPreflightRequest(expected);
+  if (value.state === "withheld") {
+    const retryAfterMs = value.retryAfterMs;
+    if (
+      !hasExactKeys(value, ["contractVersion", "state", "request", "reason", "retryAfterMs"])
+      || typeof value.reason !== "string"
+      || !EXISTING_SESSION_PREFLIGHT_WITHHELD_REASONS.has(value.reason)
+      || (retryAfterMs !== null
+        && (typeof retryAfterMs !== "number" || !Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0 || retryAfterMs > 604_800_000))
+    ) return null;
+    return {
+      contractVersion: 1,
+      state: "withheld",
+      request,
+      reason: value.reason,
+      retryAfterMs: retryAfterMs as number | null,
+    };
+  }
+  const hasProviderTelemetry = Object.prototype.hasOwnProperty.call(value, "providerTelemetry");
+  if (
+    value.state !== "identity_verified"
+    || !hasExactKeys(value, [
+      "contractVersion",
+      "state",
+      "request",
+      "identity",
+      "checkedAt",
+      "providerTurnStarted",
+      "capabilities",
+      "health",
+      ...(hasProviderTelemetry ? ["providerTelemetry"] : []),
+    ])
+    || value.providerTurnStarted !== false
+    || !isCanonicalUtcTimestamp(value.checkedAt)
+    || !isRecord(value.identity)
+    || !hasExactKeys(value.identity, [
+      "connectorId",
+      "providerId",
+      "nativeSessionId",
+      "happierSessionId",
+      "serverProfileId",
+      "machineId",
+      "hostId",
+    ])
+    || value.identity.connectorId !== expected.connectorId
+    || value.identity.hostId !== expected.requiredHostId
+    || !isBoundedCanonicalText(value.identity.providerId)
+    || !isBoundedCanonicalText(value.identity.nativeSessionId, 2_048)
+    || (value.identity.happierSessionId !== null && !isBoundedCanonicalText(value.identity.happierSessionId))
+    || (value.identity.serverProfileId !== null && !isBoundedCanonicalText(value.identity.serverProfileId))
+    || (value.identity.machineId !== null && !isBoundedCanonicalText(value.identity.machineId))
+    || (expected.requiredMachineId !== undefined && value.identity.machineId !== expected.requiredMachineId)
+  ) return null;
+  const capabilities = normalizeExistingSessionPreflightCapabilities(value.capabilities);
+  const health = normalizeExistingSessionPreflightHealth(value.health);
+  if (capabilities === null || health === null) return null;
+  const identity = {
+    connectorId: expected.connectorId,
+    providerId: value.identity.providerId as string,
+    nativeSessionId: value.identity.nativeSessionId as string,
+    happierSessionId: value.identity.happierSessionId as string | null,
+    serverProfileId: value.identity.serverProfileId as string | null,
+    machineId: value.identity.machineId as string | null,
+    hostId: expected.requiredHostId,
+  };
+  const providerTelemetry = hasProviderTelemetry
+    ? normalizeExistingSessionProviderTelemetry(value.providerTelemetry, identity)
+    : existingSessionProviderTelemetryWithheld("connector_telemetry_unsupported");
+  return {
+    contractVersion: 1,
+    state: "identity_verified",
+    request,
+    identity,
+    checkedAt: value.checkedAt,
+    providerTurnStarted: false,
+    capabilities,
+    health,
+    providerTelemetry,
+  };
+}
+
+function parseExistingSessionPreflightResponse(
+  value: unknown,
+  expectedRequests: readonly RoomCockpitExistingSessionPreflightRequestV1[],
+): readonly RoomCockpitExistingSessionPreflightCommandResultV1[] | null {
+  if (!isRecord(value) || !hasExactKeys(value, ["results"]) || !Array.isArray(value.results) || value.results.length !== expectedRequests.length) {
+    return null;
+  }
+  const seenCommandIds = new Set<string>();
+  const results: RoomCockpitExistingSessionPreflightCommandResultV1[] = [];
+  for (const [index, entry] of value.results.entries()) {
+    const expected = expectedRequests[index];
+    if (
+      expected === undefined
+      || !isRecord(entry)
+      || !hasExactKeys(entry, ["commandId", "result"])
+      || !isBoundedCanonicalText(entry.commandId, 192)
+      || seenCommandIds.has(entry.commandId)
+    ) return null;
+    const result = normalizeExistingSessionPreflightResult(entry.result, expected);
+    if (result === null) return null;
+    seenCommandIds.add(entry.commandId);
+    results.push({ commandId: entry.commandId, result });
+  }
+  return results;
 }
 
 async function readResponsePayload(response: Response): Promise<unknown> {
@@ -327,7 +850,10 @@ export function RoomCockpitRoute({
   const [draftRoomId, setDraftRoomId] = useState(normalizedInitialRoomId ?? "");
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(normalizedInitialRoomId);
   const [snapshot, setSnapshot] = useState<RoomCockpitRouteSnapshot>(() => initialSnapshot(projectId, normalizedInitialRoomId));
+  const [execution, setExecution] = useState<RoomCockpitExecutionSurfaceV1 | undefined>(undefined);
+  const [liveEventProvenance, setLiveEventProvenance] = useState<RoomCockpitLiveEventProvenanceV1 | null>(null);
   const requestEpochRef = useRef(0);
+  const executionEpochRef = useRef(0);
   const liveStreamEpochRef = useRef(0);
   const liveStreamStateRef = useRef<RoomCockpitLiveStreamState | null>(null);
 
@@ -398,12 +924,106 @@ export function RoomCockpitRoute({
         return;
       }
       setSnapshot({ state: "ready", projection: candidate, detail: "Verified Room projection loaded." });
-    } catch (error) {
+    } catch {
       if (requestEpoch !== requestEpochRef.current) return;
       setSnapshot({
         state: "degraded",
-        detail: error instanceof Error && error.message ? error.message : "Unable to contact the Room control-plane endpoint. Retry after it is connected.",
+        detail: "Unable to contact the Room control-plane endpoint. Retry after it is connected.",
       });
+    }
+  }, [fetchProjection, projectId]);
+
+  const loadExecutionStatus = useCallback(async (roomId: string | null) => {
+    const requestEpoch = ++executionEpochRef.current;
+    if (!projectId || !roomId) {
+      setExecution(undefined);
+      return;
+    }
+
+    setExecution({
+      state: "loading",
+      detail: "Loading the authorized Room execution lifecycle snapshot.",
+    });
+    const query = new URLSearchParams({ projectId });
+    const path = `/api/room-control-plane/status?${query.toString()}`;
+
+    try {
+      const response = await fetchProjection(path, { headers: withTokenHeader({ accept: "application/json" }) });
+      const payload = await readResponsePayload(response);
+      if (requestEpoch !== executionEpochRef.current) return;
+
+      if (!response.ok) {
+        setExecution({
+          state: response.status === 401 || response.status === 403 ? "permission-denied" : "unavailable",
+          detail: getResponseDetail(payload, "The authorized Room execution lifecycle endpoint is unavailable."),
+        });
+        return;
+      }
+
+      const candidate = isRecord(payload) ? payload.status : undefined;
+      if (!isRoomCockpitExecutionStatus(candidate, projectId)) {
+        setExecution({
+          state: "unavailable",
+          detail: "The execution endpoint returned a lifecycle snapshot that does not satisfy the Cockpit contract.",
+        });
+        return;
+      }
+
+      setExecution({
+        state: "available",
+        detail: "Authorized controller lifecycle snapshot. It does not certify provider, model, account, quota, or session health.",
+        status: candidate,
+      });
+    } catch {
+      if (requestEpoch !== executionEpochRef.current) return;
+      setExecution({
+        state: "unavailable",
+        detail: "Unable to contact the authorized Room execution lifecycle endpoint.",
+      });
+    }
+  }, [fetchProjection, projectId]);
+
+  const preflightExistingSessions = useCallback(async (
+    requests: readonly RoomCockpitExistingSessionPreflightRequestV1[],
+  ): Promise<RoomCockpitExistingSessionPreflightSubmissionV1> => {
+    if (!projectId) {
+      return { state: "failed", detail: "Select a project before running an authorized existing-Session preflight." };
+    }
+    if (requests.length < 1 || requests.length > 64) {
+      return { state: "failed", detail: "Existing-Session preflight accepts between one and 64 bounded Session inputs." };
+    }
+    const expectedRequests = requests.map(cloneExistingSessionPreflightRequest);
+    const query = new URLSearchParams({ projectId });
+    const path = `/api/rooms/session-preflight?${query.toString()}`;
+    try {
+      const response = await fetchProjection(path, {
+        method: "POST",
+        headers: withTokenHeader({
+          accept: "application/json",
+          "content-type": "application/json",
+        }),
+        body: JSON.stringify({ sessions: expectedRequests }),
+      });
+      const payload = await readResponsePayload(response);
+      if (!response.ok) {
+        return {
+          state: "failed",
+          detail: getResponseDetail(payload, "The authorized existing-Session preflight endpoint is unavailable."),
+        };
+      }
+      const results = parseExistingSessionPreflightResponse(payload, expectedRequests);
+      if (results === null) {
+        return {
+          state: "failed",
+          detail: "The existing-Session preflight endpoint returned data that does not satisfy the Cockpit contract.",
+        };
+      }
+      return { state: "succeeded", results };
+    } catch {
+      return {
+        state: "failed",
+        detail: "Unable to contact the authorized existing-Session preflight endpoint.",
+      };
     }
   }, [fetchProjection, projectId]);
 
@@ -413,6 +1033,23 @@ export function RoomCockpitRoute({
       requestEpochRef.current += 1;
     };
   }, [loadRoom, selectedRoomId]);
+
+  useEffect(() => {
+    void loadExecutionStatus(selectedRoomId);
+    return () => {
+      executionEpochRef.current += 1;
+    };
+  }, [loadExecutionStatus, selectedRoomId]);
+
+  useEffect(() => {
+    /*
+     * FNXC:RoomCockpitEventProvenance 2026-07-20-21:49:
+     * Retain only the last scope-bound canonical event pointer. Clear it before
+     * a new project or Room stream begins so a prior Session's causal metadata
+     * can never be presented as evidence for the selected Room.
+     */
+    setLiveEventProvenance(null);
+  }, [projectId, selectedRoomId]);
 
   useEffect(() => {
     const roomId = selectedRoomId;
@@ -504,8 +1141,9 @@ export function RoomCockpitRoute({
         if (!alert) return;
         markLiveStreamUnavailable(getServerAlertUnavailableDetail(alert), "server_health");
       },
-      onEvent: ({ cursor, reconciliationRequired }) => {
+      onEvent: ({ cursor, provenance, reconciliationRequired }) => {
         if (!isCurrentStream()) return;
+        setLiveEventProvenance(provenance);
         if (reconciliationRequired) {
           markLiveStreamUnavailable(
             `Room event cursor ${cursor} requires durable reconciliation. Health and capacity remain withheld until a fresh canonical projection is read.`,
@@ -561,11 +1199,22 @@ export function RoomCockpitRoute({
           </form>
         )}
       />
+      <RoomCockpitExistingSessionPreflightPanel
+        disabled={!projectId}
+        onPreflight={preflightExistingSessions}
+      />
       <RoomCockpitView
         state={snapshot.state}
         projection={snapshot.projection}
         stateDetail={snapshot.detail}
-        callbacks={{ onRefresh: () => void loadRoom(selectedRoomId) }}
+        execution={execution}
+        liveEventProvenance={liveEventProvenance}
+        callbacks={{
+          onRefresh: () => {
+            void loadRoom(selectedRoomId);
+            void loadExecutionStatus(selectedRoomId);
+          },
+        }}
       />
     </section>
   );

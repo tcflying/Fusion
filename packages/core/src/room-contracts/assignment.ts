@@ -95,8 +95,19 @@ export interface ValidateRoomRoleAssignmentInputV1 {
 export interface TransitionRoomRoleAssignmentInputV1 {
   readonly protocol: RoomProtocolDefinitionV1;
   readonly currentAssignment: RoomRoleAssignmentV1;
+  /**
+   * Persisted snapshot that certified `currentAssignment`. A phase transition
+   * may deliberately introduce a newer target-phase capability snapshot; the
+   * old assignment must be validated against its own evidence first.
+   */
+  readonly currentCapabilitySnapshot?: RoomCapabilitySnapshotV1;
   readonly targetPhaseId: string;
-  readonly satisfiedGateIds: readonly string[];
+  /**
+   * The exact declared transition gate after the command layer has validated
+   * immutable phase-gate evidence. This is an internal policy hand-off, never
+   * a caller assertion that a gate passed.
+   */
+  readonly verifiedTransitionGateId: string;
   readonly atTurnBoundary: boolean;
   readonly capabilitySnapshot: RoomCapabilitySnapshotV1;
   readonly constraints: RoomRoleAssignmentConstraintsV1;

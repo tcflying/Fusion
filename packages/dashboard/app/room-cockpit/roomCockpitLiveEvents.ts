@@ -8,9 +8,19 @@ export interface RoomCockpitLiveEventScopeV1 {
   readonly roomId: string;
 }
 
+export interface RoomCockpitLiveEventProvenanceV1 {
+  readonly cursor: string;
+  readonly eventId: string;
+  readonly type: string;
+  readonly occurredAt: string;
+  readonly correlationId: string;
+  readonly causationId: string | null;
+}
+
 export interface RoomCockpitLiveEventV1 {
   readonly scope: RoomCockpitLiveEventScopeV1;
   readonly cursor: string;
+  readonly provenance: RoomCockpitLiveEventProvenanceV1;
   readonly reconciliationRequired: boolean;
 }
 
@@ -79,6 +89,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const canonicalExpected = [...expected].sort();
+  return actual.length === canonicalExpected.length && actual.every((key, index) => key === canonicalExpected[index]);
+}
+
+function parseCanonicalText(value: unknown, maximum = 256): string | null {
+  if (typeof value !== "string" || !value.trim() || value !== value.trim() || value.length > maximum) return null;
+  return value;
+}
+
 function parseCursor(value: unknown, allowZero = false): string | null {
   if (
     typeof value !== "string"
@@ -125,6 +146,45 @@ function isIsoTimestampOrNull(value: unknown): value is string | null {
     && value.length <= 64
     && Number.isFinite(Date.parse(value))
   );
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string"
+    && value.trim() === value
+    && value.length <= 64
+    && Number.isFinite(Date.parse(value));
+}
+
+function parseEventProvenance(value: unknown): RoomCockpitLiveEventProvenanceV1 | null {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "cursor",
+    "eventId",
+    "type",
+    "occurredAt",
+    "correlationId",
+    "causationId",
+  ])) return null;
+  const cursor = parseCursor(value.cursor);
+  const eventId = parseCanonicalText(value.eventId);
+  const type = parseCanonicalText(value.type);
+  const correlationId = parseCanonicalText(value.correlationId);
+  const causationId = value.causationId === null ? null : parseCanonicalText(value.causationId);
+  if (
+    !cursor
+    || !eventId
+    || !type
+    || !isIsoTimestamp(value.occurredAt)
+    || !correlationId
+    || (causationId === null && value.causationId !== null)
+  ) return null;
+  return Object.freeze({
+    cursor,
+    eventId,
+    type,
+    occurredAt: value.occurredAt,
+    correlationId,
+    causationId,
+  });
 }
 
 function parseLiveAlert(value: unknown): RoomCockpitLiveAlertV1 | null {
@@ -215,38 +275,50 @@ function parseAlertEvent(value: unknown): RoomCockpitLiveAlertEventV1 | null {
   return alerts ? { scope, alerts } : null;
 }
 
-function isReconciliationRequired(payload: Record<string, unknown>): boolean {
-  if (isRecord(payload.connection) && payload.connection.state !== "connected") return true;
-  if (!Array.isArray(payload.alerts)) return false;
-  return payload.alerts.some((alert) => isRecord(alert)
-    && typeof alert.code === "string"
-    && [
-      "canonical_replay_failed",
-      "canonical_replay_invalid",
-      "replay_cursor_ahead",
-      "replay_window_overflow",
-      "source_sequence_gap",
-      "stream_disconnected",
-    ].includes(alert.code));
+function isReconciliationRequired(
+  connection: RoomCockpitLiveConnectionEventV1["connection"],
+  alerts: readonly RoomCockpitLiveAlertV1[],
+): boolean {
+  if (connection.state !== "connected") return true;
+  return alerts.some((alert) => [
+    "canonical_replay_failed",
+    "canonical_replay_invalid",
+    "replay_cursor_ahead",
+    "replay_window_overflow",
+    "source_sequence_gap",
+    "stream_disconnected",
+  ].includes(alert.code));
 }
 
 export function parseRoomCockpitLiveEvent(value: unknown): RoomCockpitLiveEventV1 | null {
-  if (!isRecord(value)) return null;
-  if (
-    value.type !== undefined
-    && value.type !== "canonical_room_event"
-    && value.type !== "room_event"
-  ) return null;
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "contractVersion",
+    "type",
+    "scope",
+    "provenance",
+    "connection",
+    "alerts",
+  ])) return null;
+  /*
+   * FNXC:RoomCockpitCanonicalEvent 2026-07-20-21:49:
+   * `room.event` and `canonical_room_event` are both valid SSE *event names*,
+   * but their payload must be the versioned, bounded canonical provenance
+   * projection. Reject envelopes and extra fields so a provider body or error
+   * cannot advance the cursor or enter Cockpit state.
+   */
+  if (value.contractVersion !== 1 || value.type !== "canonical_room_event") return null;
 
   const scope = parseScope(value.scope);
-  const envelope = isRecord(value.envelope) ? value.envelope : value;
-  const cursor = parseCursor(envelope.cursor);
-  if (!scope || !cursor) return null;
+  const provenance = parseEventProvenance(value.provenance);
+  const connection = parseLiveConnection(value.connection);
+  const alerts = scope ? parseScopedAlerts(value.alerts, scope, false) : null;
+  if (!scope || !provenance || !connection || !alerts) return null;
 
   return {
     scope,
-    cursor,
-    reconciliationRequired: isReconciliationRequired(value),
+    cursor: provenance.cursor,
+    provenance,
+    reconciliationRequired: isReconciliationRequired(connection, alerts),
   };
 }
 
@@ -328,8 +400,8 @@ export function connectRoomCockpitLiveEvents(options: ConnectRoomCockpitLiveEven
     }, reconnectDelay(reconnectAttempts));
   };
 
-  const consume = (rawEvent: Event): void => {
-    if (disposed) return;
+  const consume = (source: RoomCockpitEventSourceV1, rawEvent: Event): void => {
+    if (disposed || eventSource !== source) return;
     const event = parseMessageEvent(rawEvent as MessageEvent);
     if (!event
       || event.scope.projectId !== options.scope.projectId
@@ -352,6 +424,9 @@ export function connectRoomCockpitLiveEvents(options: ConnectRoomCockpitLiveEven
       return;
     }
     eventSource = source;
+    const consumeFromSource = (rawEvent: Event): void => {
+      consume(source, rawEvent);
+    };
     source.onopen = () => {
       if (disposed || eventSource !== source) return;
       const reconnected = reconnectAttempts > 0;
@@ -368,9 +443,9 @@ export function connectRoomCockpitLiveEvents(options: ConnectRoomCockpitLiveEven
       }
       scheduleReconnect("transport_error");
     };
-    source.onmessage = consume;
-    source.addEventListener("room.event", consume);
-    source.addEventListener("canonical_room_event", consume);
+    source.onmessage = consumeFromSource;
+    source.addEventListener("room.event", consumeFromSource);
+    source.addEventListener("canonical_room_event", consumeFromSource);
     source.addEventListener("room.connection", (rawEvent) => {
       if (disposed || eventSource !== source) return;
       const event = parseConnectionMessageEvent(rawEvent as MessageEvent);

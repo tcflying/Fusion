@@ -31,7 +31,8 @@
 import { describe, it, expect, afterEach, beforeAll } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { execSync } from "node:child_process";
 import {
   createAsyncDataLayer,
@@ -39,8 +40,9 @@ import {
   recordRunAuditEventWithinTransaction,
   type AsyncDataLayer,
   type RunAuditEventInput,
+  type TransactionOptions,
 } from "../../postgres/data-layer.js";
-import { createConnectionSetFromUrl } from "../../postgres/connection.js";
+import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
 import type { ResolvedBackend } from "../../postgres/backend-resolver.js";
 import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import * as schema from "../../postgres/schema/index.js";
@@ -85,7 +87,7 @@ interface TestLayer {
   adminDb: ReturnType<typeof drizzle>;
 }
 
-async function setupFreshLayer(): Promise<TestLayer> {
+async function setupFreshLayer(options?: { poolMax?: number }): Promise<TestLayer> {
   const dbName = uniqueDbName();
   try {
     adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
@@ -117,7 +119,7 @@ async function setupFreshLayer(): Promise<TestLayer> {
     migrationUrlOverridden: false,
   };
   const connections = await createConnectionSetFromUrl(dataBackend, {
-    poolMax: 5,
+    poolMax: options?.poolMax ?? 5,
     connectTimeoutSeconds: 5,
   });
   const layer = createAsyncDataLayer(connections);
@@ -166,6 +168,116 @@ async function readAuditRows(
   )) as unknown as Array<Record<string, unknown>>;
   return result;
 }
+
+const pgDialect = new PgDialect();
+
+type TransactionEntrypoint = (
+  layer: AsyncDataLayer,
+  fn: (tx: unknown) => Promise<void>,
+  options: TransactionOptions,
+) => Promise<void>;
+
+function createTransactionRuntimeHarness(): {
+  layer: AsyncDataLayer;
+  executedQueries: SQL[];
+  transactionConfigs: unknown[];
+} {
+  const executedQueries: SQL[] = [];
+  const transactionConfigs: unknown[] = [];
+  const transaction = {
+    execute: async (query: SQL) => {
+      executedQueries.push(query);
+      return [];
+    },
+  };
+  const runtime = {
+    transaction: async (
+      fn: (tx: unknown) => Promise<unknown>,
+      config?: unknown,
+    ) => {
+      transactionConfigs.push(config);
+      return fn(transaction);
+    },
+  };
+
+  return {
+    layer: createAsyncDataLayer({
+      runtime,
+      ping: async () => {},
+      close: async () => {},
+    } as unknown as PostgresConnections),
+    executedQueries,
+    transactionConfigs,
+  };
+}
+
+describe("AsyncDataLayer: server timeout transaction configuration", () => {
+  it("sets both PostgreSQL timeouts locally before entering the callback", async () => {
+    const { layer, executedQueries } = createTransactionRuntimeHarness();
+
+    let callbackSawLocalSettings = false;
+    await layer.transaction(
+      async () => {
+        callbackSawLocalSettings = executedQueries.length === 1;
+      },
+      { statementTimeoutMs: 75, lockTimeoutMs: 50 },
+    );
+
+    expect(callbackSawLocalSettings).toBe(true);
+    const query = pgDialect.sqlToQuery(executedQueries[0]!);
+    expect(query.sql.replace(/\s+/g, " ").trim()).toBe(
+      "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)",
+    );
+    expect(query.params).toEqual(["75ms", "50ms"]);
+  });
+
+  it("preserves a plain transaction when timeout options are omitted", async () => {
+    const { layer, executedQueries, transactionConfigs } = createTransactionRuntimeHarness();
+    let callbackCalls = 0;
+
+    await layer.transaction(async () => {
+      callbackCalls += 1;
+    });
+
+    expect(callbackCalls).toBe(1);
+    expect(executedQueries).toEqual([]);
+    expect(transactionConfigs).toEqual([undefined]);
+  });
+
+  const transactionEntrypoints: readonly [string, TransactionEntrypoint][] = [
+    ["transaction", (layer, fn, options) => layer.transaction(fn, options)],
+    ["transactionImmediate", (layer, fn, options) => layer.transactionImmediate(fn, options)],
+  ];
+  const invalidTimeoutOptions: readonly [string, TransactionOptions][] = [
+    ["a zero statement timeout", { statementTimeoutMs: 0 }],
+    ["a negative lock timeout", { lockTimeoutMs: -1 }],
+    ["a fractional statement timeout", { statementTimeoutMs: 1.5 }],
+    ["a NaN lock timeout", { lockTimeoutMs: Number.NaN }],
+    ["an infinite statement timeout", { statementTimeoutMs: Number.POSITIVE_INFINITY }],
+    ["an unsafe lock timeout", { lockTimeoutMs: Number.MAX_SAFE_INTEGER + 1 }],
+    ["a non-number statement timeout", { statementTimeoutMs: "75" as unknown as number }],
+  ];
+
+  for (const [entrypointName, beginTransaction] of transactionEntrypoints) {
+    it.each(invalidTimeoutOptions)(
+      `rejects %s before beginning ${entrypointName}`,
+      async (_description, options) => {
+        const { layer, executedQueries, transactionConfigs } = createTransactionRuntimeHarness();
+        let callbackCalled = false;
+
+        await expect(
+          beginTransaction(layer, async () => {
+            callbackCalled = true;
+          }, options),
+        ).rejects.toThrow(RangeError);
+
+        expect(callbackCalled).toBe(false);
+        expect(executedQueries).toEqual([]);
+        expect(transactionConfigs).toEqual([]);
+      },
+    );
+  }
+});
 
 pgDescribe("AsyncDataLayer: VAL-DATA-002 — transaction atomicity (commit)", () => {
   let ctx: TestLayer | null = null;
@@ -309,6 +421,116 @@ pgDescribe("AsyncDataLayer: VAL-DATA-003 — transaction atomicity (rollback)", 
 
     const after = await countAuditRows(ctx.adminDb);
     expect(after).toBe(0);
+  });
+});
+
+/*
+FNXC:AsyncDataLayer 2026-07-21-00:48:
+Transaction callers need optional PostgreSQL server-side statement_timeout and lock_timeout limits. The limits must be local to the active transaction so pooled connections do not retain them, and PostgreSQL timeout errors must roll back every prior write without client-side abandonment.
+*/
+pgDescribe("AsyncDataLayer: transaction-local server timeouts", () => {
+  let ctx: TestLayer | null = null;
+
+  afterEach(async () => {
+    await teardownLayer(ctx);
+    ctx = null;
+  });
+
+  it("applies statement_timeout and lock_timeout only within the configured transaction", async () => {
+    const testLayer = await setupFreshLayer({ poolMax: 1 });
+    ctx = testLayer;
+    const before = (await testLayer.layer.db.execute(
+      sql`SELECT current_setting('statement_timeout') AS statement_timeout, current_setting('lock_timeout') AS lock_timeout`,
+    )) as unknown as Array<{ statement_timeout: string; lock_timeout: string }>;
+
+    const inside = await testLayer.layer.transaction(
+      async (tx) => {
+        const settings = (await tx.execute(
+          sql`SELECT current_setting('statement_timeout') AS statement_timeout, current_setting('lock_timeout') AS lock_timeout`,
+        )) as unknown as Array<{ statement_timeout: string; lock_timeout: string }>;
+        return settings[0];
+      },
+      { statementTimeoutMs: 75, lockTimeoutMs: 50 },
+    );
+
+    expect(inside).toEqual({ statement_timeout: "75ms", lock_timeout: "50ms" });
+
+    const after = (await testLayer.layer.db.execute(
+      sql`SELECT current_setting('statement_timeout') AS statement_timeout, current_setting('lock_timeout') AS lock_timeout`,
+    )) as unknown as Array<{ statement_timeout: string; lock_timeout: string }>;
+    expect(after[0]).toEqual(before[0]);
+  });
+
+  it("rolls back writes when PostgreSQL cancels a statement at statement_timeout", async () => {
+    const testLayer = await setupFreshLayer();
+    ctx = testLayer;
+    const runId = "run-statement-timeout-rollback";
+
+    await expect(
+      testLayer.layer.transactionImmediate(
+        async (tx) => {
+          await recordRunAuditEventWithinTransaction(tx, {
+            projectId: "timeout-test-project",
+            runId,
+            agentId: "agent-statement-timeout",
+            domain: "database",
+            mutationType: "task:update",
+            target: "FN-STATEMENT-TIMEOUT",
+          });
+          await tx.execute(sql`SELECT pg_sleep(0.2)`);
+        },
+        { statementTimeoutMs: 50 },
+      ),
+    ).rejects.toThrow(/statement timeout/i);
+
+    expect(await countAuditRows(testLayer.adminDb)).toBe(0);
+  });
+
+  it("rolls back writes when PostgreSQL cancels a lock wait at lock_timeout", async () => {
+    const testLayer = await setupFreshLayer();
+    ctx = testLayer;
+    const runId = "run-lock-timeout-rollback";
+    const lockName = `fusion-data-layer-lock-timeout-${process.pid}-${Date.now()}`;
+    let resolveLockHolder!: () => void;
+    const releaseLockHolder = new Promise<void>((resolve) => {
+      resolveLockHolder = resolve;
+    });
+    let resolveLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      resolveLockAcquired = resolve;
+    });
+    const lockHolder = testLayer.adminSql.begin(async (lockedTx) => {
+      await lockedTx`SELECT pg_advisory_xact_lock(hashtext(${lockName}))`;
+      resolveLockAcquired();
+      await releaseLockHolder;
+    });
+    await lockAcquired;
+
+    const fallbackReleaseTimer = setTimeout(resolveLockHolder, 250);
+    try {
+      await expect(
+        testLayer.layer.transaction(
+          async (tx) => {
+            await recordRunAuditEventWithinTransaction(tx, {
+              projectId: "timeout-test-project",
+              runId,
+              agentId: "agent-lock-timeout",
+              domain: "database",
+              mutationType: "task:update",
+              target: "FN-LOCK-TIMEOUT",
+            });
+            await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${lockName}))`);
+          },
+          { lockTimeoutMs: 50 },
+        ),
+      ).rejects.toThrow(/lock timeout/i);
+    } finally {
+      clearTimeout(fallbackReleaseTimer);
+      resolveLockHolder();
+      await lockHolder;
+    }
+
+    expect(await countAuditRows(testLayer.adminDb)).toBe(0);
   });
 });
 

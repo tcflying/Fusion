@@ -502,7 +502,7 @@ async function appendTrustedBindingRevocation(
       evidenceHash: record.evidenceHash,
       revokedAt: record.revokedAt,
     })
-    .onConflictDoNothing({ target: roomEvolutionTrustedBindingRevocations.id })
+    .onConflictDoNothing()
     .returning({ id: roomEvolutionTrustedBindingRevocations.id });
   return insertOutcome(record.id, rows);
 }
@@ -534,7 +534,7 @@ async function appendCanarySuccessOutcome(
       evidenceHash: record.evidenceHash,
       completedAt: record.completedAt,
     })
-    .onConflictDoNothing({ target: roomEvolutionCanarySuccessOutcomes.id })
+    .onConflictDoNothing()
     .returning({ id: roomEvolutionCanarySuccessOutcomes.id });
   return insertOutcome(record.id, rows);
 }

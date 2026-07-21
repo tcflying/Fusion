@@ -499,6 +499,7 @@ describe("AsyncRoomLeaseStore PostgreSQL fencing", () => {
     await roomStore.completeDeliveryAttempt({
       outboxId: "outbox-sender-dispatch-guard",
       attemptId: "attempt-sender-dispatch-guard-1",
+      senderFence: secondAttempt.senderFence,
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
       nativeMessageId: null,

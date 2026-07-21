@@ -1,4 +1,5 @@
 import type {
+  RoomCapabilityRegistry,
   RoomBindingRecordV1,
   SessionConnectorCapabilitiesV1,
   SessionConnectorCapabilityState,
@@ -9,16 +10,45 @@ import type {
   CreateRoomBindingCapabilityReportInputV1,
   RoomBindingCapabilityReporterFreshnessV1,
 } from "./room-binding-capability-reporter.js";
+import { createRoomBindingCapabilityReport } from "./room-binding-capability-reporter.js";
 import {
   updateRoomCapabilityRegistry,
   type RoomCapabilityRegistryUpdateInputV1,
   type RoomCapabilityRegistryUpdateResultV1,
+  type RoomCapabilityRegistryUpdateSampleV1,
   type RoomCapabilityRegistryWriterPortV1,
 } from "./room-capability-registry-updater.js";
 
 export const ROOM_CONNECTOR_RUNTIME_OBSERVATION_REPORTER_CONTRACT_VERSION = 1 as const;
 
 const RUNTIME_OBSERVATION_SOURCE = "controlled_connector_runtime_observation_port" as const;
+const OBSERVABLE_CONCRETE_BINDING_STATES = new Set<RoomBindingRecordV1["state"]>([
+  "attached",
+  "paused",
+  "authentication_blocked",
+  "host_unavailable",
+  "delivery_uncertain",
+]);
+
+/**
+ * FNXC:RoomCapabilitySchedulingEvidence 2026-07-20-00:24:
+ * Complete trusted capability evidence is useful even when it forbids work.
+ * Keep this conservative scheduling classification shared by single-binding
+ * reporting and multi-binding aggregation: only an attached Session with a
+ * healthy connector/host, clear rate limit, and at least one verified tool
+ * can receive a new task.
+ */
+export function isRoomConnectorCapabilitySnapshotSchedulable(
+  binding: Pick<RoomBindingRecordV1, "state">,
+  snapshot: RoomCapabilityRegistry.RoomBindingCapabilitySnapshotV1,
+): boolean {
+  return binding.state === "attached"
+    && snapshot.health.connectorState === "healthy"
+    && snapshot.health.hostState === "healthy"
+    && snapshot.rateLimit.state === "clear"
+    && snapshot.tools.length > 0
+    && snapshot.tools.every((tool) => tool.state === "verified");
+}
 
 export type RoomConnectorRuntimeUnknownReasonV1 =
   | "not_collected"
@@ -245,6 +275,26 @@ export type RoomConnectorRuntimeObservationReporterResultV1 =
     readonly update: Exclude<RoomCapabilityRegistryUpdateResultV1, { readonly ok: true }>;
   };
 
+/**
+ * FNXC:RoomCapabilityAtomicAggregation 2026-07-19-23:58:
+ * Producing a trusted sample is deliberately separate from committing it. A
+ * controller that owns multiple active bindings must collect every concrete
+ * observation and submit one all-or-nothing registry update, never persist a
+ * partial first sample merely because one connector replied earlier.
+ */
+export type RoomConnectorRuntimeObservationCollectionResultV1 =
+  | {
+    readonly ok: true;
+    readonly outcome: "collected";
+    readonly scheduling: "schedulable" | "not_schedulable";
+    readonly projectId: string;
+    readonly roomId: string;
+    readonly bindingId: string;
+    readonly unknown: readonly [];
+    readonly sample: RoomCapabilityRegistryUpdateSampleV1;
+  }
+  | Extract<RoomConnectorRuntimeObservationReporterResultV1, { readonly outcome: "withheld" }>;
+
 type RuntimeRecord = Record<string, unknown>;
 
 function isRecord(value: unknown): value is RuntimeRecord {
@@ -371,8 +421,12 @@ function validateInput(
   if (binding.roomId !== rawInput.target.roomId) {
     issues.push(issue("binding_mismatch", "$.target.binding.roomId", "Binding must belong to the requested Room"));
   }
-  if (binding.state !== "attached" || binding.detachedAt !== null) {
-    issues.push(issue("binding_mismatch", "$.target.binding.state", "Only an attached concrete binding can be runtime-observed"));
+  if (
+    typeof binding.state !== "string"
+    || !OBSERVABLE_CONCRETE_BINDING_STATES.has(binding.state as RoomBindingRecordV1["state"])
+    || binding.detachedAt !== null
+  ) {
+    issues.push(issue("binding_mismatch", "$.target.binding.state", "Only a current concrete binding can be runtime-observed"));
   }
   return issues;
 }
@@ -493,11 +547,10 @@ function registryRejected(
   };
 }
 
-export async function reportRoomConnectorRuntimeObservation(
+export async function collectRoomConnectorRuntimeObservation(
   rawInput: RoomConnectorRuntimeObservationInputV1,
   observationPort: ControlledRoomConnectorRuntimeObservationPortV1,
-  writer: RoomCapabilityRegistryWriterPortV1,
-): Promise<RoomConnectorRuntimeObservationReporterResultV1> {
+): Promise<RoomConnectorRuntimeObservationCollectionResultV1> {
   const inputIssues = validateInput(rawInput);
   if (inputIssues.length > 0) {
     return withheld(rawInput, inputIssues[0]!, inputIssues);
@@ -675,26 +728,61 @@ export async function reportRoomConnectorRuntimeObservation(
       calibration: asCalibration(calibration, observation.calibration.observedAt),
     },
   };
-  const update = await updateRoomCapabilityRegistry({
-    contractVersion: 1,
-    projectId: input.target.projectId,
-    roomId: input.target.roomId,
-    expectedAggregateVersion: input.registryUpdate.expectedAggregateVersion,
-    expectedRegistryRevision: input.registryUpdate.expectedRegistryRevision,
-    roomWorkerFence: input.registryUpdate.roomWorkerFence,
-    idempotencyKey: input.registryUpdate.idempotencyKey,
-    sampledAt: input.asOf,
-    freshness: input.registryUpdate.freshness,
-    samples: [{ source: "trusted_session_connector", report }],
-  }, writer);
-  if (!update.ok) return registryRejected(input, update);
+  const createdReport = createRoomBindingCapabilityReport(report);
+  if (!createdReport.ok) {
+    const firstIssue = createdReport.issues[0];
+    const reporterIssue = issue(
+      "runtime_observation_invalid",
+      "$.observation",
+      firstIssue?.message ?? "Controlled runtime observation could not form a trusted capability report",
+    );
+    return withheld(input, reporterIssue, [reporterIssue]);
+  }
   return {
     ok: true,
-    outcome: "reported",
-    scheduling: update.scheduling,
+    outcome: "collected",
+    scheduling: isRoomConnectorCapabilitySnapshotSchedulable(
+      input.target.binding,
+      createdReport.value.snapshot,
+    ) ? "schedulable" : "not_schedulable",
     projectId: input.target.projectId,
     roomId: input.target.roomId,
     bindingId: input.target.binding.id,
+    unknown: [],
+    sample: { source: "trusted_session_connector", report },
+  };
+}
+
+export async function reportRoomConnectorRuntimeObservation(
+  rawInput: RoomConnectorRuntimeObservationInputV1,
+  observationPort: ControlledRoomConnectorRuntimeObservationPortV1,
+  writer: RoomCapabilityRegistryWriterPortV1,
+): Promise<RoomConnectorRuntimeObservationReporterResultV1> {
+  const collected = await collectRoomConnectorRuntimeObservation(rawInput, observationPort);
+  if (!collected.ok) return collected;
+
+  const update = await updateRoomCapabilityRegistry({
+    contractVersion: 1,
+    projectId: rawInput.target.projectId,
+    roomId: rawInput.target.roomId,
+    expectedAggregateVersion: rawInput.registryUpdate.expectedAggregateVersion,
+    expectedRegistryRevision: rawInput.registryUpdate.expectedRegistryRevision,
+    roomWorkerFence: rawInput.registryUpdate.roomWorkerFence,
+    idempotencyKey: rawInput.registryUpdate.idempotencyKey,
+    sampledAt: rawInput.asOf,
+    freshness: rawInput.registryUpdate.freshness,
+    samples: [collected.sample],
+  }, writer);
+  if (!update.ok) return registryRejected(rawInput, update);
+  return {
+    ok: true,
+    outcome: "reported",
+    scheduling: collected.scheduling === "schedulable" && update.scheduling === "schedulable"
+      ? "schedulable"
+      : "not_schedulable",
+    projectId: rawInput.target.projectId,
+    roomId: rawInput.target.roomId,
+    bindingId: rawInput.target.binding.id,
     unknown: [],
     update,
   };

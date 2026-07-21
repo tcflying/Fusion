@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 
 import { and, eq, gt, isNull, lte, sql } from "drizzle-orm";
 
-import { assertRoomLeaseFence, type StoredRoomLeaseV1 } from "./async-room-lease-store.js";
+import {
+  assertRoomLeaseFence,
+  lockRoomLeaseResourceWithinTransaction,
+  type AssertRoomLeaseFenceInput,
+  type StoredRoomLeaseV1,
+} from "./async-room-lease-store.js";
 import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
 import {
   operationalRooms,
@@ -162,7 +167,18 @@ export interface RoomProviderBackpressurePostgresCommitInputV1 {
   readonly roomId: string;
   readonly lease: StoredRoomLeaseV1;
   readonly expectedAggregateVersion: number;
+  /** Optional so non-delivery Core callers retain their existing contract. */
+  readonly senderFence?: Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" };
   readonly requestId: string;
+  /**
+   * FNXC:RoomProviderAdmissionReplay 2026-07-19-23:20:
+   * A Room outbox retry can recover under a newer clock, lease, telemetry, or
+   * aggregate version after Core already committed its reservation. This hash
+   * binds the immutable delivery/session attempt instead of those moving
+   * observations, so Core can replay the one durable reservation without
+   * accidentally minting another provider slot.
+   */
+  readonly idempotencyBindingHash?: string;
   readonly decisionInput: RoomProviderBackpressureControllerInputV1;
   readonly decision: RoomProviderBackpressureControllerResultV1;
 }
@@ -183,11 +199,34 @@ export interface RoomProviderBackpressurePostgresReleaseInputV1 {
   readonly releasedAt: string;
 }
 
+/**
+ * FNXC:RoomProviderBackpressure 2026-07-19-18:45:
+ * A capacity reservation may outlive its admission decision, but never its
+ * fenced worker authority. Renewal carries no scope, class, or account fields
+ * and preserves the original reservation binding while advancing expiry.
+ */
+export interface RoomProviderBackpressurePostgresRenewInputV1 {
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly lease: StoredRoomLeaseV1;
+  readonly expectedAggregateVersion: number;
+  readonly reservationId: string;
+  readonly claimId: string;
+  readonly operationId: string;
+  readonly asOf: string;
+  readonly expiresAt: string;
+}
+
+export type RoomProviderBackpressurePostgresRenewResultV1 =
+  | { readonly status: "renewed"; readonly reservationId: string; readonly expiresAt: string; readonly replayed: boolean }
+  | { readonly status: "held"; readonly reason: string };
+
 export interface RoomProviderBackpressurePostgresPortsV1 {
   read(input: RoomProviderBackpressurePostgresReadInputV1): Promise<RoomProviderBackpressurePostgresSnapshotV1>;
   commit(
     input: RoomProviderBackpressurePostgresCommitInputV1,
   ): Promise<RoomProviderBackpressurePostgresCommitResultV1>;
+  renew(input: RoomProviderBackpressurePostgresRenewInputV1): Promise<RoomProviderBackpressurePostgresRenewResultV1>;
   release(input: RoomProviderBackpressurePostgresReleaseInputV1): Promise<void>;
 }
 
@@ -195,6 +234,12 @@ export interface CreateRoomProviderBackpressurePostgresPortsInputV1 {
   readonly layer: AsyncDataLayer;
   readonly snapshotSource: RoomProviderBackpressurePostgresSnapshotSourceV1;
   readonly projectId?: string;
+  /**
+   * A factory-owned trusted clock seam. Production omits this and reads the
+   * PostgreSQL transaction clock; deterministic integration tests may supply a
+   * fixed authority clock without turning a caller audit timestamp into proof.
+   */
+  readonly fenceValidationClock?: (tx: DbTransaction) => string | Promise<string>;
 }
 
 export class RoomProviderBackpressurePostgresError extends Error {
@@ -242,6 +287,7 @@ export function createRoomProviderBackpressurePostgresPorts(
   return Object.freeze({
     read: implementation.read.bind(implementation),
     commit: implementation.commit.bind(implementation),
+    renew: implementation.renew.bind(implementation),
     release: implementation.release.bind(implementation),
   });
 }
@@ -308,13 +354,14 @@ class RoomProviderBackpressurePostgresPorts {
     const requestHash = commitRequestHash(commitInput);
 
     return this.input.layer.transactionImmediate(async (tx) => {
+      const fenceValidationAt = await currentFenceValidationTime(tx, this.input.fenceValidationClock);
       try {
         await assertWorkerLease(
           tx,
           commitInput.projectId,
           commitInput.roomId,
           commitInput.lease,
-          commitInput.decisionInput.asOf,
+          fenceValidationAt,
         );
       } catch {
         return held("stale_fence");
@@ -327,10 +374,26 @@ class RoomProviderBackpressurePostgresPorts {
       )) {
         return held("stale_room_version");
       }
+      if (commitInput.senderFence !== undefined) {
+        await lockRoomLeaseResourceWithinTransaction(
+          tx,
+          commitInput.projectId,
+          "sender",
+          commitInput.senderFence.resourceId,
+        );
+        try {
+          await assertRoomLeaseFence(tx, commitInput.projectId, {
+            ...commitInput.senderFence,
+            now: fenceValidationAt,
+          });
+        } catch {
+          return held("stale_sender_fence");
+        }
+      }
 
       await lockScope(tx, commitInput.projectId, scopeKey);
       let state = await loadState(tx, commitInput.projectId, scopeKey);
-      state = await stabilizeState(tx, state, commitInput.projectId, scopeKey, commitInput.decisionInput.asOf);
+      state = await stabilizeState(tx, state, commitInput.projectId, scopeKey, fenceValidationAt);
 
       const operation = await findOperation(
         tx,
@@ -339,15 +402,33 @@ class RoomProviderBackpressurePostgresPorts {
         commitInput.requestId,
         commitInput.decisionInput.operation.kind,
       );
-      if (operation) return replayOperation(tx, operation, requestHash, commitInput.decisionInput.asOf);
+      if (operation) {
+        return replayOperation(
+          tx,
+          operation,
+          requestHash,
+          commitInput.decisionInput.asOf,
+          commitInput.lease,
+        );
+      }
 
       state ??= await createInitialState(tx, commitInput.projectId, scope, scopeKey, commitInput.decisionInput.asOf);
       const activeReservations = await loadActiveReservations(
         tx,
         commitInput.projectId,
         scopeKey,
-        commitInput.decisionInput.asOf,
+        fenceValidationAt,
       );
+      const deliveryOwnerKey = providerDeliveryOwnerKeyFromRequestId(commitInput.requestId);
+      if (
+        deliveryOwnerKey !== null
+        && activeReservations.some((reservation) =>
+          reservation.requestId !== commitInput.requestId
+          && providerDeliveryOwnerKeyFromClaimId(reservation.claimId) === deliveryOwnerKey,
+        )
+      ) {
+        return held("delivery_reservation_unresolved");
+      }
       const current = rowToState(state, activeReservations.some((reservation) => reservation.isHalfOpenProbe));
       if (!expectedStateMatches(commitInput.decisionInput.state, current)) return held("state_stale");
 
@@ -367,7 +448,7 @@ class RoomProviderBackpressurePostgresPorts {
           commitInput.projectId,
           commitInput.roomId,
           commitInput.lease,
-          commitInput.decisionInput.asOf,
+          fenceValidationAt,
         );
         reservationId = randomUUID();
         await tx.insert(roomProviderBackpressureReservations).values({
@@ -413,12 +494,13 @@ class RoomProviderBackpressurePostgresPorts {
     this.assertProjectScope(releaseInput.projectId);
 
     await this.input.layer.transactionImmediate(async (tx) => {
+      const fenceValidationAt = await currentFenceValidationTime(tx, this.input.fenceValidationClock);
       await assertWorkerLease(
         tx,
         releaseInput.projectId,
         releaseInput.roomId,
         releaseInput.lease,
-        releaseInput.releasedAt,
+        fenceValidationAt,
       );
       const preliminary = await findReservationById(tx, releaseInput.projectId, releaseInput.reservationId);
       if (!preliminary) {
@@ -458,6 +540,115 @@ class RoomProviderBackpressurePostgresPorts {
     });
   }
 
+  async renew(
+    renewInput: RoomProviderBackpressurePostgresRenewInputV1,
+  ): Promise<RoomProviderBackpressurePostgresRenewResultV1> {
+    if (!validRenewInput(renewInput)) return renewHeld("invalid_input");
+    this.assertProjectScope(renewInput.projectId);
+    const requestHash = renewRequestHash(renewInput);
+
+    return this.input.layer.transactionImmediate(async (tx) => {
+      let fencedLease: StoredRoomLeaseV1;
+      let fenceValidationAt: string;
+      try {
+        fenceValidationAt = await currentFenceValidationTime(tx, this.input.fenceValidationClock);
+        fencedLease = await assertWorkerLease(
+          tx,
+          renewInput.projectId,
+          renewInput.roomId,
+          renewInput.lease,
+          fenceValidationAt,
+        );
+      } catch {
+        return renewHeld("stale_fence");
+      }
+      return this.renewWithinTransaction(tx, renewInput, requestHash, fencedLease, fenceValidationAt);
+    });
+  }
+
+  private async renewWithinTransaction(
+    tx: DbTransaction,
+    renewInput: RoomProviderBackpressurePostgresRenewInputV1,
+    requestHash: string,
+    fencedLease: StoredRoomLeaseV1,
+    fenceValidationAt: string,
+  ): Promise<RoomProviderBackpressurePostgresRenewResultV1> {
+    if (!await roomHasVersion(
+      tx,
+      renewInput.projectId,
+      renewInput.roomId,
+      renewInput.expectedAggregateVersion,
+    )) {
+      return renewHeld("stale_room_version");
+    }
+    const preliminary = await findReservationById(tx, renewInput.projectId, renewInput.reservationId);
+    if (!preliminary) return renewHeld("reservation_not_found");
+
+    await lockScope(tx, renewInput.projectId, preliminary.scopeKey);
+    const state = await loadState(tx, renewInput.projectId, preliminary.scopeKey);
+    if (!state) return renewHeld("reservation_not_found");
+    await stabilizeState(tx, state, renewInput.projectId, preliminary.scopeKey, fenceValidationAt);
+    const reservation = await findReservationById(tx, renewInput.projectId, renewInput.reservationId);
+    if (!reservation) return renewHeld("reservation_not_found");
+    if (Date.parse(reservation.expiresAt) <= Date.parse(fenceValidationAt) || reservation.releaseOutcome === "expired") {
+      return renewHeld("reservation_expired");
+    }
+    if (reservation.releasedAt !== null) return renewHeld("reservation_not_found");
+    if (!renewMatchesReservation(renewInput, reservation)) return renewHeld("stale_fence");
+
+    const operation = await findOperation(
+      tx,
+      renewInput.projectId,
+      reservation.scopeKey,
+      renewStorageRequestId(renewInput),
+      "dispatch",
+    );
+    if (operation) {
+      if (operation.requestHash !== requestHash || operation.reservationId !== reservation.id) {
+        return renewHeld("idempotency_conflict");
+      }
+      return renewedReservation(reservation.id, reservation.expiresAt, true);
+    }
+    if (Date.parse(renewInput.expiresAt) <= Date.parse(reservation.expiresAt)) {
+      return renewHeld("renewal_regression");
+    }
+    if (Date.parse(renewInput.expiresAt) < Date.parse(fencedLease.expiresAt)) {
+      return renewHeld("renewal_before_worker_lease_expiry");
+    }
+    const renewed = await tx
+        .update(roomProviderBackpressureReservations)
+        .set({ expiresAt: renewInput.expiresAt })
+        .where(and(
+          eq(roomProviderBackpressureReservations.projectId, renewInput.projectId),
+          eq(roomProviderBackpressureReservations.id, reservation.id),
+          eq(roomProviderBackpressureReservations.roomId, renewInput.roomId),
+          eq(roomProviderBackpressureReservations.claimId, renewInput.claimId),
+          eq(roomProviderBackpressureReservations.leaseId, fencedLease.id),
+          eq(roomProviderBackpressureReservations.leaseEpoch, fencedLease.epoch),
+          eq(roomProviderBackpressureReservations.expectedAggregateVersion, renewInput.expectedAggregateVersion),
+          eq(roomProviderBackpressureReservations.expiresAt, reservation.expiresAt),
+          isNull(roomProviderBackpressureReservations.releasedAt),
+        ))
+        .returning({ id: roomProviderBackpressureReservations.id });
+    if (!renewed[0]) return renewHeld("stale_fence");
+
+    await tx.insert(roomProviderBackpressureOperations).values({
+        projectId: renewInput.projectId,
+        scopeKey: reservation.scopeKey,
+        requestId: renewStorageRequestId(renewInput),
+        // The fixed schema accepts dispatch/success/failure only. This durable
+        // namespace retains replay semantics without a schema migration.
+        operationKind: "dispatch",
+        requestHash,
+        action: "admit",
+        reason: "reservation_renewed",
+        stateRevision: state.revision,
+        reservationId: reservation.id,
+        occurredAt: renewInput.asOf,
+    });
+    return renewedReservation(reservation.id, renewInput.expiresAt, false);
+  }
+
   private assertProjectScope(projectId: string): void {
     if (this.boundProjectId && this.boundProjectId !== projectId) {
       throw new RoomProviderBackpressurePostgresError(
@@ -487,6 +678,32 @@ async function assertWorkerLease(
     expectedEpoch: lease.epoch,
     now,
   });
+}
+
+/*
+FNXC:RoomProviderFenceClock 2026-07-20-01:25:
+Provider admission, renewal, and release carry caller audit times that can be
+older than the database write. Validate the Room-worker fence with a current,
+factory-owned authority clock instead; production reads PostgreSQL's transaction
+clock, while a deterministic test seam never changes the caller audit record.
+*/
+async function currentFenceValidationTime(
+  tx: DbTransaction,
+  configuredClock: CreateRoomProviderBackpressurePostgresPortsInputV1["fenceValidationClock"],
+): Promise<string> {
+  const candidate = configuredClock ? await configuredClock(tx) : await readTransactionClock(tx);
+  if (!canonicalTimestamp(candidate)) {
+    throw new RoomProviderBackpressurePostgresError("Room provider backpressure fence clock is invalid");
+  }
+  return candidate;
+}
+
+async function readTransactionClock(tx: DbTransaction): Promise<string | undefined> {
+  const result: unknown = await tx.execute<{ readonly now: string }>(
+    sql`SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS now`,
+  );
+  const row = Array.isArray(result) ? result[0] : undefined;
+  return isRecord(row) && typeof row.now === "string" ? row.now : undefined;
 }
 
 async function lockScope(tx: DbTransaction, projectId: string, scopeKey: string): Promise<void> {
@@ -679,6 +896,7 @@ async function replayOperation(
   operation: OperationRow,
   requestHash: string,
   asOf: string,
+  lease: StoredRoomLeaseV1,
 ): Promise<RoomProviderBackpressurePostgresCommitResultV1> {
   if (operation.requestHash !== requestHash) return held("idempotency_conflict");
   if (operation.reservationId === null) return held(operation.reason);
@@ -688,6 +906,9 @@ async function replayOperation(
     && reservation.releasedAt === null
     && Date.parse(reservation.expiresAt) > Date.parse(asOf)
   ) {
+    if (reservation.leaseId !== lease.id || reservation.leaseEpoch !== lease.epoch) {
+      return held("reservation_worker_handoff_required");
+    }
     return reserved(reservation.id);
   }
   return held("reservation_expired");
@@ -898,6 +1119,17 @@ function boundedExponentialBackoff(baseBackoffMs: number, maxBackoffMs: number, 
 }
 
 function commitRequestHash(input: RoomProviderBackpressurePostgresCommitInputV1): string {
+  if (input.idempotencyBindingHash !== undefined) {
+    return hashRoomValue({
+      contractVersion: ROOM_PROVIDER_BACKPRESSURE_POSTGRES_CONTRACT_VERSION,
+      projectId: input.projectId,
+      roomId: input.roomId,
+      requestId: input.requestId,
+      idempotencyBindingHash: input.idempotencyBindingHash,
+      scope: input.decisionInput.scope,
+      operation: input.decisionInput.operation,
+    });
+  }
   return hashRoomValue({
     contractVersion: ROOM_PROVIDER_BACKPRESSURE_POSTGRES_CONTRACT_VERSION,
     projectId: input.projectId,
@@ -927,11 +1159,57 @@ function commitRequestHash(input: RoomProviderBackpressurePostgresCommitInputV1)
   });
 }
 
+function renewRequestHash(input: RoomProviderBackpressurePostgresRenewInputV1): string {
+  return hashRoomValue({
+    contractVersion: ROOM_PROVIDER_BACKPRESSURE_POSTGRES_CONTRACT_VERSION,
+    kind: "renew",
+    projectId: input.projectId,
+    roomId: input.roomId,
+    reservationId: input.reservationId,
+    claimId: input.claimId,
+    operationId: input.operationId,
+    expectedAggregateVersion: input.expectedAggregateVersion,
+    lease: {
+      id: input.lease.id,
+      holderId: input.lease.holderId,
+      hostId: input.lease.hostId,
+      epoch: input.lease.epoch,
+    },
+    expiresAt: input.expiresAt,
+  });
+}
+
+function renewStorageRequestId(input: RoomProviderBackpressurePostgresRenewInputV1): string {
+  return `renew:${hashRoomValue({ reservationId: input.reservationId, operationId: input.operationId })}`;
+}
+
 function claimIdFromRequestId(requestId: string): string | null {
   const prefix = "room-provider-capacity:";
   if (!requestId.startsWith(prefix)) return null;
   const claimId = requestId.slice(prefix.length);
   return canonicalString(claimId) ? claimId : null;
+}
+
+/*
+FNXC:RoomProviderReservationOwnerFence 2026-07-20-00:08:
+Engine request ids bind a provider reservation to one durable Room outbox as
+`<outbox-id>:provider-admission:<generation>`. A failed cleanup may leave that
+reservation live until its fenced worker-lease TTL. Reject a later generation
+for the same outbox while it is live instead of silently consuming a second
+provider slot; unrelated Room work remains schedulable and the original TTL is
+still the authoritative cleanup boundary.
+*/
+function providerDeliveryOwnerKeyFromRequestId(requestId: string): string | null {
+  return providerDeliveryOwnerKeyFromClaimId(claimIdFromRequestId(requestId));
+}
+
+function providerDeliveryOwnerKeyFromClaimId(claimId: string | null): string | null {
+  if (claimId === null) return null;
+  const marker = ":provider-admission:";
+  const markerIndex = claimId.indexOf(marker);
+  if (markerIndex <= 0) return null;
+  const ownerKey = claimId.slice(0, markerIndex);
+  return canonicalString(ownerKey) ? ownerKey : null;
 }
 
 function sameControllerResult(
@@ -1009,11 +1287,35 @@ function releaseMatchesReservation(
     && reservation.expectedAggregateVersion === input.expectedAggregateVersion;
 }
 
+function renewMatchesReservation(
+  input: RoomProviderBackpressurePostgresRenewInputV1,
+  reservation: ReservationRow,
+): boolean {
+  return reservation.projectId === input.projectId
+    && reservation.roomId === input.roomId
+    && reservation.claimId === input.claimId
+    && reservation.leaseId === input.lease.id
+    && reservation.leaseEpoch === input.lease.epoch
+    && reservation.expectedAggregateVersion === input.expectedAggregateVersion;
+}
+
 function reserved(reservationId: string): RoomProviderBackpressurePostgresCommitResultV1 {
   return Object.freeze({ status: "reserved", reservationId });
 }
 
 function held(reason: string): RoomProviderBackpressurePostgresCommitResultV1 {
+  return Object.freeze({ status: "held", reason });
+}
+
+function renewedReservation(
+  reservationId: string,
+  expiresAt: string,
+  replayed: boolean,
+): RoomProviderBackpressurePostgresRenewResultV1 {
+  return Object.freeze({ status: "renewed", reservationId, expiresAt, replayed });
+}
+
+function renewHeld(reason: string): RoomProviderBackpressurePostgresRenewResultV1 {
   return Object.freeze({ status: "held", reason });
 }
 
@@ -1053,7 +1355,9 @@ function validCommitInput(value: unknown): value is RoomProviderBackpressurePost
     || !canonicalString(value.roomId)
     || !validRoomWorkerLease(value.lease, value.roomId)
     || !nonNegativeSafeInteger(value.expectedAggregateVersion)
+    || (value.senderFence !== undefined && !validSenderFence(value.senderFence, value.roomId))
     || !canonicalString(value.requestId)
+    || (value.idempotencyBindingHash !== undefined && !canonicalSha256(value.idempotencyBindingHash))
     || !validControllerInput(value.decisionInput)
     || !validControllerResult(value.decision)
   ) {
@@ -1063,6 +1367,10 @@ function validCommitInput(value: unknown): value is RoomProviderBackpressurePost
     && sameScope(value.decision.scope, value.decisionInput.scope)
     && value.decision.scopeKey === scopeToKey(value.decisionInput.scope)
     && value.decision.state.scopeKey === value.decision.scopeKey;
+}
+
+function canonicalSha256(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
 }
 
 function validateReleaseInput(value: unknown): asserts value is RoomProviderBackpressurePostgresReleaseInputV1 {
@@ -1079,6 +1387,20 @@ function validateReleaseInput(value: unknown): asserts value is RoomProviderBack
     || !canonicalTimestamp(value.releasedAt)) {
     throw new RoomProviderBackpressurePostgresError("Room provider backpressure release input is invalid");
   }
+}
+
+function validRenewInput(value: unknown): value is RoomProviderBackpressurePostgresRenewInputV1 {
+  return isRecord(value)
+    && canonicalString(value.projectId)
+    && canonicalString(value.roomId)
+    && validRoomWorkerLease(value.lease, value.roomId)
+    && nonNegativeSafeInteger(value.expectedAggregateVersion)
+    && canonicalString(value.reservationId)
+    && canonicalString(value.claimId)
+    && canonicalString(value.operationId)
+    && canonicalTimestamp(value.asOf)
+    && canonicalTimestamp(value.expiresAt)
+    && Date.parse(value.expiresAt) > Date.parse(value.asOf);
 }
 
 function validControllerInput(value: unknown): value is RoomProviderBackpressureControllerInputV1 {
@@ -1193,6 +1515,17 @@ function validRoomWorkerLease(value: unknown, roomId: unknown): value is StoredR
     && Date.parse(value.expiresAt) > Date.parse(value.acquiredAt)
     && (value.releasedAt === null || canonicalTimestamp(value.releasedAt))
     && canonicalTimestamp(value.heartbeatAt);
+}
+
+function validSenderFence(value: unknown, roomId: unknown): value is Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" } {
+  return isRecord(value)
+    && canonicalString(value.leaseId)
+    && value.roomId === roomId
+    && value.kind === "sender"
+    && canonicalString(value.resourceId)
+    && canonicalString(value.holderId)
+    && canonicalString(value.hostId)
+    && positiveSafeInteger(value.expectedEpoch);
 }
 
 function freezeScope(scope: RoomProviderBackpressureScopeV1): RoomProviderBackpressureScopeV1 {

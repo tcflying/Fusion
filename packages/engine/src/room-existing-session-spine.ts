@@ -1,15 +1,28 @@
+import {
+  assignRoomRoles,
+  createRoomCapabilitySnapshot,
+  getRoomProtocolDefinition,
+  hashRoomValue,
+  normalizeRoomRoleAssignmentConstraints,
+} from "@fusion/core";
 import type {
   AsyncRoomStore,
   CreateRoomWithExistingBindingsInput,
   RoomAggregateV1,
   RoomAuthorityEnvelopeV1,
   RoomBindingRecordV1,
+  RoomCapabilitySnapshotInputV1,
   RoomMessageIntent,
   RoomOutboxRecordV1,
+  RoomPhaseGateEvidenceProjectionV1,
+  RoomPhaseGateEvidenceRecordV1,
+  RoomRoleAssignmentConstraintsV1,
+  RoomRoleAssignmentProjectionV1,
+  RouteRoomProtocolMessageInputV1,
+  RouteRoomProtocolMessageResultV1,
   RouteOperatorMessageResultV1,
   SessionConnectorIdentityV1,
 } from "@fusion/core";
-import { hashRoomValue } from "@fusion/core";
 
 import {
   RoomSessionConnectorIngestionPersistence,
@@ -30,7 +43,10 @@ export type RoomExistingSessionSpineErrorCode =
   | "ROOM_EXISTING_SESSION_SEAT_NOT_FOUND"
   | "ROOM_EXISTING_SESSION_BINDING_NOT_FOUND"
   | "ROOM_EXISTING_SESSION_AUTHORITY_CONFLICT"
-  | "ROOM_EXISTING_SESSION_DELIVERY_CONFLICT";
+  | "ROOM_EXISTING_SESSION_DELIVERY_CONFLICT"
+  | "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID"
+  | "ROOM_EXISTING_SESSION_PHASE_BOUNDARY_CONFLICT"
+  | "ROOM_EXISTING_SESSION_PROTOCOL_ROUTE_CONFLICT";
 
 export class RoomExistingSessionSpineError extends Error {
   constructor(
@@ -44,8 +60,23 @@ export class RoomExistingSessionSpineError extends Error {
 
 export type RoomExistingSessionStore = Pick<
   AsyncRoomStore,
-  "createRoomWithExistingBindings" | "getRoom" | "routeOperatorMessage"
+  | "createRoomWithExistingBindings"
+  | "getRoom"
+  | "recordRoomPhaseGateEvidence"
+  | "transitionRoomRoleAssignment"
+  | "routeRoomProtocolMessage"
+  | "routeOperatorMessage"
 > & RoomConnectorIngestionStore;
+
+/**
+ * The caller must attest concrete binding capabilities rather than inferring
+ * them from a provider or connector label. The core policy validates the
+ * certification and user locks/forbids before any existing Session is attached.
+ */
+export interface RoomRoleAssignmentConfigurationV1 {
+  readonly capabilitySnapshot: RoomCapabilitySnapshotInputV1;
+  readonly constraints: RoomRoleAssignmentConstraintsV1;
+}
 
 export interface ExactExistingSessionSeatRequest {
   readonly seatId: string;
@@ -62,6 +93,36 @@ export interface ExactExistingSessionSeatRequest {
 export interface CreateRoomWithExistingSessionsInput {
   readonly room: CreateRoomWithExistingBindingsInput["room"];
   readonly sessions: readonly ExactExistingSessionSeatRequest[];
+  readonly roleAssignment: RoomRoleAssignmentConfigurationV1;
+}
+
+export interface TransitionRoomRoleAssignmentAtCompletedTurnBoundaryInput {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly boundaryTurnId: string;
+  readonly targetPhaseId: string;
+  readonly phaseGateEvidenceId: string;
+  readonly idempotencyKey: string;
+  readonly roleAssignment: RoomRoleAssignmentConfigurationV1;
+}
+
+export interface RecordRoomPhaseGateEvidenceAtCompletedTurnBoundaryInput {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly idempotencyKey: string;
+  readonly evidence: RoomPhaseGateEvidenceRecordV1;
+}
+
+/**
+ * Explicit typed protocol ingress for a Room already bound to existing native
+ * Sessions. It intentionally does not reinterpret connector-history text: an
+ * adapter must first produce a validated protocol envelope before using it.
+ */
+export interface RouteStructuredRoomProtocolMessageInput {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly idempotencyKey: string;
+  readonly message: unknown;
 }
 
 export interface SendToRoomSeatInput {
@@ -108,6 +169,14 @@ provider dispatch; this seam never becomes a second sender. Restore reads only
 durable Room state, while ingestion reloads durable cursors through the
 event-first/history-repair path.
 The integration suite uses deterministic doubles and is not live-provider proof.
+
+FNXC:SessionRoomExistingSpine 2026-07-19-05:46:
+Existing-Session Room creation now requires an explicit per-binding capability
+snapshot plus operator locks/forbids. The Engine preflights the immutable policy
+before connector ensure or Room persistence, then activates the durable entry
+assignment with a causal system command. Later phases use an explicit completed
+turn boundary and retain core's atomic CAS/gate enforcement; this is a runtime
+seam, not a live-provider certification.
 */
 export class RoomExistingSessionSpine {
   private readonly now: () => string;
@@ -121,6 +190,7 @@ export class RoomExistingSessionSpine {
     input: CreateRoomWithExistingSessionsInput,
   ): Promise<RoomAggregateV1> {
     validateExistingSessionRequests(input.sessions);
+    const roleAssignment = preflightEntryRoleAssignment(input);
     const participants: CreateRoomWithExistingBindingsInput["participants"][number][] = [];
     const nativeIdentities = new Set<string>();
     const happierIdentities = new Set<string>();
@@ -191,28 +261,126 @@ export class RoomExistingSessionSpine {
     }
 
     const occurredAt = this.now();
-    return this.options.roomStore.createRoomWithExistingBindings({
+    const creationEventId = `room-existing-session:${input.room.id}:created`;
+    const created = await this.options.roomStore.createRoomWithExistingBindings({
       room: { ...input.room },
       participants,
+      entryRoleAssignment: roleAssignment,
       now: occurredAt,
     }, {
-      eventId: `room-existing-session:${input.room.id}:created`,
+      eventId: creationEventId,
       actorType: "system",
       actorId: "room-existing-session-spine",
       correlationId: `room-existing-session:${input.room.id}`,
       causationId: null,
       occurredAt,
     });
+    return this.requireRoom(created.room.id);
   }
 
-  async sendToSeat(input: SendToRoomSeatInput): Promise<RoomOutboxRecordV1> {
+  async transitionRoleAssignmentAtCompletedTurnBoundary(
+    input: TransitionRoomRoleAssignmentAtCompletedTurnBoundaryInput,
+  ): Promise<RoomRoleAssignmentProjectionV1> {
+    validateRoleTransitionRequest(input);
+    await this.requireRoom(input.roomId);
+
+    /*
+    FNXC:SessionRoomExistingSpine 2026-07-19-06:46:
+    An exact completed-turn transition retry must enter AsyncRoomStore before
+    this adapter evaluates a stale aggregate or boundary projection. Core owns
+    the command hash, result replay, CAS, safe-boundary, gate, and assignment
+    policy; prechecking here previously rejected a committed command before
+    Core could return its original durable role-assignment result.
+    */
+    const occurredAt = this.now();
+    return this.options.roomStore.transitionRoomRoleAssignment({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      boundaryTurnId: input.boundaryTurnId,
+      targetPhaseId: input.targetPhaseId,
+      phaseGateEvidenceId: input.phaseGateEvidenceId,
+      idempotencyKey: input.idempotencyKey,
+      capabilitySnapshot: input.roleAssignment.capabilitySnapshot,
+      constraints: input.roleAssignment.constraints,
+      now: occurredAt,
+    }, {
+      eventId: `room-existing-session:${input.roomId}:role-assignment:${hashRoomValue(input.idempotencyKey)}`,
+      actorType: "system",
+      actorId: "room-existing-session-spine",
+      correlationId: `room-existing-session:${input.roomId}:phase:${input.targetPhaseId}`,
+      causationId: `room-existing-session:${input.roomId}:turn:${input.boundaryTurnId}`,
+      occurredAt,
+    });
+  }
+
+  async recordPhaseGateEvidenceAtCompletedTurnBoundary(
+    input: RecordRoomPhaseGateEvidenceAtCompletedTurnBoundaryInput,
+  ): Promise<RoomPhaseGateEvidenceProjectionV1> {
+    validatePhaseGateEvidenceRequest(input);
+    await this.requireRoom(input.roomId);
+    const occurredAt = this.now();
+    return this.options.roomStore.recordRoomPhaseGateEvidence({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      idempotencyKey: input.idempotencyKey,
+      evidence: structuredClone(input.evidence),
+      now: occurredAt,
+    }, {
+      eventId: `room-existing-session:${input.roomId}:phase-gate-evidence:${hashRoomValue(input.idempotencyKey)}`,
+      actorType: "system",
+      actorId: "room-existing-session-spine",
+      correlationId: `room-existing-session:${input.roomId}:phase-gate:${input.evidence.id}`,
+      causationId: `room-existing-session:${input.roomId}:turn:${input.evidence.turnId}`,
+      occurredAt,
+    });
+  }
+
+  /**
+   * Persist one already-structured peer message through the canonical core
+   * router. This is the runtime ingress seam for adapters; raw connector
+   * history remains evidence-only until an adapter constructs this envelope.
+   */
+  async routeStructuredProtocolMessage(
+    input: RouteStructuredRoomProtocolMessageInput,
+  ): Promise<RouteRoomProtocolMessageResultV1> {
+    requireNonEmpty(input.roomId, "roomId");
+    requireNonEmpty(input.idempotencyKey, "idempotencyKey");
+    if (!Number.isSafeInteger(input.expectedAggregateVersion) || input.expectedAggregateVersion < 0) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_PROTOCOL_ROUTE_CONFLICT",
+        "A structured protocol route requires a non-negative expected aggregate version",
+      );
+    }
+    const room = await this.requireRoom(input.roomId);
+    if (room.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_PROTOCOL_ROUTE_CONFLICT",
+        "The structured protocol route has a stale Room aggregate version",
+      );
+    }
+    const command: RouteRoomProtocolMessageInputV1 = {
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      idempotencyKey: input.idempotencyKey,
+      message: input.message,
+    };
+    return this.options.roomStore.routeRoomProtocolMessage(command);
+  }
+
+  /**
+   * FNXC:SessionRoomMessageRouting 2026-07-19-17:18:
+   * Command gateways need the authoritative post-commit event version for an
+   * optimistic API acknowledgement. Keep the full routing result available
+   * here while the existing single-seat convenience method remains compatible.
+   */
+  async routeOperatorMessageToSeat(input: SendToRoomSeatInput): Promise<RouteOperatorMessageResultV1> {
     requireNonEmpty(input.roomId, "roomId");
     requireNonEmpty(input.seatId, "seatId");
     requireNonEmpty(input.commandId, "commandId");
     requireNonEmpty(input.correlationId, "correlationId");
     requireNonEmpty(input.idempotencyKey, "idempotencyKey");
     const occurredAt = this.now();
-    const routed = await this.options.roomStore.routeOperatorMessage({
+    return this.options.roomStore.routeOperatorMessage({
       contractVersion: 1,
       apiVersion: "room.v1",
       commandId: input.commandId,
@@ -232,7 +400,13 @@ export class RoomExistingSessionSpine {
         contentHash: hashRoomValue(input.content),
       },
     });
-    return requireExactRoutedSeatDelivery(routed, input.seatId);
+  }
+
+  async sendToSeat(input: SendToRoomSeatInput): Promise<RoomOutboxRecordV1> {
+    return requireExactRoutedSeatDelivery(
+      await this.routeOperatorMessageToSeat(input),
+      input.seatId,
+    );
   }
 
   async ingestSeat(input: IngestRoomSeatInput): Promise<SessionConnectorIngestionResult> {
@@ -311,6 +485,140 @@ function validateExistingSessionRequests(
   }
 }
 
+function preflightEntryRoleAssignment(
+  input: CreateRoomWithExistingSessionsInput,
+): RoomRoleAssignmentConfigurationV1 {
+  const roleAssignment = requireRoleAssignmentConfiguration(input.roleAssignment);
+  const protocol = getRoomProtocolDefinition(input.room.protocolId, input.room.protocolVersion);
+  if (!protocol || !protocol.phases[0]) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID",
+      "Existing-Session Room creation requires a supported protocol with an entry phase",
+    );
+  }
+  const snapshot = requireCertifiedBindings(
+    roleAssignment.capabilitySnapshot,
+    input.sessions.map((session) => session.bindingId),
+    "Existing-Session Room creation",
+  );
+  const constraints = requireRoleAssignmentConstraints(roleAssignment.constraints);
+  const assignment = assignRoomRoles({
+    protocol,
+    phaseId: protocol.phases[0].id,
+    capabilitySnapshot: snapshot,
+    constraints,
+    producerBindingIds: [],
+  });
+  if (!assignment.ok) {
+    throwRoleAssignmentPreflightError("Existing-Session Room creation", assignment.unsatisfied);
+  }
+  return { capabilitySnapshot: snapshot, constraints };
+}
+
+function requireRoleAssignmentConfiguration(
+  value: unknown,
+): RoomRoleAssignmentConfigurationV1 {
+  if (
+    !isRecord(value)
+    || !isRecord(value.capabilitySnapshot)
+    || !isRecord(value.constraints)
+  ) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID",
+      "Explicit capability certifications and role-assignment locks/forbids are required",
+    );
+  }
+  return value as unknown as RoomRoleAssignmentConfigurationV1;
+}
+
+function requireCertifiedBindings(
+  input: RoomCapabilitySnapshotInputV1,
+  expectedBindingIds: readonly string[],
+  scope: string,
+): RoomCapabilitySnapshotInputV1 {
+  const snapshot = createRoomCapabilitySnapshot(input);
+  if (!snapshot.ok) throwRoleAssignmentPreflightError(scope, snapshot.unsatisfied);
+  const expected = new Set(expectedBindingIds);
+  const certified = new Set(snapshot.value.bindings.map((binding) => binding.bindingId));
+  if (
+    expected.size !== expectedBindingIds.length
+    || certified.size !== expected.size
+    || [...expected].some((bindingId) => !certified.has(bindingId))
+  ) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID",
+      `${scope} requires exactly one explicit capability certification for every attached binding`,
+    );
+  }
+  return snapshot.value;
+}
+
+function requireRoleAssignmentConstraints(
+  input: RoomRoleAssignmentConstraintsV1,
+): RoomRoleAssignmentConstraintsV1 {
+  const constraints = normalizeRoomRoleAssignmentConstraints(input);
+  if (!constraints.ok) throwRoleAssignmentPreflightError("Role-assignment constraints", constraints.unsatisfied);
+  return constraints.value;
+}
+
+function validateRoleTransitionRequest(
+  input: TransitionRoomRoleAssignmentAtCompletedTurnBoundaryInput,
+): void {
+  for (const [field, value] of Object.entries({
+    roomId: input.roomId,
+    boundaryTurnId: input.boundaryTurnId,
+    targetPhaseId: input.targetPhaseId,
+    phaseGateEvidenceId: input.phaseGateEvidenceId,
+    idempotencyKey: input.idempotencyKey,
+  })) {
+    requireNonEmpty(value, field);
+  }
+  if (!Number.isSafeInteger(input.expectedAggregateVersion) || input.expectedAggregateVersion < 0) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_PHASE_BOUNDARY_CONFLICT",
+      "A completed-turn phase transition requires a non-negative expected aggregate version",
+    );
+  }
+}
+
+function validatePhaseGateEvidenceRequest(
+  input: RecordRoomPhaseGateEvidenceAtCompletedTurnBoundaryInput,
+): void {
+  for (const [field, value] of Object.entries({
+    roomId: input.roomId,
+    idempotencyKey: input.idempotencyKey,
+  })) {
+    requireNonEmpty(value, field);
+  }
+  if (!Number.isSafeInteger(input.expectedAggregateVersion) || input.expectedAggregateVersion < 0) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_PHASE_BOUNDARY_CONFLICT",
+      "Phase-gate evidence requires a non-negative expected aggregate version",
+    );
+  }
+  if (!isRecord(input.evidence) || typeof input.evidence.id !== "string" || input.evidence.id.trim().length === 0) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID",
+      "Phase-gate evidence requires an immutable evidence record with an id",
+    );
+  }
+}
+
+function throwRoleAssignmentPreflightError(
+  scope: string,
+  unsatisfied: readonly { readonly code: string }[],
+): never {
+  const codes = [...new Set(unsatisfied.map((failure) => failure.code))].sort().join(", ");
+  throw new RoomExistingSessionSpineError(
+    "ROOM_EXISTING_SESSION_ROLE_ASSIGNMENT_INVALID",
+    `${scope} capability-aware role assignment is not satisfiable${codes ? `: ${codes}` : ""}`,
+  );
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function rejectDuplicate(values: Set<string>, value: string, field: string): void {
   if (values.has(value)) {
     throw new RoomExistingSessionSpineError(
@@ -321,8 +629,8 @@ function rejectDuplicate(values: Set<string>, value: string, field: string): voi
   values.add(value);
 }
 
-function requireNonEmpty(value: string, field: string): void {
-  if (!value.trim()) {
+function requireNonEmpty(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) {
     throw new RoomExistingSessionSpineError(
       "ROOM_EXISTING_SESSION_INVALID_REQUEST",
       `${field} must not be empty`,

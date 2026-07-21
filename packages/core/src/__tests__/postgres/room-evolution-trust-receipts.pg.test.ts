@@ -9,6 +9,7 @@ import {
   AsyncRoomEvolutionLedger,
   type AppendRoomEvolutionCanarySuccessOutcomeInputV1,
   type AppendRoomEvolutionTrustedBindingInputV1,
+  type AppendRoomEvolutionTrustedBindingRevocationInputV1,
   type RoomEvolutionLedgerScope,
 } from "../../async-room-evolution-ledger.js";
 import { AsyncRoomEvolutionLedgerPostgresPersistence } from "../../async-room-evolution-ledger-postgres.js";
@@ -36,6 +37,9 @@ interface EmbeddedTestContext {
 const PROJECT_ID = "project-evolution-trust-pg";
 const ROOM_ID = "room-evolution-trust-pg";
 const CREATED_AT = "2026-07-19T20:00:00.000Z";
+const CANARY_CREATED_AT = "2026-07-19T20:00:01.000Z";
+const CANARY_SUCCESS_AT = "2026-07-19T20:00:02.000Z";
+const PROMOTION_DECIDED_AT = "2026-07-19T20:00:03.000Z";
 const EXPIRES_AT = "2026-07-20T20:00:00.000Z";
 const SCOPE = {
   projectId: PROJECT_ID,
@@ -243,7 +247,21 @@ function canarySuccess(): AppendRoomEvolutionCanarySuccessOutcomeInputV1 {
     metrics: { quality: 0.96 },
     evidence: [evidence("canary-success-pg")],
     evidenceHash: hash("canary-success-pg"),
-    completedAt: CREATED_AT,
+    completedAt: CANARY_SUCCESS_AT,
+  };
+}
+
+function revocation(id: string): AppendRoomEvolutionTrustedBindingRevocationInputV1 {
+  return {
+    scope: SCOPE,
+    id,
+    trustedBindingId: "trust-evaluator",
+    revokedByPrincipalId: "owner-principal",
+    revokerGrantId: "grant-owner",
+    reason: "Concurrent revocations must converge on one immutable binding decision.",
+    evidence: [evidence(id + "-evidence")],
+    evidenceHash: hash(id + "-evidence"),
+    revokedAt: CREATED_AT,
   };
 }
 
@@ -368,11 +386,11 @@ async function seedVerifiedCanaryGraph(): Promise<AsyncRoomEvolutionLedger> {
     candidateVersionId: "candidate-pg-next",
     allocationVersion: 1,
     allocation: { fraction: 0.1 },
-    successCriteria: { quality: { min: 0.9 } },
+    successCriteria: { quality: { min: 0.9 }, hardGateResultIds: ["gate-pg-1"] },
     failureCriteria: { correctionRate: { max: 0.05 } },
     state: "running",
     rollbackTargetCandidateVersionId: "candidate-pg-baseline",
-    createdAt: CREATED_AT,
+    createdAt: CANARY_CREATED_AT,
   });
   return value;
 }
@@ -400,7 +418,7 @@ describe("AsyncRoomEvolutionLedgerPostgresPersistence trust receipts", () => {
         evidence: [evidence("promotion-pg")],
         evidenceHash: hash("promotion-pg"),
         rollbackTargetCandidateVersionId: "candidate-pg-baseline",
-        decidedAt: CREATED_AT,
+        decidedAt: PROMOTION_DECIDED_AT,
       },
       canarySuccessOutcomeId: success.record.id,
       decisionBindingId: "trust-evaluator",
@@ -464,5 +482,36 @@ describe("AsyncRoomEvolutionLedgerPostgresPersistence trust receipts", () => {
       ...canarySuccess(),
       id: "canary-success-pg-conflict",
     })).rejects.toMatchObject({ code: "immutable_conflict" });
+  });
+
+  it("maps concurrent alternate canary receipts and binding revocations to immutable conflicts", async () => {
+    await seedRoomIdentities();
+    const value = await seedVerifiedCanaryGraph();
+
+    const receiptResults = await Promise.allSettled([
+      value.appendCanarySuccessOutcome(canarySuccess()),
+      value.appendCanarySuccessOutcome({ ...canarySuccess(), id: "canary-success-pg-alternate" }),
+    ]);
+    const receiptSuccesses = receiptResults.filter((result) => result.status === "fulfilled");
+    const receiptFailures = receiptResults.filter((result) => result.status === "rejected");
+    expect(receiptSuccesses).toHaveLength(1);
+    expect(receiptFailures).toHaveLength(1);
+    expect(receiptFailures[0]).toMatchObject({
+      status: "rejected",
+      reason: { code: "immutable_conflict" },
+    });
+
+    const revocationResults = await Promise.allSettled([
+      value.appendTrustedBindingRevocation(revocation("trust-evaluator-revocation-primary")),
+      value.appendTrustedBindingRevocation(revocation("trust-evaluator-revocation-alternate")),
+    ]);
+    const revocationSuccesses = revocationResults.filter((result) => result.status === "fulfilled");
+    const revocationFailures = revocationResults.filter((result) => result.status === "rejected");
+    expect(revocationSuccesses).toHaveLength(1);
+    expect(revocationFailures).toHaveLength(1);
+    expect(revocationFailures[0]).toMatchObject({
+      status: "rejected",
+      reason: { code: "immutable_conflict" },
+    });
   });
 });

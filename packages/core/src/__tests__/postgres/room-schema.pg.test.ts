@@ -14,13 +14,12 @@ import {
   MIGRATION_BOOKKEEPING_TABLE,
   readSchemaMigrationSql,
   SCHEMA_BASELINE_VERSION,
+  SCHEMA_MIGRATIONS,
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-  SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-  SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
+  SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION,
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
   SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-  SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
   SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
   SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
   SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
@@ -38,6 +37,18 @@ interface EmbeddedTestContext {
 
 const contexts: EmbeddedTestContext[] = [];
 
+const MIGRATION_OWNED_ROOM_TABLE_NAMES = [
+  "room_phase_gate_evidence",
+  "room_protocol_messages",
+  "room_role_assignments",
+  "room_semantic_controller_inbox",
+  "room_semantic_loop_breaks",
+  "room_semantic_states",
+  "room_task_progress_observations",
+  "room_task_recovery_actions",
+  "room_task_recovery_plans",
+] as const;
+
 async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
   const dataDir = mkdtempSync(join(tmpdir(), "fusion-room-schema-"));
   const lifecycle = new EmbeddedPostgresLifecycle({
@@ -54,6 +65,44 @@ async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
   } satisfies EmbeddedTestContext;
   contexts.push(context);
   return context;
+}
+
+async function materializeHistoricalBaseline(context: EmbeddedTestContext): Promise<void> {
+  await context.connections!.migration.execute(
+    sql.raw(await readSchemaMigrationSql(SCHEMA_BASELINE_VERSION)),
+  );
+}
+
+function expectedRegisteredMigrationsAfter(version: string): string[] {
+  const versionIndex = SCHEMA_MIGRATIONS.findIndex((migration) => migration.version === version);
+  if (versionIndex < 0) {
+    throw new Error(`Unknown registered schema migration version: ${version}`);
+  }
+  return SCHEMA_MIGRATIONS.slice(versionIndex + 1).map((migration) => migration.version);
+}
+
+async function materializeHistoricalSchemaThrough(
+  context: EmbeddedTestContext,
+  targetVersion: string,
+): Promise<void> {
+  const targetIndex = SCHEMA_MIGRATIONS.findIndex((migration) => migration.version === targetVersion);
+  if (targetIndex < 0) {
+    throw new Error(`Unknown registered schema migration version: ${targetVersion}`);
+  }
+  await context.connections!.migration.execute(sql.raw(`
+    CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
+      version text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    )
+  `));
+  for (const migration of SCHEMA_MIGRATIONS.slice(0, targetIndex + 1)) {
+    await context.connections!.migration.execute(
+      sql.raw(await readSchemaMigrationSql(migration.version)),
+    );
+    await context.connections!.migration.execute(
+      sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${migration.version})`,
+    );
+  }
 }
 
 async function restorePreMembershipProductionInvariantState(
@@ -163,39 +212,11 @@ describe("Session Room PostgreSQL migration", () => {
     const context = await startEmbeddedDatabase();
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
-    expect(result.appliedVersions).toEqual([
-      SCHEMA_BASELINE_VERSION,
-      SCHEMA_ROOM_VERSION,
-      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
-      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
-      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(result.appliedVersions).toEqual(SCHEMA_MIGRATIONS.map((migration) => migration.version));
     expect(result.baselineApplied).toBe(true);
-    expect(await getAppliedMigrations(context.connections!.migration)).toEqual([
-      SCHEMA_BASELINE_VERSION,
-      SCHEMA_ROOM_VERSION,
-      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
-      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
-      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(await getAppliedMigrations(context.connections!.migration)).toEqual(
+      SCHEMA_MIGRATIONS.map((migration) => migration.version),
+    );
 
     const rows = (await context.connections!.migration.execute(sql`
       SELECT table_name
@@ -207,7 +228,9 @@ describe("Session Room PostgreSQL migration", () => {
       WHERE table_schema = 'project' AND table_name = 'operational_rooms'
       ORDER BY table_name
     `)) as unknown as Array<{ table_name: string }>;
-    expect(rows.map((row) => row.table_name)).toEqual([...ROOM_PROJECT_TABLE_NAMES].sort());
+    expect(rows.map((row) => row.table_name)).toEqual([
+      ...new Set([...ROOM_PROJECT_TABLE_NAMES, ...MIGRATION_OWNED_ROOM_TABLE_NAMES]),
+    ].sort());
 
     const membershipForeignKeys = (await context.connections!.migration.execute(sql`
       SELECT constraint_name
@@ -569,24 +592,11 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("upgrades existing 0010 messages with durable routing targets and nullable provenance", async () => {
     const context = await startEmbeddedDatabase();
-    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await materializeHistoricalSchemaThrough(
+      context,
+      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
+    );
     await context.connections!.migration.execute(sql.raw(`
-      DROP TABLE IF EXISTS project.room_message_targets;
-      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
-      WHERE version = '${SCHEMA_ROOM_MESSAGE_ROUTING_VERSION}';
-
-      ALTER TABLE project.room_messages
-        DROP CONSTRAINT IF EXISTS room_messages_id_room_project_unique,
-        DROP COLUMN IF EXISTS target_seat_ids,
-        DROP COLUMN IF EXISTS idempotency_key,
-        DROP COLUMN IF EXISTS expected_aggregate_version;
-
-      ALTER TABLE project.room_seats
-        DROP CONSTRAINT IF EXISTS room_seats_id_room_project_unique;
-
-      ALTER TABLE project.room_bindings
-        DROP CONSTRAINT IF EXISTS room_bindings_id_seat_room_project_unique;
-
       INSERT INTO project.operational_rooms (
         id, project_id, objective, protocol_id, protocol_version,
         lifecycle_state, created_at, updated_at
@@ -627,7 +637,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_MESSAGE_ROUTING_VERSION]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION),
+    );
 
     const messages = (await context.connections!.migration.execute(sql`
       SELECT target_seat_ids, idempotency_key, expected_aggregate_version
@@ -672,55 +684,11 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("upgrades existing 0011 task rows into scoped typed DAG projections", async () => {
     const context = await startEmbeddedDatabase();
-    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await materializeHistoricalSchemaThrough(
+      context,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+    );
     await context.connections!.migration.execute(sql.raw(`
-      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
-      WHERE version = '${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}';
-
-      ALTER TABLE project.room_task_edges
-        DROP CONSTRAINT IF EXISTS room_task_edges_from_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_edges_to_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_edges_kind_check,
-        DROP CONSTRAINT IF EXISTS room_task_edges_self_check,
-        ADD CONSTRAINT room_task_edges_from_fkey
-          FOREIGN KEY (from_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE,
-        ADD CONSTRAINT room_task_edges_to_fkey
-          FOREIGN KEY (to_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE;
-
-      DROP INDEX IF EXISTS project.idx_room_task_edges_to;
-      CREATE INDEX idx_room_task_edges_to
-        ON project.room_task_edges(room_id, to_node_id);
-
-      ALTER TABLE project.room_task_nodes
-        DROP CONSTRAINT IF EXISTS room_task_nodes_parent_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_id_room_project_unique,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_node_version_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_progress_signature_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_projection_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_role_requirements_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_capability_requirements_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_resource_hints_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_authority_scope_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_retry_policy_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_evidence_ids_check,
-        DROP COLUMN IF EXISTS role_requirements,
-        DROP COLUMN IF EXISTS capability_requirements,
-        DROP COLUMN IF EXISTS resource_hints,
-        DROP COLUMN IF EXISTS authority_scope,
-        DROP COLUMN IF EXISTS retry_policy,
-        DROP COLUMN IF EXISTS acceptance_evidence_ids,
-        DROP COLUMN IF EXISTS reopened_by_evidence_id,
-        ALTER COLUMN progress_signature DROP NOT NULL;
-
-      DROP INDEX IF EXISTS project.idx_room_task_nodes_parent;
-      CREATE INDEX idx_room_task_nodes_parent
-        ON project.room_task_nodes(parent_node_id);
-
-      ALTER TABLE project.operational_rooms
-        DROP CONSTRAINT IF EXISTS operational_rooms_aggregate_version_check,
-        DROP CONSTRAINT IF EXISTS operational_rooms_task_graph_version_check,
-        DROP COLUMN IF EXISTS task_graph_version;
-
       INSERT INTO project.operational_rooms (
         id, project_id, objective, protocol_id, protocol_version,
         lifecycle_state, created_at, updated_at
@@ -755,7 +723,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION),
+    );
 
     const rooms = (await context.connections!.migration.execute(sql`
       SELECT task_graph_version::integer AS task_graph_version
@@ -1204,47 +1174,11 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("upgrades a legacy accepted node with deterministic hash-only acceptance evidence", async () => {
     const context = await startEmbeddedDatabase();
-    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await materializeHistoricalSchemaThrough(
+      context,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+    );
     await context.connections!.migration.execute(sql.raw(`
-      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
-      WHERE version = '${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}';
-
-      ALTER TABLE project.room_task_edges
-        DROP CONSTRAINT IF EXISTS room_task_edges_from_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_edges_to_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_edges_kind_check,
-        DROP CONSTRAINT IF EXISTS room_task_edges_self_check,
-        ADD CONSTRAINT room_task_edges_from_fkey
-          FOREIGN KEY (from_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE,
-        ADD CONSTRAINT room_task_edges_to_fkey
-          FOREIGN KEY (to_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE;
-
-      ALTER TABLE project.room_task_nodes
-        DROP CONSTRAINT IF EXISTS room_task_nodes_parent_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_id_room_project_unique,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_node_version_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_progress_signature_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_projection_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_role_requirements_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_capability_requirements_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_resource_hints_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_authority_scope_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_retry_policy_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_evidence_ids_check,
-        DROP COLUMN IF EXISTS role_requirements,
-        DROP COLUMN IF EXISTS capability_requirements,
-        DROP COLUMN IF EXISTS resource_hints,
-        DROP COLUMN IF EXISTS authority_scope,
-        DROP COLUMN IF EXISTS retry_policy,
-        DROP COLUMN IF EXISTS acceptance_evidence_ids,
-        DROP COLUMN IF EXISTS reopened_by_evidence_id,
-        ALTER COLUMN progress_signature DROP NOT NULL;
-
-      ALTER TABLE project.operational_rooms
-        DROP CONSTRAINT IF EXISTS operational_rooms_aggregate_version_check,
-        DROP CONSTRAINT IF EXISTS operational_rooms_task_graph_version_check,
-        DROP COLUMN IF EXISTS task_graph_version;
-
       INSERT INTO project.operational_rooms (
         id, project_id, objective, protocol_id, protocol_version,
         lifecycle_state, created_at, updated_at
@@ -1265,7 +1199,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_MESSAGE_ROUTING_VERSION),
+    );
     expect(await getAppliedMigrations(context.connections!.migration)).toContain(
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     );
@@ -1301,47 +1237,11 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("fails 0012 before registration when a legacy accepted node lacks accepted_at", async () => {
     const context = await startEmbeddedDatabase();
-    await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    await materializeHistoricalSchemaThrough(
+      context,
+      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
+    );
     await context.connections!.migration.execute(sql.raw(`
-      DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
-      WHERE version = '${SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION}';
-
-      ALTER TABLE project.room_task_edges
-        DROP CONSTRAINT IF EXISTS room_task_edges_from_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_edges_to_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_edges_kind_check,
-        DROP CONSTRAINT IF EXISTS room_task_edges_self_check,
-        ADD CONSTRAINT room_task_edges_from_fkey
-          FOREIGN KEY (from_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE,
-        ADD CONSTRAINT room_task_edges_to_fkey
-          FOREIGN KEY (to_node_id) REFERENCES project.room_task_nodes(id) ON DELETE CASCADE;
-
-      ALTER TABLE project.room_task_nodes
-        DROP CONSTRAINT IF EXISTS room_task_nodes_parent_room_project_fkey,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_id_room_project_unique,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_node_version_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_progress_signature_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_projection_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_role_requirements_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_capability_requirements_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_resource_hints_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_authority_scope_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_retry_policy_check,
-        DROP CONSTRAINT IF EXISTS room_task_nodes_acceptance_evidence_ids_check,
-        DROP COLUMN IF EXISTS role_requirements,
-        DROP COLUMN IF EXISTS capability_requirements,
-        DROP COLUMN IF EXISTS resource_hints,
-        DROP COLUMN IF EXISTS authority_scope,
-        DROP COLUMN IF EXISTS retry_policy,
-        DROP COLUMN IF EXISTS acceptance_evidence_ids,
-        DROP COLUMN IF EXISTS reopened_by_evidence_id,
-        ALTER COLUMN progress_signature DROP NOT NULL;
-
-      ALTER TABLE project.operational_rooms
-        DROP CONSTRAINT IF EXISTS operational_rooms_aggregate_version_check,
-        DROP CONSTRAINT IF EXISTS operational_rooms_task_graph_version_check,
-        DROP COLUMN IF EXISTS task_graph_version;
-
       INSERT INTO project.operational_rooms (
         id, project_id, objective, protocol_id, protocol_version,
         lifecycle_state, created_at, updated_at
@@ -1367,12 +1267,12 @@ describe("Session Room PostgreSQL migration", () => {
     expect(await getAppliedMigrations(context.connections!.migration)).not.toContain(
       SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
     );
-  });
+  }, 30_000);
 
   it("upgrades an existing 0000 database without replaying the baseline", async () => {
     const context = await startEmbeddedDatabase();
+    await materializeHistoricalBaseline(context);
     await context.connections!.migration.execute(sql.raw(`
-      CREATE SCHEMA IF NOT EXISTS project;
       CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
         version text PRIMARY KEY,
         applied_at timestamptz NOT NULL DEFAULT now()
@@ -1381,23 +1281,19 @@ describe("Session Room PostgreSQL migration", () => {
       VALUES ('${SCHEMA_BASELINE_VERSION}');
     `));
 
+    const historicalBaselineTables = (await context.connections!.migration.execute(sql`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'project' AND table_name = 'approval_requests'
+    `)) as unknown as Array<{ table_name: string }>;
+    expect(historicalBaselineTables).toEqual([{ table_name: "approval_requests" }]);
+
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
-    expect(result.appliedVersions).toEqual([
-      SCHEMA_ROOM_VERSION,
-      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
-      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
-      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_BASELINE_VERSION),
+    );
+    expect(result.appliedVersions).toContain(SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION);
     expect(result.baselineApplied).toBe(false);
     const rooms = (await context.connections!.migration.execute(sql`
       SELECT table_name
@@ -1405,12 +1301,18 @@ describe("Session Room PostgreSQL migration", () => {
       WHERE table_schema = 'project' AND table_name = 'operational_rooms'
     `)) as unknown as Array<{ table_name: string }>;
     expect(rooms).toEqual([{ table_name: "operational_rooms" }]);
+    const evolutionTables = (await context.connections!.migration.execute(sql`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'project' AND table_name = 'room_evolution_hypotheses'
+    `)) as unknown as Array<{ table_name: string }>;
+    expect(evolutionTables).toEqual([{ table_name: "room_evolution_hypotheses" }]);
   });
 
   it("upgrades an existing 0001 Room schema through connector ingestion", async () => {
     const context = await startEmbeddedDatabase();
+    await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
-    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
     await context.connections!.migration.execute(sql.raw(roomSql));
     await context.connections!.migration.execute(sql.raw(`
       CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
@@ -1422,20 +1324,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([
-      SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
-      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
-      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_VERSION),
+    );
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
       FROM pg_indexes
@@ -1462,9 +1353,9 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("upgrades an existing 0002 schema through connector ingestion", async () => {
     const context = await startEmbeddedDatabase();
+    await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
-    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
     await context.connections!.migration.execute(sql.raw(roomSql));
     await context.connections!.migration.execute(sql.raw(ownershipSql));
     await context.connections!.migration.execute(sql.raw(`
@@ -1480,19 +1371,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([
-      SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,
-      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION),
+    );
     const indexes = (await context.connections!.migration.execute(sql`
       SELECT indexname
       FROM pg_indexes
@@ -1503,10 +1384,10 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("upgrades an existing 0003 schema and deterministically backfills inbox identities", async () => {
     const context = await startEmbeddedDatabase();
+    await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
     const outboxSql = await readSchemaMigrationSql(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
-    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
     await context.connections!.migration.execute(sql.raw(roomSql));
     await context.connections!.migration.execute(sql.raw(ownershipSql));
     await context.connections!.migration.execute(sql.raw(outboxSql));
@@ -1565,18 +1446,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([
-      SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION,
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION),
+    );
     const receipts = (await context.connections!.migration.execute(sql`
       SELECT id, dedupe_key, role, occurred_at, source, legacy_placeholder
       FROM project.room_inbox_receipts
@@ -1694,11 +1566,11 @@ describe("Session Room PostgreSQL migration", () => {
 
   it("upgrades an existing 0004 schema with durable delivery reconciliation evidence", async () => {
     const context = await startEmbeddedDatabase();
+    await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
     const outboxSql = await readSchemaMigrationSql(SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION);
     const ingestionSql = await readSchemaMigrationSql(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION);
-    await context.connections!.migration.execute(sql.raw("CREATE SCHEMA IF NOT EXISTS project"));
     await context.connections!.migration.execute(sql.raw(roomSql));
     await context.connections!.migration.execute(sql.raw(ownershipSql));
     await context.connections!.migration.execute(sql.raw(outboxSql));
@@ -1718,17 +1590,9 @@ describe("Session Room PostgreSQL migration", () => {
     `));
 
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
-    expect(result.appliedVersions).toEqual([
-      SCHEMA_ROOM_DELIVERY_RECONCILIATION_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_FUTURE_SEATS_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_PROJECT_SCOPE_VERSION,
-      SCHEMA_ROOM_RUN_AUDIT_OUTBOX_VERSION,
-      SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
-      SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
-      SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
-      SCHEMA_ROOM_TASK_GRAPH_COMMANDS_VERSION,
-      SCHEMA_ROOM_TASK_TOPOLOGY_LINEAGE_VERSION,
-    ]);
+    expect(result.appliedVersions).toEqual(
+      expectedRegisteredMigrationsAfter(SCHEMA_ROOM_CONNECTOR_INGESTION_VERSION),
+    );
     const columns = (await context.connections!.migration.execute(sql`
       SELECT column_name, is_nullable
       FROM information_schema.columns
@@ -2062,5 +1926,282 @@ describe("Session Room PostgreSQL migration", () => {
     expect(await getAppliedMigrations(context.connections!.migration)).not.toContain(
       SCHEMA_ROOM_MEMBERSHIP_PRODUCTION_INVARIANTS_VERSION,
     );
+  });
+
+  it("materializes append-only controlled-evolution lineage with scoped evidence and rollback proof", async () => {
+    const context = await startEmbeddedDatabase();
+    const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
+    expect(result.appliedVersions).toContain(SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION);
+
+    const evolutionTables = (await context.connections!.migration.execute(sql`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'project'
+        AND table_name LIKE 'room_evolution_%'
+      ORDER BY table_name
+    `)) as unknown as Array<{ table_name: string }>;
+    expect(evolutionTables.map((row) => row.table_name)).toEqual([
+      "room_evolution_benchmark_cases",
+      "room_evolution_benchmark_results",
+      "room_evolution_canaries",
+      "room_evolution_canary_observations",
+      "room_evolution_candidate_versions",
+      "room_evolution_experiments",
+      "room_evolution_gate_results",
+      "room_evolution_hypotheses",
+      "room_evolution_promotion_decisions",
+      "room_evolution_rollbacks",
+    ]);
+
+    await context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.operational_rooms (
+        id, project_id, objective, protocol_id, protocol_version,
+        lifecycle_state, created_at, updated_at
+      ) VALUES (
+        'room-evolution', 'project-evolution', 'controlled evolution fixture',
+        'implementation', 1, 'running',
+        '2026-07-19T13:21:00.000Z', '2026-07-19T13:21:00.000Z'
+      );
+
+      INSERT INTO project.room_evolution_hypotheses (
+        id, project_id, room_id, scope_kind, scope_key, revision, state,
+        source_signal_kinds, evidence, evidence_hash, declared_scope,
+        risk_class, expected_mechanism, affected_domains, created_by_actor_id,
+        created_at
+      ) VALUES (
+        'hypothesis-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 1, 'experimenting',
+        '["verified_failure"]'::jsonb,
+        '[{"outcomeId":"outcome-1","kind":"verified_failure"}]'::jsonb,
+        'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        '["task_decomposition"]'::jsonb, 'moderate',
+        'Reduce repeated no-progress decomposition retries.',
+        '["coding"]'::jsonb, 'operator-1', '2026-07-19T13:21:00.000Z'
+      );
+
+      INSERT INTO project.room_evolution_candidate_versions (
+        id, project_id, room_id, scope_kind, scope_key, hypothesis_id,
+        version_number, candidate_kind, base_revision, candidate_ref,
+        isolation_kind, isolation_ref, immutable_input, input_hash,
+        produced_by_actor_id, base_candidate_version_id,
+        rollback_target_candidate_version_id, created_at
+      ) VALUES
+        (
+          'candidate-base', 'project-evolution', 'room-evolution', 'room',
+          'room:room-evolution', 'hypothesis-room', 1, 'task_decomposition',
+          'strategy:baseline', 'strategy:candidate-base', 'versioned_policy_store',
+          'policy://candidate-base', '{"prompt":"baseline"}'::jsonb,
+          'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          'producer-1', NULL, NULL, '2026-07-19T13:21:00.000Z'
+        ),
+        (
+          'candidate-next', 'project-evolution', 'room-evolution', 'room',
+          'room:room-evolution', 'hypothesis-room', 2, 'task_decomposition',
+          'strategy:candidate-base', 'strategy:candidate-next', 'versioned_policy_store',
+          'policy://candidate-next', '{"prompt":"more explicit"}'::jsonb,
+          'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          'producer-1', 'candidate-base', 'candidate-base',
+          '2026-07-19T13:21:01.000Z'
+        );
+
+      INSERT INTO project.room_evolution_experiments (
+        id, project_id, room_id, scope_kind, scope_key, hypothesis_id,
+        candidate_version_id, state, input_snapshot_hash, authorization_evidence,
+        authorization_hash, capacity_pool, created_by_actor_id, created_at
+      ) VALUES (
+        'experiment-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'hypothesis-room', 'candidate-next', 'completed',
+        'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+        '{"policy":"approved"}'::jsonb,
+        'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        'evolution_low_priority', 'operator-1', '2026-07-19T13:21:02.000Z'
+      );
+
+      INSERT INTO project.room_evolution_benchmark_cases (
+        id, project_id, room_id, scope_kind, scope_key, domain, case_kind,
+        contains_private_room_data, source_authorization_id, authorization_evidence,
+        case_payload, expected_outcome, content_hash, created_at
+      ) VALUES (
+        'benchmark-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'coding', 'golden', false, NULL,
+        '{}'::jsonb, '{"task":"decompose"}'::jsonb,
+        '{"mustComplete":true}'::jsonb,
+        'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+        '2026-07-19T13:21:03.000Z'
+      );
+
+      INSERT INTO project.room_evolution_benchmark_results (
+        id, project_id, room_id, scope_kind, scope_key, experiment_id,
+        candidate_version_id, benchmark_case_id, evaluator_actor_id,
+        evaluator_kind, outcome, metrics, evidence, evidence_hash, completed_at
+      ) VALUES (
+        'benchmark-result-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'experiment-room', 'candidate-next',
+        'benchmark-room', 'reviewer-1', 'independent_reviewer', 'passed',
+        '{"quality":0.9}'::jsonb,
+        '[{"evidenceId":"evidence-benchmark"}]'::jsonb,
+        'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+        '2026-07-19T13:21:04.000Z'
+      );
+
+      INSERT INTO project.room_evolution_gate_results (
+        id, project_id, room_id, scope_kind, scope_key, experiment_id,
+        candidate_version_id, benchmark_result_id, gate_name, gate_class,
+        outcome, evaluator_actor_id, evaluator_kind, candidate_producer_actor_id,
+        metrics, evidence, evidence_hash, promotion_eligible, completed_at
+      ) VALUES (
+        'gate-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'experiment-room', 'candidate-next',
+        'benchmark-result-room', 'evidence-integrity', 'hard', 'passed',
+        'reviewer-1', 'independent_reviewer', 'producer-1',
+        '{"integrity":1}'::jsonb,
+        '[{"evidenceId":"evidence-gate"}]'::jsonb,
+        'sha256:2222222222222222222222222222222222222222222222222222222222222222',
+        true, '2026-07-19T13:21:05.000Z'
+      );
+
+      INSERT INTO project.room_evolution_canaries (
+        id, project_id, room_id, scope_kind, scope_key, experiment_id,
+        candidate_version_id, allocation_version, allocation, success_criteria,
+        failure_criteria, state, rollback_target_candidate_version_id,
+        created_at
+      ) VALUES (
+        'canary-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'experiment-room', 'candidate-next', 1,
+        '{"trafficPercent":5}'::jsonb, '{"maxCorrectionRate":0.05}'::jsonb,
+        '{"maxCorrectionRate":0.1}'::jsonb, 'succeeded', 'candidate-base',
+        '2026-07-19T13:21:06.000Z'
+      );
+
+      INSERT INTO project.room_evolution_canary_observations (
+        id, project_id, room_id, scope_kind, scope_key, canary_id,
+        metric_name, metric_value, threshold, breached, evidence, evidence_hash,
+        observed_at
+      ) VALUES (
+        'canary-observation-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'canary-room', 'correction_rate',
+        '{"value":0.02}'::jsonb, '{"max":0.05}'::jsonb, false,
+        '[{"evidenceId":"evidence-canary"}]'::jsonb,
+        'sha256:3333333333333333333333333333333333333333333333333333333333333333',
+        '2026-07-19T13:21:07.000Z'
+      );
+
+      INSERT INTO project.room_evolution_promotion_decisions (
+        id, project_id, room_id, scope_kind, scope_key, experiment_id,
+        candidate_version_id, canary_id, decision, risk_class, authority_tier,
+        candidate_producer_actor_id, decision_actor_id, approval_request_id,
+        authorization_evidence, evidence, evidence_hash,
+        rollback_target_candidate_version_id, decided_at
+      ) VALUES (
+        'promotion-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'experiment-room', 'candidate-next', 'canary-room',
+        'promoted', 'moderate', 'independent', 'producer-1', 'reviewer-1', NULL,
+        '{"preAuthorized":true}'::jsonb,
+        '[{"gateResultId":"gate-room"}]'::jsonb,
+        'sha256:4444444444444444444444444444444444444444444444444444444444444444',
+        'candidate-base', '2026-07-19T13:21:08.000Z'
+      );
+
+      INSERT INTO project.room_evolution_rollbacks (
+        id, project_id, room_id, scope_kind, scope_key, promotion_decision_id,
+        canary_id, from_candidate_version_id, to_candidate_version_id,
+        trigger_kind, reason, evidence, evidence_hash, executed_at
+      ) VALUES (
+        'rollback-room', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'promotion-room', 'canary-room', 'candidate-next',
+        'candidate-base', 'automatic', 'simulated regression proof',
+        '[{"observationId":"canary-observation-room"}]'::jsonb,
+        'sha256:5555555555555555555555555555555555555555555555555555555555555555',
+        '2026-07-19T13:21:09.000Z'
+      );
+    `));
+
+    const rollbackLineage = (await context.connections!.migration.execute(sql`
+      SELECT from_candidate_version_id, to_candidate_version_id, trigger_kind
+      FROM project.room_evolution_rollbacks
+      WHERE id = 'rollback-room'
+    `)) as unknown as Array<Record<string, unknown>>;
+    expect(rollbackLineage).toEqual([{
+      from_candidate_version_id: "candidate-next",
+      to_candidate_version_id: "candidate-base",
+      trigger_kind: "automatic",
+    }]);
+
+    await expect(context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_evolution_hypotheses (
+        id, project_id, room_id, scope_kind, scope_key, revision, state,
+        source_signal_kinds, evidence, evidence_hash, declared_scope,
+        risk_class, expected_mechanism, affected_domains, created_by_actor_id,
+        created_at
+      ) VALUES (
+        'hypothesis-invalid-project-scope', 'project-evolution', 'room-evolution',
+        'project', 'project:project-evolution', 1, 'proposed',
+        '["verified_failure"]'::jsonb,
+        '[{"outcomeId":"outcome-invalid"}]'::jsonb,
+        'sha256:6666666666666666666666666666666666666666666666666666666666666666',
+        '["task_decomposition"]'::jsonb, 'low', 'invalid project scope',
+        '["coding"]'::jsonb, 'operator-1', '2026-07-19T13:21:10.000Z'
+      )
+    `))).rejects.toThrow();
+
+    await expect(context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_evolution_benchmark_cases (
+        id, project_id, room_id, scope_kind, scope_key, domain, case_kind,
+        contains_private_room_data, source_authorization_id, authorization_evidence,
+        case_payload, expected_outcome, content_hash, created_at
+      ) VALUES (
+        'benchmark-private-without-authorization', 'project-evolution',
+        'room-evolution', 'room', 'room:room-evolution', 'coding',
+        'rolling_authorized', true, NULL, '{}'::jsonb,
+        '{"task":"private"}'::jsonb, '{"mustComplete":true}'::jsonb,
+        'sha256:7777777777777777777777777777777777777777777777777777777777777777',
+        '2026-07-19T13:21:11.000Z'
+      )
+    `))).rejects.toThrow();
+
+    await expect(context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_evolution_gate_results (
+        id, project_id, room_id, scope_kind, scope_key, experiment_id,
+        candidate_version_id, benchmark_result_id, gate_name, gate_class,
+        outcome, evaluator_actor_id, evaluator_kind, candidate_producer_actor_id,
+        metrics, evidence, evidence_hash, promotion_eligible, completed_at
+      ) VALUES (
+        'gate-self-accepted', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'experiment-room', 'candidate-next',
+        'benchmark-result-room', 'self-report', 'hard', 'passed',
+        'producer-1', 'producer_self_report', 'producer-1',
+        '{}'::jsonb, '[{"evidenceId":"self-report"}]'::jsonb,
+        'sha256:8888888888888888888888888888888888888888888888888888888888888888',
+        true, '2026-07-19T13:21:12.000Z'
+      )
+    `))).rejects.toThrow();
+
+    await context.connections!.migration.execute(sql.raw(`
+      INSERT INTO project.room_evolution_candidate_versions (
+        id, project_id, room_id, scope_kind, scope_key, hypothesis_id,
+        version_number, candidate_kind, base_revision, candidate_ref,
+        isolation_kind, isolation_ref, immutable_input, input_hash,
+        produced_by_actor_id, base_candidate_version_id,
+        rollback_target_candidate_version_id, created_at
+      ) VALUES (
+        'candidate-immutable', 'project-evolution', 'room-evolution', 'room',
+        'room:room-evolution', 'hypothesis-room', 3, 'task_decomposition',
+        'strategy:candidate-next', 'strategy:candidate-immutable',
+        'versioned_policy_store', 'policy://candidate-immutable',
+        '{"prompt":"immutable"}'::jsonb,
+        'sha256:9999999999999999999999999999999999999999999999999999999999999999',
+        'producer-1', 'candidate-next', 'candidate-base',
+        '2026-07-19T13:21:13.000Z'
+      )
+    `));
+    await expect(context.connections!.migration.execute(sql.raw(`
+      UPDATE project.room_evolution_candidate_versions
+      SET candidate_ref = 'strategy:mutated'
+      WHERE id = 'candidate-next'
+    `))).rejects.toThrow();
+    await expect(context.connections!.migration.execute(sql.raw(`
+      DELETE FROM project.room_evolution_candidate_versions
+      WHERE id = 'candidate-immutable'
+    `))).rejects.toThrow();
   });
 });

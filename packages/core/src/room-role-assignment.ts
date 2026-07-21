@@ -6,6 +6,7 @@ import type {
   RoomBindingCapabilitySnapshotV1,
   RoomCapabilitySnapshotInputV1,
   RoomCapabilitySnapshotV1,
+  RoomRoleAssignmentConstraintsV1,
   RoomRoleAssignmentFailureV1,
   RoomRoleAssignmentPolicyResultV1,
   RoomRoleAssignmentV1,
@@ -375,6 +376,58 @@ export function createRoomCapabilitySnapshot(
   });
 }
 
+export function normalizeRoomRoleAssignmentConstraints(
+  input: RoomRoleAssignmentConstraintsV1,
+): RoomRoleAssignmentPolicyResultV1<RoomRoleAssignmentConstraintsV1> {
+  if (!isRuntimeRecord(input as unknown)) {
+    return deepFreeze({
+      ok: false,
+      unsatisfied: [invalid("assignment_contract_mismatch", "$.constraints", "Role assignment constraints must be an object")],
+    });
+  }
+  const normalized: { locks: { roleId: string; bindingId: string }[]; forbids: { roleId: string; bindingId: string }[] } = {
+    locks: [],
+    forbids: [],
+  };
+  for (const kind of ["locks", "forbids"] as const) {
+    const entries = input[kind];
+    if (!Array.isArray(entries)) {
+      return deepFreeze({
+        ok: false,
+        unsatisfied: [invalid("assignment_contract_mismatch", `$.constraints.${kind}`, "Role assignment constraints must be arrays")],
+      });
+    }
+    const seen = new Set<string>();
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (
+        !isRuntimeRecord(entry)
+        || !nonEmptyString(entry.roleId)
+        || !nonEmptyString(entry.bindingId)
+      ) {
+        return deepFreeze({
+          ok: false,
+          unsatisfied: [invalid("assignment_contract_mismatch", `$.constraints.${kind}[${index}]`, "Each role constraint requires a role and binding identity")],
+        });
+      }
+      const identity = `${entry.roleId}\u0000${entry.bindingId}`;
+      if (seen.has(identity)) {
+        return deepFreeze({
+          ok: false,
+          unsatisfied: [invalid("assignment_contract_mismatch", `$.constraints.${kind}[${index}]`, "Duplicate role constraints are not canonical", { roleId: entry.roleId, bindingId: entry.bindingId })],
+        });
+      }
+      seen.add(identity);
+      normalized[kind].push({ roleId: entry.roleId, bindingId: entry.bindingId });
+    }
+    normalized[kind].sort((left, right) => {
+      const role = compareText(left.roleId, right.roleId);
+      return role !== 0 ? role : compareText(left.bindingId, right.bindingId);
+    });
+  }
+  return deepFreeze({ ok: true, value: normalized });
+}
+
 export function assignRoomRoles(
   input: AssignRoomRolesInputV1,
 ): RoomRoleAssignmentPolicyResultV1<RoomRoleAssignmentV1> {
@@ -429,48 +482,10 @@ function normalizeAssignRoomRolesInput(
     candidate.capabilitySnapshot as RoomCapabilitySnapshotInputV1,
   );
   if (!snapshotResult.ok) return snapshotResult;
-  if (!isRuntimeRecord(candidate.constraints)) {
-    return deepFreeze({
-      ok: false,
-      unsatisfied: [invalid("assignment_contract_mismatch", "$.constraints", "Role assignment constraints must be an object")],
-    });
-  }
-  const normalizedConstraints: { locks: { roleId: string; bindingId: string }[]; forbids: { roleId: string; bindingId: string }[] } = {
-    locks: [],
-    forbids: [],
-  };
-  for (const kind of ["locks", "forbids"] as const) {
-    const entries = candidate.constraints[kind];
-    if (!Array.isArray(entries)) {
-      return deepFreeze({
-        ok: false,
-        unsatisfied: [invalid("assignment_contract_mismatch", `$.constraints.${kind}`, "Role assignment constraints must be arrays")],
-      });
-    }
-    const seen = new Set<string>();
-    for (let index = 0; index < entries.length; index += 1) {
-      const entry = entries[index];
-      if (
-        !isRuntimeRecord(entry)
-        || !nonEmptyString(entry.roleId)
-        || !nonEmptyString(entry.bindingId)
-      ) {
-        return deepFreeze({
-          ok: false,
-          unsatisfied: [invalid("assignment_contract_mismatch", `$.constraints.${kind}[${index}]`, "Each role constraint requires a role and binding identity")],
-        });
-      }
-      const identity = `${entry.roleId}\u0000${entry.bindingId}`;
-      if (seen.has(identity)) {
-        return deepFreeze({
-          ok: false,
-          unsatisfied: [invalid("assignment_contract_mismatch", `$.constraints.${kind}[${index}]`, "Duplicate role constraints are not canonical", { roleId: entry.roleId, bindingId: entry.bindingId })],
-        });
-      }
-      seen.add(identity);
-      normalizedConstraints[kind].push({ roleId: entry.roleId, bindingId: entry.bindingId });
-    }
-  }
+  const constraintsResult = normalizeRoomRoleAssignmentConstraints(
+    candidate.constraints as RoomRoleAssignmentConstraintsV1,
+  );
+  if (!constraintsResult.ok) return constraintsResult;
   if (!isUniqueNonEmptyStringArray(candidate.producerBindingIds)) {
     return deepFreeze({
       ok: false,
@@ -483,7 +498,7 @@ function normalizeAssignRoomRolesInput(
       protocol: protocolResult.value,
       phaseId: candidate.phaseId,
       capabilitySnapshot: snapshotResult.value,
-      constraints: normalizedConstraints,
+      constraints: constraintsResult.value,
       producerBindingIds: [...candidate.producerBindingIds].sort(compareText),
     },
   });
@@ -972,7 +987,7 @@ export function transitionRoomRoleAssignment(
   if (
     !isRuntimeRecord(candidate)
     || !nonEmptyString(candidate.targetPhaseId)
-    || !isUniqueNonEmptyStringArray(candidate.satisfiedGateIds)
+    || !nonEmptyString(candidate.verifiedTransitionGateId)
     || typeof candidate.atTurnBoundary !== "boolean"
   ) {
     return deepFreeze({
@@ -990,7 +1005,8 @@ export function transitionRoomRoleAssignment(
   const currentValidation = validateRoomRoleAssignment({
     protocol: protocolResult.value,
     assignment: candidate.currentAssignment as RoomRoleAssignmentV1,
-    capabilitySnapshot: candidate.capabilitySnapshot as RoomCapabilitySnapshotV1,
+    capabilitySnapshot: (candidate.currentCapabilitySnapshot
+      ?? candidate.capabilitySnapshot) as RoomCapabilitySnapshotV1,
     authoritativeProducerBindingIds: candidate.authoritativeProducerBindingIds as string[] | undefined,
   });
   if (!currentValidation.ok) return currentValidation;
@@ -1015,11 +1031,11 @@ export function transitionRoomRoleAssignment(
       ],
     });
   }
-  if (!input.satisfiedGateIds.includes(transition.whenGateId)) {
+  if (input.verifiedTransitionGateId !== transition.whenGateId) {
     return deepFreeze({
       ok: false,
       unsatisfied: [
-        invalid("transition_gate_unsatisfied", "$.satisfiedGateIds", `Transition gate '${transition.whenGateId}' has not passed`),
+        invalid("transition_gate_unsatisfied", "$.verifiedTransitionGateId", `Transition gate '${transition.whenGateId}' has not been independently verified`),
       ],
     });
   }

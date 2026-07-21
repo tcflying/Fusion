@@ -199,6 +199,38 @@
   grid-template-columns: 1fr;
 }
 
+.sessionLinks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.sessionLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 31px;
+  padding: 6px 8px;
+  color: var(--participant-signal);
+  border: 1px solid color-mix(in srgb, var(--participant-hot-line) 58%, var(--participant-line));
+  background: color-mix(in srgb, var(--participant-raised) 76%, transparent);
+  font-family: "Aptos", "Noto Sans", sans-serif;
+  font-size: 0.75rem;
+  font-weight: 650;
+  line-height: 1.2;
+  text-decoration: none;
+}
+
+.sessionLink:hover {
+  color: var(--participant-ink);
+  background: color-mix(in srgb, var(--participant-hot-line) 18%, var(--participant-raised));
+}
+
+.sessionLink:focus-visible {
+  outline: 2px solid var(--participant-signal);
+  outline-offset: 2px;
+}
+
 .field {
   min-width: 0;
   padding: 9px 10px;

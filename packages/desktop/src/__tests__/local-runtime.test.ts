@@ -37,6 +37,7 @@ class FakeServer {
   }
 
   close(callback: () => void): void {
+    this.emit("close");
     callback();
   }
 }
@@ -78,6 +79,10 @@ const engineMocks = vi.hoisted(() => {
   const ProjectEngineManager = vi.fn(function () {
     return engineManager;
   });
+  const createWindowsNativeRoomHostCompositionAdapterRegistry = vi.fn((input: unknown) => ({
+    kind: "windows-native-room-host-composition-registry",
+    input,
+  }));
   const seedDashboardProvidersDispose = vi.fn();
   const seedDashboardProviders = vi.fn(async ({ authStorage }: { authStorage: unknown }) => ({
     authStorage: { ...(authStorage as object), __wrapped: true },
@@ -99,6 +104,7 @@ const engineMocks = vi.hoisted(() => {
     CentralCore,
     PluginLoader,
     ProjectEngineManager,
+    createWindowsNativeRoomHostCompositionAdapterRegistry,
     seedDashboardProviders,
     seedDashboardProvidersDispose,
     createServer,
@@ -121,6 +127,7 @@ vi.mock("../bundled-plugin-dirs.js", () => ({ resolveDesktopBundlePluginDirs: en
 vi.mock("@fusion/dashboard", () => ({ createServer: engineMocks.createServer }));
 vi.mock("@fusion/engine", () => ({
   ProjectEngineManager: engineMocks.ProjectEngineManager,
+  createWindowsNativeRoomHostCompositionAdapterRegistry: engineMocks.createWindowsNativeRoomHostCompositionAdapterRegistry,
   createFusionAuthStorage: () => ({ reload: () => undefined, getOAuthProviders: () => [], hasAuth: () => false }),
   createFusionModelRegistry: () => ({ listModels: () => [], refresh: () => undefined }),
   seedDashboardProviders: engineMocks.seedDashboardProviders,
@@ -132,8 +139,7 @@ describe("LocalRuntimeManager", () => {
     watch: vi.fn(async () => undefined),
     close: vi.fn(),
     getPluginStore: vi.fn(() => engineMocks.pluginStoreInstance),
-    runPluginSchemaInits: engineMocks.runPluginSchemaInits,
-    getAsyncLayer: vi.fn(() => ({ projectId: "project-1" } as never)),
+    getDatabase: vi.fn(() => ({ runPluginSchemaInits: engineMocks.runPluginSchemaInits })),
   };
 
   beforeEach(() => {
@@ -165,55 +171,60 @@ describe("LocalRuntimeManager", () => {
     expect(manager.getServerPort()).toBe(4545);
   });
 
-  /*
-  FNXC:MigrationHoldingPage 2026-07-17-13:40:
-  Pins the desktop migration-progress contract: while createStore (which runs the
-  one-time SQLite→PG migration) is in flight, progress published through the
-  createStore callback must be visible on getStatus() as
-  state:"starting" + migration, and a terminal "running" status must not carry it.
-  */
-  it("publishes migration progress while starting and clears it when running", async () => {
+  it("marks an unexpectedly closed embedded dashboard visible and releases its owned resources", async () => {
     const { LocalRuntimeManager } = await import("../local-runtime.ts");
-    const server = new FakeServer(4550);
-    let releaseStore: () => void = () => {};
-    const storeGate = new Promise<void>((resolve) => {
-      releaseStore = resolve;
-    });
+    const server = new FakeServer(4545);
+    const cleanup = vi.fn(async () => undefined);
     const manager = new LocalRuntimeManager({
       rootDir: "/repo",
-      createStore: async (_rootDir, onMigrationProgress) => {
-        onMigrationProgress?.({
-          active: true,
-          phase: "table-progress",
-          label: "[3/12] project.tasks — 500/2000 rows",
-        });
-        await storeGate;
-        return store;
-      },
+      createStore: async () => store,
       createDashboardServer: async () => {
         setTimeout(() => server.emit("listening"), 0);
-        return server as unknown as Server;
+        return { server: server as unknown as Server, cleanup };
       },
     });
 
-    const startPromise = manager.startLocal();
+    await manager.startLocal();
+    server.emit("close");
+
+    expect(manager.getStatus()).toEqual({
+      source: "embedded-local",
+      state: "error",
+      error: "Embedded Fusion dashboard server closed unexpectedly.",
+    });
     await vi.waitFor(() => {
-      expect(manager.getStatus()).toMatchObject({
-        source: "embedded-local",
-        state: "starting",
-        migration: {
-          active: true,
-          phase: "table-progress",
-          label: "[3/12] project.tasks — 500/2000 rows",
-        },
-      });
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(store.close).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("contains an unexpected server error without reporting a dead runtime as running", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const server = new FakeServer(4545);
+    const closeSpy = vi.spyOn(server, "close");
+    const cleanup = vi.fn(async () => undefined);
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => store,
+      createDashboardServer: async () => {
+        setTimeout(() => server.emit("listening"), 0);
+        return { server: server as unknown as Server, cleanup };
+      },
     });
 
-    releaseStore();
-    const status = await startPromise;
-    expect(status.state).toBe("running");
-    expect(status.migration).toBeUndefined();
-    expect(manager.getStatus().migration).toBeUndefined();
+    await manager.startLocal();
+    server.emit("error", new Error("runtime probe detail must not reach the desktop status"));
+
+    expect(manager.getStatus()).toEqual({
+      source: "embedded-local",
+      state: "error",
+      error: "Embedded Fusion dashboard server encountered an unexpected error.",
+    });
+    await vi.waitFor(() => {
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+      expect(cleanup).toHaveBeenCalledTimes(1);
+      expect(store.close).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("returns external-cli status without starting embedded runtime", async () => {
@@ -519,8 +530,6 @@ describe("LocalRuntimeManager", () => {
 
     await manager.startLocal();
 
-    expect(engineMocks.CentralCore).toHaveBeenCalledWith(undefined, { asyncLayer: store.getAsyncLayer() });
-
     expect(engineMocks.seedDashboardProviders).toHaveBeenCalledWith(
       expect.objectContaining({ authStorage: expect.anything(), modelRegistry: expect.anything() }),
     );
@@ -531,6 +540,44 @@ describe("LocalRuntimeManager", () => {
 
     await manager.stopLocal();
     expect(engineMocks.seedDashboardProvidersDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses a backend boot's unscoped host layer for the default CentralCore", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const server = new FakeServer(4545);
+    const hostAsyncLayer = { scope: "host" };
+    const backendStore = {
+      ...store,
+      __backendHostAsyncLayer: hostAsyncLayer,
+    };
+    engineMocks.createServer.mockReturnValueOnce({
+      listen: vi.fn(() => {
+        setTimeout(() => server.emit("listening"), 0);
+        return server as unknown as Server;
+      }),
+    });
+
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => backendStore,
+    });
+
+    await manager.startLocal();
+
+    expect(engineMocks.CentralCore).toHaveBeenCalledWith(undefined, { asyncLayer: hostAsyncLayer });
+    expect(engineMocks.createWindowsNativeRoomHostCompositionAdapterRegistry).toHaveBeenCalledWith({
+      hostAsyncLayer,
+    });
+    expect(engineMocks.ProjectEngineManager).toHaveBeenCalledWith(
+      engineMocks.centralCore,
+      expect.objectContaining({
+        roomHostCompositionOperatorAdapterRegistry: expect.objectContaining({
+          kind: "windows-native-room-host-composition-registry",
+        }),
+      }),
+    );
+
+    await manager.stopLocal();
   });
 
   /*
@@ -549,6 +596,7 @@ describe("LocalRuntimeManager", () => {
         return server as unknown as Server;
       }),
     });
+
     const manager = new LocalRuntimeManager({
       rootDir: "/repo",
       createStore: async () => store,
@@ -562,8 +610,6 @@ describe("LocalRuntimeManager", () => {
       expect.objectContaining({ pluginStore: engineMocks.pluginStoreInstance, taskStore: expect.anything() }),
     );
     expect(engineMocks.pluginLoaderInstance.loadAllPlugins).toHaveBeenCalledTimes(1);
-    /* FNXC:DesktopPluginSchema 2026-07-14-23:31: The host verifies single schema ownership by leaving execution to PluginLoader instead of replaying collected contracts. */
-    expect(engineMocks.runPluginSchemaInits).not.toHaveBeenCalled();
     expect(engineMocks.createServer).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({

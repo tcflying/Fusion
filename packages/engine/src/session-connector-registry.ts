@@ -382,15 +382,12 @@ export class SessionConnectorRegistry {
         this.healthMaxAgeMs,
         this.healthMaxFutureSkewMs,
       );
-      if (!isMutationHealthReady(health, input.capability)) {
-        const reasonCodes = health.capabilities[input.capability] === "verified"
-          ? health.reasonCodes
-          : [...new Set([...health.reasonCodes, "capability_not_verified" as const])];
+      if (!isMutationHealthReady(health)) {
         throw new SessionConnectorHealthNotReadyError(
           connector.id,
           input.capability,
           health.state,
-          reasonCodes,
+          health.reasonCodes,
           health.retryAfterMs,
         );
       }
@@ -634,10 +631,16 @@ function assertHealthContract(
   }
 }
 
-function isMutationHealthReady(
-  health: SessionConnectorHealthV1,
-  capability: SessionConnectorCapabilityName,
-): boolean {
+/*
+ * FNXC:SessionConnectorIdentityBoundCapability 2026-07-20-21:08:
+ * requireVerified() already validates the requested capability against the
+ * exact bound Session identity. getHealth(hostId) intentionally has no Session
+ * identity, so its capability matrix is host-level diagnostics and cannot
+ * overrule a freshly verified identity-bound mutation path. Health still gates
+ * authentication, daemon, server, backend, rate limit, host reachability, and
+ * explicit degradation before every mutable operation.
+ */
+function isMutationHealthReady(health: SessionConnectorHealthV1): boolean {
   return health.state === "healthy"
     && health.authentication === "authenticated"
     && (health.daemon === "running" || health.daemon === "not_applicable")
@@ -645,6 +648,5 @@ function isMutationHealthReady(
     && (health.backend === "ready" || health.backend === "not_applicable")
     && health.rateLimit === "clear"
     && health.host === "reachable"
-    && health.reasonCodes.length === 0
-    && health.capabilities[capability] === "verified";
+    && health.reasonCodes.length === 0;
 }

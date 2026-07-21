@@ -8,6 +8,7 @@ import {
   applySchemaBaseline,
   createAsyncDataLayer,
   createConnectionSetFromUrl,
+  getRoomProtocolDefinition,
   hashRoomValue,
   type SessionConnectorCapabilitiesV1,
   type SessionConnectorCapabilityName,
@@ -20,7 +21,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { EmbeddedPostgresLifecycle } from "../../../core/src/postgres/embedded-lifecycle.js";
-import { roomInboxReceipts } from "../../../core/src/postgres/schema/room.js";
+import { roomInboxReceipts, roomTurns } from "../../../core/src/postgres/schema/room.js";
 import { RoomExistingSessionSpine } from "../room-existing-session-spine.js";
 import { SessionConnectorRegistry } from "../session-connector-registry.js";
 
@@ -241,6 +242,48 @@ describe("Room existing-Session spine with real PostgreSQL", () => {
           requiredMachineId: session.identity.machineId!,
           idempotencyKey: `ensure:${session.seatId}`,
         })),
+        roleAssignment: {
+          capabilitySnapshot: {
+            contractVersion: 1,
+            snapshotId: "existing-session-spine-pg-capabilities-r1",
+            revision: 1,
+            capturedAt: NOW,
+            bindings: [
+              {
+                bindingId: SESSIONS[0].bindingId,
+                availability: "eligible",
+                capabilityRevision: "codex-existing-session-pg-r1",
+                capabilities: [
+                  { name: "source_read", state: "verified" },
+                  { name: "workspace_write", state: "verified" },
+                ],
+              },
+              {
+                bindingId: SESSIONS[1].bindingId,
+                availability: "eligible",
+                capabilityRevision: "claude-existing-session-pg-r1",
+                capabilities: [
+                  { name: "source_read", state: "verified" },
+                  { name: "test", state: "verified" },
+                ],
+              },
+            ],
+          },
+          constraints: {
+            locks: [{ roleId: "implementer", bindingId: SESSIONS[0].bindingId }],
+            forbids: [],
+          },
+        },
+      });
+      await expect(writerStore.getActiveRoomRoleAssignment(ROOM_ID)).resolves.toMatchObject({
+        phaseId: "plan",
+        assignment: {
+          phaseId: "plan",
+          assignments: [expect.objectContaining({
+            roleId: "implementer",
+            bindingIds: [SESSIONS[0].bindingId],
+          })],
+        },
       });
 
       const restoredStore = new AsyncRoomStore(layer);
@@ -346,6 +389,131 @@ describe("Room existing-Session spine with real PostgreSQL", () => {
           source: "history",
         })).toSorted((left, right) => left.bindingId.localeCompare(right.bindingId)),
       );
+
+      // This is a persisted completed turn fixture, not a provider interaction.
+      // It exercises the Engine seam's boundary checks against the real role
+      // assignment command after the original creation/ingestion proof finishes.
+      const beforePhaseTransition = await writerStore.getRoom(ROOM_ID);
+      if (!beforePhaseTransition) throw new Error("Room must persist before phase transition");
+      const ready = await writerStore.transitionLifecycle(ROOM_ID, {
+        to: "ready",
+        expectedAggregateVersion: beforePhaseTransition.room.aggregateVersion,
+        now: "2026-07-18T02:57:03.000Z",
+      }, {
+        eventId: "existing-session-spine-pg-ready",
+        actorType: "system",
+        actorId: "room-existing-session-spine-pg-test",
+        correlationId: "existing-session-spine-pg-phase-transition",
+        causationId: null,
+        occurredAt: "2026-07-18T02:57:03.000Z",
+      });
+      const running = await writerStore.transitionLifecycle(ROOM_ID, {
+        to: "running",
+        expectedAggregateVersion: ready.room.aggregateVersion,
+        now: "2026-07-18T02:57:04.000Z",
+      }, {
+        eventId: "existing-session-spine-pg-running",
+        actorType: "system",
+        actorId: "room-existing-session-spine-pg-test",
+        correlationId: "existing-session-spine-pg-phase-transition",
+        causationId: "existing-session-spine-pg-ready",
+        occurredAt: "2026-07-18T02:57:04.000Z",
+      });
+      await layer.db.insert(roomTurns).values({
+        id: "turn-existing-session-spine-pg-plan",
+        projectId: PROJECT_ID,
+        roomId: ROOM_ID,
+        sequence: 1,
+        protocolPhaseId: "plan",
+        membershipVersion: running.membershipVersion,
+        state: "completed",
+        startedAt: "2026-07-18T02:57:05.000Z",
+        endedAt: "2026-07-18T02:57:06.000Z",
+      });
+      const phaseSpine = new RoomExistingSessionSpine({
+        ...options,
+        roomStore: writerStore,
+        now: () => "2026-07-18T02:57:07.000Z",
+      });
+      const protocol = getRoomProtocolDefinition("implementation", 1);
+      if (!protocol) throw new Error("Implementation protocol must exist");
+      const phaseGateEvidence = await phaseSpine.recordPhaseGateEvidenceAtCompletedTurnBoundary({
+        roomId: ROOM_ID,
+        expectedAggregateVersion: running.room.aggregateVersion,
+        idempotencyKey: "existing-session-spine-pg-plan-ready-evidence",
+        evidence: {
+          contractVersion: 1,
+          id: "phase-gate-existing-session-spine-pg-plan-ready",
+          protocolId: protocol.id,
+          protocolVersion: protocol.version,
+          protocolHash: hashRoomValue(protocol),
+          gateId: "plan_ready",
+          phaseId: "plan",
+          turnId: "turn-existing-session-spine-pg-plan",
+          candidateId: "candidate-existing-session-spine-pg-plan",
+          candidateHash: hashRoomValue("candidate-existing-session-spine-pg-plan"),
+          source: {
+            recordId: "source-existing-session-spine-pg-plan-ready",
+            sourceHash: hashRoomValue("source-existing-session-spine-pg-plan-ready"),
+            recordedAt: "2026-07-18T02:57:07.000Z",
+          },
+          verdict: "passed",
+          evaluatorBindingId: SESSIONS[1].bindingId,
+          producerBindingIds: [SESSIONS[0].bindingId],
+          operatorApproval: null,
+        },
+      });
+      const afterPhaseGateEvidence = await writerStore.getRoom(ROOM_ID);
+      if (!afterPhaseGateEvidence) throw new Error("Room must persist phase-gate evidence");
+      const transitioned = await phaseSpine.transitionRoleAssignmentAtCompletedTurnBoundary({
+        roomId: ROOM_ID,
+        expectedAggregateVersion: afterPhaseGateEvidence.room.aggregateVersion,
+        boundaryTurnId: "turn-existing-session-spine-pg-plan",
+        targetPhaseId: "implement",
+        phaseGateEvidenceId: phaseGateEvidence.id,
+        idempotencyKey: "existing-session-spine-pg-plan-to-implement",
+        roleAssignment: {
+          capabilitySnapshot: {
+            contractVersion: 1,
+            snapshotId: "existing-session-spine-pg-capabilities-r2",
+            revision: 2,
+            capturedAt: "2026-07-18T02:57:07.000Z",
+            bindings: [
+              {
+                bindingId: SESSIONS[0].bindingId,
+                availability: "eligible",
+                capabilityRevision: "codex-existing-session-pg-r2",
+                capabilities: [
+                  { name: "source_read", state: "verified" },
+                  { name: "workspace_write", state: "verified" },
+                ],
+              },
+              {
+                bindingId: SESSIONS[1].bindingId,
+                availability: "eligible",
+                capabilityRevision: "claude-existing-session-pg-r2",
+                capabilities: [
+                  { name: "source_read", state: "verified" },
+                  { name: "test", state: "verified" },
+                ],
+              },
+            ],
+          },
+          constraints: {
+            locks: [{ roleId: "implementer", bindingId: SESSIONS[0].bindingId }],
+            forbids: [],
+          },
+        },
+      });
+      expect(transitioned).toMatchObject({
+        phaseId: "implement",
+        state: "active",
+        assignment: {
+          phaseId: "implement",
+          producerBindingIds: [SESSIONS[0].bindingId],
+        },
+      });
+      await expect(writerStore.getActiveRoomRoleAssignment(ROOM_ID)).resolves.toEqual(transitioned);
       expect(connector.ensureExisting).toHaveBeenCalledTimes(2);
       expect(connector.create).not.toHaveBeenCalled();
       expect(connector.send).not.toHaveBeenCalled();

@@ -74,6 +74,74 @@ export function hashRoomProviderBackpressureSendRequestBinding(
   return hashRoomValue(binding);
 }
 
+/**
+ * Stable durable-admission identity. Deadline and sender fence are deliberately
+ * omitted: both are short-lived execution authorities that can legitimately
+ * advance when a crashed Room worker recovers the same immutable outbox send.
+ */
+export interface RoomProviderBackpressureAdmissionReplayBindingV1 {
+  readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
+  readonly delivery: Readonly<Pick<
+    RoomOutboxRecordV1,
+    "id" | "roomId" | "logicalMessageId" | "localMessageId" | "bindingId" | "idempotencyKey" | "payloadHash"
+  >>;
+  readonly binding: Readonly<Pick<
+    RoomBindingRecordV1,
+    "id" | "roomId" | "seatId" | "generation" | "connectorId" | "providerId"
+    | "nativeSessionId" | "happierSessionId" | "serverProfileId" | "machineId" | "hostId"
+  >>;
+  readonly identity: Readonly<SessionConnectorIdentityV1>;
+  readonly attemptId: string;
+}
+
+export function createRoomProviderBackpressureAdmissionReplayBinding(
+  input: Pick<
+    RoomProviderBackpressureSendGateRequestV1,
+    "delivery" | "binding" | "identity" | "attemptId"
+  >,
+): RoomProviderBackpressureAdmissionReplayBindingV1 {
+  /*
+  FNXC:RoomProviderAdmissionReplay 2026-07-19-23:21:
+  An outbox generation is the durable identity of one provider admission. Its
+  retry must not depend on current clock, deadline, or sender fence because a
+  recovered worker changes all three while it is still proving the same exact
+  delivery and native Session binding.
+  */
+  return Object.freeze({
+    contractVersion: ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION,
+    delivery: Object.freeze({
+      id: input.delivery.id,
+      roomId: input.delivery.roomId,
+      logicalMessageId: input.delivery.logicalMessageId,
+      localMessageId: input.delivery.localMessageId,
+      bindingId: input.delivery.bindingId,
+      idempotencyKey: input.delivery.idempotencyKey,
+      payloadHash: input.delivery.payloadHash,
+    }),
+    binding: Object.freeze({
+      id: input.binding.id,
+      roomId: input.binding.roomId,
+      seatId: input.binding.seatId,
+      generation: input.binding.generation,
+      connectorId: input.binding.connectorId,
+      providerId: input.binding.providerId,
+      nativeSessionId: input.binding.nativeSessionId,
+      happierSessionId: input.binding.happierSessionId,
+      serverProfileId: input.binding.serverProfileId,
+      machineId: input.binding.machineId,
+      hostId: input.binding.hostId,
+    }),
+    identity: Object.freeze({ ...input.identity }),
+    attemptId: input.attemptId,
+  });
+}
+
+export function hashRoomProviderBackpressureAdmissionReplayBinding(
+  binding: RoomProviderBackpressureAdmissionReplayBindingV1,
+): string {
+  return hashRoomValue(binding);
+}
+
 export interface RoomProviderBackpressureSendGateRequestV1 {
   readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
   readonly delivery: RoomOutboxRecordV1;
@@ -103,6 +171,23 @@ export interface RoomProviderBackpressureSendAuthorityV1 {
   readonly decision: RoomProviderBackpressureControllerResultV1;
 }
 
+/**
+ * Immutable reservation evidence needed if a pre-send cleanup cannot settle.
+ * A later recovery worker may record expiry evidence, but it must never forge a
+ * release with this historical worker fence.
+ */
+export interface RoomProviderBackpressureSendPermitCleanupDescriptorV1 {
+  readonly claimId: string;
+  readonly originalWorkerFence: {
+    readonly leaseId: string;
+    readonly holderId: string;
+    readonly hostId: string;
+    readonly epoch: number;
+  };
+  readonly expectedAggregateVersion: number;
+  readonly reservationExpiresAt: string;
+}
+
 export type RoomProviderBackpressureSendCompletionV1 =
   | {
       readonly kind: "not_started";
@@ -121,6 +206,38 @@ export type RoomProviderBackpressureSendCompletionV1 =
       readonly completedAt: string;
     };
 
+/** Stable caller-chosen replay identity for one reservation lease renewal. */
+export interface RoomProviderBackpressureSendPermitRenewInputV1 {
+  readonly asOf: string;
+  readonly operationId: string;
+}
+
+export type RoomProviderBackpressureSendPermitRenewResultV1 =
+  | {
+      readonly action: "renewed";
+      readonly expiresAt: string;
+      readonly replayed: boolean;
+    }
+  | {
+      readonly action: "defer";
+      readonly reason: string;
+      readonly retryAfterMs: number;
+    };
+
+/**
+ * Cleanup is intentionally separate from connector delivery. A known connector
+ * receipt remains authoritative even if durable capacity accounting is delayed.
+ */
+export type RoomProviderBackpressureSendPermitCleanupResultV1 =
+  | {
+      readonly action: "released";
+    }
+  | {
+      readonly action: "cleanup_failed";
+      readonly reason: string;
+      readonly retryAfterMs: number;
+    };
+
 export interface RoomProviderBackpressureSendPermitV1 {
   readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
   /** Opaque Core reservation identity; the Engine neither creates nor rewrites it. */
@@ -133,7 +250,15 @@ export interface RoomProviderBackpressureSendPermitV1 {
   /** The reservation cannot authorize a send at or after this instant. */
   readonly expiresAt: string;
   readonly authority: RoomProviderBackpressureSendAuthorityV1;
-  complete(input: RoomProviderBackpressureSendCompletionV1): Promise<void>;
+  /** Present only when a durable provider gate can prove the original reservation fence. */
+  readonly cleanupDescriptor?: RoomProviderBackpressureSendPermitCleanupDescriptorV1;
+  /** Available on durable Engine permits; optional to preserve legacy gate compatibility. */
+  renew?(input: RoomProviderBackpressureSendPermitRenewInputV1): Promise<RoomProviderBackpressureSendPermitRenewResultV1>;
+  /** Release capacity without changing the already-known connector result. */
+  release?(input: RoomProviderBackpressureSendCompletionV1): Promise<RoomProviderBackpressureSendPermitCleanupResultV1>;
+  complete(
+    input: RoomProviderBackpressureSendCompletionV1,
+  ): Promise<RoomProviderBackpressureSendPermitCleanupResultV1 | void>;
 }
 
 export type RoomProviderBackpressureSendGateResultV1 =
@@ -150,12 +275,25 @@ export type RoomProviderBackpressureSendGateResultV1 =
       readonly retryAfterMs?: number | null;
     };
 
+/*
+FNXC:RoomProviderAdmissionTimeoutRecovery 2026-07-21-00:50:
+Only a gate that commits under the exact sender fence may be recovered after a
+process dies before its late admission callback. Other gates remain opaque: a
+recovery worker must preserve delivery_uncertain rather than infer that no
+provider permit or connector send happened.
+*/
+export interface RoomProviderBackpressureAdmissionTimeoutRecoveryProtocolV1 {
+  readonly contractVersion: typeof ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION;
+  readonly kind: "core_sender_fenced_v1";
+}
+
 /**
  * The eventual Core-backed implementation owns read/decide/commit/release.
  * Engine can only ask it to admit one exact connector send and report whether
  * that send started or how it finished.
  */
 export interface RoomProviderBackpressureSendGateV1 {
+  readonly timeoutRecoveryProtocol?: RoomProviderBackpressureAdmissionTimeoutRecoveryProtocolV1;
   admit(input: RoomProviderBackpressureSendGateRequestV1): Promise<RoomProviderBackpressureSendGateResultV1>;
 }
 
@@ -170,10 +308,109 @@ export type RoomProviderBackpressureSendPreflightV1 =
       readonly retryAfterMs: number | null;
     };
 
+/**
+ * Called only after a provider gate admits after the caller's deadline already
+ * won. A durable coordinator may first record the immutable reservation fence,
+ * then invoke the original permit completion without letting that sidecar block
+ * the caller that already deferred the delivery.
+ */
+export type RoomProviderBackpressureLateAdmittedPermitHandlerV1 = (input: {
+  readonly permit: RoomProviderBackpressureSendPermitV1;
+  readonly request: RoomProviderBackpressureSendGateRequestV1;
+}) => Promise<void>;
+
+/**
+ * Receives a late-admission durability failure so the owner can replay the same
+ * idempotent Core fence rather than silently treating a lost response as a
+ * completed provider boundary.
+ */
+export type RoomProviderBackpressureLateAdmittedPermitFailureHandlerV1 = (input: {
+  readonly permit: RoomProviderBackpressureSendPermitV1;
+  readonly request: RoomProviderBackpressureSendGateRequestV1;
+  readonly error: unknown;
+}) => Promise<void>;
+
+/**
+ * Runs after the caller's deadline wins but before its retryable timeout is
+ * exposed. The request is the sole durable-fence input; a timeout does not
+ * imply any provider outcome.
+ */
+export type RoomProviderBackpressureGateTimeoutHandlerV1 = (input: {
+  readonly request: RoomProviderBackpressureSendGateRequestV1;
+}) => Promise<void>;
+
+/** A runtime-validated terminal gate outcome that proves no permit was issued. */
+export type RoomProviderBackpressureLateNoPermitOutcomeV1 = Extract<
+  RoomProviderBackpressureSendGateResultV1,
+  { readonly action: "defer" }
+>;
+
+/**
+ * Runs only after a timeout fence completes and the original gate later
+ * returns a valid terminal no-permit outcome. Rejections and malformed gate
+ * values deliberately leave the timeout fence unresolved.
+ */
+export type RoomProviderBackpressureLateNoPermitHandlerV1 = (input: {
+  readonly request: RoomProviderBackpressureSendGateRequestV1;
+  readonly outcome: RoomProviderBackpressureLateNoPermitOutcomeV1;
+}) => Promise<void>;
+
+/**
+ * A callback failed after its timeout fence was exposed. This is a terminal
+ * coordinator signal: it is not a no-permit result and cannot release the
+ * existing fence or authorize a connector send.
+ */
+export type RoomProviderBackpressureLateSettlementFailureV1 =
+  | {
+      readonly callback: "onLateNoPermit";
+      readonly request: RoomProviderBackpressureSendGateRequestV1;
+      readonly outcome: RoomProviderBackpressureLateNoPermitOutcomeV1;
+      readonly error: unknown;
+    }
+  | {
+      readonly callback: "onLateAdmittedPermit" | "onLateAdmittedPermitFailure";
+      readonly request: RoomProviderBackpressureSendGateRequestV1;
+      readonly permit: RoomProviderBackpressureSendPermitV1;
+      readonly error: unknown;
+    };
+
+/**
+ * Persists or otherwise records an unresolved late-settlement failure. If this
+ * reporter itself fails, the original timeout fence deliberately remains in
+ * force; the boundary never converts that failure into a retryable defer.
+ */
+export type RoomProviderBackpressureLateSettlementFailureHandlerV1 = (
+  input: RoomProviderBackpressureLateSettlementFailureV1,
+) => Promise<void>;
+
+/**
+ * Coordinator callbacks for a gate whose response may outlive the caller's
+ * deadline. The boundary preserves the timeout fence until only a validated
+ * terminal result can resolve it.
+ */
+export interface RoomProviderBackpressureGateTimeoutCallbacksV1 {
+  /** Required at runtime whenever any late-settlement callback is configured. */
+  readonly onTimeout?: RoomProviderBackpressureGateTimeoutHandlerV1;
+  readonly onLateNoPermit?: RoomProviderBackpressureLateNoPermitHandlerV1;
+  readonly onLateAdmittedPermit?: RoomProviderBackpressureLateAdmittedPermitHandlerV1;
+  readonly onLateAdmittedPermitFailure?: RoomProviderBackpressureLateAdmittedPermitFailureHandlerV1;
+  readonly onLateSettlementFailure?: RoomProviderBackpressureLateSettlementFailureHandlerV1;
+}
+
 export class RoomProviderBackpressureGateTimeoutError extends Error {
   constructor(readonly deadline: string) {
     super("Room provider gate exceeded its admission deadline");
     this.name = "RoomProviderBackpressureGateTimeoutError";
+  }
+}
+
+/** A timeout fence could not be durably established, so admission must stop. */
+export class RoomProviderBackpressureGateTimeoutFenceError extends Error {
+  readonly code = "provider_gate_timeout_fence_failed" as const;
+
+  constructor(readonly fenceError: unknown) {
+    super("Room provider timeout fence could not be established");
+    this.name = "RoomProviderBackpressureGateTimeoutFenceError";
   }
 }
 
@@ -205,14 +442,36 @@ export async function admitRoomProviderBackpressureConnectorSend(
   input: {
     readonly gate: RoomProviderBackpressureSendGateV1;
     readonly request: RoomProviderBackpressureSendGateRequestV1;
-  },
+  } & RoomProviderBackpressureGateTimeoutCallbacksV1,
 ): Promise<RoomProviderBackpressureSendPreflightV1> {
+  /*
+  FNXC:RoomProviderTimeoutFenceCallbackContract 2026-07-20:
+  A late-settlement callback can act only on a request that first acquired a
+  durable timeout tombstone. Reject its incomplete callback configuration
+  before starting the gate, so no unfenced retryable timeout can escape.
+  */
+  if (requiresProviderGateTimeoutFence(input) && input.onTimeout === undefined) {
+    throw missingProviderGateTimeoutFenceError();
+  }
   let raw: unknown;
   try {
-    raw = await raceProviderGateAdmission(input.gate, input.request);
+    raw = await raceProviderGateAdmission(
+      input.gate,
+      input.request,
+      input,
+    );
   } catch (error) {
     if (error instanceof RoomProviderBackpressureGateTimeoutError) {
       return deferred("provider_gate_timeout");
+    }
+    if (error instanceof RoomProviderBackpressureGateTimeoutFenceError) {
+      /*
+      FNXC:RoomProviderGateTimeoutFenceFailure 2026-07-20-23:24:
+      A retryable defer would let the coordinator attempt another delivery even
+      though it could not establish the timeout tombstone. Propagate this
+      terminal boundary error so neither a permit nor a normal retry escapes.
+      */
+      throw error;
     }
     return deferred("provider_gate_unavailable");
   }
@@ -233,7 +492,7 @@ export async function admitRoomProviderBackpressureConnectorSend(
   }
 
   const permit = raw.permit as unknown as RoomProviderBackpressureSendPermitV1;
-  const invalidReason = invalidPermitReason(permit, input.request);
+  const invalidReason = invalidPermitReason(permit, input.request, { allowAbortedSignal: true });
   if (invalidReason !== null) {
     /*
     FNXC:RoomProviderBackpressureSendBoundary 2026-07-19-20:10:
@@ -265,6 +524,11 @@ export async function sendWithAdmittedRoomProviderBackpressure(
     readonly request: RoomProviderBackpressureSendGateRequestV1;
     readonly completedAt: () => string;
     readonly send: () => Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>>;
+    /** Optional observability hook; its failure can never replace a connector result. */
+    readonly onCleanupFailure?: (failure: Extract<
+      RoomProviderBackpressureSendPermitCleanupResultV1,
+      { readonly action: "cleanup_failed" }
+    >) => void;
   },
 ): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>> {
   /*
@@ -280,10 +544,10 @@ export async function sendWithAdmittedRoomProviderBackpressure(
     asOf: input.completedAt(),
   });
   if (revalidated.action === "defer") {
-    await settleIfPresent(input.permit, {
+    reportCleanupFailure(input.onCleanupFailure, await settlePermit(input.permit, {
       kind: "not_started",
       completedAt: input.completedAt(),
-    });
+    }));
     throw new RoomProviderBackpressurePreSendWithheldError(revalidated.reason);
   }
 
@@ -291,26 +555,26 @@ export async function sendWithAdmittedRoomProviderBackpressure(
   try {
     result = await input.send();
   } catch (error) {
-    try {
-      await input.permit.complete(Object.freeze({
-        kind: "connector_exception",
-        completedAt: input.completedAt(),
-      }));
-    } catch {
+    const cleanup = await settlePermit(input.permit, Object.freeze({
+      kind: "connector_exception",
+      completedAt: input.completedAt(),
+    }));
+    reportCleanupFailure(input.onCleanupFailure, cleanup);
+    if (cleanup.action === "cleanup_failed") {
       throw new RoomProviderBackpressureCompletionUnconfirmedError(null);
     }
     throw error;
   }
 
-  try {
-    await input.permit.complete(Object.freeze({
-      kind: "connector_result",
-      completedAt: input.completedAt(),
-      outcome: result.ok ? result.value.outcome : "error",
-      connectorErrorCode: result.ok ? null : result.error.code,
-      retryAfterMs: result.ok ? null : result.error.retryAfterMs ?? null,
-    }));
-  } catch {
+  const cleanup = await settlePermit(input.permit, Object.freeze({
+    kind: "connector_result",
+    completedAt: input.completedAt(),
+    outcome: result.ok ? result.value.outcome : "error",
+    connectorErrorCode: result.ok ? null : result.error.code,
+    retryAfterMs: result.ok ? null : result.error.retryAfterMs ?? null,
+  }));
+  reportCleanupFailure(input.onCleanupFailure, cleanup);
+  if (cleanup.action === "cleanup_failed") {
     throw new RoomProviderBackpressureCompletionUnconfirmedError(result);
   }
   return result;
@@ -326,6 +590,7 @@ export async function abandonAdmittedRoomProviderBackpressure(
 function invalidPermitReason(
   permit: RoomProviderBackpressureSendPermitV1,
   request: RoomProviderBackpressureSendGateRequestV1,
+  options: { readonly allowAbortedSignal?: boolean } = {},
 ): string | null {
   if (
     permit.contractVersion !== ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION
@@ -342,7 +607,7 @@ function invalidPermitReason(
   }
   const asOf = Date.parse(request.asOf);
   const deadline = Date.parse(request.deadline);
-  if (request.signal.aborted) {
+  if (request.signal.aborted && options.allowAbortedSignal !== true) {
     return request.signal.reason instanceof RoomProviderBackpressureGateTimeoutError
       ? "provider_gate_timeout"
       : "provider_gate_aborted";
@@ -452,15 +717,53 @@ function isPolicy(value: unknown): value is RoomProviderBackpressurePolicyV1 {
     && positiveSafeInteger(value.circuitOpenMs);
 }
 
-async function settleIfPresent(
-  permit: unknown,
+async function settlePermit(
+  permit: RoomProviderBackpressureSendPermitV1,
   completion: RoomProviderBackpressureSendCompletionV1,
-): Promise<void> {
-  if (!isRecord(permit) || typeof permit.complete !== "function") return;
+): Promise<RoomProviderBackpressureSendPermitCleanupResultV1> {
   try {
-    await (permit.complete as (input: RoomProviderBackpressureSendCompletionV1) => Promise<void>)(completion);
+    const result = await permit.complete(completion);
+    if (result === undefined) return Object.freeze({ action: "released" });
+    if (
+      isRecord(result)
+      && result.action === "released"
+    ) {
+      return Object.freeze({ action: "released" });
+    }
+    if (
+      isRecord(result)
+      && result.action === "cleanup_failed"
+      && canonicalString(result.reason)
+      && nonNegativeSafeInteger(result.retryAfterMs)
+    ) {
+      return Object.freeze({
+        action: "cleanup_failed",
+        reason: result.reason,
+        retryAfterMs: result.retryAfterMs,
+      });
+    }
   } catch {
     // A failed compensation must not turn a pre-send refusal into a send.
+  }
+  return Object.freeze({
+    action: "cleanup_failed",
+    reason: "provider_reservation_cleanup_failed",
+    retryAfterMs: 1_000,
+  });
+}
+
+function reportCleanupFailure(
+  report: ((failure: Extract<
+    RoomProviderBackpressureSendPermitCleanupResultV1,
+    { readonly action: "cleanup_failed" }
+  >) => void) | undefined,
+  result: RoomProviderBackpressureSendPermitCleanupResultV1,
+): void {
+  if (result.action !== "cleanup_failed" || report === undefined) return;
+  try {
+    report(result);
+  } catch {
+    // Observability cannot overwrite a connector result or change send control flow.
   }
 }
 
@@ -474,15 +777,50 @@ function deferred(
 function raceProviderGateAdmission(
   gate: RoomProviderBackpressureSendGateV1,
   request: RoomProviderBackpressureSendGateRequestV1,
+  callbacks: RoomProviderBackpressureGateTimeoutCallbacksV1,
 ): Promise<RoomProviderBackpressureSendGateResultV1> {
   if (request.signal.aborted) {
-    return Promise.reject(request.signal.reason ?? new RoomProviderBackpressureGateTimeoutError(request.deadline));
+    const reason = request.signal.reason ?? new RoomProviderBackpressureGateTimeoutError(request.deadline);
+    if (reason instanceof RoomProviderBackpressureGateTimeoutError) {
+      return runProviderGateTimeoutFence(callbacks.onTimeout, request).then(() => {
+        throw reason;
+      });
+    }
+    return Promise.reject(reason);
   }
   return new Promise<RoomProviderBackpressureSendGateResultV1>((resolve, reject) => {
-    const cleanup = () => request.signal.removeEventListener("abort", onAbort);
+    let settled = false;
+    let abortGrace: ReturnType<typeof setTimeout> | null = null;
+    let timeoutFence: Promise<void> | null = null;
+    const cleanup = () => {
+      if (abortGrace !== null) clearTimeout(abortGrace);
+      request.signal.removeEventListener("abort", onAbort);
+    };
     const onAbort = () => {
-      cleanup();
-      reject(request.signal.reason ?? new RoomProviderBackpressureGateTimeoutError(request.deadline));
+      if (request.signal.reason instanceof RoomProviderBackpressureGateTimeoutError) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        timeoutFence = runProviderGateTimeoutFence(callbacks.onTimeout, request);
+        void timeoutFence.then(
+          () => reject(request.signal.reason),
+          (error: unknown) => reject(error),
+        );
+        return;
+      }
+      /*
+      FNXC:RoomProviderGateAbortCleanup 2026-07-19-23:16:
+      A provider gate can finish an already-durable admission in the same event
+      turn that caller cancellation arrives. Give its resolved permit one
+      microtask turn to reach the coordinator for sender-fenced cleanup; a
+      genuinely late admit is released here instead of being silently lost.
+      */
+      abortGrace ??= setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(request.signal.reason ?? new RoomProviderBackpressureGateTimeoutError(request.deadline));
+      }, 0);
     };
     request.signal.addEventListener("abort", onAbort, { once: true });
     let operation: Promise<RoomProviderBackpressureSendGateResultV1>;
@@ -494,13 +832,201 @@ function raceProviderGateAdmission(
       return;
     }
     operation.then((result) => {
+      if (settled) {
+        resolveLateProviderGateResultAfterCallerSettles(result, request, callbacks, timeoutFence);
+        return;
+      }
+      settled = true;
       cleanup();
       resolve(result);
     }, (error: unknown) => {
+      if (settled) return;
+      settled = true;
       cleanup();
       reject(error);
     });
   });
+}
+
+function runProviderGateTimeoutFence(
+  onTimeout: RoomProviderBackpressureGateTimeoutHandlerV1 | undefined,
+  request: RoomProviderBackpressureSendGateRequestV1,
+): Promise<void> {
+  if (onTimeout === undefined) return Promise.resolve();
+  try {
+    return Promise.resolve(onTimeout(Object.freeze({ request }))).catch((error: unknown) => {
+      throw timeoutFenceError(error);
+    });
+  } catch (error) {
+    return Promise.reject(timeoutFenceError(error));
+  }
+}
+
+function requiresProviderGateTimeoutFence(
+  callbacks: RoomProviderBackpressureGateTimeoutCallbacksV1,
+): boolean {
+  return callbacks.onLateNoPermit !== undefined
+    || callbacks.onLateAdmittedPermit !== undefined
+    || callbacks.onLateAdmittedPermitFailure !== undefined
+    || callbacks.onLateSettlementFailure !== undefined;
+}
+
+function missingProviderGateTimeoutFenceError(): RoomProviderBackpressureGateTimeoutFenceError {
+  return new RoomProviderBackpressureGateTimeoutFenceError(
+    new Error("Late provider settlement callbacks require an onTimeout fence"),
+  );
+}
+
+function timeoutFenceError(error: unknown): RoomProviderBackpressureGateTimeoutFenceError {
+  return error instanceof RoomProviderBackpressureGateTimeoutFenceError
+    ? error
+    : new RoomProviderBackpressureGateTimeoutFenceError(error);
+}
+
+function resolveLateProviderGateResultAfterCallerSettles(
+  result: RoomProviderBackpressureSendGateResultV1,
+  request: RoomProviderBackpressureSendGateRequestV1,
+  callbacks: RoomProviderBackpressureGateTimeoutCallbacksV1,
+  timeoutFence: Promise<void> | null,
+): void {
+  const resolveLateResult = () => resolveLateProviderGateResult(
+    result,
+    request,
+    callbacks,
+    timeoutFence !== null,
+  );
+  if (timeoutFence === null) {
+    void resolveLateResult().catch(() => undefined);
+    return;
+  }
+  void timeoutFence.then(
+    resolveLateResult,
+    () => undefined,
+  ).catch(() => undefined);
+}
+
+async function resolveLateProviderGateResult(
+  result: RoomProviderBackpressureSendGateResultV1,
+  request: RoomProviderBackpressureSendGateRequestV1,
+  callbacks: RoomProviderBackpressureGateTimeoutCallbacksV1,
+  timedOut: boolean,
+): Promise<void> {
+  const terminalNoPermit = timedOut ? validLateNoPermitOutcome(result) : null;
+  if (terminalNoPermit !== null) {
+    if (callbacks.onLateNoPermit !== undefined) {
+      try {
+        await callbacks.onLateNoPermit(Object.freeze({ request, outcome: terminalNoPermit }));
+      } catch (error) {
+        await reportLateSettlementFailure(callbacks.onLateSettlementFailure, Object.freeze({
+          callback: "onLateNoPermit" as const,
+          request,
+          outcome: terminalNoPermit,
+          error,
+        }));
+      }
+    }
+    return;
+  }
+  await releaseLateAdmittedPermit(
+    result,
+    request,
+    callbacks.onLateAdmittedPermit,
+    callbacks.onLateAdmittedPermitFailure,
+    timedOut ? callbacks.onLateSettlementFailure : undefined,
+  );
+}
+
+async function reportLateSettlementFailure(
+  report: RoomProviderBackpressureLateSettlementFailureHandlerV1 | undefined,
+  failure: RoomProviderBackpressureLateSettlementFailureV1,
+): Promise<void> {
+  if (report === undefined) return;
+  try {
+    await report(failure);
+  } catch {
+    // The successful timeout callback owns the still-active durable fence.
+  }
+}
+
+function validLateNoPermitOutcome(
+  result: unknown,
+): RoomProviderBackpressureLateNoPermitOutcomeV1 | null {
+  if (
+    !isRecord(result)
+    || result.contractVersion !== ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION
+    || result.action !== "defer"
+    || "permit" in result
+    || !canonicalString(result.reason)
+  ) {
+    return null;
+  }
+  if (result.retryAfterMs === undefined) {
+    return Object.freeze({
+      contractVersion: ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION,
+      action: "defer",
+      reason: result.reason,
+    });
+  }
+  if (!nullableNonNegativeSafeInteger(result.retryAfterMs)) return null;
+  return Object.freeze({
+    contractVersion: ROOM_PROVIDER_BACKPRESSURE_SEND_BOUNDARY_CONTRACT_VERSION,
+    action: "defer",
+    reason: result.reason,
+    retryAfterMs: result.retryAfterMs,
+  });
+}
+
+async function releaseLateAdmittedPermit(
+  result: RoomProviderBackpressureSendGateResultV1,
+  request: RoomProviderBackpressureSendGateRequestV1,
+  onLateAdmittedPermit: RoomProviderBackpressureLateAdmittedPermitHandlerV1 | undefined,
+  onLateAdmittedPermitFailure: RoomProviderBackpressureLateAdmittedPermitFailureHandlerV1 | undefined,
+  onLateSettlementFailure: RoomProviderBackpressureLateSettlementFailureHandlerV1 | undefined,
+): Promise<void> {
+  if (!isRecord(result) || result.action !== "admit" || !isRecord(result.permit)) return;
+  const permit = result.permit as unknown as RoomProviderBackpressureSendPermitV1;
+  if (invalidPermitReason(permit, request, { allowAbortedSignal: true }) !== null) return;
+  /*
+  FNXC:RoomProviderLateAdmissionCleanup 2026-07-20-00:45:
+  Once the caller timed out, the late permit is no longer allowed to affect the
+  outbox. A canonical coordinator owns durable cleanup admission; if that
+  callback cannot persist its fence, do not fall through to an untracked
+  release. The Core reservation TTL is the remaining fail-closed boundary.
+  */
+  if (onLateAdmittedPermit !== undefined) {
+    try {
+      await onLateAdmittedPermit(Object.freeze({ permit, request }));
+    } catch (error) {
+      if (onLateAdmittedPermitFailure === undefined) {
+        await reportLateSettlementFailure(onLateSettlementFailure, Object.freeze({
+          callback: "onLateAdmittedPermit" as const,
+          request,
+          permit,
+          error,
+        }));
+        return;
+      }
+      try {
+        await onLateAdmittedPermitFailure(Object.freeze({ permit, request, error }));
+      } catch (recoveryError) {
+        await reportLateSettlementFailure(onLateSettlementFailure, Object.freeze({
+          callback: "onLateAdmittedPermitFailure" as const,
+          request,
+          permit,
+          error: recoveryError,
+        }));
+      }
+    }
+    return;
+  }
+  try {
+    await Promise.resolve(permit.complete(Object.freeze({
+      kind: "not_started" as const,
+      completedAt: request.asOf,
+    })));
+  } catch {
+    // The original admission is already fenced by the deadline; never leak a late cleanup exception.
+  }
 }
 
 function sameScope(value: unknown, scope: RoomProviderBackpressureScopeV1): boolean {

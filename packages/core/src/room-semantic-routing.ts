@@ -11,6 +11,12 @@ export interface RoomSemanticRoutingSeatV1 {
   readonly seatId: string;
   readonly bindingId: string;
   readonly roleId: string;
+  /**
+   * One concrete Session can legitimately cover multiple active protocol
+   * roles. `roleId` remains the canonical display/default role for v1 callers;
+   * this array is the full role set used for origin and responder checks.
+   */
+  readonly roleIds?: readonly string[];
   readonly groupIds: readonly string[];
 }
 
@@ -19,6 +25,8 @@ export interface RoomSemanticHistoryEntryV1 {
   readonly sequence: number;
   readonly nodeId: string;
   readonly intent: RoomMessageIntent;
+  /** Stable semantic identity excluding per-attempt message id and timestamp. */
+  readonly semanticLoopFingerprint: string;
   readonly semanticHash: string;
   readonly evidenceStateHash: string;
   readonly decisionStateHash: string;
@@ -47,6 +55,7 @@ export interface RoomSemanticRoutingIssue {
 export interface RoomSemanticRoutingAuditV1 {
   readonly outcome: "route" | "loop_break";
   readonly messageFingerprint: string;
+  readonly semanticLoopFingerprint: string;
   readonly targetFingerprint: string;
   readonly semanticHash: string;
   readonly evidenceStateHash: string;
@@ -109,6 +118,48 @@ const MESSAGE_INTENTS = new Set<RoomMessageIntent>([
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function canonicalizeMessageTarget(message: RoomProtocolMessageV1): RoomProtocolMessageV1["target"] {
+  return message.target.kind === "seats"
+    ? { kind: "seats", seatIds: [...message.target.seatIds].sort(compareText) }
+    : message.target;
+}
+
+/**
+ * Returns the loop identity for semantically repeated work. It deliberately
+ * omits `messageId` and `issuedAt`: a retried turn receives fresh transport
+ * identity but must not evade the bounded-discussion guard. Conversely, the
+ * content/reference/target/role fields remain, so a distinct critique under
+ * the same controller state is not falsely classified as a loop.
+ */
+export function buildRoomSemanticLoopFingerprint(message: RoomProtocolMessageV1): string {
+  return hashRoomValue({
+    protocolId: message.protocolId,
+    protocolVersion: message.protocolVersion,
+    phaseId: message.phaseId,
+    channelId: message.channelId,
+    projectId: message.projectId,
+    roomId: message.roomId,
+    turnId: message.turnId,
+    nodeId: message.nodeId,
+    origin: message.origin,
+    target: canonicalizeMessageTarget(message),
+    intent: message.intent,
+    contentHash: message.contentHash,
+    semanticHash: message.semanticHash,
+    evidenceStateHash: message.evidenceStateHash,
+    decisionStateHash: message.decisionStateHash,
+    // Parent IDs record conversational lineage, but each retry normally has a
+    // new parent. They must not let identical output evade loop detection.
+    // Evidence and resolution references remain part of the identity because
+    // either one is a material reason to permit another bounded turn.
+    references: {
+      evidenceRefs: message.references.evidenceRefs,
+      resolutionRefs: message.references.resolutionRefs,
+    },
+    authority: message.authority,
+  });
 }
 
 function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
@@ -198,7 +249,21 @@ function normalizeRoutingInputs(input: unknown): {
     ["message", "protocol", "seats", "history", "authoritativeState"],
   );
   const seats = parseArray(record.seats, "$.seats", 256).map((rawSeat, index) => {
-    const seat = parseRecord(rawSeat, `$.seats[${index}]`, ["seatId", "bindingId", "roleId", "groupIds"]);
+    const seat = parseRecord(
+      rawSeat,
+      `$.seats[${index}]`,
+      ["seatId", "bindingId", "roleId", "roleIds", "groupIds"],
+      ["seatId", "bindingId", "roleId", "groupIds"],
+    );
+    const roleId = parseIdentifier(seat.roleId, `$.seats[${index}].roleId`);
+    const roleIds = (seat.roleIds === undefined
+      ? [roleId]
+      : parseArray(seat.roleIds, `$.seats[${index}].roleIds`, 64)
+        .map((candidate, roleIndex) => parseIdentifier(candidate, `$.seats[${index}].roleIds[${roleIndex}]`))
+    ).sort(compareText);
+    if (roleIds.length === 0 || new Set(roleIds).size !== roleIds.length || !roleIds.includes(roleId)) {
+      throw new TypeError("Seat roleIds must be unique, non-empty, and contain roleId");
+    }
     const groupIds = parseArray(seat.groupIds, `$.seats[${index}].groupIds`, 64)
       .map((groupId, groupIndex) => parseIdentifier(groupId, `$.seats[${index}].groupIds[${groupIndex}]`))
       .sort(compareText);
@@ -206,7 +271,8 @@ function normalizeRoutingInputs(input: unknown): {
     return {
       seatId: parseIdentifier(seat.seatId, `$.seats[${index}].seatId`),
       bindingId: parseIdentifier(seat.bindingId, `$.seats[${index}].bindingId`),
-      roleId: parseIdentifier(seat.roleId, `$.seats[${index}].roleId`),
+      roleId,
+      roleIds,
       groupIds,
     };
   });
@@ -223,6 +289,7 @@ function normalizeRoutingInputs(input: unknown): {
       "sequence",
       "nodeId",
       "intent",
+      "semanticLoopFingerprint",
       "semanticHash",
       "evidenceStateHash",
       "decisionStateHash",
@@ -238,6 +305,10 @@ function normalizeRoutingInputs(input: unknown): {
       sequence: entry.sequence as number,
       nodeId: parseIdentifier(entry.nodeId, `$.history[${index}].nodeId`),
       intent: entry.intent as RoomMessageIntent,
+      semanticLoopFingerprint: parseHash(
+        entry.semanticLoopFingerprint,
+        `$.history[${index}].semanticLoopFingerprint`,
+      ),
       semanticHash: parseHash(entry.semanticHash, `$.history[${index}].semanticHash`),
       evidenceStateHash: parseHash(entry.evidenceStateHash, `$.history[${index}].evidenceStateHash`),
       decisionStateHash: parseHash(entry.decisionStateHash, `$.history[${index}].decisionStateHash`),
@@ -392,7 +463,7 @@ export function routeRoomSemanticMessage(
   if (
     !origin
     || origin.bindingId !== message.origin.bindingId
-    || origin.roleId !== message.origin.roleId
+    || !(origin.roleIds?.includes(message.origin.roleId) ?? origin.roleId === message.origin.roleId)
   ) {
     return reject(
       "origin_binding_mismatch",
@@ -443,7 +514,8 @@ export function routeRoomSemanticMessage(
   }
 
   const responderSeatIds = runtimeInput.seats
-    .filter((seat) => context.channel.responderRoleIds.includes(seat.roleId))
+    .filter((seat) => (seat.roleIds ?? [seat.roleId])
+      .some((roleId) => context.channel.responderRoleIds.includes(roleId)))
     .map((seat) => seat.seatId);
   const recipientSeatIds: string[] = [];
   appendUnique(recipientSeatIds, selectedSeatIds, message.origin.seatId);
@@ -455,12 +527,15 @@ export function routeRoomSemanticMessage(
     ? [...recipientSeatIds]
     : recipientSeatIds.filter((seatId) => responderSeatIds.includes(seatId));
 
+  const canonicalTarget = canonicalizeMessageTarget(message);
+  const semanticLoopFingerprint = buildRoomSemanticLoopFingerprint(message);
   let repeatedSemanticCount = 1;
   for (let index = runtimeInput.history.length - 1; index >= 0; index -= 1) {
     const entry = runtimeInput.history[index]!;
     if (
       entry.nodeId !== message.nodeId
       || entry.intent !== message.intent
+      || entry.semanticLoopFingerprint !== semanticLoopFingerprint
       || entry.semanticHash !== runtimeInput.authoritativeState.semanticHash
       || entry.evidenceStateHash !== runtimeInput.authoritativeState.evidenceStateHash
       || entry.decisionStateHash !== runtimeInput.authoritativeState.decisionStateHash
@@ -468,10 +543,6 @@ export function routeRoomSemanticMessage(
     repeatedSemanticCount += 1;
   }
   const loopBreak = repeatedSemanticCount >= runtimeInput.semanticRepeatLimit;
-
-  const canonicalTarget = message.target.kind === "seats"
-    ? { kind: "seats" as const, seatIds: [...message.target.seatIds].sort(compareText) }
-    : message.target;
 
   const safeFingerprintInput = {
     contractVersion: message.contractVersion,
@@ -498,6 +569,7 @@ export function routeRoomSemanticMessage(
   const audit: RoomSemanticRoutingAuditV1 = Object.freeze({
     outcome: loopBreak ? "loop_break" : "route",
     messageFingerprint: hashRoomValue(safeFingerprintInput),
+    semanticLoopFingerprint,
     targetFingerprint: hashRoomValue(canonicalTarget),
     semanticHash: message.semanticHash,
     evidenceStateHash: message.evidenceStateHash,

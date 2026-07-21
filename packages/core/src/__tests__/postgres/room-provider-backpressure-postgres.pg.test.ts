@@ -13,6 +13,7 @@ import { applySchemaBaseline } from "../../postgres/schema-applier.js";
 import {
   operationalRooms,
   roomProviderBackpressureReservations,
+  roomProviderBackpressureStates,
 } from "../../postgres/schema/room.js";
 import {
   ROOM_PROVIDER_BACKPRESSURE_CONTROLLER_CONTRACT_VERSION,
@@ -97,6 +98,7 @@ function createPorts(
   projectId: string,
   scope: RoomProviderBackpressureScopeV1 = DEFAULT_SCOPE,
   policy: RoomProviderBackpressurePolicyV1 = DEFAULT_POLICY,
+  useDatabaseFenceClock = false,
 ): RoomProviderBackpressurePostgresPortsV1 {
   return createRoomProviderBackpressurePostgresPorts({
     layer: createAsyncDataLayer(sharedContext!.connections!, { projectId }),
@@ -112,6 +114,7 @@ function createPorts(
         policy: Object.freeze({ ...policy }),
       }),
     },
+    ...(useDatabaseFenceClock ? {} : { fenceValidationClock: () => AS_OF }),
   });
 }
 
@@ -158,6 +161,31 @@ async function acquireWorkerLease(
     expiresAt,
   });
   if (!result.ok) throw new Error(`Could not acquire Room worker lease: ${result.reason}`);
+  return result.lease;
+}
+
+async function renewWorkerLease(
+  projectId: string,
+  lease: StoredRoomLeaseV1,
+  now: string,
+  expiresAt: string,
+): Promise<StoredRoomLeaseV1> {
+  const store = new AsyncRoomLeaseStore(
+    createAsyncDataLayer(sharedContext!.connections!, { projectId }),
+    { projectId },
+  );
+  const result = await store.renewLease({
+    leaseId: lease.id,
+    roomId: lease.roomId,
+    kind: lease.kind,
+    resourceId: lease.resourceId,
+    holderId: lease.holderId,
+    hostId: lease.hostId,
+    expectedEpoch: lease.epoch,
+    now,
+    expiresAt,
+  });
+  if (!result.ok) throw new Error(`Could not renew Room worker lease: ${result.reason}`);
   return result.lease;
 }
 
@@ -294,6 +322,7 @@ async function commit(
   requestId: string,
   decisionInput: RoomProviderBackpressureControllerInputV1,
   decision: RoomProviderBackpressureControllerResultV1,
+  options: { readonly idempotencyBindingHash?: string } = {},
 ) {
   return ports.commit({
     projectId,
@@ -303,7 +332,27 @@ async function commit(
     requestId,
     decisionInput,
     decision,
+    ...options,
   });
+}
+
+async function renewReservation(
+  ports: RoomProviderBackpressurePostgresPortsV1,
+  input: {
+    readonly projectId: string;
+    readonly roomId: string;
+    readonly lease: StoredRoomLeaseV1;
+    readonly expectedAggregateVersion: number;
+    readonly reservationId: string;
+    readonly claimId: string;
+    readonly operationId: string;
+    readonly asOf: string;
+    readonly expiresAt: string;
+  },
+): Promise<unknown> {
+  return (ports as unknown as {
+    renew(value: typeof input): Promise<unknown>;
+  }).renew(input);
 }
 
 beforeAll(async () => {
@@ -333,6 +382,189 @@ afterAll(async () => {
 });
 
 describe("Room provider backpressure PostgreSQL ports", () => {
+  it("rejects delayed provider commit and renewal writes after the Room-worker lease has expired", async () => {
+    const ports = createPorts(PROJECT_A, DEFAULT_SCOPE, DEFAULT_POLICY, true);
+    const lease = await acquireWorkerLease(PROJECT_A, ROOM_A, "lease-delayed-fence");
+    const commitRequestId = "room-provider-capacity:claim-delayed-fence";
+    const snapshot = await read(ports, PROJECT_A, ROOM_A, lease, commitRequestId, AS_OF);
+    const input = controllerInput(snapshot, commitRequestId, AS_OF, { kind: "dispatch" });
+
+    await expect(commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      lease,
+      commitRequestId,
+      input,
+      normalAdmission(input),
+    )).resolves.toEqual({ status: "held", reason: "stale_fence" });
+
+    await requireLayer().db.insert(roomProviderBackpressureStates).values({
+      projectId: PROJECT_A,
+      scopeKey: scopeKey(DEFAULT_SCOPE),
+      providerId: DEFAULT_SCOPE.providerId,
+      accountId: DEFAULT_SCOPE.accountId,
+      modelId: DEFAULT_SCOPE.modelId,
+      connectorId: DEFAULT_SCOPE.connectorId,
+      nodeId: DEFAULT_SCOPE.nodeId,
+      circuitState: "closed",
+      consecutiveFailures: 0,
+      retryAttempt: 0,
+      retryNotBefore: null,
+      openUntil: null,
+      revision: 0,
+      lastUpdatedAt: AS_OF,
+    });
+    await requireLayer().db.insert(roomProviderBackpressureReservations).values({
+      id: "reservation-delayed-fence",
+      projectId: PROJECT_A,
+      scopeKey: scopeKey(DEFAULT_SCOPE),
+      roomId: ROOM_A,
+      requestId: "room-provider-capacity:claim-delayed-renewal",
+      claimId: "claim-delayed-fence",
+      leaseId: lease.id,
+      leaseEpoch: lease.epoch,
+      expectedAggregateVersion: 0,
+      workClass: "normal",
+      isHalfOpenProbe: false,
+      circuitOpenMs: DEFAULT_POLICY.circuitOpenMs,
+      acquiredAt: AS_OF,
+      expiresAt: LEASE_EXPIRES_AT,
+      releasedAt: null,
+      releaseOutcome: null,
+    });
+
+    await expect(renewReservation(ports, {
+      projectId: PROJECT_A,
+      roomId: ROOM_A,
+      lease,
+      expectedAggregateVersion: 0,
+      reservationId: "reservation-delayed-fence",
+      claimId: "claim-delayed-fence",
+      operationId: "renew-delayed-fence",
+      asOf: AS_OF,
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+    })).resolves.toEqual({ status: "held", reason: "stale_fence" });
+  }, 60_000);
+
+  it("replays an admitted provider reservation when only the recovery observation clock advances", async () => {
+    const ports = createPorts(PROJECT_A);
+    const lease = await acquireWorkerLease(PROJECT_A, ROOM_A, "lease-replay-clock");
+    const requestId = "room-provider-capacity:claim-replay-clock";
+    const idempotencyBindingHash = `sha256:${"a".repeat(64)}`;
+    const firstSnapshot = await read(ports, PROJECT_A, ROOM_A, lease, requestId, AS_OF);
+    const firstInput = controllerInput(firstSnapshot, requestId, AS_OF, { kind: "dispatch" });
+    const first = await commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      lease,
+      requestId,
+      firstInput,
+      normalAdmission(firstInput),
+      { idempotencyBindingHash },
+    );
+    expect(first.status).toBe("reserved");
+    if (first.status !== "reserved") throw new Error("Expected initial provider reservation");
+
+    const replaySnapshot = await read(ports, PROJECT_A, ROOM_A, lease, requestId, AFTER_ADMIT);
+    const replayInput = controllerInput(replaySnapshot, requestId, AFTER_ADMIT, { kind: "dispatch" });
+    await expect(commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      lease,
+      requestId,
+      replayInput,
+      normalAdmission(replayInput),
+      { idempotencyBindingHash },
+    )).resolves.toEqual({ status: "reserved", reservationId: first.reservationId });
+  }, 60_000);
+
+  it("holds a fresh provider admission for one outbox while its earlier durable reservation is still live", async () => {
+    const ports = createPorts(PROJECT_A);
+    const lease = await acquireWorkerLease(PROJECT_A, ROOM_A, "lease-delivery-owner");
+    const firstRequest = "room-provider-capacity:outbox-owner-1:provider-admission:outbox-owner-1:first";
+    const firstSnapshot = await read(ports, PROJECT_A, ROOM_A, lease, firstRequest, AS_OF);
+    const firstInput = controllerInput(firstSnapshot, firstRequest, AS_OF, { kind: "dispatch" });
+    await expect(commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      lease,
+      firstRequest,
+      firstInput,
+      normalAdmission(firstInput),
+    )).resolves.toMatchObject({ status: "reserved" });
+
+    const laterRequest = "room-provider-capacity:outbox-owner-1:provider-admission:outbox-owner-1:retry";
+    const laterSnapshot = await read(ports, PROJECT_A, ROOM_A, lease, laterRequest, AFTER_ADMIT);
+    const laterInput = controllerInput(laterSnapshot, laterRequest, AFTER_ADMIT, { kind: "dispatch" });
+    await expect(commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      lease,
+      laterRequest,
+      laterInput,
+      normalAdmission(laterInput),
+    )).resolves.toEqual({ status: "held", reason: "delivery_reservation_unresolved" });
+  }, 60_000);
+
+  it("does not replay a live provider reservation as a usable permit after its Room-worker lease hands off", async () => {
+    const ports = createPorts(PROJECT_A);
+    const firstLease = await acquireWorkerLease(PROJECT_A, ROOM_A, "lease-replay-handoff-first");
+    const requestId = "room-provider-capacity:outbox-handoff-1:provider-admission:outbox-handoff-1:first";
+    const idempotencyBindingHash = `sha256:${"b".repeat(64)}`;
+    const firstSnapshot = await read(ports, PROJECT_A, ROOM_A, firstLease, requestId, AS_OF);
+    const firstInput = controllerInput(firstSnapshot, requestId, AS_OF, { kind: "dispatch" });
+    await expect(commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      firstLease,
+      requestId,
+      firstInput,
+      normalAdmission(firstInput),
+      { idempotencyBindingHash },
+    )).resolves.toMatchObject({ status: "reserved" });
+
+    const leaseStore = new AsyncRoomLeaseStore(
+      createAsyncDataLayer(sharedContext!.connections!, { projectId: PROJECT_A }),
+      { projectId: PROJECT_A },
+    );
+    await expect(leaseStore.releaseLease({
+      leaseId: firstLease.id,
+      roomId: firstLease.roomId,
+      kind: firstLease.kind,
+      resourceId: firstLease.resourceId,
+      holderId: firstLease.holderId,
+      hostId: firstLease.hostId,
+      expectedEpoch: firstLease.epoch,
+      now: AFTER_ADMIT,
+    })).resolves.toMatchObject({ ok: true });
+    const replacementLease = await acquireWorkerLease(
+      PROJECT_A,
+      ROOM_A,
+      "lease-replay-handoff-replacement",
+      AFTER_ADMIT,
+      LATER_LEASE_EXPIRES_AT,
+      firstLease.epoch,
+    );
+    const replaySnapshot = await read(ports, PROJECT_A, ROOM_A, replacementLease, requestId, AFTER_ADMIT);
+    const replayInput = controllerInput(replaySnapshot, requestId, AFTER_ADMIT, { kind: "dispatch" });
+    await expect(commit(
+      ports,
+      PROJECT_A,
+      ROOM_A,
+      replacementLease,
+      requestId,
+      replayInput,
+      normalAdmission(replayInput),
+      { idempotencyBindingHash },
+    )).resolves.toEqual({ status: "held", reason: "reservation_worker_handoff_required" });
+  }, 60_000);
+
   it("serializes each provider scope, isolates accounts and projects, and rejects a forged release", async () => {
     const scopeB = Object.freeze({ ...DEFAULT_SCOPE, accountId: "account-b" });
     const portsA = createPorts(PROJECT_A);
@@ -456,6 +688,158 @@ describe("Room provider backpressure PostgreSQL ports", () => {
       .from(roomProviderBackpressureReservations)
       .where(eq(roomProviderBackpressureReservations.id, first.reservationId));
     expect(expired).toEqual([{ releasedAt: LATER, releaseOutcome: "expired" }]);
+  }, 60_000);
+
+  it("fenced-renews a live provider reservation to the current worker-lease endpoint and safely replays once", async () => {
+    const ports = createPorts(PROJECT_A);
+    const initialLease = await acquireWorkerLease(PROJECT_A, ROOM_A, "lease-renew");
+    const requestId = "room-provider-capacity:claim-renew";
+    const snapshot = await read(ports, PROJECT_A, ROOM_A, initialLease, requestId);
+    const input = controllerInput(snapshot, requestId, AS_OF, { kind: "dispatch" });
+    const committed = await commit(ports, PROJECT_A, ROOM_A, initialLease, requestId, input, normalAdmission(input));
+    expect(committed.status).toBe("reserved");
+    if (committed.status !== "reserved") throw new Error("Expected provider reservation");
+
+    const currentLease = await renewWorkerLease(PROJECT_A, initialLease, AFTER_ADMIT, LATER_LEASE_EXPIRES_AT);
+    const renewInput = {
+      projectId: PROJECT_A,
+      roomId: ROOM_A,
+      lease: currentLease,
+      expectedAggregateVersion: 0,
+      reservationId: committed.reservationId,
+      claimId: "claim-renew",
+      operationId: "renew-provider-reservation",
+      asOf: AFTER_ADMIT,
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+    } as const;
+    await expect(renewReservation(ports, renewInput)).resolves.toEqual({
+      status: "renewed",
+      reservationId: committed.reservationId,
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+      replayed: false,
+    });
+    await expect(renewReservation(ports, renewInput)).resolves.toEqual({
+      status: "renewed",
+      reservationId: committed.reservationId,
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+      replayed: true,
+    });
+
+    const reservation = await requireLayer().db
+      .select({
+        expiresAt: roomProviderBackpressureReservations.expiresAt,
+        requestId: roomProviderBackpressureReservations.requestId,
+        claimId: roomProviderBackpressureReservations.claimId,
+        workClass: roomProviderBackpressureReservations.workClass,
+        leaseId: roomProviderBackpressureReservations.leaseId,
+        leaseEpoch: roomProviderBackpressureReservations.leaseEpoch,
+      })
+      .from(roomProviderBackpressureReservations)
+      .where(eq(roomProviderBackpressureReservations.id, committed.reservationId));
+    expect(reservation).toEqual([{
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+      requestId,
+      claimId: "claim-renew",
+      workClass: "normal",
+      leaseId: currentLease.id,
+      leaseEpoch: currentLease.epoch,
+    }]);
+  }, 60_000);
+
+  it("rejects provider renewal conflicts, regressions, stale worker or room authority, released reservations, and expired reservations", async () => {
+    const ports = createPorts(PROJECT_A);
+    const initialLease = await acquireWorkerLease(PROJECT_A, ROOM_A, "lease-renew-fences");
+    const requestId = "room-provider-capacity:claim-renew-fences";
+    const snapshot = await read(ports, PROJECT_A, ROOM_A, initialLease, requestId);
+    const input = controllerInput(snapshot, requestId, AS_OF, { kind: "dispatch" });
+    const committed = await commit(ports, PROJECT_A, ROOM_A, initialLease, requestId, input, normalAdmission(input));
+    if (committed.status !== "reserved") throw new Error("Expected provider reservation");
+    const currentLease = await renewWorkerLease(PROJECT_A, initialLease, AFTER_ADMIT, LATER_LEASE_EXPIRES_AT);
+    const renewInput = {
+      projectId: PROJECT_A,
+      roomId: ROOM_A,
+      lease: currentLease,
+      expectedAggregateVersion: 0,
+      reservationId: committed.reservationId,
+      claimId: "claim-renew-fences",
+      operationId: "renew-provider-fences",
+      asOf: AFTER_ADMIT,
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+    } as const;
+    await expect(renewReservation(ports, renewInput)).resolves.toMatchObject({ status: "renewed" });
+    await expect(renewReservation(ports, { ...renewInput, expiresAt: "2026-07-19T14:12:00.000Z" }))
+      .resolves.toEqual({ status: "held", reason: "idempotency_conflict" });
+    await expect(renewReservation(ports, {
+      ...renewInput,
+      operationId: "renew-provider-backwards",
+      expiresAt: "2026-07-19T14:10:00.000Z",
+    })).resolves.toEqual({ status: "held", reason: "renewal_regression" });
+    await expect(renewReservation(ports, {
+      ...renewInput,
+      operationId: "renew-provider-stale-lease",
+      lease: { ...currentLease, holderId: "worker:forged" },
+    })).resolves.toEqual({ status: "held", reason: "stale_fence" });
+
+    await requireLayer().db
+      .update(operationalRooms)
+      .set({ aggregateVersion: 1 })
+      .where(eq(operationalRooms.id, ROOM_A));
+    await expect(renewReservation(ports, {
+      ...renewInput,
+      operationId: "renew-provider-stale-version",
+    })).resolves.toEqual({ status: "held", reason: "stale_room_version" });
+
+    await ports.release({
+      projectId: PROJECT_A,
+      roomId: ROOM_A,
+      lease: currentLease,
+      expectedAggregateVersion: 0,
+      requestId,
+      reservationId: committed.reservationId,
+      claimId: "claim-renew-fences",
+      outcome: "worker_completed",
+      releasedAt: AFTER_ADMIT,
+    });
+    await expect(renewReservation(ports, {
+      ...renewInput,
+      expectedAggregateVersion: 1,
+      operationId: "renew-provider-released",
+    })).resolves.toEqual({ status: "held", reason: "reservation_not_found" });
+
+    const expiringLease = await acquireWorkerLease(PROJECT_A, ROOM_A2, "lease-renew-expired");
+    const expiringRequest = "room-provider-capacity:claim-renew-expired";
+    const expiringSnapshot = await read(ports, PROJECT_A, ROOM_A2, expiringLease, expiringRequest);
+    const expiringDecision = controllerInput(expiringSnapshot, expiringRequest, AS_OF, { kind: "dispatch" });
+    const expiring = await commit(
+      ports,
+      PROJECT_A,
+      ROOM_A2,
+      expiringLease,
+      expiringRequest,
+      expiringDecision,
+      normalAdmission(expiringDecision),
+    );
+    if (expiring.status !== "reserved") throw new Error("Expected expiring provider reservation");
+    const replacementLease = await acquireWorkerLease(
+      PROJECT_A,
+      ROOM_A2,
+      "lease-renew-expired-replacement",
+      LATER,
+      LATER_LEASE_EXPIRES_AT,
+      expiringLease.epoch,
+    );
+    await read(ports, PROJECT_A, ROOM_A2, replacementLease, "room-provider-capacity:trigger-expiry", LATER);
+    await expect(renewReservation(ports, {
+      projectId: PROJECT_A,
+      roomId: ROOM_A2,
+      lease: replacementLease,
+      expectedAggregateVersion: 0,
+      reservationId: expiring.reservationId,
+      claimId: "claim-renew-expired",
+      operationId: "renew-provider-expired",
+      asOf: LATER,
+      expiresAt: LATER_LEASE_EXPIRES_AT,
+    })).resolves.toEqual({ status: "held", reason: "reservation_expired" });
   }, 60_000);
 
   it("persists an open circuit, permits exactly one half-open probe, and closes only after its fenced success", async () => {

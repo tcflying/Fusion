@@ -34,7 +34,11 @@ const mockGetProjectByPath = vi.fn();
 const mockRegisterProject = vi.fn();
 const mockEnsureProjectForPath = vi.fn();
 const mockUpdateProject = vi.fn().mockResolvedValue({});
-const { mockIsValidSqliteDatabaseFile } = vi.hoisted(() => ({
+const mockCentralConstructor = vi.fn();
+const mockBackendShutdown = vi.fn();
+const mockAsyncLayer = {};
+const { mockCreateTaskStoreForBackend, mockIsValidSqliteDatabaseFile } = vi.hoisted(() => ({
+  mockCreateTaskStoreForBackend: vi.fn(),
   mockIsValidSqliteDatabaseFile: vi.fn(),
 }));
 
@@ -42,14 +46,18 @@ vi.mock("@fusion/core", async () => {
   const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
   return {
     ...actual,
-    CentralCore: makeConstructibleMock(() => ({
-      init: mockCentralInit,
-      close: mockCentralClose,
-      getProjectByPath: mockGetProjectByPath,
-      registerProject: mockRegisterProject,
-      ensureProjectForPath: mockEnsureProjectForPath,
-      updateProject: mockUpdateProject,
-    })),
+    CentralCore: makeConstructibleMock((...args: unknown[]) => {
+      mockCentralConstructor(...args);
+      return {
+        init: mockCentralInit,
+        close: mockCentralClose,
+        getProjectByPath: mockGetProjectByPath,
+        registerProject: mockRegisterProject,
+        ensureProjectForPath: mockEnsureProjectForPath,
+        updateProject: mockUpdateProject,
+      };
+    }),
+    createTaskStoreForBackend: mockCreateTaskStoreForBackend,
     isQmdAvailable: vi.fn(() => Promise.resolve(true)),
     QMD_INSTALL_COMMAND: "bun install -g @tobilu/qmd",
     resolveGlobalDir: vi.fn(),
@@ -90,9 +98,25 @@ describe("init command", () => {
     tempHomeDir = tempDir("fn-init-home-");
     process.env.HOME = tempHomeDir;
     process.env.USERPROFILE = tempHomeDir;
+    mockCentralInit.mockReset();
+    mockCentralClose.mockReset();
+    mockGetProjectByPath.mockReset();
+    mockRegisterProject.mockReset();
+    mockEnsureProjectForPath.mockReset();
+    mockUpdateProject.mockReset();
     mockCentralInit.mockResolvedValue(undefined);
     mockCentralClose.mockResolvedValue(undefined);
+    mockCentralConstructor.mockReset();
+    mockCreateTaskStoreForBackend.mockReset();
+    mockBackendShutdown.mockReset();
+    mockBackendShutdown.mockResolvedValue(undefined);
+    mockCreateTaskStoreForBackend.mockResolvedValue({
+      taskStore: {},
+      asyncLayer: mockAsyncLayer,
+      shutdown: mockBackendShutdown,
+    });
     mockGetProjectByPath.mockResolvedValue(undefined);
+    mockUpdateProject.mockResolvedValue({});
     mockRegisterProject.mockResolvedValue({
       id: "proj_1234567890abcdef",
       name: "test-project",
@@ -186,6 +210,61 @@ describe("init command", () => {
       createdAt: "2026-07-14T00:00:00.000Z",
     });
     expect(mockEnsureProjectForPath).not.toHaveBeenCalled();
+  });
+
+  it("boots a backend layer for central registration and releases it after success", async () => {
+    await runInit({ path: tempProjectDir });
+
+    expect(mockCreateTaskStoreForBackend).toHaveBeenCalledWith({ rootDir: tempProjectDir });
+    expect(mockCentralConstructor).toHaveBeenCalledWith(undefined, { asyncLayer: mockAsyncLayer });
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith(expect.objectContaining({ path: tempProjectDir }));
+    expect(mockCentralClose).toHaveBeenCalledTimes(1);
+    expect(mockBackendShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("registers a valid local-only project instead of telling the user to register it later", async () => {
+    const fusionDir = join(tempProjectDir, ".fusion");
+    const dbPath = join(fusionDir, "fusion.db");
+    mkdirSync(fusionDir, { recursive: true });
+    writeFileSync(dbPath, "SQLite format 3\u0000");
+
+    await runInit({ path: tempProjectDir });
+
+    expect(mockEnsureProjectForPath).toHaveBeenCalledWith(expect.objectContaining({ path: tempProjectDir }));
+    expect(mockBackendShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when no PostgreSQL backend can be created", async () => {
+    mockCreateTaskStoreForBackend.mockResolvedValueOnce(null);
+
+    await expect(runInit({ path: tempProjectDir })).rejects.toThrow(
+      "Central project registration requires a PostgreSQL backend",
+    );
+    expect(mockBackendShutdown).not.toHaveBeenCalled();
+  });
+
+  it("does not report local initialization as success after central registration fails", async () => {
+    mockEnsureProjectForPath.mockRejectedValueOnce(new Error("postgres password=super-secret"));
+    const originalLog = console.log;
+    const logs: string[] = [];
+    console.log = (...args: unknown[]) => {
+      logs.push(args.join(" "));
+    };
+
+    try {
+      await expect(runInit({ path: tempProjectDir })).rejects.toThrow(
+        "Central project registration failed",
+      );
+    } finally {
+      console.log = originalLog;
+    }
+
+    const logOutput = logs.join("\n");
+    expect(logOutput).not.toContain("Project initialized locally");
+    expect(logOutput).not.toContain("Registered in central database");
+    expect(logOutput).not.toContain("super-secret");
+    expect(mockCentralClose).toHaveBeenCalledTimes(1);
+    expect(mockBackendShutdown).toHaveBeenCalledTimes(1);
   });
 
   it("should reject existing invalid fusion.db files", async () => {

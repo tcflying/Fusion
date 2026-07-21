@@ -118,6 +118,7 @@ export type RoomRuntimeObservabilityBridgeReasonCodeV1 =
   | "duplicate_event"
   | "invalid_input"
   | "scope_mismatch"
+  | "sink_unconfigured"
   | "sink_ack_failed"
   | "sink_ack_rejected"
   | "stale_cursor";
@@ -131,7 +132,7 @@ export type RoomRuntimeObservabilityBridgeResultV1 =
   | ({
     readonly ok: true;
     readonly outcome: "published";
-    readonly delivery: "core_calculated" | "sink_acknowledged";
+    readonly delivery: "sink_acknowledged";
   } & RoomRuntimeObservabilityPublicationV1)
   | {
     readonly ok: false;
@@ -724,8 +725,17 @@ export class RoomRuntimeObservabilityBridge {
       evidenceRefs: baseEvidenceRefs,
     } satisfies RoomRuntimeObservabilityPublicationV1);
     if (this.sink === null) {
-      this.recordPublished(key, publication);
-      return freeze({ ok: true as const, outcome: "published" as const, delivery: "core_calculated" as const, ...publication });
+      /*
+      FNXC:RoomObservabilitySinkBoundary 2026-07-19-23:43:
+      A calculated in-memory snapshot is useful for diagnosis but is not an
+      operational publication. Do not advance the durable/replay cursor or
+      present it as delivered until a sink explicitly acknowledges it.
+      */
+      return withhold(
+        "sink_unconfigured",
+        "Observability snapshot was calculated but no durable sink is configured",
+        baseEvidenceRefs,
+      );
     }
     let acknowledgement: RoomRuntimeObservabilitySinkAckV1;
     try {

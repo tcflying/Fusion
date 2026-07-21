@@ -1,11 +1,8 @@
 /*
-FNXC:DesktopOAuth 2026-07-18-04:00:
-OAuth login handlers call window.open AFTER awaiting POST /auth/login. When
-the round trip outlives Chromium's transient user activation (~5s — observed
-with the OpenAI Codex flow while the Anthropic flow, being faster, worked),
-the popup is silently blocked in the desktop app and the system browser never
-opens. On desktop, prefer the activation-free shell:openExternal IPC bridge;
-in the web app fall back to window.open.
+FNXC:DesktopOAuth 2026-07-21-09:30:
+Official Fusion v0.72.0 fixes desktop OAuth flows whose post-login await can
+outlive Chromium user activation and silently block `window.open`. On desktop,
+prefer the activation-free IPC bridge; on web, retain the browser fallback.
 */
 
 interface DesktopShellApi {
@@ -17,22 +14,14 @@ function desktopShellApi(): DesktopShellApi | undefined {
   return w.fusionAPI ?? w.electronAPI;
 }
 
-/*
-FNXC:DesktopOAuth 2026-07-18-06:00:
-Review finding: the old "fall back to window.open when the IPC declines" ran
-window.open from an async continuation — exactly the activation-less context
-this module exists to avoid, so the fallback was always popup-blocked. On
-desktop the IPC is the ONLY viable opener; a failure is logged instead of
-pretending a blocked fallback helped.
-*/
 /** Open a URL in the user's browser: desktop IPC when available, window.open otherwise. */
 export function openExternalUrl(url: string): void {
   const api = desktopShellApi();
   if (typeof api?.openExternal === "function") {
     void api.openExternal(url).then((opened) => {
-      if (!opened) console.error(`openExternalUrl: desktop shell declined to open ${url}`);
-    }).catch((error: unknown) => {
-      console.error(`openExternalUrl: desktop shell failed to open ${url}`, error);
+      if (!opened) window.open(url, "_blank");
+    }).catch(() => {
+      window.open(url, "_blank");
     });
     return;
   }

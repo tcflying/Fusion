@@ -447,7 +447,7 @@ async function listRecoverableDeliveries(
         : unsettledDelivery,
     ))
     .orderBy(asc(roomOutbox.createdAt), asc(roomOutbox.id));
-  return rows.toSorted((left, right) => {
+  return [...rows].sort((left, right) => {
     return recoveryStatePriority(left.deliveryState)
       - recoveryStatePriority(right.deliveryState);
   });
@@ -464,7 +464,7 @@ async function advanceRecoveryCheckpoint(
   const bindingCursors: Record<string, string | null> = { ...latest.bindingCursors };
   const confirmedDeliveries = deliveries
     .filter((delivery) => delivery.state === "confirmed" && delivery.nativeCursor)
-    .toSorted((left, right) =>
+    .sort((left, right) =>
       left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
     );
   for (const delivery of confirmedDeliveries) {

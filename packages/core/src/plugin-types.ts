@@ -12,7 +12,10 @@
  */
 
 import type { Database } from "./db.js";
-import type { SessionConnectorV1 } from "./room-contracts/session-connector.js";
+import type {
+  SessionConnectorV1,
+  SessionConnectorWriteAuthorizerV1,
+} from "./room-contracts/session-connector.js";
 import type { TaskStore } from "./store.js";
 import type { PlanningQuestion, Task, WorkflowStepMode, WorkflowStepToolMode } from "./types.js";
 import type {
@@ -296,6 +299,11 @@ export interface PluginContext {
   createInteractiveAiSession?: CreateInteractiveAiSessionFactory;
   /** Optional host capability to resolve a project-scoped TaskStore by projectId. */
   resolveProjectTaskStore?: (projectId: string) => Promise<TaskStore>;
+  /**
+   * Host-owned, request-scoped external-write verifier. It is present only for
+   * Session Connector factory construction; plugin settings cannot replace it.
+   */
+  sessionConnectorWriteAuthorizer?: SessionConnectorWriteAuthorizerV1;
 }
 
 /**

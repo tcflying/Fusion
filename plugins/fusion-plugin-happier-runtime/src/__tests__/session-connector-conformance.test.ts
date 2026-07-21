@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE,
   HAPPIER_OFFICIAL_MCP_SOURCE_REVISION,
+  createHappierSessionConnectorWithHostWriteAuthorization,
   HappierSessionConnector,
 } from "../session-connector.js";
 import { HAPPIER_OFFICIAL_MCP_TOOLS } from "../happier-mcp-client.js";
@@ -20,14 +21,14 @@ const IDENTITY: SessionConnectorIdentityV1 = {
   hostId: "fusion-host-1",
 };
 
-function connectorFor(options: { binding?: boolean; takeover?: boolean; tools?: string[] } = {}) {
+function connectorFor(options: { binding?: boolean; takeover?: boolean; hostAuthorization?: boolean; tools?: string[] } = {}) {
   const tools = options.tools ?? Object.values(HAPPIER_OFFICIAL_MCP_TOOLS);
   const client = {
     listTools: vi.fn(async () => tools.map((name) => ({ name }))),
     callTool: vi.fn(async () => ({ structuredContent: { sessionId: IDENTITY.happierSessionId } })),
     close: vi.fn(async () => undefined),
   };
-  return new HappierSessionConnector({
+  const connectorOptions = {
     settings: {
       activeServerId: "server-1",
       ...(options.binding === false ? {} : {
@@ -56,7 +57,17 @@ function connectorFor(options: { binding?: boolean; takeover?: boolean; tools?: 
         details: [],
       })),
     },
-  });
+  };
+  const verifier = options.hostAuthorization
+    ? vi.fn(async (request) => ({
+      authorized: true as const,
+      authorizationId: "host-grant-1",
+      scopeFingerprint: request.scopeFingerprint,
+    }))
+    : undefined;
+  return verifier
+    ? createHappierSessionConnectorWithHostWriteAuthorization(connectorOptions, verifier)
+    : new HappierSessionConnector(connectorOptions);
 }
 
 describe("Happier official MCP capability conformance", () => {
@@ -70,16 +81,20 @@ describe("Happier official MCP capability conformance", () => {
     });
   });
 
-  it("certifies only manually bound MCP controls and leaves native-only surfaces unavailable", async () => {
-    const connector = connectorFor({ takeover: true });
-    const capabilities = await connector.getCapabilities(IDENTITY);
+  it("certifies an MCP send only when a host-owned request authorization verifier is installed", async () => {
+    const withoutHostVerifier = await connectorFor({ takeover: true }).getCapabilities(IDENTITY);
+    const capabilities = await connectorFor({ takeover: true, hostAuthorization: true }).getCapabilities(IDENTITY);
 
     expect(capabilities.sourceRevision).toBe(HAPPIER_OFFICIAL_MCP_SOURCE_REVISION);
+    expect(withoutHostVerifier.capabilities).toMatchObject({
+      send: { state: "unavailable", reasonCode: "operation_unavailable" },
+      interrupt: { state: "unavailable", reasonCode: "operation_unavailable" },
+    });
     expect(capabilities.capabilities).toMatchObject({
       ensureExisting: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_list+session_status_get" },
       status: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_status_get" },
       send: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_message_send+session_wait_idle" },
-      interrupt: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_stop" },
+      interrupt: { state: "unavailable", reasonCode: "operation_unavailable" },
       create: { state: "unavailable", reasonCode: "operation_unavailable" },
       history: { state: "unavailable", reasonCode: "operation_unavailable" },
       events: { state: "unavailable", reasonCode: "operation_unavailable" },

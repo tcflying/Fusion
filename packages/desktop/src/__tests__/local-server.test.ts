@@ -119,6 +119,7 @@ const mocks = vi.hoisted(() => {
     authStorage: { ...(authStorage as object), __wrapped: true },
     dispose: seedDashboardProvidersDispose,
   }));
+  const createTaskStoreForBackend = vi.fn(async () => null);
 
   return {
     TaskStore,
@@ -138,6 +139,7 @@ const mocks = vi.hoisted(() => {
     runPluginSchemaInits,
     seedDashboardProviders,
     seedDashboardProvidersDispose,
+    createTaskStoreForBackend,
     ensureBundledPluginInstalled,
     isBundledPluginId,
     resolveDesktopBundlePluginDirs,
@@ -150,6 +152,7 @@ vi.mock("@fusion/core", () => ({
   /* FNXC:MigrationHoldingPage 2026-07-17-13:50: local-server.ts formats migration progress for the launch gate. */
   formatMigrationProgress: (event: { phase: string }) => `migration ${event.phase}`,
   CentralCore: mocks.CentralCore,
+  createTaskStoreForBackend: mocks.createTaskStoreForBackend,
   PluginLoader: mocks.PluginLoader,
   ensureBundledPluginInstalled: mocks.ensureBundledPluginInstalled,
   isBundledPluginId: mocks.isBundledPluginId,
@@ -169,6 +172,7 @@ vi.mock("@fusion/engine", () => ({
 describe("DesktopLocalServerManager", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.createTaskStoreForBackend.mockResolvedValue(null);
   });
 
   it("starts local runtime and exposes port", async () => {
@@ -193,6 +197,23 @@ describe("DesktopLocalServerManager", () => {
         centralCore: mocks.centralCore,
       }),
     );
+  });
+
+  it("uses the backend boot's unscoped host layer for CentralCore", async () => {
+    const { DesktopLocalServerManager } = await import("../local-server.ts");
+    const hostAsyncLayer = { scope: "host" };
+    mocks.createTaskStoreForBackend.mockResolvedValueOnce({
+      taskStore: mocks.store,
+      hostAsyncLayer,
+      shutdown: vi.fn(async () => undefined),
+    });
+    const manager = new DesktopLocalServerManager("/repo");
+
+    await manager.start();
+
+    expect(mocks.CentralCore).toHaveBeenCalledWith(undefined, { asyncLayer: hostAsyncLayer });
+
+    await manager.stop();
   });
 
   it("stops local runtime and resets state", async () => {

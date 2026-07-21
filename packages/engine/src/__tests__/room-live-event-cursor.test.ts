@@ -191,9 +191,9 @@ describe("RoomLiveEventCursorCoordinator", () => {
   });
 
   it("uses durable canonical replay for a Room the process has not observed in memory", async () => {
-    const canonicalReplay = vi.fn(async () => [roomEvent("7")]);
+    const canonicalReplay = vi.fn(async () => ({ events: [roomEvent("7")], hasMore: false }));
     const coordinator = new RoomLiveEventCursorCoordinator({
-      canonicalReplayPort: { listEvents: canonicalReplay },
+      canonicalReplayPort: { listEventPage: canonicalReplay },
       maxBufferedEvents: 2,
       maxReplayEvents: 2,
     });
@@ -216,9 +216,29 @@ describe("RoomLiveEventCursorCoordinator", () => {
     expect(result.events.map((event) => event.eventId)).toEqual(["event-7"]);
   });
 
+  it("keeps the canonical replay port as a paged contract instead of inferring continuation from event count", async () => {
+    const canonicalReplay = vi.fn(async () => ({ events: [], hasMore: true }));
+    const port = { listEventPage: canonicalReplay } satisfies RoomLiveEventCanonicalReplayPortV1;
+    const coordinator = new RoomLiveEventCursorCoordinator({
+      canonicalReplayPort: port,
+      maxBufferedEvents: 2,
+      maxReplayEvents: 2,
+    });
+
+    const result = await coordinator.reconnect(reconnect(null, 2));
+
+    expect(canonicalReplay).toHaveBeenCalledWith({
+      contractVersion: 1,
+      scope: SCOPE,
+      afterCursor: null,
+      limit: 2,
+    });
+    expect(result).toMatchObject({ ok: true, replaySource: "canonical_port", hasMore: true });
+  });
+
   it("uses the injected canonical replay port after bounded cache overflow and exposes the overflow alert to an SSE/dashboard consumer", async () => {
-    const canonicalReplay = vi.fn(async () => [roomEvent("1"), roomEvent("2")]);
-    const port: RoomLiveEventCanonicalReplayPortV1 = { listEvents: canonicalReplay };
+    const canonicalReplay = vi.fn(async () => ({ events: [roomEvent("1"), roomEvent("2")], hasMore: true }));
+    const port: RoomLiveEventCanonicalReplayPortV1 = { listEventPage: canonicalReplay };
     const coordinator = new RoomLiveEventCursorCoordinator({
       canonicalReplayPort: port,
       maxBufferedEvents: 2,

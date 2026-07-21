@@ -150,7 +150,14 @@ describe("RoomRuntimeObservabilityBridge", () => {
   });
 
   it("publishes unknown telemetry and explicit alerts instead of fabricating connector health or zero metrics", async () => {
-    const bridge = new RoomRuntimeObservabilityBridge();
+    const publish = vi.fn(async () => ({
+      ok: true as const,
+      acknowledgementRef: "evidence://sink/unknown-telemetry-ack",
+      acknowledgedAt: COMPUTED_AT,
+    }));
+    const bridge = new RoomRuntimeObservabilityBridge({
+      sink: { publish } satisfies RoomRuntimeObservabilitySinkV1,
+    });
 
     const result = await bridge.observe(input({
       connectorRuntime: null,
@@ -160,7 +167,7 @@ describe("RoomRuntimeObservabilityBridge", () => {
     expect(result).toMatchObject({
       ok: true,
       outcome: "published",
-      delivery: "core_calculated",
+      delivery: "sink_acknowledged",
       connector: { state: "unknown" },
       idle: { state: "unknown" },
       snapshot: {
@@ -181,6 +188,19 @@ describe("RoomRuntimeObservabilityBridge", () => {
       "metrics_telemetry_missing",
       "connector_health_unknown",
     ]));
+  });
+
+  it("withholds calculated metrics when no durable sink is configured", async () => {
+    const bridge = new RoomRuntimeObservabilityBridge();
+
+    const result = await bridge.observe(input());
+
+    expect(result).toMatchObject({
+      ok: false,
+      outcome: "withheld",
+      reason: { code: "sink_unconfigured" },
+    });
+    expect(bridge.getLatest(SCOPE)).toBeNull();
   });
 
   it("withholds cross-scope connector facts before they can overwrite a Room snapshot", async () => {

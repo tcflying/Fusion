@@ -856,6 +856,7 @@ describe("Session Room PostgreSQL crash recovery", () => {
     await fixture.roomStore.completeDeliveryAttempt({
       outboxId: fixture.outboxId,
       attemptId: "attempt-future-retry-window-1",
+      senderFence: senderFence(leases.sender),
       outcome: "retryable_failure",
       connectorAcknowledgementId: null,
       nativeMessageId: null,
@@ -927,6 +928,7 @@ describe("Session Room PostgreSQL crash recovery", () => {
     await fixture.roomStore.completeDeliveryAttempt({
       outboxId: fixture.outboxId,
       attemptId: "attempt-uncertain-sibling-block-1",
+      senderFence: senderFence(leases.sender),
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
       nativeMessageId: null,
@@ -1720,6 +1722,7 @@ describe("Session Room PostgreSQL crash recovery", () => {
     const uncertain = await fixture.roomStore.completeDeliveryAttempt({
       outboxId: fixture.outboxId,
       attemptId: "attempt-uncertain-same-version-1",
+      senderFence: senderFence(initialLeases.sender),
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
       nativeMessageId: null,
@@ -1951,6 +1954,7 @@ describe("Session Room PostgreSQL crash recovery", () => {
     await fixture.roomStore.completeDeliveryAttempt({
       outboxId: fixture.outboxId,
       attemptId: "attempt-native-takeover-uncertain",
+      senderFence: senderFence(firstLeases.sender),
       outcome: "delivery_uncertain",
       connectorAcknowledgementId: null,
       nativeMessageId: null,

@@ -13,16 +13,18 @@
  *   - Graceful shutdown of all engines via `stopAll()`
  */
 
-import { realpathSync } from "node:fs";
-import { resolve as pathResolve } from "node:path";
 import type {
   CentralCore,
   TaskStore,
   RegisteredProject,
-  MigrationProgressEvent,
 } from "@fusion/core";
 import { ProjectEngine } from "./project-engine.js";
 import type { ProjectEngineOptions } from "./project-engine.js";
+import type { RoomHostCompositionProviderV1 } from "./room-host-composition.js";
+import {
+  createRoomHostCompositionOperatorPolicyProvider,
+  type RoomHostCompositionOperatorAdapterRegistryV1,
+} from "./room-host-composition-operator-policy-provider.js";
 import type { ProjectRuntimeConfig } from "./project-runtime.js";
 import { AgentSemaphore } from "./concurrency.js";
 import {
@@ -51,18 +53,25 @@ export interface EngineManagerOptions {
   getTaskMergeBlocker?: ProjectEngineOptions["getTaskMergeBlocker"];
   onInsightRunProcessed?: ProjectEngineOptions["onInsightRunProcessed"];
   /**
-   * FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
-   * backend boot so engines reuse one connection pool (no second embedded PG).
-   *
-   * FNXC:FasterStartup 2026-07-14-23:55:
-   * Inject only for the project whose resolved working directory matches this
-   * store's rootDir. Multi-project engines must factory-boot (or receive) their
-   * own bound store — a cwd-partitioned TaskStore must never back a different
-   * project root. Callers may still pass per-call overrides via ensureEngine.
+   * FNXC:RoomHostComposition 2026-07-20-02:28:
+   * The manager forwards the one host-owned Room composition authority by
+   * identity. It must not derive capacity, provider limits, connector facts, or
+   * raw Room seams from project settings while the provider resolves the bundle.
    */
+  roomHostCompositionProvider?: RoomHostCompositionProviderV1;
+  /**
+   * Opt-in host-owned registry for a CentralCore Room operator-policy bundle.
+   * It is deliberately separate from raw seams and an already-built provider:
+   * mixing the origins would make the active execution authority ambiguous.
+   */
+  roomHostCompositionOperatorAdapterRegistry?: RoomHostCompositionOperatorAdapterRegistryV1;
+  roomGlobalConcurrencyVerifiedPolicy?: ProjectEngineOptions["roomGlobalConcurrencyVerifiedPolicy"];
+  roomProviderBackpressureVerifiedFactory?: ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"];
+  roomCapabilityRegistryRefreshVerifiedFactory?: ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"];
+  roomTaskDispatchCapacityAdmissionVerifiedFactory?: ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"];
+  // FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
+  // backend boot so all engines reuse one connection pool (no second embedded PG).
   externalTaskStore?: ProjectEngineOptions["externalTaskStore"];
-  /** Forward first-boot SQLite migration progress to a fixed-port holding server. */
-  onMigrationProgress?: (event: MigrationProgressEvent) => void;
 }
 
 /** Default interval for background reconciliation (30 seconds). */
@@ -98,11 +107,47 @@ export class ProjectEngineManager {
   /** Reconciliation state for background project startup. */
   private reconciliationInterval: ReturnType<typeof setInterval> | null = null;
   private reconciliationStopped = false;
+  private readonly resolvedRoomHostCompositionProvider?: RoomHostCompositionProviderV1;
 
   constructor(
     private centralCore: CentralCore,
     private options: EngineManagerOptions = {},
   ) {
+    const hasRawVerifiedRoomComposition =
+      options.roomGlobalConcurrencyVerifiedPolicy !== undefined
+      || options.roomProviderBackpressureVerifiedFactory !== undefined
+      || options.roomCapabilityRegistryRefreshVerifiedFactory !== undefined
+      || options.roomTaskDispatchCapacityAdmissionVerifiedFactory !== undefined;
+    if (
+      options.roomHostCompositionOperatorAdapterRegistry !== undefined
+      && options.roomHostCompositionProvider !== undefined
+    ) {
+      throw new Error(
+        "ProjectEngineManager rejects an explicit Room host composition provider with an operator adapter registry",
+      );
+    }
+    if (
+      options.roomHostCompositionOperatorAdapterRegistry !== undefined
+      && hasRawVerifiedRoomComposition
+    ) {
+      throw new Error(
+        "ProjectEngineManager rejects an operator adapter registry with raw verified Room composition seams",
+      );
+    }
+    /*
+    FNXC:RoomHostCompositionOperatorManager 2026-07-20-09:32:
+    The manager may construct the CentralCore-backed provider only when a host
+    explicitly supplies its live adapter registry. It does not enable a default
+    policy, infer adapter facts, or silently merge this authority with legacy
+    raw seams; missing/expired policy or unverified adapters remain withheld.
+    */
+    this.resolvedRoomHostCompositionProvider = options.roomHostCompositionProvider
+      ?? (options.roomHostCompositionOperatorAdapterRegistry === undefined
+        ? undefined
+        : createRoomHostCompositionOperatorPolicyProvider({
+          authorityReader: centralCore,
+          adapterRegistry: options.roomHostCompositionOperatorAdapterRegistry,
+        }));
     // Dynamic getter so live changes to globalMaxConcurrent take effect immediately
     this.globalSemaphore = new AgentSemaphore(() => this.currentGlobalLimit);
 
@@ -300,17 +345,6 @@ export class ProjectEngineManager {
       this.concurrencyListener = undefined;
     }
 
-    /*
-    FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
-    Project runtimes own the PostgreSQL pools CentralCore may have adopted. Persist mesh-offline state before stopping any engine so runtime backend shutdown cannot race the final central write against a closed pool.
-    */
-    try {
-      this.centralCore.stopDiscovery();
-      await this.centralCore.markLocalNodeOffline();
-    } catch (error) {
-      runtimeLog.warn(`Failed to persist local node offline before engine shutdown: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
     const stops = Array.from(this.engines.entries()).map(
       async ([id, engine]) => {
         try {
@@ -482,7 +516,7 @@ export class ProjectEngineManager {
     }
 
     const runtimeConfig = await this.buildRuntimeConfig(project);
-    const engineOptions = this.buildEngineOptions(project, runtimeConfig.workingDirectory, overrides);
+    const engineOptions = this.buildEngineOptions(project, overrides);
 
     // Acquire the per-machine singleton guard before spinning up any engine
     // subsystems. This prevents two fusion processes from running engines for
@@ -556,27 +590,13 @@ export class ProjectEngineManager {
       maxWorktrees: (settings?.maxWorktrees as number) ?? 10,
       // Shared global semaphore — all engines share one concurrency pool
       globalSemaphore: this.globalSemaphore,
-      onMigrationProgress: this.options.onMigrationProgress,
     };
   }
 
   private buildEngineOptions(
     project: RegisteredProject,
-    workingDirectory: string,
     overrides?: Partial<ProjectEngineOptions>,
   ): ProjectEngineOptions {
-    /*
-    FNXC:FasterStartup 2026-07-14-23:55 / 2026-07-15-00:40:
-    Share the CLI-booted TaskStore only when the engine's working directory is
-    the same project root as the store. Compare realpath when available so a
-    symlinked CLI cwd and a registry-canonical path still share one pool
-    (Greptile: path.resolve alone double-boots symlink aliases).
-    */
-    const sharedStore = this.options.externalTaskStore;
-    const shareForThisProject = Boolean(
-      sharedStore
-      && sameProjectRoot(sharedStore.getRootDir(), workingDirectory),
-    );
     return {
       projectId: project.id,
       cliPackageVersion: this.options.cliPackageVersion,
@@ -588,25 +608,16 @@ export class ProjectEngineManager {
       prReconcileGithubOps: this.options.prReconcileGithubOps,
       getTaskMergeBlocker: this.options.getTaskMergeBlocker,
       onInsightRunProcessed: this.options.onInsightRunProcessed,
-      ...(shareForThisProject && sharedStore ? { externalTaskStore: sharedStore } : {}),
+      roomHostCompositionProvider: this.resolvedRoomHostCompositionProvider,
+      roomGlobalConcurrencyVerifiedPolicy: this.options.roomGlobalConcurrencyVerifiedPolicy,
+      roomProviderBackpressureVerifiedFactory: this.options.roomProviderBackpressureVerifiedFactory,
+      roomCapabilityRegistryRefreshVerifiedFactory: this.options.roomCapabilityRegistryRefreshVerifiedFactory,
+      roomTaskDispatchCapacityAdmissionVerifiedFactory: this.options.roomTaskDispatchCapacityAdmissionVerifiedFactory,
+      // FNXC:SqliteFinalRemoval 2026-06-26-11:20: forward the shared external
+      // TaskStore so engines reuse the central boot's connection pool instead
+      // of starting a second embedded PostgreSQL on the same data dir.
+      ...(this.options.externalTaskStore ? { externalTaskStore: this.options.externalTaskStore } : {}),
       ...overrides,
     };
   }
-}
-
-/**
- * FNXC:FasterStartup 2026-07-15-00:40:
- * Path identity for externalTaskStore matching: resolve then realpath so
- * symlinked project roots compare equal to their canonical registry path.
- */
-function sameProjectRoot(a: string, b: string): boolean {
-  const normalize = (p: string): string => {
-    const resolved = pathResolve(p);
-    try {
-      return realpathSync(resolved);
-    } catch {
-      return resolved;
-    }
-  };
-  return normalize(a) === normalize(b);
 }

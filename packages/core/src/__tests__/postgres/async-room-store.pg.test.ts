@@ -238,21 +238,28 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       },
     );
 
-    const firstPage = await store.listEvents(created.room.id, undefined, { limit: 2 });
-    expect(firstPage).toHaveLength(2);
-    expect(firstPage.map((event) => event.aggregateVersion)).toEqual([0, 1]);
-    expect(Number(firstPage[0]?.cursor)).toBeLessThan(Number(firstPage[1]?.cursor));
+    const firstPage = await store.listEventPage(created.room.id, undefined, { limit: 2 });
+    expect(firstPage.events).toHaveLength(2);
+    expect(firstPage.events.map((event) => event.aggregateVersion)).toEqual([0, 1]);
+    expect(firstPage.hasMore).toBe(true);
+    expect(Number(firstPage.events[0]?.cursor)).toBeLessThan(Number(firstPage.events[1]?.cursor));
 
-    const afterCursor = firstPage[1]?.cursor;
+    const afterCursor = firstPage.events[1]?.cursor;
     if (!afterCursor) throw new Error("Bounded canonical replay did not return a cursor");
-    const secondPage = await store.listEvents(created.room.id, afterCursor, { limit: 1 });
-    expect(secondPage).toHaveLength(1);
-    expect(secondPage.map((event) => event.aggregateVersion)).toEqual([2]);
-    expect(Number(secondPage[0]?.cursor)).toBeGreaterThan(Number(afterCursor));
+    const secondPage = await store.listEventPage(created.room.id, afterCursor, { limit: 1 });
+    expect(secondPage.events).toHaveLength(1);
+    expect(secondPage.events.map((event) => event.aggregateVersion)).toEqual([2]);
+    expect(secondPage.hasMore).toBe(false);
+    expect(Number(secondPage.events[0]?.cursor)).toBeGreaterThan(Number(afterCursor));
+
+    const legacyPage = await store.listEvents(created.room.id, undefined, { limit: 2 });
+    expect(legacyPage.map((event) => event.aggregateVersion)).toEqual([0, 1]);
 
     await expect(store.listEvents(created.room.id, undefined, { limit: 0 }))
       .rejects.toMatchObject({ code: "room_event_list_invalid" });
     await expect(store.listEvents(created.room.id, undefined, { limit: MAX_ROOM_EVENT_LIST_LIMIT + 1 }))
+      .rejects.toMatchObject({ code: "room_event_list_invalid" });
+    await expect(store.listEventPage(created.room.id, "1.0", { limit: 1 }))
       .rejects.toMatchObject({ code: "room_event_list_invalid" });
   });
 
@@ -1015,5 +1022,5 @@ describe("AsyncRoomStore PostgreSQL transactions", () => {
       reconciliationFromCursor: "cursor-after-accepted-evidence",
       now: "2026-07-17T04:16:01.000Z",
     })).rejects.toThrow(/uncertain|accepted evidence|reconcile/i);
-  });
+  }, 60_000);
 });

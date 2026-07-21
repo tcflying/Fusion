@@ -34,6 +34,8 @@ import {
   disablePlugin as disablePluginAsync,
   updatePluginState as updatePluginStateAsync,
   updatePluginSettings as updatePluginSettingsAsync,
+  getProjectState as getProjectStateAsync,
+  updateProjectPluginSettings as updateProjectPluginSettingsAsync,
   updatePluginInstall as updatePluginInstallAsync,
 } from "./async-plugin-store.js";
 
@@ -50,7 +52,215 @@ const HAPPIER_RUNTIME_SETTING_KEYS = new Set([
   "backend",
   "timeoutMs",
   "maxOutputBytes",
+  "happierSessionBindings",
 ]);
+
+const HAPPIER_SESSION_BINDING_FIELDS = new Set([
+  "canonicalSessionUri",
+  "happierSessionId",
+  "serverProfileId",
+  "machineId",
+]);
+const HAPPIER_LEGACY_STORED_SESSION_BINDING_FIELDS = new Set([
+  ...HAPPIER_SESSION_BINDING_FIELDS,
+  "projectPath",
+  "takeoverConfirmedAt",
+]);
+
+type HappierSessionBinding = Readonly<{
+  canonicalSessionUri: string;
+  happierSessionId: string;
+  serverProfileId: string;
+  machineId: string;
+}>;
+
+type HappierStoredSessionBinding = Readonly<{
+  projectPath: string;
+}> & HappierSessionBinding;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function safeHappierString(value: unknown, maximum = 512): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(trimmed) ? trimmed : null;
+}
+
+function canonicalHappierSessionUri(value: unknown): string | null {
+  const candidate = safeHappierString(value, 2_000);
+  if (!candidate) return null;
+  try {
+    const uri = new URL(candidate);
+    const providerId = uri.protocol.slice(0, -1);
+    if (providerId !== "codex" && providerId !== "claude" && providerId !== "opencode") return null;
+    const expectedHost = providerId === "codex" ? "threads" : "sessions";
+    if (uri.hostname !== expectedHost || uri.username || uri.password || uri.port || uri.search || uri.hash) return null;
+    const nativeSessionId = safeHappierString(decodeURIComponent(uri.pathname.replace(/^\/+/u, "")), 512);
+    if (!nativeSessionId || nativeSessionId.includes("/")) return null;
+    const canonical = `${providerId}://${expectedHost}/${encodeURIComponent(nativeSessionId)}`;
+    return candidate === canonical ? canonical : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactFields(value: Record<string, unknown>, allowed: ReadonlySet<string>): string[] {
+  return Object.keys(value).filter((key) => !allowed.has(key)).sort();
+}
+
+function validateHappierBinding(value: unknown): string[] {
+  if (!isRecord(value)) return ["must be an object"];
+  const unsupported = exactFields(value, HAPPIER_SESSION_BINDING_FIELDS);
+  if (unsupported.length > 0) return [`contains unsupported field(s): ${unsupported.join(", ")}`];
+  if (!canonicalHappierSessionUri(value.canonicalSessionUri)) return ["has an invalid canonicalSessionUri"];
+  for (const key of ["happierSessionId", "serverProfileId", "machineId"] as const) {
+    if (!safeHappierString(value[key])) return [`has an invalid ${key}`];
+  }
+  return [];
+}
+
+function normalizeHappierBinding(value: unknown): HappierSessionBinding | null {
+  if (validateHappierBinding(value).length > 0 || !isRecord(value)) return null;
+  const canonicalSessionUri = canonicalHappierSessionUri(value.canonicalSessionUri);
+  const happierSessionId = safeHappierString(value.happierSessionId);
+  const serverProfileId = safeHappierString(value.serverProfileId);
+  const machineId = safeHappierString(value.machineId);
+  if (!canonicalSessionUri || !happierSessionId || !serverProfileId || !machineId) return null;
+  return { canonicalSessionUri, happierSessionId, serverProfileId, machineId };
+}
+
+function normalizeLegacyStoredHappierBinding(value: unknown): HappierStoredSessionBinding | null {
+  if (!isRecord(value)) return null;
+  if (exactFields(value, HAPPIER_LEGACY_STORED_SESSION_BINDING_FIELDS).length > 0) return null;
+  const binding = normalizeHappierBinding(Object.fromEntries(
+    Object.entries(value).filter(([key]) => HAPPIER_SESSION_BINDING_FIELDS.has(key)),
+  ));
+  const projectPath = safeHappierString(value.projectPath, 4_096);
+  if (!binding || !projectPath || projectPath !== resolve(projectPath)) return null;
+  if (value.takeoverConfirmedAt !== undefined) {
+    const confirmedAt = safeHappierString(value.takeoverConfirmedAt, 128);
+    if (!confirmedAt || !Number.isFinite(Date.parse(confirmedAt))) return null;
+  }
+  return { projectPath, ...binding };
+}
+
+function validateHappierSessionBindings(value: unknown): string[] {
+  if (!Array.isArray(value)) return ["happierSessionBindings must be an array"];
+  const seenCanonicalSessions = new Set<string>();
+  const seenHappierSessions = new Set<string>();
+  const errors: string[] = [];
+  for (const [index, binding] of value.entries()) {
+    const bindingErrors = validateHappierBinding(binding);
+    if (bindingErrors.length > 0) {
+      errors.push(`happierSessionBindings[${index}] ${bindingErrors.join(", ")}`);
+      continue;
+    }
+    const normalized = normalizeHappierBinding(binding);
+    if (!normalized) {
+      errors.push(`happierSessionBindings[${index}] has an invalid canonical form`);
+      continue;
+    }
+    const canonicalKey = normalized.canonicalSessionUri;
+    const happierKey = normalized.happierSessionId;
+    if (seenCanonicalSessions.has(canonicalKey) || seenHappierSessions.has(happierKey)) {
+      errors.push(`happierSessionBindings[${index}] conflicts with an existing binding in this project`);
+      continue;
+    }
+    seenCanonicalSessions.add(canonicalKey);
+    seenHappierSessions.add(happierKey);
+  }
+  return errors;
+}
+
+function storedHappierBindings(value: unknown): readonly HappierStoredSessionBinding[] {
+  if (!Array.isArray(value)) return [];
+  const normalized: HappierStoredSessionBinding[] = [];
+  const seenCanonicalSessions = new Set<string>();
+  const seenHappierSessions = new Set<string>();
+  for (const candidate of value) {
+    const binding = normalizeLegacyStoredHappierBinding(candidate);
+    if (!binding) continue;
+    const canonicalKey = `${binding.projectPath}\u0000${binding.canonicalSessionUri}`;
+    const happierKey = `${binding.projectPath}\u0000${binding.happierSessionId}`;
+    if (seenCanonicalSessions.has(canonicalKey) || seenHappierSessions.has(happierKey)) continue;
+    seenCanonicalSessions.add(canonicalKey);
+    seenHappierSessions.add(happierKey);
+    normalized.push(binding);
+  }
+  return normalized;
+}
+
+function normalizedProjectHappierBindings(value: unknown): readonly HappierSessionBinding[] {
+  if (!Array.isArray(value)) return [];
+  const normalized: HappierSessionBinding[] = [];
+  const seenCanonicalSessions = new Set<string>();
+  const seenHappierSessions = new Set<string>();
+  for (const candidate of value) {
+    const binding = normalizeHappierBinding(candidate);
+    if (!binding || seenCanonicalSessions.has(binding.canonicalSessionUri) || seenHappierSessions.has(binding.happierSessionId)) continue;
+    seenCanonicalSessions.add(binding.canonicalSessionUri);
+    seenHappierSessions.add(binding.happierSessionId);
+    normalized.push(binding);
+  }
+  return normalized;
+}
+
+function projectHappierSettings(value: unknown): Record<string, unknown> {
+  if (!isRecord(value) || !hasOwn(value, "happierSessionBindings")) return {};
+  if (validateHappierSessionBindings(value.happierSessionBindings).length > 0) return {};
+  const bindings = normalizedProjectHappierBindings(value.happierSessionBindings);
+  return { happierSessionBindings: bindings };
+}
+
+function legacyProjectHappierSettings(
+  settings: Record<string, unknown>,
+  projectPath: string,
+): Record<string, unknown> {
+  const bindings = storedHappierBindings(settings.happierSessionBindings)
+    .filter((binding) => binding.projectPath === projectPath)
+    .map(({ projectPath: _projectPath, ...binding }) => binding);
+  return bindings.length > 0 ? { happierSessionBindings: bindings } : {};
+}
+
+function projectScopedHappierSettings(
+  settings: Record<string, unknown>,
+  projectSettings: Record<string, unknown>,
+  legacyProjectPath?: string,
+): Record<string, unknown> {
+  const { happierSessionBindings: _legacyBindings, ...withoutBindings } = settings;
+  const scoped = projectHappierSettings(projectSettings);
+  if (hasOwn(scoped, "happierSessionBindings")) return { ...withoutBindings, ...scoped };
+  return legacyProjectPath
+    ? { ...withoutBindings, ...legacyProjectHappierSettings(settings, legacyProjectPath) }
+    : withoutBindings;
+}
+
+function splitHappierSettingsForPersistence(settings: Record<string, unknown>): {
+  globalSettings: Record<string, unknown>;
+  projectSettings: Record<string, unknown> | undefined;
+} {
+  const { happierSessionBindings, ...globalSettings } = settings;
+  if (!hasOwn(settings, "happierSessionBindings")) return { globalSettings, projectSettings: undefined };
+  return {
+    globalSettings,
+    projectSettings: { happierSessionBindings: normalizedProjectHappierBindings(happierSessionBindings) },
+  };
+}
+
+/*
+ * FNXC:HappierSessionBindingPersistence 2026-07-20-01:20:
+ * A Happier mapping is project-owned state rather than global installation
+ * configuration. Normalize every persisted identity, reject whitespace aliases,
+ * and never let a malformed legacy element erase valid mappings for another
+ * project. Binding metadata cannot authorize provider writes; that boundary is
+ * enforced by the connector's host/runtime authorization interface.
+ */
 
 export function validatePluginSettingsPolicy(
   pluginId: string,
@@ -58,9 +268,13 @@ export function validatePluginSettingsPolicy(
 ): string[] {
   if (pluginId !== HAPPIER_RUNTIME_PLUGIN_ID) return [];
   const unsupported = Object.keys(settings).filter((key) => !HAPPIER_RUNTIME_SETTING_KEYS.has(key));
-  return unsupported.length > 0
+  const errors = unsupported.length > 0
     ? [`Unsupported Happier setting(s): ${unsupported.sort().join(", ")}`]
     : [];
+  if ("happierSessionBindings" in settings) {
+    errors.push(...validateHappierSessionBindings(settings.happierSessionBindings));
+  }
+  return errors;
 }
 
 export function sanitizePersistedPluginSettings(
@@ -68,9 +282,10 @@ export function sanitizePersistedPluginSettings(
   settings: Record<string, unknown>,
 ): Record<string, unknown> {
   if (pluginId !== HAPPIER_RUNTIME_PLUGIN_ID) return settings;
-  return Object.fromEntries(
-    Object.entries(settings).filter(([key]) => HAPPIER_RUNTIME_SETTING_KEYS.has(key)),
+  const sanitized = Object.fromEntries(
+    Object.entries(settings).filter(([key]) => key !== "happierSessionBindings" && HAPPIER_RUNTIME_SETTING_KEYS.has(key)),
   );
+  return sanitized;
 }
 
 export interface PluginStoreEvents {
@@ -145,6 +360,8 @@ interface ProjectStateRow {
   enabled: number;
   state: string;
   error: string | null;
+  /** Present only after the project-state settings migration. */
+  settings?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -229,17 +446,13 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
 
   /**
    * FNXC:SqliteFinalRemoval 2026-06-26-10:10:
-   * In backend mode (asyncLayer injected), never construct operational SQLite
-   * stores. A narrowly scoped, read-only bridge may inspect retained plugin
-   * rows once behind a durable PostgreSQL marker; all subsequent install and
-   * project-state authority remains in PostgreSQL.
+   * In backend mode (asyncLayer injected), skip all SQLite construction and
+   * the legacy migration sweep. The PostgreSQL schema baseline already covers
+   * these. The per-project plugin state rows are created on-demand by the
+   * async register/enable/disable helpers.
    */
   async init(): Promise<void> {
     if (this.backendMode) {
-      /*
-      FNXC:PluginLegacyMigration 2026-07-15-02:09:
-      PostgreSQL plugin reads use central.plugin_installs plus path-scoped project_plugin_states. The startup factory completes the retained-SQLite bridge with its privileged migration connection before constructing the runtime layer; PluginStore.init must not attempt DDL or migration writes through the restricted project-scoped role used by dashboard, serve, desktop, and engine startup.
-      */
       return;
     }
     const _ = this.localDb;
@@ -301,10 +514,18 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
   }
 
   private rowToPlugin(install: InstallRow, state?: ProjectStateRow): PluginInstallation {
-    const settings = sanitizePersistedPluginSettings(
+    const storedSettings = sanitizePersistedPluginSettings(
       install.id,
       fromJson<Record<string, unknown>>(install.settings) || {},
     );
+    const stateSettings = fromJson<Record<string, unknown>>(state?.settings) || {};
+    const settings = install.id === HAPPIER_RUNTIME_PLUGIN_ID
+      ? projectScopedHappierSettings(
+        storedSettings,
+        stateSettings,
+        this.normalizedProjectPath,
+      )
+      : storedSettings;
     return {
       id: install.id,
       name: install.name,
@@ -329,7 +550,7 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
   private cleanPersistedSettings(install: InstallRow): InstallRow {
     const settings = fromJson<Record<string, unknown>>(install.settings) || {};
     const sanitized = sanitizePersistedPluginSettings(install.id, settings);
-    if (Object.keys(settings).length === Object.keys(sanitized).length) return install;
+    if (toJson(settings) === toJson(sanitized)) return install;
 
     /*
      * FNXC:HappierRuntime 2026-07-14-10:13:
@@ -343,6 +564,91 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       .run(serialized, updatedAt, install.id);
     this.centralDb.bumpLastModified();
     return { ...install, settings: serialized, updatedAt };
+  }
+
+  private async migrateLegacyHappierBindings(
+    plugin: PluginInstallation,
+  ): Promise<PluginInstallation> {
+    if (
+      plugin.id !== HAPPIER_RUNTIME_PLUGIN_ID
+      || !hasOwn(plugin.settings, "happierSessionBindings")
+    ) {
+      return plugin;
+    }
+
+    /*
+     * FNXC:HappierProjectBindingMigration 2026-07-20-02:25:
+     * Earlier builds put every project's Happier mappings into one mutable
+     * installation document. Move every independently valid legacy record in
+     * one transaction, preserve an explicit valid per-project empty array as a
+     * deliberate clear, and remove the global field only after that transfer.
+     * A malformed sibling must never erase valid mappings owned by another
+     * project.
+     */
+    await this.asyncLayer!.transactionImmediate(async (tx) => {
+      const current = await getPluginAsync(tx, plugin.id, this.normalizedProjectPath);
+      if (!hasOwn(current.settings, "happierSessionBindings")) return;
+
+      const grouped = new Map<string, HappierSessionBinding[]>();
+      for (const binding of storedHappierBindings(current.settings.happierSessionBindings)) {
+        const { projectPath, ...projectBinding } = binding;
+        const bindings = grouped.get(projectPath) ?? [];
+        bindings.push(projectBinding);
+        grouped.set(projectPath, bindings);
+      }
+
+      for (const [projectPath, bindings] of grouped) {
+        const state = await getProjectStateAsync(tx, projectPath, plugin.id);
+        if (projectHappierSettings(state?.settings).happierSessionBindings !== undefined) continue;
+        await updateProjectPluginSettingsAsync(tx, {
+          projectPath,
+          pluginId: plugin.id,
+          settings: { happierSessionBindings: bindings },
+        });
+      }
+
+      await updatePluginSettingsAsync(
+        tx,
+        plugin.id,
+        sanitizePersistedPluginSettings(plugin.id, current.settings),
+      );
+    });
+
+    return getPluginAsync(this.asyncLayer!.db, plugin.id, this.normalizedProjectPath);
+  }
+
+  private async cleanBackendPersistedSettings(
+    plugin: PluginInstallation,
+  ): Promise<PluginInstallation> {
+    const migrated = await this.migrateLegacyHappierBindings(plugin);
+    const sanitized = sanitizePersistedPluginSettings(migrated.id, migrated.settings);
+
+    /*
+     * FNXC:HappierRuntime 2026-07-14-13:30:
+     * Fusion 0.60 defaults to PostgreSQL, so Happier's credential-ownership
+     * boundary must clean both single-plugin and list reads on the async path.
+     * Persist the cleaned record before returning it so no later surface can
+     * re-expose historical undeclared settings.
+     */
+    if (toJson(migrated.settings) !== toJson(sanitized)) {
+      await updatePluginSettingsAsync(this.asyncLayer!.db, migrated.id, sanitized);
+    }
+    const state = await getProjectStateAsync(
+      this.asyncLayer!.db,
+      this.normalizedProjectPath,
+      migrated.id,
+    );
+    const settings = migrated.id === HAPPIER_RUNTIME_PLUGIN_ID
+      ? projectScopedHappierSettings(
+        sanitized,
+        isRecord(state?.settings) ? state.settings : {},
+        this.normalizedProjectPath,
+      )
+      : sanitized;
+    return {
+      ...migrated,
+      settings,
+    };
   }
 
   private getProjectState(pluginId: string): ProjectStateRow | undefined {
@@ -502,32 +808,6 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       );
     }
 
-    /*
-     * FNXC:SqliteFinalRemoval 2026-06-26-10:15:
-     * Backend-mode: delegate to the async Drizzle registerPlugin helper which
-     * inserts the install row + per-project state atomically via a transaction.
-     */
-    if (this.backendMode) {
-      const plugin = await registerPluginAsync(this.asyncLayer!, {
-        manifest,
-        path,
-        settings,
-        aiScanOnLoad,
-        projectPath: this.normalizedProjectPath,
-      });
-      this.emit("plugin:registered", plugin);
-      return plugin;
-    }
-
-    const existing = this.centralDb
-      .prepare("SELECT id FROM plugin_installs WHERE id = ?")
-      .get(manifest.id);
-    if (existing) {
-      throw Object.assign(new Error(`Plugin "${manifest.id}" is already registered`), {
-        code: "EEXISTS",
-      });
-    }
-
     const defaultSettings: Record<string, unknown> = {};
     if (manifest.settingsSchema) {
       for (const [key, schema] of Object.entries(manifest.settingsSchema)) {
@@ -540,6 +820,41 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
     const policyErrors = validatePluginSettingsPolicy(manifest.id, mergedSettings);
     if (policyErrors.length > 0) {
       throw new Error(`Settings validation failed: ${policyErrors.join(", ")}`);
+    }
+    const persisted = manifest.id === HAPPIER_RUNTIME_PLUGIN_ID
+      ? splitHappierSettingsForPersistence(mergedSettings)
+      : { globalSettings: mergedSettings, projectSettings: undefined };
+
+    /*
+     * FNXC:SqliteFinalRemoval 2026-06-26-10:15:
+     * Backend-mode: delegate to the async Drizzle registerPlugin helper which
+     * inserts the install row + per-project state atomically via a transaction.
+     */
+    if (this.backendMode) {
+      const plugin = await registerPluginAsync(this.asyncLayer!, {
+        manifest,
+        path,
+        settings: persisted.globalSettings,
+        projectSettings: persisted.projectSettings,
+        aiScanOnLoad,
+        projectPath: this.normalizedProjectPath,
+      });
+      const scoped = await this.cleanBackendPersistedSettings(plugin);
+      this.emit("plugin:registered", scoped);
+      return scoped;
+    }
+
+    if (persisted.projectSettings) {
+      throw new Error("Happier session bindings require the transaction-safe backend mode");
+    }
+
+    const existing = this.centralDb
+      .prepare("SELECT id FROM plugin_installs WHERE id = ?")
+      .get(manifest.id);
+    if (existing) {
+      throw Object.assign(new Error(`Plugin "${manifest.id}" is already registered`), {
+        code: "EEXISTS",
+      });
     }
 
     const now = new Date().toISOString();
@@ -559,7 +874,7 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
         manifest.author ?? null,
         manifest.homepage ?? null,
         path.trim(),
-        toJson(mergedSettings),
+        toJson(persisted.globalSettings),
         manifest.settingsSchema ? toJson(manifest.settingsSchema) : null,
         toJson(manifest.dependencies || []),
         aiScanOnLoad ? 1 : 0,
@@ -599,7 +914,8 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
      * Backend-mode: delegate to the async Drizzle getPlugin helper.
      */
     if (this.backendMode) {
-      return getPluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
+      const plugin = await getPluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
+      return this.cleanBackendPersistedSettings(plugin);
     }
     const install = this.centralDb
       .prepare("SELECT * FROM plugin_installs WHERE id = ?")
@@ -616,7 +932,8 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
      * Backend-mode: delegate to the async Drizzle listPlugins helper.
      */
     if (this.backendMode) {
-      return listPluginsAsync(this.asyncLayer!.db, this.normalizedProjectPath, filter);
+      const plugins = await listPluginsAsync(this.asyncLayer!.db, this.normalizedProjectPath, filter);
+      return Promise.all(plugins.map((plugin) => this.cleanBackendPersistedSettings(plugin)));
     }
     const installs = this.centralDb
       .prepare("SELECT * FROM plugin_installs ORDER BY createdAt ASC")
@@ -644,9 +961,10 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
      */
     if (this.backendMode) {
       const updated = await enablePluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
-      this.emit("plugin:enabled", updated);
-      this.emit("plugin:updated", updated);
-      return updated;
+      const scoped = await this.cleanBackendPersistedSettings(updated);
+      this.emit("plugin:enabled", scoped);
+      this.emit("plugin:updated", scoped);
+      return scoped;
     }
     await this.getPlugin(id);
     this.upsertProjectState(id, { enabled: true });
@@ -665,9 +983,10 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
      */
     if (this.backendMode) {
       const updated = await disablePluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
-      this.emit("plugin:disabled", updated);
-      this.emit("plugin:updated", updated);
-      return updated;
+      const scoped = await this.cleanBackendPersistedSettings(updated);
+      this.emit("plugin:disabled", scoped);
+      this.emit("plugin:updated", scoped);
+      return scoped;
     }
     await this.getPlugin(id);
     this.upsertProjectState(id, { enabled: false });
@@ -707,8 +1026,9 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
           state,
           error,
         );
-        this.emit("plugin:updated", updated);
-        return updated;
+        const scoped = await this.cleanBackendPersistedSettings(updated);
+        this.emit("plugin:updated", scoped);
+        return scoped;
       }
 
       this.upsertProjectState(id, { state, error });
@@ -743,9 +1063,10 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
         state,
         error ?? null,
       );
-      this.emit("plugin:stateChanged", updated, oldState, state);
-      this.emit("plugin:updated", updated);
-      return updated;
+      const scoped = await this.cleanBackendPersistedSettings(updated);
+      this.emit("plugin:stateChanged", scoped, oldState, state);
+      this.emit("plugin:updated", scoped);
+      return scoped;
     }
 
     this.upsertProjectState(id, { state, error: error ?? null });
@@ -755,6 +1076,18 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
     this.emit("plugin:stateChanged", updated, oldState, state);
     this.emit("plugin:updated", updated);
     return updated;
+  }
+
+  private async persistedSettingsForUpdate(id: string): Promise<Record<string, unknown>> {
+    if (this.backendMode) {
+      const plugin = await getPluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
+      return sanitizePersistedPluginSettings(id, plugin.settings);
+    }
+    const install = this.centralDb
+      .prepare("SELECT settings FROM plugin_installs WHERE id = ?")
+      .get(id) as Pick<InstallRow, "settings"> | undefined;
+    if (!install) throw Object.assign(new Error(`Plugin "${id}" not found`), { code: "ENOENT" });
+    return sanitizePersistedPluginSettings(id, fromJson<Record<string, unknown>>(install.settings) || {});
   }
 
   async updatePluginSettings(id: string, settings: Record<string, unknown>): Promise<PluginInstallation> {
@@ -768,17 +1101,38 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
       throw new Error(`Settings validation failed: ${validationErrors.join(", ")}`);
     }
 
-    const mergedSettings = { ...plugin.settings, ...settings };
+    const existingSettings = await this.persistedSettingsForUpdate(id);
+    const persisted = id === HAPPIER_RUNTIME_PLUGIN_ID
+      ? splitHappierSettingsForPersistence(settings)
+      : { globalSettings: settings, projectSettings: undefined };
+    const mergedSettings = id === HAPPIER_RUNTIME_PLUGIN_ID
+      ? { ...existingSettings, ...persisted.globalSettings }
+      : { ...plugin.settings, ...persisted.globalSettings };
 
     /*
      * FNXC:SqliteFinalRemoval 2026-06-26-10:25:
      * Backend-mode: delegate settings persistence to the async helper.
      */
     if (this.backendMode) {
-      await updatePluginSettingsAsync(this.asyncLayer!.db, id, mergedSettings);
+      await this.asyncLayer!.transactionImmediate(async (tx) => {
+        if (toJson(existingSettings) !== toJson(mergedSettings)) {
+          await updatePluginSettingsAsync(tx, id, mergedSettings);
+        }
+        if (persisted.projectSettings) {
+          await updateProjectPluginSettingsAsync(tx, {
+            projectPath: this.normalizedProjectPath,
+            pluginId: id,
+            settings: persisted.projectSettings,
+          });
+        }
+      });
       const updated = await this.getPlugin(id);
       this.emit("plugin:updated", updated);
       return updated;
+    }
+
+    if (persisted.projectSettings) {
+      throw new Error("Happier session bindings require the transaction-safe backend mode");
     }
 
     this.centralDb

@@ -17,10 +17,12 @@ import {
   pgSchema,
   text,
   integer,
+  bigint,
   jsonb,
   primaryKey,
   foreignKey,
   unique,
+  uniqueIndex,
   check,
   index,
 } from "drizzle-orm/pg-core";
@@ -220,6 +222,7 @@ export const projectPluginStates = centralSchema.table("project_plugin_states", 
   enabled: integer("enabled").notNull().default(0),
   state: text("state").notNull().default("installed"),
   error: text("error"),
+  settings: jsonb("settings").notNull().default({}),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
@@ -306,24 +309,292 @@ export const taskClaims = centralSchema.table("task_claims", {
   index("idxTaskClaimsOwner").on(t.ownerNodeId),
 ]);
 
-/** FNXC:SettingsBackups 2026-07-16-15:00: a unique central name makes a shared-cluster routine impossible to duplicate per project. */
-export const globalRoutines = centralSchema.table("global_routines", {
+/*
+ * FNXC:GlobalCapacityLedger 2026-07-20-03:12:
+ * A global slot counter cannot prove which execution owns a slot or recover a
+ * crash safely. Keep this ledger in the central schema (not the Room schema):
+ * legacy task/triage and Room worker capacity must contend under one durable,
+ * cross-project authority, while Room-specific lease tables retain their FK and
+ * delete semantics. Every claim is therefore a typed capacity lease with an
+ * explicit resource identity, holder/lease fence, expiry, and idempotent
+ * operation record.
+ */
+export const globalCapacityState = centralSchema.table("global_capacity_state", {
   id: text("id").primaryKey(),
-  name: text("name").notNull().unique(),
-  description: text("description"),
-  agentId: text("agent_id").notNull().default(""),
-  triggerType: text("trigger_type").notNull(),
-  triggerConfig: jsonb("trigger_config").notNull(),
-  command: text("command"),
-  enabled: integer("enabled").notNull().default(1),
-  lastRunAt: text("last_run_at"),
-  lastRunResult: jsonb("last_run_result"),
-  nextRunAt: text("next_run_at"),
-  runCount: integer("run_count").notNull().default(0),
-  runHistory: jsonb("run_history").notNull().default([]),
-  createdAt: text("created_at").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull().default(0),
+  policyHash: text("policy_hash").notNull(),
   updatedAt: text("updated_at").notNull(),
-});
+}, (t) => [
+  check("global_capacity_state_id_check", sql`${t.id} = 'global-capacity-ledger-v1'`),
+  check("global_capacity_state_revision_check", sql`${t.revision} BETWEEN 0 AND 9007199254740991`),
+  check("global_capacity_state_policy_hash_check", sql`btrim(${t.policyHash}) <> ''`),
+  check("global_capacity_state_updated_at_check", sql`btrim(${t.updatedAt}) <> ''`),
+]);
+
+export const globalCapacityPolicyAuthority = centralSchema.table("global_capacity_policy_authority", {
+  id: text("id").primaryKey(),
+  policyJson: jsonb("policy_json").notNull(),
+  policyHash: text("policy_hash").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  check("global_capacity_policy_authority_id_check", sql`${t.id} = 'global-capacity-policy-authority-v1'`),
+  check("global_capacity_policy_authority_policy_json_check", sql`jsonb_typeof(${t.policyJson}) = 'object'`),
+  check("global_capacity_policy_authority_policy_hash_check", sql`${t.policyHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("global_capacity_policy_authority_revision_check", sql`${t.revision} BETWEEN 1 AND 9007199254740991`),
+  check("global_capacity_policy_authority_updated_at_check", sql`btrim(${t.updatedAt}) <> ''`),
+]);
+
+/**
+ * Explicit operator-selected, project-and-host-scoped Room composition bundle.
+ * Runtime provider/session facts never live in this authority record.
+ */
+export const roomHostCompositionOperatorPolicyAuthority = centralSchema.table("room_host_composition_operator_policy_authority", {
+  projectId: text("project_id").notNull(),
+  hostId: text("host_id").notNull(),
+  bundleId: text("bundle_id").notNull(),
+  issuer: text("issuer").notNull(),
+  policyJson: jsonb("policy_json").notNull(),
+  policyHash: text("policy_hash").notNull(),
+  revision: bigint("revision", { mode: "number" }).notNull(),
+  issuedAt: text("issued_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  revokedAt: text("revoked_at"),
+  revokedReason: text("revoked_reason"),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.hostId], name: "room_host_composition_operator_policy_authority_primary" }),
+  foreignKey({ columns: [t.projectId], foreignColumns: [projects.id] }).onDelete("restrict"),
+  index("idx_room_host_composition_operator_policy_authority_active")
+    .on(t.projectId, t.hostId, t.expiresAt)
+    .where(sql`${t.revokedAt} IS NULL`),
+  check("room_host_composition_operator_policy_authority_policy_json_check", sql`jsonb_typeof(${t.policyJson}) = 'object'`),
+  check("room_host_composition_operator_policy_authority_policy_hash_check", sql`${t.policyHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("room_host_composition_operator_policy_authority_revision_check", sql`${t.revision} BETWEEN 1 AND 9007199254740991`),
+  check("room_host_composition_operator_policy_authority_window_check", sql`${t.expiresAt} > ${t.issuedAt}`),
+  check("room_host_composition_operator_policy_authority_revocation_check", sql`
+    (${t.revokedAt} IS NULL AND ${t.revokedReason} IS NULL)
+    OR (${t.revokedAt} IS NOT NULL AND ${t.revokedReason} IS NOT NULL)
+  `),
+  check("room_host_composition_operator_policy_authority_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.hostId}) <> ''
+    AND btrim(${t.bundleId}) <> ''
+    AND btrim(${t.issuer}) <> ''
+    AND btrim(${t.policyHash}) <> ''
+    AND btrim(${t.issuedAt}) <> ''
+    AND btrim(${t.updatedAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+    AND (${t.revokedAt} IS NULL OR btrim(${t.revokedAt}) <> '')
+    AND (${t.revokedReason} IS NULL OR btrim(${t.revokedReason}) <> '')
+  `),
+]);
+
+export const globalCapacityClaims = centralSchema.table("global_capacity_claims", {
+  id: text("id").notNull(),
+  projectId: text("project_id").notNull(),
+  resourceKind: text("resource_kind").notNull(),
+  resourceId: text("resource_id").notNull(),
+  workClass: text("work_class").notNull(),
+  slots: integer("slots").notNull(),
+  holderId: text("holder_id").notNull(),
+  leaseId: text("lease_id").notNull(),
+  fence: bigint("fence", { mode: "number" }).notNull(),
+  acquiredAt: text("acquired_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  releasedAt: text("released_at"),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id], name: "global_capacity_claims_primary" }),
+  index("idx_global_capacity_claims_active")
+    .on(t.projectId, t.resourceKind, t.workClass, t.expiresAt, t.id)
+    .where(sql`${t.releasedAt} IS NULL`),
+  uniqueIndex("idx_global_capacity_claims_active_resource")
+    .on(t.projectId, t.resourceKind, t.resourceId)
+    .where(sql`${t.releasedAt} IS NULL`),
+  index("idx_global_capacity_claims_expiry")
+    .on(t.expiresAt, t.id)
+    .where(sql`${t.releasedAt} IS NULL`),
+  check("global_capacity_claims_resource_kind_check", sql`${t.resourceKind} IN ('room_worker','legacy_task','legacy_triage')`),
+  check("global_capacity_claims_work_class_check", sql`${t.workClass} IN ('normal','verifier','recovery')`),
+  check("global_capacity_claims_slots_check", sql`${t.slots} BETWEEN 1 AND 2147483647`),
+  check("global_capacity_claims_fence_check", sql`${t.fence} BETWEEN 1 AND 9007199254740991`),
+  check("global_capacity_claims_window_check", sql`${t.expiresAt} > ${t.acquiredAt}`),
+  check("global_capacity_claims_nonblank_check", sql`
+    btrim(${t.id}) <> ''
+    AND btrim(${t.projectId}) <> ''
+    AND btrim(${t.resourceKind}) <> ''
+    AND btrim(${t.resourceId}) <> ''
+    AND btrim(${t.workClass}) <> ''
+    AND btrim(${t.holderId}) <> ''
+    AND btrim(${t.leaseId}) <> ''
+    AND btrim(${t.acquiredAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+    AND (${t.releasedAt} IS NULL OR btrim(${t.releasedAt}) <> '')
+  `),
+]);
+
+export const globalCapacityOperations = centralSchema.table("global_capacity_operations", {
+  projectId: text("project_id").notNull(),
+  commandKind: text("command_kind").notNull(),
+  operationId: text("operation_id").notNull(),
+  requestHash: text("request_hash").notNull(),
+  action: text("action").notNull(),
+  reason: text("reason").notNull(),
+  claimId: text("claim_id"),
+  fence: bigint("fence", { mode: "number" }),
+  occurredAt: text("occurred_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.commandKind, t.operationId], name: "global_capacity_operations_primary" }),
+  index("idx_global_capacity_operations_claim").on(t.projectId, t.claimId, t.commandKind, t.occurredAt),
+  check("global_capacity_operations_kind_check", sql`${t.commandKind} IN ('acquire','renew','release')`),
+  check("global_capacity_operations_action_check", sql`${t.action} IN ('acquired','renewed','released','held','rejected')`),
+  check("global_capacity_operations_hash_check", sql`${t.requestHash} ~ '^sha256:[a-f0-9]{64}$'`),
+  check("global_capacity_operations_nonblank_check", sql`
+    btrim(${t.projectId}) <> ''
+    AND btrim(${t.commandKind}) <> ''
+    AND btrim(${t.operationId}) <> ''
+    AND btrim(${t.requestHash}) <> ''
+    AND btrim(${t.action}) <> ''
+    AND btrim(${t.reason}) <> ''
+    AND btrim(${t.occurredAt}) <> ''
+    AND (${t.claimId} IS NULL OR btrim(${t.claimId}) <> '')
+  `),
+]);
+
+/**
+ * FNXC:GlobalCapacityLegacyAttempt 2026-07-20-04:31:
+ * The generic capacity ledger deliberately knows only about slots. Legacy
+ * executor and triage side effects need a separate, durable attempt boundary:
+ * an acquired ledger replay must never be mistaken for permission to run the
+ * same external work twice after a process crash.
+ */
+export const globalCapacityLegacyAttempts = centralSchema.table("global_capacity_legacy_attempts", {
+  id: text("id").notNull(),
+  projectId: text("project_id").notNull(),
+  resourceKind: text("resource_kind").notNull(),
+  resourceId: text("resource_id").notNull(),
+  state: text("state").notNull(),
+  workClass: text("work_class").notNull(),
+  slots: integer("slots").notNull(),
+  holderId: text("holder_id").notNull(),
+  leaseId: text("lease_id").notNull(),
+  capacityFence: bigint("capacity_fence", { mode: "number" }).notNull(),
+  claimId: text("claim_id").notNull(),
+  acquireOperationId: text("acquire_operation_id").notNull(),
+  acquireGeneration: integer("acquire_generation").notNull(),
+  lastWithheldOperationId: text("last_withheld_operation_id"),
+  renewOperationId: text("renew_operation_id").notNull(),
+  renewGeneration: integer("renew_generation").notNull(),
+  lastRenewalOperationId: text("last_renewal_operation_id"),
+  releaseOperationId: text("release_operation_id").notNull(),
+  preparedAt: text("prepared_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  admittedAt: text("admitted_at"),
+  workStartedAt: text("work_started_at"),
+  workStartReceiptId: text("work_start_receipt_id"),
+  workFinishedAt: text("work_finished_at"),
+  releasedAt: text("released_at"),
+  supersededAt: text("superseded_at"),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id], name: "global_capacity_legacy_attempts_primary" }),
+  uniqueIndex("idx_global_capacity_legacy_attempts_active_resource")
+    .on(t.projectId, t.resourceKind, t.resourceId)
+    .where(sql`${t.state} IN ('prepared','withheld','admitted','work_started','work_finished')`),
+  index("idx_global_capacity_legacy_attempts_resource_history")
+    .on(t.projectId, t.resourceKind, t.resourceId, t.capacityFence),
+  index("idx_global_capacity_legacy_attempts_recovery")
+    .on(t.state, t.updatedAt)
+    .where(sql`${t.state} IN ('work_started','work_finished')`),
+  check("global_capacity_legacy_attempts_resource_kind_check", sql`${t.resourceKind} IN ('legacy_task','legacy_triage')`),
+  check("global_capacity_legacy_attempts_state_check", sql`${t.state} IN ('prepared','withheld','admitted','work_started','work_finished','released','superseded')`),
+  check("global_capacity_legacy_attempts_work_class_check", sql`${t.workClass} IN ('normal','verifier','recovery')`),
+  check("global_capacity_legacy_attempts_slots_check", sql`${t.slots} BETWEEN 1 AND 2147483647`),
+  check("global_capacity_legacy_attempts_fence_check", sql`${t.capacityFence} BETWEEN 1 AND 9007199254740991`),
+  check("global_capacity_legacy_attempts_generation_check", sql`${t.acquireGeneration} BETWEEN 1 AND 2147483647`),
+  check("global_capacity_legacy_attempts_renew_generation_check", sql`${t.renewGeneration} BETWEEN 1 AND 2147483647`),
+  check("global_capacity_legacy_attempts_window_check", sql`${t.expiresAt} > ${t.preparedAt}`),
+  check("global_capacity_legacy_attempts_nonblank_check", sql`
+    btrim(${t.id}) <> ''
+    AND btrim(${t.projectId}) <> ''
+    AND btrim(${t.resourceKind}) <> ''
+    AND btrim(${t.resourceId}) <> ''
+    AND btrim(${t.state}) <> ''
+    AND btrim(${t.workClass}) <> ''
+    AND btrim(${t.holderId}) <> ''
+    AND btrim(${t.leaseId}) <> ''
+    AND btrim(${t.claimId}) <> ''
+    AND btrim(${t.acquireOperationId}) <> ''
+    AND btrim(${t.renewOperationId}) <> ''
+    AND btrim(${t.releaseOperationId}) <> ''
+    AND btrim(${t.preparedAt}) <> ''
+    AND btrim(${t.expiresAt}) <> ''
+    AND btrim(${t.updatedAt}) <> ''
+    AND (${t.lastWithheldOperationId} IS NULL OR btrim(${t.lastWithheldOperationId}) <> '')
+    AND (${t.lastRenewalOperationId} IS NULL OR btrim(${t.lastRenewalOperationId}) <> '')
+    AND (${t.admittedAt} IS NULL OR btrim(${t.admittedAt}) <> '')
+    AND (${t.workStartedAt} IS NULL OR btrim(${t.workStartedAt}) <> '')
+    AND (${t.workStartReceiptId} IS NULL OR btrim(${t.workStartReceiptId}) <> '')
+    AND (${t.workFinishedAt} IS NULL OR btrim(${t.workFinishedAt}) <> '')
+    AND (${t.releasedAt} IS NULL OR btrim(${t.releasedAt}) <> '')
+    AND (${t.supersededAt} IS NULL OR btrim(${t.supersededAt}) <> '')
+  `),
+  check("global_capacity_legacy_attempts_state_timestamps_check", sql`
+    (
+      ${t.state} IN ('prepared','withheld')
+      AND ${t.admittedAt} IS NULL
+      AND ${t.workStartedAt} IS NULL
+      AND ${t.workStartReceiptId} IS NULL
+      AND ${t.workFinishedAt} IS NULL
+      AND ${t.releasedAt} IS NULL
+      AND ${t.supersededAt} IS NULL
+    )
+    OR (
+      ${t.state} = 'admitted'
+      AND ${t.admittedAt} IS NOT NULL
+      AND ${t.workStartedAt} IS NULL
+      AND ${t.workStartReceiptId} IS NULL
+      AND ${t.workFinishedAt} IS NULL
+      AND ${t.releasedAt} IS NULL
+      AND ${t.supersededAt} IS NULL
+    )
+    OR (
+      ${t.state} = 'work_started'
+      AND ${t.admittedAt} IS NOT NULL
+      AND ${t.workStartedAt} IS NOT NULL
+      AND ${t.workStartReceiptId} IS NOT NULL
+      AND ${t.workFinishedAt} IS NULL
+      AND ${t.releasedAt} IS NULL
+      AND ${t.supersededAt} IS NULL
+    )
+    OR (
+      ${t.state} = 'work_finished'
+      AND ${t.admittedAt} IS NOT NULL
+      AND ${t.workStartedAt} IS NOT NULL
+      AND ${t.workStartReceiptId} IS NOT NULL
+      AND ${t.workFinishedAt} IS NOT NULL
+      AND ${t.releasedAt} IS NULL
+      AND ${t.supersededAt} IS NULL
+    )
+    OR (
+      ${t.state} = 'released'
+      AND ${t.releasedAt} IS NOT NULL
+      AND ${t.supersededAt} IS NULL
+      AND (
+        (${t.workStartedAt} IS NULL AND ${t.workStartReceiptId} IS NULL)
+        OR (${t.workStartedAt} IS NOT NULL AND ${t.workStartReceiptId} IS NOT NULL)
+      )
+    )
+    OR (
+      ${t.state} = 'superseded'
+      AND ${t.workStartedAt} IS NULL
+      AND ${t.workStartReceiptId} IS NULL
+      AND ${t.workFinishedAt} IS NULL
+      AND ${t.releasedAt} IS NULL
+      AND ${t.supersededAt} IS NOT NULL
+    )
+  `),
+]);
 
 // ── Schema version meta ──────────────────────────────────────────────
 export const centralMeta = centralSchema.table("__meta", {
@@ -340,5 +611,7 @@ export const centralTableNames = [
   "central_activity_log", "global_concurrency", "central_settings",
   "peer_nodes", "settings_sync_state", "managed_docker_nodes",
   "plugin_installs", "project_plugin_states", "mesh_shared_snapshots",
-  "mesh_write_queue", "secrets_global", "task_claims", "global_routines", "__meta",
+  "mesh_write_queue", "secrets_global", "task_claims", "global_capacity_state",
+  "global_capacity_policy_authority",
+  "global_capacity_claims", "global_capacity_operations", "global_capacity_legacy_attempts", "__meta",
 ] as const;

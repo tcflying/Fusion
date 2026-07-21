@@ -7,6 +7,7 @@ import type {
 } from "@fusion/core";
 import { describe, expect, it, vi } from "vitest";
 import {
+  ROOM_COCKPIT_DEEP_LINK_LOOKUP_TIMEOUT_MS,
   RoomControlPlaneReadService,
   RoomControlPlaneReadServiceError,
 } from "../room-control-plane-read-service.js";
@@ -346,6 +347,221 @@ describe("RoomControlPlaneReadService", () => {
 
     (sourceAggregate.room as { objective: string }).objective = "mutated source";
     expect(projection?.objective).toBe("Produce a verified control-plane projection");
+  });
+
+  it("projects session links only when the connector certifies the exact active binding identity", async () => {
+    const getDeepLinks = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        contractVersion: 1 as const,
+        bindingId: "binding-1",
+        connectorId: "happier",
+        providerId: "codex",
+        nativeSessionId: "codex://threads/example",
+        happierSessionId: "happier-1",
+        serverProfileId: "server-1",
+        machineId: "machine-1",
+        hostId: "host-1",
+        happierUrl: "http://127.0.0.1:18287/session/happier-1?serverId=server-1",
+        nativeSessionUrl: "codex://threads/example",
+      },
+    }));
+    const connectorRegistry = {
+      tryGet: vi.fn(() => ({ getDeepLinks })),
+    };
+    const { store } = createStore();
+    const service = new RoomControlPlaneReadService({
+      projectId: PROJECT_ID,
+      roomStore: store,
+      connectorRegistry: connectorRegistry as never,
+    });
+
+    const projection = await service.getRoomProjection({ projectId: PROJECT_ID, roomId: ROOM_ID });
+
+    expect(connectorRegistry.tryGet).toHaveBeenCalledWith("happier");
+    expect(getDeepLinks).toHaveBeenCalledWith({
+      contractVersion: 1,
+      bindingId: "binding-1",
+      identity: {
+        connectorId: "happier",
+        providerId: "codex",
+        nativeSessionId: "codex://threads/example",
+        happierSessionId: "happier-1",
+        serverProfileId: "server-1",
+        machineId: "machine-1",
+        hostId: "host-1",
+      },
+    });
+    expect(projection?.participants).toEqual([expect.objectContaining({
+      seatId: "seat-1",
+      bindingId: "binding-1",
+      happierUrl: "http://127.0.0.1:18287/session/happier-1?serverId=server-1",
+      nativeSessionUrl: "codex://threads/example",
+    })]);
+    expect(Object.isFrozen(projection?.participants)).toBe(true);
+    expect(Object.isFrozen(projection?.participants[0])).toBe(true);
+  });
+
+  it("projects only identity-bound connector health and keeps it distinct from unreported provider telemetry", async () => {
+    const getDeepLinks = vi.fn(async () => ({ ok: false as const, error: { code: "unavailable" } }));
+    const getHealth = vi.fn(async () => ({
+      connectorId: "happier",
+      hostId: "host-1",
+      state: "authentication_required" as const,
+      checkedAt: UPDATED_AT,
+      authentication: "required" as const,
+      daemon: "running" as const,
+      server: "reachable" as const,
+      backend: "ready" as const,
+      rateLimit: "unknown" as const,
+      host: "reachable" as const,
+      capabilities: {},
+      reasonCodes: ["authentication_required" as const],
+      retryAfterMs: null,
+    }));
+    const { store } = createStore();
+    const service = new RoomControlPlaneReadService({
+      projectId: PROJECT_ID,
+      roomStore: store,
+      connectorRegistry: { tryGet: vi.fn(() => ({ getDeepLinks, getHealth })) } as never,
+    });
+
+    const projection = await service.getRoomProjection({ projectId: PROJECT_ID, roomId: ROOM_ID });
+
+    expect(getHealth).toHaveBeenCalledWith("host-1");
+    expect(projection?.participants).toEqual([expect.objectContaining({
+      model: null,
+      connectorHealth: {
+        state: "authentication_required",
+        checkedAt: UPDATED_AT,
+        authentication: "required",
+        rateLimit: "unknown",
+        reasonCodes: ["authentication_required"],
+        retryAfterMs: null,
+      },
+    })]);
+  });
+
+  it("withholds malformed or mismatched connector health without blocking the canonical Room projection", async () => {
+    const getDeepLinks = vi.fn(async () => ({ ok: false as const, error: { code: "unavailable" } }));
+    const getHealth = vi.fn(async () => ({
+      connectorId: "other-connector",
+      hostId: "host-1",
+      state: "healthy",
+      checkedAt: UPDATED_AT,
+      authentication: "authenticated",
+      rateLimit: "clear",
+      reasonCodes: ["not-a-contract-code"],
+      retryAfterMs: null,
+    }));
+    const { store } = createStore();
+    const service = new RoomControlPlaneReadService({
+      projectId: PROJECT_ID,
+      roomStore: store,
+      connectorRegistry: { tryGet: vi.fn(() => ({ getDeepLinks, getHealth })) } as never,
+    });
+
+    await expect(service.getRoomProjection({ projectId: PROJECT_ID, roomId: ROOM_ID })).resolves.toMatchObject({
+      roomId: ROOM_ID,
+      participants: [expect.objectContaining({
+        connectorHealth: {
+          state: "unknown",
+          checkedAt: null,
+          authentication: "unknown",
+          rateLimit: "unknown",
+          reasonCodes: [],
+          retryAfterMs: null,
+        },
+      })],
+    });
+  });
+
+  it("withholds connector links when the returned immutable identity does not match the Room binding", async () => {
+    const getDeepLinks = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        contractVersion: 1 as const,
+        bindingId: "different-binding",
+        connectorId: "happier",
+        providerId: "codex",
+        nativeSessionId: "codex://threads/example",
+        happierSessionId: "happier-1",
+        serverProfileId: "server-1",
+        machineId: "machine-1",
+        hostId: "host-1",
+        happierUrl: "http://127.0.0.1:18287/session/happier-1?serverId=server-1",
+        nativeSessionUrl: "codex://threads/example",
+      },
+    }));
+    const { store } = createStore();
+    const service = new RoomControlPlaneReadService({
+      projectId: PROJECT_ID,
+      roomStore: store,
+      connectorRegistry: { tryGet: vi.fn(() => ({ getDeepLinks })) } as never,
+    });
+
+    const projection = await service.getRoomProjection({ projectId: PROJECT_ID, roomId: ROOM_ID });
+
+    expect(projection?.participants).toEqual([expect.objectContaining({
+      happierUrl: null,
+      nativeSessionUrl: null,
+    })]);
+  });
+
+  it("withholds a connector web link that does not target the exact Happier session and server profile", async () => {
+    const getDeepLinks = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        contractVersion: 1 as const,
+        bindingId: "binding-1",
+        connectorId: "happier",
+        providerId: "codex",
+        nativeSessionId: "codex://threads/example",
+        happierSessionId: "happier-1",
+        serverProfileId: "server-1",
+        machineId: "machine-1",
+        hostId: "host-1",
+        happierUrl: "https://untrusted.example/session/different-session?serverId=server-1",
+        nativeSessionUrl: null,
+      },
+    }));
+    const { store } = createStore();
+    const service = new RoomControlPlaneReadService({
+      projectId: PROJECT_ID,
+      roomStore: store,
+      connectorRegistry: { tryGet: vi.fn(() => ({ getDeepLinks })) } as never,
+    });
+
+    const projection = await service.getRoomProjection({ projectId: PROJECT_ID, roomId: ROOM_ID });
+
+    expect(projection?.participants).toEqual([expect.objectContaining({
+      happierUrl: null,
+      nativeSessionUrl: null,
+    })]);
+  });
+
+  it("does not let a stalled connector deep-link lookup block the canonical Room projection", async () => {
+    vi.useFakeTimers();
+    const getDeepLinks = vi.fn(() => new Promise<never>(() => undefined));
+    const { store } = createStore();
+    const service = new RoomControlPlaneReadService({
+      projectId: PROJECT_ID,
+      roomStore: store,
+      connectorRegistry: { tryGet: vi.fn(() => ({ getDeepLinks })) } as never,
+    });
+
+    try {
+      const projectionPromise = service.getRoomProjection({ projectId: PROJECT_ID, roomId: ROOM_ID });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(ROOM_COCKPIT_DEEP_LINK_LOOKUP_TIMEOUT_MS);
+
+      await expect(projectionPromise).resolves.toMatchObject({
+        roomId: ROOM_ID,
+        participants: [expect.objectContaining({ happierUrl: null, nativeSessionUrl: null })],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails closed when a project-bound store returns a foreign Room projection", async () => {

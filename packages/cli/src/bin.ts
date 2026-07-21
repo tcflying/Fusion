@@ -179,6 +179,7 @@ function loadCommandHandlers() {
   const { runSkillsSearch, runSkillsInstall } = lazyCommandModule(() => import("./commands/skills.js"));
   const { runResearchCreate, runResearchList, runResearchShow, runResearchExport, runResearchCancel, runResearchRetry } = lazyCommandModule(() => import("./commands/research.js"));
   const { runExperimentFinalize } = lazyCommandModule(() => import("./commands/experiment-finalize.js"));
+  const { parseRoomControlPlanePolicyCommandArgs, runRoomControlPlanePolicy } = lazyCommandModule(() => import("./commands/room-control-plane.js"));
   const { runUpdate } = lazyCommandModule(() => import("./commands/update.js"));
 
   return {
@@ -315,6 +316,8 @@ function loadCommandHandlers() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    parseRoomControlPlanePolicyCommandArgs,
+    runRoomControlPlanePolicy,
     runUpdate,
     runChatInteractive,
   };
@@ -430,6 +433,11 @@ PR:
   fn node show | info [name] [--json] Show node details
   fn node health <name>               Health check a node
   fn mesh status [--json]              Show full mesh state
+  fn room-control-plane host-policy install --file <policy.json>
+  fn room-control-plane host-policy revoke --file <policy.json>
+  fn room-control-plane capacity-policy install --file <policy.json>
+  fn room-control-plane capacity-policy update --file <policy.json>
+                                      Install/revoke explicit Room execution authority; never derives provider facts from settings
   fn settings                          Show current Fusion configuration
   fn settings set <key> <value>        Update a configuration setting
   fn settings set defaultNodeId <node-id>
@@ -841,6 +849,8 @@ async function main() {
     runResearchCancel,
     runResearchRetry,
     runExperimentFinalize,
+    parseRoomControlPlanePolicyCommandArgs,
+    runRoomControlPlanePolicy,
     runUpdate,
     runChatInteractive,
   } = loadCommandHandlers();
@@ -1177,6 +1187,21 @@ async function main() {
             console.log("Try: fn mesh status");
             process.exit(1);
         }
+        break;
+      }
+
+      case "room-control-plane": {
+        /*
+        FNXC:RoomControlPlanePolicyCommand 2026-07-20-22:36:
+        This is the only CLI path that grants or withdraws Room execution
+        authority. The JSON file contains the exact project and host scope, so
+        a global --project convenience flag must not silently override it.
+        */
+        if (projectName) {
+          throw new Error("Room control-plane policy commands require projectId inside the explicit policy file, not --project");
+        }
+        const parsed = parseRoomControlPlanePolicyCommandArgs(args.slice(1));
+        await runRoomControlPlanePolicy(parsed);
         break;
       }
 

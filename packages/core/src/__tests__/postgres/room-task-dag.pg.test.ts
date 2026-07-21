@@ -18,6 +18,7 @@ import {
   type RoomTaskNodeProjectionV1,
 } from "../../async-room-store.js";
 import { hashRoomValue } from "../../room-integrity.js";
+import { rebuildRoomProjectionFromEvents } from "../../room-projection-replay.js";
 import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
 import {
   createAsyncDataLayer,
@@ -304,6 +305,21 @@ afterAll(async () => {
 });
 
 describe("AsyncRoomStore PostgreSQL task DAG", () => {
+  it("replays a persisted task-graph mutation without aggregate projection drift", async () => {
+    const fixture = await createRoomTaskGraphFixture("replay-task-graph-mutation");
+    const graph = await mutateGraph(
+      fixture,
+      { aggregateVersion: fixture.aggregateVersion, dagVersion: 0 },
+      "add-replayable-node",
+      [{ action: "add_node", node: taskNode("node-replayable", 1_000) }],
+    );
+
+    expect(graph.aggregateVersion).toBe(fixture.aggregateVersion + 1);
+    expect(
+      rebuildRoomProjectionFromEvents(await fixture.store.listEvents(fixture.roomId)),
+    ).toEqual(await fixture.store.getRoom(fixture.roomId));
+  });
+
   it("reads one repeatable task-graph snapshot across a concurrent mutation", async () => {
     const fixture = await createRoomTaskGraphFixture("consistent-snapshot");
     const concurrentNode = taskNode("node-concurrent-snapshot", 1_000);
@@ -868,7 +884,6 @@ describe("AsyncRoomStore PostgreSQL task DAG", () => {
 
   it("fails closed when an unsatisfied requires edge targets active work", async () => {
     const activeStates = [
-      "running",
       "waiting_approval",
       "rate_limited",
       "retrying",

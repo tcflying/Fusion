@@ -1,20 +1,14 @@
 import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import {
   ROOM_COCKPIT_COMPOSER_TARGET_MODES,
-  RoomCockpitComposer,
-  type RoomCockpitComposerDraftV1,
   type RoomCockpitComposerGroupV1,
   type RoomCockpitComposerParticipantV1,
-  type RoomCockpitComposerSubmitResultV1,
   type RoomCockpitComposerTargetModeV1,
 } from "./RoomCockpitComposer";
-import {
-  RoomCockpitAlertPanel,
-  type RoomCockpitAlertActionCallbackResultV1,
-  type RoomCockpitAlertActionRequestV1,
-} from "./RoomCockpitAlertPanel";
+import { RoomCockpitAlertPanel } from "./RoomCockpitAlertPanel";
 import { RoomCockpitEvidencePanel } from "./RoomCockpitEvidencePanel";
 import { RoomCockpitParticipantPanel } from "./RoomCockpitParticipantPanel";
+import type { RoomCockpitLiveEventProvenanceV1 } from "./roomCockpitLiveEvents";
 import styles from "./RoomCockpitView.module.css";
 
 export const ROOM_COCKPIT_TASK_STATES = [
@@ -34,6 +28,37 @@ export type RoomCockpitTaskStateV1 = (typeof ROOM_COCKPIT_TASK_STATES)[number];
 export type RoomCockpitHealthStateV1 = "healthy" | "degraded" | "critical" | "paused" | "unknown";
 export type RoomCockpitConfidenceBandV1 = "high" | "medium" | "low" | "unknown";
 export type RoomCockpitViewStateV1 = "loading" | "ready" | "empty" | "degraded" | "permission-denied";
+export type RoomCockpitExecutionStateV1 =
+  | "not_started"
+  | "starting"
+  | "not_enabled"
+  | "read_only_withheld"
+  | "execution_started"
+  | "stopping"
+  | "stopped"
+  | "startup_failed";
+
+export interface RoomCockpitExecutionStatusV1 {
+  readonly contractVersion: 1;
+  readonly projectId: string;
+  readonly state: RoomCockpitExecutionStateV1;
+  readonly reasonCodes: readonly string[];
+  readonly changedAt: string;
+  readonly readServiceAvailable: boolean;
+  readonly liveEventServiceAvailable: boolean;
+  readonly controllerStarted: boolean;
+}
+
+export type RoomCockpitExecutionSurfaceV1 =
+  | {
+    readonly state: "loading" | "unavailable" | "permission-denied";
+    readonly detail: string;
+  }
+  | {
+    readonly state: "available";
+    readonly detail: string;
+    readonly status: RoomCockpitExecutionStatusV1;
+  };
 
 export interface RoomCockpitHealthV1 {
   readonly state: RoomCockpitHealthStateV1;
@@ -198,18 +223,16 @@ export interface RoomCockpitViewCallbacksV1 {
   readonly onRefresh?: () => void;
   readonly onRequestAccess?: () => void;
   readonly onSelectTask?: (task: RoomCockpitTaskNodeV1) => void;
-  readonly onGuardedComposerSubmit?: (
-    draft: RoomCockpitComposerDraftV1,
-  ) => Promise<RoomCockpitComposerSubmitResultV1> | RoomCockpitComposerSubmitResultV1;
-  readonly onGuardedAlertAction?: (
-    request: RoomCockpitAlertActionRequestV1,
-  ) => Promise<RoomCockpitAlertActionCallbackResultV1> | RoomCockpitAlertActionCallbackResultV1;
 }
 
 export interface RoomCockpitViewProps {
   readonly state: RoomCockpitViewStateV1;
   readonly projection?: RoomCockpitProjectionV1;
   readonly stateDetail?: string;
+  /** Project-scoped controller lifecycle only; it never certifies provider health. */
+  readonly execution?: RoomCockpitExecutionSurfaceV1;
+  /** Last safe causal pointer observed from the current Room SSE stream. */
+  readonly liveEventProvenance?: RoomCockpitLiveEventProvenanceV1 | null;
   readonly callbacks?: RoomCockpitViewCallbacksV1;
 }
 
@@ -250,6 +273,17 @@ const confidenceLabels: Record<RoomCockpitConfidenceBandV1, string> = {
   unknown: "unknown",
 };
 
+const executionStateLabels: Record<RoomCockpitExecutionStateV1, string> = {
+  not_started: "not started",
+  starting: "starting",
+  not_enabled: "not enabled",
+  read_only_withheld: "read-only withheld",
+  execution_started: "controller started",
+  stopping: "stopping",
+  stopped: "stopped",
+  startup_failed: "startup failed",
+};
+
 /**
  * FNXC:RoomCockpit 2026-07-19-15:25:
  * This is a projection-only operations slice: it renders only verified Room data
@@ -258,7 +292,14 @@ const confidenceLabels: Record<RoomCockpitConfidenceBandV1, string> = {
  * Task-first visibility, keyboard selection, critical-path diagnosis, capacity,
  * confidence, and mobile-safe controls remain available before a route owns it.
  */
-export function RoomCockpitView({ state, projection, stateDetail, callbacks }: RoomCockpitViewProps) {
+export function RoomCockpitView({
+  state,
+  projection,
+  stateDetail,
+  execution,
+  liveEventProvenance,
+  callbacks,
+}: RoomCockpitViewProps) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -321,42 +362,33 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
     "--room-cockpit-columns": String(Math.max(taskColumns.length, 1)),
   };
   const composer = parseRoomCockpitComposerSurface(projection.composer);
-  const observedCapacity = getObservedCapacityTelemetry(projection.capacity);
-  const capacityTelemetryState = observedCapacity !== null
-    ? "available"
-    : projection.capacity.telemetry.availability === "unavailable"
-      ? "unavailable"
-      : "withheld";
-  const capacityTelemetryDetail = observedCapacity !== null
-    ? capacityTelemetryDetailOrFallback(
-      observedCapacity.telemetry.detail,
-      "Persistent runtime telemetry is available for this Room.",
-    )
-    : projection.capacity.telemetry.availability === "unavailable"
-      ? capacityTelemetryDetailOrFallback(
-        projection.capacity.telemetry.detail,
-        "The Room projection marked persistent runtime capacity telemetry unavailable.",
-      )
-      : "Observed capacity telemetry was withheld because the available payload did not satisfy the telemetry boundary.";
+  /*
+   * FNXC:RoomCockpitStructuralTelemetry 2026-07-20-21:49:
+   * The current production composition does not supply a verified runtime
+   * telemetry sink. Keep graph counts visibly structural and withhold capacity,
+   * process, crash, wait, and recovery claims until that evidence exists.
+   */
+  const capacityTelemetryState = "unavailable";
+  const capacityTelemetryDetail = "No production runtime capacity observation is connected to this Cockpit. Structural graph counts are not capacity, process, crash, wait, or recovery telemetry.";
 
   const composerUnavailableReason = projection.composer === undefined
     ? "No verified composer targeting data has been projected for this Room."
     : composer === null
       ? "Composer target data was withheld because it does not satisfy the guarded composer boundary."
-      : "No guarded draft delivery callback is connected for this Room.";
+      : "Draft delivery is intentionally unavailable in this structural Cockpit until a verified command execution receipt exists.";
 
   return (
     <main className={styles.root} data-state={state} aria-label={`Room cockpit for ${projection.roomId}`}>
       <header className={styles.commandHeader}>
         <div className={styles.commandIdentity}>
-          <p className={styles.eyebrow}>Room operations / live projection</p>
+          <p className={styles.eyebrow}>Room control plane / canonical structural projection</p>
           <h1 className={styles.roomId}>Room / {projection.roomId}</h1>
           <p className={styles.objective}>{projection.objective}</p>
         </div>
         <div className={styles.commandStatus} aria-label="Current Room status">
           <span className={styles.statusLamp} data-health={projection.health.state} aria-hidden="true" />
           <div>
-            <span className={styles.statusLabel}>Health</span>
+            <span className={styles.statusLabel}>Projection status</span>
             <strong>{healthLabels[projection.health.state]}</strong>
             <span className={styles.statusDetail}>{projection.health.detail}</span>
           </div>
@@ -367,6 +399,9 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
           <span>Critical path: {projection.criticalPathNodeIds.length} node{projection.criticalPathNodeIds.length === 1 ? "" : "s"}</span>
         </div>
       </header>
+
+      {execution ? <RoomCockpitExecutionPanel execution={execution} /> : null}
+      {liveEventProvenance ? <RoomCockpitEventProvenancePanel provenance={liveEventProvenance} /> : null}
 
       {state === "degraded" ? (
         <div className={styles.degradedNotice} role="alert">
@@ -380,7 +415,7 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
         </div>
       ) : null}
 
-      <section className={styles.signalTape} aria-label="Room operating signals">
+      <section className={styles.signalTape} aria-label="Room structural signals">
         <SignalReadout
           label="Completion"
           value={`${projection.completion.acceptedNodes} / ${projection.completion.total} accepted`}
@@ -396,12 +431,10 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
           tone={`confidence-${projection.confidence.band}`}
         />
         <SignalReadout
-          label="Capacity"
-          value={`${projection.capacity.activeSlots} / ${projection.capacity.configuredSlots} active slots`}
-          detail={observedCapacity !== null
-            ? `${projection.capacity.queueDepth} queued · ${formatThroughput(observedCapacity.throughputPerMinute)}`
-            : `${projection.capacity.queueDepth} queued · capacity telemetry ${capacityTelemetryState}`}
-          meterLabel="Active configured capacity"
+          label="Structural task graph"
+          value={`${projection.capacity.activeSlots} running task nodes / ${projection.capacity.configuredSlots} attached bindings`}
+          detail={`${projection.capacity.queueDepth} pending graph nodes · runtime capacity telemetry ${capacityTelemetryState}`}
+          meterLabel="Structural running task node ratio"
           meterValue={activeRatio}
           tone="capacity"
         />
@@ -506,10 +539,10 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
         <section className={styles.capacityPanel} aria-labelledby="room-cockpit-capacity-title">
           <div className={styles.panelHeading}>
             <div>
-              <p className={styles.panelKicker}>Dispatch envelope</p>
-              <h2 id="room-cockpit-capacity-title">Capacity ledger</h2>
+              <p className={styles.panelKicker}>Canonical task topology</p>
+              <h2 id="room-cockpit-capacity-title">Structural allocation ledger</h2>
             </div>
-            <span className={styles.capacityRate}>{formatPercent(projection.capacity.utilizationRatio)} structural</span>
+            <span className={styles.capacityRate}>{formatPercent(projection.capacity.utilizationRatio)} graph ratio</span>
           </div>
           <section
             className={styles.capacityTelemetryState}
@@ -517,38 +550,23 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
             aria-label={`Runtime capacity telemetry ${capacityTelemetryState}`}
             role="status"
           >
-            <p className={styles.capacityTelemetryKicker}>Runtime observation / {capacityTelemetryState}</p>
-            <strong>{observedCapacity !== null
-              ? "Observed runtime capacity"
-              : capacityTelemetryState === "unavailable"
-                ? "Runtime capacity telemetry unavailable"
-                : "Observed capacity telemetry withheld"}
-            </strong>
+            <p className={styles.capacityTelemetryKicker}>Runtime observation / unavailable</p>
+            <strong>Runtime capacity telemetry unavailable</strong>
             <p>{capacityTelemetryDetail}</p>
-            {observedCapacity !== null ? (
-              <dl className={styles.capacityTelemetryFacts}>
-                <div><dt>Source</dt><dd>Persistent runtime telemetry</dd></div>
-                <div><dt>Observed at</dt><dd>{observedCapacity.telemetry.observedAt}</dd></div>
-              </dl>
-            ) : null}
           </section>
           <dl className={styles.capacityList}>
-            <div><dt>Theoretical</dt><dd>{projection.capacity.theoreticalSlots}</dd></div>
-            <div><dt>Configured</dt><dd>{projection.capacity.configuredSlots}</dd></div>
-            <div><dt>Verifier reserve</dt><dd>{observedCapacity?.reservedVerifierSlots ?? "Unavailable"}</dd></div>
-            <div><dt>Recovery reserve</dt><dd>{observedCapacity?.reservedRecoverySlots ?? "Unavailable"}</dd></div>
+            <div><dt>Declared task-node scale</dt><dd>{projection.capacity.theoreticalSlots}</dd></div>
+            <div><dt>Attached bindings</dt><dd>{projection.capacity.configuredSlots}</dd></div>
+            <div><dt>Runtime verifier reserve</dt><dd>Unavailable</dd></div>
+            <div><dt>Runtime recovery reserve</dt><dd>Unavailable</dd></div>
           </dl>
           <ul className={styles.idleReasons}>
-            {observedCapacity === null ? <li className={styles.capacityUnavailableItem}>Idle-capacity reasons are unavailable.</li>
-              : observedCapacity.idleReasons.length > 0 ? observedCapacity.idleReasons.map((reason) => (
-                <li key={`${reason.reason}-${reason.slots}`}><strong>{reason.slots}</strong> {reason.reason.replaceAll("_", " ")}</li>
-              )) : <li>No observed idle-capacity reasons were reported.</li>}
+            <li className={styles.capacityUnavailableItem}>Runtime wait and recovery observations are unavailable.</li>
           </ul>
         </section>
 
         <RoomCockpitAlertPanel
           alerts={projection.actionableAlerts}
-          onAction={callbacks?.onGuardedAlertAction}
         />
       </div>
 
@@ -560,21 +578,84 @@ export function RoomCockpitView({ state, projection, stateDetail, callbacks }: R
       </div>
 
       <div className={styles.composerSurface}>
-        {composer !== null && callbacks?.onGuardedComposerSubmit ? (
-          <RoomCockpitComposer {...composer} onGuardedSubmit={callbacks.onGuardedComposerSubmit} />
-        ) : <RoomCockpitComposerUnavailable reason={composerUnavailableReason} />}
+        <RoomCockpitComposerUnavailable reason={composerUnavailableReason} />
       </div>
     </main>
   );
 }
 
+/*
+ * FNXC:RoomCockpitExecutionStatus 2026-07-20-21:49:
+ * The Cockpit presents the authorized controller lifecycle independently from
+ * Room health and capacity. `execution_started` means the fenced controller
+ * began its lifecycle, not that a Windows process/PID is live, crash-free, or
+ * that a provider, model, account, quota, or Session is healthy.
+ */
+function RoomCockpitExecutionPanel({ execution }: { readonly execution: RoomCockpitExecutionSurfaceV1 }) {
+  const status = execution.state === "available" ? execution.status : null;
+  const label = status ? executionStateLabels[status.state] : execution.state.replaceAll("-", " ");
+
+  return (
+    <section
+      className={styles.executionPanel}
+      data-execution-state={status?.state ?? execution.state}
+      aria-label="Room execution control-plane status"
+      role="status"
+    >
+      <div className={styles.executionIdentity}>
+        <p>Control-plane lifecycle</p>
+        <strong>{label}</strong>
+        <span>{execution.detail}</span>
+      </div>
+      {status ? (
+        <>
+          <dl className={styles.executionFacts}>
+            <div><dt>Read service</dt><dd>{status.readServiceAvailable ? "available" : "withheld"}</dd></div>
+            <div><dt>Live events</dt><dd>{status.liveEventServiceAvailable ? "available" : "withheld"}</dd></div>
+            <div><dt>Engine controller lifecycle</dt><dd>{status.controllerStarted ? "started" : "not started"}</dd></div>
+            <div><dt>Changed</dt><dd>{status.changedAt}</dd></div>
+          </dl>
+          <div className={styles.executionReasons} aria-label="Execution reason codes">
+            {status.reasonCodes.length > 0
+              ? status.reasonCodes.map((reason) => <code key={reason}>{reason}</code>)
+              : <span>No lifecycle withholding reason was reported.</span>}
+          </div>
+        </>
+      ) : null}
+      <p className={styles.executionBoundary}>Lifecycle evidence only — not Windows process, PID, or crash-liveness evidence; provider, model, account, quota, and session health are not certified here.</p>
+    </section>
+  );
+}
+
+function RoomCockpitEventProvenancePanel({
+  provenance,
+}: {
+  readonly provenance: RoomCockpitLiveEventProvenanceV1;
+}) {
+  return (
+    <section className={styles.executionPanel} aria-label="Last observed Room event provenance" role="status">
+      <div className={styles.executionIdentity}>
+        <p>Canonical event provenance</p>
+        <strong>{provenance.type}</strong>
+        <span>Bounded causal metadata only; event body and provider diagnostics are not retained.</span>
+      </div>
+      <dl className={styles.executionFacts}>
+        <div><dt>Cursor</dt><dd>{provenance.cursor}</dd></div>
+        <div><dt>Event</dt><dd>{provenance.eventId}</dd></div>
+        <div><dt>Occurred</dt><dd>{provenance.occurredAt}</dd></div>
+        <div><dt>Correlation</dt><dd>{provenance.correlationId}</dd></div>
+        <div><dt>Causation</dt><dd>{provenance.causationId ?? "No causation recorded"}</dd></div>
+      </dl>
+    </section>
+  );
+}
+
 /**
- * FNXC:RoomCockpitWiring 2026-07-19-16:50:
- * The cockpit can render standalone participant, evidence, alert, and composer
- * surfaces only from caller-supplied projections. Do not derive identities,
- * targets, evidence, or a delivery callback from the legacy summary projection:
- * absent or malformed data stays visibly unavailable/withheld, and the composer
- * never mounts without an external guarded-delivery boundary.
+ * FNXC:RoomCockpitUnsupportedActions 2026-07-20-21:49:
+ * This structural Cockpit can show supplied participant, evidence, alert, and
+ * composer facts, but it must not turn any callback into a provider send,
+ * cancel, pause, retry, or recovery command. Keep composer and alert controls
+ * unavailable until a target runtime proves command receipt and execution.
  */
 function parseRoomCockpitComposerSurface(value: unknown): RoomCockpitComposerSurfaceV1 | null {
   if (!isRecord(value) || !Array.isArray(value.participants)) return null;
@@ -609,49 +690,6 @@ function isComposerTargetMode(value: unknown): value is RoomCockpitComposerTarge
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * FNXC:RoomCockpitCapacityTelemetry 2026-07-19-17:00:
- * Observed capacity is not inferred from the structural projection. The Engine
- * discriminant is the authority: only a complete `available` runtime-telemetry
- * payload reaches observed reserve, throughput, or idle-reason readouts.
- */
-function getObservedCapacityTelemetry(
-  capacity: RoomCockpitCapacityV1,
-): RoomCockpitCapacityWithRuntimeTelemetryV1 | null {
-  return hasObservedCapacityTelemetry(capacity) ? capacity : null;
-}
-
-function hasObservedCapacityTelemetry(
-  capacity: RoomCockpitCapacityV1,
-): capacity is RoomCockpitCapacityWithRuntimeTelemetryV1 {
-  if (capacity.telemetry.availability !== "available") return false;
-  if (
-    capacity.telemetry.source !== "persistent_runtime_telemetry"
-    || typeof capacity.telemetry.observedAt !== "string"
-    || !isFiniteNumber(capacity.reservedVerifierSlots)
-    || !isFiniteNumber(capacity.reservedRecoverySlots)
-    || !isFiniteNumber(capacity.throughputPerMinute)
-    || !Array.isArray(capacity.idleReasons)
-    || !capacity.idleReasons.every(isCapacityIdleReason)
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function isCapacityIdleReason(value: unknown): value is RoomCockpitIdleReasonV1 {
-  return isRecord(value) && typeof value.reason === "string" && isFiniteNumber(value.slots);
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function capacityTelemetryDetailOrFallback(detail: unknown, fallback: string): string {
-  return typeof detail === "string" && detail.trim().length > 0 ? detail : fallback;
 }
 
 function RoomCockpitComposerUnavailable({ reason }: { readonly reason: string }) {
@@ -750,8 +788,8 @@ function TaskDetail({ task, tasksById }: { readonly task: RoomCockpitTaskNodeV1;
       <DetailList label="Outputs" values={task.outputs} />
       <DetailList label="Hard gates" values={task.gateIds} />
       <DetailList label="Evidence" values={task.evidenceIds} />
-      {task.waitReason ? <p className={styles.waitReason}><strong>Wait</strong>{task.waitReason}</p> : null}
-      {task.nextRecoveryAction ? <p className={styles.recoveryAction}><strong>Recovery boundary</strong>{task.nextRecoveryAction}</p> : null}
+      {task.waitReason ? <p className={styles.waitReason}><strong>Graph dependency note</strong>{task.waitReason}</p> : null}
+      {task.nextRecoveryAction ? <p className={styles.recoveryAction}><strong>Recorded next step (not executed)</strong>{task.nextRecoveryAction}</p> : null}
     </div>
   );
 }
@@ -816,8 +854,4 @@ function clampRatio(value: number): number {
 
 function formatPercent(value: number): string {
   return `${Math.round(clampRatio(value) * 100)}%`;
-}
-
-function formatThroughput(value: number): string {
-  return `${value.toFixed(1)} / min`;
 }

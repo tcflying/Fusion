@@ -51,6 +51,25 @@ export interface HappierCliSettings {
   profile?: string;
   backend?: HappierBackend;
   happierSessionBindings?: readonly HappierSessionBinding[];
+  /**
+   * Opt in to Fusion's separately-versioned local Happier MCP extension. This
+   * never changes which operations are treated as official MCP capabilities.
+   */
+  enableLocalRuntimeSnapshot?: boolean;
+  /**
+   * FNXC:HappierReconciliationHistoryConfig 2026-07-20-12:04:
+   * Opt in to Fusion's separately-versioned local, cursor-preserving Happier
+   * history extension. It is not an upstream MCP capability and is used only
+   * for fail-closed durable reconciliation.
+   */
+  enableLocalReconciliationHistory?: boolean;
+  /**
+   * FNXC:HappierProviderTelemetryConfig 2026-07-21-02:51:
+   * Explicitly opt in to the non-official local MCP telemetry read. It can
+   * report only a fresh persisted in-band snapshot and never grants provider,
+   * dispatch, or capacity readiness.
+   */
+  enableLocalProviderTelemetry?: boolean;
   timeoutMs?: number;
   maxOutputBytes?: number;
 }

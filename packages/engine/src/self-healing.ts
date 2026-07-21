@@ -807,6 +807,24 @@ export class SelfHealingManager {
     AWAITING_APPROVAL_PAUSE_REASON,
   ]);
 
+  /*
+   * FNXC:GlobalCapacityRecovery 2026-07-20-06:19:
+   * A global-capacity recovery pause means the external work boundary is uncertain.
+   * Scope-decay and board-stall recovery must not turn that system hold into a runnable
+   * task; retain the reason prefix without setting userPaused, because an operator must
+   * reconcile the durable capacity attempt rather than merely resume a user pause.
+   */
+  private static readonly GLOBAL_CAPACITY_RECOVERY_PAUSE_REASON_PREFIX = "global-capacity-recovery:v1:";
+
+  private static isGlobalCapacityRecoveryPauseReason(pausedReason: string | undefined): boolean {
+    return pausedReason?.startsWith(SelfHealingManager.GLOBAL_CAPACITY_RECOVERY_PAUSE_REASON_PREFIX) === true;
+  }
+
+  private static isPausedScopeDecayExcludedReason(pausedReason: string | undefined): boolean {
+    return SelfHealingManager.PAUSED_SCOPE_DECAY_EXCLUDED_REASONS.has(pausedReason ?? "")
+      || SelfHealingManager.isGlobalCapacityRecoveryPauseReason(pausedReason);
+  }
+
   constructor(
     private store: TaskStore,
     private options: SelfHealingOptions,
@@ -3375,6 +3393,9 @@ export class SelfHealingManager {
     if (settings.globalPause || settings.enginePaused) return withPerPr({ outcome: "skipped", reason: "engine-paused" });
     if (!task.branch || !task.worktree) return withPerPr({ outcome: "skipped", reason: "missing-branch-or-worktree" });
     if (task.userPaused) return withPerPr({ outcome: "skipped", reason: "user-paused" });
+    if (SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason)) {
+      return withPerPr({ outcome: "skipped", reason: "global-capacity-recovery-hold" });
+    }
     if (task.checkedOutBy) return withPerPr({ outcome: "skipped", reason: "checked-out" });
     if (task.pausedReason === "worktrunk_operation_failed") return withPerPr({ outcome: "skipped", reason: "worktrunk-paused" });
     if (activeSessionRegistry.isPathActive(task.worktree)) return withPerPr({ outcome: "skipped", reason: "active-session" });
@@ -3599,7 +3620,10 @@ export class SelfHealingManager {
       // per-task override preserves that for override-less tasks while letting
       // explicit autoMerge:true tasks recover.
       const candidates = [...todoCandidates, ...inProgressCandidates, ...inReviewPausedCandidates]
-        .filter((task) => allowsAutoMergeProcessing(task, settings));
+        .filter((task) =>
+          allowsAutoMergeProcessing(task, settings)
+          && !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason),
+        );
       const executingIds = this.options.getExecutingTaskIds?.() ?? new Set<string>();
       const activeTaskIds = await this.listActiveHeartbeatTaskIds();
 
@@ -5079,7 +5103,7 @@ export class SelfHealingManager {
     const reboundedIds: string[] = [];
     for (const task of tasks) {
       if (task.column !== "in-progress" || task.paused !== true) continue;
-      if (SelfHealingManager.PAUSED_SCOPE_DECAY_EXCLUDED_REASONS.has(task.pausedReason ?? "")) continue;
+      if (SelfHealingManager.isPausedScopeDecayExcludedReason(task.pausedReason)) continue;
       const followerCount = followersByHolder.get(task.id) ?? 0;
       if (followerCount <= 0) continue;
 
@@ -6682,6 +6706,7 @@ export class SelfHealingManager {
         t.column === "in-review" &&
         allowsAutoMergeProcessing(t, settings) &&
         !t.paused &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(t.pausedReason) &&
         // FNXC:AutoMergeHold 2026-07-09-17:10: FN-7750 intentionally keeps the pure branchContext-shape predicate here. Stale shared-group members must stay OUT of solo no-op finalize even when their group is not live; only the positive auto-merge-off exemption gates use the live-group predicate.
         !isSharedBranchGroupMemberIntegration(t) &&
         // FNXC:Workspace 2026-06-22-14:10 (Phase D review A — workspace single-commit-finalize gate):
@@ -6883,6 +6908,7 @@ export class SelfHealingManager {
       const tasks = await this.store.listTasks({ column: "done", slim: true });
       const candidates = tasks.filter((task) =>
         task.column === "done" &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         (!task.mergeDetails?.commitSha || task.mergeDetails.commitSha.trim().length === 0) &&
         (task.modifiedFiles?.length ?? 0) > 0,
       ).slice(0, DONE_TASK_INTEGRITY_SWEEP_LIMIT);
@@ -9250,6 +9276,7 @@ export class SelfHealingManager {
         task.status === "failed" &&
         task.scopeOverride !== true &&
         task.mergeDetails?.mergeConfirmed !== true &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         !executingIds.has(task.id),
       );
 
@@ -9425,6 +9452,7 @@ export class SelfHealingManager {
         task.status === "failed" &&
         (task.mergeRetries ?? 0) >= maxAutoMergeRetries &&
         task.mergeDetails?.mergeConfirmed !== true &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         !executingIds.has(task.id),
       );
 
@@ -10040,6 +10068,7 @@ export class SelfHealingManager {
         task.column === "in-review" &&
         Boolean(task.branch) &&
         task.mergeDetails?.mergeConfirmed !== true &&
+        !SelfHealingManager.isGlobalCapacityRecoveryPauseReason(task.pausedReason) &&
         !executingIds.has(task.id),
       );
 

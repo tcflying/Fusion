@@ -20,6 +20,16 @@ export const HAPPIER_OFFICIAL_MCP_TOOLS = {
   stop: "session_stop",
 } as const;
 
+/**
+ * Not part of Happier's upstream public MCP contract. These tool names are
+ * available only when the local source extension is explicitly enabled.
+ */
+export const HAPPIER_LOCAL_MCP_EXTENSION_TOOLS = {
+  runtimeSnapshot: "fusion_runtime_snapshot_get",
+  reconciliationHistory: "fusion_reconciliation_history_get",
+  providerTelemetry: "fusion_provider_telemetry_get",
+} as const;
+
 export type HappierOfficialMcpToolName = (typeof HAPPIER_OFFICIAL_MCP_TOOLS)[keyof typeof HAPPIER_OFFICIAL_MCP_TOOLS];
 
 export interface HappierMcpToolDefinition {

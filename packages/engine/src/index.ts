@@ -4,7 +4,9 @@ export * from "./session-connector-ingestion.js";
 export * from "./room-session-connector-ingestion-persistence.js";
 export * from "./room-delivery-coordinator.js";
 export * from "./room-existing-session-spine.js";
+export * from "./room-existing-session-preflight.js";
 export * from "./room-evolution-runtime.js";
+export * from "./project-room-command-gateway.js";
 export { reloadExemptTools, addToExemptTools, getExemptToolNames } from "./agent-action-gate.js";
 export type { AgentActionGateContext } from "./agent-action-gate.js";
 export { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
@@ -989,10 +991,97 @@ export {
   type RoomControllerLeaseStore,
   type RoomControllerOptions,
   type RoomControllerRoomStore,
+  type RoomTaskDispatcher,
   type RoomWorker,
   type RoomWorkerRunInput,
 } from "./room-controller.js";
 export * from "./room-global-concurrency-runtime.js";
+export type {
+  RoomCompositionDependenciesV1,
+  RoomHostCompositionAuthorityV1,
+  RoomHostCompositionContextV1,
+  RoomHostCompositionProviderV1,
+  RoomHostCompositionResolutionV1,
+  RoomVerifiedCompositionV1,
+} from "./room-host-composition.js";
+export * from "./room-host-composition-operator-policy-provider.js";
+export * from "./room-windows-host-composition-adapter-registry.js";
+export {
+  DEFAULT_ROOM_SEMANTIC_CONTROLLER_INBOX_MAX_ACTIONS,
+  RoomSemanticControllerInboxProcessor,
+  RoomSemanticControllerInboxProcessorError,
+  type ProcessRoomSemanticControllerInboxInput,
+  type RoomSemanticControllerInboxProcessSummary,
+  type RoomSemanticControllerInboxProcessorOptions,
+  type RoomSemanticControllerInboxStopReason,
+  type RoomSemanticControllerInboxStore,
+} from "./room-semantic-controller-inbox-processor.js";
+export {
+  DEFAULT_ROOM_TASK_RECOVERY_ACTION_MAX_ACTIONS,
+  DEFAULT_ROOM_TASK_RECOVERY_ACTION_RETRY_DELAY_MS,
+  RoomTaskRecoveryActionProcessor,
+  RoomTaskRecoveryActionProcessorError,
+  type ProcessRoomTaskRecoveryActionsInput,
+  type RoomTaskRecoveryActionConsumer,
+  type RoomTaskRecoveryActionConsumerContextV1,
+  type RoomTaskRecoveryActionProcessSummary,
+  type RoomTaskRecoveryActionProcessorOptions,
+  type RoomTaskRecoveryActionStopReason,
+  type RoomTaskRecoveryActionStore,
+} from "./room-task-recovery-action-processor.js";
+export {
+  createRoomTaskRecoveryPlanConsumer,
+  RoomTaskRecoveryPlanConsumerError,
+  type RoomTaskRecoveryActionConsumerContext,
+  type RoomTaskRecoveryPlanConsumer,
+  type RoomTaskRecoveryPlanStore,
+} from "./room-task-recovery-plan-consumer.js";
+export * from "./fusion-room-workspace-primitives.js";
+export * from "./fusion-room-workspace-runtime.js";
+export * from "./room-terminalization-coordinator.js";
+export * from "./room-evolution-promotion-commit-coordinator.js";
+export * from "./room-evolution-promotion-ledger-adapter.js";
+export * from "./room-evolution-hypothesis-commit-coordinator.js";
+export * from "./room-message-authority-guard.js";
+export * from "./room-evolution-isolated-candidate-coordinator.js";
+export * from "./room-evolution-isolated-candidate-ledger-adapter.js";
+export * from "./room-evolution-git-worktree-port.js";
+export * from "./room-strategy-version-runtime-coordinator.js";
+export * from "./room-control-plane-read-service.js";
+export * from "./room-evolution-canary-ledger-adapter.js";
+export * from "./room-evolution-canary-rollback-coordinator.js";
+export * from "./room-evolution-capacity-reservation.js";
+export * from "./room-adaptive-scheduling-policy.js";
+export * from "./room-global-concurrency-accounting.js";
+export * from "./room-provider-backpressure-controller.js";
+export * from "./room-runtime-observability-bridge.js";
+export * from "./room-evidence-eval-store-bridge.js";
+export * from "./room-live-event-cursor.js";
+export * from "./room-independent-arbitration-coordinator.js";
+export * from "./room-independent-arbitration-ledger-adapter.js";
+export * from "./room-candidate-fanout-blind-review-coordinator.js";
+export * from "./room-deterministic-evidence-gate-coordinator.js";
+export * from "./room-candidate-synthesis-coordinator.js";
+export * from "./room-candidate-synthesis-ledger-adapter.js";
+export * from "./room-connector-runtime-observation-reporter.js";
+export * from "./room-session-connector-runtime-observation-port.js";
+export * from "./room-workspace-coordinator.js";
+export {
+  planRoomDependencyDispatch,
+  RoomDependencyDispatchGraphError,
+  type RoomDependencyDispatchBlockerV1,
+  type RoomDependencyDispatchCandidateV1,
+  type RoomDependencyDispatchPlanV1,
+  type RoomDependencyDispatchWaitV1,
+} from "./room-dependency-dispatch.js";
+export {
+  RoomDependencyDispatchCoordinator,
+  RoomDependencyDispatchCoordinatorError,
+  type DispatchReadyRoomTasksInput,
+  type DispatchReadyRoomTasksResult,
+  type RoomDependencyDispatchCoordinatorOptions,
+  type RoomTaskDispatchStore,
+} from "./room-dependency-dispatch-coordinator.js";
 export {
   RoomRunAuditDispatcher,
   type RoomRunAuditDispatcherOptions,
@@ -1199,3 +1288,5 @@ export {
   type ResolvedCliExecutorConfig,
   type LaunchCliTaskSessionOptions,
 } from "./cli-agent/task-session.js";
+export * from "./room-blind-review-coordinator.js";
+export * from "./room-candidate-fanout-blind-review-coordinator.js";

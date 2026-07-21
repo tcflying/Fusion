@@ -16,8 +16,54 @@ export const ROOM_COCKPIT_LEASE_STATES = [
   "unknown",
 ] as const;
 
+export const ROOM_COCKPIT_CONNECTOR_HEALTH_STATES = [
+  "healthy",
+  "degraded",
+  "authentication_required",
+  "rate_limited",
+  "host_unavailable",
+  "unavailable",
+  "unknown",
+] as const;
+
+export const ROOM_COCKPIT_CONNECTOR_AUTHENTICATION_STATES = [
+  "authenticated",
+  "required",
+  "unknown",
+] as const;
+
+export const ROOM_COCKPIT_CONNECTOR_RATE_LIMIT_STATES = [
+  "clear",
+  "limited",
+  "unknown",
+] as const;
+
+const ROOM_COCKPIT_CONNECTOR_REASON_CODES = new Set([
+  "executable_unavailable",
+  "executable_timeout",
+  "executable_not_found",
+  "authentication_required",
+  "authentication_timeout",
+  "authentication_invalid",
+  "server_unreachable",
+  "server_not_probed",
+  "daemon_stopped",
+  "status_timeout",
+  "status_invalid",
+  "backend_unavailable",
+  "backend_timeout",
+  "backend_invalid",
+  "rate_limited",
+  "host_unavailable",
+  "capability_not_verified",
+  "probe_failed",
+]);
+
 export type RoomCockpitHeartbeatFreshnessV1 = (typeof ROOM_COCKPIT_HEARTBEAT_FRESHNESS)[number];
 export type RoomCockpitLeaseStateV1 = (typeof ROOM_COCKPIT_LEASE_STATES)[number];
+export type RoomCockpitConnectorHealthStateV1 = (typeof ROOM_COCKPIT_CONNECTOR_HEALTH_STATES)[number];
+export type RoomCockpitConnectorAuthenticationV1 = (typeof ROOM_COCKPIT_CONNECTOR_AUTHENTICATION_STATES)[number];
+export type RoomCockpitConnectorRateLimitV1 = (typeof ROOM_COCKPIT_CONNECTOR_RATE_LIMIT_STATES)[number];
 
 export interface RoomCockpitParticipantLeaseV1 {
   readonly state: RoomCockpitLeaseStateV1;
@@ -30,6 +76,18 @@ export interface RoomCockpitParticipantV1 {
   readonly bindingId: string;
   readonly nativeSessionId: string | null;
   readonly happierSessionId: string | null;
+  /** Connector-certified only; raw session IDs must not be converted into links in the browser. */
+  readonly nativeSessionUrl?: string | null;
+  /** Connector-certified only; raw session IDs must not be converted into links in the browser. */
+  readonly happierUrl?: string | null;
+  readonly connectorHealth: {
+    readonly state: RoomCockpitConnectorHealthStateV1;
+    readonly checkedAt: string | null;
+    readonly authentication: RoomCockpitConnectorAuthenticationV1;
+    readonly rateLimit: RoomCockpitConnectorRateLimitV1;
+    readonly reasonCodes: readonly string[];
+    readonly retryAfterMs: number | null;
+  };
   readonly role: string;
   readonly provider: string;
   readonly model: string;
@@ -78,10 +136,18 @@ interface NormalizedParticipant {
   readonly bindingId: string | null;
   readonly nativeSessionId: string | null;
   readonly happierSessionId: string | null;
+  readonly nativeSessionUrl: string | null;
+  readonly happierUrl: string | null;
   readonly role: string | null;
   readonly provider: string | null;
   readonly model: string | null;
   readonly host: string | null;
+  readonly connectorHealthState: RoomCockpitConnectorHealthStateV1;
+  readonly connectorHealthCheckedAt: string | null;
+  readonly connectorAuthentication: RoomCockpitConnectorAuthenticationV1;
+  readonly connectorRateLimit: RoomCockpitConnectorRateLimitV1;
+  readonly connectorReasonCodes: readonly string[];
+  readonly connectorRetryAfterMs: number | null;
   readonly heartbeatFreshness: RoomCockpitHeartbeatFreshnessV1;
   readonly lastObservedAt: string | null;
   readonly recoveryOwner: string | null;
@@ -108,6 +174,41 @@ function readText(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+function readSafeHappierUrl(value: unknown): string | null {
+  const raw = readText(value);
+  if (raw === null) return null;
+  try {
+    const parsed = new URL(raw);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:")
+      && parsed.username.length === 0
+      && parsed.password.length === 0
+      && parsed.hash.length === 0
+      ? parsed.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readSafeNativeSessionUrl(value: unknown): string | null {
+  const raw = readText(value);
+  if (raw === null) return null;
+  try {
+    const parsed = new URL(raw);
+    const permittedProtocol = parsed.protocol === "codex:"
+      || parsed.protocol === "claude:"
+      || parsed.protocol === "opencode:";
+    return permittedProtocol
+      && parsed.username.length === 0
+      && parsed.password.length === 0
+      && parsed.hash.length === 0
+      ? parsed.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function readTimestamp(value: unknown): string | null {
   const timestamp = readText(value);
   return timestamp !== null && ISO_TIMESTAMP.test(timestamp) && Number.isFinite(Date.parse(timestamp)) ? timestamp : null;
@@ -129,6 +230,30 @@ function readLeaseState(value: unknown): RoomCockpitLeaseStateV1 | null {
     : null;
 }
 
+function readConnectorHealthState(value: unknown): RoomCockpitConnectorHealthStateV1 {
+  return typeof value === "string" && (ROOM_COCKPIT_CONNECTOR_HEALTH_STATES as readonly string[]).includes(value)
+    ? value as RoomCockpitConnectorHealthStateV1
+    : "unknown";
+}
+
+function readConnectorAuthentication(value: unknown): RoomCockpitConnectorAuthenticationV1 {
+  return typeof value === "string" && (ROOM_COCKPIT_CONNECTOR_AUTHENTICATION_STATES as readonly string[]).includes(value)
+    ? value as RoomCockpitConnectorAuthenticationV1
+    : "unknown";
+}
+
+function readConnectorRateLimit(value: unknown): RoomCockpitConnectorRateLimitV1 {
+  return typeof value === "string" && (ROOM_COCKPIT_CONNECTOR_RATE_LIMIT_STATES as readonly string[]).includes(value)
+    ? value as RoomCockpitConnectorRateLimitV1
+    : "unknown";
+}
+
+function readConnectorReasonCodes(value: unknown): readonly string[] {
+  return Array.isArray(value) && value.every((reason) => typeof reason === "string" && ROOM_COCKPIT_CONNECTOR_REASON_CODES.has(reason))
+    ? [...new Set(value)]
+    : [];
+}
+
 function normalizeLease(value: unknown): NormalizedLease {
   const lease = isRecord(value) ? value : null;
   return {
@@ -145,16 +270,25 @@ function normalizeParticipant(value: unknown): NormalizedParticipant {
   const limits = isRecord(participant.limits) ? participant.limits : {};
   const wait = isRecord(participant.wait) ? participant.wait : null;
   const leases = isRecord(participant.leases) ? participant.leases : {};
+  const connectorHealth = isRecord(participant.connectorHealth) ? participant.connectorHealth : {};
 
   return {
     seatId: readText(participant.seatId),
     bindingId: readText(participant.bindingId),
     nativeSessionId: readText(participant.nativeSessionId),
     happierSessionId: readText(participant.happierSessionId),
+    nativeSessionUrl: readSafeNativeSessionUrl(participant.nativeSessionUrl),
+    happierUrl: readSafeHappierUrl(participant.happierUrl),
     role: readText(participant.role),
     provider: readText(participant.provider),
     model: readText(participant.model),
     host: readText(participant.host),
+    connectorHealthState: readConnectorHealthState(connectorHealth.state),
+    connectorHealthCheckedAt: readTimestamp(connectorHealth.checkedAt),
+    connectorAuthentication: readConnectorAuthentication(connectorHealth.authentication),
+    connectorRateLimit: readConnectorRateLimit(connectorHealth.rateLimit),
+    connectorReasonCodes: readConnectorReasonCodes(connectorHealth.reasonCodes),
+    connectorRetryAfterMs: readNonNegativeNumber(connectorHealth.retryAfterMs),
     heartbeatFreshness: readHeartbeatFreshness(heartbeat.freshness),
     lastObservedAt: readTimestamp(heartbeat.lastObservedAt),
     recoveryOwner: readText(heartbeat.recoveryOwner),
@@ -212,12 +346,50 @@ function displayLease(lease: NormalizedLease): string {
   return `${lease.state} · ${lease.holderId ?? "holder unavailable"}`;
 }
 
+function displayConnectorReasons(
+  value: readonly string[],
+  state: RoomCockpitConnectorHealthStateV1,
+): string {
+  if (state === "unknown") return "Unavailable";
+  const additionalReasons = value.filter((reason) => reason !== state);
+  return additionalReasons.length > 0 ? additionalReasons.join(", ") : "No additional reason";
+}
+
+function displayRetryAfter(value: number | null): string {
+  return value === null ? "Unavailable" : `${value} ms`;
+}
+
 function TelemetryField({ label, value }: { readonly label: string; readonly value: string }) {
   return (
     <div className={styles.field}>
       <dt>{label}</dt>
       <dd>{value}</dd>
     </div>
+  );
+}
+
+/**
+ * FNXC:RoomCockpitSessionLinks 2026-07-19-23:58:
+ * The operator must be able to move from Fusion into the matching Happier or
+ * native session without copying identifiers between tools. This is rendered
+ * only from a connector-certified URL and re-validates the protocol at the
+ * browser boundary; IDs alone never produce a clickable destination.
+ */
+function SessionLinks({ participant, seatLabel }: { readonly participant: NormalizedParticipant; readonly seatLabel: string }) {
+  if (participant.happierUrl === null && participant.nativeSessionUrl === null) return null;
+  return (
+    <nav className={styles.sessionLinks} aria-label={`Session links for ${seatLabel}`}>
+      {participant.happierUrl !== null ? (
+        <a className={styles.sessionLink} href={participant.happierUrl} target="_blank" rel="noopener noreferrer">
+          Open in Happier <span aria-hidden="true">↗</span>
+        </a>
+      ) : null}
+      {participant.nativeSessionUrl !== null ? (
+        <a className={styles.sessionLink} href={participant.nativeSessionUrl} target="_blank" rel="noopener noreferrer">
+          Open native session <span aria-hidden="true">↗</span>
+        </a>
+      ) : null}
+    </nav>
   );
 }
 
@@ -249,10 +421,18 @@ function ParticipantCard({ participant, index }: { readonly participant: Normali
           <TelemetryField label="Happier Session" value={displayKnown(participant.happierSessionId, "Unavailable")} />
         </dl>
 
+        <SessionLinks participant={participant} seatLabel={seatLabel} />
+
         <dl className={styles.telemetryLedger} aria-label={`Participant telemetry for ${seatLabel}`}>
           <TelemetryField label="Provider" value={displayKnown(participant.provider)} />
           <TelemetryField label="Actual model" value={displayKnown(participant.model)} />
           <TelemetryField label="Host" value={displayKnown(participant.host)} />
+          <TelemetryField label="Connector condition" value={participant.connectorHealthState} />
+          <TelemetryField label="Connector checked" value={displayTimestamp(participant.connectorHealthCheckedAt)} />
+          <TelemetryField label="Connector authentication" value={participant.connectorAuthentication} />
+          <TelemetryField label="Connector rate limit" value={participant.connectorRateLimit} />
+          <TelemetryField label="Connector reasons" value={displayConnectorReasons(participant.connectorReasonCodes, participant.connectorHealthState)} />
+          <TelemetryField label="Connector retry after" value={displayRetryAfter(participant.connectorRetryAfterMs)} />
           <TelemetryField label="Heartbeat" value={participant.heartbeatFreshness} />
           <TelemetryField label="Last observed" value={displayTimestamp(participant.lastObservedAt)} />
           <TelemetryField label="Recovery owner" value={displayKnown(participant.recoveryOwner, "Unavailable")} />

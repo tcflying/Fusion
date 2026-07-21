@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { isProxy } from "node:util/types";
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 
 import {
   RoomDomainError,
   addRoomSeat,
   attachRoomBinding,
   createRoomAggregate,
+  terminalizeRoomLifecycle,
   transitionRoomLifecycle,
   type CreateRoomAggregateInput,
   type PendingRoomMembershipChangeV1,
@@ -14,7 +15,60 @@ import {
   type RoomBindingReplacementV1,
   type TransitionRoomLifecycleInput,
 } from "./room-domain.js";
+import {
+  createRoomTerminalizationContract,
+  createRoomTerminalizationProjection,
+  parseRoomTerminalizationProjection,
+  terminalizeRoomTerminalizationProjection,
+  type RoomTerminalizationContractProjectionV1,
+  type RoomTerminalizationContractRecordV1,
+  type RoomTerminalizationMarkerV1,
+  type RoomTerminalizationRiskEvidenceRefV1,
+} from "./room-terminalization-contract.js";
+import type {
+  EvaluateRoomTerminalizationInputV1,
+  RoomTerminalizationOutcomeV1,
+} from "./room-terminalization.js";
 import type { RoomLifecycleState, RoomTaskNodeState } from "./room-contracts/storage.js";
+import {
+  assignRoomRoles,
+  createRoomCapabilitySnapshot,
+  normalizeRoomRoleAssignmentConstraints,
+  transitionRoomRoleAssignment,
+  validateRoomRoleAssignment,
+} from "./room-role-assignment.js";
+import {
+  mergeRoomCapabilityRegistry,
+  validateRoomBindingCapabilitySnapshot,
+  type RoomBindingCapabilitySnapshotV1,
+  type RoomCapabilityFreshnessPolicyV1,
+  type RoomCapabilityRegistryIssueV1,
+  type RoomCapabilityRegistryV1,
+} from "./room-capability-registry.js";
+import {
+  evaluateRoomPhaseTransitionGateEvidence,
+  type RoomPhaseGateEvidenceProtocolV1,
+  type RoomPhaseGateEvidenceRecordV1,
+  type RoomPhaseGateProducerLineageV1,
+} from "./room-phase-gate-evidence.js";
+import { resolveRoomTaskRoleAssignment } from "./room-task-role-assignment.js";
+import {
+  getRoomProtocolDefinition,
+  getRoomProtocolNoProgressRecoveryPolicy,
+} from "./room-protocol-definitions.js";
+import type {
+  RoomCapabilitySnapshotInputV1,
+  RoomCapabilitySnapshotV1,
+  RoomRoleAssignmentConstraintsV1,
+  RoomRoleAssignmentV1,
+} from "./room-contracts/assignment.js";
+import {
+  selectNextRoomNoProgressRecoveryAction,
+  type RoomProtocolDefinitionV1,
+  type RoomProtocolNoProgressRecoveryPolicyV1,
+  type RoomProtocolRecoveryActionV1,
+  type RoomProtocolSelectedNoProgressRecoveryActionV1,
+} from "./room-contracts/protocol.js";
 import {
   assertRoomLeaseFence,
   loadRoomLeaseById,
@@ -44,6 +98,13 @@ import type {
   RoomMessageIntent,
   RoomMessageTargetV1,
 } from "./room-contracts/controller.js";
+import type { RoomProtocolMessageV1 } from "./room-contracts/protocol-message.js";
+import { validateRoomProtocolMessage } from "./room-contracts/protocol-message.js";
+import {
+  routeRoomSemanticMessage,
+  type RoomSemanticHistoryEntryV1,
+  type RoomSemanticRoutingSeatV1,
+} from "./room-semantic-routing.js";
 import {
   recordRunAuditEventWithinTransaction,
   type AsyncDataLayer,
@@ -55,10 +116,20 @@ import {
   compareRoomText,
   hashRoomValue,
 } from "./room-integrity.js";
-import { parseRoomAggregateProjection } from "./room-projection-replay.js";
+import {
+  extractRoomTaskRecoveryExhaustionTaskGraphProjection,
+  parseRoomAggregateProjection,
+  rebuildRoomCapabilityRegistryProjectionFromEvents,
+  rebuildRoomTerminalizationProjectionFromEvents,
+  rebuildRoomProjectionFromEvents,
+  ROOM_CAPABILITY_REGISTRY_MERGED_EVENT_TYPE,
+  ROOM_TERMINALIZATION_CONTRACT_RECORDED_EVENT_TYPE,
+  type ReplayedRoomCapabilityRegistryProjectionV1,
+} from "./room-projection-replay.js";
 import { approvalRequests, cliSessions, runAuditOutbox } from "./postgres/schema/project.js";
 import {
   operationalRooms,
+  roomCapabilityRegistryProjections,
   roomBindingIngestionState,
   roomBindings,
   roomEvidence,
@@ -71,9 +142,18 @@ import {
   roomMessages,
   roomOutbox,
   roomOutboxAttempts,
+  roomPhaseGateEvidence,
+  roomRoleAssignments,
+  roomProtocolMessages,
+  roomSemanticControllerInbox,
+  roomSemanticLoopBreaks,
+  roomSemanticStates,
   roomSeats,
   roomTaskEdges,
   roomTaskNodes,
+  roomTaskProgressObservations,
+  roomTaskRecoveryActions,
+  roomTaskRecoveryPlans,
   roomTurns,
 } from "./postgres/schema/room.js";
 
@@ -106,6 +186,77 @@ export interface AssertRoomWorkerAuthorityInput {
 export interface RoomWorkerAuthorityV1 {
   readonly lease: StoredRoomLeaseV1;
   readonly posture: RoomRecoveryPostureV1;
+}
+
+export interface RoomCapabilityRegistryProjectionV1 {
+  readonly id: string;
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly registry: RoomCapabilityRegistryV1;
+  readonly aggregateVersion: number;
+  readonly sourceEventId: string;
+  readonly workerFence: {
+    readonly leaseId: string;
+    readonly holderId: string;
+    readonly hostId: string;
+    readonly expectedEpoch: number;
+  };
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface RecordRoomCapabilityRegistryInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedRegistryRevision: number;
+  readonly roomWorkerFence: Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now">;
+  readonly idempotencyKey: string;
+  readonly samples: readonly RoomBindingCapabilitySnapshotV1[];
+  readonly freshness: RoomCapabilityFreshnessPolicyV1;
+  readonly asOf: string;
+}
+
+export interface RecordRoomCapabilityRegistryResultV1 {
+  readonly projection: RoomCapabilityRegistryProjectionV1;
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
+}
+
+export interface RecordRoomTerminalizationContractInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly roomWorkerFence: Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now">;
+  readonly idempotencyKey: string;
+  readonly completionContractRef: string;
+  readonly gateEvidenceSetId: string;
+  readonly independentVerificationRefs: readonly string[];
+  readonly unresolvedRiskEvidence: readonly RoomTerminalizationRiskEvidenceRefV1[];
+  readonly cancellationReason: string | null;
+  readonly terminalization: EvaluateRoomTerminalizationInputV1;
+  readonly asOf: string;
+}
+
+export interface RecordRoomTerminalizationContractResultV1 {
+  readonly projection: RoomTerminalizationContractProjectionV1;
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
+}
+
+export interface TerminalizeRoomInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly roomWorkerFence: Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now">;
+  readonly idempotencyKey: string;
+  readonly terminalContractId: string;
+  readonly terminalContractHash: string;
+  readonly asOf: string;
+}
+
+export interface TerminalizeRoomResultV1 {
+  readonly aggregate: RoomAggregateV1;
+  readonly projection: RoomTerminalizationContractProjectionV1;
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
 }
 
 export class RoomWorkerAuthorityError extends Error {
@@ -278,18 +429,63 @@ export interface AsyncRoomStoreOptions {
   readonly projectId?: string;
   readonly onCommittedEvent?: RoomCommittedEventListener;
   readonly onNotificationError?: (error: unknown, event: RoomEventRecordV1) => void;
+  /** Trusted backend clock; injectable only for deterministic persistence tests. */
+  readonly currentTime?: () => string;
 }
 
 export const MAX_ROOM_EVENT_LIST_LIMIT = 1_000;
 
 export interface ListRoomEventsOptionsV1 {
-  readonly limit: number;
+readonly limit: number;
+}
+
+export interface RoomEventPageV1 {
+readonly events: readonly RoomEventRecordV1[];
+readonly hasMore: boolean;
+}
+
+export const DEFAULT_ROOM_SUMMARY_LIST_LIMIT = 25;
+export const MAX_ROOM_SUMMARY_LIST_LIMIT = 100;
+
+export interface ListRoomSummariesInputV1 {
+  /** Bounded server-side page size. Omitted values use DEFAULT_ROOM_SUMMARY_LIST_LIMIT. */
+  readonly limit?: number;
+  /** Opaque cursor emitted by a prior listRoomSummaries result for the same project. */
+  readonly cursor?: string | null;
+}
+
+/**
+ * Deliberately narrow, durable projection for a project-scoped Room overview.
+ * It never exposes arbitrary JSON projection blobs, authority data, or provider
+ * transcript data to a list caller.
+ */
+export interface RoomSummaryV1 {
+  readonly contractVersion: 1;
+  readonly id: string;
+  readonly projectId: string;
+  readonly objective: string;
+  readonly protocolId: string;
+  readonly protocolVersion: number;
+  readonly lifecycleState: RoomLifecycleState;
+  readonly aggregateVersion: number;
+  readonly membershipVersion: number;
+  readonly activeTurnId: string | null;
+  readonly seatCount: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface ListRoomSummariesResultV1 {
+  readonly rooms: readonly RoomSummaryV1[];
+  readonly nextCursor: string | null;
 }
 
 export type RoomStoreErrorCode =
   | "idempotency_conflict"
   | "idempotency_result_missing"
+  | "room_list_invalid"
   | "room_event_list_invalid"
+  | "room_list_projection_drift"
   | "routing_command_invalid"
   | "routing_target_not_found"
   | "routing_group_not_found"
@@ -313,7 +509,29 @@ export type RoomStoreErrorCode =
   | "task_graph_unknown_node"
   | "task_graph_invalid_mutation"
   | "task_graph_critical_path_overflow"
-  | "task_graph_version_overflow";
+  | "task_graph_version_overflow"
+  | "task_dispatch_invalid_claim"
+  | "task_dispatch_dependency_blocked"
+  | "task_dispatch_owner_conflict"
+  | "role_assignment_invalid"
+  | "role_assignment_conflict"
+  | "role_assignment_missing"
+  | "semantic_message_invalid"
+  | "semantic_state_missing"
+  | "semantic_state_conflict"
+  | "semantic_route_conflict"
+  | "semantic_controller_action_conflict"
+  | "task_progress_observation_invalid"
+  | "task_progress_observation_conflict"
+  | "task_recovery_action_invalid"
+  | "task_recovery_action_conflict"
+  | "capability_registry_invalid"
+  | "capability_registry_conflict"
+  | "capability_registry_drift"
+  | "terminalization_controller_required"
+  | "terminalization_contract_missing"
+  | "terminalization_contract_conflict"
+  | "terminalization_gate_blocked";
 
 export class RoomStoreError extends Error {
   readonly code: RoomStoreErrorCode;
@@ -345,7 +563,8 @@ function normalizeRoomEventListLimit(options: unknown): number | undefined {
   }
   const limit = (options as { readonly limit?: unknown }).limit;
   if (
-    !Number.isSafeInteger(limit)
+    typeof limit !== "number"
+    || !Number.isSafeInteger(limit)
     || limit < 1
     || limit > MAX_ROOM_EVENT_LIST_LIMIT
   ) {
@@ -355,6 +574,106 @@ function normalizeRoomEventListLimit(options: unknown): number | undefined {
     );
   }
   return limit;
+}
+
+interface RoomSummaryCursorV1 {
+  readonly contractVersion: 1;
+  readonly projectId: string;
+  readonly updatedAt: string;
+  readonly roomId: string;
+}
+
+function roomListInputError(message: string): RoomStoreError {
+  return new RoomStoreError("room_list_invalid", message);
+}
+
+function normalizeRoomSummaryListLimit(limit: unknown): number {
+  if (limit === undefined) return DEFAULT_ROOM_SUMMARY_LIST_LIMIT;
+  if (
+    typeof limit !== "number"
+    || !Number.isSafeInteger(limit)
+    || limit < 1
+    || limit > MAX_ROOM_SUMMARY_LIST_LIMIT
+  ) {
+    throw roomListInputError(
+      `Room summary list limit must be an integer between 1 and ${MAX_ROOM_SUMMARY_LIST_LIMIT}`,
+    );
+  }
+  return limit;
+}
+
+function isCanonicalRoomSummaryTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 64) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function encodeRoomSummaryCursor(cursor: RoomSummaryCursorV1): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeRoomSummaryCursor(cursor: unknown, projectId: string): RoomSummaryCursorV1 {
+  if (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 512) {
+    throw roomListInputError("Room summary cursor must be a bounded opaque string");
+  }
+
+  let parsed: unknown;
+  try {
+    const decoded = Buffer.from(cursor, "base64url");
+    if (decoded.toString("base64url") !== cursor) {
+      throw new Error("non-canonical base64url cursor");
+    }
+    parsed = JSON.parse(decoded.toString("utf8"));
+  } catch {
+    throw roomListInputError("Room summary cursor is malformed");
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw roomListInputError("Room summary cursor payload must be an object");
+  }
+  const payload = parsed as Record<string, unknown>;
+  const keys = Object.keys(payload).sort();
+  if (
+    keys.length !== 4
+    || keys[0] !== "contractVersion"
+    || keys[1] !== "projectId"
+    || keys[2] !== "roomId"
+    || keys[3] !== "updatedAt"
+    || payload.contractVersion !== 1
+    || typeof payload.projectId !== "string"
+    || payload.projectId !== projectId
+    || typeof payload.roomId !== "string"
+    || payload.roomId.trim().length === 0
+    || payload.roomId !== payload.roomId.trim()
+    || !isCanonicalRoomSummaryTimestamp(payload.updatedAt)
+  ) {
+    throw roomListInputError("Room summary cursor is invalid for this project");
+  }
+
+  return {
+    contractVersion: 1,
+    projectId,
+    roomId: payload.roomId,
+    updatedAt: payload.updatedAt,
+  };
+}
+
+function roomSummaryFromAggregate(aggregate: RoomAggregateV1): RoomSummaryV1 {
+  return {
+    contractVersion: 1,
+    id: aggregate.room.id,
+    projectId: aggregate.room.projectId,
+    objective: aggregate.room.objective,
+    protocolId: aggregate.room.protocolId,
+    protocolVersion: aggregate.room.protocolVersion,
+    lifecycleState: aggregate.room.state,
+    aggregateVersion: aggregate.room.aggregateVersion,
+    membershipVersion: aggregate.membershipVersion,
+    activeTurnId: aggregate.activeTurnId,
+    seatCount: aggregate.seats.length,
+    createdAt: aggregate.room.createdAt,
+    updatedAt: aggregate.room.updatedAt,
+  };
 }
 
 export interface EnqueueRoomMessageInput {
@@ -413,6 +732,51 @@ export interface RouteOperatorMessageResultV1 {
   readonly replayed: boolean;
 }
 
+export interface ClaimReadyRoomTaskDispatchInputV1 {
+  readonly roomId: string;
+  readonly nodeId: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedDagVersion: number;
+  readonly expectedNodeVersion: number;
+  readonly owner: {
+    readonly seatId: string;
+    readonly bindingId: string;
+  };
+  /**
+   * Mandatory once the Room has an active capability-aware role assignment.
+   * It binds the coordinator's candidate to the exact durable revision that
+   * the fenced claim revalidates inside its transaction.
+   */
+  readonly roleAssignment?: {
+    readonly assignmentId: string;
+    readonly revision: number;
+    readonly phaseId: string;
+  };
+  readonly roomWorkerFence: Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now">;
+  readonly idempotencyKey: string;
+  readonly commandId: string;
+  readonly correlationId: string;
+  readonly issuedAt: string;
+  readonly authority: RoomAuthorityEnvelopeV1;
+  readonly message: {
+    readonly intent: RoomMessageIntent;
+    readonly content: string;
+    readonly contentHash: string;
+  };
+}
+
+export interface ClaimReadyRoomTaskDispatchResultV1 {
+  readonly nodeId: string;
+  readonly ownerSeatId: string;
+  readonly ownerBindingId: string;
+  readonly runningNodeVersion: number;
+  readonly message: StoredRoomMessageV1;
+  readonly target: DurableRoomMessageTargetV1;
+  readonly delivery: RoomOutboxRecordV1;
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
+}
+
 export interface EnqueueRoomMessageResult {
   readonly message: StoredRoomMessageV1;
   readonly deliveries: readonly RoomOutboxRecordV1[];
@@ -431,6 +795,22 @@ export interface BeginRoomDeliveryAttemptInput {
    * can never downgrade again after their first lease is created.
    */
   readonly senderFence?: Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" };
+}
+
+export interface DeferPendingRoomDeliveryInput {
+  readonly outboxId: string;
+  /** The caller must still own the exact unsent outbox generation. */
+  readonly expectedAttemptCount: number;
+  /** Pre-send deferral is an external-send authority operation, never a legacy bypass. */
+  readonly senderFence: NonNullable<BeginRoomDeliveryAttemptInput["senderFence"]>;
+  readonly nextAttemptAt: string;
+  readonly reasonCode: string;
+  readonly now: string;
+  readonly audit: {
+    readonly runId: string;
+    readonly agentId: string;
+    readonly taskId?: string;
+  };
 }
 
 export interface TransferNativeIdeSenderLeaseInput {
@@ -471,6 +851,13 @@ export interface ResumeAutomaticSenderAfterNativeIdeResult {
 export interface CompleteRoomDeliveryAttemptInput {
   readonly outboxId: string;
   readonly attemptId: string;
+  /**
+   * Completion must prove the same sender epoch that began the external send.
+   * This closes the send→ack window after a native IDE or replacement sender
+   * takes over the binding. Legacy rows with no sender-lease history remain
+   * readable during rolling upgrades.
+   */
+  readonly senderFence?: Omit<AssertRoomLeaseFenceInput, "now"> & { readonly kind: "sender" };
   readonly outcome: "confirmed" | "delivery_uncertain" | "retryable_failure" | "rejected";
   readonly connectorAcknowledgementId: string | null;
   readonly nativeMessageId: string | null;
@@ -500,6 +887,486 @@ export interface ReconcileRoomDeliveryInput {
     readonly agentId: string;
     readonly taskId?: string;
   };
+}
+
+/** Five minutes of unresolved provider history is a visible node-level stop, never a Room-level stop. */
+export const DEFAULT_TASK_DISPATCH_UNCERTAINTY_MAX_AGE_MS = 5 * 60 * 1_000;
+/** A controller crash may be reclaimed quickly, but never by a stale worker fence. */
+export const DEFAULT_ROOM_SEMANTIC_CONTROLLER_ACTION_CLAIM_TTL_MS = 30_000;
+/** Recovery actions are higher-cost than inbox routing and get a bounded minute-long claim. */
+export const DEFAULT_ROOM_TASK_RECOVERY_ACTION_CLAIM_TTL_MS = 60_000;
+
+export interface RoomRoleAssignmentProjectionV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly revision: number;
+  readonly state: "active" | "superseded";
+  readonly protocolId: string;
+  readonly protocolVersion: number;
+  readonly phaseId: string;
+  readonly capabilitySnapshot: RoomCapabilitySnapshotV1;
+  readonly constraints: RoomRoleAssignmentConstraintsV1;
+  readonly assignment: RoomRoleAssignmentV1;
+  readonly authoritativeProducerBindingIds: readonly string[];
+  readonly aggregateVersion: number;
+  readonly createdAt: string;
+  readonly supersededAt: string | null;
+}
+
+/** Immutable proof that a concrete Room phase gate passed for one boundary turn. */
+export interface RoomPhaseGateEvidenceProjectionV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly evidence: RoomPhaseGateEvidenceRecordV1;
+  readonly evidenceHash: string;
+  readonly producerLineage: RoomPhaseGateProducerLineageV1;
+  readonly evidenceNotBefore: string;
+  readonly createdAt: string;
+}
+
+export interface RecordRoomPhaseGateEvidenceInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly idempotencyKey: string;
+  readonly evidence: RoomPhaseGateEvidenceRecordV1;
+  readonly now: string;
+}
+
+export interface ActivateRoomRoleAssignmentInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly idempotencyKey: string;
+  readonly capabilitySnapshot: RoomCapabilitySnapshotInputV1;
+  readonly constraints: RoomRoleAssignmentConstraintsV1;
+  readonly now: string;
+}
+
+export interface TransitionRoomRoleAssignmentCommandInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  /** A completed/cancelled/uncertain turn after which no later turn has started. */
+  readonly boundaryTurnId: string;
+  readonly targetPhaseId: string;
+  /** ID of immutable proof previously recorded by recordRoomPhaseGateEvidence. */
+  readonly phaseGateEvidenceId: string;
+  readonly idempotencyKey: string;
+  readonly capabilitySnapshot: RoomCapabilitySnapshotInputV1;
+  readonly constraints: RoomRoleAssignmentConstraintsV1;
+  readonly now: string;
+}
+
+export interface RoomSemanticStateProjectionV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly turnId: string;
+  readonly nodeId: string;
+  readonly revision: number;
+  readonly state: "active" | "superseded";
+  readonly protocolId: string;
+  readonly protocolVersion: number;
+  readonly phaseId: string;
+  readonly semanticHash: string;
+  readonly evidenceStateHash: string;
+  readonly decisionStateHash: string;
+  readonly stateFingerprint: string;
+  readonly createdAt: string;
+  readonly supersededAt: string | null;
+}
+
+export interface SetRoomSemanticStateInputV1 {
+  readonly roomId: string;
+  readonly turnId: string;
+  readonly nodeId: string;
+  readonly expectedAggregateVersion: number;
+  /** The current Room-controller fence that owns this semantic-state revision. */
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly idempotencyKey: string;
+  readonly semanticHash: string;
+  readonly evidenceStateHash: string;
+  readonly decisionStateHash: string;
+}
+
+export interface RoomProtocolMessageProjectionV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly protocolMessageId: string;
+  readonly turnId: string;
+  readonly nodeId: string;
+  readonly protocolId: string;
+  readonly protocolVersion: number;
+  readonly phaseId: string;
+  readonly channelId: string;
+  /** Original protocol-issued timestamp; it is not replaced by database commit time. */
+  readonly issuedAt: string;
+  /** Full validated transport envelope retained for event replay and controller re-checks. */
+  readonly envelope: RoomProtocolMessageV1;
+  readonly origin: RoomProtocolMessageV1["origin"];
+  /** Original peer-selected target, retained even if a loop is escalated to the controller. */
+  readonly target: RoomProtocolMessageV1["target"];
+  /** Stable semantic identity used by the durable bounded-discussion guard. */
+  readonly semanticLoopFingerprint: string;
+  readonly semanticStateId: string;
+  readonly semanticStateRevision: number;
+  readonly semanticStateFingerprint: string;
+  readonly routeOutcome: "route" | "loop_break";
+  readonly recipientController: boolean;
+  readonly recipientSeatIds: readonly string[];
+  readonly requiredControllerResponse: boolean;
+  readonly requiredResponderSeatIds: readonly string[];
+  readonly createdAt: string;
+}
+
+export interface RouteRoomProtocolMessageInputV1 {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly idempotencyKey: string;
+  readonly message: unknown;
+}
+
+export interface RoomSemanticControllerActionV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly protocolMessageId: string | null;
+  readonly actionKind: "semantic_message" | "semantic_loop_break";
+  readonly reasonCode: string | null;
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly state: "pending" | "claimed" | "processed";
+  readonly attemptCount: number;
+  readonly claimToken: string | null;
+  readonly claimExpiresAt: string | null;
+  readonly claimedBy: string | null;
+  readonly processedAt: string | null;
+  readonly lastErrorCode: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface RouteRoomProtocolMessageResultV1 {
+  readonly message: StoredRoomMessageV1;
+  readonly protocolMessage: RoomProtocolMessageProjectionV1;
+  readonly targets: readonly DurableRoomMessageTargetV1[];
+  readonly deliveries: readonly RoomOutboxRecordV1[];
+  readonly controllerAction: RoomSemanticControllerActionV1 | null;
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
+}
+
+/**
+ * Complete immutable materialization of one semantic route. It is embedded in
+ * the Room event so a lost mutable projection can be independently inspected
+ * or rebuilt without consulting message/outbox/inbox tables from another run.
+ */
+export interface RoomSemanticRouteEventSnapshotV1 {
+  readonly contractVersion: "room-semantic-route-snapshot/v1";
+  readonly sourceMessage: StoredRoomMessageV1;
+  readonly protocolMessage: RoomProtocolMessageProjectionV1;
+  readonly targets: readonly DurableRoomMessageTargetV1[];
+  readonly deliveries: readonly RoomOutboxRecordV1[];
+  readonly controllerAction: RoomSemanticControllerActionV1 | null;
+  readonly loopBreak: {
+    readonly message: StoredRoomMessageV1;
+    readonly target: DurableRoomMessageTargetV1;
+    readonly controllerAction: RoomSemanticControllerActionV1;
+  } | null;
+}
+
+/**
+ * Immutable state transition for one controller inbox action. Route snapshots
+ * seed the inbox projection; these follow-up snapshots make every claim, retry,
+ * and completion replayable without reading the mutable inbox table.
+ */
+export interface RoomSemanticControllerActionEventSnapshotV1 {
+  readonly contractVersion: "room-semantic-controller-action-snapshot/v1";
+  readonly transition: "claimed" | "processed" | "retry";
+  readonly previousState: "pending" | "claimed";
+  readonly action: RoomSemanticControllerActionV1;
+}
+
+export interface ClaimRoomSemanticControllerActionInputV1 {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly workerId: string;
+  readonly now: string;
+  readonly claimTtlMs?: number;
+}
+
+export interface CompleteRoomSemanticControllerActionInputV1 {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly actionId: string;
+  readonly claimToken: string;
+  readonly outcome: "processed" | "retry";
+  readonly errorCode: string | null;
+  readonly now: string;
+}
+
+export interface RecoverNoProgressTaskDispatchesInput {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly now: string;
+  readonly maxDeliveryUncertaintyAgeMs?: number;
+}
+
+export interface RecoverNoProgressTaskDispatchesResult {
+  readonly blockedNodeIds: readonly string[];
+  readonly skippedOutboxIds: readonly string[];
+}
+
+/**
+ * A progress round carries only normalized hashes and stable source references.
+ * Raw model text, test output, and connector history stay in their respective
+ * evidence stores; the recovery ledger must be safe to replay and inspect.
+ */
+export interface RoomTaskProgressSignalHashesV1 {
+  readonly semanticHash: string;
+  readonly evidenceHash: string;
+  readonly artifactHash: string;
+  readonly testHash: string;
+  readonly resolvedDissentHash: string;
+}
+
+export interface RoomTaskProgressObservationOriginV1 {
+  readonly contractVersion: "room-task-progress-observation-origin/v1";
+  readonly sourceKind: "controller" | "connector" | "recovery_worker" | "operator";
+  readonly sourceRef: string;
+}
+
+export interface RoomTaskProgressObservationV1 extends RoomTaskProgressSignalHashesV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly nodeId: string;
+  readonly nodeVersion: number;
+  readonly turnId: string;
+  readonly phaseId: string;
+  readonly roundId: string;
+  readonly idempotencyKey: string;
+  /**
+   * Canonical hash of the current node marker and all five independent signals.
+   * A single unchanged prose summary can therefore never hide new evidence,
+   * artifacts, test results, or resolved dissent.
+   */
+  readonly progressSignature: string;
+  readonly origin: RoomTaskProgressObservationOriginV1;
+  readonly observedAt: string;
+  readonly createdAt: string;
+}
+
+export interface RoomTaskNoProgressRecoveryActionSnapshotV1 {
+  readonly contractVersion: "room-task-no-progress-recovery-action/v1";
+  readonly protocolId: string;
+  readonly protocolVersion: number;
+  readonly turnId: string;
+  readonly phaseId: string;
+  readonly nodeId: string;
+  readonly nodeVersion: number;
+  readonly observationId: string;
+  readonly recoveryAction: RoomProtocolRecoveryActionV1;
+  readonly recoveryActionHash: string;
+  readonly ladderOrder: number;
+  readonly minimumConsecutiveUnchangedRounds: number;
+  /**
+   * The store records a concrete action but never invents a Session, model, or
+   * provider side effect. A controller must supply the separate authoritative
+   * plan/approval path before it can mark this action processed.
+   */
+  readonly executionMode: "controller_plan" | "operator_approval";
+}
+
+export interface RoomTaskRecoveryActionV1 {
+  readonly id: string;
+  readonly roomId: string;
+  readonly nodeId: string;
+  readonly nodeVersion: number;
+  readonly observationId: string;
+  readonly actionId: string;
+  readonly actionSnapshot: RoomTaskNoProgressRecoveryActionSnapshotV1;
+  readonly policySnapshot: RoomProtocolNoProgressRecoveryPolicyV1;
+  readonly state: "pending" | "claimed" | "processed";
+  readonly attemptCount: number;
+  readonly claimToken: string | null;
+  readonly claimExpiresAt: string | null;
+  readonly claimedByWorkerId: string | null;
+  readonly claimedAt: string | null;
+  readonly nextEligibleAt: string;
+  readonly resultPayload: RoomTaskRecoveryActionResultV1 | null;
+  readonly lastErrorCode: string | null;
+  readonly operatorApprovalId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly processedAt: string | null;
+}
+
+/**
+ * Completion means the recovery request has a durable, independently
+ * addressable handoff/approval/supersession receipt. It does not pretend that a
+ * provider-side effect happened merely because a worker acknowledged a queue.
+ */
+export interface RoomTaskRecoveryActionResultV1 {
+  readonly contractVersion: "room-task-recovery-action-result/v1";
+  readonly kind:
+    | "controller_plan_submitted"
+    | "operator_approval_requested"
+    | "superseded";
+  readonly receiptRef: string;
+  readonly resultHash: string;
+}
+
+/**
+ * Immutable, provider-free handoff created for a claimed no-progress action.
+ * A controller-plan handoff authorizes a later typed control mutation; an
+ * operator-approval handoff is the durable escalation record. Neither claims
+ * that a provider or workspace side effect has occurred.
+ */
+export interface RoomTaskRecoveryPlanV1 {
+  readonly contractVersion: "room-task-recovery-plan/v1";
+  readonly id: string;
+  readonly roomId: string;
+  readonly recoveryActionId: string;
+  readonly executionMode: RoomTaskNoProgressRecoveryActionSnapshotV1["executionMode"];
+  readonly actionSnapshot: RoomTaskNoProgressRecoveryActionSnapshotV1;
+  readonly actionSnapshotHash: string;
+  readonly resultReceipt: RoomTaskRecoveryActionResultV1;
+  readonly createdAt: string;
+}
+
+export interface RecordRoomTaskRecoveryPlanInputV1 {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  /** Must name the currently claimed, exact no-progress action. */
+  readonly recoveryActionId: string;
+  readonly claimToken: string;
+  /** Stable per-action plan identity; retries must replay the same plan event. */
+  readonly idempotencyKey: string;
+  readonly now: string;
+}
+
+export interface RoomTaskRecoveryPlanEventSnapshotV1 {
+  readonly contractVersion: "room-task-recovery-plan-snapshot/v1";
+  readonly plan: RoomTaskRecoveryPlanV1;
+}
+
+export type RoomTaskNoProgressRecoveryDecisionV1 =
+  | {
+      readonly kind: "below_threshold";
+      readonly consecutiveUnchangedRounds: number;
+    }
+  | {
+      readonly kind: "awaiting_active_action";
+      readonly consecutiveUnchangedRounds: number;
+      readonly activeActionId: string;
+    }
+  | {
+      readonly kind: "action_enqueued";
+      readonly consecutiveUnchangedRounds: number;
+      readonly action: RoomTaskRecoveryActionV1;
+    }
+  | {
+      readonly kind: "exhausted";
+      readonly consecutiveUnchangedRounds: number;
+      readonly exhaustedGateIds: readonly string[];
+    }
+  | {
+      readonly kind: "no_declared_action";
+      readonly consecutiveUnchangedRounds: number;
+    };
+
+/**
+ * Every observation event freezes both the fact vector and the deterministic
+ * ladder result produced from that vector. If a derived action is lost from its
+ * mutable queue, replay can seed it again without reevaluating later state.
+ */
+export interface RoomTaskProgressObservationEventSnapshotV1 {
+  readonly contractVersion: "room-task-progress-observation-snapshot/v1";
+  readonly observation: RoomTaskProgressObservationV1;
+  readonly decision: RoomTaskNoProgressRecoveryDecisionV1;
+}
+
+export interface RecordRoomTaskProgressObservationInputV1 {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly expectedAggregateVersion: number;
+  readonly expectedDagVersion: number;
+  readonly nodeId: string;
+  readonly expectedNodeVersion: number;
+  readonly turnId: string;
+  readonly phaseId: string;
+  readonly roundId: string;
+  readonly idempotencyKey: string;
+  readonly signals: RoomTaskProgressSignalHashesV1;
+  readonly origin: RoomTaskProgressObservationOriginV1;
+  readonly observedAt: string;
+}
+
+export interface RecordRoomTaskProgressObservationResultV1 {
+  readonly observation: RoomTaskProgressObservationV1;
+  readonly decision: RoomTaskNoProgressRecoveryDecisionV1;
+  readonly event: RoomEventRecordV1;
+  readonly replayed: boolean;
+}
+
+/** Read model for a cockpit; all contents are durable, hash/reference-only data. */
+export interface RoomTaskProgressRecoveryProjectionV1 {
+  readonly roomId: string;
+  readonly observations: readonly RoomTaskProgressObservationV1[];
+  readonly actions: readonly RoomTaskRecoveryActionV1[];
+}
+
+/**
+ * Immutable transition recorded whenever a worker claims, retries, or resolves
+ * a no-progress recovery action. Observation events seed action rows.
+ */
+export interface RoomTaskRecoveryActionEventSnapshotV1 {
+  readonly contractVersion: "room-task-recovery-action-snapshot/v1";
+  readonly transition: "claimed" | "processed" | "retry";
+  readonly previousState: "pending" | "claimed";
+  readonly action: RoomTaskRecoveryActionV1;
+}
+
+export interface ClaimRoomTaskRecoveryActionInputV1 {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly workerId: string;
+  readonly now: string;
+  readonly claimTtlMs?: number;
+}
+
+export interface CompleteRoomTaskRecoveryActionInputV1 {
+  readonly roomId: string;
+  readonly roomWorkerFence: Omit<
+    AssertRoomLeaseFenceInput,
+    "roomId" | "kind" | "resourceId" | "now"
+  >;
+  readonly actionId: string;
+  readonly claimToken: string;
+  /** Stable per-completion command identity; an interrupted acknowledgement replays exactly. */
+  readonly idempotencyKey: string;
+  readonly outcome: "processed" | "retry";
+  readonly resultPayload: RoomTaskRecoveryActionResultV1 | null;
+  readonly errorCode: string | null;
+  readonly retryAt?: string;
+  readonly now: string;
 }
 
 export interface RecordRoomInboxReceiptInput {
@@ -599,6 +1466,15 @@ export interface CreateRoomWithExistingBindingsInput {
     };
     readonly binding: RoomBindingReplacementV1;
   }[];
+  /**
+   * When supplied, initial existing-Session membership and its entry-phase
+   * capability-aware role assignment commit in the same transaction. This
+   * prevents a crash between binding ownership and dispatch authorization.
+   */
+  readonly entryRoleAssignment?: {
+    readonly capabilitySnapshot: RoomCapabilitySnapshotInputV1;
+    readonly constraints: RoomRoleAssignmentConstraintsV1;
+  };
   readonly now: string;
 }
 
@@ -667,6 +1543,7 @@ export interface RoomTaskNodeDefinitionV1 {
   readonly id: string;
   readonly parentNodeId: string | null;
   readonly objective: string;
+  readonly assignedSeatIds?: readonly string[];
   readonly inputRefs: readonly string[];
   readonly outputRefs: readonly string[];
   readonly roleRequirements: readonly string[];
@@ -694,6 +1571,7 @@ export interface RoomTaskNodeTerminalLineageV1 {
 }
 
 export interface RoomTaskNodeProjectionV1 extends RoomTaskNodeDefinitionV1 {
+  readonly assignedSeatIds?: readonly string[];
   readonly state: RoomTaskNodeState;
   readonly nodeVersion: number;
   readonly acceptedAt: string | null;
@@ -811,6 +1689,86 @@ export interface RoomTaskGraphProjectionV1 {
   readonly criticalPathNodeIds: readonly string[];
 }
 
+export type RoomTaskGraphReplayErrorCode =
+  | "task_graph_replay_missing_snapshot"
+  | "task_graph_replay_invalid_snapshot";
+
+/**
+ * Event-only task-graph reconstruction is intentionally separate from the
+ * aggregate replay API: the aggregate has no task nodes or edges. Every graph
+ * mutation and every ready-to-running dispatch therefore carries a complete,
+ * canonical graph snapshot. Legacy v1 dispatch events remain aggregate
+ * replayable but fail closed here because they cannot prove the resulting
+ * graph.
+ */
+export class RoomTaskGraphReplayError extends Error {
+  readonly code: RoomTaskGraphReplayErrorCode;
+
+  constructor(code: RoomTaskGraphReplayErrorCode, message: string) {
+    super(message);
+    this.name = "RoomTaskGraphReplayError";
+    this.code = code;
+  }
+}
+
+export function rebuildRoomTaskGraphProjectionFromEvents(
+  events: readonly RoomEventRecordV1[],
+): RoomTaskGraphProjectionV1 {
+  const aggregate = rebuildRoomProjectionFromEvents(events);
+  let projection = buildTaskGraphProjection(
+    aggregate.room.id,
+    0,
+    0,
+    new Map(),
+    new Map(),
+  );
+  for (const event of events) {
+    switch (event.eventType) {
+      case "room_task_graph_mutated":
+        projection = readTaskGraphReplaySnapshot(event, 1, "Task-graph mutation");
+        break;
+      case "room_task_dispatch_claimed":
+        projection = readTaskGraphReplaySnapshot(event, [2, 3], "Task-dispatch");
+        assertDispatchReplaySnapshot(event, projection);
+        break;
+      case "room_task_dispatch_delivery_rejected":
+        projection = readTaskGraphReplaySnapshot(event, 1, "Task-dispatch rejection");
+        assertDispatchDeliveryBlockReplaySnapshot(event, projection);
+        break;
+      case "room_task_dispatch_delivery_uncertain_blocked":
+        projection = readTaskGraphReplaySnapshot(event, 1, "Task-dispatch uncertainty recovery");
+        assertDispatchDeliveryBlockReplaySnapshot(event, projection);
+        break;
+      /*
+      FNXC:SessionRoomTaskProgressRecovery 2026-07-19-08:42:
+      A no-progress ladder exhaustion blocks the affected node in the same
+      transaction that appends its event. Its graph snapshot is intentionally
+      named differently from generic mutations, so replay must consume the
+      hash-bound exhaustion evidence rather than retain a stale pre-block graph.
+      */
+      case "room_task_recovery_ladder_exhausted":
+        projection = readTaskGraphRecoveryExhaustionReplaySnapshot(event);
+        break;
+      default:
+        projection = {
+          ...projection,
+          aggregateVersion: event.aggregateVersion,
+        };
+        break;
+    }
+  }
+  if (
+    projection.roomId !== aggregate.room.id
+    || projection.aggregateVersion !== aggregate.room.aggregateVersion
+  ) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-graph replay did not converge to Room ${aggregate.room.id} aggregate version ${aggregate.room.aggregateVersion}`,
+    );
+  }
+  return projection;
+}
+
 /**
  * Durable PostgreSQL owner for the operational Room aggregate.
  *
@@ -823,6 +1781,7 @@ export interface RoomTaskGraphProjectionV1 {
 export class AsyncRoomStore {
   private readonly projectId: string;
   private readonly listeners = new Set<RoomCommittedEventListener>();
+  private readonly currentTime: () => string;
 
   constructor(
     private readonly layer: AsyncDataLayer,
@@ -838,6 +1797,7 @@ export class AsyncRoomStore {
       );
     }
     this.projectId = projectId;
+    this.currentTime = options.currentTime ?? (() => new Date().toISOString());
     if (options.onCommittedEvent) this.listeners.add(options.onCommittedEvent);
   }
 
@@ -883,7 +1843,7 @@ export class AsyncRoomStore {
         createdAt: aggregate.room.createdAt,
         updatedAt: aggregate.room.updatedAt,
       });
-      const event = await insertRoomEvent(tx, aggregate, "room_created", context, {
+      const createdEvent = await insertRoomEvent(tx, aggregate, "room_created", context, {
         projectionVersion: 1,
         initialProjection: aggregate,
         initialProjectionHash: hashRoomValue(aggregate),
@@ -896,9 +1856,9 @@ export class AsyncRoomStore {
         createdAt: aggregate.room.createdAt,
         updatedAt: aggregate.room.updatedAt,
       });
-      return { aggregate, event };
+      return { aggregate, event: createdEvent };
     });
-    this.publishCommittedEvent(committed.event);
+    if (committed.event) this.publishCommittedEvent(committed.event);
     return committed.aggregate;
   }
 
@@ -933,6 +1893,9 @@ export class AsyncRoomStore {
         binding: { ...participant.binding },
       }));
     validateInitialExistingParticipants(participants);
+    const entryRoleAssignment = input.entryRoleAssignment
+      ? prepareInitialExistingSessionRoleAssignment(input.room, input.entryRoleAssignment)
+      : null;
 
     const base = createRoomAggregate({
       ...input.room,
@@ -965,8 +1928,17 @@ export class AsyncRoomStore {
       projectId: this.projectId,
       room: input.room,
       participants,
+      entryRoleAssignment: entryRoleAssignment
+        ? {
+            capabilitySnapshot: entryRoleAssignment.capabilitySnapshot,
+            constraints: entryRoleAssignment.constraints,
+          }
+        : null,
     });
     const idempotencyKey = "create-room-with-existing-bindings";
+    const commandType = entryRoleAssignment
+      ? "create_room_with_existing_bindings_and_entry_role_assignment"
+      : "create_room_with_existing_bindings";
 
     const committed = await this.layer.transactionImmediate(async (tx) => {
       await lockRoomBindingIdentities(
@@ -992,7 +1964,7 @@ export class AsyncRoomStore {
         const idempotency = idempotencyRows[0];
         if (
           !idempotency
-          || idempotency.commandType !== "create_room_with_existing_bindings"
+          || idempotency.commandType !== commandType
           || idempotency.commandHash !== commandHash
         ) {
           throw new RoomStoreError(
@@ -1007,13 +1979,15 @@ export class AsyncRoomStore {
           );
         }
         return {
-          aggregate: await loadInitialRoomCreationResult(
-            tx,
-            this.projectId,
-            aggregate.room.id,
-            idempotency.resultEventId,
-          ),
-          event: null,
+          aggregate: entryRoleAssignment
+            ? existing
+            : await loadInitialRoomCreationResult(
+                tx,
+                this.projectId,
+                aggregate.room.id,
+                idempotency.resultEventId,
+              ),
+          events: [],
         };
       }
       for (const participant of participants) {
@@ -1067,7 +2041,7 @@ export class AsyncRoomStore {
         replacedByBindingId: null,
         replacementReason: null,
       })));
-      const event = await insertRoomEvent(tx, aggregate, "room_created", context, {
+      const createdEvent = await insertRoomEvent(tx, aggregate, "room_created", context, {
         projectionVersion: 1,
         initialProjection: aggregate,
         initialProjectionHash: hashRoomValue(aggregate),
@@ -1081,20 +2055,119 @@ export class AsyncRoomStore {
         updatedAt: aggregate.room.updatedAt,
         initialExistingSessionBindingIds: participants.map((participant) => participant.binding.id),
       });
+      let committedAggregate = aggregate;
+      const events: RoomEventRecordV1[] = [createdEvent];
+      let resultEventId = createdEvent.id;
+      if (entryRoleAssignment) {
+        await assertRoleAssignmentSnapshotBindingsCurrent(
+          tx,
+          this.projectId,
+          aggregate.room.id,
+          entryRoleAssignment.capabilitySnapshot,
+        );
+        const entryAggregateVersion = advanceTaskGraphVersion(
+          aggregate.room.aggregateVersion,
+          `aggregateVersion:${aggregate.room.id}`,
+        );
+        const entryProjection: RoomRoleAssignmentProjectionV1 = {
+          id: `room-role-assignment:${aggregate.room.id}:r1:${randomUUID()}`,
+          roomId: aggregate.room.id,
+          revision: 1,
+          state: "active",
+          protocolId: entryRoleAssignment.protocol.id,
+          protocolVersion: entryRoleAssignment.protocol.version,
+          phaseId: entryRoleAssignment.entryPhaseId,
+          capabilitySnapshot: entryRoleAssignment.capabilitySnapshot,
+          constraints: entryRoleAssignment.constraints,
+          assignment: entryRoleAssignment.assignment,
+          authoritativeProducerBindingIds: entryRoleAssignment.assignment.producerBindingIds,
+          aggregateVersion: entryAggregateVersion,
+          createdAt: input.now,
+          supersededAt: null,
+        };
+        const updated = await tx
+          .update(operationalRooms)
+          .set({
+            aggregateVersion: entryAggregateVersion,
+            protocolPhaseId: entryProjection.phaseId,
+            updatedAt: input.now,
+          })
+          .where(and(
+            eq(operationalRooms.id, aggregate.room.id),
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.aggregateVersion, aggregate.room.aggregateVersion),
+          ))
+          .returning({ id: operationalRooms.id });
+        if (updated.length !== 1) {
+          throw new RoomDomainError(
+            "aggregate_version_conflict",
+            `Concurrent Room update rejected entry role assignment for ${aggregate.room.id}`,
+            { expected: aggregate.room.aggregateVersion },
+          );
+        }
+        await tx.insert(roomRoleAssignments).values({
+          id: entryProjection.id,
+          projectId: this.projectId,
+          roomId: entryProjection.roomId,
+          revision: entryProjection.revision,
+          aggregateVersion: entryProjection.aggregateVersion,
+          state: entryProjection.state,
+          protocolId: entryProjection.protocolId,
+          protocolVersion: entryProjection.protocolVersion,
+          phaseId: entryProjection.phaseId,
+          capabilitySnapshot: entryProjection.capabilitySnapshot,
+          constraints: entryProjection.constraints,
+          assignment: entryProjection.assignment,
+          authoritativeProducerBindingIds: entryProjection.authoritativeProducerBindingIds,
+          createdAt: entryProjection.createdAt,
+          supersededAt: null,
+        });
+        committedAggregate = {
+          ...aggregate,
+          room: {
+            ...aggregate.room,
+            aggregateVersion: entryAggregateVersion,
+            updatedAt: input.now,
+          },
+        };
+        const entryEvent = await insertRoomEvent(tx, committedAggregate, "room_role_assignment_activated", {
+          ...context,
+          eventId: context.eventId ? `${context.eventId}:entry-role-assignment` : undefined,
+          causationId: createdEvent.id,
+          occurredAt: input.now,
+        }, {
+          projectionVersion: 1,
+          assignmentId: entryProjection.id,
+          revision: entryProjection.revision,
+          protocolId: entryProjection.protocolId,
+          protocolVersion: entryProjection.protocolVersion,
+          phaseId: entryProjection.phaseId,
+          capabilitySnapshot: entryProjection.capabilitySnapshot,
+          capabilitySnapshotHash: hashRoomValue(entryProjection.capabilitySnapshot),
+          constraints: entryProjection.constraints,
+          constraintsHash: hashRoomValue(entryProjection.constraints),
+          assignment: entryProjection.assignment,
+          assignmentHash: hashRoomValue(entryProjection.assignment),
+          authoritativeProducerBindingIds: entryProjection.authoritativeProducerBindingIds,
+          updatedAt: input.now,
+        });
+        events.push(entryEvent);
+        resultEventId = entryEvent.id;
+      }
       await tx.insert(roomIdempotencyKeys).values({
         id: `room-idempotency-${randomUUID()}`,
         projectId: this.projectId,
         roomId: aggregate.room.id,
         idempotencyKey,
-        commandType: "create_room_with_existing_bindings",
+        commandType,
         commandHash,
-        resultEventId: event.id,
+        resultEventId,
         createdAt: input.now,
         expiresAt: null,
       });
-      return { aggregate, event };
+      return { aggregate: committedAggregate, events };
     });
-    if (committed.event) this.publishCommittedEvent(committed.event);
+    for (const event of committed.events) this.publishCommittedEvent(event);
     return committed.aggregate;
   }
 
@@ -1318,6 +2391,13 @@ export class AsyncRoomStore {
     input: TransitionRoomLifecycleInput,
     context: RoomCommandContext,
   ): Promise<RoomAggregateV1> {
+    if (isControllerTerminalizationOutcome(input.to)) {
+      throw new RoomDomainError(
+        "terminalization_required",
+        `Room ${roomId} may enter ${input.to} only through a hash-bound controller terminalization contract`,
+        { to: input.to },
+      );
+    }
     const committed = await this.layer.transactionImmediate(async (tx) => {
       const current = await loadRoomAggregateProjection(tx, this.projectId, roomId);
       if (!current) {
@@ -1375,8 +2455,794 @@ export class AsyncRoomStore {
     return committed.aggregate;
   }
 
+  /**
+   * FNXC:RoomTerminalizationStore 2026-07-18-11:36:
+   * Terminal outcomes require a controller-fenced, append-only contract record
+   * before any lifecycle mutation. A failed hard gate is durable repair evidence,
+   * never a reason to fabricate a successful completion.
+   *
+   * Record the immutable evidence snapshot before a controller may even request
+   * a lifecycle terminalization. A red contract is intentionally retained for
+   * repair/audit rather than being converted into a misleading completion.
+   */
+  async recordRoomTerminalizationContract(
+    input: RecordRoomTerminalizationContractInputV1,
+    context: RoomCommandContext,
+  ): Promise<RecordRoomTerminalizationContractResultV1> {
+    assertTerminalizationControllerContext(context, input.roomWorkerFence, input.asOf);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      completionContractRef: input.completionContractRef,
+      gateEvidenceSetId: input.gateEvidenceSetId,
+      independentVerificationRefs: [...input.independentVerificationRefs].sort(),
+      unresolvedRiskEvidence: [...input.unresolvedRiskEvidence]
+        .map((entry) => ({ ...entry }))
+        .sort((left, right) => left.ref.localeCompare(right.ref)),
+      cancellationReason: input.cancellationReason,
+      terminalization: input.terminalization,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "record_room_terminalization_contract",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.asOf,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        return {
+          result: await loadRecordedTerminalizationContractResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            input.idempotencyKey,
+            commandHash,
+          ),
+          eventToPublish: null,
+        };
+      }
+
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, "room_worker", input.roomId);
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.asOf,
+      });
+
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected terminalization contract for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion, actual: current.room.aggregateVersion },
+        );
+      }
+      if (current.terminalization) {
+        throw new RoomStoreError(
+          "terminalization_contract_conflict",
+          `Room ${input.roomId} already terminalized through ${current.terminalization.contractId}`,
+        );
+      }
+      const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+      if (!protocol) {
+        throw new RoomStoreError(
+          "terminalization_contract_conflict",
+          `Room ${input.roomId} references an unavailable protocol ${current.room.protocolId}@${current.room.protocolVersion}`,
+        );
+      }
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `terminalizationContractAggregateVersion:${input.roomId}`,
+      );
+      const eventId = context.eventId
+        ? `${context.eventId}:terminalization-contract`
+        : `room-event-${randomUUID()}`;
+      const contract = createRoomTerminalizationContract({
+        id: `room-terminal-contract-${randomUUID()}`,
+        projectId: this.projectId,
+        roomId: input.roomId,
+        aggregateVersion,
+        protocolId: current.room.protocolId,
+        protocolVersion: current.room.protocolVersion,
+        completionContractRef: input.completionContractRef,
+        gateEvidenceSetId: input.gateEvidenceSetId,
+        independentVerificationRefs: input.independentVerificationRefs,
+        unresolvedRiskEvidence: input.unresolvedRiskEvidence,
+        cancellationReason: input.cancellationReason,
+        terminalization: input.terminalization,
+        recordEventId: eventId,
+        recordedAt: input.asOf,
+      });
+      const projection = createRoomTerminalizationProjection(contract);
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion,
+          updatedAt: input.asOf,
+        },
+      };
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion,
+          completionContract: projection,
+          updatedAt: input.asOf,
+        })
+        .where(and(
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected terminalization contract for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      const event = await insertRoomEvent(tx, next, ROOM_TERMINALIZATION_CONTRACT_RECORDED_EVENT_TYPE, {
+        ...context,
+        eventId,
+        occurredAt: input.asOf,
+      }, {
+        projectionVersion: 1,
+        contract,
+        contractHash: contract.contractHash,
+        recordedAt: input.asOf,
+      });
+      const bound = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(and(eq(roomIdempotencyKeys.id, reservationId), eq(roomIdempotencyKeys.projectId, this.projectId)))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (bound.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind terminalization contract key ${input.idempotencyKey}`,
+        );
+      }
+      return { result: { projection, event, replayed: false }, eventToPublish: event };
+    });
+    if (committed.eventToPublish) this.publishCommittedEvent(committed.eventToPublish);
+    return committed.result;
+  }
+
+  /** Return a validated current terminalization contract projection, if one exists. */
+  async getRoomTerminalizationContract(
+    roomId: string,
+  ): Promise<RoomTerminalizationContractProjectionV1 | null> {
+    return this.layer.transaction(async (tx) => {
+      const [projection, events] = await Promise.all([
+        loadRoomTerminalizationProjection(tx, this.projectId, roomId),
+        loadRoomEvents(tx, this.projectId, roomId),
+      ]);
+      const replayed = rebuildRoomTerminalizationProjectionFromEvents(events);
+      if (!projection && !replayed) return null;
+      if (!projection || !replayed || hashRoomValue(projection) !== hashRoomValue(replayed)) {
+        throw new RoomStoreError(
+          "terminalization_contract_conflict",
+          `Terminalization contract projection for Room ${roomId} disagrees with the immutable Room ledger`,
+        );
+      }
+      return projection;
+    },
+    { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  /**
+   * FNXC:RoomTerminalizationStore 2026-07-18-11:37:
+   * The final write rechecks the immutable event-backed contract under the same
+   * worker fence, revokes competing workers atomically, and lets acknowledgement
+   * loss replay the committed result without repeating the terminal side effect.
+   *
+   * Commit the terminal state only after the same controller fence, immutable
+   * contract hash, and fresh pure-policy evaluation still agree. This is the
+   * sole durable path for terminal lifecycle outcomes.
+   */
+  async terminalizeRoom(
+    input: TerminalizeRoomInputV1,
+    context: RoomCommandContext,
+  ): Promise<TerminalizeRoomResultV1> {
+    assertTerminalizationControllerContext(context, input.roomWorkerFence, input.asOf);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      terminalContractId: input.terminalContractId,
+      terminalContractHash: input.terminalContractHash,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "terminalize_room",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.asOf,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        return {
+          result: await loadTerminalizedRoomResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            input.idempotencyKey,
+            commandHash,
+          ),
+          eventToPublish: null,
+        };
+      }
+      await lockRoomLeaseResourceWithinTransaction(tx, this.projectId, "room_worker", input.roomId);
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.asOf,
+      });
+
+      const [current, projection, events] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        loadRoomTerminalizationProjection(tx, this.projectId, input.roomId),
+        loadRoomEvents(tx, this.projectId, input.roomId),
+      ]);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      if (!projection) {
+        throw new RoomStoreError(
+          "terminalization_contract_missing",
+          `Room ${input.roomId} has no recorded terminalization contract`,
+        );
+      }
+      const replayedProjection = rebuildRoomTerminalizationProjectionFromEvents(events);
+      if (!replayedProjection || hashRoomValue(replayedProjection) !== hashRoomValue(projection)) {
+        throw new RoomStoreError(
+          "terminalization_contract_conflict",
+          `Room ${input.roomId} terminalization projection does not match its immutable contract ledger`,
+        );
+      }
+      if (projection.state !== "recorded" || projection.terminalization !== null || current.terminalization) {
+        throw new RoomStoreError(
+          "terminalization_contract_conflict",
+          `Room ${input.roomId} terminalization contract is not pending`,
+        );
+      }
+      const contract = projection.contract;
+      if (contract.id !== input.terminalContractId || contract.contractHash !== input.terminalContractHash) {
+        throw new RoomStoreError(
+          "terminalization_contract_conflict",
+          `Room ${input.roomId} terminalization contract identity or hash changed`,
+        );
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion
+        || contract.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Room ${input.roomId} terminalization contract no longer matches current aggregate version`,
+          {
+            expected: input.expectedAggregateVersion,
+            actual: current.room.aggregateVersion,
+            contractAggregateVersion: contract.aggregateVersion,
+          },
+        );
+      }
+      if (!contract.decision.canTerminalize) {
+        throw new RoomStoreError(
+          "terminalization_gate_blocked",
+          `Room ${input.roomId} terminalization contract still has unmet evidence or gate requirements`,
+        );
+      }
+      const eventId = context.eventId
+        ? `${context.eventId}:terminalized`
+        : `room-event-${randomUUID()}`;
+      const marker: RoomTerminalizationMarkerV1 = {
+        contractId: contract.id,
+        contractHash: contract.contractHash,
+        outcome: contract.requestedOutcome,
+        eventId,
+        aggregateVersion: advanceTaskGraphVersion(
+          current.room.aggregateVersion,
+          `terminalizationAggregateVersion:${input.roomId}`,
+        ),
+        terminalizedAt: input.asOf,
+      };
+      const next = terminalizeRoomLifecycle(current, {
+        to: contract.requestedOutcome,
+        expectedAggregateVersion: input.expectedAggregateVersion,
+        now: input.asOf,
+        terminalization: marker,
+      });
+      const terminalProjection = terminalizeRoomTerminalizationProjection(projection, marker);
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          lifecycleState: next.room.state,
+          aggregateVersion: next.room.aggregateVersion,
+          completionContract: terminalProjection,
+          updatedAt: next.room.updatedAt,
+        })
+        .where(and(
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected terminalization for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      await tx
+        .update(roomLeases)
+        .set({ releasedAt: input.asOf })
+        .where(and(
+          eq(roomLeases.projectId, this.projectId),
+          eq(roomLeases.roomId, input.roomId),
+          eq(roomLeases.kind, "room_worker"),
+          isNull(roomLeases.releasedAt),
+        ));
+      const event = await insertRoomEvent(tx, next, "room_terminalized", {
+        ...context,
+        eventId,
+        occurredAt: input.asOf,
+      }, {
+        projectionVersion: 1,
+        contract,
+        contractId: contract.id,
+        contractHash: contract.contractHash,
+        recordEventId: contract.recordEventId,
+        from: current.room.state,
+        to: next.room.state,
+        terminalizedAt: input.asOf,
+      });
+      const bound = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(and(eq(roomIdempotencyKeys.id, reservationId), eq(roomIdempotencyKeys.projectId, this.projectId)))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (bound.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind terminalization key ${input.idempotencyKey}`,
+        );
+      }
+      return {
+        result: { aggregate: next, projection: terminalProjection, event, replayed: false },
+        eventToPublish: event,
+      };
+    });
+    if (committed.eventToPublish) this.publishCommittedEvent(committed.eventToPublish);
+    return committed.result;
+  }
+
   async getRoom(roomId: string): Promise<RoomAggregateV1 | undefined> {
     return loadRoomAggregateProjection(this.layer.db, this.projectId, roomId);
+  }
+
+  /**
+   * FNXC:RoomControlPlaneList 2026-07-19-16:01:
+   * The Room cockpit and global operations overview must rebuild their list
+   * from project-bound durable projections after any browser reconnect. Use a
+   * bounded, project-bound keyset cursor and derive each public summary from
+   * the current aggregate so arbitrary JSON projection fields cannot cross the
+   * control-plane read boundary.
+   */
+  async listRoomSummaries(
+    input: ListRoomSummariesInputV1 = {},
+  ): Promise<ListRoomSummariesResultV1> {
+    const limit = normalizeRoomSummaryListLimit(input.limit);
+    const cursor = input.cursor === null || input.cursor === undefined
+      ? null
+      : decodeRoomSummaryCursor(input.cursor, this.projectId);
+
+    return this.layer.transaction(async (tx) => {
+      const afterCursorCondition = cursor
+        ? or(
+          gt(operationalRooms.updatedAt, cursor.updatedAt),
+          and(
+            eq(operationalRooms.updatedAt, cursor.updatedAt),
+            gt(operationalRooms.id, cursor.roomId),
+          ),
+        )
+        : undefined;
+      const rows = await tx
+        .select({
+          id: operationalRooms.id,
+          projectId: operationalRooms.projectId,
+          aggregateVersion: operationalRooms.aggregateVersion,
+          membershipVersion: operationalRooms.membershipVersion,
+          updatedAt: operationalRooms.updatedAt,
+        })
+        .from(operationalRooms)
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          afterCursorCondition,
+        ))
+        .orderBy(asc(operationalRooms.updatedAt), asc(operationalRooms.id))
+        .limit(limit + 1);
+      const pageRows = rows.slice(0, limit);
+      const rooms = await Promise.all(pageRows.map(async (row) => {
+        const aggregate = await loadRoomAggregateProjection(tx, this.projectId, row.id);
+        if (
+          !aggregate
+          || aggregate.room.id !== row.id
+          || aggregate.room.projectId !== this.projectId
+          || aggregate.room.projectId !== row.projectId
+          || aggregate.room.updatedAt !== row.updatedAt
+          || aggregate.room.aggregateVersion !== Number(row.aggregateVersion)
+          || aggregate.membershipVersion !== Number(row.membershipVersion)
+        ) {
+          throw new RoomStoreError(
+            "room_list_projection_drift",
+            `Room summary projection for ${row.id} is not bound to the current durable aggregate`,
+          );
+        }
+        return roomSummaryFromAggregate(aggregate);
+      }));
+      const last = pageRows[pageRows.length - 1];
+
+      return {
+        rooms,
+        nextCursor: rows.length > limit && last
+          ? encodeRoomSummaryCursor({
+            contractVersion: 1,
+            projectId: this.projectId,
+            roomId: last.id,
+            updatedAt: last.updatedAt,
+          })
+          : null,
+      };
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  /**
+   * Return only a projection that still exactly matches the immutable Room
+   * ledger. This makes a manually altered current-row visible as drift instead
+   * of serving it as a trustworthy capability report.
+   */
+  async getRoomCapabilityRegistry(
+    roomId: string,
+  ): Promise<RoomCapabilityRegistryProjectionV1 | null> {
+    assertNonBlankTaskGraphString(roomId, "roomId");
+    return this.layer.transaction(async (tx) => {
+      const projection = await loadRoomCapabilityRegistryProjection(tx, this.projectId, roomId);
+      const events = await loadRoomEvents(tx, this.projectId, roomId);
+      if (!projection && events.length === 0) return null;
+      const replayed = rebuildRoomCapabilityRegistryProjectionFromEvents(events);
+      if (!projection) {
+        if (replayed) {
+          throw new RoomStoreError(
+            "capability_registry_drift",
+            `Capability registry projection for Room ${roomId} is missing its immutable replay result`,
+          );
+        }
+        return null;
+      }
+      if (!replayed || !roomCapabilityRegistryProjectionMatchesReplay(projection, replayed)) {
+        throw new RoomStoreError(
+          "capability_registry_drift",
+          `Capability registry projection for Room ${roomId} disagrees with its immutable event replay`,
+        );
+      }
+      return projection;
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  /*
+  FNXC:RoomCapabilityRegistry 2026-07-19-10:01:
+  A dynamic capability report is accepted only under the current room-worker
+  fence and both the Room aggregate and registry revision compare-and-swap.
+  The store persists exactly the integrity-checked snapshots supplied by the
+  reporter; it never fills in model, account, tool, health, or quality fields
+  from a provider label or mutable side table.
+  */
+  async recordRoomCapabilityRegistry(
+    rawInput: RecordRoomCapabilityRegistryInputV1,
+  ): Promise<RecordRoomCapabilityRegistryResultV1> {
+    const input = normalizeRecordRoomCapabilityRegistryInput(rawInput);
+    const samples = canonicalizeRoomCapabilityRegistrySamples(input.samples);
+    const registryId = roomCapabilityRegistryId(this.projectId, input.roomId);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedRegistryRevision: input.expectedRegistryRevision,
+      registryId,
+      samples,
+      freshness: input.freshness,
+      asOf: input.asOf,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.asOf,
+      });
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "record_room_capability_registry",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.asOf,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "record_room_capability_registry"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different capability-registry command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Capability-registry key ${input.idempotencyKey} has no committed event`,
+          );
+        }
+        return {
+          result: {
+            ...(await loadRoomCapabilityRegistryCommandResult(
+              tx,
+              this.projectId,
+              input.roomId,
+              existing.resultEventId,
+            )),
+            replayed: true,
+          },
+          eventToPublish: null,
+        };
+      }
+
+      const [currentRoom, currentProjection] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        loadRoomCapabilityRegistryProjection(tx, this.projectId, input.roomId),
+      ]);
+      if (!currentRoom) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      if (currentRoom.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected capability registry for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion, actual: currentRoom.room.aggregateVersion },
+        );
+      }
+      const actualRegistryRevision = currentProjection?.registry.revision ?? 0;
+      if (actualRegistryRevision !== input.expectedRegistryRevision) {
+        throw new RoomStoreError(
+          "capability_registry_conflict",
+          `Capability registry for Room ${input.roomId} expected revision ${input.expectedRegistryRevision} but is ${actualRegistryRevision}`,
+        );
+      }
+      if (isEarlierTimestamp(input.asOf, currentRoom.room.updatedAt)) {
+        throw new RoomStoreError(
+          "capability_registry_invalid",
+          `Capability registry observation time cannot precede Room ${input.roomId} updatedAt`,
+        );
+      }
+      await assertRoomCapabilityRegistrySamplesMatchBindings(
+        tx,
+        this.projectId,
+        input.roomId,
+        currentProjection?.registry ?? null,
+        samples,
+      );
+      const merged = mergeRoomCapabilityRegistry({
+        registryId,
+        current: currentProjection?.registry ?? null,
+        samples,
+        asOf: input.asOf,
+        freshness: input.freshness,
+      });
+      if (!merged.ok) throwRoomCapabilityRegistryIssues(merged.issues);
+
+      if (currentProjection && merged.value.revision === currentProjection.registry.revision) {
+        const bound = await tx
+          .update(roomIdempotencyKeys)
+          .set({ resultEventId: currentProjection.sourceEventId })
+          .where(and(
+            eq(roomIdempotencyKeys.id, reservationId),
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+          ))
+          .returning({ id: roomIdempotencyKeys.id });
+        if (bound.length !== 1) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Failed to bind unchanged capability-registry key ${input.idempotencyKey}`,
+          );
+        }
+        return {
+          result: {
+            ...(await loadRoomCapabilityRegistryCommandResult(
+              tx,
+              this.projectId,
+              input.roomId,
+              currentProjection.sourceEventId,
+            )),
+            replayed: true,
+          },
+          eventToPublish: null,
+        };
+      }
+
+      const aggregateVersion = advanceTaskGraphVersion(
+        currentRoom.room.aggregateVersion,
+        `capabilityRegistryAggregateVersion:${input.roomId}`,
+      );
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion, updatedAt: input.asOf })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected capability registry for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      const next: RoomAggregateV1 = {
+        ...currentRoom,
+        room: { ...currentRoom.room, aggregateVersion, updatedAt: input.asOf },
+      };
+      const eventId = `room-event-${randomUUID()}`;
+      const event = await insertRoomEvent(tx, next, ROOM_CAPABILITY_REGISTRY_MERGED_EVENT_TYPE, {
+        eventId,
+        actorType: "controller",
+        actorId: input.roomWorkerFence.holderId,
+        correlationId: input.idempotencyKey,
+        causationId: null,
+        occurredAt: input.asOf,
+      }, {
+        projectionVersion: 1,
+        registryId,
+        previousRegistryRevision: input.expectedRegistryRevision,
+        registry: structuredClone(merged.value),
+        samples: structuredClone(samples),
+        freshness: structuredClone(input.freshness),
+        createdAt: currentProjection?.createdAt ?? input.asOf,
+        asOf: input.asOf,
+        workerFence: structuredClone(input.roomWorkerFence),
+      });
+      const projection: RoomCapabilityRegistryProjectionV1 = {
+        id: roomCapabilityRegistryProjectionId(this.projectId, input.roomId),
+        projectId: this.projectId,
+        roomId: input.roomId,
+        registry: merged.value,
+        aggregateVersion,
+        sourceEventId: event.id,
+        workerFence: structuredClone(input.roomWorkerFence),
+        createdAt: currentProjection?.createdAt ?? input.asOf,
+        updatedAt: input.asOf,
+      };
+      if (currentProjection) {
+        const updated = await tx
+          .update(roomCapabilityRegistryProjections)
+          .set({
+            registryId,
+            revision: projection.registry.revision,
+            aggregateVersion: projection.aggregateVersion,
+            registry: projection.registry,
+            registryIntegrityHash: projection.registry.integrityHash,
+            sourceEventId: projection.sourceEventId,
+            workerLeaseId: projection.workerFence.leaseId,
+            workerHolderId: projection.workerFence.holderId,
+            workerHostId: projection.workerFence.hostId,
+            workerLeaseEpoch: projection.workerFence.expectedEpoch,
+            updatedAt: projection.updatedAt,
+          })
+          .where(and(
+            eq(roomCapabilityRegistryProjections.projectId, this.projectId),
+            eq(roomCapabilityRegistryProjections.roomId, input.roomId),
+            eq(roomCapabilityRegistryProjections.revision, input.expectedRegistryRevision),
+          ))
+          .returning({ id: roomCapabilityRegistryProjections.id });
+        if (updated.length !== 1) {
+          throw new RoomStoreError(
+            "capability_registry_conflict",
+            `Concurrent capability registry update rejected revision ${input.expectedRegistryRevision}`,
+          );
+        }
+      } else {
+        await tx.insert(roomCapabilityRegistryProjections).values({
+          id: projection.id,
+          projectId: projection.projectId,
+          roomId: projection.roomId,
+          registryId,
+          revision: projection.registry.revision,
+          aggregateVersion: projection.aggregateVersion,
+          registry: projection.registry,
+          registryIntegrityHash: projection.registry.integrityHash,
+          sourceEventId: projection.sourceEventId,
+          workerLeaseId: projection.workerFence.leaseId,
+          workerHolderId: projection.workerFence.holderId,
+          workerHostId: projection.workerFence.hostId,
+          workerLeaseEpoch: projection.workerFence.expectedEpoch,
+          createdAt: projection.createdAt,
+          updatedAt: projection.updatedAt,
+        });
+      }
+      const bound = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(and(
+          eq(roomIdempotencyKeys.id, reservationId),
+          eq(roomIdempotencyKeys.projectId, this.projectId),
+        ))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (bound.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind capability-registry key ${input.idempotencyKey} to event ${event.id}`,
+        );
+      }
+      return {
+        result: { projection, event, replayed: false },
+        eventToPublish: event,
+      };
+    });
+    if (committed.eventToPublish) this.publishCommittedEvent(committed.eventToPublish);
+    return committed.result;
   }
 
   async getTaskGraph(roomId: string): Promise<RoomTaskGraphProjectionV1 | null> {
@@ -1385,6 +3251,2855 @@ export class AsyncRoomStore {
       (tx) => loadRoomTaskGraphProjection(tx, this.projectId, roomId),
       { isolationLevel: "repeatable read", accessMode: "read only" },
     );
+  }
+
+  /**
+   * Durable observability read for the recovery cockpit. It deliberately
+   * exposes no raw model/provider payloads: only progress hashes, immutable
+   * action snapshots, claim ownership, receipts, and scheduler times.
+   */
+  async getTaskProgressRecoveryProjection(
+    roomId: string,
+  ): Promise<RoomTaskProgressRecoveryProjectionV1> {
+    assertNonBlankTaskGraphString(roomId, "roomId");
+    return this.layer.transaction(async (tx) => {
+      const [observationRows, actionRows] = await Promise.all([
+        tx
+          .select()
+          .from(roomTaskProgressObservations)
+          .where(and(
+            eq(roomTaskProgressObservations.projectId, this.projectId),
+            eq(roomTaskProgressObservations.roomId, roomId),
+          ))
+          .orderBy(
+            asc(roomTaskProgressObservations.observedAt),
+            asc(roomTaskProgressObservations.id),
+          ),
+        tx
+          .select()
+          .from(roomTaskRecoveryActions)
+          .where(and(
+            eq(roomTaskRecoveryActions.projectId, this.projectId),
+            eq(roomTaskRecoveryActions.roomId, roomId),
+          ))
+          .orderBy(
+            asc(roomTaskRecoveryActions.createdAt),
+            asc(roomTaskRecoveryActions.id),
+          ),
+      ]);
+      return {
+        roomId,
+        observations: observationRows.map(rowToRoomTaskProgressObservation),
+        actions: actionRows.map(rowToRoomTaskRecoveryAction),
+      };
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  async getActiveRoomRoleAssignment(roomId: string): Promise<RoomRoleAssignmentProjectionV1 | null> {
+    assertNonBlankTaskGraphString(roomId, "roomId");
+    return this.layer.transaction(async (tx) => {
+      const rows = await tx
+        .select()
+        .from(roomRoleAssignments)
+        .where(and(
+          eq(roomRoleAssignments.projectId, this.projectId),
+          eq(roomRoleAssignments.roomId, roomId),
+          eq(roomRoleAssignments.state, "active"),
+        ))
+        .limit(1);
+      return rows[0] ? parseStoredRoomRoleAssignment(rows[0]) : null;
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  /**
+   * Record immutable phase-gate proof before a phase transition may reference
+   * it. The transition command receives only this durable id and re-evaluates
+   * the proof; it never trusts a caller-owned passed-gate list.
+   *
+   * FNXC:RoomPhaseGateEvidence 2026-07-18-08:41:
+   * Evidence, its producer-lineage snapshot, aggregate CAS, immutable event,
+   * and idempotency receipt are one transaction. A restarted controller can
+   * therefore observe the same proof without recreating or self-attesting it.
+   */
+  async recordRoomPhaseGateEvidence(
+    rawInput: RecordRoomPhaseGateEvidenceInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomPhaseGateEvidenceProjectionV1> {
+    const input = normalizeRecordRoomPhaseGateEvidenceInput(rawInput);
+    if (context.actorType !== "controller" && context.actorType !== "system") {
+      throw new RoomStoreError(
+        "role_assignment_invalid",
+        "Only the supervised controller or system ingress may record phase-gate evidence",
+      );
+    }
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      evidence: input.evidence,
+    });
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "record_room_phase_gate_evidence",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.now,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "record_room_phase_gate_evidence"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${input.idempotencyKey} has no committed phase-gate evidence event`,
+          );
+        }
+        const evidenceRows = await tx
+          .select()
+          .from(roomPhaseGateEvidence)
+          .where(and(
+            eq(roomPhaseGateEvidence.projectId, this.projectId),
+            eq(roomPhaseGateEvidence.roomId, input.roomId),
+            eq(roomPhaseGateEvidence.id, input.evidence.id),
+          ))
+          .limit(1);
+        if (!evidenceRows[0]) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotent phase-gate evidence ${input.evidence.id} is missing its immutable projection`,
+          );
+        }
+        return { projection: parseStoredRoomPhaseGateEvidence(evidenceRows[0]), event: null };
+      }
+
+      const [current, activeRows] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        tx
+          .select()
+          .from(roomRoleAssignments)
+          .where(and(
+            eq(roomRoleAssignments.projectId, this.projectId),
+            eq(roomRoleAssignments.roomId, input.roomId),
+            eq(roomRoleAssignments.state, "active"),
+          ))
+          .limit(1),
+      ]);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected phase-gate evidence for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      if (isEarlierTimestamp(input.now, current.room.updatedAt)) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Phase-gate evidence timestamp cannot precede Room ${input.roomId} updatedAt`,
+        );
+      }
+      const activeRow = activeRows[0];
+      if (!activeRow) {
+        throw new RoomStoreError(
+          "role_assignment_missing",
+          `Room ${input.roomId} has no active role assignment for phase-gate evidence`,
+        );
+      }
+      const active = parseStoredRoomRoleAssignment(activeRow);
+      const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+      if (!protocol || protocol.id !== active.protocolId || protocol.version !== active.protocolVersion) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          `Room ${input.roomId} has no compatible protocol for phase-gate evidence`,
+        );
+      }
+      const boundaryTurn = current.turns.find((turn) => turn.id === input.evidence.turnId);
+      const laterTurnStarted = boundaryTurn
+        ? current.turns.some((turn) => turn.sequence > boundaryTurn.sequence && turn.startedAt !== null)
+        : false;
+      if (
+        !boundaryTurn
+        || boundaryTurn.protocolPhaseId !== active.phaseId
+        || laterTurnStarted
+        || !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)
+      ) {
+        throw new RoomDomainError(
+          "turn_boundary_required",
+          `Phase-gate evidence ${input.evidence.id} must bind a safe completed turn in active phase ${active.phaseId}`,
+        );
+      }
+      const producerLineage = createRoomPhaseGateProducerLineage(
+        active,
+        input.evidence,
+        protocol,
+      );
+      const decision = evaluatePhaseGateEvidenceForTransition({
+        protocol,
+        fromPhaseId: active.phaseId,
+        targetPhaseId: findProtocolTargetPhaseForGate(protocol, active.phaseId, input.evidence.gateId),
+        turnId: input.evidence.turnId,
+        evidence: input.evidence,
+        evidenceNotBefore: active.createdAt,
+        evaluatedAt: input.now,
+        producerLineage,
+      });
+      if (!decision.transitionAllowed || decision.acceptedEvidenceId !== input.evidence.id) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          formatPhaseGateEvidenceDecisionFailure(decision.unmetReasons),
+        );
+      }
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `aggregateVersion:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: { ...current.room, aggregateVersion, updatedAt: input.now },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected phase-gate evidence for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      const projection: RoomPhaseGateEvidenceProjectionV1 = {
+        id: input.evidence.id,
+        roomId: input.roomId,
+        evidence: structuredClone(input.evidence),
+        evidenceHash: hashRoomValue(input.evidence),
+        producerLineage,
+        evidenceNotBefore: active.createdAt,
+        createdAt: input.now,
+      };
+      await tx.insert(roomPhaseGateEvidence).values({
+        id: projection.id,
+        projectId: this.projectId,
+        roomId: projection.roomId,
+        evidence: projection.evidence,
+        evidenceHash: projection.evidenceHash,
+        producerLineage: projection.producerLineage,
+        evidenceNotBefore: projection.evidenceNotBefore,
+        createdAt: projection.createdAt,
+      });
+      const event = await insertRoomEvent(tx, next, "room_phase_gate_evidence_recorded", context, {
+        projectionVersion: 1,
+        phaseGateEvidenceId: projection.id,
+        evidence: projection.evidence,
+        evidenceHash: projection.evidenceHash,
+        producerLineage: projection.producerLineage,
+        evidenceNotBefore: projection.evidenceNotBefore,
+        recordedAt: projection.createdAt,
+      });
+      await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId));
+      return { projection, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.projection;
+  }
+
+  /**
+   * Activate the only entry-phase assignment from a canonical capability
+   * snapshot. The Room aggregate, phase projection, assignment row, immutable
+   * event, and idempotency result commit together so dispatch never chooses a
+   * binding from an unrecorded or stale policy decision.
+   *
+   * FNXC:SessionRoomRoleAssignment 2026-07-19-02:24:
+   * User locks and forbids are durable control-plane inputs. The coordinator
+   * may not replace this record with a convenient active Session; role policy,
+   * concrete binding identity, and producer lineage must survive restart and
+   * be rechecked by the eventual fenced dispatch claim.
+   */
+  async activateRoomRoleAssignment(
+    rawInput: ActivateRoomRoleAssignmentInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomRoleAssignmentProjectionV1> {
+    const input = normalizeActivateRoomRoleAssignmentInput(rawInput);
+    const snapshotResult = createRoomCapabilitySnapshot(input.capabilitySnapshot);
+    if (!snapshotResult.ok) throwRoleAssignmentPolicyError(snapshotResult.unsatisfied);
+    const constraintsResult = normalizeRoomRoleAssignmentConstraints(input.constraints);
+    if (!constraintsResult.ok) throwRoleAssignmentPolicyError(constraintsResult.unsatisfied);
+    const snapshot = snapshotResult.value;
+    const constraints = constraintsResult.value;
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      capabilitySnapshot: snapshot,
+      constraints,
+    });
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "activate_room_role_assignment",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.now,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "activate_room_role_assignment"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${input.idempotencyKey} has no committed role-assignment event`,
+          );
+        }
+        return {
+          projection: await loadRoomRoleAssignmentResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            existing.resultEventId,
+          ),
+          event: null,
+        };
+      }
+
+      const [current, existingActiveRows] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        tx
+          .select({ id: roomRoleAssignments.id })
+          .from(roomRoleAssignments)
+          .where(and(
+            eq(roomRoleAssignments.projectId, this.projectId),
+            eq(roomRoleAssignments.roomId, input.roomId),
+            eq(roomRoleAssignments.state, "active"),
+          ))
+          .limit(1),
+      ]);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected role assignment for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      if (existingActiveRows[0]) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Room ${input.roomId} already has an active role assignment`,
+        );
+      }
+      if (current.activeTurnId !== null || current.room.state === "archived") {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Room ${input.roomId} can activate its entry role assignment only at a turn boundary`,
+        );
+      }
+      const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+      if (!protocol) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          `Room ${input.roomId} references unsupported protocol ${current.room.protocolId}@${current.room.protocolVersion}`,
+        );
+      }
+      const entryPhaseId = protocol.phases[0]?.id;
+      if (!entryPhaseId) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          `Room protocol ${protocol.id}@${protocol.version} has no entry phase`,
+        );
+      }
+      await assertRoleAssignmentSnapshotBindingsCurrent(
+        tx,
+        this.projectId,
+        input.roomId,
+        snapshot,
+      );
+      const assignmentResult = assignRoomRoles({
+        protocol,
+        phaseId: entryPhaseId,
+        capabilitySnapshot: snapshot,
+        constraints,
+        producerBindingIds: [],
+      });
+      if (!assignmentResult.ok) throwRoleAssignmentPolicyError(assignmentResult.unsatisfied);
+      const latestRows = await tx
+        .select({ revision: roomRoleAssignments.revision })
+        .from(roomRoleAssignments)
+        .where(and(
+          eq(roomRoleAssignments.projectId, this.projectId),
+          eq(roomRoleAssignments.roomId, input.roomId),
+        ))
+        .orderBy(desc(roomRoleAssignments.revision))
+        .limit(1);
+      const revision = advanceTaskGraphVersion(
+        latestRows[0] ? Number(latestRows[0].revision) : 0,
+        `roleAssignmentRevision:${input.roomId}`,
+      );
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `aggregateVersion:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion,
+          updatedAt: input.now,
+        },
+      };
+      const updated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion,
+          protocolPhaseId: entryPhaseId,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (updated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected role assignment for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      const projection: RoomRoleAssignmentProjectionV1 = {
+        id: `room-role-assignment:${input.roomId}:r${revision}:${randomUUID()}`,
+        roomId: input.roomId,
+        revision,
+        state: "active",
+        protocolId: protocol.id,
+        protocolVersion: protocol.version,
+        phaseId: entryPhaseId,
+        capabilitySnapshot: snapshot,
+        constraints,
+        assignment: assignmentResult.value,
+        authoritativeProducerBindingIds: assignmentResult.value.producerBindingIds,
+        aggregateVersion,
+        createdAt: input.now,
+        supersededAt: null,
+      };
+      await tx.insert(roomRoleAssignments).values({
+        id: projection.id,
+        projectId: this.projectId,
+        roomId: projection.roomId,
+        revision: projection.revision,
+        aggregateVersion: projection.aggregateVersion,
+        state: projection.state,
+        protocolId: projection.protocolId,
+        protocolVersion: projection.protocolVersion,
+        phaseId: projection.phaseId,
+        capabilitySnapshot: projection.capabilitySnapshot,
+        constraints: projection.constraints,
+        assignment: projection.assignment,
+        authoritativeProducerBindingIds: projection.authoritativeProducerBindingIds,
+        createdAt: projection.createdAt,
+        supersededAt: null,
+      });
+      const event = await insertRoomEvent(tx, next, "room_role_assignment_activated", context, {
+        projectionVersion: 1,
+        assignmentId: projection.id,
+        revision: projection.revision,
+        protocolId: projection.protocolId,
+        protocolVersion: projection.protocolVersion,
+        phaseId: projection.phaseId,
+        capabilitySnapshot: projection.capabilitySnapshot,
+        capabilitySnapshotHash: hashRoomValue(projection.capabilitySnapshot),
+        constraints: projection.constraints,
+        constraintsHash: hashRoomValue(projection.constraints),
+        assignment: projection.assignment,
+        assignmentHash: hashRoomValue(projection.assignment),
+        authoritativeProducerBindingIds: projection.authoritativeProducerBindingIds,
+        updatedAt: input.now,
+      });
+      await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId));
+      return { projection, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.projection;
+  }
+
+  /**
+   * Advance the active assignment only after a recorded turn boundary and the
+   * protocol's declared gate. The old record is superseded rather than edited,
+   * preserving producer lineage for independent verifier/acceptor selection.
+   *
+   * FNXC:SessionRoomRoleAssignment 2026-07-19-03:02:
+   * A phase transition is one causal commit: boundary proof, new certified
+   * capability snapshot, old/new assignment state, Room phase, aggregate CAS,
+   * immutable event, and idempotency result either all persist or none do.
+   */
+  async transitionRoomRoleAssignment(
+    rawInput: TransitionRoomRoleAssignmentCommandInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomRoleAssignmentProjectionV1> {
+    const input = normalizeTransitionRoomRoleAssignmentInput(rawInput);
+    const snapshotResult = createRoomCapabilitySnapshot(input.capabilitySnapshot);
+    if (!snapshotResult.ok) throwRoleAssignmentPolicyError(snapshotResult.unsatisfied);
+    const constraintsResult = normalizeRoomRoleAssignmentConstraints(input.constraints);
+    if (!constraintsResult.ok) throwRoleAssignmentPolicyError(constraintsResult.unsatisfied);
+    const snapshot = snapshotResult.value;
+    const constraints = constraintsResult.value;
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      boundaryTurnId: input.boundaryTurnId,
+      targetPhaseId: input.targetPhaseId,
+      phaseGateEvidenceId: input.phaseGateEvidenceId,
+      capabilitySnapshot: snapshot,
+      constraints,
+    });
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "transition_room_role_assignment",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.now,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "transition_room_role_assignment"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${input.idempotencyKey} has no committed role-transition event`,
+          );
+        }
+        return {
+          projection: await loadRoomRoleAssignmentResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            existing.resultEventId,
+            "room_role_assignment_transitioned",
+          ),
+          event: null,
+        };
+      }
+
+      const [current, activeRows, phaseRows] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        tx
+          .select()
+          .from(roomRoleAssignments)
+          .where(and(
+            eq(roomRoleAssignments.projectId, this.projectId),
+            eq(roomRoleAssignments.roomId, input.roomId),
+            eq(roomRoleAssignments.state, "active"),
+          ))
+          .limit(1),
+        tx
+          .select({ protocolPhaseId: operationalRooms.protocolPhaseId })
+          .from(operationalRooms)
+          .where(and(
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.id, input.roomId),
+          ))
+          .limit(1),
+      ]);
+      if (!current) {
+        throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected role transition for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      if (isEarlierTimestamp(input.now, current.room.updatedAt)) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Role transition timestamp cannot precede Room ${input.roomId} updatedAt`,
+        );
+      }
+      if (current.room.state !== "running" && current.room.state !== "paused") {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Room ${input.roomId} cannot change role phase while ${current.room.state}`,
+        );
+      }
+      if (current.activeTurnId !== null) {
+        throw new RoomDomainError(
+          "turn_boundary_required",
+          `Room ${input.roomId} still has active turn ${current.activeTurnId}`,
+        );
+      }
+      const boundaryTurn = current.turns.find((turn) => turn.id === input.boundaryTurnId);
+      const laterTurnStarted = boundaryTurn
+        ? current.turns.some((turn) => turn.sequence > boundaryTurn.sequence && turn.startedAt !== null)
+        : false;
+      if (
+        !boundaryTurn
+        || laterTurnStarted
+        || !["completed", "cancelled", "uncertain"].includes(boundaryTurn.state)
+      ) {
+        throw new RoomDomainError(
+          "turn_boundary_required",
+          `Turn ${input.boundaryTurnId} has not reached a safe role-assignment boundary`,
+        );
+      }
+      const activeRow = activeRows[0];
+      if (!activeRow) {
+        throw new RoomStoreError(
+          "role_assignment_missing",
+          `Room ${input.roomId} has no active role assignment to transition`,
+        );
+      }
+      const active = parseStoredRoomRoleAssignment(activeRow);
+      if (phaseRows[0]?.protocolPhaseId !== active.phaseId) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Room ${input.roomId} phase does not match its active role assignment`,
+        );
+      }
+      const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+      if (!protocol || protocol.id !== active.protocolId || protocol.version !== active.protocolVersion) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          `Room ${input.roomId} has no compatible protocol for its active role assignment`,
+        );
+      }
+      const phaseGateEvidenceRows = await tx
+        .select()
+        .from(roomPhaseGateEvidence)
+        .where(and(
+          eq(roomPhaseGateEvidence.projectId, this.projectId),
+          eq(roomPhaseGateEvidence.roomId, input.roomId),
+          eq(roomPhaseGateEvidence.id, input.phaseGateEvidenceId),
+        ))
+        .limit(1);
+      const phaseGateEvidenceRow = phaseGateEvidenceRows[0];
+      if (!phaseGateEvidenceRow) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          `Room ${input.roomId} has no immutable phase-gate evidence ${input.phaseGateEvidenceId}`,
+        );
+      }
+      const phaseGateEvidence = parseStoredRoomPhaseGateEvidence(phaseGateEvidenceRow);
+      if (phaseGateEvidence.evidence.turnId !== input.boundaryTurnId) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          `Phase-gate evidence ${input.phaseGateEvidenceId} does not bind boundary turn ${input.boundaryTurnId}`,
+        );
+      }
+      const phaseGateDecision = evaluatePhaseGateEvidenceForTransition({
+        protocol,
+        fromPhaseId: active.phaseId,
+        targetPhaseId: input.targetPhaseId,
+        turnId: input.boundaryTurnId,
+        evidence: phaseGateEvidence.evidence,
+        evidenceNotBefore: phaseGateEvidence.evidenceNotBefore,
+        evaluatedAt: input.now,
+        producerLineage: phaseGateEvidence.producerLineage,
+      });
+      if (
+        !phaseGateDecision.transitionAllowed
+        || phaseGateDecision.acceptedEvidenceId !== phaseGateEvidence.id
+        || phaseGateDecision.exactGateId === null
+      ) {
+        throw new RoomStoreError(
+          "role_assignment_invalid",
+          formatPhaseGateEvidenceDecisionFailure(phaseGateDecision.unmetReasons),
+        );
+      }
+      await assertRoleAssignmentSnapshotBindingsCurrent(tx, this.projectId, input.roomId, snapshot);
+      const assignmentResult = transitionRoomRoleAssignment({
+        protocol,
+        currentAssignment: active.assignment,
+        currentCapabilitySnapshot: active.capabilitySnapshot,
+        targetPhaseId: input.targetPhaseId,
+        verifiedTransitionGateId: phaseGateDecision.exactGateId,
+        atTurnBoundary: true,
+        capabilitySnapshot: snapshot,
+        constraints,
+        authoritativeProducerBindingIds: active.authoritativeProducerBindingIds,
+      });
+      if (!assignmentResult.ok) throwRoleAssignmentPolicyError(assignmentResult.unsatisfied);
+      const revision = advanceTaskGraphVersion(active.revision, `roleAssignmentRevision:${input.roomId}`);
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `aggregateVersion:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: { ...current.room, aggregateVersion, updatedAt: input.now },
+      };
+      const superseded = await tx
+        .update(roomRoleAssignments)
+        .set({ state: "superseded", supersededAt: input.now })
+        .where(and(
+          eq(roomRoleAssignments.projectId, this.projectId),
+          eq(roomRoleAssignments.roomId, input.roomId),
+          eq(roomRoleAssignments.id, active.id),
+          eq(roomRoleAssignments.state, "active"),
+        ))
+        .returning({ id: roomRoleAssignments.id });
+      if (superseded.length !== 1) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Concurrent role transition superseded assignment ${active.id}`,
+        );
+      }
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion, protocolPhaseId: input.targetPhaseId, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+          eq(operationalRooms.protocolPhaseId, active.phaseId),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent Room update rejected role transition for ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      const projection: RoomRoleAssignmentProjectionV1 = {
+        id: `room-role-assignment:${input.roomId}:r${revision}:${randomUUID()}`,
+        roomId: input.roomId,
+        revision,
+        state: "active",
+        protocolId: protocol.id,
+        protocolVersion: protocol.version,
+        phaseId: input.targetPhaseId,
+        capabilitySnapshot: snapshot,
+        constraints,
+        assignment: assignmentResult.value,
+        authoritativeProducerBindingIds: assignmentResult.value.producerBindingIds,
+        aggregateVersion,
+        createdAt: input.now,
+        supersededAt: null,
+      };
+      await tx.insert(roomRoleAssignments).values({
+        id: projection.id,
+        projectId: this.projectId,
+        roomId: projection.roomId,
+        revision: projection.revision,
+        aggregateVersion: projection.aggregateVersion,
+        state: projection.state,
+        protocolId: projection.protocolId,
+        protocolVersion: projection.protocolVersion,
+        phaseId: projection.phaseId,
+        capabilitySnapshot: projection.capabilitySnapshot,
+        constraints: projection.constraints,
+        assignment: projection.assignment,
+        authoritativeProducerBindingIds: projection.authoritativeProducerBindingIds,
+        createdAt: projection.createdAt,
+        supersededAt: null,
+      });
+      const event = await insertRoomEvent(tx, next, "room_role_assignment_transitioned", context, {
+        projectionVersion: 1,
+        assignmentId: projection.id,
+        previousAssignmentId: active.id,
+        boundaryTurnId: input.boundaryTurnId,
+        phaseGateEvidenceId: phaseGateEvidence.id,
+        phaseGateEvidence: phaseGateEvidence.evidence,
+        phaseGateEvidenceHash: phaseGateEvidence.evidenceHash,
+        producerLineage: phaseGateEvidence.producerLineage,
+        evidenceNotBefore: phaseGateEvidence.evidenceNotBefore,
+        verifiedTransitionGateId: phaseGateDecision.exactGateId,
+        revision: projection.revision,
+        protocolId: projection.protocolId,
+        protocolVersion: projection.protocolVersion,
+        phaseId: projection.phaseId,
+        capabilitySnapshot: projection.capabilitySnapshot,
+        capabilitySnapshotHash: hashRoomValue(projection.capabilitySnapshot),
+        constraints: projection.constraints,
+        constraintsHash: hashRoomValue(projection.constraints),
+        assignment: projection.assignment,
+        assignmentHash: hashRoomValue(projection.assignment),
+        authoritativeProducerBindingIds: projection.authoritativeProducerBindingIds,
+        updatedAt: input.now,
+      });
+      await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId));
+      return { projection, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.projection;
+  }
+
+  async getActiveRoomSemanticState(
+    roomId: string,
+    turnId: string,
+    nodeId: string,
+  ): Promise<RoomSemanticStateProjectionV1 | null> {
+    assertNonBlankTaskGraphString(roomId, "roomId");
+    assertNonBlankTaskGraphString(turnId, "turnId");
+    assertNonBlankTaskGraphString(nodeId, "nodeId");
+    return this.layer.transaction(async (tx) => {
+      const rows = await tx
+        .select()
+        .from(roomSemanticStates)
+        .where(and(
+          eq(roomSemanticStates.projectId, this.projectId),
+          eq(roomSemanticStates.roomId, roomId),
+          eq(roomSemanticStates.turnId, turnId),
+          eq(roomSemanticStates.nodeId, nodeId),
+          eq(roomSemanticStates.state, "active"),
+        ))
+        .limit(1);
+      return rows[0] ? parseStoredRoomSemanticState(rows[0]) : null;
+    }, { isolationLevel: "repeatable read", accessMode: "read only" });
+  }
+
+  /**
+   * Establish or advance the controller-owned state that a structured seat
+   * message must echo. This intentionally has no peer actor path: peers route
+   * against it but cannot author it.
+   *
+   * FNXC:SessionRoomSemanticRouting 2026-07-19-03:31:
+   * State supersession, aggregate CAS, immutable event, and idempotency bind
+   * in one transaction. A restart therefore cannot reinterpret an old peer
+   * hash as authority for a newly revised node or protocol phase.
+   */
+  async setRoomSemanticState(
+    rawInput: SetRoomSemanticStateInputV1,
+    context: RoomCommandContext,
+  ): Promise<RoomSemanticStateProjectionV1> {
+    const input = normalizeSetRoomSemanticStateInput(rawInput);
+    assertSemanticStateControllerContext(context);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      turnId: input.turnId,
+      nodeId: input.nodeId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      semanticHash: input.semanticHash,
+      evidenceStateHash: input.evidenceStateHash,
+      decisionStateHash: input.decisionStateHash,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "set_semantic_state",
+          commandHash,
+          resultEventId: null,
+          createdAt: context.occurredAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existing = await loadSemanticStateIdempotencyResult(
+          tx,
+          this.projectId,
+          input.roomId,
+          input.idempotencyKey,
+          commandHash,
+        );
+        return { projection: existing, event: null };
+      }
+
+      // FNXC:SessionRoomSemanticRouting 2026-07-19:
+      // Semantic state controls the hashes every later peer route must echo.
+      // A controller identity string is not sufficient here: lock and prove the
+      // current Room-worker epoch in the same transaction as the aggregate CAS
+      // so a taken-over worker cannot publish a new authoritative state.
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: context.occurredAt,
+      });
+
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      assertSemanticStateRoomPreconditions(current, input, context.occurredAt);
+      const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+      const activeAssignment = await loadActiveRoomRoleAssignmentWithinTransaction(
+        tx,
+        this.projectId,
+        input.roomId,
+      );
+      assertSemanticStateProtocolPreconditions(current, protocol, activeAssignment, input);
+      if (!protocol || !activeAssignment) {
+        throw new RoomStoreError("semantic_state_conflict", "Semantic state preconditions did not resolve active protocol role state");
+      }
+      await assertActiveRoomProtocolPhaseWithinTransaction(
+        tx,
+        this.projectId,
+        input.roomId,
+        activeAssignment.phaseId,
+      );
+      await assertRoomSemanticStateNode(tx, this.projectId, input.roomId, input.nodeId);
+
+      const activeRows = await tx
+        .select()
+        .from(roomSemanticStates)
+        .where(and(
+          eq(roomSemanticStates.projectId, this.projectId),
+          eq(roomSemanticStates.roomId, input.roomId),
+          eq(roomSemanticStates.turnId, input.turnId),
+          eq(roomSemanticStates.nodeId, input.nodeId),
+          eq(roomSemanticStates.state, "active"),
+        ))
+        .limit(1);
+      const previous = activeRows[0] ? parseStoredRoomSemanticState(activeRows[0]) : null;
+      if (previous && semanticStateHashesEqual(previous, input)) {
+        throw new RoomStoreError(
+          "semantic_state_conflict",
+          `Room ${input.roomId} already has this active semantic state for ${input.turnId}/${input.nodeId}`,
+        );
+      }
+      const nextAggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `semanticStateAggregate:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: nextAggregateVersion,
+          updatedAt: context.occurredAt,
+        },
+      };
+      if (previous) {
+        const superseded = await tx
+          .update(roomSemanticStates)
+          .set({ state: "superseded", supersededAt: context.occurredAt })
+          .where(and(
+            eq(roomSemanticStates.id, previous.id),
+            eq(roomSemanticStates.projectId, this.projectId),
+            eq(roomSemanticStates.state, "active"),
+          ))
+          .returning({ id: roomSemanticStates.id });
+        if (superseded.length !== 1) {
+          throw new RoomStoreError(
+            "semantic_state_conflict",
+            `Concurrent semantic-state supersession rejected for ${input.turnId}/${input.nodeId}`,
+          );
+        }
+      }
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion: nextAggregateVersion, updatedAt: context.occurredAt })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent semantic-state update rejected for Room ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+      const revision = previous
+        ? advanceTaskGraphVersion(previous.revision, `semanticStateRevision:${input.roomId}`)
+        : 1;
+      const projection: RoomSemanticStateProjectionV1 = {
+        id: `room-semantic-state:${input.roomId}:${input.turnId}:${input.nodeId}:r${revision}:${randomUUID()}`,
+        roomId: input.roomId,
+        turnId: input.turnId,
+        nodeId: input.nodeId,
+        revision,
+        state: "active",
+        protocolId: protocol.id,
+        protocolVersion: protocol.version,
+        phaseId: activeAssignment.phaseId,
+        semanticHash: input.semanticHash,
+        evidenceStateHash: input.evidenceStateHash,
+        decisionStateHash: input.decisionStateHash,
+        stateFingerprint: buildRoomSemanticStateFingerprint({
+          roomId: input.roomId,
+          turnId: input.turnId,
+          nodeId: input.nodeId,
+          protocolId: protocol.id,
+          protocolVersion: protocol.version,
+          phaseId: activeAssignment.phaseId,
+          semanticHash: input.semanticHash,
+          evidenceStateHash: input.evidenceStateHash,
+          decisionStateHash: input.decisionStateHash,
+        }),
+        createdAt: context.occurredAt,
+        supersededAt: null,
+      };
+      await tx.insert(roomSemanticStates).values({
+        id: projection.id,
+        projectId: this.projectId,
+        roomId: projection.roomId,
+        turnId: projection.turnId,
+        nodeId: projection.nodeId,
+        revision: projection.revision,
+        state: projection.state,
+        protocolId: projection.protocolId,
+        protocolVersion: projection.protocolVersion,
+        phaseId: projection.phaseId,
+        semanticHash: projection.semanticHash,
+        evidenceStateHash: projection.evidenceStateHash,
+        decisionStateHash: projection.decisionStateHash,
+        stateFingerprint: projection.stateFingerprint,
+        createdAt: projection.createdAt,
+        supersededAt: null,
+      });
+      const event = await insertRoomEvent(tx, next, "room_semantic_state_updated", context, {
+        projectionVersion: 1,
+        semanticStateId: projection.id,
+        revision: projection.revision,
+        turnId: projection.turnId,
+        nodeId: projection.nodeId,
+        protocolId: projection.protocolId,
+        protocolVersion: projection.protocolVersion,
+        phaseId: projection.phaseId,
+        semanticHash: projection.semanticHash,
+        evidenceStateHash: projection.evidenceStateHash,
+        decisionStateHash: projection.decisionStateHash,
+        stateFingerprint: projection.stateFingerprint,
+        updatedAt: next.room.updatedAt,
+      });
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind semantic state idempotency key ${input.idempotencyKey}`,
+        );
+      }
+      return { projection, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.projection;
+  }
+
+  /**
+   * Persist a typed seat-origin protocol message, freeze every resolved target,
+   * and write only durable delivery/controller intent. Provider delivery stays
+   * in the existing outbox worker after this transaction commits.
+   *
+   * FNXC:SessionRoomSemanticRouting 2026-07-19-03:36:
+   * The semantic router is deliberately pure. This adapter is its durable
+   * boundary: it reconstructs protocol seats/history/state from PostgreSQL,
+   * uses a controller-owned state revision, and records a single loop-break
+   * escalation for one unchanged semantic fingerprint.
+   */
+  async routeRoomProtocolMessage(
+    rawInput: RouteRoomProtocolMessageInputV1,
+  ): Promise<RouteRoomProtocolMessageResultV1> {
+    const input = normalizeRouteRoomProtocolMessageInput(rawInput);
+    const messageValidation = validateRoomProtocolMessage(input.message);
+    if (!messageValidation.ok) {
+      throw new RoomStoreError(
+        "semantic_message_invalid",
+        `Structured Room message is invalid: ${messageValidation.issues.map((issue) => issue.code).join(", ")}`,
+      );
+    }
+    const message = messageValidation.value;
+    if (message.projectId !== this.projectId || message.roomId !== input.roomId) {
+      throw new RoomStoreError(
+        "semantic_message_invalid",
+        "Structured Room message project or Room identity does not match this store command",
+      );
+    }
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      message,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      const committedAt = this.currentTime();
+      if (!isCanonicalUtcIsoTimestamp(committedAt)) {
+        throw new RoomStoreError(
+          "semantic_route_conflict",
+          "Trusted backend clock must return a canonical UTC ISO timestamp",
+        );
+      }
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "route_protocol_message",
+          commandHash,
+          resultEventId: null,
+          createdAt: committedAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const replay = await loadRoomProtocolMessageIdempotencyResult(
+          tx,
+          this.projectId,
+          input.roomId,
+          input.idempotencyKey,
+          commandHash,
+        );
+        return { result: { ...replay, replayed: true }, event: null };
+      }
+
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      assertSemanticRouteRoomPreconditions(current, input, message);
+      const protocol = getRoomProtocolDefinition(current.room.protocolId, current.room.protocolVersion);
+      const activeAssignment = await loadActiveRoomRoleAssignmentWithinTransaction(
+        tx,
+        this.projectId,
+        input.roomId,
+      );
+      const semanticState = await loadActiveRoomSemanticStateWithinTransaction(
+        tx,
+        this.projectId,
+        input.roomId,
+        message.turnId,
+        message.nodeId,
+      );
+      assertSemanticRouteProtocolPreconditions(
+        current,
+        protocol,
+        activeAssignment,
+        semanticState,
+        message,
+      );
+      if (!protocol || !activeAssignment || !semanticState) {
+        throw new RoomStoreError("semantic_route_conflict", "Semantic route preconditions did not resolve active protocol state");
+      }
+      await assertActiveRoomProtocolPhaseWithinTransaction(
+        tx,
+        this.projectId,
+        input.roomId,
+        activeAssignment.phaseId,
+      );
+      await assertRoomSemanticStateNode(tx, this.projectId, input.roomId, message.nodeId);
+      const existingProtocolMessage = await tx
+        .select({ id: roomProtocolMessages.id })
+        .from(roomProtocolMessages)
+        .where(and(
+          eq(roomProtocolMessages.projectId, this.projectId),
+          eq(roomProtocolMessages.roomId, input.roomId),
+          eq(roomProtocolMessages.protocolMessageId, message.messageId),
+        ))
+        .limit(1);
+      if (existingProtocolMessage.length > 0) {
+        throw new RoomStoreError(
+          "semantic_route_conflict",
+          `Protocol message ${message.messageId} has already been durably routed for Room ${input.roomId}`,
+        );
+      }
+
+      const seats = buildSemanticRoutingSeats(current, activeAssignment);
+      const history = await loadRoomSemanticHistoryWithinTransaction(
+        tx,
+        this.projectId,
+        input.roomId,
+        message.turnId,
+      );
+      const routed = routeRoomSemanticMessage({
+        message,
+        protocol,
+        seats,
+        history,
+        authoritativeState: {
+          semanticHash: semanticState.semanticHash,
+          evidenceStateHash: semanticState.evidenceStateHash,
+          decisionStateHash: semanticState.decisionStateHash,
+        },
+      });
+      if (!routed.ok) {
+        throw new RoomStoreError(
+          "semantic_message_invalid",
+          `Structured Room message cannot be routed: ${routed.issues.map((issue) => issue.code).join(", ")}`,
+        );
+      }
+
+      const route = routed.value;
+      const routeAudit = normalizeSemanticRouteAudit(route.audit);
+      const nextAggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `semanticRouteAggregate:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: nextAggregateVersion,
+          updatedAt: committedAt,
+        },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion: nextAggregateVersion, updatedAt: committedAt })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent semantic message route rejected for Room ${input.roomId}`,
+          { expected: input.expectedAggregateVersion },
+        );
+      }
+
+      const sourceMessageId = `room-message-${randomUUID()}`;
+      const sourceTarget: RoomMessageTargetV1 = route.outcome === "loop_break"
+        ? { kind: "controller" }
+        : message.target;
+      const recipientSeatIds = route.outcome === "route" ? route.recipientSeatIds : [];
+      const resolvedRecipients = recipientSeatIds.map((seatId) => {
+        const seat = seats.find((candidate) => candidate.seatId === seatId);
+        if (!seat) {
+          throw new RoomStoreError(
+            "semantic_route_conflict",
+            `Semantic route resolved unknown active seat ${seatId}`,
+          );
+        }
+        return { seatId: seat.seatId, bindingId: seat.bindingId };
+      });
+      await tx.insert(roomMessages).values({
+        id: sourceMessageId,
+        projectId: this.projectId,
+        roomId: input.roomId,
+        turnId: message.turnId,
+        nodeId: message.nodeId,
+        originType: "seat",
+        originId: message.origin.seatId,
+        intent: message.intent,
+        target: sourceTarget,
+        targetSeatIds: resolvedRecipients.map((recipient) => recipient.seatId),
+        authority: message.authority as unknown as Readonly<Record<string, unknown>>,
+        content: message.content,
+        contentHash: message.contentHash,
+        evidenceRefs: message.references.evidenceRefs,
+        idempotencyKey: input.idempotencyKey,
+        expectedAggregateVersion: input.expectedAggregateVersion,
+        createdAt: committedAt,
+      });
+      const targetValues = buildSemanticMessageTargetValues({
+        projectId: this.projectId,
+        roomId: input.roomId,
+        messageId: sourceMessageId,
+        target: sourceTarget,
+        recipients: resolvedRecipients,
+        createdAt: committedAt,
+      });
+      await tx.insert(roomMessageTargets).values(targetValues);
+      const outboxValues = resolvedRecipients.map((recipient) => {
+        const deliveryIdempotencyKey = `${input.idempotencyKey}:${recipient.bindingId}`;
+        return {
+          id: `room-outbox-${randomUUID()}`,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          messageId: sourceMessageId,
+          bindingId: recipient.bindingId,
+          logicalMessageId: sourceMessageId,
+          localMessageId: buildRoomConnectorLocalMessageId({
+            logicalMessageId: sourceMessageId,
+            bindingId: recipient.bindingId,
+            idempotencyKey: deliveryIdempotencyKey,
+            payloadHash: message.contentHash,
+          }),
+          idempotencyKey: deliveryIdempotencyKey,
+          payloadHash: message.contentHash,
+          deliveryState: "pending" as const,
+          nativeAcknowledgement: null,
+          nativeCursor: null,
+          reconciliationFromCursor: null,
+          reconciliationEvidenceRef: null,
+          dispatchTaskNodeId: null,
+          dispatchClaimNodeVersion: null,
+          attemptCount: 0,
+          lastErrorCode: null,
+          nextAttemptAt: null,
+          createdAt: committedAt,
+          updatedAt: committedAt,
+        };
+      });
+      if (outboxValues.length > 0) await tx.insert(roomOutbox).values(outboxValues);
+
+      const protocolProjection: RoomProtocolMessageProjectionV1 = {
+        id: sourceMessageId,
+        roomId: input.roomId,
+        protocolMessageId: message.messageId,
+        turnId: message.turnId,
+        nodeId: message.nodeId,
+        protocolId: message.protocolId,
+        protocolVersion: message.protocolVersion,
+          phaseId: message.phaseId,
+          channelId: message.channelId,
+          issuedAt: message.issuedAt,
+          envelope: message,
+          origin: message.origin,
+          target: message.target,
+        semanticLoopFingerprint: route.audit.semanticLoopFingerprint,
+        semanticStateId: semanticState.id,
+        semanticStateRevision: semanticState.revision,
+        semanticStateFingerprint: semanticState.stateFingerprint,
+        routeOutcome: route.outcome,
+        recipientController: route.outcome === "route" ? route.recipientController : true,
+        recipientSeatIds,
+        requiredControllerResponse: route.outcome === "route"
+          ? route.requiredControllerResponse
+          : true,
+        requiredResponderSeatIds: route.outcome === "route" ? route.requiredResponderSeatIds : [],
+        createdAt: committedAt,
+      };
+      await tx.insert(roomProtocolMessages).values({
+        id: protocolProjection.id,
+        projectId: this.projectId,
+        roomId: protocolProjection.roomId,
+        protocolMessageId: protocolProjection.protocolMessageId,
+        turnId: protocolProjection.turnId,
+        nodeId: protocolProjection.nodeId,
+        protocolId: protocolProjection.protocolId,
+        protocolVersion: protocolProjection.protocolVersion,
+        phaseId: protocolProjection.phaseId,
+        channelId: protocolProjection.channelId,
+        issuedAt: protocolProjection.issuedAt,
+        originSeatId: protocolProjection.origin.seatId,
+        originBindingId: protocolProjection.origin.bindingId,
+        originRoleId: protocolProjection.origin.roleId,
+        semanticHash: message.semanticHash,
+        evidenceStateHash: message.evidenceStateHash,
+        decisionStateHash: message.decisionStateHash,
+        semanticStateId: protocolProjection.semanticStateId,
+        semanticStateRevision: protocolProjection.semanticStateRevision,
+        semanticStateFingerprint: protocolProjection.semanticStateFingerprint,
+        protocolTarget: protocolProjection.target,
+        referenceBundle: message.references,
+        semanticLoopFingerprint: route.audit.semanticLoopFingerprint,
+        routeOutcome: protocolProjection.routeOutcome,
+        recipientController: protocolProjection.recipientController,
+        recipientSeatIds: protocolProjection.recipientSeatIds,
+        requiredControllerResponse: protocolProjection.requiredControllerResponse,
+        requiredResponderSeatIds: protocolProjection.requiredResponderSeatIds,
+        audit: routeAudit,
+        createdAt: protocolProjection.createdAt,
+      });
+
+      let controllerAction: RoomSemanticControllerActionV1 | null = null;
+      let escalationMessageId: string | null = null;
+      let escalationTargetId: string | null = null;
+      let loopBreak: RoomSemanticRouteEventSnapshotV1["loopBreak"] = null;
+      if (route.outcome === "route" && route.recipientController) {
+        controllerAction = await enqueueRoomSemanticControllerAction(tx, {
+          projectId: this.projectId,
+          roomId: input.roomId,
+          messageId: sourceMessageId,
+          protocolMessageId: message.messageId,
+          actionKind: "semantic_message",
+          reasonCode: null,
+          payload: buildSemanticControllerActionPayload(message, semanticState, routeAudit),
+          createdAt: committedAt,
+        });
+      } else if (route.outcome === "loop_break") {
+        const escalation = await ensureRoomSemanticLoopBreakEscalation(tx, {
+          projectId: this.projectId,
+          roomId: input.roomId,
+          sourceMessageId,
+          message,
+          semanticState,
+          audit: routeAudit,
+          createdAt: committedAt,
+        });
+        controllerAction = escalation.controllerAction;
+        escalationMessageId = escalation.messageId;
+        escalationTargetId = escalation.targetId;
+        loopBreak = escalation.snapshot;
+      }
+
+      const sourceMessage: StoredRoomMessageV1 = {
+        contractVersion: 1,
+        id: sourceMessageId,
+        roomId: input.roomId,
+        turnId: message.turnId,
+        nodeId: message.nodeId,
+        originType: "seat",
+        originId: message.origin.seatId,
+        targetSeatIds: resolvedRecipients.map((recipient) => recipient.seatId),
+        intent: message.intent,
+        contentHash: message.contentHash,
+        authorityEnvelope: message.authority as unknown as Readonly<Record<string, unknown>>,
+        createdAt: committedAt,
+        content: message.content,
+      };
+      const durableTargets = targetValues.map(rowToDurableMessageTarget);
+      const deliveries = outboxValues.map(rowToOutboxRecord);
+      const snapshot: RoomSemanticRouteEventSnapshotV1 = {
+        contractVersion: "room-semantic-route-snapshot/v1",
+        sourceMessage,
+        protocolMessage: protocolProjection,
+        targets: durableTargets,
+        deliveries,
+        controllerAction,
+        loopBreak,
+      };
+
+      const event = await insertRoomEvent(tx, next, "room_protocol_message_routed", {
+        eventId: `room-event-${randomUUID()}`,
+        actorType: message.authority.actorType,
+        actorId: message.authority.actorId,
+        correlationId: message.messageId,
+        causationId: message.messageId,
+        occurredAt: committedAt,
+      }, {
+        projectionVersion: 2,
+        messageId: sourceMessageId,
+        protocolMessageId: message.messageId,
+        targetIds: targetValues.map((target) => target.id),
+        outboxIds: outboxValues.map((delivery) => delivery.id),
+        controllerActionId: controllerAction?.id ?? null,
+        escalationMessageId,
+        escalationTargetId,
+        semanticStateId: semanticState.id,
+        semanticStateRevision: semanticState.revision,
+        semanticStateFingerprint: semanticState.stateFingerprint,
+        outcome: route.outcome,
+        audit: routeAudit,
+        snapshot,
+        updatedAt: next.room.updatedAt,
+      });
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind semantic route idempotency key ${input.idempotencyKey}`,
+        );
+      }
+      const result: RouteRoomProtocolMessageResultV1 = {
+        message: sourceMessage,
+        protocolMessage: protocolProjection,
+        targets: durableTargets,
+        deliveries,
+        controllerAction,
+        event,
+        replayed: false,
+      };
+      return { result, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.result;
+  }
+
+  /**
+   * Claim the oldest pending (or expired) controller-directed semantic action
+   * under the same durable Room worker fence that owns task dispatch.
+   */
+  async claimNextRoomSemanticControllerAction(
+    rawInput: ClaimRoomSemanticControllerActionInputV1,
+  ): Promise<RoomSemanticControllerActionV1 | null> {
+    const input = normalizeClaimRoomSemanticControllerActionInput(rawInput);
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.now,
+      });
+      const candidates = await tx
+        .select()
+        .from(roomSemanticControllerInbox)
+        .where(and(
+          eq(roomSemanticControllerInbox.projectId, this.projectId),
+          eq(roomSemanticControllerInbox.roomId, input.roomId),
+          or(
+            eq(roomSemanticControllerInbox.state, "pending"),
+            eq(roomSemanticControllerInbox.state, "claimed"),
+          ),
+        ))
+        .orderBy(asc(roomSemanticControllerInbox.createdAt), asc(roomSemanticControllerInbox.id));
+      const candidate = candidates.find((action) =>
+        action.state === "pending"
+        || (action.state === "claimed"
+          && action.claimExpiresAt !== null
+          && Date.parse(action.claimExpiresAt) <= Date.parse(input.now)),
+      );
+      if (!candidate) return { action: null, event: null };
+      const claimToken = `room-semantic-controller-claim-${randomUUID()}`;
+      const claimTtlMs = input.claimTtlMs ?? DEFAULT_ROOM_SEMANTIC_CONTROLLER_ACTION_CLAIM_TTL_MS;
+      const claimExpiresAt = new Date(
+        Date.parse(input.now) + claimTtlMs,
+      ).toISOString();
+      const claimed = await tx
+        .update(roomSemanticControllerInbox)
+        .set({
+          state: "claimed",
+          attemptCount: candidate.attemptCount + 1,
+          claimToken,
+          claimExpiresAt,
+          claimedBy: input.workerId,
+          processedAt: null,
+          lastErrorCode: null,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(roomSemanticControllerInbox.id, candidate.id),
+          eq(roomSemanticControllerInbox.projectId, this.projectId),
+          eq(roomSemanticControllerInbox.roomId, input.roomId),
+          eq(roomSemanticControllerInbox.state, candidate.state),
+          candidate.state === "claimed" && candidate.claimToken !== null
+            ? eq(roomSemanticControllerInbox.claimToken, candidate.claimToken)
+            : isNull(roomSemanticControllerInbox.claimToken),
+        ))
+        .returning();
+      if (claimed.length !== 1) {
+        throw new RoomStoreError(
+          "semantic_controller_action_conflict",
+          `Concurrent controller inbox claim rejected for action ${candidate.id}`,
+        );
+      }
+      const action = rowToRoomSemanticControllerAction(claimed[0]);
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${input.roomId} disappeared during semantic controller inbox claim`,
+        );
+      }
+      const nextAggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `semanticControllerActionClaim:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: nextAggregateVersion,
+          updatedAt: input.now,
+        },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion: nextAggregateVersion, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, current.room.aggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent semantic controller inbox claim rejected for Room ${input.roomId}`,
+          { expected: current.room.aggregateVersion },
+        );
+      }
+      const snapshot: RoomSemanticControllerActionEventSnapshotV1 = {
+        contractVersion: "room-semantic-controller-action-snapshot/v1",
+        transition: "claimed",
+        previousState: candidate.state === "claimed" ? "claimed" : "pending",
+        action,
+      };
+      const event = await insertRoomEvent(tx, next, "room_semantic_controller_action_claimed", {
+        eventId: `room-event-${randomUUID()}`,
+        actorType: "controller",
+        actorId: input.workerId,
+        correlationId: action.protocolMessageId ?? action.messageId,
+        causationId: action.messageId,
+        occurredAt: input.now,
+      }, {
+        projectionVersion: 1,
+        actionId: action.id,
+        snapshot,
+        updatedAt: next.room.updatedAt,
+      });
+      return { action, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.action;
+  }
+
+  /**
+   * Complete or release a claimed action. The claim token and Room worker fence
+   * are both checked inside the write transaction, so an old controller cannot
+   * acknowledge an action after lease takeover.
+   */
+  async completeRoomSemanticControllerAction(
+    rawInput: CompleteRoomSemanticControllerActionInputV1,
+  ): Promise<RoomSemanticControllerActionV1> {
+    const input = normalizeCompleteRoomSemanticControllerActionInput(rawInput);
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.now,
+      });
+      const updated = await tx
+        .update(roomSemanticControllerInbox)
+        .set(input.outcome === "processed"
+          ? {
+              state: "processed",
+              claimToken: null,
+              claimExpiresAt: null,
+              claimedBy: null,
+              processedAt: input.now,
+              lastErrorCode: null,
+              updatedAt: input.now,
+            }
+          : {
+              state: "pending",
+              claimToken: null,
+              claimExpiresAt: null,
+              claimedBy: null,
+              processedAt: null,
+              lastErrorCode: input.errorCode,
+              updatedAt: input.now,
+            })
+        .where(and(
+          eq(roomSemanticControllerInbox.id, input.actionId),
+          eq(roomSemanticControllerInbox.projectId, this.projectId),
+          eq(roomSemanticControllerInbox.roomId, input.roomId),
+          eq(roomSemanticControllerInbox.state, "claimed"),
+          eq(roomSemanticControllerInbox.claimToken, input.claimToken),
+        ))
+        .returning();
+      if (updated.length !== 1) {
+        throw new RoomStoreError(
+          "semantic_controller_action_conflict",
+          `Controller inbox action ${input.actionId} is not claimed by this worker token`,
+        );
+      }
+      const action = rowToRoomSemanticControllerAction(updated[0]);
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${input.roomId} disappeared during semantic controller inbox completion`,
+        );
+      }
+      const nextAggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        `semanticControllerActionComplete:${input.roomId}`,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: nextAggregateVersion,
+          updatedAt: input.now,
+        },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion: nextAggregateVersion, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, current.room.aggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Concurrent semantic controller inbox completion rejected for Room ${input.roomId}`,
+          { expected: current.room.aggregateVersion },
+        );
+      }
+      const snapshot: RoomSemanticControllerActionEventSnapshotV1 = {
+        contractVersion: "room-semantic-controller-action-snapshot/v1",
+        transition: input.outcome,
+        previousState: "claimed",
+        action,
+      };
+      const event = await insertRoomEvent(tx, next, "room_semantic_controller_action_completed", {
+        eventId: `room-event-${randomUUID()}`,
+        actorType: "controller",
+        actorId: input.roomWorkerFence.holderId,
+        correlationId: action.protocolMessageId ?? action.messageId,
+        causationId: action.messageId,
+        occurredAt: input.now,
+      }, {
+        projectionVersion: 1,
+        actionId: action.id,
+        snapshot,
+        updatedAt: next.room.updatedAt,
+      });
+      return { action, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.action;
+  }
+
+  /**
+   * Freeze one complete task-progress vector and, in the same fenced commit,
+   * choose the next declared no-progress rung. This method records intent only:
+   * it never creates a Session, switches a model, or invokes a provider.
+   */
+  async recordRoomTaskProgressObservation(
+    rawInput: RecordRoomTaskProgressObservationInputV1,
+  ): Promise<RecordRoomTaskProgressObservationResultV1> {
+    const input = normalizeRecordRoomTaskProgressObservationInput(rawInput);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedDagVersion: input.expectedDagVersion,
+      nodeId: input.nodeId,
+      expectedNodeVersion: input.expectedNodeVersion,
+      turnId: input.turnId,
+      phaseId: input.phaseId,
+      roundId: input.roundId,
+      signals: input.signals,
+      origin: input.origin,
+      observedAt: input.observedAt,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.observedAt,
+      });
+      const reservationId = "room-idempotency-" + randomUUID();
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "record_room_task_progress_observation",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.observedAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "record_room_task_progress_observation"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            "Idempotency key " + input.idempotencyKey + " was already used for a different progress observation",
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            "Progress observation key " + input.idempotencyKey + " has no committed event",
+          );
+        }
+        return {
+          result: await loadRoomTaskProgressObservationResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            existing.resultEventId,
+          ),
+          event: null,
+        };
+      }
+
+      const [current, graph, activeAssignmentRows, activeTurnRows] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        loadRoomTaskGraphProjection(tx, this.projectId, input.roomId),
+        tx
+          .select()
+          .from(roomRoleAssignments)
+          .where(and(
+            eq(roomRoleAssignments.projectId, this.projectId),
+            eq(roomRoleAssignments.roomId, input.roomId),
+            eq(roomRoleAssignments.state, "active"),
+          ))
+          .limit(1),
+        tx
+          .select()
+          .from(roomTurns)
+          .where(and(
+            eq(roomTurns.projectId, this.projectId),
+            eq(roomTurns.roomId, input.roomId),
+            eq(roomTurns.id, input.turnId),
+          ))
+          .limit(1),
+      ]);
+      const posture = await this.readRecoveryPosture(tx, input.roomId);
+      const activeAssignment = activeAssignmentRows[0]
+        ? parseStoredRoomRoleAssignment(activeAssignmentRows[0])
+        : null;
+      assertTaskProgressObservationRoomPreconditions(
+        current,
+        graph,
+        activeAssignment,
+        activeTurnRows[0],
+        posture,
+        input,
+      );
+      const room = current!;
+      const taskGraph = graph!;
+      const node = taskGraph.nodes.find((candidate) => candidate.id === input.nodeId);
+      if (
+        !node
+        || node.nodeVersion !== input.expectedNodeVersion
+        || !["running", "retrying"].includes(node.state)
+      ) {
+        throw new RoomStoreError(
+          "task_progress_observation_invalid",
+          "Task node " + input.nodeId + " is not a current running/retrying progress-observation target",
+        );
+      }
+      if (isEarlierTimestamp(input.observedAt, room.room.updatedAt)) {
+        throw new RoomStoreError(
+          "task_progress_observation_invalid",
+          "Progress observation timestamp cannot precede Room " + input.roomId + " updatedAt",
+        );
+      }
+
+      const priorObservationRows = await tx
+        .select()
+        .from(roomTaskProgressObservations)
+        .where(and(
+          eq(roomTaskProgressObservations.projectId, this.projectId),
+          eq(roomTaskProgressObservations.roomId, input.roomId),
+          eq(roomTaskProgressObservations.nodeId, input.nodeId),
+          eq(roomTaskProgressObservations.nodeVersion, input.expectedNodeVersion),
+          eq(roomTaskProgressObservations.turnId, input.turnId),
+          eq(roomTaskProgressObservations.phaseId, input.phaseId),
+        ))
+        .orderBy(desc(roomTaskProgressObservations.observedAt), desc(roomTaskProgressObservations.id));
+      if (priorObservationRows.some((row) => row.roundId === input.roundId)) {
+        throw new RoomStoreError(
+          "task_progress_observation_conflict",
+          "Progress round " + input.roundId + " already exists for task node " + input.nodeId,
+        );
+      }
+      const latestObservation = priorObservationRows[0];
+      if (
+        latestObservation
+        && Date.parse(latestObservation.observedAt) >= Date.parse(input.observedAt)
+      ) {
+        throw new RoomStoreError(
+          "task_progress_observation_conflict",
+          "Progress round " + input.roundId + " must occur after the preceding round for task node " + input.nodeId,
+        );
+      }
+
+      const observation: RoomTaskProgressObservationV1 = {
+        id: "room-task-progress-observation-" + randomUUID(),
+        roomId: input.roomId,
+        nodeId: input.nodeId,
+        nodeVersion: input.expectedNodeVersion,
+        turnId: input.turnId,
+        phaseId: input.phaseId,
+        roundId: input.roundId,
+        idempotencyKey: input.idempotencyKey,
+        progressSignature: buildRoomTaskProgressObservationSignature(node, input.signals),
+        ...input.signals,
+        origin: input.origin,
+        observedAt: input.observedAt,
+        createdAt: input.observedAt,
+      };
+      const priorActions = (await tx
+        .select()
+        .from(roomTaskRecoveryActions)
+        .where(and(
+          eq(roomTaskRecoveryActions.projectId, this.projectId),
+          eq(roomTaskRecoveryActions.roomId, input.roomId),
+          eq(roomTaskRecoveryActions.nodeId, input.nodeId),
+          eq(roomTaskRecoveryActions.nodeVersion, input.expectedNodeVersion),
+        ))
+        .orderBy(asc(roomTaskRecoveryActions.createdAt), asc(roomTaskRecoveryActions.id)))
+        .map(rowToRoomTaskRecoveryAction)
+        .filter((action) =>
+          action.actionSnapshot.turnId === input.turnId
+          && action.actionSnapshot.phaseId === input.phaseId,
+        );
+      const protocol = getRoomProtocolDefinition(room.room.protocolId, room.room.protocolVersion);
+      const policy = getRoomProtocolNoProgressRecoveryPolicy(
+        room.room.protocolId,
+        room.room.protocolVersion,
+      );
+      const decision = deriveRoomTaskNoProgressDecision({
+        roomId: input.roomId,
+        node,
+        observation,
+        priorObservations: priorObservationRows.map(rowToRoomTaskProgressObservation),
+        priorActions,
+        protocol,
+        policy,
+      });
+
+      let graphProjection: RoomTaskGraphProjectionV1 | null = null;
+      let next: RoomAggregateV1;
+      if (decision.kind === "exhausted") {
+        const applied = applyTaskGraphMutations(taskGraph, {
+          roomId: input.roomId,
+          expectedAggregateVersion: room.room.aggregateVersion,
+          expectedDagVersion: taskGraph.dagVersion,
+          idempotencyKey: "recovery-ladder-exhausted:" + input.idempotencyKey,
+          mutations: [{
+            action: "transition_node",
+            nodeId: node.id,
+            expectedNodeVersion: node.nodeVersion,
+            to: "blocked",
+            acceptanceEvidenceIds: [],
+            progressSignature: node.progressSignature,
+          }],
+          mutatedAt: input.observedAt,
+        }, null);
+        graphProjection = applied.projection;
+        next = {
+          ...room,
+          room: {
+            ...room.room,
+            aggregateVersion: graphProjection.aggregateVersion,
+            updatedAt: input.observedAt,
+          },
+        };
+        const roomUpdated = await tx
+          .update(operationalRooms)
+          .set({
+            aggregateVersion: graphProjection.aggregateVersion,
+            taskGraphVersion: graphProjection.dagVersion,
+            updatedAt: input.observedAt,
+          })
+          .where(and(
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.id, input.roomId),
+            eq(operationalRooms.aggregateVersion, room.room.aggregateVersion),
+            eq(operationalRooms.taskGraphVersion, taskGraph.dagVersion),
+          ))
+          .returning({ id: operationalRooms.id });
+        if (roomUpdated.length !== 1) {
+          throw new RoomStoreError(
+            "task_recovery_action_conflict",
+            "Concurrent exhaustion recovery changed Room " + input.roomId,
+          );
+        }
+        await persistRoomTaskGraphProjection(
+          tx,
+          this.projectId,
+          taskGraph,
+          graphProjection,
+          input.observedAt,
+          applied.retiredEdges,
+        );
+      } else {
+        const aggregateVersion = advanceTaskGraphVersion(
+          room.room.aggregateVersion,
+          "taskProgressObservation:" + input.roomId,
+        );
+        next = {
+          ...room,
+          room: {
+            ...room.room,
+            aggregateVersion,
+            updatedAt: input.observedAt,
+          },
+        };
+        const roomUpdated = await tx
+          .update(operationalRooms)
+          .set({ aggregateVersion, updatedAt: input.observedAt })
+          .where(and(
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.id, input.roomId),
+            eq(operationalRooms.aggregateVersion, room.room.aggregateVersion),
+          ))
+          .returning({ id: operationalRooms.id });
+        if (roomUpdated.length !== 1) {
+          throw new RoomStoreError(
+            "task_progress_observation_conflict",
+            "Concurrent progress observation changed Room " + input.roomId,
+          );
+        }
+      }
+
+      await tx.insert(roomTaskProgressObservations).values({
+        id: observation.id,
+        projectId: this.projectId,
+        roomId: observation.roomId,
+        nodeId: observation.nodeId,
+        nodeVersion: observation.nodeVersion,
+        turnId: observation.turnId,
+        phaseId: observation.phaseId,
+        roundId: observation.roundId,
+        idempotencyKey: observation.idempotencyKey,
+        progressSignature: observation.progressSignature,
+        semanticHash: observation.semanticHash,
+        evidenceHash: observation.evidenceHash,
+        artifactHash: observation.artifactHash,
+        testHash: observation.testHash,
+        resolvedDissentHash: observation.resolvedDissentHash,
+        origin: observation.origin,
+        observedAt: observation.observedAt,
+        createdAt: observation.createdAt,
+      });
+      if (decision.kind === "action_enqueued") {
+        const action = decision.action;
+        await tx.insert(roomTaskRecoveryActions).values({
+          id: action.id,
+          projectId: this.projectId,
+          roomId: action.roomId,
+          nodeId: action.nodeId,
+          nodeVersion: action.nodeVersion,
+          observationId: action.observationId,
+          actionId: action.actionId,
+          actionSnapshot: action.actionSnapshot,
+          policySnapshot: action.policySnapshot,
+          state: action.state,
+          attemptCount: action.attemptCount,
+          claimToken: action.claimToken,
+          claimExpiresAt: action.claimExpiresAt,
+          claimedByWorkerId: action.claimedByWorkerId,
+          claimedAt: action.claimedAt,
+          nextEligibleAt: action.nextEligibleAt,
+          resultPayload: action.resultPayload,
+          lastErrorCode: action.lastErrorCode,
+          operatorApprovalId: action.operatorApprovalId,
+          createdAt: action.createdAt,
+          updatedAt: action.updatedAt,
+          processedAt: action.processedAt,
+        });
+      }
+
+      const snapshot: RoomTaskProgressObservationEventSnapshotV1 = {
+        contractVersion: "room-task-progress-observation-snapshot/v1",
+        observation,
+        decision,
+      };
+      const eventType = roomTaskProgressObservationEventType(decision);
+      const event = await insertRoomEvent(tx, next, eventType, {
+        eventId: "room-event-" + randomUUID(),
+        actorType: "controller",
+        actorId: input.roomWorkerFence.holderId,
+        correlationId: "room-task-progress:" + input.roomId + ":" + input.nodeId + ":" + input.roundId,
+        causationId: input.turnId,
+        occurredAt: input.observedAt,
+      }, {
+        projectionVersion: 1,
+        snapshot,
+        ...(graphProjection
+          ? {
+              taskGraphProjection: graphProjection,
+              taskGraphProjectionHash: hashRoomValue(graphProjection),
+            }
+          : {}),
+        updatedAt: input.observedAt,
+      });
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          "Failed to bind progress observation idempotency key " + input.idempotencyKey,
+        );
+      }
+      return {
+        result: {
+          observation,
+          decision,
+          event,
+          replayed: false,
+        },
+        event,
+      };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.result;
+  }
+
+  /**
+   * Claim one due recovery action through the Room worker fence. A stale
+   * phase/turn/node action is intentionally left untouched for its authoritative
+   * controller to supersede; it can never mutate a newer task incarnation.
+   */
+  async claimNextRoomTaskRecoveryAction(
+    rawInput: ClaimRoomTaskRecoveryActionInputV1,
+  ): Promise<RoomTaskRecoveryActionV1 | null> {
+    const input = normalizeClaimRoomTaskRecoveryActionInput(rawInput);
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.now,
+      });
+      const [current, graph, candidates, observationRows] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        loadRoomTaskGraphProjection(tx, this.projectId, input.roomId),
+        tx
+          .select()
+          .from(roomTaskRecoveryActions)
+          .where(and(
+            eq(roomTaskRecoveryActions.projectId, this.projectId),
+            eq(roomTaskRecoveryActions.roomId, input.roomId),
+            or(
+              eq(roomTaskRecoveryActions.state, "pending"),
+              eq(roomTaskRecoveryActions.state, "claimed"),
+            ),
+          ))
+          .orderBy(asc(roomTaskRecoveryActions.createdAt), asc(roomTaskRecoveryActions.id)),
+        tx
+          .select()
+          .from(roomTaskProgressObservations)
+          .where(and(
+            eq(roomTaskProgressObservations.projectId, this.projectId),
+            eq(roomTaskProgressObservations.roomId, input.roomId),
+          ))
+          .orderBy(desc(roomTaskProgressObservations.observedAt), desc(roomTaskProgressObservations.id)),
+      ]);
+      if (!current || !graph) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          "Operational Room " + input.roomId + " disappeared during recovery-action claim",
+        );
+      }
+      const posture = await this.readRecoveryPosture(tx, input.roomId);
+      const withheldReason = recoveryWithheldReason(posture);
+      if (withheldReason) throw new RoomWorkerAuthorityError(posture, withheldReason);
+      if (current.room.state !== "running") {
+        throw new RoomWorkerAuthorityError(posture, "lifecycle_not_running");
+      }
+      const observations = observationRows.map(rowToRoomTaskProgressObservation);
+      const observationsById = new Map(observations.map((observation) => [observation.id, observation]));
+      const latestObservationByScope = new Map<string, RoomTaskProgressObservationV1>();
+      for (const observation of observations) {
+        const key = [
+          observation.nodeId,
+          observation.nodeVersion,
+          observation.turnId,
+          observation.phaseId,
+        ].join("\u0000");
+        if (!latestObservationByScope.has(key)) {
+          latestObservationByScope.set(key, observation);
+        }
+      }
+      const candidate = candidates
+        .map(rowToRoomTaskRecoveryAction)
+        .find((action) => {
+          if (Date.parse(action.nextEligibleAt) > Date.parse(input.now)) return false;
+          if (
+            action.state === "claimed"
+            && (action.claimExpiresAt === null || Date.parse(action.claimExpiresAt) > Date.parse(input.now))
+          ) {
+            return false;
+          }
+          if (current.activeTurnId !== action.actionSnapshot.turnId) return false;
+          const activeTurn = current.turns.find((turn) => turn.id === current.activeTurnId);
+          if (!activeTurn || activeTurn.protocolPhaseId !== action.actionSnapshot.phaseId) return false;
+          const triggeringObservation = observationsById.get(action.observationId);
+          const latestObservation = latestObservationByScope.get([
+            action.nodeId,
+            action.nodeVersion,
+            action.actionSnapshot.turnId,
+            action.actionSnapshot.phaseId,
+          ].join("\u0000"));
+          if (
+            !triggeringObservation
+            || !latestObservation
+            || !sameRoomTaskProgressVector(triggeringObservation, latestObservation)
+          ) {
+            return false;
+          }
+          const node = graph.nodes.find((item) => item.id === action.nodeId);
+          return Boolean(
+            node
+            && node.nodeVersion === action.nodeVersion
+            && ["running", "retrying"].includes(node.state),
+          );
+        });
+      if (!candidate) return { action: null, event: null };
+
+      const claimTtlMs = input.claimTtlMs ?? DEFAULT_ROOM_TASK_RECOVERY_ACTION_CLAIM_TTL_MS;
+      const claimToken = "room-task-recovery-claim-" + randomUUID();
+      const claimExpiresAt = new Date(
+        Date.parse(input.now) + claimTtlMs,
+      ).toISOString();
+      const updatedRows = await tx
+        .update(roomTaskRecoveryActions)
+        .set({
+          state: "claimed",
+          attemptCount: candidate.attemptCount + 1,
+          claimToken,
+          claimExpiresAt,
+          claimedByWorkerId: input.workerId,
+          claimedAt: input.now,
+          resultPayload: null,
+          lastErrorCode: null,
+          processedAt: null,
+          updatedAt: input.now,
+        })
+        .where(and(
+          eq(roomTaskRecoveryActions.id, candidate.id),
+          eq(roomTaskRecoveryActions.projectId, this.projectId),
+          eq(roomTaskRecoveryActions.roomId, input.roomId),
+          eq(roomTaskRecoveryActions.state, candidate.state),
+          candidate.state === "claimed" && candidate.claimToken !== null
+            ? eq(roomTaskRecoveryActions.claimToken, candidate.claimToken)
+            : isNull(roomTaskRecoveryActions.claimToken),
+        ))
+        .returning();
+      if (updatedRows.length !== 1) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Concurrent recovery-action claim rejected for " + candidate.id,
+        );
+      }
+      const action = rowToRoomTaskRecoveryAction(updatedRows[0]);
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        "taskRecoveryActionClaim:" + input.roomId,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion,
+          updatedAt: input.now,
+        },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, current.room.aggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Concurrent recovery-action claim changed Room " + input.roomId,
+        );
+      }
+      const snapshot: RoomTaskRecoveryActionEventSnapshotV1 = {
+        contractVersion: "room-task-recovery-action-snapshot/v1",
+        transition: "claimed",
+        previousState: candidate.state === "claimed" ? "claimed" : "pending",
+        action,
+      };
+      const event = await insertRoomEvent(tx, next, "room_task_recovery_action_claimed", {
+        eventId: "room-event-" + randomUUID(),
+        actorType: "controller",
+        actorId: input.workerId,
+        correlationId: "room-task-recovery:" + action.id,
+        causationId: action.observationId,
+        occurredAt: input.now,
+      }, {
+        projectionVersion: 1,
+        actionId: action.id,
+        snapshot,
+        updatedAt: input.now,
+      });
+      return { action, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.action;
+  }
+
+  /**
+   * Persist an authoritative recovery handoff/approval receipt or release a
+   * claim for a bounded retry. This is deliberately separate from any provider
+   * invocation: external effects must be proven before this acknowledgement.
+   */
+  async completeRoomTaskRecoveryAction(
+    rawInput: CompleteRoomTaskRecoveryActionInputV1,
+  ): Promise<RoomTaskRecoveryActionV1> {
+    const input = normalizeCompleteRoomTaskRecoveryActionInput(rawInput);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      actionId: input.actionId,
+      claimToken: input.claimToken,
+      outcome: input.outcome,
+      resultPayload: input.resultPayload,
+      errorCode: input.errorCode,
+      retryAt: input.retryAt ?? null,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.now,
+      });
+      const reservationId = "room-idempotency-" + randomUUID();
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "complete_room_task_recovery_action",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.now,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "complete_room_task_recovery_action"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            "Idempotency key " + input.idempotencyKey + " was already used for a different recovery-action completion",
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            "Recovery-action completion key " + input.idempotencyKey + " has no committed event",
+          );
+        }
+        return {
+          action: await loadRoomTaskRecoveryActionCompletionResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            existing.resultEventId,
+          ),
+          event: null,
+        };
+      }
+      if (
+        input.outcome === "processed"
+        && input.resultPayload !== null
+        && input.resultPayload.receiptRef.startsWith("room-task-recovery-plan:")
+      ) {
+        const planRows = await tx
+          .select()
+          .from(roomTaskRecoveryPlans)
+          .where(and(
+            eq(roomTaskRecoveryPlans.projectId, this.projectId),
+            eq(roomTaskRecoveryPlans.roomId, input.roomId),
+            eq(roomTaskRecoveryPlans.recoveryActionId, input.actionId),
+          ))
+          .limit(1);
+        const planRow = planRows[0];
+        if (!planRow) {
+          throw new RoomStoreError(
+            "task_recovery_action_invalid",
+            "Recovery-plan receipt must reference a durable plan for action " + input.actionId,
+          );
+        }
+        const plan = rowToRoomTaskRecoveryPlan(planRow);
+        if (
+          plan.resultReceipt.receiptRef !== input.resultPayload.receiptRef
+          || plan.resultReceipt.resultHash !== input.resultPayload.resultHash
+          || plan.resultReceipt.kind !== input.resultPayload.kind
+        ) {
+          throw new RoomStoreError(
+            "task_recovery_action_invalid",
+            "Recovery-plan receipt does not match its immutable handoff for action " + input.actionId,
+          );
+        }
+      }
+      const updatedRows = await tx
+        .update(roomTaskRecoveryActions)
+        .set(input.outcome === "processed"
+          ? {
+              state: "processed",
+              claimToken: null,
+              claimExpiresAt: null,
+              claimedByWorkerId: null,
+              claimedAt: null,
+              processedAt: input.now,
+              resultPayload: input.resultPayload,
+              lastErrorCode: null,
+              updatedAt: input.now,
+            }
+          : {
+              state: "pending",
+              claimToken: null,
+              claimExpiresAt: null,
+              claimedByWorkerId: null,
+              claimedAt: null,
+              processedAt: null,
+              resultPayload: null,
+              lastErrorCode: input.errorCode,
+              nextEligibleAt: input.retryAt,
+              updatedAt: input.now,
+            })
+        .where(and(
+          eq(roomTaskRecoveryActions.id, input.actionId),
+          eq(roomTaskRecoveryActions.projectId, this.projectId),
+          eq(roomTaskRecoveryActions.roomId, input.roomId),
+          eq(roomTaskRecoveryActions.state, "claimed"),
+          eq(roomTaskRecoveryActions.claimToken, input.claimToken),
+        ))
+        .returning();
+      if (updatedRows.length !== 1) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Recovery action " + input.actionId + " is not claimed by this worker token",
+        );
+      }
+      const action = rowToRoomTaskRecoveryAction(updatedRows[0]);
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          "Operational Room " + input.roomId + " disappeared during recovery-action completion",
+        );
+      }
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        "taskRecoveryActionComplete:" + input.roomId,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion,
+          updatedAt: input.now,
+        },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, current.room.aggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Concurrent recovery-action completion changed Room " + input.roomId,
+        );
+      }
+      const snapshot: RoomTaskRecoveryActionEventSnapshotV1 = {
+        contractVersion: "room-task-recovery-action-snapshot/v1",
+        transition: input.outcome,
+        previousState: "claimed",
+        action,
+      };
+      const event = await insertRoomEvent(tx, next, "room_task_recovery_action_completed", {
+        eventId: "room-event-" + randomUUID(),
+        actorType: "controller",
+        actorId: input.roomWorkerFence.holderId,
+        correlationId: "room-task-recovery:" + action.id,
+        causationId: action.observationId,
+        occurredAt: input.now,
+      }, {
+        projectionVersion: 1,
+        actionId: action.id,
+        snapshot,
+        updatedAt: input.now,
+      });
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          "Failed to bind recovery-action completion idempotency key " + input.idempotencyKey,
+        );
+      }
+      return { action, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.action;
+  }
+
+  /**
+   * Materialize the one durable, provider-free control handoff for a currently
+   * claimed no-progress action. The plan and its immutable Room event share a
+   * transaction; a crash can therefore replay the same plan but cannot leave a
+   * fabricated receipt behind. Actual model/session/workspace effects remain
+   * separate controller or approved-operator commands.
+   */
+  async recordRoomTaskRecoveryPlan(
+    rawInput: RecordRoomTaskRecoveryPlanInputV1,
+  ): Promise<RoomTaskRecoveryPlanV1> {
+    const input = normalizeRecordRoomTaskRecoveryPlanInput(rawInput);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      recoveryActionId: input.recoveryActionId,
+    });
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.now,
+      });
+      const reservationId = "room-idempotency-" + randomUUID();
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "record_room_task_recovery_plan",
+          commandHash,
+          resultEventId: null,
+          createdAt: input.now,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "record_room_task_recovery_plan"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            "Idempotency key " + input.idempotencyKey + " was already used for a different recovery-plan command",
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            "Recovery-plan key " + input.idempotencyKey + " has no committed event",
+          );
+        }
+        return {
+          plan: await loadRoomTaskRecoveryPlanResult(
+            tx,
+            this.projectId,
+            input.roomId,
+            existing.resultEventId,
+          ),
+          event: null,
+        };
+      }
+
+      const actionRows = await tx
+        .select()
+        .from(roomTaskRecoveryActions)
+        .where(and(
+          eq(roomTaskRecoveryActions.id, input.recoveryActionId),
+          eq(roomTaskRecoveryActions.projectId, this.projectId),
+          eq(roomTaskRecoveryActions.roomId, input.roomId),
+        ))
+        .limit(1);
+      const actionRow = actionRows[0];
+      if (!actionRow) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Recovery action " + input.recoveryActionId + " is not present in this Room",
+        );
+      }
+      const action = rowToRoomTaskRecoveryAction(actionRow);
+      if (
+        action.state !== "claimed"
+        || action.claimToken !== input.claimToken
+        || action.claimedByWorkerId !== input.roomWorkerFence.holderId
+      ) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Recovery plan requires the exact current claim for action " + input.recoveryActionId,
+        );
+      }
+      const current = await loadRoomAggregateProjection(tx, this.projectId, input.roomId);
+      if (!current) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          "Operational Room " + input.roomId + " disappeared during recovery-plan recording",
+        );
+      }
+      const posture = await this.readRecoveryPosture(tx, input.roomId);
+      const withheldReason = recoveryWithheldReason(posture);
+      if (withheldReason) throw new RoomWorkerAuthorityError(posture, withheldReason);
+      if (current.room.state !== "running") {
+        throw new RoomWorkerAuthorityError(posture, "lifecycle_not_running");
+      }
+
+      const plan = createRoomTaskRecoveryPlan(action, input.now);
+      const inserted = await tx
+        .insert(roomTaskRecoveryPlans)
+        .values({
+          id: plan.id,
+          projectId: this.projectId,
+          roomId: plan.roomId,
+          recoveryActionId: plan.recoveryActionId,
+          executionMode: plan.executionMode,
+          actionSnapshot: plan.actionSnapshot,
+          actionSnapshotHash: plan.actionSnapshotHash,
+          resultReceipt: plan.resultReceipt,
+          createdAt: plan.createdAt,
+        })
+        .returning({ id: roomTaskRecoveryPlans.id });
+      if (inserted.length !== 1) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "A recovery plan already exists for action " + input.recoveryActionId,
+        );
+      }
+      const aggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        "taskRecoveryPlan:" + input.roomId,
+      );
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion,
+          updatedAt: input.now,
+        },
+      };
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({ aggregateVersion, updatedAt: input.now })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, current.room.aggregateVersion),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomStoreError(
+          "task_recovery_action_conflict",
+          "Concurrent recovery-plan recording changed Room " + input.roomId,
+        );
+      }
+      const event = await insertRoomEvent(tx, next, "room_task_recovery_plan_recorded", {
+        eventId: "room-event-" + randomUUID(),
+        actorType: "controller",
+        actorId: input.roomWorkerFence.holderId,
+        correlationId: "room-task-recovery-plan:" + plan.id,
+        causationId: action.observationId,
+        occurredAt: input.now,
+      }, {
+        projectionVersion: 1,
+        recoveryActionId: plan.recoveryActionId,
+        snapshot: {
+          contractVersion: "room-task-recovery-plan-snapshot/v1",
+          plan,
+        },
+        recordedAt: input.now,
+        updatedAt: input.now,
+      });
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(eq(roomIdempotencyKeys.id, reservationId))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          "Failed to bind recovery-plan idempotency key " + input.idempotencyKey,
+        );
+      }
+      return { plan, event };
+    });
+    if (committed.event) this.publishCommittedEvent(committed.event);
+    return committed.plan;
+  }
+
+  /** Lists immutable recovery handoffs for a cockpit or later controller pass. */
+  async getRoomTaskRecoveryPlans(roomId: string): Promise<readonly RoomTaskRecoveryPlanV1[]> {
+    const rows = await this.layer.db
+      .select()
+      .from(roomTaskRecoveryPlans)
+      .where(and(
+        eq(roomTaskRecoveryPlans.projectId, this.projectId),
+        eq(roomTaskRecoveryPlans.roomId, roomId),
+      ))
+      .orderBy(asc(roomTaskRecoveryPlans.createdAt), asc(roomTaskRecoveryPlans.id));
+    return rows.map(rowToRoomTaskRecoveryPlan);
   }
 
   /**
@@ -1902,7 +6617,7 @@ export class AsyncRoomStore {
       throw new RoomDomainError("room_state_conflict", `Operational Room ${roomId} does not exist`);
     }
 
-    const [lastLifecycleEvent, roomApproval, waitingNode] = await Promise.all([
+    const [lastLifecycleEvent, roomApproval] = await Promise.all([
       handle
         .select({ actorType: roomEvents.actorType, payload: roomEvents.payload })
         .from(roomEvents)
@@ -1935,16 +6650,6 @@ export class AsyncRoomStore {
         )
         .limit(1)
         .then((rows) => rows[0]),
-      handle
-        .select({ id: roomTaskNodes.id })
-        .from(roomTaskNodes)
-        .where(and(
-          eq(roomTaskNodes.projectId, this.projectId),
-          eq(roomTaskNodes.roomId, roomId),
-          eq(roomTaskNodes.state, "waiting_approval"),
-        ))
-        .limit(1)
-        .then((rows) => rows[0]),
     ]);
     const payload = lastLifecycleEvent?.payload;
     const transitionedToPaused = Boolean(
@@ -1953,7 +6658,14 @@ export class AsyncRoomStore {
       && !Array.isArray(payload)
       && (payload as Record<string, unknown>).to === "paused",
     );
-    const approvalState = roomApproval?.status === "pending" || waitingNode
+    /*
+    FNXC:SessionRoomNonBlockingApproval 2026-07-19-00:03:
+    A task-level waiting_approval state is a DAG-local dependency wait, not a
+    Room-wide hold. Only an approval request explicitly targeted at the Room
+    may withhold its worker, so independent ready branches can still claim and
+    recover under the same Room fence.
+    */
+    const approvalState = roomApproval?.status === "pending"
       ? "waiting"
       : roomApproval?.status === "denied" && room.lifecycleState === "blocked"
         ? "blocked"
@@ -2409,6 +7121,14 @@ export class AsyncRoomStore {
     return loadRoomEvents(this.layer.db, this.projectId, roomId, afterCursor, options);
   }
 
+  async listEventPage(
+    roomId: string,
+    afterCursor?: string,
+    options?: ListRoomEventsOptionsV1,
+  ): Promise<RoomEventPageV1> {
+    return loadRoomEventPage(this.layer.db, this.projectId, roomId, afterCursor, options);
+  }
+
   async getRoutedMessage(messageId: string): Promise<StoredRoutedOperatorMessageV1 | null> {
     const rows = await this.layer.db
       .select()
@@ -2735,6 +7455,421 @@ export class AsyncRoomStore {
   }
 
   /**
+   * Atomically claim one ready assigned node for fenced controller dispatch.
+   * The claim creates only durable provider intent; Room recovery remains the
+   * sole sender that may later invoke a connector.
+   *
+   * FNXC:SessionRoomDispatchClaim 2026-07-18-23:18:
+   * Task 5.7 requires non-blocking branches to enter running only together
+   * with their exact owner, message, target, outbox, and immutable ledger
+   * event. A room-worker fence is asserted under the same advisory lock so a
+   * displaced controller cannot create work after a takeover.
+   */
+  async claimReadyTaskDispatch(
+    rawInput: ClaimReadyRoomTaskDispatchInputV1,
+  ): Promise<ClaimReadyRoomTaskDispatchResultV1> {
+    const input = normalizeReadyTaskDispatchClaimInput(rawInput, this.projectId);
+    const commandHash = hashRoomValue({
+      roomId: input.roomId,
+      nodeId: input.nodeId,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedDagVersion: input.expectedDagVersion,
+      expectedNodeVersion: input.expectedNodeVersion,
+      owner: input.owner,
+      roleAssignment: input.roleAssignment ?? null,
+      commandId: input.commandId,
+      correlationId: input.correlationId,
+      authority: input.authority,
+      message: input.message,
+    });
+
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      const committedAt = this.currentTime();
+      if (!isCanonicalUtcIsoTimestamp(committedAt)) {
+        throw new RoomStoreError(
+          "task_dispatch_invalid_claim",
+          "Trusted backend clock must return a canonical UTC ISO timestamp",
+        );
+      }
+      await assertRoomLeaseFence(tx, this.projectId, {
+        leaseId: input.roomWorkerFence.leaseId,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        holderId: input.roomWorkerFence.holderId,
+        hostId: input.roomWorkerFence.hostId,
+        expectedEpoch: input.roomWorkerFence.expectedEpoch,
+        now: committedAt,
+      });
+
+      const reservationId = `room-idempotency-${randomUUID()}`;
+      const reservation = await tx
+        .insert(roomIdempotencyKeys)
+        .values({
+          id: reservationId,
+          projectId: this.projectId,
+          roomId: input.roomId,
+          idempotencyKey: input.idempotencyKey,
+          commandType: "claim_ready_task_dispatch",
+          commandHash,
+          resultEventId: null,
+          createdAt: committedAt,
+          expiresAt: null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: roomIdempotencyKeys.id });
+
+      // A replay still proves present worker authority before returning the
+      // immutable claim. It deliberately ignores later aggregate movement.
+      if (reservation.length === 0) {
+        const existingRows = await tx
+          .select()
+          .from(roomIdempotencyKeys)
+          .where(and(
+            eq(roomIdempotencyKeys.projectId, this.projectId),
+            eq(roomIdempotencyKeys.roomId, input.roomId),
+            eq(roomIdempotencyKeys.idempotencyKey, input.idempotencyKey),
+          ))
+          .limit(1);
+        const existing = existingRows[0];
+        if (
+          !existing
+          || existing.commandType !== "claim_ready_task_dispatch"
+          || existing.commandHash !== commandHash
+        ) {
+          throw new RoomStoreError(
+            "idempotency_conflict",
+            `Idempotency key ${input.idempotencyKey} was already used for a different Room command`,
+          );
+        }
+        if (!existing.resultEventId) {
+          throw new RoomStoreError(
+            "idempotency_result_missing",
+            `Idempotency key ${input.idempotencyKey} has no committed task-dispatch event`,
+          );
+        }
+        const replay = await loadReadyTaskDispatchClaimResult(
+          tx,
+          this.projectId,
+          existing.resultEventId,
+        );
+        return { result: { ...replay, replayed: true }, eventToPublish: null };
+      }
+
+      const [current, graph, activeAssignmentRows, phaseRows] = await Promise.all([
+        loadRoomAggregateProjection(tx, this.projectId, input.roomId),
+        loadRoomTaskGraphProjection(tx, this.projectId, input.roomId),
+        tx
+          .select()
+          .from(roomRoleAssignments)
+          .where(and(
+            eq(roomRoleAssignments.projectId, this.projectId),
+            eq(roomRoleAssignments.roomId, input.roomId),
+            eq(roomRoleAssignments.state, "active"),
+          ))
+          .limit(1),
+        tx
+          .select({ protocolPhaseId: operationalRooms.protocolPhaseId })
+          .from(operationalRooms)
+          .where(and(
+            eq(operationalRooms.projectId, this.projectId),
+            eq(operationalRooms.id, input.roomId),
+          ))
+          .limit(1),
+      ]);
+      if (!current || !graph) {
+        throw new RoomDomainError(
+          "room_state_conflict",
+          `Operational Room ${input.roomId} disappeared during task dispatch claim`,
+        );
+      }
+      const posture = await this.readRecoveryPosture(tx, input.roomId);
+      const withheldReason = recoveryWithheldReason(posture);
+      if (withheldReason) throw new RoomWorkerAuthorityError(posture, withheldReason);
+      if (current.room.state !== "running") {
+        throw new RoomWorkerAuthorityError(posture, "lifecycle_not_running");
+      }
+      if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+        throw new RoomDomainError(
+          "aggregate_version_conflict",
+          `Room ${input.roomId} expected aggregate version ${input.expectedAggregateVersion} but is ${current.room.aggregateVersion}`,
+          { expected: input.expectedAggregateVersion, actual: current.room.aggregateVersion },
+        );
+      }
+      if (graph.dagVersion !== input.expectedDagVersion) {
+        throw new RoomStoreError(
+          "dag_version_conflict",
+          `Room ${input.roomId} expected DAG version ${input.expectedDagVersion} but is ${graph.dagVersion}`,
+        );
+      }
+      if (isEarlierTimestamp(committedAt, current.room.updatedAt)) {
+        throw new RoomStoreError(
+          "task_dispatch_invalid_claim",
+          `Task-dispatch claim timestamp cannot precede Room ${input.roomId} updatedAt`,
+        );
+      }
+
+      const node = graph.nodes.find((candidate) => candidate.id === input.nodeId);
+      if (!node || node.nodeVersion !== input.expectedNodeVersion || node.state !== "ready") {
+        throw new RoomStoreError(
+          "task_dispatch_invalid_claim",
+          `Ready task node ${input.nodeId} no longer matches its claimed version`,
+        );
+      }
+      if (!taskNodeDependenciesSatisfied(node.id, new Map(graph.nodes.map((candidate) => [candidate.id, candidate])), new Map(graph.edges.map((edge) => [edge.id, edge])))) {
+        throw new RoomStoreError(
+          "task_dispatch_dependency_blocked",
+          `Task node ${input.nodeId} cannot dispatch until its required predecessors are accepted`,
+        );
+      }
+      const activeAssignment = activeAssignmentRows[0]
+        ? parseStoredRoomRoleAssignment(activeAssignmentRows[0])
+        : null;
+      if (!activeAssignment) {
+        throw new RoomStoreError(
+          "role_assignment_missing",
+          `Task dispatch for ${input.nodeId} requires an active capability-aware role assignment`,
+        );
+      }
+      if (
+        !input.roleAssignment
+        || input.roleAssignment.assignmentId !== activeAssignment.id
+        || input.roleAssignment.revision !== activeAssignment.revision
+        || input.roleAssignment.phaseId !== activeAssignment.phaseId
+      ) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Task dispatch for ${input.nodeId} does not name the active role-assignment revision`,
+        );
+      }
+      if (phaseRows[0]?.protocolPhaseId !== activeAssignment.phaseId) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Room ${input.roomId} phase does not match its active role assignment`,
+        );
+      }
+      await assertRoleAssignmentSnapshotBindingsCurrent(
+        tx,
+        this.projectId,
+        input.roomId,
+        activeAssignment.capabilitySnapshot,
+      );
+      const ownership = resolveRoomTaskRoleAssignment(
+        node,
+        activeAssignment.assignment,
+        activeAssignment.capabilitySnapshot,
+      );
+      if (
+        !ownership.ok
+        || ownership.bindingIds.length !== 1
+        || ownership.bindingIds[0] !== input.owner.bindingId
+      ) {
+        throw new RoomStoreError(
+          "role_assignment_conflict",
+          `Task node ${input.nodeId} is not uniquely eligible for its active role assignment`,
+        );
+      }
+      const ownerSeat = current.seats.find((seat) => seat.id === input.owner.seatId);
+      const ownerBinding = current.bindings.find((binding) => binding.id === input.owner.bindingId);
+      if (
+        !ownerSeat
+        || ownerSeat.state !== "active"
+        || ownerSeat.activeBindingId !== input.owner.bindingId
+        || !ownerBinding
+        || ownerBinding.seatId !== ownerSeat.id
+        || ownerBinding.state !== "attached"
+      ) {
+        throw new RoomStoreError(
+          "task_dispatch_owner_conflict",
+          `Task dispatch owner ${input.owner.seatId}/${input.owner.bindingId} is not the current attached assignment`,
+        );
+      }
+
+      const nextAggregateVersion = advanceTaskGraphVersion(
+        current.room.aggregateVersion,
+        "aggregateVersion",
+      );
+      const nextDagVersion = advanceTaskGraphVersion(graph.dagVersion, "dagVersion");
+      const nextNodeVersion = advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`);
+      const next: RoomAggregateV1 = {
+        ...current,
+        room: {
+          ...current.room,
+          aggregateVersion: nextAggregateVersion,
+          updatedAt: committedAt,
+        },
+      };
+      const dispatchedNodes = new Map(graph.nodes.map((candidate) => [
+        candidate.id,
+        candidate.id === node.id
+          ? { ...candidate, state: "running" as const, nodeVersion: nextNodeVersion }
+          : candidate,
+      ] as const));
+      const dispatchedGraph = buildTaskGraphProjection(
+        input.roomId,
+        nextAggregateVersion,
+        nextDagVersion,
+        dispatchedNodes,
+        new Map(graph.edges.map((edge) => [edge.id, edge] as const)),
+      );
+      const roomUpdated = await tx
+        .update(operationalRooms)
+        .set({
+          aggregateVersion: nextAggregateVersion,
+          taskGraphVersion: nextDagVersion,
+          updatedAt: committedAt,
+        })
+        .where(and(
+          eq(operationalRooms.projectId, this.projectId),
+          eq(operationalRooms.id, input.roomId),
+          eq(operationalRooms.aggregateVersion, input.expectedAggregateVersion),
+          eq(operationalRooms.taskGraphVersion, input.expectedDagVersion),
+          eq(operationalRooms.lifecycleState, "running"),
+        ))
+        .returning({ id: operationalRooms.id });
+      if (roomUpdated.length !== 1) {
+        throw new RoomStoreError(
+          "dag_version_conflict",
+          `Concurrent task-dispatch claim rejected for Room ${input.roomId}`,
+        );
+      }
+      const nodeUpdated = await tx
+        .update(roomTaskNodes)
+        .set({ state: "running", nodeVersion: nextNodeVersion })
+        .where(and(
+          eq(roomTaskNodes.projectId, this.projectId),
+          eq(roomTaskNodes.roomId, input.roomId),
+          eq(roomTaskNodes.id, input.nodeId),
+          eq(roomTaskNodes.state, "ready"),
+          eq(roomTaskNodes.nodeVersion, input.expectedNodeVersion),
+        ))
+        .returning({ id: roomTaskNodes.id });
+      if (nodeUpdated.length !== 1) {
+        throw new RoomStoreError(
+          "task_node_version_conflict",
+          `Concurrent task-dispatch node claim rejected for ${input.nodeId}`,
+        );
+      }
+
+      const messageId = `room-message-${randomUUID()}`;
+      const targetId = `room-message-target-${randomUUID()}`;
+      const outboxId = `room-outbox-${randomUUID()}`;
+      const target = { kind: "seats" as const, seatIds: [ownerSeat.id] };
+      await tx.insert(roomMessages).values({
+        id: messageId,
+        projectId: this.projectId,
+        roomId: input.roomId,
+        turnId: current.activeTurnId,
+        nodeId: node.id,
+        originType: "controller",
+        originId: input.authority.actorId,
+        intent: input.message.intent,
+        target,
+        targetSeatIds: [ownerSeat.id],
+        authority: input.authority,
+        content: input.message.content,
+        contentHash: input.message.contentHash,
+        evidenceRefs: input.authority.evidenceRefs,
+        idempotencyKey: input.idempotencyKey,
+        expectedAggregateVersion: input.expectedAggregateVersion,
+        createdAt: committedAt,
+      });
+      await tx.insert(roomMessageTargets).values({
+        id: targetId,
+        projectId: this.projectId,
+        roomId: input.roomId,
+        messageId,
+        selectorKind: "seats",
+        selectorRef: null,
+        targetKind: "seat",
+        seatId: ownerSeat.id,
+        bindingId: ownerBinding.id,
+        ordinal: 0,
+        createdAt: committedAt,
+      });
+      const deliveryIdempotencyKey = `${input.idempotencyKey}:${ownerBinding.id}`;
+      await tx.insert(roomOutbox).values({
+        id: outboxId,
+        projectId: this.projectId,
+        roomId: input.roomId,
+        messageId,
+        bindingId: ownerBinding.id,
+        logicalMessageId: messageId,
+        localMessageId: buildRoomConnectorLocalMessageId({
+          logicalMessageId: messageId,
+          bindingId: ownerBinding.id,
+          idempotencyKey: deliveryIdempotencyKey,
+          payloadHash: input.message.contentHash,
+        }),
+        idempotencyKey: deliveryIdempotencyKey,
+        payloadHash: input.message.contentHash,
+        deliveryState: "pending",
+        nativeAcknowledgement: null,
+        nativeCursor: null,
+        reconciliationFromCursor: null,
+        reconciliationEvidenceRef: null,
+        dispatchTaskNodeId: node.id,
+        dispatchClaimNodeVersion: nextNodeVersion,
+        attemptCount: 0,
+        lastErrorCode: null,
+        nextAttemptAt: null,
+        createdAt: committedAt,
+        updatedAt: committedAt,
+      });
+      const event = await insertRoomEvent(tx, next, "room_task_dispatch_claimed", {
+        eventId: `room-event-${randomUUID()}`,
+        actorType: input.authority.actorType,
+        actorId: input.authority.actorId,
+        correlationId: input.correlationId,
+        causationId: input.commandId,
+        occurredAt: committedAt,
+      }, {
+        projectionVersion: 3,
+        nodeId: node.id,
+        ownerSeatId: ownerSeat.id,
+        ownerBindingId: ownerBinding.id,
+        roleAssignmentId: activeAssignment?.id ?? null,
+        roleAssignmentRevision: activeAssignment?.revision ?? null,
+        roleAssignmentPhaseId: activeAssignment?.phaseId ?? null,
+        runningNodeVersion: nextNodeVersion,
+        dagVersion: nextDagVersion,
+        messageId,
+        targetId,
+        outboxId,
+        idempotencyKey: input.idempotencyKey,
+        projection: dispatchedGraph,
+        projectionHash: hashRoomValue(dispatchedGraph),
+        updatedAt: committedAt,
+      });
+      const linked = await tx
+        .update(roomIdempotencyKeys)
+        .set({ resultEventId: event.id })
+        .where(and(
+          eq(roomIdempotencyKeys.id, reservationId),
+          eq(roomIdempotencyKeys.projectId, this.projectId),
+        ))
+        .returning({ id: roomIdempotencyKeys.id });
+      if (linked.length !== 1) {
+        throw new RoomStoreError(
+          "idempotency_result_missing",
+          `Failed to bind task-dispatch idempotency key ${input.idempotencyKey} to event ${event.id}`,
+        );
+      }
+      const result = await loadReadyTaskDispatchClaimResult(tx, this.projectId, event.id);
+      return { result: { ...result, replayed: false }, eventToPublish: event };
+    });
+
+    if (committed.eventToPublish) this.publishCommittedEvent(committed.eventToPublish);
+    return committed.result;
+  }
+
+  /**
    * Persist one logical message, every native delivery intent, and the causal
    * Room event atomically. A replay with the same key returns the first result;
    * reusing the key for different content is a hard conflict.
@@ -2979,47 +8114,13 @@ export class AsyncRoomStore {
         );
       }
 
-      let senderLease: StoredRoomLeaseV1 | null = null;
-      if (input.senderFence) {
-        await lockRoomConnectorIngestion(tx, this.projectId, current.bindingId);
-        await lockRoomLeaseResourceWithinTransaction(
-          tx,
-          this.projectId,
-          "sender",
-          input.senderFence.resourceId,
-        );
-        senderLease = await assertRoomLeaseFence(tx, this.projectId, {
-          ...input.senderFence,
-          now: input.now,
-        });
-        if (
-          senderLease.kind !== "sender"
-          || senderLease.roomId !== current.roomId
-          || senderLease.resourceId !== current.bindingId
-        ) {
-          throw new RoomLeaseFenceError(
-            `Sender lease ${senderLease.id} does not authorize outbox ${input.outboxId}`,
-            senderLease,
-          );
-        }
-      } else {
-        const leaseHistory = await tx
-          .select({ id: roomLeases.id })
-          .from(roomLeases)
-          .where(and(
-            eq(roomLeases.projectId, this.projectId),
-            eq(roomLeases.kind, "sender"),
-            eq(roomLeases.resourceId, current.bindingId),
-          ))
-          .orderBy(desc(roomLeases.epoch))
-          .limit(1);
-        if (leaseHistory.length > 0) {
-          throw new RoomLeaseFenceError(
-            `Sender-managed outbox ${input.outboxId} requires the exact active sender lease fence`,
-            null,
-          );
-        }
-      }
+      const senderLease = await assertDeliverySenderFenceWithinTransaction(tx, {
+        projectId: this.projectId,
+        outbox: current,
+        outboxId: input.outboxId,
+        senderFence: input.senderFence,
+        now: input.now,
+      });
 
       if (senderLease) {
         const ingestion = await loadRoomConnectorIngestionState(
@@ -3170,6 +8271,123 @@ export class AsyncRoomStore {
           `Delivery attempt ${input.attemptId} already exists or conflicts: ${errorMessage(error)}`,
         );
       }
+      return rowToOutboxRecord(updatedRow);
+    });
+  }
+
+  /*
+  FNXC:SessionRoomDelivery 2026-07-19-19:56:
+  Provider backpressure discovered before the external write must stay pending
+  and retry later under the current sender fence. It is not an attempted or
+  uncertain delivery, so no attempt row or counter may be consumed.
+  */
+  async deferPendingDelivery(
+    input: DeferPendingRoomDeliveryInput,
+  ): Promise<RoomOutboxRecordV1> {
+    if (!Number.isSafeInteger(input.expectedAttemptCount) || input.expectedAttemptCount < 0) {
+      throw new RoomStoreError(
+        "delivery_attempt_conflict",
+        `Delivery deferral for ${input.outboxId} requires a non-negative expected attempt count`,
+      );
+    }
+    assertSafeRoomAuditCode(input.reasonCode, `Delivery deferral for ${input.outboxId}`);
+    assertCanonicalIsoTimestamp(input.now, `Delivery deferral for ${input.outboxId} now`);
+    assertCanonicalIsoTimestamp(input.nextAttemptAt, `Delivery deferral for ${input.outboxId} nextAttemptAt`);
+    if (Date.parse(input.nextAttemptAt) <= Date.parse(input.now)) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Delivery deferral for ${input.outboxId} requires a future nextAttemptAt`,
+      );
+    }
+    if (!input.audit.runId.trim() || !input.audit.agentId.trim()) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        `Delivery deferral for ${input.outboxId} requires run and agent audit identity`,
+      );
+    }
+
+    return this.layer.transactionImmediate(async (tx) => {
+      const rows = await tx
+        .select()
+        .from(roomOutbox)
+        .where(and(eq(roomOutbox.projectId, this.projectId), eq(roomOutbox.id, input.outboxId)))
+        .limit(1)
+        .for("update");
+      const current = rows[0];
+      if (!current) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} does not exist in project ${this.projectId}`,
+        );
+      }
+      if (current.deliveryState !== "pending") {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Room outbox ${input.outboxId} cannot defer from state ${current.deliveryState}`,
+        );
+      }
+      if (current.attemptCount !== input.expectedAttemptCount) {
+        throw new RoomStoreError(
+          "delivery_attempt_conflict",
+          `Room outbox ${input.outboxId} is on attempt ${current.attemptCount}, not expected attempt ${input.expectedAttemptCount}`,
+        );
+      }
+
+      await assertDeliverySenderFenceWithinTransaction(tx, {
+        projectId: this.projectId,
+        outbox: current,
+        outboxId: input.outboxId,
+        senderFence: input.senderFence,
+        now: input.now,
+      });
+
+      const updated = await tx
+        .update(roomOutbox)
+        .set({
+          lastErrorCode: input.reasonCode,
+          nextAttemptAt: input.nextAttemptAt,
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(roomOutbox.projectId, this.projectId),
+            eq(roomOutbox.id, input.outboxId),
+            eq(roomOutbox.deliveryState, "pending"),
+            eq(roomOutbox.attemptCount, input.expectedAttemptCount),
+          ),
+        )
+        .returning();
+      const updatedRow = updated[0];
+      if (!updatedRow) {
+        throw new RoomStoreError(
+          "delivery_state_conflict",
+          `Concurrent delivery deferral changed Room outbox ${input.outboxId}`,
+        );
+      }
+
+      // Run audit remains identifiers, hashes, state, and a bounded reason code only.
+      await recordRunAuditEventWithinTransaction(tx, {
+        projectId: this.projectId,
+        timestamp: input.now,
+        taskId: input.audit.taskId,
+        agentId: input.audit.agentId,
+        runId: input.audit.runId,
+        domain: "database",
+        mutationType: "room:connector-delivery-deferred",
+        target: input.outboxId,
+        metadata: {
+          roomId: current.roomId,
+          bindingId: current.bindingId,
+          messageId: current.messageId,
+          logicalMessageId: current.logicalMessageId,
+          localMessageId: current.localMessageId,
+          payloadHash: current.payloadHash,
+          attempt: current.attemptCount,
+          fromState: current.deliveryState,
+          reasonCode: input.reasonCode,
+          nextAttemptAt: input.nextAttemptAt,
+        },
+      });
       return rowToOutboxRecord(updatedRow);
     });
   }
@@ -3383,12 +8601,13 @@ export class AsyncRoomStore {
     input: CompleteRoomDeliveryAttemptInput,
   ): Promise<RoomOutboxRecordV1> {
     assertSafeRoomAuditCode(input.errorCode, `Delivery completion for ${input.outboxId}`);
-    return this.layer.transactionImmediate(async (tx) => {
+    const committed = await this.layer.transactionImmediate(async (tx) => {
       const rows = await tx
         .select()
         .from(roomOutbox)
         .where(and(eq(roomOutbox.projectId, this.projectId), eq(roomOutbox.id, input.outboxId)))
-        .limit(1);
+        .limit(1)
+        .for("update");
       const current = rows[0];
       if (!current || current.deliveryState !== "dispatching") {
         throw new RoomStoreError(
@@ -3396,6 +8615,14 @@ export class AsyncRoomStore {
           `Room outbox ${input.outboxId} is not dispatching`,
         );
       }
+      await assertDeliverySenderFenceWithinTransaction(tx, {
+        projectId: this.projectId,
+        outbox: current,
+        outboxId: input.outboxId,
+        senderFence: input.senderFence,
+        now: input.now,
+        allowExpiredExactFence: true,
+      });
       const attemptRows = await tx
         .select()
         .from(roomOutboxAttempts)
@@ -3536,6 +8763,13 @@ export class AsyncRoomStore {
           errorCode: input.errorCode,
         },
       });
+      const taskDispatchEvent = nextState === "rejected"
+        ? await blockTaskDispatchNode(tx, this.projectId, current, {
+          now: input.now,
+          eventType: "room_task_dispatch_delivery_rejected",
+          errorCode: input.errorCode ?? "delivery_rejected",
+        })
+        : null;
       if (nextState === "confirmed" || nextState === "rejected") {
         await refreshBlockedSenderTakeoverAfterDeliveryResolution(
           tx,
@@ -3545,8 +8779,111 @@ export class AsyncRoomStore {
           input.now,
         );
       }
-      return rowToOutboxRecord(updatedRow);
+      return {
+        result: rowToOutboxRecord(updatedRow),
+        eventToPublish: taskDispatchEvent,
+      };
     });
+    if (committed.eventToPublish) this.publishCommittedEvent(committed.eventToPublish);
+    return committed.result;
+  }
+
+  /**
+   * Recorded no-progress ladder for task-dispatch uncertainty. A provider
+   * history ambiguity is allowed time to reconcile; after the bounded window,
+   * only its exact task node becomes blocked. Independent branches retain their
+   * normal controller lifecycle and no blind resend is attempted.
+   */
+  async recoverNoProgressTaskDispatches(
+    input: RecoverNoProgressTaskDispatchesInput,
+  ): Promise<RecoverNoProgressTaskDispatchesResult> {
+    if (!isCanonicalUtcIsoTimestamp(input.now)) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        "No-progress task recovery requires a canonical UTC timestamp",
+      );
+    }
+    const maxAgeMs = input.maxDeliveryUncertaintyAgeMs
+      ?? DEFAULT_TASK_DISPATCH_UNCERTAINTY_MAX_AGE_MS;
+    if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs <= 0) {
+      throw new RoomStoreError(
+        "delivery_state_conflict",
+        "No-progress task recovery requires a positive safe uncertainty age",
+      );
+    }
+    const nowMs = Date.parse(input.now);
+    const committed = await this.layer.transactionImmediate(async (tx) => {
+      await lockRoomLeaseResourceWithinTransaction(
+        tx,
+        this.projectId,
+        "room_worker",
+        input.roomId,
+      );
+      await assertRoomLeaseFence(tx, this.projectId, {
+        ...input.roomWorkerFence,
+        roomId: input.roomId,
+        kind: "room_worker",
+        resourceId: input.roomId,
+        now: input.now,
+      });
+      const candidates = await tx
+        .select()
+        .from(roomOutbox)
+        .where(and(
+          eq(roomOutbox.projectId, this.projectId),
+          eq(roomOutbox.roomId, input.roomId),
+          eq(roomOutbox.deliveryState, "delivery_uncertain"),
+          isNotNull(roomOutbox.dispatchTaskNodeId),
+          isNotNull(roomOutbox.dispatchClaimNodeVersion),
+        ))
+        .orderBy(asc(roomOutbox.createdAt), asc(roomOutbox.id));
+      const blockedNodeIds: string[] = [];
+      const skippedOutboxIds: string[] = [];
+      const events: RoomEventRecordV1[] = [];
+      for (const outbox of candidates) {
+        const observations = await tx
+          .select({ endedAt: roomOutboxAttempts.endedAt })
+          .from(roomOutboxAttempts)
+          .where(and(
+            eq(roomOutboxAttempts.projectId, this.projectId),
+            eq(roomOutboxAttempts.outboxId, outbox.id),
+            eq(roomOutboxAttempts.outcome, "delivery_uncertain"),
+            isNotNull(roomOutboxAttempts.endedAt),
+          ))
+          .orderBy(asc(roomOutboxAttempts.endedAt), asc(roomOutboxAttempts.id))
+          .limit(1);
+        const firstUncertainAt = observations[0]?.endedAt;
+        if (!firstUncertainAt || !isCanonicalUtcIsoTimestamp(firstUncertainAt)) {
+          skippedOutboxIds.push(outbox.id);
+          continue;
+        }
+        if (nowMs - Date.parse(firstUncertainAt) < maxAgeMs) {
+          skippedOutboxIds.push(outbox.id);
+          continue;
+        }
+        const event = await blockTaskDispatchNode(tx, this.projectId, outbox, {
+          now: input.now,
+          eventType: "room_task_dispatch_delivery_uncertain_blocked",
+          errorCode: outbox.lastErrorCode ?? "delivery_uncertain_timeout",
+          firstUncertainAt,
+        });
+        if (!event) {
+          skippedOutboxIds.push(outbox.id);
+          continue;
+        }
+        events.push(event);
+        if (outbox.dispatchTaskNodeId) blockedNodeIds.push(outbox.dispatchTaskNodeId);
+      }
+      return {
+        result: {
+          blockedNodeIds: Object.freeze([...blockedNodeIds]),
+          skippedOutboxIds: Object.freeze([...skippedOutboxIds]),
+        },
+        events,
+      };
+    });
+    for (const event of committed.events) this.publishCommittedEvent(event);
+    return committed.result;
   }
 
   async getConnectorIngestionState(
@@ -4334,6 +9671,7 @@ export class AsyncRoomStore {
 
 type LoadedEnqueueMessageResult = Omit<EnqueueRoomMessageResult, "replayed">;
 type LoadedRouteOperatorMessageResult = Omit<RouteOperatorMessageResultV1, "replayed">;
+type LoadedReadyTaskDispatchClaimResult = Omit<ClaimReadyRoomTaskDispatchResultV1, "replayed">;
 type RouteOperatorMessageEnvelopeV1 = Omit<RoomControllerCommandEnvelopeV1, "command"> & {
   readonly command: Extract<
     RoomControllerCommandEnvelopeV1["command"],
@@ -4621,6 +9959,138 @@ async function loadRouteOperatorMessageResult(
   };
 }
 
+async function loadReadyTaskDispatchClaimResult(
+  handle: QueryHandle,
+  projectId: string,
+  eventId: string,
+): Promise<LoadedReadyTaskDispatchClaimResult> {
+  const eventRows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.id, eventId)))
+    .limit(1);
+  const eventRow = eventRows[0];
+  if (!eventRow || eventRow.eventType !== "room_task_dispatch_claimed") {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Committed task-dispatch event ${eventId} no longer exists`,
+    );
+  }
+  const payload = asRecord(eventRow.payload);
+  if (payload.projectionVersion === 3) {
+    const roleAssignmentId = payload.roleAssignmentId;
+    const roleAssignmentRevision = payload.roleAssignmentRevision;
+    const roleAssignmentPhaseId = payload.roleAssignmentPhaseId;
+    const hasRoleAssignment = roleAssignmentId !== null
+      || roleAssignmentRevision !== null
+      || roleAssignmentPhaseId !== null;
+    if (
+      (hasRoleAssignment && (
+        !isNonBlankString(roleAssignmentId)
+        || !Number.isSafeInteger(roleAssignmentRevision)
+        || (roleAssignmentRevision as number) < 1
+        || !isNonBlankString(roleAssignmentPhaseId)
+      ))
+      || (!hasRoleAssignment && (
+        roleAssignmentId !== null
+        || roleAssignmentRevision !== null
+        || roleAssignmentPhaseId !== null
+      ))
+    ) {
+      throw new RoomStoreError(
+        "idempotency_result_missing",
+        `Task-dispatch event ${eventId} has invalid role-assignment provenance`,
+      );
+    }
+  }
+  const nodeId = typeof payload.nodeId === "string" ? payload.nodeId : null;
+  const ownerSeatId = typeof payload.ownerSeatId === "string" ? payload.ownerSeatId : null;
+  const ownerBindingId = typeof payload.ownerBindingId === "string" ? payload.ownerBindingId : null;
+  const messageId = typeof payload.messageId === "string" ? payload.messageId : null;
+  const targetId = typeof payload.targetId === "string" ? payload.targetId : null;
+  const outboxId = typeof payload.outboxId === "string" ? payload.outboxId : null;
+  const runningNodeVersion = typeof payload.runningNodeVersion === "number"
+    ? payload.runningNodeVersion
+    : null;
+  if (
+    !nodeId
+    || !ownerSeatId
+    || !ownerBindingId
+    || !messageId
+    || !targetId
+    || !outboxId
+    || runningNodeVersion === null
+    || !Number.isSafeInteger(runningNodeVersion)
+    || runningNodeVersion < 1
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Task-dispatch event ${eventId} has invalid immutable result metadata`,
+    );
+  }
+
+  const [messageRows, targetRows, deliveryRows] = await Promise.all([
+    handle
+      .select()
+      .from(roomMessages)
+      .where(and(
+        eq(roomMessages.projectId, projectId),
+        eq(roomMessages.roomId, eventRow.roomId),
+        eq(roomMessages.id, messageId),
+      ))
+      .limit(1),
+    handle
+      .select()
+      .from(roomMessageTargets)
+      .where(and(
+        eq(roomMessageTargets.projectId, projectId),
+        eq(roomMessageTargets.roomId, eventRow.roomId),
+        eq(roomMessageTargets.id, targetId),
+        eq(roomMessageTargets.messageId, messageId),
+      ))
+      .limit(1),
+    handle
+      .select()
+      .from(roomOutbox)
+      .where(and(
+        eq(roomOutbox.projectId, projectId),
+        eq(roomOutbox.roomId, eventRow.roomId),
+        eq(roomOutbox.id, outboxId),
+        eq(roomOutbox.messageId, messageId),
+      ))
+      .limit(1),
+  ]);
+  const message = messageRows[0];
+  const target = targetRows[0];
+  const delivery = deliveryRows[0];
+  if (
+    !message
+    || message.originType !== "controller"
+    || message.nodeId !== nodeId
+    || !target
+    || target.targetKind !== "seat"
+    || target.seatId !== ownerSeatId
+    || target.bindingId !== ownerBindingId
+    || !delivery
+    || delivery.bindingId !== ownerBindingId
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Task-dispatch event ${eventId} no longer matches its durable message intent`,
+    );
+  }
+  return {
+    nodeId,
+    ownerSeatId,
+    ownerBindingId,
+    runningNodeVersion,
+    message: rowToStoredMessage(message),
+    target: rowToDurableMessageTarget(target),
+    delivery: rowToOutboxRecord(delivery),
+    event: rowToRoomEvent(eventRow),
+  };
+}
+
 async function loadDurableMessageTargets(
   handle: QueryHandle,
   projectId: string,
@@ -4726,6 +10196,44 @@ function isNonBlankString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isCanonicalRoomHash(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function normalizeSemanticRouteAudit(value: unknown): Readonly<Record<string, unknown>> {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "outcome",
+      "messageFingerprint",
+      "semanticLoopFingerprint",
+      "targetFingerprint",
+      "semanticHash",
+      "evidenceStateHash",
+      "decisionStateHash",
+      "repeatedSemanticCount",
+      "recipientCount",
+      "requiredResponderCount",
+    ])
+    || !(value.outcome === "route" || value.outcome === "loop_break")
+    || !isCanonicalRoomHash(value.messageFingerprint)
+    || !isCanonicalRoomHash(value.semanticLoopFingerprint)
+    || !isCanonicalRoomHash(value.targetFingerprint)
+    || !isCanonicalRoomHash(value.semanticHash)
+    || !isCanonicalRoomHash(value.evidenceStateHash)
+    || !isCanonicalRoomHash(value.decisionStateHash)
+    || !Number.isSafeInteger(value.repeatedSemanticCount)
+    || (value.repeatedSemanticCount as number) < 1
+    || !Number.isSafeInteger(value.recipientCount)
+    || (value.recipientCount as number) < 0
+    || !Number.isSafeInteger(value.requiredResponderCount)
+    || (value.requiredResponderCount as number) < 0
+  ) {
+    throw new RoomStoreError("semantic_route_conflict", "Semantic route returned an invalid audit record");
+  }
+  return structuredClone(value);
+}
+
 function isUniqueNonBlankStringArray(value: unknown): value is string[] {
   return Array.isArray(value)
     && value.every(isNonBlankString)
@@ -4752,6 +10260,3941 @@ function isRoomMessageTarget(value: unknown): value is RoomMessageTargetV1 {
     return isUniqueNonBlankStringArray(value.seatIds) && value.seatIds.length > 0;
   }
   return false;
+}
+
+function normalizeReadyTaskDispatchClaimInput(
+  value: unknown,
+  projectId: string,
+): ClaimReadyRoomTaskDispatchInputV1 {
+  if (!isRuntimeRecord(value)) throwInvalidTaskDispatchClaim();
+  const owner = value.owner;
+  const fence = value.roomWorkerFence;
+  const authority = value.authority;
+  const message = value.message;
+  const roleAssignment = value.roleAssignment;
+  const hasRoleAssignment = roleAssignment !== undefined;
+  if (
+    !hasExactObjectKeys(value, [
+      "roomId",
+      "nodeId",
+      "expectedAggregateVersion",
+      "expectedDagVersion",
+      "expectedNodeVersion",
+      "owner",
+      "roomWorkerFence",
+      "idempotencyKey",
+      "commandId",
+      "correlationId",
+      "issuedAt",
+      "authority",
+      "message",
+      ...(hasRoleAssignment ? ["roleAssignment"] : []),
+    ])
+    || !isRuntimeRecord(owner)
+    || !hasExactObjectKeys(owner, ["seatId", "bindingId"])
+    || !isNonBlankString(owner.seatId)
+    || !isNonBlankString(owner.bindingId)
+    || !isRuntimeRecord(fence)
+    || !hasExactObjectKeys(fence, ["leaseId", "holderId", "hostId", "expectedEpoch"])
+    || !isNonBlankString(fence.leaseId)
+    || !isNonBlankString(fence.holderId)
+    || !isNonBlankString(fence.hostId)
+    || !Number.isSafeInteger(fence.expectedEpoch)
+    || (fence.expectedEpoch as number) < 1
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.nodeId)
+    || !isNonBlankString(value.idempotencyKey)
+    || !isNonBlankString(value.commandId)
+    || !isNonBlankString(value.correlationId)
+    || !isCanonicalUtcIsoTimestamp(value.issuedAt)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !Number.isSafeInteger(value.expectedDagVersion)
+    || (value.expectedDagVersion as number) < 0
+    || !Number.isSafeInteger(value.expectedNodeVersion)
+    || (value.expectedNodeVersion as number) < 0
+    || !isRuntimeRecord(authority)
+    || authority.actorType !== "controller"
+    || authority.actorId !== fence.holderId
+    || authority.projectId !== projectId
+    || authority.roomId !== value.roomId
+    || !isNonBlankString(authority.actorId)
+    || !(authority.deviceId === null || isNonBlankString(authority.deviceId))
+    || !isNonBlankString(authority.role)
+    || !isUniqueNonBlankStringArray(authority.allowedActions)
+    || !authority.allowedActions.includes("room:task:dispatch")
+    || !isUniqueNonBlankStringArray(authority.nodeIds)
+    || !authority.nodeIds.includes(value.nodeId)
+    || !isUniqueNonBlankStringArray(authority.seatIds)
+    || !authority.seatIds.includes(owner.seatId)
+    || !isUniqueNonBlankStringArray(authority.evidenceRefs)
+    || !isRuntimeRecord(message)
+    || !hasExactObjectKeys(message, ["intent", "content", "contentHash"])
+    || !isRoomMessageIntent(message.intent)
+    || typeof message.content !== "string"
+    || !isNonBlankString(message.contentHash)
+    || hashRoomValue(message.content) !== message.contentHash
+    || (hasRoleAssignment && (
+      !isRuntimeRecord(roleAssignment)
+      || !hasExactObjectKeys(roleAssignment, ["assignmentId", "revision", "phaseId"])
+      || !isNonBlankString(roleAssignment.assignmentId)
+      || !Number.isSafeInteger(roleAssignment.revision)
+      || (roleAssignment.revision as number) < 1
+      || !isNonBlankString(roleAssignment.phaseId)
+    ))
+  ) {
+    throwInvalidTaskDispatchClaim();
+  }
+  return {
+    roomId: value.roomId,
+    nodeId: value.nodeId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    expectedDagVersion: value.expectedDagVersion as number,
+    expectedNodeVersion: value.expectedNodeVersion as number,
+    owner: { seatId: owner.seatId, bindingId: owner.bindingId },
+    ...(hasRoleAssignment ? {
+      roleAssignment: {
+        assignmentId: (roleAssignment as Record<string, unknown>).assignmentId as string,
+        revision: (roleAssignment as Record<string, unknown>).revision as number,
+        phaseId: (roleAssignment as Record<string, unknown>).phaseId as string,
+      },
+    } : {}),
+    roomWorkerFence: {
+      leaseId: fence.leaseId,
+      holderId: fence.holderId,
+      hostId: fence.hostId,
+      expectedEpoch: fence.expectedEpoch as number,
+    },
+    idempotencyKey: value.idempotencyKey,
+    commandId: value.commandId,
+    correlationId: value.correlationId,
+    issuedAt: value.issuedAt,
+    authority: authority as unknown as RoomAuthorityEnvelopeV1,
+    message: {
+      intent: message.intent as RoomMessageIntent,
+      content: message.content,
+      contentHash: message.contentHash,
+    },
+  };
+}
+
+function hasExactObjectKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort(compareRoomText);
+  const expected = [...keys].sort(compareRoomText);
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function normalizeActivateRoomRoleAssignmentInput(value: unknown): ActivateRoomRoleAssignmentInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "expectedAggregateVersion",
+      "idempotencyKey",
+      "capabilitySnapshot",
+      "constraints",
+      "now",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !isNonBlankString(value.idempotencyKey)
+    || !isRuntimeRecord(value.capabilitySnapshot)
+    || !isRuntimeRecord(value.constraints)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+  ) {
+    throwInvalidRoomRoleAssignmentActivation();
+  }
+  return {
+    roomId: value.roomId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    idempotencyKey: value.idempotencyKey,
+    capabilitySnapshot: value.capabilitySnapshot as unknown as RoomCapabilitySnapshotInputV1,
+    constraints: value.constraints as unknown as RoomRoleAssignmentConstraintsV1,
+    now: value.now,
+  };
+}
+
+function normalizeRecordRoomPhaseGateEvidenceInput(
+  value: unknown,
+): RecordRoomPhaseGateEvidenceInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "expectedAggregateVersion",
+      "idempotencyKey",
+      "evidence",
+      "now",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !isNonBlankString(value.idempotencyKey)
+    || !isRuntimeRecord(value.evidence)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      "Phase-gate evidence requires a Room, aggregate version, immutable evidence record, idempotency key, and timestamp",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    idempotencyKey: value.idempotencyKey,
+    evidence: structuredClone(value.evidence) as unknown as RoomPhaseGateEvidenceRecordV1,
+    now: value.now,
+  };
+}
+
+function normalizeTransitionRoomRoleAssignmentInput(
+  value: unknown,
+): TransitionRoomRoleAssignmentCommandInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "expectedAggregateVersion",
+      "boundaryTurnId",
+      "targetPhaseId",
+      "phaseGateEvidenceId",
+      "idempotencyKey",
+      "capabilitySnapshot",
+      "constraints",
+      "now",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !isNonBlankString(value.boundaryTurnId)
+    || !isNonBlankString(value.targetPhaseId)
+    || !isNonBlankString(value.phaseGateEvidenceId)
+    || !isNonBlankString(value.idempotencyKey)
+    || !isRuntimeRecord(value.capabilitySnapshot)
+    || !isRuntimeRecord(value.constraints)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      "Role-assignment transition requires a completed boundary turn, a declared target phase, immutable phase-gate evidence, a canonical capability snapshot, constraints, idempotency key, aggregate version, and timestamp",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    boundaryTurnId: value.boundaryTurnId,
+    targetPhaseId: value.targetPhaseId,
+    phaseGateEvidenceId: value.phaseGateEvidenceId,
+    idempotencyKey: value.idempotencyKey,
+    capabilitySnapshot: value.capabilitySnapshot as unknown as RoomCapabilitySnapshotInputV1,
+    constraints: value.constraints as unknown as RoomRoleAssignmentConstraintsV1,
+    now: value.now,
+  };
+}
+
+function normalizeSetRoomSemanticStateInput(value: unknown): SetRoomSemanticStateInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "turnId",
+      "nodeId",
+      "expectedAggregateVersion",
+      "roomWorkerFence",
+      "idempotencyKey",
+      "semanticHash",
+      "evidenceStateHash",
+      "decisionStateHash",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.turnId)
+    || !isNonBlankString(value.nodeId)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !isRuntimeRecord(value.roomWorkerFence)
+    || !hasExactObjectKeys(value.roomWorkerFence, ["leaseId", "holderId", "hostId", "expectedEpoch"])
+    || !isNonBlankString(value.roomWorkerFence.leaseId)
+    || !isNonBlankString(value.roomWorkerFence.holderId)
+    || !isNonBlankString(value.roomWorkerFence.hostId)
+    || !Number.isSafeInteger(value.roomWorkerFence.expectedEpoch)
+    || (value.roomWorkerFence.expectedEpoch as number) < 1
+    || !isNonBlankString(value.idempotencyKey)
+    || !isCanonicalRoomHash(value.semanticHash)
+    || !isCanonicalRoomHash(value.evidenceStateHash)
+    || !isCanonicalRoomHash(value.decisionStateHash)
+  ) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      "Semantic state requires exact Room/turn/node identity, an aggregate version, idempotency key, and canonical semantic/evidence/decision hashes",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    turnId: value.turnId,
+    nodeId: value.nodeId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    roomWorkerFence: {
+      leaseId: value.roomWorkerFence.leaseId,
+      holderId: value.roomWorkerFence.holderId,
+      hostId: value.roomWorkerFence.hostId,
+      expectedEpoch: value.roomWorkerFence.expectedEpoch as number,
+    },
+    idempotencyKey: value.idempotencyKey,
+    semanticHash: value.semanticHash as string,
+    evidenceStateHash: value.evidenceStateHash as string,
+    decisionStateHash: value.decisionStateHash as string,
+  };
+}
+
+function normalizeRouteRoomProtocolMessageInput(value: unknown): RouteRoomProtocolMessageInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, ["roomId", "expectedAggregateVersion", "idempotencyKey", "message"])
+    || !isNonBlankString(value.roomId)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !isNonBlankString(value.idempotencyKey)
+  ) {
+    throw new RoomStoreError(
+      "semantic_message_invalid",
+      "Structured message routing requires a Room aggregate version, idempotency key, and bounded protocol message payload",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    idempotencyKey: value.idempotencyKey,
+    message: value.message,
+  };
+}
+
+function normalizeClaimRoomSemanticControllerActionInput(
+  value: unknown,
+): ClaimRoomSemanticControllerActionInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !(hasExactObjectKeys(value, ["roomId", "roomWorkerFence", "workerId", "now"])
+      || hasExactObjectKeys(value, ["roomId", "roomWorkerFence", "workerId", "now", "claimTtlMs"]))
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.workerId)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+    || !isRuntimeRecord(value.roomWorkerFence)
+    || !hasExactObjectKeys(value.roomWorkerFence, ["leaseId", "holderId", "hostId", "expectedEpoch"])
+    || !isNonBlankString(value.roomWorkerFence.leaseId)
+    || !isNonBlankString(value.roomWorkerFence.holderId)
+    || !isNonBlankString(value.roomWorkerFence.hostId)
+    || !Number.isSafeInteger(value.roomWorkerFence.expectedEpoch)
+    || (value.roomWorkerFence.expectedEpoch as number) < 1
+    || !(value.claimTtlMs === undefined
+      || (Number.isSafeInteger(value.claimTtlMs) && (value.claimTtlMs as number) > 0))
+  ) {
+    throw new RoomStoreError(
+      "semantic_controller_action_conflict",
+      "Controller inbox claim requires a current Room worker fence, worker identity, canonical timestamp, and positive claim TTL",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    roomWorkerFence: {
+      leaseId: value.roomWorkerFence.leaseId,
+      holderId: value.roomWorkerFence.holderId,
+      hostId: value.roomWorkerFence.hostId,
+      expectedEpoch: value.roomWorkerFence.expectedEpoch as number,
+    },
+    workerId: value.workerId,
+    now: value.now,
+    claimTtlMs: value.claimTtlMs === undefined
+      ? DEFAULT_ROOM_SEMANTIC_CONTROLLER_ACTION_CLAIM_TTL_MS
+      : value.claimTtlMs as number,
+  };
+}
+
+function normalizeCompleteRoomSemanticControllerActionInput(
+  value: unknown,
+): CompleteRoomSemanticControllerActionInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "roomWorkerFence",
+      "actionId",
+      "claimToken",
+      "outcome",
+      "errorCode",
+      "now",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !isRuntimeRecord(value.roomWorkerFence)
+    || !hasExactObjectKeys(value.roomWorkerFence, ["leaseId", "holderId", "hostId", "expectedEpoch"])
+    || !isNonBlankString(value.roomWorkerFence.leaseId)
+    || !isNonBlankString(value.roomWorkerFence.holderId)
+    || !isNonBlankString(value.roomWorkerFence.hostId)
+    || !Number.isSafeInteger(value.roomWorkerFence.expectedEpoch)
+    || (value.roomWorkerFence.expectedEpoch as number) < 1
+    || !isNonBlankString(value.actionId)
+    || !isNonBlankString(value.claimToken)
+    || !(value.outcome === "processed" || value.outcome === "retry")
+    || !(value.errorCode === null || isNonBlankString(value.errorCode))
+    || (value.outcome === "processed" && value.errorCode !== null)
+    || (value.outcome === "retry" && !isNonBlankString(value.errorCode))
+    || !isCanonicalUtcIsoTimestamp(value.now)
+  ) {
+    throw new RoomStoreError(
+      "semantic_controller_action_conflict",
+      "Controller inbox completion requires the exact active claim token, current Room worker fence, explicit outcome, and canonical timestamp",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    roomWorkerFence: {
+      leaseId: value.roomWorkerFence.leaseId,
+      holderId: value.roomWorkerFence.holderId,
+      hostId: value.roomWorkerFence.hostId,
+      expectedEpoch: value.roomWorkerFence.expectedEpoch as number,
+    },
+    actionId: value.actionId,
+    claimToken: value.claimToken,
+    outcome: value.outcome,
+    errorCode: value.errorCode,
+    now: value.now,
+  };
+}
+
+function normalizeRecordRoomTaskProgressObservationInput(
+  value: unknown,
+): RecordRoomTaskProgressObservationInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "roomWorkerFence",
+      "expectedAggregateVersion",
+      "expectedDagVersion",
+      "nodeId",
+      "expectedNodeVersion",
+      "turnId",
+      "phaseId",
+      "roundId",
+      "idempotencyKey",
+      "signals",
+      "origin",
+      "observedAt",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.nodeId)
+    || !isNonBlankString(value.turnId)
+    || !isNonBlankString(value.phaseId)
+    || !isNonBlankString(value.roundId)
+    || !isNonBlankString(value.idempotencyKey)
+    || !isCanonicalUtcIsoTimestamp(value.observedAt)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !Number.isSafeInteger(value.expectedDagVersion)
+    || (value.expectedDagVersion as number) < 0
+    || !Number.isSafeInteger(value.expectedNodeVersion)
+    || (value.expectedNodeVersion as number) < 0
+    || !isRoomWorkerFenceInput(value.roomWorkerFence)
+    || !isRoomTaskProgressSignalHashes(value.signals)
+    || !isRoomTaskProgressObservationOrigin(value.origin)
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      "Progress observation requires a fenced Room worker, exact Room/DAG/node/turn/phase identity, canonical signal hashes, a versioned source reference, and a canonical timestamp",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    roomWorkerFence: normalizeRoomWorkerFence(value.roomWorkerFence),
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    expectedDagVersion: value.expectedDagVersion as number,
+    nodeId: value.nodeId,
+    expectedNodeVersion: value.expectedNodeVersion as number,
+    turnId: value.turnId,
+    phaseId: value.phaseId,
+    roundId: value.roundId,
+    idempotencyKey: value.idempotencyKey,
+    signals: {
+      semanticHash: value.signals.semanticHash,
+      evidenceHash: value.signals.evidenceHash,
+      artifactHash: value.signals.artifactHash,
+      testHash: value.signals.testHash,
+      resolvedDissentHash: value.signals.resolvedDissentHash,
+    },
+    origin: {
+      contractVersion: "room-task-progress-observation-origin/v1",
+      sourceKind: value.origin.sourceKind,
+      sourceRef: value.origin.sourceRef,
+    },
+    observedAt: value.observedAt,
+  };
+}
+
+function normalizeClaimRoomTaskRecoveryActionInput(
+  value: unknown,
+): ClaimRoomTaskRecoveryActionInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !(hasExactObjectKeys(value, ["roomId", "roomWorkerFence", "workerId", "now"])
+      || hasExactObjectKeys(value, ["roomId", "roomWorkerFence", "workerId", "now", "claimTtlMs"]))
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.workerId)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+    || !isRoomWorkerFenceInput(value.roomWorkerFence)
+    || value.workerId !== value.roomWorkerFence.holderId
+    || !(value.claimTtlMs === undefined
+      || (Number.isSafeInteger(value.claimTtlMs) && (value.claimTtlMs as number) > 0))
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-action claim requires the current fenced worker identity, canonical timestamp, and positive bounded claim TTL",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    roomWorkerFence: normalizeRoomWorkerFence(value.roomWorkerFence),
+    workerId: value.workerId,
+    now: value.now,
+    claimTtlMs: value.claimTtlMs === undefined
+      ? DEFAULT_ROOM_TASK_RECOVERY_ACTION_CLAIM_TTL_MS
+      : value.claimTtlMs as number,
+  };
+}
+
+function normalizeCompleteRoomTaskRecoveryActionInput(
+  value: unknown,
+): CompleteRoomTaskRecoveryActionInputV1 {
+  const allowedKeys = [
+    "roomId",
+    "roomWorkerFence",
+    "actionId",
+    "claimToken",
+    "idempotencyKey",
+    "outcome",
+    "resultPayload",
+    "errorCode",
+    "now",
+  ];
+  if (
+    !isRuntimeRecord(value)
+    || !(hasExactObjectKeys(value, allowedKeys)
+      || hasExactObjectKeys(value, [...allowedKeys, "retryAt"]))
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.actionId)
+    || !isNonBlankString(value.claimToken)
+    || !isNonBlankString(value.idempotencyKey)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+    || !isRoomWorkerFenceInput(value.roomWorkerFence)
+    || !(value.outcome === "processed" || value.outcome === "retry")
+    || !(value.errorCode === null || isSafeRoomTaskRecoveryErrorCode(value.errorCode))
+    || (value.outcome === "processed" && (
+      value.errorCode !== null
+      || !isRoomTaskRecoveryActionResult(value.resultPayload)
+      || value.retryAt !== undefined
+    ))
+    || (value.outcome === "retry" && (
+      !isSafeRoomTaskRecoveryErrorCode(value.errorCode)
+      || value.resultPayload !== null
+      || !isCanonicalUtcIsoTimestamp(value.retryAt)
+      || Date.parse(value.retryAt as string) <= Date.parse(value.now)
+    ))
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-action completion requires its exact claim token, current fence, and either a canonical durable receipt or a future bounded retry time",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    roomWorkerFence: normalizeRoomWorkerFence(value.roomWorkerFence),
+    actionId: value.actionId,
+    claimToken: value.claimToken,
+    idempotencyKey: value.idempotencyKey,
+    outcome: value.outcome,
+    resultPayload: value.resultPayload as RoomTaskRecoveryActionResultV1 | null,
+    errorCode: value.errorCode,
+    retryAt: value.retryAt === undefined ? undefined : value.retryAt as string,
+    now: value.now,
+  };
+}
+
+function normalizeRecordRoomTaskRecoveryPlanInput(
+  value: unknown,
+): RecordRoomTaskRecoveryPlanInputV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "roomWorkerFence",
+      "recoveryActionId",
+      "claimToken",
+      "idempotencyKey",
+      "now",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !isRoomWorkerFenceInput(value.roomWorkerFence)
+    || !isNonBlankString(value.recoveryActionId)
+    || !isNonBlankString(value.claimToken)
+    || !isNonBlankString(value.idempotencyKey)
+    || !isCanonicalUtcIsoTimestamp(value.now)
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-plan recording requires the exact current action claim, worker fence, idempotency key, and canonical timestamp",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    roomWorkerFence: normalizeRoomWorkerFence(value.roomWorkerFence),
+    recoveryActionId: value.recoveryActionId,
+    claimToken: value.claimToken,
+    idempotencyKey: value.idempotencyKey,
+    now: value.now,
+  };
+}
+
+function isRoomWorkerFenceInput(
+  value: unknown,
+): value is Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now"> {
+  return isRuntimeRecord(value)
+    && hasExactObjectKeys(value, ["leaseId", "holderId", "hostId", "expectedEpoch"])
+    && isNonBlankString(value.leaseId)
+    && isNonBlankString(value.holderId)
+    && isNonBlankString(value.hostId)
+    && Number.isSafeInteger(value.expectedEpoch)
+    && (value.expectedEpoch as number) >= 1;
+}
+
+function normalizeRoomWorkerFence(
+  value: Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now">,
+): Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now"> {
+  return {
+    leaseId: value.leaseId,
+    holderId: value.holderId,
+    hostId: value.hostId,
+    expectedEpoch: value.expectedEpoch,
+  };
+}
+
+function normalizeRecordRoomCapabilityRegistryInput(
+  rawInput: RecordRoomCapabilityRegistryInputV1,
+): RecordRoomCapabilityRegistryInputV1 {
+  const value = rawInput as unknown;
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "roomId",
+      "expectedAggregateVersion",
+      "expectedRegistryRevision",
+      "roomWorkerFence",
+      "idempotencyKey",
+      "samples",
+      "freshness",
+      "asOf",
+    ])
+    || !isNonBlankString(value.roomId)
+    || !Number.isSafeInteger(value.expectedAggregateVersion)
+    || (value.expectedAggregateVersion as number) < 0
+    || !Number.isSafeInteger(value.expectedRegistryRevision)
+    || (value.expectedRegistryRevision as number) < 0
+    || !isRoomWorkerFenceInput(value.roomWorkerFence)
+    || !isNonBlankString(value.idempotencyKey)
+    || !Array.isArray(value.samples)
+    || value.samples.length === 0
+    || !isRuntimeRecord(value.freshness)
+    || !hasExactObjectKeys(value.freshness, [
+      "maxSnapshotAgeMs",
+      "maxSignalAgeMs",
+      "maxFutureSkewMs",
+    ])
+    || !isCanonicalUtcIsoTimestamp(value.asOf)
+  ) {
+    throw new RoomStoreError(
+      "capability_registry_invalid",
+      "Capability registry recording requires a Room aggregate/revision CAS, non-empty immutable samples, a fenced worker, idempotency key, freshness policy, and canonical observation time",
+    );
+  }
+  return {
+    roomId: value.roomId,
+    expectedAggregateVersion: value.expectedAggregateVersion as number,
+    expectedRegistryRevision: value.expectedRegistryRevision as number,
+    roomWorkerFence: normalizeRoomWorkerFence(value.roomWorkerFence),
+    idempotencyKey: value.idempotencyKey,
+    samples: value.samples as readonly RoomBindingCapabilitySnapshotV1[],
+    freshness: value.freshness as unknown as RoomCapabilityFreshnessPolicyV1,
+    asOf: value.asOf,
+  };
+}
+
+function canonicalizeRoomCapabilityRegistrySamples(
+  samples: readonly RoomBindingCapabilitySnapshotV1[],
+): readonly RoomBindingCapabilitySnapshotV1[] {
+  const canonical: RoomBindingCapabilitySnapshotV1[] = [];
+  const issues: RoomCapabilityRegistryIssueV1[] = [];
+  for (const sample of samples) {
+    const validated = validateRoomBindingCapabilitySnapshot(sample);
+    if (validated.ok) canonical.push(validated.value);
+    else issues.push(...validated.issues);
+  }
+  if (issues.length > 0) throwRoomCapabilityRegistryIssues(issues);
+  return canonical;
+}
+
+function throwRoomCapabilityRegistryIssues(
+  issues: readonly RoomCapabilityRegistryIssueV1[],
+): never {
+  const summary = issues
+    .slice(0, 3)
+    .map((issue) => `${issue.code}@${issue.path}`)
+    .join(", ");
+  throw new RoomStoreError(
+    "capability_registry_invalid",
+    `Capability registry samples are invalid${summary ? `: ${summary}` : ""}`,
+  );
+}
+
+async function assertRoomCapabilityRegistrySamplesMatchBindings(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  current: RoomCapabilityRegistryV1 | null,
+  samples: readonly RoomBindingCapabilitySnapshotV1[],
+): Promise<void> {
+  const rows = await tx
+    .select()
+    .from(roomBindings)
+    .where(and(
+      eq(roomBindings.projectId, projectId),
+      eq(roomBindings.roomId, roomId),
+      inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
+    ));
+  const activeById = new Map(rows.map((row) => [row.id, row]));
+  for (const sample of samples) {
+    const binding = activeById.get(sample.lineage.bindingId);
+    if (
+      !binding
+      || binding.generation !== sample.lineage.bindingGeneration
+      || binding.connectorId !== sample.lineage.connectorId
+      || binding.providerId !== sample.lineage.providerId
+      || binding.nativeSessionId !== sample.lineage.nativeSessionId
+      || binding.hostId !== sample.lineage.hostId
+    ) {
+      throw new RoomStoreError(
+        "capability_registry_invalid",
+        `Capability snapshot ${sample.snapshotId} does not match an active concrete binding in Room ${roomId}`,
+      );
+    }
+  }
+  if (current === null) {
+    const sampleBindingIds = new Set(samples.map((sample) => sample.lineage.bindingId));
+    if (
+      activeById.size !== sampleBindingIds.size
+      || [...activeById.keys()].some((bindingId) => !sampleBindingIds.has(bindingId))
+    ) {
+      throw new RoomStoreError(
+        "capability_registry_invalid",
+        `Initial capability registry for Room ${roomId} must report every active concrete binding`,
+      );
+    }
+  }
+}
+
+function roomCapabilityRegistryId(projectId: string, roomId: string): string {
+  return `room-capability-registry/v1:${hashRoomValue({ projectId, roomId })}`;
+}
+
+function roomCapabilityRegistryProjectionId(projectId: string, roomId: string): string {
+  return `room-capability-registry-projection:${hashRoomValue({ projectId, roomId })}`;
+}
+
+const CAPABILITY_REGISTRY_STORAGE_VALIDATION_FRESHNESS: RoomCapabilityFreshnessPolicyV1 = {
+  maxSnapshotAgeMs: Number.MAX_SAFE_INTEGER,
+  maxSignalAgeMs: Number.MAX_SAFE_INTEGER,
+  maxFutureSkewMs: 0,
+};
+
+async function loadRoomCapabilityRegistryProjection(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+): Promise<RoomCapabilityRegistryProjectionV1 | null> {
+  const rows = await handle
+    .select()
+    .from(roomCapabilityRegistryProjections)
+    .where(and(
+      eq(roomCapabilityRegistryProjections.projectId, projectId),
+      eq(roomCapabilityRegistryProjections.roomId, roomId),
+    ))
+    .limit(1);
+  return rows[0] ? rowToRoomCapabilityRegistryProjection(rows[0]) : null;
+}
+
+function rowToRoomCapabilityRegistryProjection(
+  row: typeof roomCapabilityRegistryProjections.$inferSelect,
+): RoomCapabilityRegistryProjectionV1 {
+  if (
+    !isNonBlankString(row.id)
+    || !isNonBlankString(row.projectId)
+    || !isNonBlankString(row.roomId)
+    || !isNonBlankString(row.registryId)
+    || !Number.isSafeInteger(row.revision)
+    || row.revision < 1
+    || !Number.isSafeInteger(row.aggregateVersion)
+    || row.aggregateVersion < 1
+    || !isNonBlankString(row.registryIntegrityHash)
+    || !isNonBlankString(row.sourceEventId)
+    || !isNonBlankString(row.workerLeaseId)
+    || !isNonBlankString(row.workerHolderId)
+    || !isNonBlankString(row.workerHostId)
+    || !Number.isSafeInteger(row.workerLeaseEpoch)
+    || row.workerLeaseEpoch < 1
+    || !isCanonicalUtcIsoTimestamp(row.createdAt)
+    || !isCanonicalUtcIsoTimestamp(row.updatedAt)
+    || !isRuntimeRecord(row.registry)
+    || !isCanonicalUtcIsoTimestamp(row.registry.observedAt)
+  ) {
+    throw new RoomStoreError("capability_registry_drift", `Stored capability registry projection ${row.id} has invalid metadata`);
+  }
+  const validated = mergeRoomCapabilityRegistry({
+    registryId: row.registryId,
+    current: row.registry as unknown as RoomCapabilityRegistryV1,
+    samples: [],
+    asOf: row.registry.observedAt,
+    freshness: CAPABILITY_REGISTRY_STORAGE_VALIDATION_FRESHNESS,
+  });
+  if (!validated.ok) {
+    throw new RoomStoreError(
+      "capability_registry_drift",
+      `Stored capability registry projection ${row.id} has invalid immutable data`,
+    );
+  }
+  const registry = validated.value;
+  if (
+    hashRoomValue(row.registry) !== hashRoomValue(registry)
+    || registry.revision !== row.revision
+    || registry.integrityHash !== row.registryIntegrityHash
+  ) {
+    throw new RoomStoreError(
+      "capability_registry_drift",
+      `Stored capability registry projection ${row.id} is not canonically serialized`,
+    );
+  }
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    roomId: row.roomId,
+    registry,
+    aggregateVersion: row.aggregateVersion,
+    sourceEventId: row.sourceEventId,
+    workerFence: {
+      leaseId: row.workerLeaseId,
+      holderId: row.workerHolderId,
+      hostId: row.workerHostId,
+      expectedEpoch: row.workerLeaseEpoch,
+    },
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+async function loadRoomCapabilityRegistryCommandResult(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+): Promise<Omit<RecordRoomCapabilityRegistryResultV1, "replayed">> {
+  const eventRows = await tx
+    .select()
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const eventRow = eventRows[0];
+  if (!eventRow || eventRow.eventType !== ROOM_CAPABILITY_REGISTRY_MERGED_EVENT_TYPE) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Capability registry event ${eventId} is missing or has an unexpected type`,
+    );
+  }
+  const events = await loadRoomEvents(tx, projectId, roomId);
+  const eventIndex = events.findIndex((event) => event.id === eventId);
+  const replayed = eventIndex < 0
+    ? null
+    : rebuildRoomCapabilityRegistryProjectionFromEvents(events.slice(0, eventIndex + 1));
+  if (!replayed || replayed.sourceEventId !== eventId) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Capability registry event ${eventId} cannot rebuild its historical result`,
+    );
+  }
+  return {
+    projection: roomCapabilityRegistryProjectionFromReplay(replayed),
+    event: rowToRoomEvent(eventRow),
+  };
+}
+
+function roomCapabilityRegistryProjectionFromReplay(
+  replayed: ReplayedRoomCapabilityRegistryProjectionV1,
+): RoomCapabilityRegistryProjectionV1 {
+  return {
+    id: roomCapabilityRegistryProjectionId(replayed.projectId, replayed.roomId),
+    projectId: replayed.projectId,
+    roomId: replayed.roomId,
+    registry: replayed.registry,
+    aggregateVersion: replayed.aggregateVersion,
+    sourceEventId: replayed.sourceEventId,
+    workerFence: structuredClone(replayed.workerFence),
+    createdAt: replayed.createdAt,
+    updatedAt: replayed.updatedAt,
+  };
+}
+
+function roomCapabilityRegistryProjectionMatchesReplay(
+  projection: RoomCapabilityRegistryProjectionV1,
+  replayed: ReplayedRoomCapabilityRegistryProjectionV1,
+): boolean {
+  return projection.projectId === replayed.projectId
+    && projection.roomId === replayed.roomId
+    && projection.aggregateVersion === replayed.aggregateVersion
+    && projection.sourceEventId === replayed.sourceEventId
+    && projection.createdAt === replayed.createdAt
+    && projection.updatedAt === replayed.updatedAt
+    && projection.workerFence.leaseId === replayed.workerFence.leaseId
+    && projection.workerFence.holderId === replayed.workerFence.holderId
+    && projection.workerFence.hostId === replayed.workerFence.hostId
+    && projection.workerFence.expectedEpoch === replayed.workerFence.expectedEpoch
+    && hashRoomValue(projection.registry) === hashRoomValue(replayed.registry);
+}
+
+function isRoomTaskProgressSignalHashes(value: unknown): value is RoomTaskProgressSignalHashesV1 {
+  return isRuntimeRecord(value)
+    && hasExactObjectKeys(value, [
+      "semanticHash",
+      "evidenceHash",
+      "artifactHash",
+      "testHash",
+      "resolvedDissentHash",
+    ])
+    && isCanonicalRoomHash(value.semanticHash)
+    && isCanonicalRoomHash(value.evidenceHash)
+    && isCanonicalRoomHash(value.artifactHash)
+    && isCanonicalRoomHash(value.testHash)
+    && isCanonicalRoomHash(value.resolvedDissentHash);
+}
+
+function isRoomTaskProgressObservationOrigin(
+  value: unknown,
+): value is RoomTaskProgressObservationOriginV1 {
+  return isRuntimeRecord(value)
+    && hasExactObjectKeys(value, ["contractVersion", "sourceKind", "sourceRef"])
+    && value.contractVersion === "room-task-progress-observation-origin/v1"
+    && (
+      value.sourceKind === "controller"
+      || value.sourceKind === "connector"
+      || value.sourceKind === "recovery_worker"
+      || value.sourceKind === "operator"
+    )
+    && isNonBlankString(value.sourceRef);
+}
+
+function isSafeRoomTaskRecoveryErrorCode(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(value);
+}
+
+function isRoomTaskRecoveryActionResult(
+  value: unknown,
+): value is RoomTaskRecoveryActionResultV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, ["contractVersion", "kind", "receiptRef", "resultHash"])
+    || value.contractVersion !== "room-task-recovery-action-result/v1"
+    || !(
+      value.kind === "controller_plan_submitted"
+      || value.kind === "operator_approval_requested"
+      || value.kind === "superseded"
+    )
+    || !isNonBlankString(value.receiptRef)
+    || !isCanonicalRoomHash(value.resultHash)
+  ) {
+    return false;
+  }
+  return value.resultHash === hashRoomValue({
+    contractVersion: value.contractVersion,
+    kind: value.kind,
+    receiptRef: value.receiptRef,
+  });
+}
+
+function assertTaskProgressObservationRoomPreconditions(
+  current: RoomAggregateV1 | undefined,
+  graph: RoomTaskGraphProjectionV1 | null,
+  activeAssignment: RoomRoleAssignmentProjectionV1 | null,
+  activeTurn: typeof roomTurns.$inferSelect | undefined,
+  posture: RoomRecoveryPostureV1,
+  input: RecordRoomTaskProgressObservationInputV1,
+): void {
+  if (!current || !graph) {
+    throw new RoomDomainError(
+      "room_state_conflict",
+      "Operational Room " + input.roomId + " disappeared during progress observation",
+    );
+  }
+  const withheldReason = recoveryWithheldReason(posture);
+  if (withheldReason) throw new RoomWorkerAuthorityError(posture, withheldReason);
+  if (current.room.state !== "running") {
+    throw new RoomWorkerAuthorityError(posture, "lifecycle_not_running");
+  }
+  if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+    throw new RoomDomainError(
+      "aggregate_version_conflict",
+      "Room " + input.roomId + " expected aggregate version "
+        + input.expectedAggregateVersion + " but is " + current.room.aggregateVersion,
+      {
+        expected: input.expectedAggregateVersion,
+        actual: current.room.aggregateVersion,
+      },
+    );
+  }
+  if (graph.dagVersion !== input.expectedDagVersion) {
+    throw new RoomStoreError(
+      "dag_version_conflict",
+      "Room " + input.roomId + " expected DAG version "
+        + input.expectedDagVersion + " but is " + graph.dagVersion,
+    );
+  }
+  if (
+    current.activeTurnId !== input.turnId
+    || !activeTurn
+    || activeTurn.state !== "running"
+    || activeTurn.protocolPhaseId !== input.phaseId
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      "Progress observation requires the current running Room turn and its exact phase",
+    );
+  }
+  if (
+    !activeAssignment
+    || activeAssignment.protocolId !== current.room.protocolId
+    || activeAssignment.protocolVersion !== current.room.protocolVersion
+    || activeAssignment.phaseId !== input.phaseId
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_missing",
+      "Progress recovery requires the active capability-aware role assignment for the current phase",
+    );
+  }
+}
+
+function buildRoomTaskProgressObservationSignature(
+  node: RoomTaskNodeProjectionV1,
+  signals: RoomTaskProgressSignalHashesV1,
+): string {
+  return hashRoomValue({
+    nodeProgressSignatureHash: hashRoomValue(node.progressSignature),
+    semanticHash: signals.semanticHash,
+    evidenceHash: signals.evidenceHash,
+    artifactHash: signals.artifactHash,
+    testHash: signals.testHash,
+    resolvedDissentHash: signals.resolvedDissentHash,
+  });
+}
+
+function sameRoomTaskProgressVector(
+  left: RoomTaskProgressObservationV1,
+  right: RoomTaskProgressObservationV1,
+): boolean {
+  return left.progressSignature === right.progressSignature
+    && left.semanticHash === right.semanticHash
+    && left.evidenceHash === right.evidenceHash
+    && left.artifactHash === right.artifactHash
+    && left.testHash === right.testHash
+    && left.resolvedDissentHash === right.resolvedDissentHash;
+}
+
+function rowToRoomTaskProgressObservation(
+  row: typeof roomTaskProgressObservations.$inferSelect,
+): RoomTaskProgressObservationV1 {
+  return parseRoomTaskProgressObservationRecord({
+    id: row.id,
+    roomId: row.roomId,
+    nodeId: row.nodeId,
+    nodeVersion: Number(row.nodeVersion),
+    turnId: row.turnId,
+    phaseId: row.phaseId,
+    roundId: row.roundId,
+    idempotencyKey: row.idempotencyKey,
+    progressSignature: row.progressSignature,
+    semanticHash: row.semanticHash,
+    evidenceHash: row.evidenceHash,
+    artifactHash: row.artifactHash,
+    testHash: row.testHash,
+    resolvedDissentHash: row.resolvedDissentHash,
+    origin: row.origin,
+    observedAt: row.observedAt,
+    createdAt: row.createdAt,
+  }, "stored task progress observation");
+}
+
+function rowToRoomTaskRecoveryAction(
+  row: typeof roomTaskRecoveryActions.$inferSelect,
+): RoomTaskRecoveryActionV1 {
+  const actionSnapshot = parseRoomTaskNoProgressRecoveryActionSnapshot(
+    row.actionSnapshot,
+    "stored task recovery action snapshot",
+  );
+  const policySnapshot = parseRoomTaskNoProgressRecoveryPolicySnapshot(
+    row.policySnapshot,
+    "stored task recovery policy snapshot",
+  );
+  const state = row.state;
+  const claimToken = row.claimToken;
+  const claimExpiresAt = row.claimExpiresAt;
+  const claimedByWorkerId = row.claimedByWorkerId;
+  const claimedAt = row.claimedAt;
+  const processedAt = row.processedAt;
+  const resultPayload = row.resultPayload;
+  const lastErrorCode = row.lastErrorCode;
+  const operatorApprovalId = row.operatorApprovalId;
+  if (
+    !isNonBlankString(row.id)
+    || !isNonBlankString(row.roomId)
+    || !isNonBlankString(row.nodeId)
+    || !Number.isSafeInteger(Number(row.nodeVersion))
+    || Number(row.nodeVersion) < 0
+    || !isNonBlankString(row.observationId)
+    || !isNonBlankString(row.actionId)
+    || !["pending", "claimed", "processed"].includes(state)
+    || !Number.isSafeInteger(row.attemptCount)
+    || row.attemptCount < 0
+    || !isCanonicalUtcIsoTimestamp(row.nextEligibleAt)
+    || !isCanonicalUtcIsoTimestamp(row.createdAt)
+    || !isCanonicalUtcIsoTimestamp(row.updatedAt)
+    || Date.parse(row.updatedAt) < Date.parse(row.createdAt)
+    || actionSnapshot.nodeId !== row.nodeId
+    || actionSnapshot.nodeVersion !== Number(row.nodeVersion)
+    || actionSnapshot.observationId !== row.observationId
+    || actionSnapshot.recoveryAction.id !== row.actionId
+    || policySnapshot.protocolId !== actionSnapshot.protocolId
+    || policySnapshot.protocolVersion !== actionSnapshot.protocolVersion
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Stored task recovery action has an invalid immutable identity or policy lineage",
+    );
+  }
+  if (state === "pending") {
+    if (
+      claimToken !== null
+      || claimExpiresAt !== null
+      || claimedByWorkerId !== null
+      || claimedAt !== null
+      || processedAt !== null
+      || resultPayload !== null
+    ) {
+      throw new RoomStoreError(
+        "task_recovery_action_invalid",
+        "Pending task recovery action must not retain a claim or result",
+      );
+    }
+  } else if (state === "claimed") {
+    if (
+      row.attemptCount < 1
+      || !isNonBlankString(claimToken)
+      || !isCanonicalUtcIsoTimestamp(claimExpiresAt)
+      || !isNonBlankString(claimedByWorkerId)
+      || !isCanonicalUtcIsoTimestamp(claimedAt)
+      || processedAt !== null
+      || resultPayload !== null
+      || lastErrorCode !== null
+      || Date.parse(claimExpiresAt) <= Date.parse(claimedAt)
+    ) {
+      throw new RoomStoreError(
+        "task_recovery_action_invalid",
+        "Claimed task recovery action has an invalid lease-shaped state",
+      );
+    }
+  } else if (
+    claimToken !== null
+    || claimExpiresAt !== null
+    || claimedByWorkerId !== null
+    || claimedAt !== null
+    || !isCanonicalUtcIsoTimestamp(processedAt)
+    || !isRoomTaskRecoveryActionResult(resultPayload)
+    || lastErrorCode !== null
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Processed task recovery action must retain exactly one durable result receipt",
+    );
+  }
+  if (
+    !(lastErrorCode === null || isSafeRoomTaskRecoveryErrorCode(lastErrorCode))
+    || !(operatorApprovalId === null || isNonBlankString(operatorApprovalId))
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Task recovery action has an invalid error or operator approval reference",
+    );
+  }
+  return {
+    id: row.id,
+    roomId: row.roomId,
+    nodeId: row.nodeId,
+    nodeVersion: Number(row.nodeVersion),
+    observationId: row.observationId,
+    actionId: row.actionId,
+    actionSnapshot,
+    policySnapshot,
+    state: state as RoomTaskRecoveryActionV1["state"],
+    attemptCount: row.attemptCount,
+    claimToken,
+    claimExpiresAt,
+    claimedByWorkerId,
+    claimedAt,
+    nextEligibleAt: row.nextEligibleAt,
+    resultPayload: resultPayload === null
+      ? null
+      : structuredClone(resultPayload) as RoomTaskRecoveryActionResultV1,
+    lastErrorCode,
+    operatorApprovalId,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    processedAt,
+  };
+}
+
+function rowToRoomTaskRecoveryPlan(
+  row: typeof roomTaskRecoveryPlans.$inferSelect,
+): RoomTaskRecoveryPlanV1 {
+  return parseRoomTaskRecoveryPlanRecord({
+    contractVersion: "room-task-recovery-plan/v1",
+    id: row.id,
+    roomId: row.roomId,
+    recoveryActionId: row.recoveryActionId,
+    executionMode: row.executionMode,
+    actionSnapshot: row.actionSnapshot,
+    actionSnapshotHash: row.actionSnapshotHash,
+    resultReceipt: row.resultReceipt,
+    createdAt: row.createdAt,
+  }, "stored task recovery plan");
+}
+
+function recoveryPlanReceiptKind(
+  executionMode: RoomTaskNoProgressRecoveryActionSnapshotV1["executionMode"],
+): RoomTaskRecoveryActionResultV1["kind"] {
+  return executionMode === "controller_plan"
+    ? "controller_plan_submitted"
+    : "operator_approval_requested";
+}
+
+function createRoomTaskRecoveryPlan(
+  action: RoomTaskRecoveryActionV1,
+  createdAt: string,
+): RoomTaskRecoveryPlanV1 {
+  const id = "room-task-recovery-plan:" + action.id;
+  const kind = recoveryPlanReceiptKind(action.actionSnapshot.executionMode);
+  const resultReceipt: RoomTaskRecoveryActionResultV1 = {
+    contractVersion: "room-task-recovery-action-result/v1",
+    kind,
+    receiptRef: id,
+    resultHash: hashRoomValue({
+      contractVersion: "room-task-recovery-action-result/v1",
+      kind,
+      receiptRef: id,
+    }),
+  };
+  return {
+    contractVersion: "room-task-recovery-plan/v1",
+    id,
+    roomId: action.roomId,
+    recoveryActionId: action.id,
+    executionMode: action.actionSnapshot.executionMode,
+    actionSnapshot: structuredClone(action.actionSnapshot),
+    actionSnapshotHash: hashRoomValue(action.actionSnapshot),
+    resultReceipt,
+    createdAt,
+  };
+}
+
+function parseRoomTaskRecoveryPlanRecord(
+  value: unknown,
+  label: string,
+): RoomTaskRecoveryPlanV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "contractVersion",
+      "id",
+      "roomId",
+      "recoveryActionId",
+      "executionMode",
+      "actionSnapshot",
+      "actionSnapshotHash",
+      "resultReceipt",
+      "createdAt",
+    ])
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " is not a complete immutable recovery-plan record",
+    );
+  }
+  const actionSnapshot = parseRoomTaskNoProgressRecoveryActionSnapshot(
+    value.actionSnapshot,
+    label + ".actionSnapshot",
+  );
+  const executionMode = value.executionMode;
+  const resultReceipt = value.resultReceipt;
+  if (
+    value.contractVersion !== "room-task-recovery-plan/v1"
+    || !isNonBlankString(value.id)
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.recoveryActionId)
+    || !(executionMode === "controller_plan" || executionMode === "operator_approval")
+    || executionMode !== actionSnapshot.executionMode
+    || !isCanonicalRoomHash(value.actionSnapshotHash)
+    || value.actionSnapshotHash !== hashRoomValue(actionSnapshot)
+    || !isRoomTaskRecoveryActionResult(resultReceipt)
+    || resultReceipt.kind !== recoveryPlanReceiptKind(executionMode)
+    || resultReceipt.receiptRef !== value.id
+    || value.id !== "room-task-recovery-plan:" + value.recoveryActionId
+    || !isCanonicalUtcIsoTimestamp(value.createdAt)
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " has invalid execution lineage, action hash, or durable receipt",
+    );
+  }
+  return {
+    contractVersion: "room-task-recovery-plan/v1",
+    id: value.id,
+    roomId: value.roomId,
+    recoveryActionId: value.recoveryActionId,
+    executionMode,
+    actionSnapshot: structuredClone(actionSnapshot),
+    actionSnapshotHash: value.actionSnapshotHash,
+    resultReceipt: structuredClone(resultReceipt),
+    createdAt: value.createdAt,
+  };
+}
+
+function parseRoomTaskProgressObservationRecord(
+  value: unknown,
+  label: string,
+): RoomTaskProgressObservationV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "id",
+      "roomId",
+      "nodeId",
+      "nodeVersion",
+      "turnId",
+      "phaseId",
+      "roundId",
+      "idempotencyKey",
+      "progressSignature",
+      "semanticHash",
+      "evidenceHash",
+      "artifactHash",
+      "testHash",
+      "resolvedDissentHash",
+      "origin",
+      "observedAt",
+      "createdAt",
+    ])
+    || !isNonBlankString(value.id)
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.nodeId)
+    || !Number.isSafeInteger(value.nodeVersion)
+    || (value.nodeVersion as number) < 0
+    || !isNonBlankString(value.turnId)
+    || !isNonBlankString(value.phaseId)
+    || !isNonBlankString(value.roundId)
+    || !isNonBlankString(value.idempotencyKey)
+    || !isCanonicalRoomHash(value.progressSignature)
+    || !isCanonicalRoomHash(value.semanticHash)
+    || !isCanonicalRoomHash(value.evidenceHash)
+    || !isCanonicalRoomHash(value.artifactHash)
+    || !isCanonicalRoomHash(value.testHash)
+    || !isCanonicalRoomHash(value.resolvedDissentHash)
+    || !isRoomTaskProgressObservationOrigin(value.origin)
+    || !isCanonicalUtcIsoTimestamp(value.observedAt)
+    || !isCanonicalUtcIsoTimestamp(value.createdAt)
+    || value.createdAt !== value.observedAt
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      label + " is not a canonical immutable task progress observation",
+    );
+  }
+  return {
+    id: value.id,
+    roomId: value.roomId,
+    nodeId: value.nodeId,
+    nodeVersion: value.nodeVersion as number,
+    turnId: value.turnId,
+    phaseId: value.phaseId,
+    roundId: value.roundId,
+    idempotencyKey: value.idempotencyKey,
+    progressSignature: value.progressSignature,
+    semanticHash: value.semanticHash,
+    evidenceHash: value.evidenceHash,
+    artifactHash: value.artifactHash,
+    testHash: value.testHash,
+    resolvedDissentHash: value.resolvedDissentHash,
+    origin: {
+      contractVersion: "room-task-progress-observation-origin/v1",
+      sourceKind: value.origin.sourceKind,
+      sourceRef: value.origin.sourceRef,
+    },
+    observedAt: value.observedAt,
+    createdAt: value.createdAt,
+  };
+}
+
+function parseRoomTaskNoProgressRecoveryActionSnapshot(
+  value: unknown,
+  label: string,
+): RoomTaskNoProgressRecoveryActionSnapshotV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "contractVersion",
+      "protocolId",
+      "protocolVersion",
+      "turnId",
+      "phaseId",
+      "nodeId",
+      "nodeVersion",
+      "observationId",
+      "recoveryAction",
+      "recoveryActionHash",
+      "ladderOrder",
+      "minimumConsecutiveUnchangedRounds",
+      "executionMode",
+    ])
+    || value.contractVersion !== "room-task-no-progress-recovery-action/v1"
+    || !isNonBlankString(value.protocolId)
+    || !Number.isSafeInteger(value.protocolVersion)
+    || (value.protocolVersion as number) < 1
+    || !isNonBlankString(value.turnId)
+    || !isNonBlankString(value.phaseId)
+    || !isNonBlankString(value.nodeId)
+    || !Number.isSafeInteger(value.nodeVersion)
+    || (value.nodeVersion as number) < 0
+    || !isNonBlankString(value.observationId)
+    || !isCanonicalRoomHash(value.recoveryActionHash)
+    || !Number.isSafeInteger(value.ladderOrder)
+    || (value.ladderOrder as number) < 1
+    || !Number.isSafeInteger(value.minimumConsecutiveUnchangedRounds)
+    || (value.minimumConsecutiveUnchangedRounds as number) < 1
+    || !(value.executionMode === "controller_plan" || value.executionMode === "operator_approval")
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " has an invalid no-progress recovery-action identity",
+    );
+  }
+  const recoveryAction = parseRoomProtocolRecoveryAction(
+    value.recoveryAction,
+    label + ".recoveryAction",
+  );
+  if (
+    value.recoveryActionHash !== hashRoomValue(recoveryAction)
+    || value.executionMode !== roomTaskRecoveryExecutionMode(recoveryAction)
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " has a forged recovery action hash or execution mode",
+    );
+  }
+  return {
+    contractVersion: "room-task-no-progress-recovery-action/v1",
+    protocolId: value.protocolId,
+    protocolVersion: value.protocolVersion as number,
+    turnId: value.turnId,
+    phaseId: value.phaseId,
+    nodeId: value.nodeId,
+    nodeVersion: value.nodeVersion as number,
+    observationId: value.observationId,
+    recoveryAction,
+    recoveryActionHash: value.recoveryActionHash,
+    ladderOrder: value.ladderOrder as number,
+    minimumConsecutiveUnchangedRounds: value.minimumConsecutiveUnchangedRounds as number,
+    executionMode: value.executionMode,
+  };
+}
+
+function parseRoomProtocolRecoveryAction(
+  value: unknown,
+  label: string,
+): RoomProtocolRecoveryActionV1 {
+  const triggers = new Set([
+    "timeout",
+    "no_progress",
+    "hard_gate_failed",
+    "participant_lost",
+    "rate_limited",
+    "conflicting_evidence",
+  ]);
+  const actions = new Set([
+    "retry",
+    "redecompose",
+    "replace_participant",
+    "add_challenger",
+    "shrink_scope",
+    "change_model",
+    "request_operator",
+  ]);
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "id",
+      "trigger",
+      "action",
+      "maxAttempts",
+      "phaseIds",
+      "exhaustedGateId",
+    ])
+    || !isNonBlankString(value.id)
+    || typeof value.trigger !== "string"
+    || !triggers.has(value.trigger)
+    || typeof value.action !== "string"
+    || !actions.has(value.action)
+    || !Number.isSafeInteger(value.maxAttempts)
+    || (value.maxAttempts as number) < 1
+    || !isUniqueNonBlankStringArray(value.phaseIds)
+    || value.phaseIds.length === 0
+    || !isNonBlankString(value.exhaustedGateId)
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " is not a valid declared protocol recovery action",
+    );
+  }
+  return {
+    id: value.id,
+    trigger: value.trigger as RoomProtocolRecoveryActionV1["trigger"],
+    action: value.action as RoomProtocolRecoveryActionV1["action"],
+    maxAttempts: value.maxAttempts as number,
+    phaseIds: [...value.phaseIds].sort(compareRoomText),
+    exhaustedGateId: value.exhaustedGateId,
+  };
+}
+
+function parseRoomTaskNoProgressRecoveryPolicySnapshot(
+  value: unknown,
+  label: string,
+): RoomProtocolNoProgressRecoveryPolicyV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, ["protocolId", "protocolVersion", "actions"])
+    || !isNonBlankString(value.protocolId)
+    || !Number.isSafeInteger(value.protocolVersion)
+    || (value.protocolVersion as number) < 1
+    || !Array.isArray(value.actions)
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " is not a versioned no-progress recovery policy",
+    );
+  }
+  const seenActionIds = new Set<string>();
+  const seenOrders = new Set<number>();
+  const actions = value.actions.map((action, index) => {
+    if (
+      !isRuntimeRecord(action)
+      || !hasExactObjectKeys(action, [
+        "recoveryActionId",
+        "ladderOrder",
+        "minimumConsecutiveUnchangedRounds",
+      ])
+      || !isNonBlankString(action.recoveryActionId)
+      || !Number.isSafeInteger(action.ladderOrder)
+      || (action.ladderOrder as number) < 1
+      || !Number.isSafeInteger(action.minimumConsecutiveUnchangedRounds)
+      || (action.minimumConsecutiveUnchangedRounds as number) < 1
+      || seenActionIds.has(action.recoveryActionId)
+      || seenOrders.has(action.ladderOrder as number)
+    ) {
+      throw new RoomStoreError(
+        "task_recovery_action_invalid",
+        label + ".actions[" + index + "] is not a unique no-progress ladder step",
+      );
+    }
+    seenActionIds.add(action.recoveryActionId);
+    seenOrders.add(action.ladderOrder as number);
+    return {
+      recoveryActionId: action.recoveryActionId,
+      ladderOrder: action.ladderOrder as number,
+      minimumConsecutiveUnchangedRounds: action.minimumConsecutiveUnchangedRounds as number,
+    };
+  });
+  return {
+    protocolId: value.protocolId,
+    protocolVersion: value.protocolVersion as number,
+    actions: actions.sort(
+      (left, right) => left.ladderOrder - right.ladderOrder
+        || left.recoveryActionId.localeCompare(right.recoveryActionId),
+    ),
+  };
+}
+
+function roomTaskRecoveryExecutionMode(
+  action: RoomProtocolRecoveryActionV1,
+): RoomTaskNoProgressRecoveryActionSnapshotV1["executionMode"] {
+  return action.action === "replace_participant"
+    || action.action === "change_model"
+    || action.action === "request_operator"
+    ? "operator_approval"
+    : "controller_plan";
+}
+
+interface DeriveRoomTaskNoProgressDecisionInput {
+  readonly roomId: string;
+  readonly node: RoomTaskNodeProjectionV1;
+  readonly observation: RoomTaskProgressObservationV1;
+  readonly priorObservations: readonly RoomTaskProgressObservationV1[];
+  readonly priorActions: readonly RoomTaskRecoveryActionV1[];
+  readonly protocol: RoomProtocolDefinitionV1 | undefined;
+  readonly policy: RoomProtocolNoProgressRecoveryPolicyV1 | undefined;
+}
+
+interface DeclaredRoomTaskNoProgressRung {
+  readonly selection: RoomProtocolSelectedNoProgressRecoveryActionV1;
+  readonly recoveryAction: RoomProtocolRecoveryActionV1;
+}
+
+function deriveRoomTaskNoProgressDecision(
+  input: DeriveRoomTaskNoProgressDecisionInput,
+): RoomTaskNoProgressRecoveryDecisionV1 {
+  if (!input.protocol || !input.policy) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Room " + input.roomId + " has no declared no-progress recovery policy for its exact protocol version",
+    );
+  }
+  const observations = [input.observation, ...input.priorObservations];
+  let consecutiveUnchangedRounds = 0;
+  for (const observation of observations) {
+    if (!sameRoomTaskProgressVector(input.observation, observation)) break;
+    consecutiveUnchangedRounds += 1;
+  }
+  const rungs = declaredRoomTaskNoProgressRungs(
+    input.protocol,
+    input.policy,
+    input.observation.phaseId,
+  );
+  if (rungs.length === 0) {
+    return {
+      kind: "no_declared_action",
+      consecutiveUnchangedRounds,
+    };
+  }
+  const minimumThreshold = Math.min(
+    ...rungs.map((rung) => rung.selection.minimumConsecutiveUnchangedRounds),
+  );
+  if (consecutiveUnchangedRounds < minimumThreshold) {
+    return {
+      kind: "below_threshold",
+      consecutiveUnchangedRounds,
+    };
+  }
+
+  const observationsById = new Map<string, RoomTaskProgressObservationV1>(
+    observations.map((observation) => [observation.id, observation]),
+  );
+  const relevantActionIds = new Set(rungs.map((rung) => rung.recoveryAction.id));
+  const currentVectorActions = input.priorActions.filter((action) => {
+    if (!relevantActionIds.has(action.actionId)) return false;
+    const triggerObservation = observationsById.get(action.observationId);
+    return triggerObservation !== undefined
+      && sameRoomTaskProgressVector(input.observation, triggerObservation);
+  });
+  const activeAction = currentVectorActions.find((action) => action.state !== "processed");
+  if (activeAction) {
+    return {
+      kind: "awaiting_active_action",
+      consecutiveUnchangedRounds,
+      activeActionId: activeAction.id,
+    };
+  }
+
+  const attemptsByActionId = new Map<string, number>();
+  for (const action of currentVectorActions) {
+    attemptsByActionId.set(
+      action.actionId,
+      (attemptsByActionId.get(action.actionId) ?? 0) + action.attemptCount,
+    );
+  }
+  let selected: RoomProtocolSelectedNoProgressRecoveryActionV1 | undefined;
+  try {
+    selected = selectNextRoomNoProgressRecoveryAction({
+      protocol: input.protocol,
+      policy: input.policy,
+      phaseId: input.observation.phaseId,
+      consecutiveUnchangedRounds,
+      priorActionAttempts: rungs.map((rung) => ({
+        actionId: rung.recoveryAction.id,
+        attempts: attemptsByActionId.get(rung.recoveryAction.id) ?? 0,
+        exhausted: false,
+      })),
+    });
+  } catch (error) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "No-progress policy selection failed: " + errorMessage(error),
+    );
+  }
+  if (selected) {
+    /*
+    FNXC:SessionRoomTaskProgressRecovery 2026-07-18-07:49:
+    Persist and hash exactly the canonical form that the durable parser and
+    event replayer reconstruct. Protocol definitions may retain source order
+    for `phaseIds`; hashing that raw order would turn an honest DB reload into
+    a forged-snapshot false positive.
+    */
+    const recoveryAction = parseRoomProtocolRecoveryAction(
+      selected.recoveryAction,
+      "selected no-progress recovery action " + selected.recoveryAction.id,
+    );
+    const action: RoomTaskRecoveryActionV1 = {
+      id: "room-task-recovery-action-" + randomUUID(),
+      roomId: input.roomId,
+      nodeId: input.node.id,
+      nodeVersion: input.node.nodeVersion,
+      observationId: input.observation.id,
+      actionId: recoveryAction.id,
+      actionSnapshot: {
+        contractVersion: "room-task-no-progress-recovery-action/v1",
+        protocolId: input.protocol.id,
+        protocolVersion: input.protocol.version,
+        turnId: input.observation.turnId,
+        phaseId: input.observation.phaseId,
+        nodeId: input.node.id,
+        nodeVersion: input.node.nodeVersion,
+        observationId: input.observation.id,
+        recoveryAction: structuredClone(recoveryAction),
+        recoveryActionHash: hashRoomValue(recoveryAction),
+        ladderOrder: selected.ladderOrder,
+        minimumConsecutiveUnchangedRounds: selected.minimumConsecutiveUnchangedRounds,
+        executionMode: roomTaskRecoveryExecutionMode(recoveryAction),
+      },
+      policySnapshot: structuredClone(input.policy),
+      state: "pending",
+      attemptCount: 0,
+      claimToken: null,
+      claimExpiresAt: null,
+      claimedByWorkerId: null,
+      claimedAt: null,
+      nextEligibleAt: input.observation.observedAt,
+      resultPayload: null,
+      lastErrorCode: null,
+      operatorApprovalId: null,
+      createdAt: input.observation.observedAt,
+      updatedAt: input.observation.observedAt,
+      processedAt: null,
+    };
+    return {
+      kind: "action_enqueued",
+      consecutiveUnchangedRounds,
+      action,
+    };
+  }
+  const allExhausted = rungs.every((rung) =>
+    (attemptsByActionId.get(rung.recoveryAction.id) ?? 0) >= rung.recoveryAction.maxAttempts,
+  );
+  if (allExhausted) {
+    return {
+      kind: "exhausted",
+      consecutiveUnchangedRounds,
+      exhaustedGateIds: [...new Set(
+        rungs.map((rung) => rung.recoveryAction.exhaustedGateId),
+      )].sort(compareRoomText),
+    };
+  }
+  return {
+    kind: "below_threshold",
+    consecutiveUnchangedRounds,
+  };
+}
+
+function declaredRoomTaskNoProgressRungs(
+  protocol: RoomProtocolDefinitionV1,
+  policy: RoomProtocolNoProgressRecoveryPolicyV1,
+  phaseId: string,
+): readonly DeclaredRoomTaskNoProgressRung[] {
+  const actionsById = new Map(
+    protocol.recoveryActions
+      .filter((action) => action.trigger === "no_progress")
+      .map((action) => [action.id, action]),
+  );
+  if (policy.protocolId !== protocol.id || policy.protocolVersion !== protocol.version) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "No-progress policy identity does not match the active Room protocol",
+    );
+  }
+  const rungs: DeclaredRoomTaskNoProgressRung[] = [];
+  for (const actionPolicy of policy.actions) {
+    const recoveryAction = actionsById.get(actionPolicy.recoveryActionId);
+    if (!recoveryAction) {
+      throw new RoomStoreError(
+        "task_recovery_action_invalid",
+        "No-progress policy references an undeclared recovery action " + actionPolicy.recoveryActionId,
+      );
+    }
+    if (!recoveryAction.phaseIds.includes(phaseId)) continue;
+    rungs.push({
+      recoveryAction,
+      selection: {
+        recoveryAction,
+        ladderOrder: actionPolicy.ladderOrder,
+        minimumConsecutiveUnchangedRounds: actionPolicy.minimumConsecutiveUnchangedRounds,
+      },
+    });
+  }
+  return rungs.sort(
+    (left, right) => left.selection.ladderOrder - right.selection.ladderOrder
+      || left.recoveryAction.id.localeCompare(right.recoveryAction.id),
+  );
+}
+
+function roomTaskProgressObservationEventType(
+  decision: RoomTaskNoProgressRecoveryDecisionV1,
+): string {
+  if (decision.kind === "action_enqueued") return "room_task_recovery_action_enqueued";
+  if (decision.kind === "exhausted") return "room_task_recovery_ladder_exhausted";
+  return "room_task_progress_observed";
+}
+
+async function loadRoomTaskProgressObservationResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+): Promise<RecordRoomTaskProgressObservationResultV1> {
+  const rows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      "Progress observation result event " + eventId + " is missing",
+    );
+  }
+  const event = rowToRoomEvent(row);
+  const snapshot = parseRoomTaskProgressObservationEventSnapshot(event);
+  return {
+    observation: snapshot.observation,
+    decision: snapshot.decision,
+    event,
+    replayed: true,
+  };
+}
+
+async function loadRoomTaskRecoveryActionCompletionResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+): Promise<RoomTaskRecoveryActionV1> {
+  const rows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      "Recovery-action completion result event " + eventId + " is missing",
+    );
+  }
+  return parseRoomTaskRecoveryActionEventSnapshot(rowToRoomEvent(row)).action;
+}
+
+async function loadRoomTaskRecoveryPlanResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+): Promise<RoomTaskRecoveryPlanV1> {
+  const rows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const row = rows[0];
+  if (!row) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      "Recovery-plan result event " + eventId + " is missing",
+    );
+  }
+  return parseRoomTaskRecoveryPlanEventSnapshot(rowToRoomEvent(row)).plan;
+}
+
+function parseRoomTaskRecoveryPlanEventSnapshot(
+  event: RoomEventRecordV1,
+): RoomTaskRecoveryPlanEventSnapshotV1 {
+  if (event.eventType !== "room_task_recovery_plan_recorded") {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Event " + event.id + " is not a recovery-plan record",
+    );
+  }
+  const payload = event.payload;
+  if (
+    !isRuntimeRecord(payload)
+    || !hasExactObjectKeys(payload, [
+      "projectionVersion",
+      "recoveryActionId",
+      "snapshot",
+      "recordedAt",
+      "updatedAt",
+    ])
+    || payload.projectionVersion !== 1
+    || !isNonBlankString(payload.recoveryActionId)
+    || !isCanonicalUtcIsoTimestamp(payload.recordedAt)
+    || payload.recordedAt !== event.occurredAt
+    || !isCanonicalUtcIsoTimestamp(payload.updatedAt)
+    || payload.updatedAt !== event.occurredAt
+    || !isRuntimeRecord(payload.snapshot)
+    || !hasExactObjectKeys(payload.snapshot, ["contractVersion", "plan"])
+    || payload.snapshot.contractVersion !== "room-task-recovery-plan-snapshot/v1"
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-plan event " + event.id + " has an invalid immutable payload",
+    );
+  }
+  const plan = parseRoomTaskRecoveryPlanRecord(payload.snapshot.plan, event.id + " snapshot.plan");
+  if (
+    plan.roomId !== event.roomId
+    || plan.recoveryActionId !== payload.recoveryActionId
+    || plan.createdAt !== event.occurredAt
+    || event.causationId === null
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-plan event " + event.id + " does not bind its immutable action lineage",
+    );
+  }
+  return {
+    contractVersion: "room-task-recovery-plan-snapshot/v1",
+    plan,
+  };
+}
+
+function parseRoomTaskRecoveryActionEventSnapshot(
+  event: RoomEventRecordV1,
+): RoomTaskRecoveryActionEventSnapshotV1 {
+  if (
+    event.eventType !== "room_task_recovery_action_claimed"
+    && event.eventType !== "room_task_recovery_action_completed"
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Event " + event.id + " is not a recovery-action state transition",
+    );
+  }
+  const payload = event.payload;
+  if (
+    !isRuntimeRecord(payload)
+    || !hasExactObjectKeys(payload, [
+      "projectionVersion",
+      "actionId",
+      "snapshot",
+      "updatedAt",
+    ])
+    || payload.projectionVersion !== 1
+    || !isNonBlankString(payload.actionId)
+    || !isCanonicalUtcIsoTimestamp(payload.updatedAt)
+    || payload.updatedAt !== event.occurredAt
+    || !isRuntimeRecord(payload.snapshot)
+    || !hasExactObjectKeys(payload.snapshot, [
+      "contractVersion",
+      "transition",
+      "previousState",
+      "action",
+    ])
+    || payload.snapshot.contractVersion !== "room-task-recovery-action-snapshot/v1"
+    || !(payload.snapshot.transition === "claimed"
+      || payload.snapshot.transition === "processed"
+      || payload.snapshot.transition === "retry")
+    || !(payload.snapshot.previousState === "pending" || payload.snapshot.previousState === "claimed")
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-action event " + event.id + " has an invalid immutable payload",
+    );
+  }
+  const action = parseRoomTaskRecoveryActionEventRecord(
+    payload.snapshot.action,
+    "recovery-action event snapshot.action",
+  );
+  if (
+    action.id !== payload.actionId
+    || action.roomId !== event.roomId
+    || action.updatedAt !== payload.updatedAt
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-action event " + event.id + " does not bind its action snapshot",
+    );
+  }
+  if (
+    event.eventType === "room_task_recovery_action_claimed"
+    && (
+      payload.snapshot.transition !== "claimed"
+      || !(payload.snapshot.previousState === "pending" || payload.snapshot.previousState === "claimed")
+      || action.state !== "claimed"
+    )
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-action claim event " + event.id + " has an illegal state transition",
+    );
+  }
+  if (
+    event.eventType === "room_task_recovery_action_completed"
+    && (
+      payload.snapshot.previousState !== "claimed"
+      || !(payload.snapshot.transition === "processed" || payload.snapshot.transition === "retry")
+      || (payload.snapshot.transition === "processed" && action.state !== "processed")
+      || (payload.snapshot.transition === "retry" && action.state !== "pending")
+    )
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      "Recovery-action completion event " + event.id + " has an illegal state transition",
+    );
+  }
+  return {
+    contractVersion: "room-task-recovery-action-snapshot/v1",
+    transition: payload.snapshot.transition,
+    previousState: payload.snapshot.previousState,
+    action,
+  };
+}
+
+function parseRoomTaskProgressObservationEventSnapshot(
+  event: RoomEventRecordV1,
+): RoomTaskProgressObservationEventSnapshotV1 {
+  const isExhausted = event.eventType === "room_task_recovery_ladder_exhausted";
+  if (
+    ![
+      "room_task_progress_observed",
+      "room_task_recovery_action_enqueued",
+      "room_task_recovery_ladder_exhausted",
+    ].includes(event.eventType)
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      "Event " + event.id + " is not a task progress observation event",
+    );
+  }
+  const payload = event.payload;
+  const expectedKeys = isExhausted
+    ? [
+        "projectionVersion",
+        "snapshot",
+        "taskGraphProjection",
+        "taskGraphProjectionHash",
+        "updatedAt",
+      ]
+    : ["projectionVersion", "snapshot", "updatedAt"];
+  if (
+    !isRuntimeRecord(payload)
+    || !hasExactObjectKeys(payload, expectedKeys)
+    || payload.projectionVersion !== 1
+    || !isCanonicalUtcIsoTimestamp(payload.updatedAt)
+    || payload.updatedAt !== event.occurredAt
+    || (isExhausted && (
+      !isRuntimeRecord(payload.taskGraphProjection)
+      || !isCanonicalRoomHash(payload.taskGraphProjectionHash)
+      || payload.taskGraphProjectionHash !== hashRoomValue(payload.taskGraphProjection)
+    ))
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      "Task progress event " + event.id + " has an invalid immutable payload",
+    );
+  }
+  if (
+    !isRuntimeRecord(payload.snapshot)
+    || !hasExactObjectKeys(payload.snapshot, ["contractVersion", "observation", "decision"])
+    || payload.snapshot.contractVersion !== "room-task-progress-observation-snapshot/v1"
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      "Task progress event " + event.id + " has no canonical observation snapshot",
+    );
+  }
+  const observation = parseRoomTaskProgressObservationRecord(
+    payload.snapshot.observation,
+    "task progress event observation",
+  );
+  const decision = parseRoomTaskNoProgressRecoveryDecision(
+    payload.snapshot.decision,
+    observation,
+    "task progress event decision",
+  );
+  const expectedEventType = roomTaskProgressObservationEventType(decision);
+  if (
+    event.eventType !== expectedEventType
+    || observation.roomId !== event.roomId
+    || observation.observedAt !== payload.updatedAt
+  ) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      "Task progress event " + event.id + " does not bind its observation decision",
+    );
+  }
+  return {
+    contractVersion: "room-task-progress-observation-snapshot/v1",
+    observation,
+    decision,
+  };
+}
+
+function parseRoomTaskNoProgressRecoveryDecision(
+  value: unknown,
+  observation: RoomTaskProgressObservationV1,
+  label: string,
+): RoomTaskNoProgressRecoveryDecisionV1 {
+  if (!isRuntimeRecord(value) || !isNonBlankString(value.kind)) {
+    throw new RoomStoreError(
+      "task_progress_observation_invalid",
+      label + " has no supported recovery-decision kind",
+    );
+  }
+  if (value.kind === "below_threshold" || value.kind === "no_declared_action") {
+    if (
+      !hasExactObjectKeys(value, ["kind", "consecutiveUnchangedRounds"])
+      || !Number.isSafeInteger(value.consecutiveUnchangedRounds)
+      || (value.consecutiveUnchangedRounds as number) < 1
+    ) {
+      throw new RoomStoreError(
+        "task_progress_observation_invalid",
+        label + " has an invalid non-action recovery decision",
+      );
+    }
+    return {
+      kind: value.kind,
+      consecutiveUnchangedRounds: value.consecutiveUnchangedRounds as number,
+    };
+  }
+  if (value.kind === "awaiting_active_action") {
+    if (
+      !hasExactObjectKeys(value, [
+        "kind",
+        "consecutiveUnchangedRounds",
+        "activeActionId",
+      ])
+      || !Number.isSafeInteger(value.consecutiveUnchangedRounds)
+      || (value.consecutiveUnchangedRounds as number) < 1
+      || !isNonBlankString(value.activeActionId)
+    ) {
+      throw new RoomStoreError(
+        "task_progress_observation_invalid",
+        label + " has an invalid active-action recovery decision",
+      );
+    }
+    return {
+      kind: "awaiting_active_action",
+      consecutiveUnchangedRounds: value.consecutiveUnchangedRounds as number,
+      activeActionId: value.activeActionId,
+    };
+  }
+  if (value.kind === "action_enqueued") {
+    if (
+      !hasExactObjectKeys(value, [
+        "kind",
+        "consecutiveUnchangedRounds",
+        "action",
+      ])
+      || !Number.isSafeInteger(value.consecutiveUnchangedRounds)
+      || (value.consecutiveUnchangedRounds as number) < 1
+    ) {
+      throw new RoomStoreError(
+        "task_progress_observation_invalid",
+        label + " has an invalid action-enqueue decision",
+      );
+    }
+    const action = parseRoomTaskRecoveryActionEventRecord(value.action, label + ".action");
+    if (
+      action.state !== "pending"
+      || action.observationId !== observation.id
+      || action.roomId !== observation.roomId
+      || action.nodeId !== observation.nodeId
+      || action.nodeVersion !== observation.nodeVersion
+      || action.actionSnapshot.turnId !== observation.turnId
+      || action.actionSnapshot.phaseId !== observation.phaseId
+    ) {
+      throw new RoomStoreError(
+        "task_progress_observation_invalid",
+        label + " action does not bind the triggering observation",
+      );
+    }
+    return {
+      kind: "action_enqueued",
+      consecutiveUnchangedRounds: value.consecutiveUnchangedRounds as number,
+      action,
+    };
+  }
+  if (value.kind === "exhausted") {
+    if (
+      !hasExactObjectKeys(value, [
+        "kind",
+        "consecutiveUnchangedRounds",
+        "exhaustedGateIds",
+      ])
+      || !Number.isSafeInteger(value.consecutiveUnchangedRounds)
+      || (value.consecutiveUnchangedRounds as number) < 1
+      || !isUniqueNonBlankStringArray(value.exhaustedGateIds)
+      || value.exhaustedGateIds.length === 0
+    ) {
+      throw new RoomStoreError(
+        "task_progress_observation_invalid",
+        label + " has an invalid exhaustion decision",
+      );
+    }
+    return {
+      kind: "exhausted",
+      consecutiveUnchangedRounds: value.consecutiveUnchangedRounds as number,
+      exhaustedGateIds: [...value.exhaustedGateIds].sort(compareRoomText),
+    };
+  }
+  throw new RoomStoreError(
+    "task_progress_observation_invalid",
+    label + " has an unsupported recovery-decision kind " + value.kind,
+  );
+}
+
+function parseRoomTaskRecoveryActionEventRecord(
+  value: unknown,
+  label: string,
+): RoomTaskRecoveryActionV1 {
+  if (
+    !isRuntimeRecord(value)
+    || !hasExactObjectKeys(value, [
+      "id",
+      "roomId",
+      "nodeId",
+      "nodeVersion",
+      "observationId",
+      "actionId",
+      "actionSnapshot",
+      "policySnapshot",
+      "state",
+      "attemptCount",
+      "claimToken",
+      "claimExpiresAt",
+      "claimedByWorkerId",
+      "claimedAt",
+      "nextEligibleAt",
+      "resultPayload",
+      "lastErrorCode",
+      "operatorApprovalId",
+      "createdAt",
+      "updatedAt",
+      "processedAt",
+    ])
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " is not a complete recovery-action event record",
+    );
+  }
+  const actionSnapshot = parseRoomTaskNoProgressRecoveryActionSnapshot(
+    value.actionSnapshot,
+    label + ".actionSnapshot",
+  );
+  const policySnapshot = parseRoomTaskNoProgressRecoveryPolicySnapshot(
+    value.policySnapshot,
+    label + ".policySnapshot",
+  );
+  const synthetic = {
+    id: value.id,
+    roomId: value.roomId,
+    nodeId: value.nodeId,
+    nodeVersion: value.nodeVersion,
+    observationId: value.observationId,
+    actionId: value.actionId,
+    actionSnapshot,
+    policySnapshot,
+    state: value.state,
+    attemptCount: value.attemptCount,
+    claimToken: value.claimToken,
+    claimExpiresAt: value.claimExpiresAt,
+    claimedByWorkerId: value.claimedByWorkerId,
+    claimedAt: value.claimedAt,
+    nextEligibleAt: value.nextEligibleAt,
+    resultPayload: value.resultPayload,
+    lastErrorCode: value.lastErrorCode,
+    operatorApprovalId: value.operatorApprovalId,
+    createdAt: value.createdAt,
+    updatedAt: value.updatedAt,
+    processedAt: value.processedAt,
+  };
+  return parseRoomTaskRecoveryActionRecord(synthetic, label);
+}
+
+function parseRoomTaskRecoveryActionRecord(
+  value: Readonly<Record<string, unknown>>,
+  label: string,
+): RoomTaskRecoveryActionV1 {
+  const actionSnapshot = value.actionSnapshot as RoomTaskNoProgressRecoveryActionSnapshotV1;
+  const policySnapshot = value.policySnapshot as RoomProtocolNoProgressRecoveryPolicyV1;
+  const state = value.state;
+  const claimToken = value.claimToken;
+  const claimExpiresAt = value.claimExpiresAt;
+  const claimedByWorkerId = value.claimedByWorkerId;
+  const claimedAt = value.claimedAt;
+  const processedAt = value.processedAt;
+  const resultPayload = value.resultPayload;
+  const lastErrorCode = value.lastErrorCode;
+  const operatorApprovalId = value.operatorApprovalId;
+  if (
+    !isNonBlankString(value.id)
+    || !isNonBlankString(value.roomId)
+    || !isNonBlankString(value.nodeId)
+    || !Number.isSafeInteger(value.nodeVersion)
+    || (value.nodeVersion as number) < 0
+    || !isNonBlankString(value.observationId)
+    || !isNonBlankString(value.actionId)
+    || !["pending", "claimed", "processed"].includes(state as string)
+    || !Number.isSafeInteger(value.attemptCount)
+    || (value.attemptCount as number) < 0
+    || !isCanonicalUtcIsoTimestamp(value.nextEligibleAt)
+    || !isCanonicalUtcIsoTimestamp(value.createdAt)
+    || !isCanonicalUtcIsoTimestamp(value.updatedAt)
+    || Date.parse(value.updatedAt as string) < Date.parse(value.createdAt as string)
+    || actionSnapshot.nodeId !== value.nodeId
+    || actionSnapshot.nodeVersion !== value.nodeVersion
+    || actionSnapshot.observationId !== value.observationId
+    || actionSnapshot.recoveryAction.id !== value.actionId
+    || policySnapshot.protocolId !== actionSnapshot.protocolId
+    || policySnapshot.protocolVersion !== actionSnapshot.protocolVersion
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " has invalid recovery-action identity or policy lineage",
+    );
+  }
+  if (state === "pending") {
+    if (
+      claimToken !== null
+      || claimExpiresAt !== null
+      || claimedByWorkerId !== null
+      || claimedAt !== null
+      || processedAt !== null
+      || resultPayload !== null
+    ) {
+      throw new RoomStoreError(
+        "task_recovery_action_invalid",
+        label + " pending action retains a claim or result",
+      );
+    }
+  } else if (state === "claimed") {
+    if (
+      (value.attemptCount as number) < 1
+      || !isNonBlankString(claimToken)
+      || !isCanonicalUtcIsoTimestamp(claimExpiresAt)
+      || !isNonBlankString(claimedByWorkerId)
+      || !isCanonicalUtcIsoTimestamp(claimedAt)
+      || processedAt !== null
+      || resultPayload !== null
+      || lastErrorCode !== null
+      || Date.parse(claimExpiresAt) <= Date.parse(claimedAt)
+    ) {
+      throw new RoomStoreError(
+        "task_recovery_action_invalid",
+        label + " has invalid claimed-action state",
+      );
+    }
+  } else if (
+    claimToken !== null
+    || claimExpiresAt !== null
+    || claimedByWorkerId !== null
+    || claimedAt !== null
+    || !isCanonicalUtcIsoTimestamp(processedAt)
+    || !isRoomTaskRecoveryActionResult(resultPayload)
+    || lastErrorCode !== null
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " has invalid processed-action state",
+    );
+  }
+  if (
+    !(lastErrorCode === null || isSafeRoomTaskRecoveryErrorCode(lastErrorCode))
+    || !(operatorApprovalId === null || isNonBlankString(operatorApprovalId))
+  ) {
+    throw new RoomStoreError(
+      "task_recovery_action_invalid",
+      label + " has an invalid error or approval reference",
+    );
+  }
+  return {
+    id: value.id,
+    roomId: value.roomId,
+    nodeId: value.nodeId,
+    nodeVersion: value.nodeVersion as number,
+    observationId: value.observationId,
+    actionId: value.actionId,
+    actionSnapshot,
+    policySnapshot,
+    state: state as RoomTaskRecoveryActionV1["state"],
+    attemptCount: value.attemptCount as number,
+    claimToken: claimToken as string | null,
+    claimExpiresAt: claimExpiresAt as string | null,
+    claimedByWorkerId: claimedByWorkerId as string | null,
+    claimedAt: claimedAt as string | null,
+    nextEligibleAt: value.nextEligibleAt as string,
+    resultPayload: resultPayload === null
+      ? null
+      : structuredClone(resultPayload) as RoomTaskRecoveryActionResultV1,
+    lastErrorCode: lastErrorCode as string | null,
+    operatorApprovalId: operatorApprovalId as string | null,
+    createdAt: value.createdAt as string,
+    updatedAt: value.updatedAt as string,
+    processedAt: processedAt as string | null,
+  };
+}
+
+function assertSemanticStateControllerContext(context: RoomCommandContext): void {
+  if (
+    context.actorType !== "controller"
+    || !isNonBlankString(context.actorId)
+    || !isNonBlankString(context.correlationId)
+    || !(context.causationId === null || isNonBlankString(context.causationId))
+    || !isCanonicalUtcIsoTimestamp(context.occurredAt)
+  ) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      "Only a trusted controller context can establish authoritative semantic state",
+    );
+  }
+}
+
+function assertSemanticStateRoomPreconditions(
+  current: RoomAggregateV1 | undefined,
+  input: SetRoomSemanticStateInputV1,
+  occurredAt: string,
+): asserts current is RoomAggregateV1 {
+  if (!current) {
+    throw new RoomDomainError(
+      "room_state_conflict",
+      `Operational Room ${input.roomId} does not exist`,
+    );
+  }
+  if (current.room.state !== "running") {
+    throw new RoomDomainError(
+      "room_state_conflict",
+      `Semantic state requires a running Room, found ${current.room.state}`,
+    );
+  }
+  if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+    throw new RoomDomainError(
+      "aggregate_version_conflict",
+      `Room ${input.roomId} expected aggregate version ${input.expectedAggregateVersion} but is ${current.room.aggregateVersion}`,
+      { expected: input.expectedAggregateVersion, actual: current.room.aggregateVersion },
+    );
+  }
+  if (current.activeTurnId !== input.turnId) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      `Semantic state must bind current turn ${current.activeTurnId ?? "none"}, not ${input.turnId}`,
+    );
+  }
+  if (isEarlierTimestamp(occurredAt, current.room.updatedAt)) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      `Semantic state timestamp cannot precede Room ${input.roomId} updatedAt`,
+    );
+  }
+}
+
+function assertSemanticStateProtocolPreconditions(
+  current: RoomAggregateV1,
+  protocol: RoomProtocolDefinitionV1 | undefined,
+  activeAssignment: RoomRoleAssignmentProjectionV1 | null,
+  input: SetRoomSemanticStateInputV1,
+): asserts protocol is RoomProtocolDefinitionV1 & NonNullable<typeof protocol> {
+  if (!protocol || !activeAssignment) {
+    throw new RoomStoreError(
+      activeAssignment ? "semantic_state_conflict" : "role_assignment_missing",
+      `Room ${input.roomId} lacks an active protocol or role assignment for semantic state`,
+    );
+  }
+  if (
+    activeAssignment.protocolId !== current.room.protocolId
+    || activeAssignment.protocolVersion !== current.room.protocolVersion
+    || !protocol.phases.some((phase) => phase.id === activeAssignment.phaseId)
+  ) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      `Room ${input.roomId} active role assignment no longer matches its protocol`,
+    );
+  }
+}
+
+function assertSemanticRouteRoomPreconditions(
+  current: RoomAggregateV1 | undefined,
+  input: RouteRoomProtocolMessageInputV1,
+  message: RoomProtocolMessageV1,
+): asserts current is RoomAggregateV1 {
+  if (!current) {
+    throw new RoomDomainError("room_state_conflict", `Operational Room ${input.roomId} does not exist`);
+  }
+  if (current.room.state !== "running") {
+    throw new RoomDomainError(
+      "room_state_conflict",
+      `Structured semantic routing requires a running Room, found ${current.room.state}`,
+    );
+  }
+  if (current.room.aggregateVersion !== input.expectedAggregateVersion) {
+    throw new RoomDomainError(
+      "aggregate_version_conflict",
+      `Room ${input.roomId} expected aggregate version ${input.expectedAggregateVersion} but is ${current.room.aggregateVersion}`,
+      { expected: input.expectedAggregateVersion, actual: current.room.aggregateVersion },
+    );
+  }
+  if (current.activeTurnId !== message.turnId) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Structured message ${message.messageId} must bind current turn ${current.activeTurnId ?? "none"}`,
+    );
+  }
+}
+
+function assertSemanticRouteProtocolPreconditions(
+  current: RoomAggregateV1,
+  protocol: RoomProtocolDefinitionV1 | undefined,
+  activeAssignment: RoomRoleAssignmentProjectionV1 | null,
+  semanticState: RoomSemanticStateProjectionV1 | null,
+  message: RoomProtocolMessageV1,
+): asserts protocol is RoomProtocolDefinitionV1 & NonNullable<typeof protocol> {
+  if (!protocol || !activeAssignment) {
+    throw new RoomStoreError(
+      activeAssignment ? "semantic_route_conflict" : "role_assignment_missing",
+      `Room ${message.roomId} lacks an active protocol or role assignment for structured routing`,
+    );
+  }
+  if (!semanticState) {
+    throw new RoomStoreError(
+      "semantic_state_missing",
+      `Room ${message.roomId} has no controller-owned semantic state for ${message.turnId}/${message.nodeId}`,
+    );
+  }
+  if (
+    message.protocolId !== current.room.protocolId
+    || message.protocolVersion !== current.room.protocolVersion
+    || activeAssignment.protocolId !== current.room.protocolId
+    || activeAssignment.protocolVersion !== current.room.protocolVersion
+    || message.phaseId !== activeAssignment.phaseId
+    || semanticState.protocolId !== current.room.protocolId
+    || semanticState.protocolVersion !== current.room.protocolVersion
+    || semanticState.phaseId !== activeAssignment.phaseId
+  ) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Structured message ${message.messageId} does not match the active protocol phase or semantic state`,
+    );
+  }
+}
+
+/**
+ * The active assignment is a projection, while the operational Room phase is
+ * the transition fence. Check both before accepting a peer hash so a damaged
+ * or stale role projection cannot route across a completed phase boundary.
+ */
+async function assertActiveRoomProtocolPhaseWithinTransaction(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  expectedPhaseId: string,
+): Promise<void> {
+  const rows = await tx
+    .select({ protocolPhaseId: operationalRooms.protocolPhaseId })
+    .from(operationalRooms)
+    .where(and(
+      eq(operationalRooms.projectId, projectId),
+      eq(operationalRooms.id, roomId),
+    ))
+    .limit(1);
+  if (rows[0]?.protocolPhaseId !== expectedPhaseId) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Room ${roomId} operational phase does not match active role assignment ${expectedPhaseId}`,
+    );
+  }
+}
+
+async function assertRoomSemanticStateNode(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  nodeId: string,
+): Promise<void> {
+  const rows = await tx
+    .select({ id: roomTaskNodes.id, state: roomTaskNodes.state })
+    .from(roomTaskNodes)
+    .where(and(
+      eq(roomTaskNodes.projectId, projectId),
+      eq(roomTaskNodes.roomId, roomId),
+      eq(roomTaskNodes.id, nodeId),
+    ))
+    .limit(1);
+  const node = rows[0];
+  if (!node || ["accepted", "blocked", "failed", "cancelled"].includes(node.state)) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Semantic state/message node ${nodeId} is absent or terminal in Room ${roomId}`,
+    );
+  }
+}
+
+function semanticStateHashesEqual(
+  state: RoomSemanticStateProjectionV1,
+  input: Pick<SetRoomSemanticStateInputV1, "semanticHash" | "evidenceStateHash" | "decisionStateHash">,
+): boolean {
+  return state.semanticHash === input.semanticHash
+    && state.evidenceStateHash === input.evidenceStateHash
+    && state.decisionStateHash === input.decisionStateHash;
+}
+
+function throwInvalidRoomRoleAssignmentActivation(): never {
+  throw new RoomStoreError(
+    "role_assignment_invalid",
+    "Role-assignment activation requires one canonical capability snapshot, explicit locks/forbids, a Room aggregate version, an idempotency key, and a canonical timestamp",
+  );
+}
+
+function throwRoleAssignmentPolicyError(
+  unsatisfied: readonly { readonly code: string; readonly path: string }[],
+): never {
+  const summary = unsatisfied
+    .slice(0, 3)
+    .map((failure) => `${failure.code}@${failure.path}`)
+    .join(", ");
+  throw new RoomStoreError(
+    "role_assignment_invalid",
+    `Room role-assignment policy is unsatisfied${summary ? `: ${summary}` : ""}`,
+  );
+}
+
+/**
+ * Capability evidence can describe a binding as temporarily unavailable, but
+ * it may never omit an active binding or invent a foreign one. The resulting
+ * complete snapshot is what makes a later role reassignment auditable instead
+ * of silently selecting only convenient participants.
+ */
+async function assertRoleAssignmentSnapshotBindingsCurrent(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  snapshot: RoomCapabilitySnapshotV1,
+): Promise<void> {
+  const rows = await tx
+    .select({ id: roomBindings.id })
+    .from(roomBindings)
+    .where(and(
+      eq(roomBindings.projectId, projectId),
+      eq(roomBindings.roomId, roomId),
+      inArray(roomBindings.state, ACTIVE_ROOM_BINDING_STATES),
+    ))
+    .orderBy(asc(roomBindings.id));
+  const persistedIds = rows.map((row) => row.id);
+  const snapshotIds = snapshot.bindings.map((binding) => binding.bindingId).sort(compareRoomText);
+  if (
+    persistedIds.length !== snapshotIds.length
+    || persistedIds.some((bindingId, index) => bindingId !== snapshotIds[index])
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Capability snapshot bindings no longer match active Room bindings for ${roomId}`,
+    );
+  }
+}
+
+function parseStoredRoomRoleAssignment(
+  row: typeof roomRoleAssignments.$inferSelect,
+): RoomRoleAssignmentProjectionV1 {
+  if (
+    !Number.isSafeInteger(row.revision)
+    || row.revision < 1
+    || !Number.isSafeInteger(row.aggregateVersion)
+    || row.aggregateVersion < 1
+    || (row.state !== "active" && row.state !== "superseded")
+    || !isNonBlankString(row.protocolId)
+    || !Number.isSafeInteger(row.protocolVersion)
+    || row.protocolVersion < 1
+    || !isNonBlankString(row.phaseId)
+    || !isCanonicalUtcIsoTimestamp(row.createdAt)
+    || !(row.supersededAt === null || isCanonicalUtcIsoTimestamp(row.supersededAt))
+    || (row.state === "active" && row.supersededAt !== null)
+    || (row.state === "superseded" && row.supersededAt === null)
+  ) {
+    throw new RoomStoreError("role_assignment_invalid", `Stored Room role assignment ${row.id} has invalid metadata`);
+  }
+  const protocol = getRoomProtocolDefinition(row.protocolId, row.protocolVersion);
+  if (!protocol) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room role assignment ${row.id} references an unsupported protocol`,
+    );
+  }
+  const snapshotResult = createRoomCapabilitySnapshot(
+    row.capabilitySnapshot as RoomCapabilitySnapshotInputV1,
+  );
+  if (!snapshotResult.ok) throwRoleAssignmentPolicyError(snapshotResult.unsatisfied);
+  const constraintsResult = normalizeRoomRoleAssignmentConstraints(
+    row.constraints as RoomRoleAssignmentConstraintsV1,
+  );
+  if (!constraintsResult.ok) throwRoleAssignmentPolicyError(constraintsResult.unsatisfied);
+  if (
+    hashRoomValue(row.capabilitySnapshot) !== hashRoomValue(snapshotResult.value)
+    || hashRoomValue(row.constraints) !== hashRoomValue(constraintsResult.value)
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room role assignment ${row.id} is not canonically serialized`,
+    );
+  }
+  if (!isUniqueNonBlankStringArray(row.authoritativeProducerBindingIds)) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room role assignment ${row.id} has invalid producer lineage`,
+    );
+  }
+  const authoritativeProducerBindingIds = [...row.authoritativeProducerBindingIds].sort(compareRoomText);
+  if (hashRoomValue(row.authoritativeProducerBindingIds) !== hashRoomValue(authoritativeProducerBindingIds)) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room role assignment ${row.id} has non-canonical producer lineage`,
+    );
+  }
+  const assignmentResult = validateRoomRoleAssignment({
+    protocol,
+    assignment: row.assignment as RoomRoleAssignmentV1,
+    capabilitySnapshot: snapshotResult.value,
+    authoritativeProducerBindingIds,
+  });
+  if (!assignmentResult.ok) throwRoleAssignmentPolicyError(assignmentResult.unsatisfied);
+  if (hashRoomValue(row.assignment) !== hashRoomValue(assignmentResult.value)) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room role assignment ${row.id} is not canonical for its protocol`,
+    );
+  }
+  if (
+    assignmentResult.value.protocolId !== row.protocolId
+    || assignmentResult.value.protocolVersion !== row.protocolVersion
+    || assignmentResult.value.phaseId !== row.phaseId
+    || hashRoomValue(assignmentResult.value.producerBindingIds) !== hashRoomValue(authoritativeProducerBindingIds)
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room role assignment ${row.id} disagrees with its authoritative lineage`,
+    );
+  }
+  return {
+    id: row.id,
+    roomId: row.roomId,
+    revision: row.revision,
+    state: row.state,
+    protocolId: row.protocolId,
+    protocolVersion: row.protocolVersion,
+    phaseId: row.phaseId,
+    capabilitySnapshot: snapshotResult.value,
+    constraints: constraintsResult.value,
+    assignment: assignmentResult.value,
+    authoritativeProducerBindingIds,
+    aggregateVersion: row.aggregateVersion,
+    createdAt: row.createdAt,
+    supersededAt: row.supersededAt,
+  };
+}
+
+function parseStoredRoomPhaseGateEvidence(
+  row: typeof roomPhaseGateEvidence.$inferSelect,
+): RoomPhaseGateEvidenceProjectionV1 {
+  if (
+    !isNonBlankString(row.id)
+    || !isNonBlankString(row.roomId)
+    || !isRuntimeRecord(row.evidence)
+    || !isNonBlankString(row.evidenceHash)
+    || row.evidenceHash !== hashRoomValue(row.evidence)
+    || !isRuntimeRecord(row.producerLineage)
+    || !isCanonicalUtcIsoTimestamp(row.evidenceNotBefore)
+    || !isCanonicalUtcIsoTimestamp(row.createdAt)
+  ) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room phase-gate evidence ${row.id} is malformed or tampered`,
+    );
+  }
+  const evidence = structuredClone(row.evidence) as unknown as RoomPhaseGateEvidenceRecordV1;
+  if (evidence.id !== row.id) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Stored Room phase-gate evidence ${row.id} does not bind its immutable record id`,
+    );
+  }
+  return {
+    id: row.id,
+    roomId: row.roomId,
+    evidence,
+    evidenceHash: row.evidenceHash,
+    producerLineage: structuredClone(row.producerLineage) as unknown as RoomPhaseGateProducerLineageV1,
+    evidenceNotBefore: row.evidenceNotBefore,
+    createdAt: row.createdAt,
+  };
+}
+
+function toRoomPhaseGateEvidenceProtocol(
+  protocol: RoomProtocolDefinitionV1,
+): RoomPhaseGateEvidenceProtocolV1 {
+  return {
+    contractVersion: 1,
+    id: protocol.id,
+    version: protocol.version,
+    definitionHash: hashRoomValue(protocol),
+    phases: protocol.phases.map((phase) => ({
+      id: phase.id,
+      entryGateIds: [...phase.entryGateIds],
+      exitGateIds: [...phase.exitGateIds],
+    })),
+    gates: protocol.gates.map((gate) => ({
+      id: gate.id,
+      kind: gate.kind,
+      hard: gate.hard,
+    })),
+    transitions: protocol.transitions.map((transition) => ({
+      fromPhaseId: transition.fromPhaseId,
+      toPhaseId: transition.toPhaseId,
+      whenGateId: transition.whenGateId,
+    })),
+  };
+}
+
+function createRoomPhaseGateProducerLineage(
+  assignment: RoomRoleAssignmentProjectionV1,
+  evidence: RoomPhaseGateEvidenceRecordV1,
+  protocol: RoomProtocolDefinitionV1,
+): RoomPhaseGateProducerLineageV1 {
+  const producerBindingIds = [...assignment.authoritativeProducerBindingIds].sort(compareRoomText);
+  return {
+    source: "durable_room_producer_lineage_ledger",
+    sourceRecordId: assignment.id,
+    sourceHash: hashRoomValue({
+      assignmentId: assignment.id,
+      protocolId: assignment.protocolId,
+      protocolVersion: assignment.protocolVersion,
+      phaseId: assignment.phaseId,
+      assignmentHash: hashRoomValue(assignment.assignment),
+      producerBindingIds,
+    }),
+    protocolId: protocol.id,
+    protocolVersion: protocol.version,
+    protocolHash: hashRoomValue(protocol),
+    turnId: evidence.turnId,
+    candidateId: evidence.candidateId,
+    candidateHash: evidence.candidateHash,
+    producerBindingIds,
+  };
+}
+
+function findProtocolTargetPhaseForGate(
+  protocol: RoomProtocolDefinitionV1,
+  fromPhaseId: string,
+  gateId: string,
+): string {
+  return protocol.transitions.find((transition) => (
+    transition.fromPhaseId === fromPhaseId && transition.whenGateId === gateId
+  ))?.toPhaseId ?? "__undeclared_phase__";
+}
+
+function evaluatePhaseGateEvidenceForTransition(input: {
+  readonly protocol: RoomProtocolDefinitionV1;
+  readonly fromPhaseId: string;
+  readonly targetPhaseId: string;
+  readonly turnId: string;
+  readonly evidence: RoomPhaseGateEvidenceRecordV1;
+  readonly evidenceNotBefore: string;
+  readonly evaluatedAt: string;
+  readonly producerLineage: RoomPhaseGateProducerLineageV1;
+}) {
+  return evaluateRoomPhaseTransitionGateEvidence({
+    contractVersion: 1,
+    protocol: toRoomPhaseGateEvidenceProtocol(input.protocol),
+    transition: {
+      protocolId: input.protocol.id,
+      protocolVersion: input.protocol.version,
+      protocolHash: hashRoomValue(input.protocol),
+      fromPhaseId: input.fromPhaseId,
+      toPhaseId: input.targetPhaseId,
+      turnId: input.turnId,
+      candidateId: input.evidence.candidateId,
+      candidateHash: input.evidence.candidateHash,
+      evidenceNotBefore: input.evidenceNotBefore,
+      evaluatedAt: input.evaluatedAt,
+    },
+    evidenceLedger: {
+      source: "durable_room_phase_gate_ledger",
+      records: [input.evidence],
+    },
+    producerLineage: input.producerLineage,
+  });
+}
+
+function formatPhaseGateEvidenceDecisionFailure(
+  reasons: readonly { readonly code: string; readonly message: string }[],
+): string {
+  const summary = reasons
+    .slice(0, 3)
+    .map((reason) => `${reason.code}: ${reason.message}`)
+    .join("; ");
+  return summary.length > 0
+    ? `Immutable phase-gate evidence is not sufficient: ${summary}`
+    : "Immutable phase-gate evidence is not sufficient";
+}
+
+async function loadRoomRoleAssignmentResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  eventId: string,
+  expectedEventType:
+    | "room_role_assignment_activated"
+    | "room_role_assignment_transitioned" = "room_role_assignment_activated",
+): Promise<RoomRoleAssignmentProjectionV1> {
+  const eventRows = await handle
+    .select({
+      aggregateVersion: roomEvents.aggregateVersion,
+      eventType: roomEvents.eventType,
+      payload: roomEvents.payload,
+    })
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, eventId),
+    ))
+    .limit(1);
+  const event = eventRows[0];
+  if (!event || event.eventType !== expectedEventType) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Role-assignment event ${eventId} is missing or has the wrong type`,
+    );
+  }
+  const payload = asRecord(event.payload);
+  if (payload.projectionVersion !== 1 || !isNonBlankString(payload.assignmentId)) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Role-assignment event ${eventId} has invalid projection metadata`,
+    );
+  }
+  if (expectedEventType === "room_role_assignment_transitioned") {
+    if (
+      !isNonBlankString(payload.previousAssignmentId)
+      || payload.previousAssignmentId === payload.assignmentId
+      || !isNonBlankString(payload.boundaryTurnId)
+      || !isNonBlankString(payload.phaseGateEvidenceId)
+      || !isRuntimeRecord(payload.phaseGateEvidence)
+      || !isNonBlankString(payload.phaseGateEvidenceHash)
+      || payload.phaseGateEvidenceHash !== hashRoomValue(payload.phaseGateEvidence)
+      || !isRuntimeRecord(payload.producerLineage)
+      || !isCanonicalUtcIsoTimestamp(payload.evidenceNotBefore)
+      || !isNonBlankString(payload.verifiedTransitionGateId)
+    ) {
+      throw new RoomStoreError(
+        "idempotency_result_missing",
+        `Role-transition event ${eventId} has invalid immutable phase-gate evidence`,
+      );
+    }
+  }
+  const rows = await handle
+    .select()
+    .from(roomRoleAssignments)
+    .where(and(
+      eq(roomRoleAssignments.projectId, projectId),
+      eq(roomRoleAssignments.roomId, roomId),
+      eq(roomRoleAssignments.id, payload.assignmentId),
+    ))
+    .limit(1);
+  const projection = rows[0] ? parseStoredRoomRoleAssignment(rows[0]) : null;
+  if (!projection || projection.aggregateVersion !== event.aggregateVersion) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Role-assignment event ${eventId} no longer has its committed projection`,
+    );
+  }
+  if (
+    payload.revision !== projection.revision
+    || payload.protocolId !== projection.protocolId
+    || payload.protocolVersion !== projection.protocolVersion
+    || payload.phaseId !== projection.phaseId
+    || payload.updatedAt !== projection.createdAt
+    || payload.capabilitySnapshotHash !== hashRoomValue(projection.capabilitySnapshot)
+    || payload.constraintsHash !== hashRoomValue(projection.constraints)
+    || payload.assignmentHash !== hashRoomValue(projection.assignment)
+    || hashRoomValue(payload.capabilitySnapshot) !== hashRoomValue(projection.capabilitySnapshot)
+    || hashRoomValue(payload.constraints) !== hashRoomValue(projection.constraints)
+    || hashRoomValue(payload.assignment) !== hashRoomValue(projection.assignment)
+    || hashRoomValue(payload.authoritativeProducerBindingIds)
+      !== hashRoomValue(projection.authoritativeProducerBindingIds)
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Role-assignment event ${eventId} failed projection integrity validation`,
+    );
+  }
+  return projection;
+}
+
+async function loadActiveRoomRoleAssignmentWithinTransaction(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+): Promise<RoomRoleAssignmentProjectionV1 | null> {
+  const rows = await handle
+    .select()
+    .from(roomRoleAssignments)
+    .where(and(
+      eq(roomRoleAssignments.projectId, projectId),
+      eq(roomRoleAssignments.roomId, roomId),
+      eq(roomRoleAssignments.state, "active"),
+    ))
+    .limit(1);
+  return rows[0] ? parseStoredRoomRoleAssignment(rows[0]) : null;
+}
+
+function buildRoomSemanticStateFingerprint(input: {
+  readonly roomId: string;
+  readonly turnId: string;
+  readonly nodeId: string;
+  readonly protocolId: string;
+  readonly protocolVersion: number;
+  readonly phaseId: string;
+  readonly semanticHash: string;
+  readonly evidenceStateHash: string;
+  readonly decisionStateHash: string;
+}): string {
+  return hashRoomValue({
+    contractVersion: "room-semantic-state/v1",
+    roomId: input.roomId,
+    turnId: input.turnId,
+    nodeId: input.nodeId,
+    protocolId: input.protocolId,
+    protocolVersion: input.protocolVersion,
+    phaseId: input.phaseId,
+    semanticHash: input.semanticHash,
+    evidenceStateHash: input.evidenceStateHash,
+    decisionStateHash: input.decisionStateHash,
+  });
+}
+
+function parseStoredRoomSemanticState(
+  row: typeof roomSemanticStates.$inferSelect,
+): RoomSemanticStateProjectionV1 {
+  if (
+    !isNonBlankString(row.id)
+    || !isNonBlankString(row.roomId)
+    || !isNonBlankString(row.turnId)
+    || !isNonBlankString(row.nodeId)
+    || !Number.isSafeInteger(row.revision)
+    || row.revision < 1
+    || (row.state !== "active" && row.state !== "superseded")
+    || !isNonBlankString(row.protocolId)
+    || !Number.isSafeInteger(row.protocolVersion)
+    || row.protocolVersion < 1
+    || !isNonBlankString(row.phaseId)
+    || !isCanonicalRoomHash(row.semanticHash)
+    || !isCanonicalRoomHash(row.evidenceStateHash)
+    || !isCanonicalRoomHash(row.decisionStateHash)
+    || !isCanonicalRoomHash(row.stateFingerprint)
+    || !isCanonicalUtcIsoTimestamp(row.createdAt)
+    || !(row.supersededAt === null || isCanonicalUtcIsoTimestamp(row.supersededAt))
+    || (row.state === "active" && row.supersededAt !== null)
+    || (row.state === "superseded" && row.supersededAt === null)
+  ) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      `Stored semantic state ${row.id} has invalid metadata`,
+    );
+  }
+  const fingerprint = buildRoomSemanticStateFingerprint({
+    roomId: row.roomId,
+    turnId: row.turnId,
+    nodeId: row.nodeId,
+    protocolId: row.protocolId,
+    protocolVersion: row.protocolVersion,
+    phaseId: row.phaseId,
+    semanticHash: row.semanticHash,
+    evidenceStateHash: row.evidenceStateHash,
+    decisionStateHash: row.decisionStateHash,
+  });
+  if (fingerprint !== row.stateFingerprint) {
+    throw new RoomStoreError(
+      "semantic_state_conflict",
+      `Stored semantic state ${row.id} does not match its immutable fingerprint`,
+    );
+  }
+  return {
+    id: row.id,
+    roomId: row.roomId,
+    turnId: row.turnId,
+    nodeId: row.nodeId,
+    revision: row.revision,
+    state: row.state,
+    protocolId: row.protocolId,
+    protocolVersion: row.protocolVersion,
+    phaseId: row.phaseId,
+    semanticHash: row.semanticHash,
+    evidenceStateHash: row.evidenceStateHash,
+    decisionStateHash: row.decisionStateHash,
+    stateFingerprint: row.stateFingerprint,
+    createdAt: row.createdAt,
+    supersededAt: row.supersededAt,
+  };
+}
+
+async function loadActiveRoomSemanticStateWithinTransaction(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  turnId: string,
+  nodeId: string,
+): Promise<RoomSemanticStateProjectionV1 | null> {
+  const rows = await handle
+    .select()
+    .from(roomSemanticStates)
+    .where(and(
+      eq(roomSemanticStates.projectId, projectId),
+      eq(roomSemanticStates.roomId, roomId),
+      eq(roomSemanticStates.turnId, turnId),
+      eq(roomSemanticStates.nodeId, nodeId),
+      eq(roomSemanticStates.state, "active"),
+    ))
+    .limit(1);
+  return rows[0] ? parseStoredRoomSemanticState(rows[0]) : null;
+}
+
+async function loadRoomSemanticHistoryWithinTransaction(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  turnId: string,
+): Promise<readonly RoomSemanticHistoryEntryV1[]> {
+  const rows = await handle
+    .select({
+      protocolMessageId: roomProtocolMessages.protocolMessageId,
+      nodeId: roomProtocolMessages.nodeId,
+      intent: roomMessages.intent,
+      semanticLoopFingerprint: roomProtocolMessages.semanticLoopFingerprint,
+      semanticHash: roomProtocolMessages.semanticHash,
+      evidenceStateHash: roomProtocolMessages.evidenceStateHash,
+      decisionStateHash: roomProtocolMessages.decisionStateHash,
+      aggregateVersion: roomEvents.aggregateVersion,
+    })
+    .from(roomProtocolMessages)
+    .innerJoin(roomMessages, and(
+      eq(roomMessages.id, roomProtocolMessages.id),
+      eq(roomMessages.projectId, roomProtocolMessages.projectId),
+      eq(roomMessages.roomId, roomProtocolMessages.roomId),
+    ))
+    .innerJoin(roomEvents, and(
+      eq(roomEvents.projectId, roomProtocolMessages.projectId),
+      eq(roomEvents.roomId, roomProtocolMessages.roomId),
+      eq(roomEvents.eventType, "room_protocol_message_routed"),
+      eq(roomEvents.correlationId, roomProtocolMessages.protocolMessageId),
+    ))
+    .where(and(
+      eq(roomProtocolMessages.projectId, projectId),
+      eq(roomProtocolMessages.roomId, roomId),
+      eq(roomProtocolMessages.turnId, turnId),
+    ))
+    .orderBy(asc(roomEvents.aggregateVersion), asc(roomEvents.id));
+  return rows.map((row) => {
+    if (
+      !isNonBlankString(row.protocolMessageId)
+      || !isNonBlankString(row.nodeId)
+      || !isRoomMessageIntent(row.intent)
+      || !isCanonicalRoomHash(row.semanticLoopFingerprint)
+      || !isCanonicalRoomHash(row.semanticHash)
+      || !isCanonicalRoomHash(row.evidenceStateHash)
+      || !isCanonicalRoomHash(row.decisionStateHash)
+    ) {
+      throw new RoomStoreError(
+        "semantic_route_conflict",
+        `Stored protocol-message history is invalid for Room ${roomId}`,
+      );
+    }
+    return {
+      messageId: row.protocolMessageId,
+      sequence: roomEventAggregateVersionToHistorySequence(row.aggregateVersion, roomId),
+      nodeId: row.nodeId,
+      intent: row.intent,
+      semanticLoopFingerprint: row.semanticLoopFingerprint,
+      semanticHash: row.semanticHash,
+      evidenceStateHash: row.evidenceStateHash,
+      decisionStateHash: row.decisionStateHash,
+    };
+  });
+}
+
+function roomEventAggregateVersionToHistorySequence(value: unknown, roomId: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Stored protocol-message history has no causal aggregate version for Room ${roomId}`,
+    );
+  }
+  return value as number;
+}
+
+function buildSemanticRoutingSeats(
+  aggregate: RoomAggregateV1,
+  assignment: RoomRoleAssignmentProjectionV1,
+): readonly RoomSemanticRoutingSeatV1[] {
+  const bySeatId = new Map<string, { bindingId: string; roleIds: Set<string> }>();
+  for (const roleAssignment of assignment.assignment.assignments) {
+    for (const bindingId of roleAssignment.bindingIds) {
+      const binding = aggregate.bindings.find((candidate) => candidate.id === bindingId);
+      const seat = binding
+        ? aggregate.seats.find((candidate) => candidate.id === binding.seatId)
+        : undefined;
+      if (
+        !binding
+        || !seat
+        || binding.state !== "attached"
+        || seat.activeBindingId !== binding.id
+        || !isOperatorMessageSeatRoutable(seat)
+      ) {
+        throw new RoomStoreError(
+          "semantic_route_conflict",
+          `Active role ${roleAssignment.roleId} points to a non-routable binding ${bindingId}`,
+        );
+      }
+      const existing = bySeatId.get(seat.id);
+      if (existing && existing.bindingId !== binding.id) {
+        throw new RoomStoreError(
+          "semantic_route_conflict",
+          `Seat ${seat.id} has more than one active role-assignment binding`,
+        );
+      }
+      const record = existing ?? { bindingId: binding.id, roleIds: new Set<string>() };
+      record.roleIds.add(roleAssignment.roleId);
+      bySeatId.set(seat.id, record);
+    }
+  }
+  if (bySeatId.size === 0) {
+    throw new RoomStoreError("semantic_route_conflict", "Active role assignment has no routable semantic seats");
+  }
+  return [...bySeatId.entries()]
+    .sort(([left], [right]) => compareRoomText(left, right))
+    .map(([seatId, record]) => {
+      const roleIds = [...record.roleIds].sort(compareRoomText);
+      return {
+        seatId,
+        bindingId: record.bindingId,
+        roleId: roleIds[0]!,
+        roleIds,
+        groupIds: roleIds.map((roleId) => `role:${roleId}`),
+      };
+    });
+}
+
+async function loadSemanticStateIdempotencyResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  idempotencyKey: string,
+  commandHash: string,
+): Promise<RoomSemanticStateProjectionV1> {
+  const keys = await handle
+    .select()
+    .from(roomIdempotencyKeys)
+    .where(and(
+      eq(roomIdempotencyKeys.projectId, projectId),
+      eq(roomIdempotencyKeys.roomId, roomId),
+      eq(roomIdempotencyKeys.idempotencyKey, idempotencyKey),
+    ))
+    .limit(1);
+  const key = keys[0];
+  if (
+    !key
+    || key.commandType !== "set_semantic_state"
+    || key.commandHash !== commandHash
+    || !key.resultEventId
+  ) {
+    throw new RoomStoreError(
+      "idempotency_conflict",
+      `Semantic-state idempotency key ${idempotencyKey} does not match a committed command`,
+    );
+  }
+  const eventRows = await handle
+    .select({ eventType: roomEvents.eventType, payload: roomEvents.payload })
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, key.resultEventId),
+    ))
+    .limit(1);
+  const event = eventRows[0];
+  const payload = event ? asRecord(event.payload) : null;
+  if (
+    !event
+    || event.eventType !== "room_semantic_state_updated"
+    || !payload
+    || !isNonBlankString(payload.semanticStateId)
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Semantic-state idempotency result ${key.resultEventId} is missing or malformed`,
+    );
+  }
+  const rows = await handle
+    .select()
+    .from(roomSemanticStates)
+    .where(and(
+      eq(roomSemanticStates.projectId, projectId),
+      eq(roomSemanticStates.roomId, roomId),
+      eq(roomSemanticStates.id, payload.semanticStateId),
+    ))
+    .limit(1);
+  const projection = rows[0] ? parseStoredRoomSemanticState(rows[0]) : null;
+  if (
+    !projection
+    || payload.revision !== projection.revision
+    || payload.turnId !== projection.turnId
+    || payload.nodeId !== projection.nodeId
+    || payload.stateFingerprint !== projection.stateFingerprint
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Semantic-state idempotency result ${key.resultEventId} lost its durable projection`,
+    );
+  }
+  return projection;
+}
+
+function parseStoredRoomProtocolMessage(
+  messageRow: typeof roomMessages.$inferSelect,
+  protocolRow: typeof roomProtocolMessages.$inferSelect,
+): RoomProtocolMessageProjectionV1 {
+  if (
+    messageRow.id !== protocolRow.id
+    || messageRow.roomId !== protocolRow.roomId
+    || messageRow.projectId !== protocolRow.projectId
+    || !isNonBlankString(protocolRow.protocolMessageId)
+    || !isNonBlankString(protocolRow.turnId)
+    || !isNonBlankString(protocolRow.nodeId)
+    || !isNonBlankString(protocolRow.protocolId)
+    || !Number.isSafeInteger(protocolRow.protocolVersion)
+    || protocolRow.protocolVersion < 1
+    || !isNonBlankString(protocolRow.phaseId)
+    || !isNonBlankString(protocolRow.channelId)
+    || !isCanonicalUtcIsoTimestamp(protocolRow.issuedAt)
+    || !isNonBlankString(protocolRow.originSeatId)
+    || !isNonBlankString(protocolRow.originBindingId)
+    || !isNonBlankString(protocolRow.originRoleId)
+    || !isCanonicalRoomHash(protocolRow.semanticHash)
+    || !isCanonicalRoomHash(protocolRow.evidenceStateHash)
+    || !isCanonicalRoomHash(protocolRow.decisionStateHash)
+    || !isNonBlankString(protocolRow.semanticStateId)
+    || !Number.isSafeInteger(protocolRow.semanticStateRevision)
+    || protocolRow.semanticStateRevision < 1
+    || !isCanonicalRoomHash(protocolRow.semanticStateFingerprint)
+    || !isCanonicalRoomHash(protocolRow.semanticLoopFingerprint)
+    || !isRoomMessageTarget(protocolRow.protocolTarget)
+    || !(protocolRow.routeOutcome === "route" || protocolRow.routeOutcome === "loop_break")
+    || typeof protocolRow.recipientController !== "boolean"
+    || typeof protocolRow.requiredControllerResponse !== "boolean"
+    || !isUniqueNonBlankStringArray(protocolRow.recipientSeatIds)
+    || !isUniqueNonBlankStringArray(protocolRow.requiredResponderSeatIds)
+    || !isCanonicalUtcIsoTimestamp(protocolRow.createdAt)
+  ) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Stored protocol message ${protocolRow.id} has invalid durable metadata`,
+    );
+  }
+  const parsedEnvelope = validateRoomProtocolMessage({
+    contractVersion: "room-protocol-message/v1",
+    messageId: protocolRow.protocolMessageId,
+    issuedAt: protocolRow.issuedAt,
+    protocolId: protocolRow.protocolId,
+    protocolVersion: protocolRow.protocolVersion,
+    phaseId: protocolRow.phaseId,
+    channelId: protocolRow.channelId,
+    projectId: messageRow.projectId,
+    roomId: messageRow.roomId,
+    turnId: protocolRow.turnId,
+    nodeId: protocolRow.nodeId,
+    origin: {
+      seatId: protocolRow.originSeatId,
+      bindingId: protocolRow.originBindingId,
+      roleId: protocolRow.originRoleId,
+    },
+    target: protocolRow.protocolTarget,
+    intent: messageRow.intent,
+    content: messageRow.content,
+    contentHash: messageRow.contentHash,
+    semanticHash: protocolRow.semanticHash,
+    evidenceStateHash: protocolRow.evidenceStateHash,
+    decisionStateHash: protocolRow.decisionStateHash,
+    authority: messageRow.authority,
+    references: protocolRow.referenceBundle,
+  });
+  if (!parsedEnvelope.ok) {
+    throw new RoomStoreError(
+      "semantic_route_conflict",
+      `Stored protocol message ${protocolRow.id} has an invalid persisted envelope`,
+    );
+  }
+  const envelope = parsedEnvelope.value;
+  return {
+    id: protocolRow.id,
+    roomId: protocolRow.roomId,
+    protocolMessageId: protocolRow.protocolMessageId,
+    turnId: protocolRow.turnId,
+    nodeId: protocolRow.nodeId,
+    protocolId: protocolRow.protocolId,
+    protocolVersion: protocolRow.protocolVersion,
+    phaseId: protocolRow.phaseId,
+    channelId: protocolRow.channelId,
+    issuedAt: protocolRow.issuedAt,
+    envelope,
+    origin: envelope.origin,
+    target: envelope.target,
+    semanticLoopFingerprint: protocolRow.semanticLoopFingerprint,
+    semanticStateId: protocolRow.semanticStateId,
+    semanticStateRevision: protocolRow.semanticStateRevision,
+    semanticStateFingerprint: protocolRow.semanticStateFingerprint,
+    routeOutcome: protocolRow.routeOutcome,
+    recipientController: protocolRow.recipientController,
+    recipientSeatIds: [...protocolRow.recipientSeatIds],
+    requiredControllerResponse: protocolRow.requiredControllerResponse,
+    requiredResponderSeatIds: [...protocolRow.requiredResponderSeatIds],
+    createdAt: protocolRow.createdAt,
+  };
+}
+
+function rowToRoomSemanticControllerAction(
+  row: typeof roomSemanticControllerInbox.$inferSelect,
+): RoomSemanticControllerActionV1 {
+  if (
+    !isNonBlankString(row.id)
+    || !isNonBlankString(row.roomId)
+    || !isNonBlankString(row.messageId)
+    || !(row.protocolMessageId === null || isNonBlankString(row.protocolMessageId))
+    || !(row.actionKind === "semantic_message" || row.actionKind === "semantic_loop_break")
+    || !(row.reasonCode === null || isNonBlankString(row.reasonCode))
+    || !(row.state === "pending" || row.state === "claimed" || row.state === "processed")
+    || !Number.isSafeInteger(row.attemptCount)
+    || row.attemptCount < 0
+    || !isCanonicalUtcIsoTimestamp(row.createdAt)
+    || !isCanonicalUtcIsoTimestamp(row.updatedAt)
+    || !(row.processedAt === null || isCanonicalUtcIsoTimestamp(row.processedAt))
+    || !(row.claimExpiresAt === null || isCanonicalUtcIsoTimestamp(row.claimExpiresAt))
+    || !(row.claimToken === null || isNonBlankString(row.claimToken))
+    || !(row.claimedBy === null || isNonBlankString(row.claimedBy))
+    || !(row.lastErrorCode === null || isNonBlankString(row.lastErrorCode))
+    || !isRuntimeRecord(row.payload)
+  ) {
+    throw new RoomStoreError(
+      "semantic_controller_action_conflict",
+      `Stored semantic controller action ${row.id} has invalid metadata`,
+    );
+  }
+  const expectedClaimShape = row.state === "pending"
+    ? row.claimToken === null && row.claimExpiresAt === null && row.claimedBy === null && row.processedAt === null
+    : row.state === "claimed"
+      ? row.claimToken !== null && row.claimExpiresAt !== null && row.claimedBy !== null && row.processedAt === null
+      : row.claimToken === null && row.claimExpiresAt === null && row.claimedBy === null && row.processedAt !== null;
+  if (!expectedClaimShape) {
+    throw new RoomStoreError(
+      "semantic_controller_action_conflict",
+      `Stored semantic controller action ${row.id} violates its state/claim invariant`,
+    );
+  }
+  return {
+    id: row.id,
+    roomId: row.roomId,
+    messageId: row.messageId,
+    protocolMessageId: row.protocolMessageId,
+    actionKind: row.actionKind,
+    reasonCode: row.reasonCode,
+    payload: structuredClone(row.payload),
+    state: row.state,
+    attemptCount: row.attemptCount,
+    claimToken: row.claimToken,
+    claimExpiresAt: row.claimExpiresAt,
+    claimedBy: row.claimedBy,
+    processedAt: row.processedAt,
+    lastErrorCode: row.lastErrorCode,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+async function loadRoomProtocolMessageIdempotencyResult(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  idempotencyKey: string,
+  commandHash: string,
+): Promise<RouteRoomProtocolMessageResultV1> {
+  const keys = await handle
+    .select()
+    .from(roomIdempotencyKeys)
+    .where(and(
+      eq(roomIdempotencyKeys.projectId, projectId),
+      eq(roomIdempotencyKeys.roomId, roomId),
+      eq(roomIdempotencyKeys.idempotencyKey, idempotencyKey),
+    ))
+    .limit(1);
+  const key = keys[0];
+  if (
+    !key
+    || key.commandType !== "route_protocol_message"
+    || key.commandHash !== commandHash
+    || !key.resultEventId
+  ) {
+    throw new RoomStoreError(
+      "idempotency_conflict",
+      `Protocol-message idempotency key ${idempotencyKey} does not match a committed command`,
+    );
+  }
+  const eventRows = await handle
+    .select()
+    .from(roomEvents)
+    .where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.roomId, roomId),
+      eq(roomEvents.id, key.resultEventId),
+    ))
+    .limit(1);
+  const eventRow = eventRows[0];
+  const payload = eventRow ? asRecord(eventRow.payload) : null;
+  if (
+    !eventRow
+    || eventRow.eventType !== "room_protocol_message_routed"
+    || !payload
+    || !isNonBlankString(payload.messageId)
+    || !isNonBlankString(payload.protocolMessageId)
+    || !isUniqueNonBlankStringArray(payload.targetIds)
+    || !isUniqueNonBlankStringArray(payload.outboxIds)
+    || !(payload.controllerActionId === null || isNonBlankString(payload.controllerActionId))
+  ) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Protocol-message idempotency result ${key.resultEventId} is missing or malformed`,
+    );
+  }
+  const messageRows = await handle
+    .select()
+    .from(roomMessages)
+    .where(and(
+      eq(roomMessages.projectId, projectId),
+      eq(roomMessages.roomId, roomId),
+      eq(roomMessages.id, payload.messageId),
+    ))
+    .limit(1);
+  const protocolRows = await handle
+    .select()
+    .from(roomProtocolMessages)
+    .where(and(
+      eq(roomProtocolMessages.projectId, projectId),
+      eq(roomProtocolMessages.roomId, roomId),
+      eq(roomProtocolMessages.id, payload.messageId),
+    ))
+    .limit(1);
+  const messageRow = messageRows[0];
+  const protocolRow = protocolRows[0];
+  if (!messageRow || !protocolRow) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Protocol-message event ${key.resultEventId} lost its message projection`,
+    );
+  }
+  const protocolMessage = parseStoredRoomProtocolMessage(messageRow, protocolRow);
+  if (protocolMessage.protocolMessageId !== payload.protocolMessageId) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Protocol-message event ${key.resultEventId} disagrees with durable protocol identity`,
+    );
+  }
+  const [targetRows, outboxRows] = await Promise.all([
+    handle
+      .select()
+      .from(roomMessageTargets)
+      .where(and(
+        eq(roomMessageTargets.projectId, projectId),
+        eq(roomMessageTargets.roomId, roomId),
+        inArray(roomMessageTargets.id, [...payload.targetIds]),
+      ))
+      .orderBy(asc(roomMessageTargets.ordinal), asc(roomMessageTargets.id)),
+    payload.outboxIds.length === 0
+      ? Promise.resolve([])
+      : handle
+        .select()
+        .from(roomOutbox)
+        .where(and(
+          eq(roomOutbox.projectId, projectId),
+          eq(roomOutbox.roomId, roomId),
+          inArray(roomOutbox.id, [...payload.outboxIds]),
+        ))
+        .orderBy(asc(roomOutbox.createdAt), asc(roomOutbox.id)),
+  ]);
+  if (targetRows.length !== payload.targetIds.length || outboxRows.length !== payload.outboxIds.length) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Protocol-message event ${key.resultEventId} lost frozen targets or delivery intent`,
+    );
+  }
+  let controllerAction: RoomSemanticControllerActionV1 | null = null;
+  if (payload.controllerActionId !== null) {
+    const actionRows = await handle
+      .select()
+      .from(roomSemanticControllerInbox)
+      .where(and(
+        eq(roomSemanticControllerInbox.projectId, projectId),
+        eq(roomSemanticControllerInbox.roomId, roomId),
+        eq(roomSemanticControllerInbox.id, payload.controllerActionId),
+      ))
+      .limit(1);
+    if (!actionRows[0]) {
+      throw new RoomStoreError(
+        "idempotency_result_missing",
+        `Protocol-message event ${key.resultEventId} lost its controller action`,
+      );
+    }
+    controllerAction = rowToRoomSemanticControllerAction(actionRows[0]);
+  }
+  return {
+    message: {
+      contractVersion: 1,
+      id: messageRow.id,
+      roomId: messageRow.roomId,
+      turnId: messageRow.turnId,
+      nodeId: messageRow.nodeId,
+      originType: messageRow.originType as StoredRoomMessageV1["originType"],
+      originId: messageRow.originId,
+      targetSeatIds: protocolMessage.recipientSeatIds,
+      intent: messageRow.intent,
+      contentHash: messageRow.contentHash,
+      authorityEnvelope: asRecord(messageRow.authority),
+      createdAt: messageRow.createdAt,
+      content: messageRow.content,
+    },
+    protocolMessage,
+    targets: targetRows.map(rowToDurableMessageTarget),
+    deliveries: outboxRows.map(rowToOutboxRecord),
+    controllerAction,
+    event: rowToRoomEvent(eventRow),
+    replayed: false,
+  };
+}
+
+function buildSemanticMessageTargetValues(input: {
+  readonly projectId: string;
+  readonly roomId: string;
+  readonly messageId: string;
+  readonly target: RoomMessageTargetV1;
+  readonly recipients: readonly { readonly seatId: string; readonly bindingId: string }[];
+  readonly createdAt: string;
+}): Array<typeof roomMessageTargets.$inferSelect> {
+  if (input.target.kind === "controller") {
+    return [{
+      id: `room-message-target-${randomUUID()}`,
+      projectId: input.projectId,
+      roomId: input.roomId,
+      messageId: input.messageId,
+      selectorKind: "controller",
+      selectorRef: null,
+      targetKind: "controller",
+      seatId: null,
+      bindingId: null,
+      ordinal: 0,
+      createdAt: input.createdAt,
+    }];
+  }
+  if (input.recipients.length === 0) {
+    throw new RoomStoreError("semantic_route_conflict", "A seat-targeted semantic route must have frozen recipients");
+  }
+  const selectorRef = input.target.kind === "group" ? input.target.groupId : null;
+  return input.recipients.map((recipient, ordinal) => ({
+    id: `room-message-target-${randomUUID()}`,
+    projectId: input.projectId,
+    roomId: input.roomId,
+    messageId: input.messageId,
+    selectorKind: input.target.kind,
+    selectorRef,
+    targetKind: "seat",
+    seatId: recipient.seatId,
+    bindingId: recipient.bindingId,
+    ordinal,
+    createdAt: input.createdAt,
+  }));
+}
+
+function buildSemanticControllerActionPayload(
+  message: RoomProtocolMessageV1,
+  state: RoomSemanticStateProjectionV1,
+  audit: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  return {
+    contractVersion: "room-semantic-controller-action/v1",
+    protocolMessageId: message.messageId,
+    // The controller must be able to re-check the same phase/channel/authority
+    // envelope that was routed; identifiers plus a hash are not enough after a
+    // restart or when the active role assignment has changed.
+    protocolEnvelope: structuredClone(message),
+    turnId: message.turnId,
+    nodeId: message.nodeId,
+    intent: message.intent,
+    origin: message.origin,
+    semanticStateId: state.id,
+    semanticStateRevision: state.revision,
+    semanticStateFingerprint: state.stateFingerprint,
+    audit,
+  };
+}
+
+async function enqueueRoomSemanticControllerAction(
+  tx: DbTransaction,
+  input: {
+    readonly projectId: string;
+    readonly roomId: string;
+    readonly messageId: string;
+    readonly protocolMessageId: string | null;
+    readonly actionKind: "semantic_message" | "semantic_loop_break";
+    readonly reasonCode: string | null;
+    readonly payload: Readonly<Record<string, unknown>>;
+    readonly createdAt: string;
+    readonly id?: string;
+  },
+): Promise<RoomSemanticControllerActionV1> {
+  const id = input.id ?? `room-semantic-controller-action-${randomUUID()}`;
+  await tx
+    .insert(roomSemanticControllerInbox)
+    .values({
+      id,
+      projectId: input.projectId,
+      roomId: input.roomId,
+      messageId: input.messageId,
+      protocolMessageId: input.protocolMessageId,
+      actionKind: input.actionKind,
+      reasonCode: input.reasonCode,
+      payload: input.payload,
+      state: "pending",
+      attemptCount: 0,
+      claimToken: null,
+      claimExpiresAt: null,
+      claimedBy: null,
+      processedAt: null,
+      lastErrorCode: null,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    })
+    .onConflictDoNothing();
+  const rows = await tx
+    .select()
+    .from(roomSemanticControllerInbox)
+    .where(and(
+      eq(roomSemanticControllerInbox.projectId, input.projectId),
+      eq(roomSemanticControllerInbox.roomId, input.roomId),
+      eq(roomSemanticControllerInbox.id, id),
+    ))
+    .limit(1);
+  if (!rows[0]) {
+    throw new RoomStoreError(
+      "semantic_controller_action_conflict",
+      `Failed to persist semantic controller action ${id}`,
+    );
+  }
+  return rowToRoomSemanticControllerAction(rows[0]);
+}
+
+async function ensureRoomSemanticLoopBreakEscalation(
+  tx: DbTransaction,
+  input: {
+    readonly projectId: string;
+    readonly roomId: string;
+    readonly sourceMessageId: string;
+    readonly message: RoomProtocolMessageV1;
+    readonly semanticState: RoomSemanticStateProjectionV1;
+    readonly audit: Readonly<Record<string, unknown>>;
+    readonly createdAt: string;
+  },
+  ): Promise<{
+    readonly messageId: string;
+    readonly targetId: string;
+    readonly controllerAction: RoomSemanticControllerActionV1;
+    readonly snapshot: NonNullable<RoomSemanticRouteEventSnapshotV1["loopBreak"]>;
+  }> {
+  const stableId = hashRoomValue({
+    roomId: input.roomId,
+    turnId: input.message.turnId,
+    nodeId: input.message.nodeId,
+    semanticStateFingerprint: input.semanticState.stateFingerprint,
+  }).slice("sha256:".length);
+  const messageId = `room-semantic-loop-help-${stableId}`;
+  const targetId = `room-semantic-loop-help-target-${stableId}`;
+  const actionId = `room-semantic-loop-help-action-${stableId}`;
+  const loopBreakId = `room-semantic-loop-break-${stableId}`;
+  const content = JSON.stringify({
+    contractVersion: "room-semantic-loop-break/v1",
+    reasonCode: "semantic_loop",
+    parentMessageId: input.message.messageId,
+    semanticStateFingerprint: input.semanticState.stateFingerprint,
+  });
+  const authority: RoomAuthorityEnvelopeV1 = {
+    actorType: "controller",
+    actorId: "room-semantic-router",
+    deviceId: null,
+    role: "controller",
+    allowedActions: ["room:semantic:review"],
+    projectId: input.projectId,
+    roomId: input.roomId,
+    nodeIds: [input.message.nodeId],
+    seatIds: [],
+    evidenceRefs: [...input.message.references.evidenceRefs],
+  };
+  const contentHash = hashRoomValue(content);
+  const escalationMessage: StoredRoomMessageV1 = {
+    contractVersion: 1,
+    id: messageId,
+    roomId: input.roomId,
+    turnId: input.message.turnId,
+    nodeId: input.message.nodeId,
+    originType: "controller",
+    originId: authority.actorId,
+    targetSeatIds: [],
+    intent: "help_request",
+    contentHash,
+    authorityEnvelope: authority as unknown as Readonly<Record<string, unknown>>,
+    createdAt: input.createdAt,
+    content,
+  };
+  const escalationTarget: DurableRoomMessageTargetV1 = {
+    contractVersion: 1,
+    id: targetId,
+    projectId: input.projectId,
+    roomId: input.roomId,
+    messageId,
+    selectorKind: "controller",
+    selectorRef: null,
+    targetKind: "controller",
+    seatId: null,
+    bindingId: null,
+    ordinal: 0,
+    createdAt: input.createdAt,
+  };
+  await tx.insert(roomMessages).values({
+    id: messageId,
+    projectId: input.projectId,
+    roomId: input.roomId,
+    turnId: input.message.turnId,
+    nodeId: input.message.nodeId,
+    originType: "controller",
+    originId: authority.actorId,
+    intent: "help_request",
+    target: { kind: "controller" },
+    targetSeatIds: [],
+    authority,
+    content: escalationMessage.content,
+    contentHash: escalationMessage.contentHash,
+    evidenceRefs: input.message.references.evidenceRefs,
+    idempotencyKey: `semantic-loop:${stableId}`,
+    expectedAggregateVersion: null,
+    createdAt: input.createdAt,
+  }).onConflictDoNothing();
+  await tx.insert(roomMessageTargets).values({
+    id: escalationTarget.id,
+    projectId: input.projectId,
+    roomId: input.roomId,
+    messageId: escalationTarget.messageId,
+    selectorKind: escalationTarget.selectorKind,
+    selectorRef: escalationTarget.selectorRef,
+    targetKind: escalationTarget.targetKind,
+    seatId: escalationTarget.seatId,
+    bindingId: escalationTarget.bindingId,
+    ordinal: escalationTarget.ordinal,
+    createdAt: escalationTarget.createdAt,
+  }).onConflictDoNothing();
+  const controllerAction = await enqueueRoomSemanticControllerAction(tx, {
+    id: actionId,
+    projectId: input.projectId,
+    roomId: input.roomId,
+    messageId,
+    protocolMessageId: input.message.messageId,
+    actionKind: "semantic_loop_break",
+    reasonCode: "semantic_loop",
+    payload: {
+      ...buildSemanticControllerActionPayload(input.message, input.semanticState, input.audit),
+      parentMessageId: input.message.messageId,
+      reasonCode: "semantic_loop",
+    },
+    createdAt: input.createdAt,
+  });
+  await tx.insert(roomSemanticLoopBreaks).values({
+    id: loopBreakId,
+    projectId: input.projectId,
+    roomId: input.roomId,
+    turnId: input.message.turnId,
+    nodeId: input.message.nodeId,
+    semanticStateFingerprint: input.semanticState.stateFingerprint,
+    sourceMessageId: input.sourceMessageId,
+    escalationMessageId: messageId,
+    createdAt: input.createdAt,
+  }).onConflictDoNothing();
+  return {
+    messageId,
+    targetId,
+    controllerAction,
+    snapshot: {
+      message: escalationMessage,
+      target: escalationTarget,
+      controllerAction,
+    },
+  };
+}
+
+function throwInvalidTaskDispatchClaim(): never {
+  throw new RoomStoreError(
+    "task_dispatch_invalid_claim",
+    "Ready task dispatch requires canonical versions, a current controller worker fence, assigned owner, authority, and content hash",
+  );
 }
 
 function resolveOperatorMessageTargets(
@@ -5385,6 +14828,111 @@ async function requireRoomBinding(
   }
 }
 
+/**
+ * Sender fencing is required on both sides of an external delivery. Checking
+ * only `beginDeliveryAttempt` leaves a TOCTOU gap: a displaced sender can
+ * still persist its old acknowledgement after a human/native takeover. The
+ * same transactional guard is therefore shared by begin and completion.
+ */
+async function assertDeliverySenderFenceWithinTransaction(
+  tx: DbTransaction,
+  input: {
+    readonly projectId: string;
+    readonly outbox: typeof roomOutbox.$inferSelect;
+    readonly outboxId: string;
+    readonly senderFence: BeginRoomDeliveryAttemptInput["senderFence"];
+    readonly now: string;
+    /**
+     * A provider acknowledgement can arrive after a lease TTL. Completion may
+     * use that expired epoch only when no replacement epoch exists under the
+     * same resource lock; begin remains strictly active-fence only.
+     */
+    readonly allowExpiredExactFence?: boolean;
+  },
+): Promise<StoredRoomLeaseV1 | null> {
+  if (input.senderFence) {
+    await lockRoomConnectorIngestion(tx, input.projectId, input.outbox.bindingId);
+    await lockRoomLeaseResourceWithinTransaction(
+      tx,
+      input.projectId,
+      "sender",
+      input.senderFence.resourceId,
+    );
+    let senderLease: StoredRoomLeaseV1;
+    try {
+      senderLease = await assertRoomLeaseFence(tx, input.projectId, {
+        ...input.senderFence,
+        now: input.now,
+      });
+    } catch (error) {
+      if (!input.allowExpiredExactFence || !(error instanceof RoomLeaseFenceError)) {
+        throw error;
+      }
+
+      const persistedLease = await assertPersistedRoomLeaseFenceIdentity(
+        tx,
+        input.projectId,
+        input.senderFence,
+      );
+      const newerEpoch = await tx
+        .select({ id: roomLeases.id })
+        .from(roomLeases)
+        .where(and(
+          eq(roomLeases.projectId, input.projectId),
+          eq(roomLeases.roomId, input.outbox.roomId),
+          eq(roomLeases.kind, "sender"),
+          eq(roomLeases.resourceId, input.senderFence.resourceId),
+          gt(roomLeases.epoch, input.senderFence.expectedEpoch),
+        ))
+        .limit(1);
+      const expiredAt = Date.parse(persistedLease.expiresAt);
+      const completionAt = Date.parse(input.now);
+      if (
+        persistedLease.releasedAt !== null
+        || !Number.isFinite(expiredAt)
+        || !Number.isFinite(completionAt)
+        || expiredAt > completionAt
+        || newerEpoch.length > 0
+      ) {
+        throw error;
+      }
+
+      // The resource lock makes this late acknowledgement linearize before a
+      // successor can acquire the binding; accepting it never resurrects F1.
+      senderLease = persistedLease;
+    }
+    if (
+      senderLease.kind !== "sender"
+      || senderLease.roomId !== input.outbox.roomId
+      || senderLease.resourceId !== input.outbox.bindingId
+    ) {
+      throw new RoomLeaseFenceError(
+        `Sender lease ${senderLease.id} does not authorize outbox ${input.outboxId}`,
+        senderLease,
+      );
+    }
+    return senderLease;
+  }
+
+  const leaseHistory = await tx
+    .select({ id: roomLeases.id })
+    .from(roomLeases)
+    .where(and(
+      eq(roomLeases.projectId, input.projectId),
+      eq(roomLeases.kind, "sender"),
+      eq(roomLeases.resourceId, input.outbox.bindingId),
+    ))
+    .orderBy(desc(roomLeases.epoch))
+    .limit(1);
+  if (leaseHistory.length > 0) {
+    throw new RoomLeaseFenceError(
+      `Sender-managed outbox ${input.outboxId} requires the exact active sender lease fence`,
+      null,
+    );
+  }
+  return null;
+}
+
 async function lockRoomConnectorIngestion(
   tx: DbTransaction,
   projectId: string,
@@ -5884,6 +15432,158 @@ async function verifyLegacyHappierBindingSource(
   }
 }
 
+function isControllerTerminalizationOutcome(value: RoomLifecycleState): value is RoomTerminalizationOutcomeV1 {
+  return value === "completed"
+    || value === "completed_with_risks"
+    || value === "partial"
+    || value === "cancelled"
+    || value === "failed";
+}
+
+function assertTerminalizationControllerContext(
+  context: RoomCommandContext,
+  fence: Omit<AssertRoomLeaseFenceInput, "roomId" | "kind" | "resourceId" | "now">,
+  asOf: string,
+): void {
+  if (context.actorType !== "controller" || context.actorId !== fence.holderId) {
+    throw new RoomStoreError(
+      "terminalization_controller_required",
+      "Only the current controller worker may record or terminalize a Room contract",
+    );
+  }
+  if (context.occurredAt !== asOf) {
+    throw new RoomStoreError(
+      "terminalization_controller_required",
+      "Terminalization command time must exactly match its controller event time",
+    );
+  }
+}
+
+async function loadRoomTerminalizationProjection(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+): Promise<RoomTerminalizationContractProjectionV1 | null> {
+  const rows = await handle
+    .select({ completionContract: operationalRooms.completionContract })
+    .from(operationalRooms)
+    .where(and(eq(operationalRooms.projectId, projectId), eq(operationalRooms.id, roomId)))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  try {
+    return parseRoomTerminalizationProjection(row.completionContract);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid terminalization contract projection";
+    throw new RoomStoreError("terminalization_contract_conflict", message);
+  }
+}
+
+async function loadRecordedTerminalizationContractResult(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  idempotencyKey: string,
+  commandHash: string,
+): Promise<RecordRoomTerminalizationContractResultV1> {
+  const existingRows = await tx
+    .select()
+    .from(roomIdempotencyKeys)
+    .where(and(
+      eq(roomIdempotencyKeys.projectId, projectId),
+      eq(roomIdempotencyKeys.roomId, roomId),
+      eq(roomIdempotencyKeys.idempotencyKey, idempotencyKey),
+    ))
+    .limit(1);
+  const existing = existingRows[0];
+  if (!existing
+    || existing.commandType !== "record_room_terminalization_contract"
+    || existing.commandHash !== commandHash) {
+    throw new RoomStoreError(
+      "idempotency_conflict",
+      `Idempotency key ${idempotencyKey} was already used for a different terminalization contract command`,
+    );
+  }
+  if (!existing.resultEventId) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Terminalization contract key ${idempotencyKey} has no committed event`,
+    );
+  }
+  const eventRows = await tx
+    .select()
+    .from(roomEvents)
+    .where(and(eq(roomEvents.projectId, projectId), eq(roomEvents.id, existing.resultEventId)))
+    .limit(1);
+  const eventRow = eventRows[0];
+  if (!eventRow || eventRow.roomId !== roomId || eventRow.eventType !== "room_terminalization_contract_recorded") {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Terminalization contract key ${idempotencyKey} references an invalid result event`,
+    );
+  }
+  const projection = await loadRoomTerminalizationProjection(tx, projectId, roomId);
+  if (!projection || projection.contract.recordEventId !== eventRow.id) {
+    throw new RoomStoreError(
+      "terminalization_contract_conflict",
+      `Terminalization contract projection does not match committed record event ${eventRow.id}`,
+    );
+  }
+  return { projection, event: rowToRoomEvent(eventRow), replayed: true };
+}
+
+async function loadTerminalizedRoomResult(
+  tx: DbTransaction,
+  projectId: string,
+  roomId: string,
+  idempotencyKey: string,
+  commandHash: string,
+): Promise<TerminalizeRoomResultV1> {
+  const existingRows = await tx
+    .select()
+    .from(roomIdempotencyKeys)
+    .where(and(
+      eq(roomIdempotencyKeys.projectId, projectId),
+      eq(roomIdempotencyKeys.roomId, roomId),
+      eq(roomIdempotencyKeys.idempotencyKey, idempotencyKey),
+    ))
+    .limit(1);
+  const existing = existingRows[0];
+  if (!existing || existing.commandType !== "terminalize_room" || existing.commandHash !== commandHash) {
+    throw new RoomStoreError(
+      "idempotency_conflict",
+      `Idempotency key ${idempotencyKey} was already used for a different terminalization command`,
+    );
+  }
+  if (!existing.resultEventId) {
+    throw new RoomStoreError("idempotency_result_missing", `Terminalization key ${idempotencyKey} has no committed event`);
+  }
+  const [eventRows, aggregate, projection] = await Promise.all([
+    tx.select().from(roomEvents).where(and(
+      eq(roomEvents.projectId, projectId),
+      eq(roomEvents.id, existing.resultEventId),
+    )).limit(1),
+    loadRoomAggregateProjection(tx, projectId, roomId),
+    loadRoomTerminalizationProjection(tx, projectId, roomId),
+  ]);
+  const eventRow = eventRows[0];
+  if (!eventRow || eventRow.roomId !== roomId || eventRow.eventType !== "room_terminalized" || !aggregate || !projection) {
+    throw new RoomStoreError(
+      "idempotency_result_missing",
+      `Terminalization key ${idempotencyKey} references an incomplete committed result`,
+    );
+  }
+  if (projection.state !== "terminalized"
+    || projection.terminalization?.eventId !== eventRow.id
+    || aggregate.terminalization?.eventId !== eventRow.id) {
+    throw new RoomStoreError(
+      "terminalization_contract_conflict",
+      `Terminalization projection does not match committed terminal event ${eventRow.id}`,
+    );
+  }
+  return { aggregate, projection, event: rowToRoomEvent(eventRow), replayed: true };
+}
+
 export async function loadRoomAggregateProjection(
   handle: QueryHandle,
   projectId: string,
@@ -5896,6 +15596,13 @@ export async function loadRoomAggregateProjection(
     .limit(1);
   const row = rooms[0];
   if (!row) return undefined;
+  let terminalization: RoomTerminalizationMarkerV1 | undefined;
+  try {
+    terminalization = parseRoomTerminalizationProjection(row.completionContract)?.terminalization ?? undefined;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid terminalization contract projection";
+    throw new RoomStoreError("terminalization_contract_conflict", message);
+  }
 
   const seatRows = await handle
     .select()
@@ -5981,6 +15688,7 @@ export async function loadRoomAggregateProjection(
       endedAt: turn.endedAt,
     })),
     pendingMembershipChanges: membershipRows.map(rowToPendingMembershipChange),
+    ...(terminalization ? { terminalization } : {}),
   };
 }
 
@@ -6532,9 +16240,11 @@ function normalizeTaskTopologyNodeDefinition(
   label: string,
 ): RoomTaskNodeDefinitionV1 {
   const record = asRecord(value);
+  const hasAssignedSeatIds = record.assignedSeatIds !== undefined;
   assertTaskGraphObjectKeys(record, [
     "id",
     "objective",
+    ...(hasAssignedSeatIds ? ["assignedSeatIds"] : []),
     "inputRefs",
     "outputRefs",
     "roleRequirements",
@@ -6726,6 +16436,7 @@ function applyTaskGraphMutations(
           id: node.id,
           parentNodeId: node.parentNodeId,
           objective: patch.objective ?? node.objective,
+          assignedSeatIds: node.assignedSeatIds,
           inputRefs: patch.inputRefs ?? node.inputRefs,
           outputRefs: patch.outputRefs ?? node.outputRefs,
           roleRequirements: patch.roleRequirements ?? node.roleRequirements,
@@ -6765,6 +16476,12 @@ function applyTaskGraphMutations(
           throw new RoomStoreError(
             "task_graph_invalid_mutation",
             `Task node ${node.id} has unsupported target state ${String(mutation.to)}`,
+          );
+        }
+        if (mutation.to === "running") {
+          throw new RoomStoreError(
+            "task_dispatch_invalid_claim",
+            `Task node ${node.id} must enter running through the fenced durable dispatch claim`,
           );
         }
         if (!ROOM_TASK_ALLOWED_TRANSITIONS[node.state].has(mutation.to)) {
@@ -7760,6 +17477,158 @@ async function loadRoomTaskGraphProjection(
   );
 }
 
+type BlockTaskDispatchNodeInput =
+  | {
+      readonly now: string;
+      readonly eventType: "room_task_dispatch_delivery_rejected";
+      readonly errorCode: string;
+    }
+  | {
+      readonly now: string;
+      readonly eventType: "room_task_dispatch_delivery_uncertain_blocked";
+      readonly errorCode: string;
+      readonly firstUncertainAt: string;
+    };
+
+async function blockTaskDispatchNode(
+  tx: DbTransaction,
+  projectId: string,
+  outbox: typeof roomOutbox.$inferSelect,
+  input: BlockTaskDispatchNodeInput,
+): Promise<RoomEventRecordV1 | null> {
+  if (
+    input.eventType === "room_task_dispatch_delivery_uncertain_blocked"
+    && !isCanonicalUtcIsoTimestamp(input.firstUncertainAt)
+  ) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `Task-dispatch uncertainty for Room outbox ${outbox.id} requires its first canonical observation time`,
+    );
+  }
+  if (outbox.dispatchTaskNodeId === null && outbox.dispatchClaimNodeVersion === null) return null;
+  if (outbox.dispatchTaskNodeId === null || outbox.dispatchClaimNodeVersion === null) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `Task-dispatch linkage for Room outbox ${outbox.id} is incomplete`,
+    );
+  }
+
+  await lockRoomLeaseResourceWithinTransaction(tx, projectId, "room_worker", outbox.roomId);
+  const [current, graph] = await Promise.all([
+    loadRoomAggregateProjection(tx, projectId, outbox.roomId),
+    loadRoomTaskGraphProjection(tx, projectId, outbox.roomId),
+  ]);
+  if (!current || !graph) {
+    throw new RoomStoreError(
+      "delivery_state_conflict",
+      `Task-dispatch rejection for ${outbox.id} lost its Room graph projection`,
+    );
+  }
+  const node = graph.nodes.find((candidate) => candidate.id === outbox.dispatchTaskNodeId);
+  if (!node || node.state !== "running" || node.nodeVersion !== outbox.dispatchClaimNodeVersion) {
+    // A later, independently fenced graph transition owns the current state.
+    // Never let a delayed rejection clobber it or emit a false second history.
+    return null;
+  }
+
+  const nextAggregateVersion = advanceTaskGraphVersion(
+    current.room.aggregateVersion,
+    "aggregateVersion",
+  );
+  const nextDagVersion = advanceTaskGraphVersion(graph.dagVersion, "dagVersion");
+  const blockedNodeVersion = advanceTaskGraphVersion(node.nodeVersion, `nodeVersion:${node.id}`);
+  const blockedNodes = new Map(graph.nodes.map((candidate) => [
+    candidate.id,
+    candidate.id === node.id
+      ? { ...candidate, state: "blocked" as const, nodeVersion: blockedNodeVersion }
+      : candidate,
+  ] as const));
+  const projection = buildTaskGraphProjection(
+    outbox.roomId,
+    nextAggregateVersion,
+    nextDagVersion,
+    blockedNodes,
+    new Map(graph.edges.map((edge) => [edge.id, edge] as const)),
+  );
+  const next: RoomAggregateV1 = {
+    ...current,
+    room: {
+      ...current.room,
+      aggregateVersion: nextAggregateVersion,
+      updatedAt: input.now,
+    },
+  };
+  const roomUpdated = await tx
+    .update(operationalRooms)
+    .set({
+      aggregateVersion: nextAggregateVersion,
+      taskGraphVersion: nextDagVersion,
+      updatedAt: input.now,
+    })
+    .where(and(
+      eq(operationalRooms.projectId, projectId),
+      eq(operationalRooms.id, outbox.roomId),
+      eq(operationalRooms.aggregateVersion, current.room.aggregateVersion),
+      eq(operationalRooms.taskGraphVersion, graph.dagVersion),
+    ))
+    .returning({ id: operationalRooms.id });
+  if (roomUpdated.length !== 1) {
+    throw new RoomStoreError(
+      "dag_version_conflict",
+      `Concurrent Room graph update rejected task-delivery rejection for ${outbox.id}`,
+    );
+  }
+  const nodeUpdated = await tx
+    .update(roomTaskNodes)
+    .set({ state: "blocked", nodeVersion: blockedNodeVersion })
+    .where(and(
+      eq(roomTaskNodes.projectId, projectId),
+      eq(roomTaskNodes.roomId, outbox.roomId),
+      eq(roomTaskNodes.id, node.id),
+      eq(roomTaskNodes.state, "running"),
+      eq(roomTaskNodes.nodeVersion, node.nodeVersion),
+    ))
+    .returning({ id: roomTaskNodes.id });
+  if (nodeUpdated.length !== 1) {
+    throw new RoomStoreError(
+      "task_node_version_conflict",
+      `Concurrent Room task-node update rejected task-delivery rejection for ${outbox.id}`,
+    );
+  }
+  const payload = input.eventType === "room_task_dispatch_delivery_rejected"
+    ? {
+        projectionVersion: 1,
+        nodeId: node.id,
+        outboxId: outbox.id,
+        blockedNodeVersion,
+        dagVersion: nextDagVersion,
+        errorCode: input.errorCode,
+        projection,
+        projectionHash: hashRoomValue(projection),
+        updatedAt: input.now,
+      }
+    : {
+        projectionVersion: 1,
+        nodeId: node.id,
+        outboxId: outbox.id,
+        blockedNodeVersion,
+        dagVersion: nextDagVersion,
+        errorCode: input.errorCode,
+        firstUncertainAt: input.firstUncertainAt,
+        projection,
+        projectionHash: hashRoomValue(projection),
+        updatedAt: input.now,
+      };
+  return insertRoomEvent(tx, next, input.eventType, {
+    eventId: `room-event-${randomUUID()}`,
+    actorType: "system",
+    actorId: "room-delivery",
+    correlationId: `room-task-dispatch-rejected:${outbox.id}`,
+    causationId: outbox.id,
+    occurredAt: input.now,
+  }, payload);
+}
+
 async function persistRoomTaskGraphProjection(
   tx: DbTransaction,
   projectId: string,
@@ -7790,7 +17659,7 @@ async function persistRoomTaskGraphProjection(
       parentNodeId: node.parentNodeId,
       objective: node.objective,
       state: node.state,
-      assignedSeatIds: [],
+      assignedSeatIds: [...(node.assignedSeatIds ?? [])],
       inputRefs: [...node.inputRefs],
       outputRefs: [...node.outputRefs],
       roleRequirements: [...node.roleRequirements],
@@ -7824,6 +17693,7 @@ async function persistRoomTaskGraphProjection(
         parentNodeId: node.parentNodeId,
         objective: node.objective,
         state: node.state,
+        assignedSeatIds: [...(node.assignedSeatIds ?? [])],
         inputRefs: [...node.inputRefs],
         outputRefs: [...node.outputRefs],
         roleRequirements: [...node.roleRequirements],
@@ -8119,6 +17989,150 @@ function parseStoredTaskGraphProjection(value: unknown, label: string): RoomTask
   return rebuilt;
 }
 
+function readTaskGraphReplaySnapshot(
+  event: RoomEventRecordV1,
+  requiredProjectionVersion: 1 | 2 | 3 | readonly (1 | 2 | 3)[],
+  label: string,
+): RoomTaskGraphProjectionV1 {
+  const payload = asRecord(event.payload);
+  const supportedProjectionVersions = Array.isArray(requiredProjectionVersion)
+    ? requiredProjectionVersion
+    : [requiredProjectionVersion];
+  if (!supportedProjectionVersions.includes(payload.projectionVersion as 1 | 2 | 3)) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_missing_snapshot",
+      `${label} event ${event.id} requires a complete task-graph snapshot at projection version ${supportedProjectionVersions.join(" or ")}`,
+    );
+  }
+  if (!isNonEmptyString(payload.projectionHash) || payload.projection === undefined) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_missing_snapshot",
+      `${label} event ${event.id} has no complete task-graph snapshot`,
+    );
+  }
+  if (hashRoomValue(payload.projection) !== payload.projectionHash) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `${label} event ${event.id} task-graph snapshot hash does not match its payload`,
+    );
+  }
+  let projection: RoomTaskGraphProjectionV1;
+  try {
+    projection = parseStoredTaskGraphProjection(payload.projection, `${label} event ${event.id}`);
+  } catch (error) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `${label} event ${event.id} task-graph snapshot is invalid: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (
+    projection.roomId !== event.roomId
+    || projection.aggregateVersion !== event.aggregateVersion
+  ) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `${label} event ${event.id} task-graph identity or aggregate version does not match its Room event`,
+    );
+  }
+  return projection;
+}
+
+function readTaskGraphRecoveryExhaustionReplaySnapshot(
+  event: RoomEventRecordV1,
+): RoomTaskGraphProjectionV1 {
+  const snapshot = extractRoomTaskRecoveryExhaustionTaskGraphProjection(event);
+  let projection: RoomTaskGraphProjectionV1;
+  try {
+    projection = parseStoredTaskGraphProjection(
+      snapshot,
+      `Task-progress exhaustion event ${event.id}`,
+    );
+  } catch (error) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-progress exhaustion event ${event.id} task-graph snapshot is invalid: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (
+    projection.roomId !== event.roomId
+    || projection.aggregateVersion !== event.aggregateVersion
+  ) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-progress exhaustion event ${event.id} task-graph identity or aggregate version does not match its Room event`,
+    );
+  }
+  return projection;
+}
+
+function assertDispatchReplaySnapshot(
+  event: RoomEventRecordV1,
+  projection: RoomTaskGraphProjectionV1,
+): void {
+  const payload = asRecord(event.payload);
+  const nodeId = payload.nodeId;
+  const runningNodeVersion = typeof payload.runningNodeVersion === "number"
+    ? payload.runningNodeVersion
+    : null;
+  const dagVersion = typeof payload.dagVersion === "number" ? payload.dagVersion : null;
+  if (
+    !isNonEmptyString(nodeId)
+    || runningNodeVersion === null
+    || !Number.isSafeInteger(runningNodeVersion)
+    || runningNodeVersion <= 0
+    || dagVersion === null
+    || !Number.isSafeInteger(dagVersion)
+    || dagVersion <= 0
+    || projection.dagVersion !== dagVersion
+  ) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-dispatch event ${event.id} has inconsistent node or DAG version metadata`,
+    );
+  }
+  const node = projection.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node || node.state !== "running" || node.nodeVersion !== runningNodeVersion) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-dispatch event ${event.id} snapshot does not contain the claimed running node`,
+    );
+  }
+}
+
+function assertDispatchDeliveryBlockReplaySnapshot(
+  event: RoomEventRecordV1,
+  projection: RoomTaskGraphProjectionV1,
+): void {
+  const payload = asRecord(event.payload);
+  const nodeId = payload.nodeId;
+  const blockedNodeVersion = typeof payload.blockedNodeVersion === "number"
+    ? payload.blockedNodeVersion
+    : null;
+  const dagVersion = typeof payload.dagVersion === "number" ? payload.dagVersion : null;
+  if (
+    !isNonEmptyString(nodeId)
+    || blockedNodeVersion === null
+    || !Number.isSafeInteger(blockedNodeVersion)
+    || blockedNodeVersion <= 0
+    || dagVersion === null
+    || !Number.isSafeInteger(dagVersion)
+    || dagVersion <= 0
+    || projection.dagVersion !== dagVersion
+  ) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-dispatch rejection event ${event.id} has inconsistent node or DAG version metadata`,
+    );
+  }
+  const node = projection.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node || node.state !== "blocked" || node.nodeVersion !== blockedNodeVersion) {
+    throw new RoomTaskGraphReplayError(
+      "task_graph_replay_invalid_snapshot",
+      `Task-dispatch rejection event ${event.id} snapshot does not contain the blocked task node`,
+    );
+  }
+}
+
 function rowToRoomTaskNodeProjection(
   row: typeof roomTaskNodes.$inferSelect,
 ): RoomTaskNodeProjectionV1 {
@@ -8126,6 +18140,7 @@ function rowToRoomTaskNodeProjection(
     id: row.id,
     parentNodeId: row.parentNodeId,
     objective: row.objective,
+    assignedSeatIds: row.assignedSeatIds,
     inputRefs: row.inputRefs,
     outputRefs: row.outputRefs,
     roleRequirements: row.roleRequirements,
@@ -8149,6 +18164,7 @@ function rowToRoomTaskNodeProjection(
 function normalizeTaskNodeProjection(value: unknown, label: string): RoomTaskNodeProjectionV1 {
   const record = asRecord(value);
   const hasTopologyLineage = record.origin !== undefined || record.terminalLineage !== undefined;
+  const hasAssignedSeatIds = record.assignedSeatIds !== undefined;
   if (hasTopologyLineage && (record.origin === undefined || !("terminalLineage" in record))) {
     throw new RoomStoreError(
       "task_graph_invalid_mutation",
@@ -8159,6 +18175,7 @@ function normalizeTaskNodeProjection(value: unknown, label: string): RoomTaskNod
     "id",
     "parentNodeId",
     "objective",
+    ...(hasAssignedSeatIds ? ["assignedSeatIds"] : []),
     "inputRefs",
     "outputRefs",
     "roleRequirements",
@@ -8180,6 +18197,7 @@ function normalizeTaskNodeProjection(value: unknown, label: string): RoomTaskNod
     id: record.id,
     parentNodeId: record.parentNodeId,
     objective: record.objective,
+    assignedSeatIds: hasAssignedSeatIds ? record.assignedSeatIds : [],
     inputRefs: record.inputRefs,
     outputRefs: record.outputRefs,
     roleRequirements: record.roleRequirements,
@@ -8227,10 +18245,15 @@ function normalizeTaskNodeProjection(value: unknown, label: string): RoomTaskNod
 
 function normalizeTaskNodeDefinition(value: unknown, label: string): RoomTaskNodeDefinitionV1 {
   const record = asRecord(value);
+  // Existing task-graph commands predate persisted seat assignment. Keep their
+  // canonical shape valid while normalizing the newly persisted column to an
+  // empty array; callers that do provide it still receive strict validation.
+  const hasAssignedSeatIds = record.assignedSeatIds !== undefined;
   assertTaskGraphObjectKeys(record, [
     "id",
     "parentNodeId",
     "objective",
+    ...(hasAssignedSeatIds ? ["assignedSeatIds"] : []),
     "inputRefs",
     "outputRefs",
     "roleRequirements",
@@ -8276,6 +18299,11 @@ function normalizeTaskNodeDefinition(value: unknown, label: string): RoomTaskNod
     id: record.id,
     parentNodeId,
     objective: record.objective,
+    assignedSeatIds: assertTaskGraphStringArray(
+      hasAssignedSeatIds ? record.assignedSeatIds : [],
+      `${label}.assignedSeatIds`,
+      true,
+    ),
     inputRefs: assertTaskGraphStringArray(record.inputRefs, `${label}.inputRefs`, true),
     outputRefs: assertTaskGraphStringArray(record.outputRefs, `${label}.outputRefs`, true),
     roleRequirements: assertTaskGraphStringArray(
@@ -8446,6 +18474,7 @@ function assertTaskNodeProjectionState(node: RoomTaskNodeProjectionV1): void {
 function cloneTaskGraphNode(node: RoomTaskNodeProjectionV1): RoomTaskNodeProjectionV1 {
   return {
     ...node,
+    assignedSeatIds: [...(node.assignedSeatIds ?? [])],
     inputRefs: [...node.inputRefs],
     outputRefs: [...node.outputRefs],
     roleRequirements: [...node.roleRequirements],
@@ -8598,10 +18627,18 @@ export async function loadRoomEvents(
   afterCursor?: string,
   options?: ListRoomEventsOptionsV1,
 ): Promise<RoomEventRecordV1[]> {
-  const cursor = afterCursor === undefined ? undefined : Number(afterCursor);
-  if (cursor !== undefined && (!Number.isSafeInteger(cursor) || cursor < 0)) {
-    throw new Error(`Invalid Room event cursor: ${afterCursor}`);
-  }
+  const page = await loadRoomEventPage(handle, projectId, roomId, afterCursor, options);
+  return [...page.events];
+}
+
+export async function loadRoomEventPage(
+  handle: QueryHandle,
+  projectId: string,
+  roomId: string,
+  afterCursor?: string,
+  options?: ListRoomEventsOptionsV1,
+): Promise<RoomEventPageV1> {
+  const cursor = normalizeRoomEventAfterCursor(afterCursor);
   const limit = normalizeRoomEventListLimit(options);
   const query = handle
     .select()
@@ -8614,8 +18651,34 @@ export async function loadRoomEvents(
         gt(roomEvents.cursor, cursor),
       ))
     .orderBy(asc(roomEvents.cursor));
-  const rows = limit === undefined ? await query : await query.limit(limit);
-  return rows.map(rowToRoomEvent);
+  const rows = limit === undefined ? await query : await query.limit(limit + 1);
+  const hasMore = limit !== undefined && rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  return {
+    events: pageRows.map(rowToRoomEvent),
+    hasMore,
+  };
+}
+
+function normalizeRoomEventAfterCursor(afterCursor: unknown): number | undefined {
+  if (afterCursor === undefined) return undefined;
+  if (
+    typeof afterCursor !== "string"
+    || !/^(?:0|[1-9][0-9]*)$/u.test(afterCursor)
+  ) {
+    throw new RoomStoreError(
+      "room_event_list_invalid",
+      "Room event cursor must be canonical decimal text",
+    );
+  }
+  const cursor = Number(afterCursor);
+  if (!Number.isSafeInteger(cursor)) {
+    throw new RoomStoreError(
+      "room_event_list_invalid",
+      "Room event cursor must be a safe integer",
+    );
+  }
+  return cursor;
 }
 
 async function insertRoomEvent(
@@ -8744,6 +18807,52 @@ function validateMembershipBinding(binding: RoomBindingReplacementV1): void {
       throw new RoomDomainError("binding_identity_conflict", `Binding ${field} must not be empty`);
     }
   }
+}
+
+interface PreparedInitialExistingSessionRoleAssignment {
+  readonly capabilitySnapshot: RoomCapabilitySnapshotV1;
+  readonly constraints: RoomRoleAssignmentConstraintsV1;
+  readonly protocol: RoomProtocolDefinitionV1;
+  readonly entryPhaseId: string;
+  readonly assignment: RoomRoleAssignmentV1;
+}
+
+/**
+ * Normalize the entry policy before opening the identity-lock transaction. The
+ * transaction later rechecks that this complete snapshot names exactly the
+ * bindings it has just persisted, closing the validate-to-commit gap.
+ */
+function prepareInitialExistingSessionRoleAssignment(
+  room: CreateRoomWithExistingBindingsInput["room"],
+  input: NonNullable<CreateRoomWithExistingBindingsInput["entryRoleAssignment"]>,
+): PreparedInitialExistingSessionRoleAssignment {
+  const snapshotResult = createRoomCapabilitySnapshot(input.capabilitySnapshot);
+  if (!snapshotResult.ok) throwRoleAssignmentPolicyError(snapshotResult.unsatisfied);
+  const constraintsResult = normalizeRoomRoleAssignmentConstraints(input.constraints);
+  if (!constraintsResult.ok) throwRoleAssignmentPolicyError(constraintsResult.unsatisfied);
+  const protocol = getRoomProtocolDefinition(room.protocolId, room.protocolVersion);
+  const entryPhaseId = protocol?.phases[0]?.id;
+  if (!protocol || !entryPhaseId) {
+    throw new RoomStoreError(
+      "role_assignment_invalid",
+      `Room protocol ${room.protocolId}@${room.protocolVersion} has no supported entry phase`,
+    );
+  }
+  const assignmentResult = assignRoomRoles({
+    protocol,
+    phaseId: entryPhaseId,
+    capabilitySnapshot: snapshotResult.value,
+    constraints: constraintsResult.value,
+    producerBindingIds: [],
+  });
+  if (!assignmentResult.ok) throwRoleAssignmentPolicyError(assignmentResult.unsatisfied);
+  return {
+    capabilitySnapshot: snapshotResult.value,
+    constraints: constraintsResult.value,
+    protocol,
+    entryPhaseId,
+    assignment: assignmentResult.value,
+  };
 }
 
 function validateInitialExistingParticipants(
