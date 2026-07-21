@@ -24,6 +24,12 @@ import {
   resolveReservedPortsFromEnv,
   shouldRunPortProbe,
 } from "./port-probe-policy.js";
+import {
+  finalizeWorkerRootCleanup,
+  registerWorkerRootLifecycle,
+  releaseWorkerRootLifecycle,
+  type WorkerRootLifecycle,
+} from "./vitest-teardown.js";
 
 type FsModule = typeof import("node:fs");
 type FsPromisesModule = typeof import("node:fs/promises");
@@ -220,6 +226,7 @@ const { root: WORKER_ROOT, selfMinted: SELF_MINTED_WORKER_ROOT } = (() => {
   }
   return { root, selfMinted };
 })();
+const WORKER_ROOT_LIFECYCLE = registerWorkerRootLifecycle(WORKER_ROOT, "worker");
 
 const REAL_TMPDIR = (() => {
   try {
@@ -248,10 +255,13 @@ function ensureWorkerRoot(): void {
   Recreate the root immediately before every mkdtemp under it so a transient sibling teardown cannot fail suite startup with ENOENT.
 
   FNXC:TestIsolation 2026-06-14-02:08:
-  When this helper recreates a removed root, it must also restore the owner marker; otherwise the post-test isolation guard reports the still-active rebuilt root as an unowned leak.
+  When this helper recreates a removed root, it must also restore the owner and
+  worker-lifecycle markers; otherwise the post-test isolation guard reports an
+  unowned leak and final cleanup cannot prove the rebuilt root is quiescent.
   */
   mkdirSync(WORKER_ROOT, { recursive: true });
   writeWorkerRootOwnerMarker(WORKER_ROOT);
+  registerWorkerRootLifecycle(WORKER_ROOT, "worker", WORKER_ROOT_LIFECYCLE.pid);
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -459,15 +469,25 @@ if (isMainThread) {
 
 function ensureWorkerCwdForSubprocess(): void {
   if (!isMainThread) return;
+  let currentCwdIsValid = false;
   try {
     originalCwd();
-    return;
+    currentCwdIsValid = true;
   } catch {
     // Recreate below. A child process launched while uv_cwd is invalid fails
     // before its own command can run, so the subprocess seam must repair cwd.
   }
 
+  if (currentCwdIsValid && workerTempDir && existsSync(workerTempDir)) return;
+
   ensureWorkerRoot();
+  /*
+  FNXC:TestIsolation 2026-07-19-19:57:
+  Windows cannot remove a process's current directory, so cleanup recovery can
+  first move cwd to the OS temp directory and then remove the owned worker cwd.
+  A merely valid fallback cwd is not enough: recreate and re-enter the missing
+  worker cwd before spawning so child processes never inherit host temp state.
+  */
   if (!workerTempDir || !existsSync(workerTempDir)) {
     workerTempDir = realpathSync(mkdtempSync(join(WORKER_ROOT, `w-${process.pid}-`)));
   }
@@ -753,6 +773,7 @@ const originalChildProcess = {
 };
 
 const trackedSubprocesses = new Map<ChildProcess, TrackedSubprocess>();
+const managedChildLifecycles = new Map<ChildProcess, WorkerRootLifecycle>();
 
 // Typed failure record so afterEach can attribute each timed-out subprocess
 // back to the test that spawned it rather than blindly throwing in whichever
@@ -923,6 +944,13 @@ function cleanupTrackedSubprocess(proc: ChildProcess): void {
   trackedSubprocesses.delete(proc);
 }
 
+function releaseManagedChildLifecycle(proc: ChildProcess): void {
+  const lifecycle = managedChildLifecycles.get(proc);
+  if (!lifecycle) return;
+  managedChildLifecycles.delete(proc);
+  releaseWorkerRootLifecycle(lifecycle);
+}
+
 function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): void {
   const timeoutMs = testSubprocessTimeoutMs(commandLine);
   const tracked: TrackedSubprocess = {
@@ -933,6 +961,9 @@ function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): voi
     testName: currentTestName(),
   };
   trackedSubprocesses.set(proc, tracked);
+  if (typeof proc.pid === "number" && proc.pid > 0) {
+    managedChildLifecycles.set(proc, registerWorkerRootLifecycle(WORKER_ROOT, "child", proc.pid));
+  }
 
   tracked.timeoutTimer = setTimeout(() => {
     tracked.timedOut = true;
@@ -947,7 +978,10 @@ function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): voi
     }
   }, timeoutMs);
 
-  const finish = () => cleanupTrackedSubprocess(proc);
+  const finish = () => {
+    cleanupTrackedSubprocess(proc);
+    releaseManagedChildLifecycle(proc);
+  };
   proc.once("close", finish);
   proc.once("error", finish);
 }
@@ -1203,25 +1237,12 @@ afterEach(async () => {
   }
 });
 
-function sleepMsSync(ms: number): void {
-  if (ms <= 0) return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function removeSelfMintedWorkerRootWithRetry(
   workerRoot = WORKER_ROOT,
   selfMinted = SELF_MINTED_WORKER_ROOT,
-  delayMs = 25,
 ): void {
   if (!selfMinted) return;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      rmSync(workerRoot, { recursive: true, force: true });
-      return;
-    } catch {
-      if (attempt < 3) sleepMsSync(delayMs);
-    }
-  }
+  finalizeWorkerRootCleanup(workerRoot);
 }
 
 export const __fusionWorkerRootCleanupTestHooks = {
@@ -1238,6 +1259,19 @@ process.on("exit", () => {
     }
     cleanupTrackedSubprocess(proc);
   }
+  for (const [proc] of managedChildLifecycles) {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      releaseManagedChildLifecycle(proc);
+      continue;
+    }
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // Ignore — final worker-root cleanup retains this lifecycle record until
+      // the child is provably gone instead of deleting a possibly-held root.
+    }
+    cleanupTrackedSubprocess(proc);
+  }
   if (workerTempDir) {
     try {
       originalChdir(tmpdir());
@@ -1247,5 +1281,6 @@ process.on("exit", () => {
       // get their own bounded best-effort removal below.
     }
   }
+  releaseWorkerRootLifecycle(WORKER_ROOT_LIFECYCLE);
   removeSelfMintedWorkerRootWithRetry();
 });

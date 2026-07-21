@@ -3,7 +3,6 @@ import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import setup, {
   __setWorkerRootRmSyncForTests,
-  __setWorkerRootSleepMsSyncForTests,
 } from "../../../__test-utils__/vitest-teardown.js";
 
 function requireEnv(name: string): string {
@@ -66,13 +65,8 @@ export default function setupPersistentEpermFixture(): () => Promise<void> {
     }
     rmSync(path, options);
   });
-  __setWorkerRootSleepMsSyncForTests(() => {});
 
   return async () => {
-    try {
-      await teardown();
-    } finally {
-      __setWorkerRootRmSyncForTests(rmSync);
-    }
+    await teardown();
   };
 }

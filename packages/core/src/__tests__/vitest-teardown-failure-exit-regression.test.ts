@@ -79,8 +79,8 @@ describe("vitest global teardown persistent-EPERM exit regression", () => {
     expect(result.signal).toBeNull();
     expect(result.status).toBe(1);
     expect(readFileSync(passMarker, "utf8")).toBe("ordinary test executed\n");
-    expect(output).toContain("[vitest-teardown] failed to remove worker root");
-    expect(output).toContain("simulated persistent EPERM");
+    expect(output).toContain("[vitest-teardown] worker-root cleanup failed");
+    expect(output).toContain('"code":"EPERM"');
 
     assertPathIsInsideFixtureRoot(workerRoot, fixtureRoot);
     assertPathIsInsideFixtureRoot(legacyHome, fixtureRoot);

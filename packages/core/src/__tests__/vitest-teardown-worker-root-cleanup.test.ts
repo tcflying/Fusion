@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { __fusionWorkerRootCleanupTestHooks } from "../__test-utils__/vitest-setup";
 import setup, {
   __setWorkerRootRmSyncForTests,
-  __setWorkerRootSleepMsSyncForTests,
+  finalizeWorkerRootCleanup,
+  removeWorkerRootWithRetry,
   removeLegacyTopLevelHomeRoots,
 } from "../__test-utils__/vitest-teardown";
 
@@ -34,7 +35,6 @@ function restoreWorkerRootEnv(): void {
 
 afterEach(() => {
   __setWorkerRootRmSyncForTests(rmSync);
-  __setWorkerRootSleepMsSyncForTests(() => {});
   process.exitCode = originalProcessExitCode;
   restoreWorkerRootEnv();
   for (const path of createdPaths.splice(0).reverse()) {
@@ -43,121 +43,40 @@ afterEach(() => {
 });
 
 describe("vitest global teardown worker-root cleanup", () => {
-  it("removes the per-invocation worker root on the clean path", async () => {
+  it("removes the per-invocation worker root after deferred finalization", async () => {
     const teardown = setup();
     const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
     makeWorkerChild(workerRoot, "clean");
 
     await teardown();
 
+    expect(existsSync(workerRoot)).toBe(true);
+    finalizeWorkerRootCleanup(workerRoot);
+
     expect(existsSync(workerRoot)).toBe(false);
   });
 
-  it("retries an EBUSY worker-root removal and removes the root", async () => {
+  it("uses only bounded native retries once the worker lifecycle is settled", async () => {
     const teardown = setup();
     const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
     makeWorkerChild(workerRoot, "busy");
-    let attempts = 0;
-    const sleeps: number[] = [];
+    let observedOptions: Parameters<typeof rmSync>[1] | undefined;
 
     __setWorkerRootRmSyncForTests((path, options) => {
-      attempts++;
-      if (attempts === 1) {
-        const error = new Error("resource busy") as NodeJS.ErrnoException;
-        error.code = "EBUSY";
-        throw error;
-      }
+      observedOptions = options;
       rmSync(path, options);
-    });
-    __setWorkerRootSleepMsSyncForTests((ms) => {
-      sleeps.push(ms);
     });
 
     await teardown();
+    finalizeWorkerRootCleanup(workerRoot);
 
-    expect(attempts).toBe(2);
-    expect(sleeps).toEqual([75]);
+    expect(observedOptions).toMatchObject({
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === "win32" ? 2 : 0,
+      retryDelay: process.platform === "win32" ? 25 : 0,
+    });
     expect(existsSync(workerRoot)).toBe(false);
-  });
-
-  it("retries transient ENOTEMPTY worker-root cleanup until the root can be removed", async () => {
-    const teardown = setup();
-    const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
-    makeWorkerChild(workerRoot, "not-empty");
-    let attempts = 0;
-    const sleeps: number[] = [];
-
-    __setWorkerRootRmSyncForTests((path, options) => {
-      attempts++;
-      if (attempts <= 3) {
-        const error = new Error("directory not empty") as NodeJS.ErrnoException;
-        error.code = "ENOTEMPTY";
-        throw error;
-      }
-      rmSync(path, options);
-    });
-    __setWorkerRootSleepMsSyncForTests((ms) => {
-      sleeps.push(ms);
-    });
-
-    await teardown();
-
-    expect(attempts).toBe(4);
-    expect(sleeps).toEqual([75, 75, 75]);
-    expect(existsSync(workerRoot)).toBe(false);
-  });
-
-  it("fails the lifecycle teardown when persistent EPERM cleanup exhausts its retry budget", async () => {
-    const teardown = setup();
-    const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
-    makeWorkerChild(workerRoot, "persistent-eperm");
-    let attempts = 0;
-
-    __setWorkerRootRmSyncForTests((path, options) => {
-      if (path === workerRoot) {
-        attempts++;
-        const error = new Error("access denied") as NodeJS.ErrnoException;
-        error.code = "EPERM";
-        throw error;
-      }
-      rmSync(path, options);
-    });
-    __setWorkerRootSleepMsSyncForTests(() => {});
-
-    await expect(teardown()).rejects.toThrow(
-      `[vitest-teardown] failed to remove worker root ${workerRoot} after 8 attempts: access denied`,
-    );
-
-    expect(attempts).toBe(8);
-    expect(existsSync(workerRoot)).toBe(true);
-    expect(process.exitCode).toBe(1);
-  });
-
-  it("still sweeps legacy HOME roots when worker-root cleanup fails", async () => {
-    const teardown = setup();
-    const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
-    makeWorkerChild(workerRoot, "persistent-eperm-legacy-home");
-    const legacyHome = remember(join(tmpdir(), `fn-test-home-after-worker-root-failure-${process.pid}-${Date.now()}`));
-    mkdirSync(legacyHome, { recursive: true });
-    let attempts = 0;
-
-    __setWorkerRootRmSyncForTests((path, options) => {
-      if (path === workerRoot) {
-        attempts++;
-        const error = new Error("access denied") as NodeJS.ErrnoException;
-        error.code = "EPERM";
-        throw error;
-      }
-      rmSync(path, options);
-    });
-    __setWorkerRootSleepMsSyncForTests(() => {});
-
-    await expect(teardown()).rejects.toThrow(
-      `[vitest-teardown] failed to remove worker root ${workerRoot} after 8 attempts: access denied`,
-    );
-
-    expect(attempts).toBe(8);
-    expect(existsSync(legacyHome)).toBe(false);
   });
 
   it("tolerates ENOENT when the worker root is already gone", async () => {
@@ -168,8 +87,82 @@ describe("vitest global teardown worker-root cleanup", () => {
 
     await teardown();
 
+    finalizeWorkerRootCleanup(workerRoot);
     expect(existsSync(workerRoot)).toBe(false);
   });
+
+  it("defers shared-root removal until worker lifecycle records are cleared", async () => {
+    const teardown = setup();
+    const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
+    const lifecycleDir = join(workerRoot, ".fusion-test-worker-lifecycle");
+    const lifecycleRecord = join(lifecycleDir, `worker-${process.pid}.json`);
+    const childLifecycleRecord = join(lifecycleDir, `child-${process.pid}.json`);
+    mkdirSync(lifecycleDir, { recursive: true });
+    writeFileSync(lifecycleRecord, JSON.stringify({ pid: process.pid, kind: "worker" }));
+    writeFileSync(childLifecycleRecord, JSON.stringify({ pid: process.pid, kind: "child" }));
+
+    await teardown();
+
+    expect(existsSync(workerRoot)).toBe(true);
+
+    rmSync(lifecycleRecord, { force: true });
+    let lifecycleFailure: unknown;
+    try {
+      finalizeWorkerRootCleanup(workerRoot);
+    } catch (error) {
+      lifecycleFailure = error;
+    }
+    expect(lifecycleFailure).toMatchObject({
+      code: "EBUSY",
+      path: workerRoot,
+      syscall: "worker-lifecycle",
+    });
+    expect(existsSync(workerRoot)).toBe(true);
+
+    rmSync(childLifecycleRecord, { force: true });
+    finalizeWorkerRootCleanup(workerRoot);
+    expect(existsSync(workerRoot)).toBe(false);
+  });
+
+  it.runIf(process.platform === "win32")(
+    "reports a final EPERM worker-root cleanup failure with structured native-retry evidence",
+    () => {
+      const workerRoot = remember(mkdtempSync(join(tmpdir(), "fusion-test-workers-eperm-")));
+      makeWorkerChild(workerRoot, "eperm");
+      let observedOptions: Parameters<typeof rmSync>[1] | undefined;
+      __setWorkerRootRmSyncForTests((_path, options) => {
+        observedOptions = options;
+        const error = Object.assign(new Error("access denied"), {
+          code: "EPERM",
+          path: workerRoot,
+          syscall: "rmdir",
+        }) as NodeJS.ErrnoException;
+        throw error;
+      });
+
+      let failure: unknown;
+      try {
+        removeWorkerRootWithRetry(workerRoot);
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toMatchObject({
+        code: "EPERM",
+        path: workerRoot,
+        syscall: "rmdir",
+        attempts: 1,
+        elapsedMs: expect.any(Number),
+        nativeMaxRetries: 2,
+      });
+      expect(observedOptions).toMatchObject({
+        recursive: true,
+        force: true,
+        maxRetries: 2,
+        retryDelay: 25,
+      });
+    },
+  );
 
   it("sweeps legacy top-level temp HOME roots without walking unrelated temp entries", () => {
     const tempRoot = remember(mkdtempSync(join(tmpdir(), "fusion-test-home-sweep-root-")));
@@ -195,7 +188,7 @@ describe("vitest global teardown worker-root cleanup", () => {
     writeFileSync(join(redirDir, "payload.txt"), "redirect temp payload");
     __fusionWorkerRootCleanupTestHooks.writeWorkerRootOwnerMarker(workerRoot);
 
-    __fusionWorkerRootCleanupTestHooks.removeSelfMintedWorkerRootWithRetry(workerRoot, true, 0);
+    __fusionWorkerRootCleanupTestHooks.removeSelfMintedWorkerRootWithRetry(workerRoot, true);
 
     expect(existsSync(workerRoot)).toBe(false);
   });

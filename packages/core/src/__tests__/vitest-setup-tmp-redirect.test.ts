@@ -104,8 +104,16 @@ describe("vitest setup tmpdir mkdtemp redirect", () => {
 
     const sink = __fusionTmpdirRedirectTestHooks.sinkForPid(process.pid);
     const doomedCwd = remember(mkdtempSync(join(tmpdir(), "fn-redirect-cwd-")));
+    const workerCwd = process.cwd();
     process.chdir(doomedCwd);
+    // Windows refuses to remove a process's current directory. Move out before
+    // simulating the worker-cwd sweep; the subprocess guard must still notice
+    // the missing owned cwd and recreate it under the worker root.
+    if (process.platform === "win32") {
+      process.chdir(tmpdir());
+    }
     rmSync(sink, { recursive: true, force: true });
+    rmSync(workerCwd, { recursive: true, force: true });
     rmSync(originalHome!, { recursive: true, force: true });
     expect(existsSync(sink)).toBe(false);
     expect(existsSync(originalHome!)).toBe(false);
@@ -122,7 +130,10 @@ describe("vitest setup tmpdir mkdtemp redirect", () => {
     const output = execSync("git config --global user.name fusion-test && git config --global --get user.name && pwd", { encoding: "utf8" });
 
     expect(output).toContain("fusion-test");
-    expect(output).toContain(process.env.FUSION_TEST_WORKER_ROOT!);
+    // Git Bash renders Windows paths as /tmp/...; inspect Node's cwd directly
+    // so the assertion verifies the isolation boundary rather than shell path
+    // spelling.
+    expect(process.cwd().startsWith(`${process.env.FUSION_TEST_WORKER_ROOT}${sep}`)).toBe(true);
     expect(process.env.HOME).toBe(originalHome);
     expect(existsSync(process.env.HOME!)).toBe(true);
     expect(existsSync(sink)).toBe(true);
