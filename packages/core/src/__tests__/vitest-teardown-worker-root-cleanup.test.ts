@@ -49,7 +49,6 @@ describe("vitest global teardown worker-root cleanup", () => {
     makeWorkerChild(workerRoot, "clean");
 
     await teardown();
-
     expect(existsSync(workerRoot)).toBe(true);
     finalizeWorkerRootCleanup(workerRoot);
 
@@ -86,7 +85,6 @@ describe("vitest global teardown worker-root cleanup", () => {
     rmSync(workerRoot, { recursive: true, force: true });
 
     await teardown();
-
     finalizeWorkerRootCleanup(workerRoot);
     expect(existsSync(workerRoot)).toBe(false);
   });
@@ -94,6 +92,7 @@ describe("vitest global teardown worker-root cleanup", () => {
   it("defers shared-root removal until worker lifecycle records are cleared", async () => {
     const teardown = setup();
     const workerRoot = remember(process.env.FUSION_TEST_WORKER_ROOT!);
+    makeWorkerChild(workerRoot, "lifecycle");
     const lifecycleDir = join(workerRoot, ".fusion-test-worker-lifecycle");
     const lifecycleRecord = join(lifecycleDir, `worker-${process.pid}.json`);
     const childLifecycleRecord = join(lifecycleDir, `child-${process.pid}.json`);
@@ -121,6 +120,7 @@ describe("vitest global teardown worker-root cleanup", () => {
 
     rmSync(childLifecycleRecord, { force: true });
     finalizeWorkerRootCleanup(workerRoot);
+
     expect(existsSync(workerRoot)).toBe(false);
   });
 
