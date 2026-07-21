@@ -43,7 +43,7 @@ the SQLite cutover ledger. Session Room uses the disjoint 0031–0074 marker
 namespace, so the stale-binary gate advances to the final registered Room
 marker while the baseline SQL remains the dedicated 0000 file.
 */
-export const SCHEMA_BASELINE_VERSION = "0074";
+export const SCHEMA_BASELINE_VERSION = "0077";
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -215,6 +215,14 @@ export const SCHEMA_ROOM_PROVIDER_ADMISSION_TIMEOUT_TOMBSTONES_VERSION = "0071";
 export const SCHEMA_ROOM_PROVIDER_ADMISSION_TIMEOUT_RECOVERY_PROTOCOL_VERSION = "0072";
 export const SCHEMA_ROOM_PROVIDER_ADMISSION_RECOVERY_RECEIPTS_VERSION = "0073";
 export const SCHEMA_ROOM_PROVIDER_ADMISSION_CORE_NO_RESERVATION_VERSION = "0074";
+export const SCHEMA_TASK_BOARD_METADATA_VERSION = "0075";
+/**
+ * FNXC:PostgresSchemaDriftRecovery 2026-07-21-23:05:
+ * Replays additive compatibility DDL when an earlier bookkeeping marker was
+ * written before its physical tables/columns were materialized.
+ */
+export const SCHEMA_SCHEMA_DRIFT_RECOVERY_VERSION = "0076";
+export const SCHEMA_RUN_AUDIT_CONFLICT_RECOVERY_VERSION = "0077";
 
 export const SCHEMA_MIGRATIONS = [
   { version: INITIAL_SCHEMA_VERSION, filename: "0000_initial.sql" },
@@ -292,6 +300,9 @@ export const SCHEMA_MIGRATIONS = [
   { version: SCHEMA_ROOM_PROVIDER_ADMISSION_TIMEOUT_RECOVERY_PROTOCOL_VERSION, filename: "0040_room_provider_admission_timeout_recovery_protocol.sql" },
   { version: SCHEMA_ROOM_PROVIDER_ADMISSION_RECOVERY_RECEIPTS_VERSION, filename: "0041_room_provider_admission_recovery_receipts.sql" },
   { version: SCHEMA_ROOM_PROVIDER_ADMISSION_CORE_NO_RESERVATION_VERSION, filename: "0042_room_provider_admission_core_no_reservation.sql" },
+  { version: SCHEMA_TASK_BOARD_METADATA_VERSION, filename: "0043_task_board_metadata.sql" },
+  { version: SCHEMA_SCHEMA_DRIFT_RECOVERY_VERSION, filename: "0044_schema_drift_recovery.sql" },
+  { version: SCHEMA_RUN_AUDIT_CONFLICT_RECOVERY_VERSION, filename: "0045_run_audit_conflict_recovery.sql" },
 ] as const;
 
 export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];
@@ -494,6 +505,22 @@ async function ensureBookkeepingTable(db: PostgresJsDatabase<Record<string, neve
       version text PRIMARY KEY,
       applied_at timestamptz NOT NULL DEFAULT now()
     )
+  `));
+  /*
+   * FNXC:PostgresSchema 2026-07-21-22:40:
+   * Runtime task-store startup reads the legacy-adoption marker through the
+   * restricted fusion_runtime role. The bookkeeping table is created in the
+   * public schema after the ownership migration's default-privilege setup, so
+   * explicitly grant its read-only access whenever that role already exists.
+   */
+  await db.execute(sql.raw(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fusion_runtime') THEN
+        GRANT SELECT, INSERT, UPDATE ON public.${MIGRATION_BOOKKEEPING_TABLE} TO fusion_runtime;
+      END IF;
+    END
+    $$;
   `));
 }
 

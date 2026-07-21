@@ -51,7 +51,7 @@
  *   Drizzle transaction callback wrapper.
  */
 
-import { sql, eq, type SQL } from "drizzle-orm";
+import { and, eq, isNull, sql, type SQL } from "drizzle-orm";
 import type { PostgresJsDatabase, PostgresJsTransaction } from "drizzle-orm/postgres-js";
 import { randomUUID } from "node:crypto";
 import type { PostgresConnections } from "./connection.js";
@@ -516,7 +516,7 @@ async function persistRunAuditEventWithinTransaction(
    * project column is the authority for cross-project isolation; metadata is
    * only a backfill source for older rows, never the live partition key.
    */
-  await tx.insert(schema.project.runAuditEvents).values({
+  const auditInsert = tx.insert(schema.project.runAuditEvents).values({
     id,
     timestamp,
     projectId,
@@ -527,13 +527,23 @@ async function persistRunAuditEventWithinTransaction(
     mutationType: input.mutationType,
     target: input.target,
     metadata: input.metadata ?? null,
-  }).onConflictDoNothing({
-    target: schema.project.runAuditEvents.id,
   });
+  if (projectId === null) {
+    await auditInsert.onConflictDoNothing();
+  } else {
+    await auditInsert.onConflictDoNothing({
+      target: [schema.project.runAuditEvents.projectId, schema.project.runAuditEvents.id],
+    });
+  }
   const stored = await tx
     .select()
     .from(schema.project.runAuditEvents)
-    .where(eq(schema.project.runAuditEvents.id, id))
+    .where(and(
+      eq(schema.project.runAuditEvents.id, id),
+      projectId === null
+        ? isNull(schema.project.runAuditEvents.projectId)
+        : eq(schema.project.runAuditEvents.projectId, projectId),
+    ))
     .limit(1)
     .then((rows) => rows[0]);
   if (!stored) {

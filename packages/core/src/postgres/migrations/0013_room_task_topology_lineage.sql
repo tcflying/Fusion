@@ -133,7 +133,7 @@ ALTER TABLE project.room_task_edges
 ALTER TABLE project.room_task_edges
   DROP CONSTRAINT IF EXISTS room_task_edges_shape_unique;
 
-DROP INDEX IF EXISTS room_task_edges_active_shape_unique;
+DROP INDEX IF EXISTS project.room_task_edges_active_shape_unique;
 
 CREATE UNIQUE INDEX room_task_edges_active_shape_unique
   ON project.room_task_edges(project_id, room_id, from_node_id, to_node_id, kind)
