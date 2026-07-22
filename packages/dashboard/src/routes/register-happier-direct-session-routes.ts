@@ -242,6 +242,35 @@ function connectedResponse(input: {
   };
 }
 
+function canonicalSessionUriForBinding(binding: TaskHappierDirectSessionBinding): string {
+  const host = binding.providerId === "codex" ? "threads" : "sessions";
+  return `${binding.providerId}://${host}/${encodeURIComponent(binding.nativeSessionId)}`;
+}
+
+function assertExistingBindingMatchesRequest(input: {
+  taskId: string;
+  binding: TaskHappierDirectSessionBinding;
+  uri: string;
+  machineId?: string;
+}): void {
+  if (input.uri !== canonicalSessionUriForBinding(input.binding)) {
+    throw new ApiError(409, `Task ${input.taskId} is already connected to a different native Session`, {
+      code: "HAPPIER_DIRECT_SESSION_CONFLICT",
+      taskId: input.taskId,
+      existingNativeSessionId: input.binding.nativeSessionId,
+      requestedSessionUri: input.uri,
+    });
+  }
+  if (input.machineId !== undefined && input.machineId !== input.binding.machineId) {
+    throw new ApiError(409, `Task ${input.taskId} is connected through a different Happier machine`, {
+      code: "machine_mismatch",
+      taskId: input.taskId,
+      existingMachineId: input.binding.machineId,
+      requestedMachineId: input.machineId,
+    });
+  }
+}
+
 const CLI_ERROR_STATUS: Readonly<Record<string, number>> = {
   daemon_unavailable: 503,
   auth_required: 401,
@@ -333,6 +362,26 @@ export function registerHappierDirectSessionRoutes(
       : undefined;
     const settings = await resolveHappierSettings(store);
     assertHappierOpenUrlConfiguration(settings.webappUrl, buildOpenUrl);
+
+    const existingBinding = await readBindingOrThrowIntegrity({ store, taskId, readBinding });
+    if (existingBinding) {
+      assertExistingBindingMatchesRequest({ taskId, binding: existingBinding, uri, machineId });
+      let assignment: BridgeAssignmentResult;
+      try {
+        assignment = await assignBridge({ store, taskId });
+      } catch (error) {
+        throw assignmentFailure(error, existingBinding);
+      }
+      res.json(connectedResponse({
+        taskId,
+        binding: existingBinding,
+        webappUrl: settings.webappUrl,
+        buildOpenUrl,
+        created: false,
+        agentId: assignment.agentId,
+      }));
+      return;
+    }
 
     let ensured: HappierDirectSessionEnsureResult;
     let binding: TaskHappierDirectSessionBinding;

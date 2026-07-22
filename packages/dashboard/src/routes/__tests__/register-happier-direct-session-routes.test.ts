@@ -294,7 +294,7 @@ describe("Happier direct-session task routes", () => {
     await expect(readTaskHappierDirectSessionBinding({ store, taskId: task.id })).resolves.toBeNull();
   });
 
-  it("POST persists one stateful remote session, one exact-role bridge, and one assignment across retries", async () => {
+  it("POST reuses one durable binding without re-running the local ensure extension", async () => {
     const task = await createTask();
     const before = await store.getTask(task.id);
     const promptBefore = await store.readPromptForArchive(task.id);
@@ -307,19 +307,13 @@ describe("Happier direct-session task routes", () => {
     expect(second.status).toBe(200);
     expect(first.body).toMatchObject({ created: true, nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
     expect(second.body).toMatchObject({ created: false, nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
-    expect(ensureHarness.ensure).toHaveBeenCalledTimes(2);
+    expect(ensureHarness.ensure).toHaveBeenCalledTimes(1);
     expect(ensureHarness.sessions).toHaveLength(1);
     expect(ensureHarness.ensure).toHaveBeenNthCalledWith(1, {
       uri: "codex://threads/thread-a",
       machineId: "machine-a",
       settings: DEFAULT_SETTINGS,
     });
-    expect(ensureHarness.ensure).toHaveBeenNthCalledWith(2, {
-      uri: "codex://threads/thread-a",
-      machineId: "machine-a",
-      settings: DEFAULT_SETTINGS,
-    });
-
     const bridgeAgents = (await agentStore.listAgents({ includeEphemeral: false }))
       .filter((agent) => agent.name === HAPPIER_BRIDGE_AGENT_NAME);
     expect(bridgeAgents).toHaveLength(1);
