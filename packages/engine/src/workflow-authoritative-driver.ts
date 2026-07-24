@@ -33,7 +33,7 @@ export interface WorkflowAuthoritativeDriverDeps {
 
 export interface WorkflowAuthoritativeDriverResult {
   handled: boolean;
-  disposition: "completed" | "failed" | "fell-back";
+  disposition: "completed" | "failed" | "suspended" | "fell-back";
   reason?: string;
   readinessReasons: string[];
   graphResult?: WorkflowGraphTaskRunResult;

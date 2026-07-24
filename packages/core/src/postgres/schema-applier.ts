@@ -373,6 +373,8 @@ Deliberately NON-NUMERIC so assertBinaryNotOlderThanDatabase ignores it by desig
 (see that guard's FNXC note — the two sites are coupled).
 */
 export const LEGACY_ADOPTION_DRAINED_MARKER = "legacy-adoption-drained";
+/** SECURITY DEFINER helper that only inserts LEGACY_ADOPTION_DRAINED_MARKER. */
+export const LEGACY_ADOPTION_DRAINED_MARKER_FUNCTION = "fusion_mark_legacy_adoption_drained";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

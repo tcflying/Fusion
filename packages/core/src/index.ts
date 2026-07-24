@@ -2686,3 +2686,45 @@ export * from "./room-provider-backpressure-postgres.js";
 export * from "./room-blind-review-registry.js";
 export * as RoomContextProviderPolicy from "./room-context-provider-policy.js";
 export * as RoomDeterministicGatePolicy from "./room-deterministic-gate-policy.js";
+
+// Compatibility exports for the current split domain modules. The merge kept
+// the Session Room additions in this barrel while upstream moved several
+// task/mission/plugin contracts into dedicated files; expose both surfaces so
+// engine consumers compiled against either generation remain valid.
+export {
+  resolveSelectedWorkflowModelLane,
+} from "./model-resolution.js";
+export { resolveProjectWorkflowModelLaneBaseline } from "./workflow-settings-resolver.js";
+export { resolveEffectiveSettingsDetailedById } from "./workflow-settings-resolver.js";
+export { enrichRunningAgentTaskShape, enrichRunningAgentTaskShapeFromFlags } from "./live-agent-count.js";
+export {
+  TaskDocumentPreconditionFailedError,
+  ArchivedTaskDocumentPublicationRejectedError,
+  validateArchivedTaskDocumentAddition,
+  validateTaskDocumentPreconditions,
+} from "./task-document-concurrency.js";
+export {
+  MissionRemediationStoppedError,
+  MissionResumeConflictError,
+  TerminalTaskReconciliationError,
+} from "./async-mission-store.js";
+export {
+  normalizeValidationDiagnostics,
+  renderValidationFailureDescription,
+} from "./mission-types.js";
+export type {
+  ValidationDiagnostics,
+  ValidationDiagnosticsInput,
+  MissionTransitionActor,
+  MissionTransitionActorType,
+} from "./mission-types.js";
+export type { PluginMcpServerContribution } from "./plugin-types.js";
+export { mapPluginMcpServerContribution } from "./mcp-config.js";
+export { isWorkflowOptionalGroupEnabled } from "./workflow-optional-steps.js";
+export { createProjectScopedPluginMcpProvider } from "./plugin-mcp-servers.js";
+export { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "./types/merge-queue.js";
+export type {
+  ArchivedTaskDocumentAdditionInput,
+  ArchivedTaskDocumentAdditionResult,
+  TaskWedgeNotificationState,
+} from "./types.js";

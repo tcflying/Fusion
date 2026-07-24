@@ -76,7 +76,8 @@ export function resolveSelectedWorkflowModelLane(
    * FNXC:WorkflowModelLaneLookup 2026-07-22-00:00:
    * Selected-workflow model lanes are stored as a dynamic key/value overlay. Keep lookup centralized: only a trimmed, non-empty string is a configured lane value; every other stored shape preserves inheritance by resolving to undefined.
    */
-  const value = settings?.selectedWorkflowModelLanes?.[key];
+  const lanes = settings?.selectedWorkflowModelLanes as Record<string, unknown> | undefined;
+  const value = lanes?.[key];
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 

@@ -13,6 +13,7 @@ import type { StalePausedReviewSignal } from "./stale-paused-review.js";
 import type { StalePausedTodoSignal } from "./stale-paused-todo.js";
 import type { StalledReviewSignal } from "./stalled-review-detector.js";
 import type { TaskAgeStalenessSignal } from "./task-age-staleness.js";
+import type { TaskWedgeNotificationState } from "./types/task-core.js";
 import type { SecretScope } from "./secrets-store.js";
 import type { UpdateChannel } from "./app-version.js";
 // FNXC:UpdateChannels 2026-07-19-12:30: re-export type-only so browser-side
@@ -81,6 +82,7 @@ import {
   MERGE_REQUEST_STATES,
   WORKFLOW_WORK_ITEM_KINDS,
   WORKFLOW_WORK_ITEM_STATES,
+  ACTIVE_WORKFLOW_WORK_ITEM_STATES,
 } from "./types/merge-queue.js";
 import type {
   MergeRequestState,
@@ -104,6 +106,7 @@ export {
   MERGE_REQUEST_STATES,
   WORKFLOW_WORK_ITEM_KINDS,
   WORKFLOW_WORK_ITEM_STATES,
+  ACTIVE_WORKFLOW_WORK_ITEM_STATES,
 };
 export type {
   MergeRequestState,
@@ -123,6 +126,16 @@ export type {
   HandoffEvidence,
   HandoffToReviewOptions,
 };
+
+// Keep the browser-safe barrel compatible with the split domain modules used by
+// the current persistence layer. These contracts were introduced after the
+// original task-document definitions below, so they are re-exported here
+// without replacing the stable legacy shapes.
+export type {
+  ArchivedTaskDocumentAdditionInput,
+  ArchivedTaskDocumentAdditionResult,
+} from "./types/documents-artifacts.js";
+export type { TaskWedgeNotificationState } from "./types/task-core.js";
 
 import {
   HIGH_FANOUT_BLOCKER_TODO_THRESHOLD,
@@ -675,6 +688,8 @@ export interface TaskDocument {
   content: string;
   /** Monotonically increasing revision number (starts at 1) */
   revision: number;
+  /** SHA-256 of the exact UTF-8 content used by the document CAS gate. */
+  contentHash: string;
   /** Who created/last-edited this revision: "user" | "agent" | "system" */
   author: string;
   /** Optional extensible metadata (JSON object) */
@@ -713,6 +728,10 @@ export interface TaskDocumentCreateInput {
   author?: string;
   /** Optional extensible metadata */
   metadata?: Record<string, unknown>;
+  /** CAS expectation; zero requires absence, positive values require a matching revision. */
+  expectedRevision?: number;
+  /** CAS expectation for the exact current content hash. */
+  expectedContentHash?: string;
 }
 
 /**
@@ -1611,6 +1630,8 @@ export interface Task {
   userPaused?: boolean;
   /** Optional machine-readable reason for automated pauses (for example dispatch-storm). */
   pausedReason?: string;
+  /** Durable episode marker for bounded task-wedge notifications. */
+  wedgeNotification?: TaskWedgeNotificationState;
   /** ISO timestamp set when the task first crossed the soft token budget cap. */
   tokenBudgetSoftAlertedAt?: string;
   /** ISO timestamp marking first one-shot alert when worktrunk failed and fell back to native backend. */

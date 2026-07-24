@@ -725,6 +725,26 @@ export interface EmbeddedLifecycleOptions {
 export const DEFAULT_START_TIMEOUT_MS = 120_000;
 
 /**
+ * Resolve the embedded cluster max_connections value while keeping a bounded
+ * range on operator-provided settings. Windows defaults lower the ceiling to
+ * avoid exhausting the desktop host's process/handle budget.
+ */
+export const DEFAULT_EMBEDDED_MAX_CONNECTIONS = 500;
+export const DEFAULT_EMBEDDED_MAX_CONNECTIONS_WIN32 = 150;
+export const EMBEDDED_MAX_CONNECTIONS_MIN = 32;
+export const EMBEDDED_MAX_CONNECTIONS_MAX = 2_000;
+
+export function resolveEmbeddedMaxConnections(
+  configured: number | undefined,
+  platform: NodeJS.Platform = process.platform,
+): number {
+  if (typeof configured === "number" && Number.isInteger(configured)) {
+    return Math.min(EMBEDDED_MAX_CONNECTIONS_MAX, Math.max(EMBEDDED_MAX_CONNECTIONS_MIN, configured));
+  }
+  return platform === "win32" ? DEFAULT_EMBEDDED_MAX_CONNECTIONS_WIN32 : DEFAULT_EMBEDDED_MAX_CONNECTIONS;
+}
+
+/**
  * The marker file `initdb` writes into a data directory once initialization
  * succeeds. Its presence means the directory is an initialized cluster and
  * `initdb` must NOT be run again (it would fail).
