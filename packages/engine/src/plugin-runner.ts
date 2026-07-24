@@ -21,6 +21,7 @@ import type {
   CliProviderContribution,
   PluginContext,
   PluginSkillContribution,
+  PluginMcpServerContribution,
   PluginWorkflowStepContribution,
   WorkflowExtensionContribution,
   PluginTraitContribution,
@@ -144,6 +145,11 @@ interface CachedWorkflowStepTemplates {
   version: number;
 }
 
+interface CachedMcpServers {
+  servers: Array<{ pluginId: string; server: PluginMcpServerContribution }>;
+  version: number;
+}
+
 interface CachedTraits {
   traits: Array<{ pluginId: string; trait: PluginTraitContribution }>;
   version: number;
@@ -174,6 +180,7 @@ export class PluginRunner {
   private cachedRuntimes: CachedRuntimes | null = null;
   private cachedCliProviderContributions: CachedCliProviderContributions | null = null;
   private cachedSkills: CachedSkills | null = null;
+  private cachedMcpServers: CachedMcpServers | null = null;
   private cachedWorkflowSteps: CachedWorkflowSteps | null = null;
   private cachedWorkflowExtensions: CachedWorkflowExtensions | null = null;
   private cachedWorkflowStepTemplates: CachedWorkflowStepTemplates | null = null;
@@ -187,6 +194,7 @@ export class PluginRunner {
   private runtimesCacheVersion = 0;
   private cliProviderContributionsCacheVersion = 0;
   private skillsCacheVersion = 0;
+  private mcpServersCacheVersion = 0;
   private workflowStepsCacheVersion = 0;
   private workflowExtensionsCacheVersion = 0;
   private workflowStepTemplatesCacheVersion = 0;
@@ -268,6 +276,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -416,6 +425,21 @@ export class PluginRunner {
       };
     }
     return this.cachedSkills.skills;
+  }
+
+  /**
+   * Raw contributions only. The project-scoped provider must filter these by
+   * project plugin state before they enter MCP resolution.
+   *
+   * FNXC:PluginMcpServers 2026-07-22-12:00:
+   * FN-8491 mirrors the skill cache while preventing runner output from being
+   * mistaken for project-scoped configuration.
+   */
+  getPluginMcpServers(): Array<{ pluginId: string; server: PluginMcpServerContribution }> {
+    if (!this.cachedMcpServers || this.cachedMcpServers.version !== this.mcpServersCacheVersion) {
+      this.cachedMcpServers = { servers: this.options.pluginLoader.getPluginMcpServers(), version: this.mcpServersCacheVersion };
+    }
+    return this.cachedMcpServers.servers;
   }
 
   getPluginWorkflowSteps(): Array<{ pluginId: string; step: PluginWorkflowStepContribution }> {
@@ -948,6 +972,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -971,6 +996,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -999,6 +1025,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1027,6 +1054,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1054,6 +1082,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1073,6 +1102,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1092,6 +1122,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1111,6 +1142,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1130,6 +1162,7 @@ export class PluginRunner {
     this.invalidateRuntimesCache();
     this.invalidateCliProviderContributionsCache();
     this.invalidateSkillsCache();
+    this.invalidateMcpServersCache();
     this.invalidateWorkflowStepsCache();
     this.invalidateWorkflowExtensionsCache();
     this.invalidateWorkflowStepTemplatesCache();
@@ -1377,6 +1410,11 @@ export class PluginRunner {
   private invalidateSkillsCache(): void {
     this.skillsCacheVersion++;
     this.log.log(`Skills cache invalidated (version: ${this.skillsCacheVersion})`);
+  }
+
+  private invalidateMcpServersCache(): void {
+    this.mcpServersCacheVersion++;
+    this.log.log(`MCP servers cache invalidated (version: ${this.mcpServersCacheVersion})`);
   }
 
   private invalidateWorkflowStepsCache(): void {

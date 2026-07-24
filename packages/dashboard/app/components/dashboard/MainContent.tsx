@@ -419,7 +419,18 @@ export function MainContent({
     return (
       <PageErrorBoundary>
         <Suspense fallback={null}>
+          {/*
+          FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+          Key embedded Chat by project, mirroring Quick Chat's FN-8257 FloatingWindow key and
+          the embedded Planning view. taskView persists per project, so when both projects last
+          used Chat the component survived a swap: useChat refetched the session LIST on
+          projectId change but never reset activeSession/messages or closed the live stream, so
+          project A's open conversation kept rendering (and streaming) under project B. The
+          remount closes the stream via unmount cleanup and restores project B's own persisted
+          active session.
+          */}
           <ChatView
+            key={currentProject?.id ?? "all-projects"}
             addToast={addToast}
             projectId={currentProject?.id}
             experimentalFeatures={experimentalFeatures}
@@ -482,7 +493,18 @@ export function MainContent({
           onOpenWorkflowEditor={openWorkflowEditorWithNav}
           onWorkflowSelectionChange={(selection) => setMissionWorkflowId(selection && !selection.isAllWorkflowsSelected ? selection.selectedWorkflow.id : null)}
         />
+        {/*
+        FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+        Key Missions by project. MissionManager refetches its list on projectId change, but its
+        nested always-mounted MissionInterviewModal (and the interviewTarget-driven
+        MilestoneSliceInterviewModal) did not reset: their resume/connect effects re-fired on
+        the new projectId and reconnected the PREVIOUS project's interview session under the
+        new project, and close persisted the goal draft under the new project's
+        kb-mission-last-goal key. The remount unmounts both modals (stream cleanup runs) and
+        clears showInterviewModal/interviewTarget with fresh state.
+        */}
         <MissionManager
+          key={currentProject?.id ?? "all-projects"}
           isInline={true}
           isOpen={true}
           onClose={() => {
@@ -716,7 +738,26 @@ export function MainContent({
           onOpenWorkflowEditor={openWorkflowEditorWithNav}
           onWorkflowSelectionChange={(selection) => setPlanningHeaderWorkflowId(selection && !selection.isAllWorkflowsSelected ? selection.selectedWorkflow.id : null)}
         />
+        {/*
+        FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+        Key embedded Planning by project so a project swap remounts it. Without the remount a
+        running plan kept its stream, selected session, and sidebar list from the previous
+        project, and the "durable active session" effect re-fired with the new projectId while
+        the old session was still selected — persisting project A's session as project B's
+        active planning session, so project B kept restoring project A's plan. Unmount cleanup
+        already closes the stream; the new mount fetches the new project's session list and
+        restores that project's own persisted draft/active session.
+
+        FNXC:PlanningMode 2026-07-23-00:00:
+        The seeded initialPlan is a one-shot handoff consumed via onInitialPlanConsumed the moment
+        Planning's auto-start fires. Planning fully unmounts whenever taskView leaves "planning",
+        which resets its in-component auto-start guard; before consumption existed, the still-set
+        modalManager.planningInitialPlan re-auto-started a duplicate planning session on every
+        navigate-back remount (and on the project-switch remount key above) while the original
+        session was silently abandoned.
+        */}
         <PlanningModeModal
+          key={currentProject?.id ?? "all-projects"}
           isOpen={true}
           onClose={closePlanningView}
           onTaskCreated={handlePlanningTaskCreated}
@@ -725,6 +766,7 @@ export function MainContent({
           tasks={tasks}
           initialSessions={bgPlanningSessions}
           initialPlan={modalManager.planningInitialPlan ?? undefined}
+          onInitialPlanConsumed={modalManager.clearPlanningInitialPlan}
           projectId={currentProject?.id}
           workflowId={modalManager.planningWorkflowId ?? planningHeaderWorkflowId}
           resumeSessionId={modalManager.planningResumeSessionId}

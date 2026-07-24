@@ -113,6 +113,77 @@ export interface WorkflowSettingsResolverStore extends WorkflowIrResolverStore {
    *  instance is bound to one project, so the resolver derives the project key from
    *  the store rather than from the task (Task carries no projectId field). */
   getWorkflowSettingsProjectId(): string;
+  /** Active project workflow whose stored model lanes act as the project-wide
+   * baseline for tasks selecting any other workflow. */
+  getDefaultWorkflowId?(): Promise<string | undefined>;
+}
+
+/**
+ * Model lanes exposed in Settings -> Project Models are persisted on the active
+ * default workflow for backward compatibility. Unlike workflow policy values,
+ * these lanes are a project baseline: every selected workflow inherits them and
+ * resolves them ahead of global and selected-workflow values.
+ */
+const PROJECT_WORKFLOW_MODEL_LANE_SETTING_IDS: ReadonlySet<string> = new Set([
+  "executionProvider",
+  "executionModelId",
+  "executionThinkingLevel",
+  "executionFallbackProvider",
+  "executionFallbackModelId",
+  "executionFallbackThinkingLevel",
+  "planningProvider",
+  "planningModelId",
+  "planningThinkingLevel",
+  "planningFallbackProvider",
+  "planningFallbackModelId",
+  "planningFallbackThinkingLevel",
+  "validatorProvider",
+  "validatorModelId",
+  "validatorThinkingLevel",
+  "validatorFallbackProvider",
+  "validatorFallbackModelId",
+  "validatorFallbackThinkingLevel",
+]);
+
+interface ProjectWorkflowModelLaneBaseline extends EffectiveSettingsResult {
+  workflowId: string;
+}
+
+async function projectWorkflowModelLaneWorkflowId(store: WorkflowSettingsResolverStore): Promise<string> {
+  try {
+    return (await store.getDefaultWorkflowId?.())?.trim() || "builtin:coding";
+  } catch {
+    return "builtin:coding";
+  }
+}
+
+async function projectWorkflowModelLaneBaseline(
+  store: WorkflowSettingsResolverStore,
+  projectId: string,
+  irCache?: Map<string, WorkflowIr>,
+  workflowId?: string,
+): Promise<ProjectWorkflowModelLaneBaseline> {
+  const resolvedWorkflowId = workflowId ?? await projectWorkflowModelLaneWorkflowId(store);
+  const ir = await resolveWorkflowIrById(store, resolvedWorkflowId, irCache);
+  const detailed = await effectiveFrom(store, ir, resolvedWorkflowId, projectId);
+  const effective: Record<string, unknown> = {};
+  const storedKeys = new Set<string>();
+  for (const id of detailed.storedKeys) {
+    if (!PROJECT_WORKFLOW_MODEL_LANE_SETTING_IDS.has(id)) continue;
+    effective[id] = detailed.effective[id];
+    storedKeys.add(id);
+  }
+  return { workflowId: resolvedWorkflowId, effective, storedKeys };
+}
+
+/** Resolve only the model-lane values configured in Project Models. */
+export async function resolveProjectWorkflowModelLaneBaseline(
+  store: WorkflowSettingsResolverStore,
+  projectId: string,
+  irCache?: Map<string, WorkflowIr>,
+): Promise<EffectiveSettingsResult> {
+  const { effective, storedKeys } = await projectWorkflowModelLaneBaseline(store, projectId, irCache);
+  return { effective, storedKeys };
 }
 
 /** The declarations carried by a resolved IR, with the built-in catalog as the
@@ -178,6 +249,55 @@ export async function resolveEffectiveSettingsById(
   return (await effectiveFrom(store, ir, workflowId, projectId)).effective;
 }
 
+/**
+ * Resolve effective settings for an explicit workflow selection while retaining
+ * the project-wide model-lane baseline used by task-based resolution.
+ *
+ * FNXC:PlanningModelPrecedence 2026-07-22-14:00:
+ * Planning Mode names a workflow before a task exists, so it must compose that
+ * selection exactly as a task would: stored Project Models remain the project
+ * baseline and the selected workflow's lanes stay in `selectedWorkflowModelLanes`.
+ * This preserves complete-pair precedence in the canonical model resolver and
+ * prevents a provider from one settings tier combining with a model from another.
+ */
+export async function resolveEffectiveSettingsDetailedById(
+  store: WorkflowSettingsResolverStore,
+  workflowId: string,
+  projectId: string,
+  irCache?: Map<string, WorkflowIr>,
+): Promise<EffectiveSettingsResult> {
+  const effectiveWorkflowId = workflowId || "builtin:coding";
+  const ir = await resolveWorkflowIrById(store, effectiveWorkflowId, irCache);
+  const selected = await effectiveFrom(store, ir, effectiveWorkflowId, projectId);
+
+  const projectBaselineWorkflowId = await projectWorkflowModelLaneWorkflowId(store);
+  if (projectBaselineWorkflowId === effectiveWorkflowId) return selected;
+
+  const projectBaseline = await projectWorkflowModelLaneBaseline(
+    store,
+    projectId,
+    irCache,
+    projectBaselineWorkflowId,
+  );
+  const effective = { ...selected.effective };
+  const storedKeys = new Set(selected.storedKeys);
+  const selectedWorkflowModelLanes: Record<string, unknown> = {};
+  for (const id of PROJECT_WORKFLOW_MODEL_LANE_SETTING_IDS) {
+    if (Object.prototype.hasOwnProperty.call(selected.effective, id)) {
+      selectedWorkflowModelLanes[id] = selected.effective[id];
+      delete effective[id];
+      storedKeys.delete(id);
+    }
+    if (!projectBaseline.storedKeys.has(id)) continue;
+    effective[id] = projectBaseline.effective[id];
+    storedKeys.add(id);
+  }
+  if (Object.keys(selectedWorkflowModelLanes).length > 0) {
+    effective.selectedWorkflowModelLanes = selectedWorkflowModelLanes;
+  }
+  return { effective, storedKeys };
+}
+
 /** The minimal task identity the per-task resolver reads. Task carries no
  *  projectId field — the project key comes from the store. */
 export interface EffectiveSettingsTaskRef {
@@ -222,16 +342,15 @@ export async function resolveEffectiveSettingsDetailed(
     workflowId = undefined;
   }
   const effectiveWorkflowId = workflowId || "builtin:coding";
-  const ir = await resolveWorkflowIrForTask(store, task.id, irCache);
   let projectId: string;
   try {
     projectId = store.getWorkflowSettingsProjectId();
   } catch {
     // Degrade to declaration defaults (empty stored map) on identity failure.
-    // Keep the resolved workflowId so builtin graphs still pick up the catalog fallback.
+    const ir = await resolveWorkflowIrForTask(store, task.id, irCache);
     return effectiveFrom(store, ir, effectiveWorkflowId, "");
   }
-  return effectiveFrom(store, ir, effectiveWorkflowId, projectId);
+  return resolveEffectiveSettingsDetailedById(store, effectiveWorkflowId, projectId, irCache);
 }
 
 function isPlannerOversightLevel(value: unknown): value is PlannerOversightLevel {

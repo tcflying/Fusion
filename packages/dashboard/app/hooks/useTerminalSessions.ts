@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createTerminalSession, killPtyTerminalSession, listTerminalSessions } from "../api";
+import { fetchSystemInfo } from "../api/system-panel";
 import { getScopedItem, setScopedItem } from "../utils/projectStorage";
 
 const STORAGE_KEY = "kb-terminal-tabs";
@@ -8,6 +9,8 @@ const STORAGE_KEY = "kb-terminal-tabs";
 const BOOTSTRAP_LIST_TIMEOUT_MS = 15000;
 /** Timeout for the auto-create createTerminalSession call during bootstrap. */
 const BOOTSTRAP_CREATE_TIMEOUT_MS = 15000;
+/** Timeout for the server-platform probe consulted by Windows browser clients. */
+const SERVER_PLATFORM_TIMEOUT_MS = 5000;
 
 /**
  * Represents a terminal tab with its metadata and session information.
@@ -41,6 +44,13 @@ interface UseTerminalSessionsReturn {
   activeTab: TerminalTab | null;
   /** Whether sessions have been validated and restored from server */
   isReady: boolean;
+  /**
+   * True when the first tab will NOT be auto-created (win32-hosted servers,
+   * probed by Windows browser clients; see the auto-create effect). Callers
+   * must render an explicit start action instead of an indefinite loading
+   * state.
+   */
+  autoCreateDisabled: boolean;
   /** Error during bootstrap/session creation, or null if no error */
   bootstrapError: string | null;
   /** Creates a new tab with a fresh server session */
@@ -72,9 +82,89 @@ function generateTabId(): string {
   return `tab-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
 }
 
+/*
+FNXC:Terminal 2026-07-23-14:30:
+GitHub #2121/#2307: the Windows auto-create skip must be observable: expose it
+as `autoCreateDisabled` so TerminalModal can render a "Start terminal" action
+instead of an infinite "Starting terminal..." spinner that only the tab-strip
+"+" button escapes.
+
+FNXC:Terminal 2026-07-23-22:40:
+This UA sniff is now only the trigger for the server-platform probe, not the
+skip itself: Windows-UA clients ask the server (resolveServerPlatform) whether
+the PTY host is actually win32 before the skip applies. See the probe comment
+below for the full contract.
+*/
+function isWindowsBrowserClient(): boolean {
+  if (typeof window === "undefined") return false;
+  const ua = window.navigator.userAgent;
+  // FNXC:Terminal 2026-07-23-21:00: match desktop Windows only. Every real
+  // desktop Windows browser (including Chromium's frozen/reduced UA) carries
+  // "Windows NT"; a bare "Windows" substring also matched Windows Phone UAs,
+  // which have no wt.exe to guard against and were needlessly denied auto-create.
+  return ua.includes("Windows NT") && !ua.includes("Windows Phone");
+}
+
+/*
+FNXC:Terminal 2026-07-23-22:40:
+The wt.exe Help/version-dialog hazard the auto-create skip guards against lives
+on the HOST that spawns the PTY, not in the browser: a Windows browser pointed
+at a mac/linux-hosted dashboard was still forced through the manual "Start
+terminal" screen for no reason. Windows-UA clients now probe the server's
+platform (GET /api/system/info) once per page load and only keep the skip when
+the SERVER is win32; a failed/timed-out probe conservatively keeps the skip so
+a real Windows host can never auto-create through a probe outage. Non-Windows
+browsers never probe — their instant auto-create path is unchanged.
+*/
+let serverPlatformProbe: Promise<string | null> | null = null;
+
+function resolveServerPlatform(): Promise<string | null> {
+  if (!serverPlatformProbe) {
+    serverPlatformProbe = withTimeout(fetchSystemInfo(), SERVER_PLATFORM_TIMEOUT_MS, "fetchSystemInfo")
+      .then((info) => (typeof info.platform === "string" ? info.platform : null))
+      .catch(() => {
+        // Do not cache failures: a later terminal mount may retry the probe.
+        serverPlatformProbe = null;
+        return null;
+      });
+  }
+  return serverPlatformProbe;
+}
+
+/** Test-only: clears the memoized server-platform probe between test cases. */
+export function __resetServerPlatformProbeForTests(): void {
+  serverPlatformProbe = null;
+}
+
 function terminalTabsStorageKey(storageScope?: string): string {
   const trimmed = storageScope?.trim();
   return trimmed ? `${STORAGE_KEY}:${trimmed}` : STORAGE_KEY;
+}
+
+/*
+FNXC:Terminal 2026-07-23-14:30 (helper extracted 2026-07-23-20:10):
+A tab list where no tab is active must never survive a restore or validation
+pass: TerminalModal derives its whole UI from `activeTab`, and an all-inactive
+tab list leaves the "Starting terminal..." spinner up forever while the
+auto-create effect is blocked by tabs.length > 0. This single helper owns the
+tie-break (activate the first tab) for BOTH the storage-read boundary and the
+server-validation success branch so the two paths cannot drift.
+*/
+function normalizeActiveTab(tabs: TerminalTab[]): TerminalTab[] {
+  if (tabs.length === 0) return tabs;
+  const activeCount = tabs.reduce((count, tab) => (tab.isActive ? count + 1 : count), 0);
+  if (activeCount === 1) return tabs;
+  /*
+  FNXC:Terminal 2026-07-23-21:00:
+  Zero active tabs wedges the "Starting terminal..." spinner (activeTab drives
+  the whole modal); MULTIPLE active tabs render several active-styled tabs while
+  only the first receives input, and the inconsistency persists back to storage.
+  Collapse both cases to exactly one active tab: the first currently-active one,
+  or the first tab when none is active.
+  */
+  const firstActiveIndex = tabs.findIndex((tab) => tab.isActive);
+  const activeIndex = firstActiveIndex === -1 ? 0 : firstActiveIndex;
+  return tabs.map((tab, i) => ({ ...tab, isActive: i === activeIndex }));
 }
 
 function readTabsFromStorage(projectId?: string, storageScope?: string): TerminalTab[] {
@@ -83,7 +173,20 @@ function readTabsFromStorage(projectId?: string, storageScope?: string): Termina
   try {
     const stored = getScopedItem(terminalTabsStorageKey(storageScope), projectId);
     if (stored) {
-      return JSON.parse(stored) as TerminalTab[];
+      const parsed = JSON.parse(stored) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      // Drop malformed entries individually instead of letting one null/shape-less
+      // element throw and discard the payload's valid sibling tabs via the outer catch.
+      const validTabs = parsed.filter(
+        (tab): tab is TerminalTab =>
+          !!tab &&
+          typeof tab === "object" &&
+          typeof (tab as TerminalTab).id === "string" &&
+          typeof (tab as TerminalTab).sessionId === "string",
+      );
+      // Normalize here (not only in server validation) because the
+      // validation-FAILURE path keeps tabs exactly as read from storage.
+      return normalizeActiveTab(validTabs);
     }
   } catch {
     // Ignore localStorage errors
@@ -170,6 +273,31 @@ export function useTerminalSessions(projectId?: string, options: UseTerminalSess
   const generationRef = useRef(0);
   const bootstrapCreateInFlightGenerationRef = useRef<number | null>(null);
 
+  /*
+  FNXC:Terminal 2026-07-23-22:40:
+  Server platform learned from the memoized /api/system/info probe. Only
+  Windows-UA clients consult it (see resolveServerPlatform): `undefined` means
+  the probe is still in flight (auto-create waits, spinner stays up), `null`
+  means the probe failed (conservatively treated as a Windows host), and a
+  string is the server's process.platform. Non-Windows browsers never enter
+  the pending state, so their auto-create is not serialized behind the probe.
+  */
+  const uaWindows = isWindowsBrowserClient();
+  const [serverPlatform, setServerPlatform] = useState<string | null | undefined>(undefined);
+  const serverPlatformPending = uaWindows && serverPlatform === undefined;
+  const autoCreateDisabled = uaWindows && (serverPlatform === "win32" || serverPlatform === null);
+
+  useEffect(() => {
+    if (!uaWindows) return;
+    let cancelled = false;
+    resolveServerPlatform().then((platform) => {
+      if (!cancelled) setServerPlatform(platform);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [uaWindows]);
+
   useEffect(() => {
     generationRef.current += 1;
     // FNXC:Terminal 2026-07-15-10:40:
@@ -253,17 +381,8 @@ export function useTerminalSessions(projectId?: string, options: UseTerminalSess
           // Strip internal _verified property and return clean TerminalTab objects
           const cleanTabs = remainingTabs.map(({ _verified: _unused, ...tab }) => tab);
 
-          // Ensure exactly one tab is active
-          const activeTab = cleanTabs.find((t) => t.isActive);
-          if (!activeTab) {
-            // No active tab, activate the first one
-            return cleanTabs.map((tab, i) => ({
-              ...tab,
-              isActive: i === 0,
-            }));
-          }
-
-          return cleanTabs;
+          // Ensure at least one tab is active (shared tie-break with the storage-read boundary)
+          return normalizeActiveTab(cleanTabs);
         });
         
         // Mark as ready after validation
@@ -294,8 +413,24 @@ export function useTerminalSessions(projectId?: string, options: UseTerminalSess
   // (wt.exe) and produce native "Help" version dialogs. Users can still create a terminal
   // explicitly from the UI.
   useEffect(() => {
-    if (typeof window !== "undefined" && window.navigator.userAgent.includes("Windows")) {
-      setIsReady(true);
+    /*
+    FNXC:Terminal 2026-07-23-21:00:
+    The Windows skip must NOT force isReady(true) here: the validation effect
+    above already sets isReady on every path (zero-tabs skip, success, failure),
+    and forcing it on mount let Windows clients connect xterm to persisted tabs
+    BEFORE server validation had pruned dead sessions. Skipping auto-create is
+    the only Windows-specific behavior this effect owns.
+
+    FNXC:Terminal 2026-07-23-22:40:
+    The skip is now keyed on the SERVER platform, not the browser UA: opening
+    the terminal must auto-start a session whenever the host that spawns the
+    PTY is not Windows, even from a Windows browser. While the platform probe
+    is in flight for a Windows-UA client, hold auto-create (pending) instead of
+    racing it; when the probe resolves non-win32 this effect re-runs and
+    creates the first tab, so the manual "Start terminal" screen is reserved
+    for genuine win32 hosts (and probe failures, conservatively).
+    */
+    if (serverPlatformPending || autoCreateDisabled) {
       return;
     }
     if (tabs.length === 0 && isReady && serverAvailable && !bootstrapError) {
@@ -365,15 +500,17 @@ export function useTerminalSessions(projectId?: string, options: UseTerminalSess
       return () => clearTimeout(timeout);
     }
   }, [
+    autoCreateDisabled,
     bootstrapError,
     bootstrapWakeGeneration,
     defaultCwd,
     isReady,
     projectId,
     serverAvailable,
+    serverPlatformPending,
     tabs.length,
     retryGeneration,
-  ]); // Run when ready, when tabs become empty, or after a stale attempt settles
+  ]); // Run when ready, when tabs become empty, after a stale attempt settles, or when the platform probe resolves
 
   /**
    * Internal create tab function (used for auto-creation and user-initiated creation).
@@ -586,6 +723,7 @@ export function useTerminalSessions(projectId?: string, options: UseTerminalSess
     tabs,
     activeTab,
     isReady,
+    autoCreateDisabled,
     bootstrapError,
     createTab,
     closeTab,

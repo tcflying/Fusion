@@ -216,7 +216,17 @@ describe("PlanningModeModal autosize", () => {
     });
   });
 
-  it("does not expose the removed final review for an unvalidated completed session", async () => {
+  it("resumes a complete session without a created task into the full plan review workspace", async () => {
+    /*
+    FNXC:PlanningMode 2026-07-24-05:45:
+    status=complete is only written by validateSession. A missing inputPayload.validated flag
+    must not strand reopen on "still being prepared".
+
+    FNXC:PlanningReopenAfterValidate 2026-07-23-23:30:
+    A finished plan with no created task must resume into plan review — readable, still
+    editable (the server reopens validated sessions on any new turn), with Proceed available —
+    never a create-retry error card or any other do-nothing screen.
+    */
     mockFetchAiSession.mockResolvedValueOnce({
       id: "session-complete-1",
       type: "planning",
@@ -250,7 +260,60 @@ describe("PlanningModeModal autosize", () => {
       />
     );
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("This plan is still being prepared");
-    expect(screen.queryByTestId("planning-description-markdown-toggle")).toBeNull();
+    expect(await screen.findByTestId("planning-plan-review")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed with plan" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refine" })).toBeInTheDocument();
+    expect(screen.queryByTestId("planning-create-retry")).toBeNull();
+    expect(screen.queryByText("This plan is still being prepared")).toBeNull();
+  });
+
+  /*
+  FNXC:PlanningMultiTask 2026-07-24-00:20:
+  A session whose task exists resumes to the editable plan review workspace with a banner
+  linking that task — not a terminal handoff — so the plan can evolve into further tasks.
+  */
+  it("resumes a task-linked complete session to plan review with the linked-task banner", async () => {
+    mockFetchAiSession.mockResolvedValueOnce({
+      id: "session-complete-linked",
+      type: "planning",
+      status: "complete",
+      title: "Linked planning output",
+      inputPayload: JSON.stringify({
+        initialPlan: "Build resilient planning resume",
+        validated: true,
+        createdTaskId: "FN-9001",
+      }),
+      conversationHistory: "[]",
+      currentQuestion: null,
+      result: JSON.stringify({
+        title: "Linked planning output",
+        description: "Recovered summary",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: ["Done"],
+      }),
+      thinkingOutput: "",
+      error: null,
+      projectId: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    render(
+      <PlanningModeModal
+        isOpen={true}
+        onClose={vi.fn()}
+        onTaskCreated={vi.fn()}
+        onTasksCreated={vi.fn()}
+        tasks={mockTasks}
+        resumeSessionId="session-complete-linked"
+      />
+    );
+
+    expect(await screen.findByTestId("planning-plan-review")).toBeInTheDocument();
+    expect(screen.getByTestId("planning-linked-task-note")).toBeInTheDocument();
+    expect(screen.getByTestId("planning-linked-task-note").textContent).toContain("FN-9001");
+    expect(screen.getByRole("button", { name: "Proceed with plan" })).toBeInTheDocument();
+    expect(screen.queryByTestId("planning-create-retry")).toBeNull();
   });
 });

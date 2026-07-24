@@ -1128,7 +1128,24 @@
     "notGranted": "Not granted",
     "toggleCapabilityGrant": "Toggle explicit grant for {{permission}}",
     "capabilityPermissionsUpdated": "Capability grants updated",
-    "capabilityPermissionsFailed": "Failed to update capability grants: {{error}}"
+    "capabilityPermissionsFailed": "Failed to update capability grants: {{error}}",
+    "disableHeartbeat": "",
+    "enableHeartbeat": "",
+    "heartbeatActionForAgent": "",
+    "heartbeatUpdating": "",
+    "heartbeatEnabledForAgent": "",
+    "heartbeatUpdateFailed": "",
+    "enableAllHeartbeats": "",
+    "disableAllHeartbeats": "",
+    "enableAllHeartbeatsConfirm": "",
+    "disableAllHeartbeatsConfirm": "",
+    "noHeartbeatsToEnable": "",
+    "noHeartbeatsToDisable": "",
+    "enableHeartbeatsSummary": "",
+    "disableHeartbeatsSummary": "",
+    "enableHeartbeatsCountHint": "",
+    "disableHeartbeatsCountHint": "",
+    "bulkFailures": ""
   },
   "app": {
     "backendError": {
@@ -1370,7 +1387,8 @@
     "noModelsAvailable": "No models available",
     "currentAgentTarget": "Current agent: {{name}}",
     "currentModelTarget": "Current model: {{model}}",
-    "currentDefaultTarget": "Using the default chat target"
+    "currentDefaultTarget": "Using the default chat target",
+    "newNotAllowedForTaskChat": ""
   },
   "chatRooms": {
     "error": {
@@ -5964,7 +5982,8 @@
       "reportDiscussionCategoryHelp": "Required when filing to GitHub Discussions. Categories are loaded from the configured repository.",
       "reportDiscussionCategorySelect": "選擇討論分類",
       "reportDiscussionCategoryUnavailable": "Discussion categories are unavailable for the configured repository.",
-      "reportDiscussionCategoryEmpty": "No Discussion categories are available for the configured repository."
+      "reportDiscussionCategoryEmpty": "No Discussion categories are available for the configured repository.",
+      "reportTargetByActionHelp": ""
     },
     "globalGeneral": {
       "andShowsUpdateNoticesInTheCLIAnd": "",
@@ -6010,7 +6029,11 @@
       "skipConfirmationDialogs": "",
       "skipConfirmationDialogsHint": "",
       "enableProactiveTaskChat": "",
-      "enableProactiveTaskChatHint": ""
+      "enableProactiveTaskChatHint": "",
+      "releaseChannel": "",
+      "releaseChannelHelp": "",
+      "channelStable": "",
+      "channelBeta": ""
     },
     "globalModels": {
       "allow": "",
@@ -6839,10 +6862,11 @@
       "allProjectResetSuccess": ""
     },
     "database": {
-      "embeddedConnectionCapHelp": "Fusion 內嵌 PostgreSQL 的最大伺服器連線數。重新啟動 Fusion 後生效。範圍：32–2,000。預設：500。外部 PostgreSQL 使用其提供者的連線限制。",
+      "embeddedConnectionCapHelp": "Fusion 內嵌 PostgreSQL 的最大伺服器連線數。重新啟動 Fusion 後生效。範圍：32–2,000。預設未設定 — Fusion 選擇 500；在 Windows 上為 150，因為每個連線都是一個獨立程序，更高的上限可能導致後端當機。外部 PostgreSQL 使用其提供者的連線限制。",
       "embeddedConnectionCap": "內嵌 PostgreSQL 連線上限",
       "embeddedConnectionCapError": "請輸入 32 到 2,000 之間的值。",
-      "advanced": "進階資料庫設定"
+      "advanced": "進階資料庫設定",
+      "embeddedConnectionCapPlaceholder": "自動"
     },
     "configVersions": {
       "title": "設定版本",
@@ -7819,7 +7843,12 @@
       "createdVia": "通過…建立",
       "parentTaskOf": "",
       "createdToUndo": "",
-      "undoTask": ""
+      "undoTask": "",
+      "creatingAgent": "",
+      "importedFrom": "",
+      "nearDuplicateOf": "",
+      "parentTask": "",
+      "title": ""
     },
     "recoveryState": "恢復狀態",
     "refine": {
@@ -8502,6 +8531,9 @@
     "resetPreferences": "",
     "shortcuts": "快捷鍵",
     "startingTerminal": "正在啟動終端...",
+    "manualStartHint": "終端已就緒 — 啟動工作階段以開始。",
+    "manualStartError": "啟動終端失敗：{{message}}",
+    "startTerminal": "啟動終端",
     "statusConnected": "已連線",
     "statusConnecting": "正在連線...",
     "statusDisconnected": "已中斷連線",

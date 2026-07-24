@@ -1435,6 +1435,15 @@ function validateColumns(ir: WorkflowIrV2): void {
       throw new WorkflowIrError(`Workflow IR has duplicate column id '${column.id}'`);
     }
     seen.add(column.id);
+    /*
+    FNXC:WorkflowColumnDescriptions 2026-07-22-12:00:
+    FN-8526 makes column explanatory copy first-class workflow metadata. Keep
+    its absent form as omission (not null) so existing definitions retain board
+    lifecycle-description fallback while arbitrary author string content round-trips.
+    */
+    if (column.description !== undefined && typeof column.description !== "string") {
+      throw new WorkflowIrError(`Workflow IR column '${column.id}' description must be a string`);
+    }
     if (!Array.isArray(column.traits)) {
       throw new WorkflowIrError(`Workflow IR column '${column.id}' traits must be an array`);
     }
@@ -1552,6 +1561,23 @@ function validateColumnAgent(column: WorkflowIrColumn): void {
 
 function validateV2(ir: WorkflowIrV2): void {
   validateColumns(ir);
+
+  // FNXC:WorkflowValidation 2026-07-21-12:20:
+  // Capacity holds must have somewhere the scheduler can actually release
+  // them. Failing authoring here avoids durable continuations that can never
+  // become runnable.
+  for (const [index, column] of ir.columns.entries()) {
+    const hold = column.traits.find((trait) => trait.trait === "hold");
+    if (hold?.config?.release !== "capacity") continue;
+    const hasDownstreamCapacity = ir.columns
+      .slice(index + 1)
+      .some((candidate) => resolveColumnFlags(candidate).countsTowardWip === true);
+    if (!hasDownstreamCapacity) {
+      throw new WorkflowIrError(
+        `Workflow IR capacity hold column '${column.id}' requires a downstream wip column`,
+      );
+    }
+  }
 
   const columnIds = new Set(ir.columns.map((c) => c.id));
   const nodeIds = new Set<string>();

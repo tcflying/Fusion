@@ -30,6 +30,22 @@ vi.mock("../planning.js", () => ({
   cleanupSession: vi.fn(),
   formatInterviewQA: vi.fn(() => ""),
   mergePlanningSubtaskDrafts: vi.fn((_sessionId: string, subtasks: unknown[]) => subtasks),
+  /*
+  FNXC:PlanningRouteTests 2026-07-23-08:20:
+  The direct registrar fixture must expose the durable create-claim lifecycle because
+  Planning create-task now resolves those exports before dispatching GitHub tracking.
+  */
+  updatePlanningCreateClaim: vi.fn(async () => undefined),
+  getDurablePlanningSession: vi.fn(async (id: string) => sessions.get(id)),
+  claimPlanningTaskCreation: vi.fn(async (id: string) => sessions.get(id)),
+  finalizePlanningTaskCreation: vi.fn(async () => undefined),
+  reconcilePlanningTaskCreation: vi.fn(async () => undefined),
+  releasePlanningTaskCreation: vi.fn(async () => undefined),
+  // FNXC:PlanningMode 2026-07-23-12:10: create-task terminalizes the session after creation.
+  validateSession: vi.fn(async () => undefined),
+  // FNXC:PlanningMultiTask 2026-07-24-00:20: create-task derives an epoch-scoped proposalClaimId.
+  planningProposalClaimId: (sessionId: string, epoch?: number) =>
+    epoch && epoch > 0 ? `planning-session:${sessionId}#${epoch}` : `planning-session:${sessionId}`,
 }));
 
 function deferred<T>() {
@@ -127,8 +143,10 @@ describe("planning routes github tracking background dispatch", () => {
         createdTasks.set(id, next);
         return next;
       }),
+      upsertTaskDocument: vi.fn(async () => undefined),
       logEntry: vi.fn(async () => undefined),
       getTask: vi.fn(async (id: string) => createdTasks.get(id)),
+      listTasks: vi.fn(async () => [...createdTasks.values()]),
       getSettings: vi.fn(async () => ({
         githubTrackingEnabledByDefault: true,
         githubTrackingDefaultRepo: "o/r",
@@ -182,6 +200,8 @@ describe("planning routes github tracking background dispatch", () => {
     createIssueSpy.mockImplementation(createIssue.wrapped);
 
     sessions.set("plan-1", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Planned task",
         description: "Planned task description",
@@ -222,6 +242,8 @@ describe("planning routes github tracking background dispatch", () => {
     createIssueSpy.mockRejectedValue(new Error("github down"));
 
     sessions.set("plan-2", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Planned task 2",
         description: "Planned task description 2",
@@ -255,6 +277,8 @@ describe("planning routes github tracking background dispatch", () => {
     });
 
     sessions.set("plan-2-sync", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Planned task 2",
         description: "Planned task description 2",
@@ -288,6 +312,8 @@ describe("planning routes github tracking background dispatch", () => {
     createIssueSpy.mockImplementation(createIssue.wrapped);
 
     sessions.set("plan-3", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Plan",
         description: "Plan",
@@ -333,6 +359,8 @@ describe("planning routes github tracking background dispatch", () => {
     createIssueSpy.mockRejectedValue(new Error("github down"));
 
     sessions.set("plan-3-reject", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Plan",
         description: "Plan",
@@ -372,6 +400,8 @@ describe("planning routes github tracking background dispatch", () => {
     });
 
     sessions.set("plan-3-sync", {
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
       summary: {
         title: "Plan",
         description: "Plan",

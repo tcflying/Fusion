@@ -398,7 +398,9 @@ export type GitMutationType =
    */
   | "pull:fast-forward"
   /**
-   * Metadata shape:
+   * `push:origin` is polymorphic — two producers emit it with different shapes:
+   *
+   * 1. Dashboard Smart Push (interactive):
    * ```ts
    * {
    *   integrationBranch: string;
@@ -413,8 +415,28 @@ export type GitMutationType =
    *   durationMs: number;
    * }
    * ```
+   *
+   * 2. Automated post-merge push (merger-ai.ts pushAfterMergeToRemote):
+   * ```ts
+   * {
+   *   integrationBranch: string;
+   *   remote: string;
+   *   targetBranch?: string;   // omitted on the shutdown-abort path
+   *   refAdvanced?: boolean;   // divergence rebase rewrote the landed squash
+   *   outcome: "success" | "failed" | "aborted";
+   *   stderrPreview?: string;  // present on "failed"
+   * }
+   * ```
+   * `outcome: "aborted"` (Tchori-Labs/Fusion#5) marks a shutdown signal after
+   * finalization: the merge stays landed and its divergence recovery branch is
+   * retained (see `push:recovery-branch`), but the target push did not complete.
    */
   | "push:origin"
+  /*
+   * FNXC:MergePush 2026-07-22-18:55:
+   * Tchori-Labs/Fusion#5 records the best-effort lifecycle of the remote pre-rebase safety ref. Metadata is ids/outcomes-only: `{ taskId, remote, recoveryBranch, sha, outcome }`, where outcome is `success`, `failed`, `deleted`, or `delete-failed`.
+   */
+  | "push:recovery-branch"
   /**
    * Metadata shape:
    * ```ts
@@ -442,6 +464,8 @@ export type DatabaseMutationType =
   | "task:steering-comment:add"
   | "task:assign"
   | "task:checkout"
+  /** Metadata: { taskId, artifactKeys, owner, source, action, attempt, maxAttempts, nodeId? } */
+  | "task:required-artifact-missing"
   | "agent:auto-recover-error-state"
   | "agent:reset-error-state-on-startup"
   | "agent:error-retry-exhausted"
@@ -569,6 +593,14 @@ export type DatabaseMutationType =
    * deliberately left in place so the operator can see what it carried. Same metadata shape.
    */
   | "task:reconcile-legacy-adoption-unmappable"
+  /*
+  FNXC:OrphanedPendingSteps 2026-07-22-16:35 (FN-8492):
+  Startup/periodic rewrite of orphaned `pending` workflow-step results (no live session
+  behind them) to `failed`, so the merge gate stays closed and failed-pre-merge-steps
+  recovery owns the re-run. Metadata ids/counts-only:
+  { taskId, column, orphanedCount, resultCount }.
+  */
+  | "task:reconcile-orphaned-pending-step-results"
   /**
    * FNXC:MergeQueue 2026-07-15-10:05:
    * Wedged single-flight merge reclaim. Metadata ids/outcomes-only:
@@ -630,6 +662,15 @@ export type DatabaseMutationType =
    * ```
    */
   | "session:runtime-resolved"
+  /**
+   * FNXC:GrokCliRouting 2026-07-22-15:10:
+   * A deferred grok-cli fallback engaged at prompt time: the primary model failed with a
+   * retryable model-selection error and the session swapped onto the Grok CLI runtime with
+   * the deferred fallback model. Metadata is ids/outcomes-only:
+   * `{ sessionPurpose, primaryProvider, primaryModelId, fallbackModelId, triggerPoint, failureCategory }`
+   * — never error prose.
+   */
+  | "session:grok-cli-fallback-engaged"
   /**
    * FNXC:AgentReflectionTelemetry 2026-06-27-00:00:
    * Agent performance reflection attempts must emit durable telemetry for every generated, skipped, or failed outcome. Metadata carries ids, trigger taxonomy, counts, and outcomes only; never persist reflection summaries, insight strings, suggested-improvement text, triggerDetail, or prompt text.

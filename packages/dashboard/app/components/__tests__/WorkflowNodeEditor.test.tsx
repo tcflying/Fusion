@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { useState } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup, within } from "@testing-library/react";
+import { act, render, screen, waitFor, cleanup, within } from "@testing-library/react";
 import { parseWorkflowIr, type WorkflowDefinition, type Settings } from "@fusion/core";
 
 // FNXC:WorkflowStepTemplate 2026-06-25-00:00: U6 deleted the built-in
@@ -1941,6 +1941,25 @@ describe("WorkflowNodeEditor — U10 columns/traits/holds", () => {
     if (ir.version !== "v2") throw new Error("expected v2");
     const columnIds = new Set(ir.columns.map((column) => column.id));
     expect(ir.nodes.every((node) => node.column === undefined || columnIds.has(node.column))).toBe(true);
+  });
+
+  it("serializes populated column descriptions on save", async () => {
+    const definition = v2Def();
+    if (definition.ir.version === "v2") definition.ir.columns[0] = {
+      ...definition.ir.columns[0],
+      description: "Initial planning guidance",
+    };
+    vi.mocked(fetchWorkflows).mockResolvedValue([definition]);
+    vi.mocked(updateWorkflow).mockImplementation(async (_id, updates) => ({ ...definition, ...(updates as object) }));
+
+    render(<WorkflowNodeEditor isOpen onClose={() => {}} addToast={() => {}} />);
+    const [description] = await screen.findAllByRole("textbox", { name: /Column description/i });
+    fireEvent.change(description, { target: { value: "Saved planning guidance" } });
+    fireEvent.click(screen.getByText("Save").closest("button")!);
+    await waitFor(() => expect(updateWorkflow).toHaveBeenCalled());
+    const saved = vi.mocked(updateWorkflow).mock.calls.at(-1)?.[1] as { ir: { columns: { description?: string }[] } };
+    expect(saved.ir.columns[0].description).toBe("Saved planning guidance");
+
   });
 
   it("saves a valid v2 workflow round-tripping columns to the API", async () => {
@@ -4278,6 +4297,16 @@ describe("WorkflowNodeEditor simplified view modes", () => {
     vi.mocked(updateWorkflow).mockImplementation(async (_id, updates) => ({ ...def(), ...(updates as object) }));
     render(<WorkflowNodeEditor isOpen onClose={() => {}} addToast={() => {}} />);
     await screen.findByTestId("wf-simple-canvas");
+    /*
+    FNXC:WorkflowSimpleView 2026-07-24-01:25:
+    Flush pending hydration/layout commits before opening the add-step modal.
+    Full-suite run 30077108784 (CI lane load) hit an additive insert — the
+    optional group landed while merge→end survived — because the toolbar pick
+    ran before the canvas settled its edge-target state; locally this never
+    reproduces (5/5 green). Same settle-before-interact class as 5a5796bca.
+    If this recurs despite the settle, quarantine per the deletion ratchet.
+    */
+    await act(async () => {});
 
     fireEvent.click(screen.getByTestId("wf-simple-toolbar-add-step"));
     const dialog = await screen.findByTestId("wf-add-step-modal");

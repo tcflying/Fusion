@@ -1138,7 +1138,24 @@
     "notGranted": "Not granted",
     "toggleCapabilityGrant": "Toggle explicit grant for {{permission}}",
     "capabilityPermissionsUpdated": "Capability grants updated",
-    "capabilityPermissionsFailed": "Failed to update capability grants: {{error}}"
+    "capabilityPermissionsFailed": "Failed to update capability grants: {{error}}",
+    "disableHeartbeat": "Disable heartbeat",
+    "enableHeartbeat": "Enable heartbeat",
+    "heartbeatActionForAgent": "{{action}} for {{name}}",
+    "heartbeatUpdating": "Updating heartbeat…",
+    "heartbeatEnabledForAgent": "Heartbeat enabled for {{name}}",
+    "heartbeatUpdateFailed": "Failed to update heartbeat: {{error}}",
+    "enableAllHeartbeats": "Enable all heartbeats",
+    "disableAllHeartbeats": "Disable all heartbeats",
+    "enableAllHeartbeatsConfirm": "Enable heartbeats for {{count}} project agents?",
+    "disableAllHeartbeatsConfirm": "Disable heartbeats for {{count}} project agents?",
+    "noHeartbeatsToEnable": "No agent heartbeats need enabling",
+    "noHeartbeatsToDisable": "No agent heartbeats need disabling",
+    "enableHeartbeatsSummary": "Enabled {{count}} heartbeats; skipped {{skipped}}",
+    "disableHeartbeatsSummary": "Disabled {{count}} heartbeats; skipped {{skipped}}",
+    "enableHeartbeatsCountHint": "Enable {{count}} disabled project heartbeats",
+    "disableHeartbeatsCountHint": "Disable {{count}} enabled project heartbeats",
+    "bulkFailures": "failed {{count}}"
   },
   "app": {
     "backendError": {
@@ -1289,6 +1306,7 @@
     "newChatModeAgent": "Agent",
     "newChatModeModel": "Model",
     "newChatTitle": "New Chat",
+    "newNotAllowedForTaskChat": "This chat is tied to a task — /new and /clear can't clear it",
     "noAgentsAvailable": "No agents available",
     "noConversationsYet": "No conversations yet",
     "noMessage": "No message",
@@ -3334,7 +3352,7 @@
     "statsInColumn_one": "{{count}} of {{total}} tasks in {{column}}",
     "statsInColumn_other": "{{count}} of {{total}} tasks in {{column}}",
     "statusMergingFix": "Merging fixes…",
-    "statusReplan": "Replan",
+    "statusReplan": "Revising",
     "stuck": "Stuck",
     "taskCreationUnavailable": "Task creation not available",
     "unpauseSelected": "Unpause selected",
@@ -5974,7 +5992,7 @@
       "reportRoadmapDedup": "Check roadmap before filing reports",
       "reportRoadmapDedupHelp": "When enabled, matching roadmap features are shown inline instead of filing another GitHub Issue or Discussion. Default: off.",
       "reportTarget": "Default report target",
-      "reportTargetHelp": "Optional Issue or Discussion target. When unset, Feedback and Help use Discussions while Bug and Idea use Issues.",
+      "reportTargetHelp": "Optional Issue or Discussion target. When unset, Feedback and Help use Discussions while Bug and Idea use Issues. No default — unset.",
       "reportTargetInherit": "Preserve action default",
       "reportTargetIssue": "GitHub Issue",
       "reportTargetDiscussion": "GitHub Discussion",
@@ -5985,10 +6003,11 @@
         "help": "Help target override"
       },
       "reportDiscussionCategory": "Discussion category",
-      "reportDiscussionCategoryHelp": "Required when filing to GitHub Discussions. Categories are loaded from the configured repository.",
+      "reportDiscussionCategoryHelp": "Required when filing to GitHub Discussions. Categories are loaded from the configured repository. No default — unset until a category is selected.",
       "reportDiscussionCategorySelect": "Select a Discussion category",
       "reportDiscussionCategoryUnavailable": "Discussion categories are unavailable for the configured repository.",
-      "reportDiscussionCategoryEmpty": "No Discussion categories are available for the configured repository."
+      "reportDiscussionCategoryEmpty": "No Discussion categories are available for the configured repository.",
+      "reportTargetByActionHelp": "Optional per-action override of the default report target for bug, feedback, idea, or help. No default — unset actions inherit reportTarget / action defaults."
     },
     "globalGeneral": {
       "andShowsUpdateNoticesInTheCLIAnd": " and shows update notices in the CLI and dashboard. Cadence is governed by the frequency below. Default: enabled. ",
@@ -6034,7 +6053,11 @@
       "gitLabAuthTokenHint": "Projects inherit this fallback only when they do not set a project GitLab token. Read-only operations need read_api or api; write actions need api; project/group tokens remain limited by resource membership. No default — unset.",
       "dismissModalsByClickingOutsideHint": " When enabled, clicking or tapping a modal backdrop closes the modal. Default: disabled, to prevent accidental dismissal. ",
       "skipConfirmationDialogs": " Skip confirmation dialogs for critical actions ",
-      "skipConfirmationDialogsHint": " When enabled, destructive actions such as deleting a task or resetting progress run immediately without a prompt. Default: disabled"
+      "skipConfirmationDialogsHint": " When enabled, destructive actions such as deleting a task or resetting progress run immediately without a prompt. Default: disabled",
+      "releaseChannel": "Release channel",
+      "releaseChannelHelp": "Stable follows official releases. Beta follows pre-releases cut from main and also picks up each stable release once it overtakes the beta. Switching back to Stable never downgrades. Default: stable.",
+      "channelStable": "Stable (recommended)",
+      "channelBeta": "Beta — early builds from main"
     },
     "globalModels": {
       "allow": "allow",
@@ -6849,10 +6872,11 @@
       "allProjectResetSuccess": "All project settings reset to defaults"
     },
     "database": {
-      "embeddedConnectionCapHelp": "Maximum server connections for Fusion's embedded PostgreSQL. Applies after restarting Fusion. Range: 32–2,000. Default: 500. External PostgreSQL uses its provider's connection limit.",
+      "embeddedConnectionCapHelp": "Maximum server connections for Fusion's embedded PostgreSQL. Applies after restarting Fusion. Range: 32–2,000. Unset by default — Fusion picks 500, or 150 on Windows where each connection is a separate process and higher caps can crash backends. External PostgreSQL uses its provider's connection limit.",
       "embeddedConnectionCap": "Embedded PostgreSQL connection cap",
       "embeddedConnectionCapError": "Enter a value between 32 and 2,000.",
-      "advanced": "Advanced database settings"
+      "advanced": "Advanced database settings",
+      "embeddedConnectionCapPlaceholder": "auto"
     },
     "configVersions": {
       "title": "Configuration versions",
@@ -7856,9 +7880,14 @@
     "provenance": {
       "createdBy": "Created by",
       "createdVia": "Created via",
+      "creatingAgent": "Creating agent",
+      "importedFrom": "Imported from",
+      "nearDuplicateOf": "Flagged near-duplicate of",
+      "parentTask": "Parent task",
       "parentTaskOf": "of",
       "createdToUndo": "Created to undo",
-      "undoTask": "Undo task"
+      "undoTask": "Undo task",
+      "title": "Provenance"
     },
     "recoveryState": "Recovery state",
     "refine": {
@@ -8456,7 +8485,7 @@
     "showSteps": "Show steps",
     "stalled": "Stalled",
     "statusMergingFix": "Merging fixes…",
-    "statusReplan": "Replan",
+    "statusReplan": "Revising",
     "stepCount_one": "{{count}} step",
     "stepCount_other": "{{count}} steps",
     "stuck": "Stuck",
@@ -8512,6 +8541,9 @@
     "resetPreferences": "Reset to defaults",
     "shortcuts": "Shortcuts",
     "startingTerminal": "Starting terminal...",
+    "manualStartHint": "The terminal is ready — start a session to begin.",
+    "manualStartError": "Failed to start terminal: {{message}}",
+    "startTerminal": "Start terminal",
     "statusConnected": "Connected",
     "statusConnecting": "Connecting...",
     "statusDisconnected": "Disconnected",

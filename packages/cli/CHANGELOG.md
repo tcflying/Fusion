@@ -1,5 +1,425 @@
 # @runfusion/fusion
 
+## 0.73.0-beta.6
+
+### Patch Changes
+
+- b007de5: summary: Fix broken beta binary builds — bun executables and the Windows desktop EXE package again.
+  category: fix
+  dev: bun compile marks `chromium-bidi` external (optional playwright-core BiDi require); release.yml quotes `-c.publish.channel=beta` so PowerShell stops splitting it into a config-file path.
+- 345dccb: summary: Fix duplicate planning sessions created when navigating away from and back to Planning.
+  category: fix
+  dev: The seeded `planningInitialPlan` handoff is now one-shot — `PlanningModeModal` consumes it via `onInitialPlanConsumed` when auto-start fires, so remounts restore the persisted active session instead of auto-starting again.
+- 07541f7: summary: Switching projects now fully resets Planning, Chat, Missions, subtask breakdown, GitHub import, and open modals.
+  category: fix
+  dev: New `closeProjectScopedModals()` on the modal manager, invoked by project select/view-all/setup-complete; PlanningModeModal, ChatView, MissionManager, SubtaskBreakdownModal, and GitHubImportModal are keyed by project id so running streams, session lists, and per-project persisted drafts/active sessions no longer leak or mis-file across projects (subtask/mission drafts save on unmount under their own project key).
+- 049c36c: summary: Task chat step narration now shows 1-based step numbers matching the task card's step count.
+  category: fix
+  dev: Display-only change in proactive-status.ts builders and merge-queue-ops proactiveStepStatusMessage; the 0-based step-index contract (tools, PROMPT.md headings, run-audit) is unchanged.
+- 0dd34cd: summary: /new and /clear in Chat no longer wipe a task-bound planner chat's history.
+  category: fix
+  dev: ChatView's exact `/new`//`/clear` intercept now recognizes `task-planner:<taskId>` sessions (surfaced in the common feed via `showTaskChatsInCommonFeed`) and consumes the command with a warning toast instead of calling createSession.
+- 86f56b5: summary: Terminal now auto-starts a session from Windows browsers when the dashboard host is not Windows.
+  category: fix
+  dev: Windows-UA clients probe `GET /api/system/info` (memoized, 5s timeout) and only keep the manual "Start terminal" gate when the server platform is `win32` or the probe fails.
+
+## 0.73.0-beta.5
+
+### Minor Changes
+
+- ebbb594: summary: Add contextual comments to Planning Mode plan reviews.
+  category: feature
+  dev: Batches selected plan quotes and suggestions into the existing plan-update generation.
+- 0d355f3: summary: Add guided setup for local OpenAI-compatible model providers.
+  category: feature
+  dev: Writes non-destructive pi models.json entries with optional Qwen thinking compatibility.
+- 2978ec4: summary: Add per-agent and project-wide heartbeat enable controls.
+  category: feature
+  dev: Preserves complete runtimeConfig replacements through the existing project-scoped agent PATCH route.
+- ca4639b: summary: One plan can now create multiple tasks — in the dashboard, the CLI, and agent tools alike.
+  category: feature
+  dev: Task-creation claims are epoch-scoped (`planning-session:{id}` → `…#N` via `planningProposalClaimId`); editing a plan past a created task rotates the epoch after turn admission. Complete sessions resume to an editable plan review with a linked-task banner; claim-lifecycle writes are surgical jsonb merges with an epoch-guarded reconcile; create-task 409s while a turn is generating. `fn task plan` / `fn_task_plan` now create through the shared claim-aware `createTaskFromPlanSession` (idempotent, session-linked, epoch-aware) and gain `--resume <sessionId>` / `resumeSessionId` plus an interactive keep-refining loop.
+
+### Patch Changes
+
+- ff165ec: summary: Beta release notes now list only that beta's changes; stable notes roll up the whole beta cycle.
+  category: fix
+  dev: `scripts/release.mjs` scopes distillation input via `selectChannelChangesets` against pre.json's consumed-changesets ledger; stable keeps the full preserved set.
+- 2499803: summary: Fix Compound Engineering sessions dying with "AI returned no valid JSON" when turns race; add retry and diagnostics.
+  category: fix
+  dev: CE orchestrator now enforces synchronous single-turn admission per session (concurrent answer/resume gets `CeTurnInProgressError`, HTTP 409) so a re-entered mobile view cannot displace the in-flight turn's live agent. The interactive AI session seam gains a second reformat retry and logs bounded raw-response snippets with provider/model via `interactiveSessionLog` on every parse failure.
+- dc13207: summary: Fix embedded PostgreSQL crash-recovery boot on Windows — no self-shutdown race, no 30s .pgrunner log stall.
+  category: fix
+  dev: Issue #2411 (beta.4 follow-up). pgctl runner logs moved to a sibling `.pgrunner-<dataDirName>` dir so crash recovery's data-dir fsync walk never hits them (legacy in-dataDir `.pgrunner` is swept); the elevated readiness scan ignores 57P03 recovery rejections; owned starts wait for the cluster to accept connections before ensureDatabase (bounded by the start timeout); the join verify retries 57P03 for up to 15s; startup-factory's joined-instance-unreachable retry backs off across ~15s instead of one 500ms attempt. Also closes the stale-pid gap: a `postmaster.pid` whose recorded pid is provably dead (signal-0 ESRCH; EPERM still counts as alive) no longer joins the dead port forever — the boot takes an owned start and PostgreSQL reclaims the stale lock itself.
+- 73a57d9: summary: Fix Planning reopen after a finished session so Retry no longer dead-ends.
+  category: fix
+  dev: Treat status=complete as terminal; recover create-retry/task-created/plan-review on load and when generation retry reports already-validated.
+- 62c5297: summary: Keep Planning plan-review Add-comment controls on-screen on mobile after text selection.
+  category: fix
+  dev: Selectioncapture uses document-level selectionchange; mobile trigger and composer are position:fixed above the nav with width auto so they stay in the visual viewport and dismiss when the selection collapses.
+- 42fe154: summary: Keep Planning Mode selected-text comments reachable in the mobile action rail.
+  category: fix
+  dev: Mobile uses the plan footer at up to 768px; wider layouts retain the selection-adjacent trigger.
+- d2e41e4: summary: Honor selected workflow planning models in Planning Mode.
+  category: fix
+  dev: Planning Mode now composes selected-workflow model lanes before canonical model resolution.
+- 492d375: summary: Keep Planning Mode recovery retries safely bounded after failed attempts.
+  category: fix
+  dev: Releases the settled automatic retry owner before scheduling its token-guarded successor.
+- d6d8a5e: summary: Keep Planning Refine and Proceed actions visible on mobile.
+  category: fix
+  dev: Pin the plan action rail while its Markdown document scrolls in short and narrow viewports.
+- 3f976e3: summary: Give Planning Mode a dedicated collaborative prompt instead of task-triage instructions.
+  category: fix
+  dev: The planning-system override remains a full system-prompt replacement.
+- c4292b2: summary: Make Planning Mode refine plans through codebase-grounded direction choices.
+  category: feature
+  dev: Selected directions and Other responses now rebuild the running-plan backbone before the next narrowing question.
+- 2021d56: summary: Show complete mission hierarchies in agent mission lookup results.
+  category: fix
+  dev: `fn_mission_show` now renders mission metadata, child IDs/statuses, task links, and empty states.
+- e734ed8: summary: Show failed mission assertions and safe validator evidence in remediation work.
+  category: fix
+  dev: Validation diagnostics are normalized consistently across SQLite and PostgreSQL mission stores.
+- e7c9b2a: summary: Scope feature validation to linked assertions instead of unfinished milestone work.
+  category: fix
+  dev: Adds provenance-safe milestone assertion persistence and derived-origin uniqueness.
+- dfb9ca6: summary: Bound generated mission fixes to one root feature retry budget.
+  category: fix
+  dev: Fix lineages retain durable stops through removal and never resume exhausted budgets.
+- e5caea5: summary: Keep supervised mission validation report-only until autonomy is explicitly enabled.
+  category: fix
+  dev: Atomic mission status and autopilot transition events now include actor and before/after metadata.
+- 3d0ce2e: summary: Fix supervised task creation and defined-feature mission bootstrap admission.
+  category: fix
+  dev: No-task heartbeat creates still require approved lineage; first defined-feature tasks link and triage safely.
+- 84d7306: summary: Make ideation candidate IDs discoverable for direct convergence.
+  category: fix
+  dev: Show and diverge tool text now includes candidate identity, provenance, and content.
+- 15b5441: summary: Keep GitHub issue import actions on one usable mobile row.
+  category: fix
+  dev: Adds Blink geometry coverage for 320px, 390px, and 412px action bars.
+- 47d2d17: summary: Let agent-card heartbeat controls disable and re-enable scheduling.
+  category: feature
+  dev: The interval dropdown now preserves runtime configuration while updating runtimeConfig.enabled.
+- 0c085bf: summary: Push-after-merge no longer silently strands approved merges when the remote diverged.
+  category: fix
+  dev: Preserves a remote recovery branch during clean-room rebases and surfaces aborted target pushes.
+- 0412113: summary: Deleting a task created from a plan no longer dead-ends the plan — Proceed creates a fresh task.
+  category: fix
+  dev: `PLANNING_CREATED_TASK_MISSING` now only fires when the linked task is still listed but unreadable (transient read); a task absent from the include-archived scan clears the stale linkage in both the create-task route and `createTaskFromPlanSession`. CLI/agent create side-effect failures are now logged; keep-refining readline closes on thrown prompts.
+- 716e698: summary: Planning Mode no longer hangs on "Generating plan" after a provider error; it surfaces a retryable error.
+  category: fix
+  dev: Provider errors thrown after a planning session persists "generating" (agent rebuild, history replay, legacy sync start) now land the session in a persisted retryable error with an SSE error event; the stream route reconciles stranded generating sessions past the watchdog window via `reconcileStalePlanningGeneration`.
+- 64b20c8: summary: Planning, mission, milestone, and onboarding interviews regenerate a question instead of "No active question" errors.
+  category: fix
+  dev: submitResponse no longer throws "No active question in session" — refine/comments fall back to a rebuilt running summary and a question-regeneration reprompt continues the interview. Mission/milestone/onboarding interviews mirror the same recovery for live sessions (completed sessions still reject); the Planning modal forwards no-question submissions instead of dead-ending locally.
+- 94644ef: summary: Planning sessions now show Complete instead of Needs input after their task is created.
+  category: fix
+  dev: POST /api/planning/create-task terminalizes the session via validateSession on every created/alreadyCreated path.
+- 5a5796b: summary: Planning mode now shows a neutral session loader while restoring a saved session instead of "Generating…".
+  category: fix
+  dev: New `session_loading` view state in PlanningModeModal; generating copy, Stop button, elapsed timer, and the missed-SSE watchdog are reserved for sessions the server reports as generating. Unrecognized persisted session shapes land in the retryable error view instead of spinning forever.
+- 0e6108a: summary: Stopping a plan now also cancels generations that haven't started streaming yet.
+  category: fix
+  dev: `stopGeneration` discards a still-pending initial turn (registered by start-streaming but not yet consumed by a stream connect) instead of returning false and letting the "stopped" generation restart on the next connect; stops remain strictly per-session when multiple plans generate concurrently.
+- e2ee8ba: summary: Every Planning Mode generation step now streams AI thinking/output, not just the first turn.
+  category: fix
+  dev: The planning workspace loader (follow-up turns — next question, refine, contextual comments, question regeneration) reuses the initial loading view's thinking container/toggle and mirrors the generation-activity label.
+- 370a7a6: summary: A finished plan is never a dead end — read it, keep refining, and create the task at any time.
+  category: fix
+  dev: Validated planning sessions reopen on any new turn (submitResponse/rewind clear `validated`; validateSession stays the only terminalizer). Complete-without-task sessions resume into the full plan review workspace instead of the create-retry card, and the create-failure screen gains a Back to plan action. The one-task-per-session claim (`proposalClaimId`) is unchanged.
+- 9f79b22: summary: Keep secondary locale catalogs in sync with heartbeat controls and settings provenance labels.
+  category: fix
+  dev: Synchronize all five secondary app catalogs with the authored English key structure so untranslated values fall back cleanly to English.
+- 907e8d0: summary: Terminal no longer sticks on "Starting terminal..." on Windows and Ctrl/Cmd+V paste is delivered exactly once.
+  category: fix
+  dev: TerminalModal Cmd/Ctrl+V now calls preventDefault so the browser's native paste cannot double-deliver, and returns true (native xterm paste) when the async clipboard API is unavailable (non-HTTPS remote, older Firefox). useTerminalSessions exposes `autoCreateDisabled` (Windows browser clients) so the modal renders a "Start terminal" action instead of an endless spinner, and normalizes all-inactive persisted tab payloads on restore.
+
+## 0.73.0-beta.4
+
+### Minor Changes
+
+- 016221c: summary: Agent chat now investigates the live codebase with tools before answering architecture and code questions.
+  category: feature
+  dev: Adds CHAT_CODEBASE_ACCURACY_GUIDANCE and appends it in direct and room chat system-prompt assembly; response-length policy yields to path/symbol evidence on repo questions. Mailbox long-form path is conditional when fn_send_message is registered; find is bounded to the project checkout.
+- de5d446: summary: Add optional explanatory descriptions to custom workflow board columns.
+  category: feature
+  dev: Workflow IR column descriptions are projected to selected, aggregate, and archived boards.
+- 64661c3: summary: Add stable dashboard theme tokens and plugin overlay layering with --fusion-max-z.
+  category: feature
+  dev: `--fusion-max-z` is synced from `floatingWindowStack.ts` with an 11001 floor; `#plugin-overlay-root` is a click-through fixed mount point; the contract is documented and guarded by a docs-to-CSS sync test.
+
+### Patch Changes
+
+- a224c11: summary: Fix the Chat View "Latest" button shifting sideways out from under the cursor when clicked.
+  category: fix
+  dev: `.chat-jump-to-latest:active` now composes `translateX(-50%) scale(0.97)` so the global `.btn:active` transform no longer replaces the centering transform.
+- adf51e2: summary: Plugin API routes now work for plugins enabled after startup or enabled only in a non-launch project.
+  category: fix
+  dev: Plugin-defined HTTP routes are dispatched per request through the shared project-scoped PluginLoader resolution (routes/context.ts getProjectPluginLoader) instead of a boot-time snapshot of the launch project's loader. Fixes Compound Engineering "Failed to load sessions/artifacts: Not found" persisting on v0.73.0-beta.3.
+- 96a9da7: summary: Notify operators when a task is terminally blocked or exhausts automated recovery.
+  category: fix
+  dev: Adds deduped task-wedge provider and dashboard mailbox delivery.
+- 0e2aa49: summary: Hide uninstalled runtime pages from Settings integrations.
+  category: fix
+  dev: Settings refreshes installed runtime navigation from plugin lifecycle updates while keeping disabled installed runtimes visible.
+- 059b954: summary: Prevent plugin toggles from reinstalling uninstalled runtimes.
+  category: fix
+  dev: FN-8521 / Runfusion/Fusion#2409 separates install from project-scoped enablement.
+- e16204d: summary: Prevent Windows embedded PostgreSQL log contention and recover once from DLL initialization crashes.
+  category: fix
+  dev: Harden native PATH, runner-log observation, and bounded owned-cluster restart behavior.
+- 4ef94e6: summary: Stop completed PostgreSQL migrations from re-scanning retained SQLite backups at startup.
+  category: fix
+  dev: Core, central, and plugin sources now honor their independent completion markers before SQLite access.
+- 25cd42d: summary: Make imported task links in Stats follow the active dashboard theme.
+  category: fix
+  dev: The shared Stats provenance link now uses the --accent token.
+- e5d6be4: summary: Lower the embedded PostgreSQL default connection cap to 150 on Windows to prevent 0xC0000142 backend crashes.
+  category: fix
+  dev: Issue #2411 — embeddedPostgresMaxConnections is now schema-unset; resolveEmbeddedMaxConnections picks win32 150 / else 500, explicit settings still clamp to [32, 2000].
+- fc4f5aa: summary: Fix Planning Mode duplicating generations and "AI returned no valid JSON" errors after leaving and returning mid-run.
+  category: fix
+  dev: Planning turns are admitted through a synchronous per-session reservation across submitResponse/retrySession/startExistingSession and the initial turn, so a racing entry is rejected instead of displacing the in-flight generation and disposing its agent mid-prompt. Duplicate starts of a generating session are no-ops, the client auto-retry budget survives view remounts (module-scoped per-session map), and SSE reconnects rebuild thinking output from a full-turn replay buffer (2000 events) instead of appending onto existing output. Planning prompts also route through the engine's promptWithFallback so context-window overflows recover via compaction instead of erroring the session.
+
+## 0.73.0-beta.3
+
+### Minor Changes
+
+- cd51e1c: summary: Filter dashboard color themes by name in Settings and Command Center.
+  category: feature
+  dev: Uses the shared ThemeDropdown filter without changing persisted theme IDs or selection behavior.
+- 53e3063: summary: Honor skill-executor config on foreach step-execute sessions so per-step skills load like top-level nodes.
+  category: feature
+  dev: Threads config.executor/skillName from step-execute into StepSessionExecutor requestedSkillNames + additionalSkillPaths with FN-8461 skill-load parity (issue #2402).
+- da616e1: summary: Add a gesture-only Quick Add Start action for eligible workflows.
+  category: feature
+  dev: Validates submitted workflow metadata and promotes only matching created tasks forward.
+- 1cd0674: summary: Add photo and file attachments to Quick Add and Main Chat.
+  category: feature
+  dev: Quick Add now aligns picker, paste, and drop MIME intake with task-store attachment support.
+- 227281d: summary: Keep default Code Review remediation retries unlimited and show the active policy.
+  category: feature
+  dev: Code Review retry prompts now preserve resolved unlimited or finite workflow revision budgets.
+- f21d3ce: summary: Add conditional task-document writes that reject stale publishers without changing revision history.
+  category: feature
+  dev: Runtime tools and dashboard clients can compare expected revision and exact-content SHA-256 hash.
+- f21d3ce: summary: Add authenticated append-only corrections for documents retained on archived tasks.
+  category: feature
+  dev: Adds project-scoped revision/hash CAS publication and archived direct document reads.
+- 3cd023f: summary: Let enabled plugins declaratively provide project MCP servers.
+  category: feature
+  dev: Plugin `mcpServers` resolve between global and project settings; project overrides and tombstones win.
+- 085f7b9: summary: Task Stats tab now shows creation provenance — source type, parent task, creating agent, and duplicate flags.
+  category: feature
+  dev: New Provenance section in `TaskTokenStatsPanel` reading the task's flat source fields and `sourceMetadata.nearDuplicateOf`/`issueUrl`.
+
+### Patch Changes
+
+- 3f7c6e4: summary: Board column headers now count REVISING (replan) cards and other visibly active cards in the processing count.
+  category: fix
+  dev: Column header count = shared Running predicate ∪ card activity-chrome predicate (isTaskAgentActive); footer/admission keep live-agent-only semantics.
+- 241a5c9: summary: Bump the bundled pi runtime to 0.81.1 for newer models, providers, and session reliability.
+  category: internal
+  dev: Pins @earendil-works/pi-ai and @earendil-works/pi-coding-agent from 0.80.10 to 0.81.1 (exact matched set + pnpm-workspace overrides). Brings Qwen Token Plan, expanded usage accounting, resilient compaction retries, and provider/catalog fixes.
+- 4413699: summary: Recover in-review tasks stranded by a restart that killed an in-flight review step, instead of failing them.
+  category: fix
+  dev: New startup sweep `reconcileOrphanedPendingStepResults` wires the previously caller-less `resolveOrphanedPendingStepResults` helper; emits `task:reconcile-orphaned-pending-step-results` run-audit events.
+- 085f7b9: summary: Duplicate follow-up tasks naming the same failing file now converge at creation across parent tasks.
+  category: fix
+  dev: `computeCrossParentDiagnosticClaim` gains file-path/slug fallback objects and wider action/failure gates (exceeds, oversized, blocks, "so X passes"); FN-8510/8511/8513/8514 incident.
+- f630478: summary: Allow freeform chat task creation without mission lineage.
+  category: fix
+  dev: `fn_task_create` / `fn_delegate_task` only hard-require approved `mission_lineage` when registered with `requireMissionLineage` (idle heartbeat patrol). User-directed chat/create paths may omit lineage; gates no longer pre-block missing lineage so freeform intake remains policy-governed.
+- e68c48d: summary: Restore the Coding Ideas board header color indicator.
+  category: fix
+  dev: Maps the Ideas intake column dot to the shared triage token.
+- 82b8b02: summary: Remove excess right padding from task popups on tablets.
+  category: fix
+  dev: Tablet task popups no longer reserve desktop resize-handle scrollbar clearance.
+- 69bd64d: summary: Show Planning status badges for active Coding Ideas Todo tasks.
+  category: fix
+  dev: Removes the column-only Todo/In-progress planning badge suppression so Board and List views use the task's real status.
+- 8ab4241: summary: Restore the Coding Ideas detail action to move parked ideas to Todo.
+  category: fix
+  dev: Detail workflow move targets now resolve independently from supplied custom-field definitions.
+- 0ade154: summary: Show Planning (not Triage) in task activity model-using logs.
+  category: fix
+  dev: Engine planning lane emits Planning using model:; dashboard parsers dual-accept legacy Triage using model: rows.
+- 93b693c: summary: Remove redundant readiness descriptions from Todo and In Review board headers.
+  category: fix
+  dev: Todo and In Review omit legacy COLUMN_DESCRIPTIONS entries so no empty description shell renders.
+- ddb5c5e: summary: Let operators enable or disable GitHub tracking from Coding Ideas task details.
+  category: feature
+  dev: GitHub tracking eligibility now recognizes the Ideas intake column and `builtin:coding-ideas` workflow ID.
+- a9de6b2: summary: Remove ellipses from merging status badges on task cards.
+  category: fix
+  dev: Keeps shared non-card merge-status labels unchanged.
+- 57af249: summary: Mobile board swipes always settle on a single centered column, never between columns.
+  category: fix
+  dev: Hardens useColumnScrollSnap settle to nearest/directional column center; keeps CSS proximity snap (no mandatory).
+- e24fb37: summary: Keep task detail footer actions on a single row on mobile.
+  category: fix
+  dev: Mobile TaskDetailModal `.modal-actions` nowrap + tokenized compression so Actions/Move/Merge fit without overflow (FN-8492).
+- 395f136: summary: Show Revising instead of Replan on needs-replan task status badges.
+  category: fix
+  dev: getTaskStatusBadgeLabel maps needs-replan to Revising; EN tasks.statusReplan updated.
+- b6135f4: summary: Keep task-card active glow during replan and revise while agents work.
+  category: fix
+  dev: isTaskAgentActive treats needs-replan (and plan-in-place replan freshness) as agent-active for board/list chrome; lock policy documented in taskActivity FNXC.
+- b9ce662: summary: Mobile board pan/fling always settles on one centered column, never between.
+  category: fix
+  dev: Closes residual useColumnScrollSnap settle race after FN-8489; keeps proximity snap and pin-until-next-touch.
+- d0d10aa: summary: Fix macOS embedded PostgreSQL startup when bundled ICU compatibility links are missing.
+  category: fix
+  dev: Repair the libicuuc loader-name symlink before initdb starts.
+- c469f90: summary: Show Xiaomi branding for Xiaomi and MiMo provider labels.
+  category: feature
+  dev: Adds a tokenized shared ProviderIcon mark and boundary-safe MiMo inference.
+- 295226e: summary: Align mobile task-detail Move actions with the footer edge.
+  category: fix
+  dev: The Task Detail spacer now owns mobile footer surplus width.
+- 8814925: summary: Restore active chat thinking and partial response state when returning to a conversation.
+  category: fix
+  dev: Guards direct-chat re-entry refreshes and late stream terminal callbacks by session selection ownership.
+- fd9e4b2: summary: Create Coding Ideas Start tasks directly in Todo.
+  category: fix
+  dev: Validates the captured workflow metadata and preserves Todo through Board and List quick-add hosts.
+- 8e6985a: summary: Reconcile completed mission features safely against archived delivery tasks.
+  category: fix
+  dev: Adds an atomic PostgreSQL terminal-evidence repair path with conflict and archive-tombstone validation.
+- d36059b: summary: Grok CLI fallback models now engage only when the primary model actually fails, instead of replacing it up front.
+  category: fix
+  dev: The FN-7758 no-visible-key seam no longer promotes a grok-cli fallback to primary at session start; only a grok-cli primary auto-routes to the Grok CLI runtime. A fallback-only grok-cli pair without a visible GROK_API_KEY is deferred: the session runs the configured primary, and on the first retryable model failure it swaps onto the Grok CLI runtime with the fallback model (audited as `session:grok-cli-fallback-engaged`). If the Grok runtime plugin is unavailable the pair is dropped with `grokCliFallbackDropped: true`. `session:runtime-resolved` now records the post-transform provider/model pair the session actually runs.
+- 2f014f5: summary: Install the agent-browser binary with Fusion on Windows, Linux, and macOS.
+  category: fix
+  dev: Pins agent-browser and publishes a top-level bin shim that forwards to its native platform binary.
+- edaa793: summary: Stop the legacy-adoption sweep from clearing live task statuses (planning, queued, merging, stuck-killed) on store open.
+  category: fix
+  dev: LEGACY_STATUS_ADOPTION now preserves statuses with live post-cutover writers; only writer-less statuses (plan-review-unavailable, triaged) keep resume-graph. Generalizes the FN-8498 needs-replan fix after FN-8504's live planner status was cleared mid-session.
+- e9ff8a5: summary: Board column and footer running counts now include live Code Review, Plan Review, and other gate sessions.
+  category: fix
+  dev: `isRunningAgentTask` treats a `pending` workflow-step-result lease as Running; shared by column headers, footer stats, admission, and CLI counts.
+- 1bda76d: summary: Fix mobile board snapping after interrupted swipes, flings, and vertical card scrolling.
+  category: fix
+  dev: useColumnScrollSnap now ignores pointercancel while the touch stream is live, settles to nearest-with-min-progress (resolveSettleTargetIndex), requires horizontal-dominant finger travel for pan intent, and lets a gesture begun mid-transit settle to plain nearest so a corrective drag wins.
+- d194290: summary: Prevent executors from starting ordered task steps before their required predecessors finish.
+  category: fix
+  dev: Applies dependency-aware ordering to both in-progress and done step transitions.
+- 1dd36ed: summary: Orphaned in-flight review steps are now marked failed for re-review instead of silently skipped at merge.
+  category: fix
+  dev: `resolveOrphanedPendingStepResults` rewrites orphans to `status:"failed"` (never deletes — deletion satisfied the merge gate and skipped review); the sweep also runs in periodic maintenance, skips `in-progress` rows, re-reads before writing, and the audit event is registered in `DatabaseMutationType` with metadata `{taskId, column, orphanedCount, resultCount}`.
+- f389a64: summary: Fix engine restarts stranding replan-loop tasks in To Do by clearing their needs-replan signal.
+  category: fix
+  dev: The KTD-8 legacy-adoption table now maps `needs-replan` to `preserve` instead of `resume-graph`; it is a live graph signal written by the plan-replan seam and consumed by triage todo-rediscovery, not un-migrated legacy state.
+- e514e13: summary: Apply project workflow model lanes to every workflow ahead of global and workflow values.
+  category: fix
+  dev: Resolution is task override, project baseline, global lane, selected-workflow value, then default model.
+- 0818fc1: summary: Keep manually parked tasks out of scheduler and remembered-owner dispatch until explicitly unpaused.
+  category: fix
+  dev: Treats either paused flag as a dispatch stop and invalidates scheduler candidacy when userPaused changes.
+- fee920d: summary: Open task card files-changed links in the task popup when Open tasks as popups is enabled.
+  category: fix
+  dev: Board TaskCard deep-tab opens (changes/retries/workflow) honor openMobileTasksInPopup and pass initialTab into FloatingWindow TaskDetailContent.
+
+## 0.73.0-beta.2
+
+### Patch Changes
+
+- 757b423: summary: Settings Check for updates now finds newer beta releases when the beta channel is selected.
+  category: fix
+  dev: Settings footer and GET /api/updates/check now force-refresh through channel-aware performUpdateCheck (updateChannel + npm beta dist-tag) instead of always querying registry latest with prerelease-blind compare.
+
+## 0.73.0-beta.1
+
+### Minor Changes
+
+- eef5eb7: summary: Unify max concurrency across planning/execution/review and simplify board capacity indicators.
+  category: feature
+  dev: maxConcurrent caps all top-level working agents per project; maxTriageConcurrent removed from UI (Settings, Command Center, Engine Control) and admission; free slots admit oldest createdAt via per-project atomic admission coordinator across lanes; footer Waiting/Running/Blocked; column headers show executing/total via shared Running predicate; Running counts unpaused WIP membership (sessionFile is not a DB/board field — do not require it); nested runNested helpers remain parent-internal soft-breach by design.
+- 527f734: summary: Let operators select the Aurora dashboard theme.
+  category: feature
+  dev: Adds persisted Aurora registry entries, first-paint validation, and dark/light palette tokens.
+- 0908e75: summary: Add the Calm dashboard theme with slate, sage, and misty light palettes.
+  category: feature
+  dev: Adds persisted calm theme tokens, first-paint validation, and shared selector support.
+- d486bf4: summary: Add the Dawn indigo-and-amber dashboard color theme.
+  category: feature
+  dev: Adds persisted Dawn theme tokens, first-paint support, and shared selector previews.
+- 83209e6: summary: Add a simple Ideas-to-Done workflow with truthful, resumable column transitions.
+  category: feature
+  dev: Persists capacity-boundary continuations and resumes the graph at the deferred node after scheduler release.
+
+### Patch Changes
+
+- 63c4742: summary: Allow planning sessions to persist PROMPT.md without an approval gate.
+  category: fix
+  dev: Classify `fn_task_prompt_write` as coordination-exempt in both gate paths so permanent-agent unknown-tool fail-safe no longer requires approval for plan/spec writes.
+- f49f5eb: summary: Report when the server Claude CLI needs login instead of waiting a minute and showing a false usage timeout.
+  category: fix
+  dev: Detects Claude Code 2.1.x unauthenticated and API-billing session-stat screens during the PTY quota fallback and exits immediately.
+- 7353b7b: summary: Let task planning persist complete specifications before Plan Review starts.
+  category: fix
+  dev: Triage sessions now use the coding tool surface so `fn_task_prompt_write` remains available.
+- 5f0502e: summary: Reject unknown `fn update` flags and document the beta install bootstrap.
+  category: fix
+  dev: Strict argv allow-list for update/upgrade; duplicate options rejected; optional stable-channel beta availability notice; docs for npm @beta bootstrap (FN-8452 / #2368).
+- 6489716: summary: Stop false CE skill-load warnings when plugin skills resolve without FUSION_CE_SKILLS_DIR.
+  category: fix
+  dev: executeWorkflowStep warns [skill-load] only when the named skill is not discoverable after multi-source merge (plugin body dirs and/or FUSION_CE_SKILLS_DIR); unrelated plugin paths do not suppress a missing-name warning; successful non-CE plugin skill nodes no longer warn on unset FUSION_CE_SKILLS_DIR (GitHub #2388 / FN-8461).
+- 190dc07: summary: Stop legacy-adoption drained-marker warn spam on every CLI open under embedded Postgres.
+  category: fix
+  dev: Grant fusion_runtime public schema usage plus SELECT and a restricted SECURITY DEFINER marker write; permanently unavailable marker infrastructure logs once per process.
+- 315bc1a: summary: Accept root-level File Scope files with extensions such as global.json and solution files.
+  category: fix
+  dev: isValidFileScopeEntry no longer requires a slash; letter-leading final extensions share create/update validation with classification. Regression coverage tracks GitHub #2389.
+- 080a8e7: summary: Stop spurious per-task `spawn /bin/sh ENOENT` noise during step baseline capture.
+  category: fix
+  dev: Graph step projection now defers missing, non-directory, and stat-error worktrees until a real checkout exists (FN-8464 / issue #2386).
+- 51fc34f: summary: Ignore stale flat skill-toggle keys so session skills match the Skills view after category layouts.
+  category: fix
+  dev: Session skillsOverride matches +/- patterns by skills/-relative path (not bareSkillName alone); legacy flat disables no longer suppress nested skillFiles bodies (GitHub #2385 / FN-8465).
+- c94920d: summary: Allow session Read tool to open host-advertised plugin skill body paths under worktree boundary.
+  category: fix
+  dev: Worktree-bound pi sessions treat one normalized AgentOptions.additionalSkillPaths list as a read-only boundary exception for read/glob/grep and as DefaultResourceLoader skill roots (GitHub #2384 / FN-8466); skill-root write/edit remain blocked.
+- 859475d: summary: Keep plugin enable state consistent across UI and loaders after toggle.
+  category: fix
+  dev: Unify project_plugin_states reads so host/engine/UI use the same per-project enablement key (issue #2383 / FN-8467).
+- 746d33e: summary: Load each enabled plugin once per process startup (no duplicate onLoad).
+  category: fix
+  dev: Host CLI and InProcessRuntime share a single-load authority with concurrency-safe single-flight so path-registered plugins no longer double-fire onLoad on fn dashboard/serve/daemon startup.
+- 824762c: summary: Stop workflow-definition creates from failing when a WF-id is already taken.
+  category: fix
+  dev: createWorkflowDefinition allocates past occupied global workflows.id values and retries id-PK unique conflicts instead of leaking Postgres 23505 to plugins/API callers (multi-project / stale next_workflow_definition_id).
+- c71a954: summary: Keep healthy AI providers running and resume provider-paused tasks when capacity returns.
+  category: fix
+  dev: Provider-scoped parks recover from daemon-side authenticated usage and capacity health transitions without task-call probes.
+- 8f7f527: summary: Keep unresolved merge-review blockers active across concurrent-main rebuilds and later retries.
+  category: fix
+  dev: Carries prior blocking reasons into rebuilt merge and review prompts so a smaller residual diff cannot incorrectly finalize a task as done.
+- de2cad7: summary: Recover missing workflow plans before review instead of approving or stranding tasks.
+  category: fix
+  dev: Verifies prompt persistence, distinguishes storage outages, gates workflow entry, and retries planning with audit events.
+- 0e29d9d: summary: Resume mission features that were interrupted during validation after an engine restart.
+  category: fix
+  dev: Shares one feature-loop transition contract across synchronous and PostgreSQL mission stores.
+- 3845535: summary: Automatically retry interrupted Planning sessions when operators return to them.
+  category: fix
+  dev: Uses session-scoped retry ownership across persisted, polled, and SSE error recovery.
+- 4eb532f: summary: Send only one in-progress update per Fusion task on its linked GitHub tracking issue.
+  category: fix
+  dev: Persists the successful in-progress notification marker and retains legacy task-log deduplication.
+- 634295c: summary: Stop Planning Mode questions from filling Mailbox and tighten desktop planning pane spacing.
+  category: fix
+  dev: Removes planning mailbox delivery and redundant desktop pane/footer insets.
+- 3b9d508: summary: Replace the Planning Sessions toggle with a consistent Back-to-sessions control.
+  category: fix
+  dev: Uses the existing session-list transition across desktop and compact Planning layouts.
+- dc834e5: summary: Preserve workflow lifecycle state and start execution steps only after worktree creation.
+  category: fix
+  dev: Adds shared active-state semantics, lifecycle records, and worktree-first graph step projection.
+
 ## 0.73.0-beta.0
 
 ### Minor Changes

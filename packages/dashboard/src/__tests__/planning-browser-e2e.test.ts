@@ -8,7 +8,7 @@ import { existsSync } from "node:fs";
 // dashboard package depend on a second copy of the browser protocol client.
 const requireFromEngine = createRequire(new URL("../../../engine/package.json", import.meta.url));
 const { chromium } = requireFromEngine("playwright-core") as {
-  chromium: { launch(options: { executablePath: string; headless: boolean }): Promise<Browser> };
+  chromium: { launch(options: { executablePath: string; headless: boolean; args?: string[] }): Promise<Browser> };
 };
 
 type Browser = {
@@ -25,6 +25,8 @@ type Page = {
   waitForTimeout(timeout: number): Promise<void>;
   evaluate<T>(pageFunction: () => T): Promise<T>;
   on(event: "console" | "pageerror", handler: (event: { text?(): string; message?: string }) => void): void;
+  screenshot(options: { path: string }): Promise<void>;
+  keyboard: { press(key: string): Promise<void> };
 };
 type Locator = {
   getByRole(role: string, options: { name: string | RegExp }): Locator;
@@ -60,21 +62,44 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
   let baseUrl: string;
 
   beforeAll(async () => {
-    server = await createServer({ root: process.cwd(), server: { host: "127.0.0.1", port: 0 }, logLevel: "error" });
+    /*
+    FNXC:PlanningModeBrowserE2E 2026-07-31-09:05:
+    This static fixture has no reload contract. Disable file watching so an fsevents watcher cannot
+    outlive Chromium and block the required responsive browser lane during teardown.
+    */
+    server = await createServer({ root: process.cwd(), server: { host: "127.0.0.1", port: 0, watch: null }, logLevel: "error" });
     await server.listen();
     baseUrl = server.resolvedUrls?.local[0] ?? "";
-    browser = await chromium.launch({ executablePath, headless: true });
+    /*
+    FNXC:PlanningModeBrowserE2E 2026-07-24-02:45:
+    CI hardening: on GitHub runners headless system Chrome dies at/after launch
+    without --no-sandbox and --disable-dev-shm-usage (small /dev/shm, sandboxed
+    runner user), cascading every test as "browser has been closed" (full-suite
+    run 30081843074 — this lane had been masked by the shard-4 watchdog kill
+    since the file landed, so it had never actually run on CI). Local launches
+    keep the default hardened sandbox.
+    */
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      ...(process.env.CI ? { args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"] } : {}),
+    });
   }, 30_000);
 
   afterAll(async () => {
     await browser?.close();
-    // Vite's close() also awaits its module graph workers, which are not part of this
-    // browser assertion and can remain alive after the fixture's mocked SSE channel.
-    // Close the actual listening socket and HMR channel directly instead.
-    server?.ws.close();
-    server?.httpServer?.closeAllConnections?.();
+    /*
+    FNXC:PlanningModeBrowserE2E 2026-07-31-09:05:
+    Bound watcher shutdown prevents a native fsevents close callback from holding this mandatory
+    browser lane open after the fixture listener is gone, while still releasing it before Vitest exits.
+    */
+    await Promise.race([
+      server.watcher.close(),
+      new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+    ]);
+    server.ws.close();
+    server.httpServer?.closeAllConnections?.();
     await new Promise<void>((resolve, reject) => server.httpServer?.close((error) => error ? reject(error) : resolve()));
-    await server.watcher.close();
     await server.pluginContainer.close();
   }, 10_000);
 
@@ -98,12 +123,16 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
     await page.close();
   }, 30_000);
 
-  async function verifyResponsiveWorkspace(viewport: { width: number; height: number }, mobile: boolean): Promise<void> {
+  async function verifyResponsiveWorkspace(viewport: { width: number; height: number }, mobile: boolean, presentation: "embedded" | "modal" = "embedded"): Promise<void> {
     const page = await browser.newPage({ viewport });
-    await page.goto(`${baseUrl}app/planning-browser-e2e-fixture.html?surface=plan-review&reset=1`);
+    await page.goto(`${baseUrl}app/planning-browser-e2e-fixture.html?surface=plan-review&presentation=${presentation}&reset=1`);
+    if (mobile) await page.getByRole("tab", { name: "Plan preview" }).click();
     await expectVisible(page.locator("[data-testid='planning-plan-markdown'] h1"));
-    await expectVisible(page.getByText("Which user outcome matters most?"));
+    if (!mobile) await expectVisible(page.getByText("Which user outcome matters most?"));
     await expectVisible(page.getByRole("button", { name: "Proceed with plan" }));
+    if (process.env.FUSION_CAPTURE_DIR && ((viewport.width === 390 && viewport.height === 844) || (viewport.width === 844 && viewport.height === 390))) {
+      await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-actions-${presentation}-${viewport.width}x${viewport.height}.png` });
+    }
 
     const layout = await page.evaluate(() => {
       const workspace = document.querySelector<HTMLElement>("[data-testid='planning-workspace']")!;
@@ -111,10 +140,13 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
       const question = document.querySelector<HTMLElement>("[data-testid='planning-question-pane']")!;
       const scroll = document.querySelector<HTMLElement>("[data-testid='planning-plan-scroll']")!;
       const actions = document.querySelector<HTMLElement>("[data-testid='planning-plan-actions']")!;
+      const questionScroll = question.querySelector<HTMLElement>(".planning-question-scroll")!;
+      const questionActions = question.querySelector<HTMLElement>(".planning-actions")!;
       const planRect = plan.getBoundingClientRect();
       const questionRect = question.getBoundingClientRect();
       const scrollRect = scroll.getBoundingClientRect();
       const actionsRect = actions.getBoundingClientRect();
+      const questionActionsRect = questionActions.getBoundingClientRect();
       return {
         planVisible: planRect.width > 0 && planRect.height > 0,
         questionVisible: questionRect.width > 0 && questionRect.height > 0,
@@ -127,14 +159,23 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
         scrollable: scroll.scrollHeight > scroll.clientHeight,
         scrollOwnerConfigured: getComputedStyle(scroll).overflowY === "auto",
         markdownRendered: Boolean(plan.querySelector("h1") && plan.querySelector("strong")),
+        flushPaneInsets: getComputedStyle(scroll).paddingLeft === "0px"
+          && getComputedStyle(questionScroll).paddingLeft === "0px",
+        desktopActionRowsAligned: Math.abs(actionsRect.top - questionActionsRect.top) <= 1
+          && Math.abs(actionsRect.bottom - questionActionsRect.bottom) <= 1,
+        actionTopDelta: Math.round(Math.abs(actionsRect.top - questionActionsRect.top)),
+        actionBottomDelta: Math.round(Math.abs(actionsRect.bottom - questionActionsRect.bottom)),
+        actionsInsideViewport: actionsRect.top >= 0 && actionsRect.bottom <= window.innerHeight,
+        refineVisible: [...actions.querySelectorAll<HTMLButtonElement>("button")].some((button) => button.textContent?.trim() === "Refine" && button.getBoundingClientRect().width > 0 && button.getBoundingClientRect().height > 0),
+        proceedVisible: [...actions.querySelectorAll<HTMLButtonElement>("button")].some((button) => button.textContent?.trim() === "Proceed with plan" && button.getBoundingClientRect().width > 0 && button.getBoundingClientRect().height > 0),
       };
     });
 
     expect(layout).toMatchObject({
       planVisible: true,
-      questionVisible: true,
-      planRightOfQuestion: !mobile,
-      planAboveQuestion: mobile,
+      questionVisible: !mobile,
+      planRightOfQuestion: true,
+      planAboveQuestion: false,
       panesInsideWorkspace: true,
       actionsInsideScroll: false,
       actionsAtBottom: true,
@@ -142,10 +183,177 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
       scrollable: true,
       scrollOwnerConfigured: true,
       markdownRendered: true,
+      flushPaneInsets: true,
+      desktopActionRowsAligned: mobile ? false : true,
+      actionTopDelta: mobile ? expect.any(Number) : 0,
+      actionBottomDelta: mobile ? expect.any(Number) : 0,
+      actionsInsideViewport: true,
+      refineVisible: true,
+      proceedVisible: true,
     });
     await page.close();
   }
 
   it("keeps the Markdown plan right of the question on desktop", () => verifyResponsiveWorkspace({ width: 1440, height: 900 }, false), 30_000);
-  it("keeps the Markdown plan above the question on mobile", () => verifyResponsiveWorkspace({ width: 390, height: 568 }, true), 30_000);
+  it("keeps the Markdown plan reachable through the mobile workspace tab", () => verifyResponsiveWorkspace({ width: 390, height: 568 }, true), 30_000);
+
+  it("keeps plan selection actions visible before scroll in portrait and short landscape across hosts", async () => {
+    for (const presentation of ["embedded", "modal"] as const) {
+      await verifyResponsiveWorkspace({ width: 390, height: 844 }, true, presentation);
+      await verifyResponsiveWorkspace({ width: 844, height: 390 }, false, presentation);
+    }
+  }, 30_000);
+
+  async function selectPlanQuote(page: Page): Promise<void> {
+    await page.evaluate(() => {
+      const markdown = document.querySelector<HTMLElement>("[data-testid='planning-plan-markdown']")!;
+      const walker = document.createTreeWalker(markdown, NodeFilter.SHOW_TEXT);
+      let textNode = walker.nextNode();
+      while (textNode && !textNode.textContent?.trim()) textNode = walker.nextNode();
+      if (!textNode) throw new Error("fixture did not render selectable plan text");
+      const range = document.createRange();
+      range.selectNodeContents(textNode);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      markdown.dispatchEvent(new Event("touchend", { bubbles: true }));
+    });
+    await expectVisible(page.getByRole("button", { name: "Add comment to selection" }));
+  }
+
+  async function verifyContextualCommentPlacement(
+    viewport: { width: number; height: number },
+    options: { inFooter: boolean; positionFixed: boolean },
+    presentation: "embedded" | "modal",
+  ): Promise<void> {
+    const { inFooter, positionFixed } = options;
+    const page = await browser.newPage({ viewport });
+    await page.goto(`${baseUrl}app/planning-browser-e2e-fixture.html?surface=plan-review&presentation=${presentation}&reset=1`);
+    if (viewport.width <= 768) await page.getByRole("tab", { name: "Plan preview" }).click();
+    await expectVisible(page.locator("[data-testid='planning-plan-markdown'] h1"));
+    await selectPlanQuote(page);
+
+    const placement = await page.evaluate(() => {
+      const buttons = [...document.querySelectorAll<HTMLButtonElement>(".planning-add-comment")];
+      const actions = document.querySelector<HTMLElement>("[data-testid='planning-plan-actions']")!;
+      const visibleButtons = buttons.filter((button) => {
+        const style = getComputedStyle(button);
+        return style.display !== "none" && style.visibility !== "hidden" && !button.disabled;
+      });
+      const visibleButton = visibleButtons[0];
+      const focusable = [...document.querySelectorAll<HTMLElement>("button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])")]
+        .filter((element) => element.getClientRects().length > 0 && getComputedStyle(element).visibility !== "hidden");
+      const triggerIndex = visibleButton ? focusable.indexOf(visibleButton) : -1;
+      const buttonRect = visibleButton?.getBoundingClientRect();
+      /*
+      FNXC:PlanningComments 2026-07-31-09:05:
+      Start at the preceding tab stop, then send actual Tab keys. Programmatic focus alone would
+      incorrectly accept a tabIndex=-1 contextual-comment trigger as keyboard reachable.
+
+      FNXC:PlanningComments 2026-07-24-05:50:
+      Phone and tablet keep the trigger in the action rail as a full-width row above
+      Refine/Proceed (not a fixed bar under the actions).
+      */
+      focusable[triggerIndex - 1]?.focus();
+      return {
+        totalButtons: buttons.length,
+        visibleButtons: visibleButtons.length,
+        visibleInActions: Boolean(visibleButton && actions.contains(visibleButton)),
+        positionFixed: visibleButton ? getComputedStyle(visibleButton).position === "fixed" : false,
+        triggerInsideViewport: Boolean(
+          buttonRect
+          && buttonRect.width > 0
+          && buttonRect.height > 0
+          && buttonRect.top >= 0
+          && buttonRect.bottom <= window.innerHeight
+          && buttonRect.left >= 0
+          && buttonRect.right <= window.innerWidth,
+        ),
+        triggerHasPreviousTabStop: triggerIndex > 0,
+        hiddenButtonsTabbable: buttons.filter((button) => button !== visibleButton && button.tabIndex >= 0 && getComputedStyle(button).display !== "none").length,
+        actionLabels: [...actions.querySelectorAll<HTMLButtonElement>("button")]
+          .filter((button) => getComputedStyle(button).display !== "none")
+          .map((button) => button.textContent?.trim()),
+      };
+    });
+
+    expect(placement).toMatchObject({
+      totalButtons: 2,
+      visibleButtons: 1,
+      visibleInActions: inFooter,
+      positionFixed,
+      // Compact shells keep the control in the visual viewport without scrolling the plan.
+      triggerInsideViewport: inFooter ? true : expect.any(Boolean),
+      triggerHasPreviousTabStop: true,
+      hiddenButtonsTabbable: 0,
+    });
+    if (inFooter) {
+      // In-flow rail row: Add comment sits above Refine/Proceed in the same footer.
+      expect(placement.actionLabels).toEqual(expect.arrayContaining([
+        "Add comment to selection",
+        "Refine",
+        "Proceed with plan",
+      ]));
+    } else {
+      expect(placement.actionLabels).not.toContain("Add comment to selection");
+    }
+
+    let reachedTriggerByTab = false;
+    for (let tabCount = 0; tabCount < 8; tabCount += 1) {
+      await page.keyboard.press("Tab");
+      reachedTriggerByTab = await page.evaluate(() => document.activeElement?.classList.contains("planning-add-comment") ?? false);
+      if (reachedTriggerByTab) break;
+    }
+    expect(reachedTriggerByTab).toBe(true);
+
+    if (inFooter && presentation === "embedded" && process.env.FUSION_CAPTURE_DIR) await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-comment-mobile-selection.png` });
+    await page.getByRole("button", { name: "Add comment to selection" }).click();
+    await expectVisible(page.getByLabel("Add plan comment"));
+    if (inFooter && presentation === "embedded" && process.env.FUSION_CAPTURE_DIR) await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-comment-mobile-editor.png` });
+    const afterOpen = await page.evaluate(() => {
+      const editor = document.querySelector<HTMLElement>(".planning-comment-editor");
+      const editorRect = editor?.getBoundingClientRect();
+      return {
+        addCommentButtons: document.querySelectorAll(".planning-add-comment").length,
+        actionChildren: document.querySelector("[data-testid='planning-plan-actions']")?.querySelectorAll(".planning-add-comment").length,
+        editorPosition: editor ? getComputedStyle(editor).position : null,
+        editorInsideViewport: Boolean(
+          editorRect
+          && editorRect.width > 0
+          && editorRect.height > 0
+          && editorRect.top >= 0
+          && editorRect.bottom <= window.innerHeight,
+        ),
+      };
+    });
+    expect(afterOpen).toMatchObject({
+      addCommentButtons: 0,
+      actionChildren: 0,
+      // Phone + tablet pin the composer; desktop keeps the in-document editor.
+      editorPosition: inFooter ? "fixed" : "static",
+      editorInsideViewport: inFooter ? true : expect.any(Boolean),
+    });
+
+    await page.evaluate(() => {
+      window.getSelection()?.removeAllRanges();
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    // Editor stays locked open while composing even if the native selection collapses.
+    await expectVisible(page.getByLabel("Add plan comment"));
+    await page.getByRole("button", { name: "Cancel" }).click();
+    // After cancel with a collapsed selection the trigger must dismiss.
+    await page.waitForTimeout(50);
+    expect(await page.getByRole("button", { name: "Add comment to selection" }).isVisible()).toBe(false);
+    await page.close();
+  }
+
+  it("places the sole contextual comment trigger by viewport in embedded and modal Planning", async () => {
+    for (const presentation of ["embedded", "modal"] as const) {
+      // Phone + tablet: full-width action-rail row above Refine/Proceed.
+      await verifyContextualCommentPlacement({ width: 768, height: 900 }, { inFooter: true, positionFixed: false }, presentation);
+      await verifyContextualCommentPlacement({ width: 769, height: 900 }, { inFooter: true, positionFixed: false }, presentation);
+      await verifyContextualCommentPlacement({ width: 1024, height: 900 }, { inFooter: true, positionFixed: false }, presentation);
+      // Desktop: document-adjacent trigger only.
+      await verifyContextualCommentPlacement({ width: 1280, height: 900 }, { inFooter: false, positionFixed: false }, presentation);
+    }
+  }, 30_000);
 });

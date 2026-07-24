@@ -365,10 +365,14 @@ describe("TaskDetailModal", () => {
       await waitFor(() => expect(noopOpenDetail).toHaveBeenCalled());
     });
 
-    it("renders compact github issue link for github import provenance", () => {
-      render(
+    it.each([
+      ["desktop", undefined],
+      ["compact/mobile", "back"],
+    ] as const)("links only the GitHub Import label to the source issue on %s markup", (_layout, mobileHeaderMode) => {
+      const { container } = render(
         <TaskDetailModal
           initialTab="definition"
+          mobileHeaderMode={mobileHeaderMode}
           task={makeTask({
             sourceType: "github_import",
             sourceMetadata: { issueUrl: "https://github.com/owner/repo/issues/42" },
@@ -382,19 +386,20 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText(/Created via GitHub Import/).closest(".detail-provenance")).toHaveTextContent(
-        "Created via GitHub Import (owner/repo#42)",
-      );
+      const issueLink = screen.getByRole("link", { name: "GitHub Import" });
+      const provenance = issueLink.closest(".detail-provenance");
+      expect(provenance).toHaveTextContent("Created via GitHub Import");
+      expect(provenance?.textContent).not.toMatch(/[()]/);
+      expect(provenance?.querySelectorAll("a")).toHaveLength(1);
+      expect(container.querySelector(".detail-provenance-context")).toBeNull();
 
-      const issueLink = screen.getByRole("link", { name: "owner/repo#42" });
       expect(issueLink).toHaveAttribute("href", "https://github.com/owner/repo/issues/42");
       expect(issueLink).toHaveAttribute("target", "_blank");
-      expect(issueLink).toHaveAttribute("rel", expect.stringContaining("noopener"));
-      expect(issueLink).toHaveAttribute("rel", expect.stringContaining("noreferrer"));
-      expect(issueLink).toHaveAttribute("title", "https://github.com/owner/repo/issues/42");
+      expect(issueLink).toHaveAttribute("rel", "noopener noreferrer");
+      expect(issueLink).not.toHaveAttribute("title");
     });
 
-    it("falls back to 'Open issue' label for unparseable github import URL", () => {
+    it("keeps GitHub Import as the sole link for a populated nonstandard source URL", () => {
       render(
         <TaskDetailModal
           initialTab="definition"
@@ -411,21 +416,19 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      const issueLink = screen.getByRole("link", { name: "Open issue" });
+      const issueLink = screen.getByRole("link", { name: "GitHub Import" });
+      const provenance = issueLink.closest(".detail-provenance");
       expect(issueLink).toHaveAttribute("href", "https://example.com/something");
-      expect(screen.getByText(/Created via GitHub Import/).closest(".detail-provenance")).toHaveTextContent(
-        "Created via GitHub Import (Open issue)",
-      );
+      expect(provenance?.querySelectorAll("a")).toHaveLength(1);
+      expect(provenance?.textContent).toBe("Created via GitHub Import");
+      expect(screen.queryByText("Open issue")).toBeNull();
     });
 
-    it("renders github import provenance with no issue URL as plain label", () => {
-      render(
+    it("renders a URL-absent GitHub import as plain text without a link shell", () => {
+      const { container, rerender } = render(
         <TaskDetailModal
           initialTab="definition"
-          task={makeTask({
-            sourceType: "github_import",
-            sourceMetadata: {},
-          })}
+          task={makeTask({ sourceType: "github_import", sourceMetadata: undefined })}
           onClose={noop}
           onMoveTask={noopMove}
           onDeleteTask={noopDelete}
@@ -435,8 +438,27 @@ describe("TaskDetailModal", () => {
         />,
       );
 
-      expect(screen.getByText("Created via GitHub Import")).toBeInTheDocument();
-      expect(screen.queryByRole("link")).not.toBeInTheDocument();
+      const assertPlainFallback = () => {
+        const provenance = screen.getByText("Created via GitHub Import").closest(".detail-provenance");
+        expect(provenance?.textContent).toBe("Created via GitHub Import");
+        expect(provenance?.querySelector("a")).toBeNull();
+        expect(container.querySelector(".detail-provenance-context")).toBeNull();
+      };
+
+      assertPlainFallback();
+      rerender(
+        <TaskDetailModal
+          initialTab="definition"
+          task={makeTask({ sourceType: "github_import", sourceMetadata: {} })}
+          onClose={noop}
+          onMoveTask={noopMove}
+          onDeleteTask={noopDelete}
+          onMergeTask={noopMerge}
+          onOpenDetail={noopOpenDetail}
+          addToast={noop}
+        />,
+      );
+      assertPlainFallback();
     });
 
     it("renders finding label for research provenance", () => {
@@ -2848,6 +2870,97 @@ describe("TaskDetailModal", () => {
     await waitFor(() => {
       const metric = screen.getByText("Total execution time").closest(".task-token-stats-panel__metric");
       expect(metric).toHaveTextContent("4m 0s");
+    });
+  });
+
+  describe("Coding (Ideas) workflow detail moves", () => {
+    const ideasWorkflowPayload = {
+      flagEnabled: true,
+      defaultWorkflowId: "builtin:coding-ideas",
+      workflows: [{
+        id: "builtin:coding-ideas",
+        name: "Coding (Ideas)",
+        columns: [
+          { id: "ideas", name: "Ideas", flags: { intake: true } },
+          { id: "todo", name: "Todo", flags: {} },
+        ],
+      }],
+      taskWorkflowIds: { "FN-ideas": "builtin:coding-ideas" },
+    };
+    const ideasTask = () => makeTask({ id: "FN-ideas", column: "ideas", title: "Parked coding idea" });
+    const setViewport = (width: number) => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+      window.dispatchEvent(new Event("resize"));
+    };
+
+    beforeEach(() => {
+      vi.mocked(dashboardApi.fetchBoardWorkflows).mockReset();
+      vi.mocked(dashboardApi.fetchBoardWorkflows).mockResolvedValue(ideasWorkflowPayload);
+    });
+
+    afterEach(() => {
+      setViewport(1024);
+    });
+
+    async function expectIdeasMove(renderDetail: () => void, onMoveTask: ReturnType<typeof vi.fn>) {
+      renderDetail();
+      const moveButton = await screen.findByRole("button", { name: "Move to Todo" });
+      expect(moveButton).toBeEnabled();
+      await userEvent.click(moveButton);
+      expect(onMoveTask).toHaveBeenCalledWith("FN-ideas", "todo", undefined);
+    }
+
+    it("moves an Ideas task to Todo from the modal at desktop width", async () => {
+      setViewport(1024);
+      const onMoveTask = vi.fn(async () => ideasTask());
+      await expectIdeasMove(() => {
+        render(<TaskDetailModal initialTab="definition" task={ideasTask()} onClose={noop} onMoveTask={onMoveTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+      }, onMoveTask);
+    });
+
+    it("moves an Ideas task to Todo from the modal at 375px", async () => {
+      setViewport(375);
+      const onMoveTask = vi.fn(async () => ideasTask());
+      await expectIdeasMove(() => {
+        render(<TaskDetailModal initialTab="definition" task={ideasTask()} onClose={noop} onMoveTask={onMoveTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+      }, onMoveTask);
+    });
+
+    it("moves an Ideas task to Todo from embedded detail at desktop width", async () => {
+      setViewport(1024);
+      const onMoveTask = vi.fn(async () => ideasTask());
+      await expectIdeasMove(() => {
+        render(<TaskDetailContent embedded initialTab="definition" task={ideasTask()} onMoveTask={onMoveTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+      }, onMoveTask);
+    });
+
+    it("moves an Ideas task to Todo from embedded detail at 375px", async () => {
+      setViewport(375);
+      const onMoveTask = vi.fn(async () => ideasTask());
+      await expectIdeasMove(() => {
+        render(<TaskDetailContent embedded initialTab="definition" task={ideasTask()} onMoveTask={onMoveTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />);
+      }, onMoveTask);
+    });
+
+    it("keeps supplied fields while independently resolving and clearing Ideas move metadata", async () => {
+      const onMoveTask = vi.fn(async () => ideasTask());
+      const workflowFieldDefs = [{ id: "owner", name: "Owner", type: "string" as const, render: { placement: "detail" as const } }];
+      const { rerender } = render(
+        <TaskDetailModal initialTab="definition" task={ideasTask()} workflowFieldDefs={workflowFieldDefs} onClose={noop} onMoveTask={onMoveTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />,
+      );
+
+      expect(await screen.findByLabelText("Owner")).toBeInTheDocument();
+      const moveButton = await screen.findByRole("button", { name: "Move to Todo" });
+      await userEvent.click(moveButton);
+      expect(onMoveTask).toHaveBeenCalledWith("FN-ideas", "todo", undefined);
+      expect(dashboardApi.fetchBoardWorkflows).toHaveBeenCalledTimes(1);
+
+      vi.mocked(dashboardApi.fetchBoardWorkflows).mockResolvedValueOnce({ flagEnabled: false, defaultWorkflowId: "", workflows: [], taskWorkflowIds: {} });
+      rerender(
+        <TaskDetailModal initialTab="definition" task={makeTask({ id: "FN-unresolved", column: "ideas" })} workflowFieldDefs={workflowFieldDefs} onClose={noop} onMoveTask={onMoveTask} onDeleteTask={noopDelete} onMergeTask={noopMerge} onOpenDetail={noopOpenDetail} addToast={noop} />,
+      );
+      await waitFor(() => expect(dashboardApi.fetchBoardWorkflows).toHaveBeenCalledTimes(2));
+      expect(screen.queryByRole("button", { name: "Move to Todo" })).toBeNull();
     });
   });
 

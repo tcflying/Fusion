@@ -185,6 +185,7 @@ function createMockStore(taskOverrides: Partial<Task> = {}, allTasks: Task[] = [
     getTask: vi.fn().mockResolvedValue({ ...baseTask, prompt: "# test" }),
     listTasks: vi.fn().mockResolvedValue(allTasks),
     updateTask: vi.fn().mockResolvedValue(baseTask),
+    pauseTask: vi.fn().mockResolvedValue({ ...baseTask, paused: true }),
     moveTask: vi.fn().mockResolvedValue({ ...baseTask, column: "done" }),
     logEntry: vi.fn().mockResolvedValue(undefined),
     appendAgentLog: vi.fn().mockResolvedValue(undefined),
@@ -572,7 +573,7 @@ describe("aiMergeTask — usage limit detection", () => {
     setupFailingTheirsStrategy();
   });
 
-  it("triggers global pause when merger catches a usage-limit error", async () => {
+  it("parks only the merge task when merger catches a usage-limit error", async () => {
     const store = createMockStore(
       { id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050" },
       [{ id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", column: "in-review" } as Task],
@@ -595,14 +596,18 @@ describe("aiMergeTask — usage limit detection", () => {
       "merger",
       "FN-050",
       "rate_limit_error: Rate limit exceeded",
+      undefined,
     );
-    expect(store.updateSettings).toHaveBeenCalledWith({
-      globalPause: true,
-      globalPauseReason: "rate-limit",
+    // FNXC:EngineTests 2026-07-23-21:40 (#2339): rate-limit pauses are provider-lane
+    // scoped ("provider-rate-limit:<providerId>") so one saturated provider does not
+    // park other lanes; no runtime provider is resolvable here, hence ":unknown".
+    expect(store.pauseTask).toHaveBeenCalledWith("FN-050", true, undefined, {
+      pausedReason: "provider-rate-limit:unknown",
     });
+    expect(store.updateSettings).not.toHaveBeenCalled();
   });
 
-  it("triggers global pause when session.prompt() resolves with exhausted-retry error on state.error", async () => {
+  it("parks the merge task when session.prompt() resolves with exhausted-retry error on state.error", async () => {
     const store = createMockStore(
       { id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050" },
       [{ id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", column: "in-review" } as Task],
@@ -627,6 +632,7 @@ describe("aiMergeTask — usage limit detection", () => {
       "merger",
       "FN-050",
       "429 Too Many Requests",
+      undefined,
     );
     // git reset --merge should be called to abort the merge
     const resetCalls = mockedExecSync.mock.calls.filter(
@@ -635,7 +641,7 @@ describe("aiMergeTask — usage limit detection", () => {
     expect(resetCalls.length).toBeGreaterThan(0);
   });
 
-  it("does NOT trigger global pause for non-usage-limit errors", async () => {
+  it("does NOT park the task for non-usage-limit errors", async () => {
     const store = createMockStore(
       { id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050" },
       [{ id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", column: "in-review" } as Task],
@@ -676,7 +682,7 @@ describe("aiMergeTask — usage limit detection", () => {
     ).rejects.toThrow("AI merge failed");
   });
 
-  it("triggers global pause for overloaded error", async () => {
+  it("parks the task for an overloaded error", async () => {
     const store = createMockStore(
       { id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050" },
       [{ id: "FN-050", worktree: "/tmp/root/.worktrees/KB-050", column: "in-review" } as Task],
@@ -699,6 +705,7 @@ describe("aiMergeTask — usage limit detection", () => {
       "merger",
       "FN-050",
       "overloaded_error: Overloaded",
+      undefined,
     );
   });
 });
@@ -1170,4 +1177,3 @@ describe("aiMergeTask — merge details collection", () => {
     expect(mergeDetails.deletions).toBeUndefined();
   });
 });
-

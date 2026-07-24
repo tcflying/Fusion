@@ -11,16 +11,25 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   runTaskStep,
   resetStepToBaseline,
   makeAncestryBlastRadiusGuard,
+  isUsableWorktreeDirectory,
   type StepRunnerTask,
   type SessionRef,
 } from "../step-runner.js";
 
 function makeStore() {
   return {
+    startStep: vi.fn().mockResolvedValue({
+      accepted: true,
+      disposition: "started",
+      task: makeTask([{ name: "Implement", status: "in-progress" }]),
+    }),
     updateStep: vi.fn().mockResolvedValue(undefined),
     logEntry: vi.fn().mockResolvedValue(undefined),
   };
@@ -68,11 +77,9 @@ describe("runTaskStep", () => {
     // Baseline is captured BEFORE the step runs.
     expect(gitRevParse).toHaveBeenCalledWith("/wt");
     expect(runStep).toHaveBeenCalledWith(0);
-    // Projection ordering: in-progress before done.
-    expect(store.updateStep.mock.calls).toEqual([
-      ["FN-001", 0, "in-progress"],
-      ["FN-001", 0, "done"],
-    ]);
+    // FNXC:StepLifecycle 2026-07-22-10:30: The accepted start projection must precede terminal completion.
+    expect(store.startStep).toHaveBeenCalledWith("FN-001", 0);
+    expect(store.updateStep.mock.calls).toEqual([["FN-001", 0, "done"]]);
   });
 
   it("passes graph projection source through in-progress and done writes", async () => {
@@ -92,8 +99,8 @@ describe("runTaskStep", () => {
       { projectionSource: "graph" },
     );
 
+    expect(store.startStep).toHaveBeenCalledWith("FN-001", 0, { source: "graph" });
     expect(store.updateStep.mock.calls).toEqual([
-      ["FN-001", 0, "in-progress", { source: "graph" }],
       ["FN-001", 0, "done", { source: "graph" }],
     ]);
   });
@@ -136,10 +143,72 @@ describe("runTaskStep", () => {
     );
 
     expect(result).toEqual({ outcome: "failure", baselineSha: "baseSHA", checkpointId: "leaf" });
-    // Only the in-progress write happened — the failed step is left non-done.
-    expect(store.updateStep.mock.calls).toEqual([["FN-001", 0, "in-progress"]]);
+    // FNXC:StepLifecycle 2026-07-22-10:30: A failed run preserves the accepted non-terminal start.
+    expect(store.startStep).toHaveBeenCalledWith("FN-001", 0);
+    expect(store.updateStep).not.toHaveBeenCalled();
     expect(store.updateStep).not.toHaveBeenCalledWith("FN-001", 0, "done");
     expect(store.updateStep).not.toHaveBeenCalledWith("FN-001", 0, "skipped");
+  });
+
+  /*
+   * FNXC:StepLifecycle 2026-07-22-10:30:
+   * Exercise both sides of the atomic verdict: corrupted in-progress state must not run,
+   * while a dependency-valid in-progress restart remains resumable.
+   */
+  it("does not execute a step whose atomic start is blocked despite an in-progress status", async () => {
+    const store = makeStore();
+    store.startStep.mockResolvedValue({
+      accepted: false,
+      disposition: "blocked",
+      blockingStepIndex: 0,
+      task: makeTask([
+        { name: "Preflight", status: "in-progress" },
+        { name: "Implement", status: "in-progress" },
+      ]),
+    });
+    const runStep = vi.fn().mockResolvedValue({ success: true });
+    const gitRevParse = vi.fn().mockResolvedValue("baseSHA");
+
+    const result = await runTaskStep(
+      { store, worktreePath: "/wt", runStep, gitRevParse },
+      makeTask([
+        { name: "Preflight", status: "in-progress" },
+        { name: "Implement", status: "in-progress" },
+      ]),
+      1,
+      { projectionSource: "graph" },
+    );
+
+    expect(result).toEqual({ outcome: "failure" });
+    expect(runStep).not.toHaveBeenCalled();
+    expect(gitRevParse).not.toHaveBeenCalled();
+    expect(store.updateStep).not.toHaveBeenCalled();
+  });
+
+  it("executes a valid in-progress resume accepted by the atomic start", async () => {
+    const store = makeStore();
+    store.startStep.mockResolvedValue({
+      accepted: true,
+      disposition: "resumed",
+      task: makeTask([
+        { name: "Preflight", status: "done" },
+        { name: "Implement", status: "in-progress" },
+      ]),
+    });
+    const runStep = vi.fn().mockResolvedValue({ success: false });
+
+    const result = await runTaskStep(
+      { store, worktreePath: "/wt", runStep, gitRevParse: async () => "baseSHA" },
+      makeTask([
+        { name: "Preflight", status: "done" },
+        { name: "Implement", status: "in-progress" },
+      ]),
+      1,
+      { projectionSource: "graph" },
+    );
+
+    expect(result.outcome).toBe("failure");
+    expect(runStep).toHaveBeenCalledWith(1);
   });
 
   it("still returns a result when baseline capture fails (best-effort)", async () => {
@@ -158,6 +227,41 @@ describe("runTaskStep", () => {
     expect(result.checkpointId).toBe("leaf");
   });
 
+  it("defers default baseline capture for missing and non-directory worktree paths", async () => {
+    const missingPath = join(tmpdir(), `fn-8464-missing-${Date.now()}`);
+    const filePath = join(tmpdir(), `fn-8464-file-${Date.now()}`);
+    await writeFile(filePath, "not a directory");
+    try {
+      for (const worktreePath of [missingPath, filePath]) {
+        const result = await runTaskStep(
+          { store: makeStore(), worktreePath, runStep: async () => ({ success: true }) },
+          makeTask([{ status: "pending" }]),
+          0,
+        );
+        expect(result).toMatchObject({ outcome: "success", baselineSha: undefined });
+      }
+    } finally {
+      await rm(filePath, { force: true });
+    }
+  });
+
+  it("keeps pre-step baseline capture for a usable worktree directory", async () => {
+    const worktreePath = await mkdtemp(join(tmpdir(), "fn-8464-directory-"));
+    const gitRevParse = vi.fn().mockResolvedValue("pre-step-sha");
+    const runStep = vi.fn().mockResolvedValue({ success: true });
+    try {
+      const result = await runTaskStep(
+        { store: makeStore(), worktreePath, runStep, gitRevParse },
+        makeTask([{ status: "pending" }]),
+        0,
+      );
+      expect(result.baselineSha).toBe("pre-step-sha");
+      expect(gitRevParse.mock.invocationCallOrder[0]).toBeLessThan(runStep.mock.invocationCallOrder[0]);
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
   it("uses the default checkpoint capture from the session ref when none injected", async () => {
     const store = makeStore();
     const sessionRef = makeSessionRef({ leafId: "leaf-xyz" });
@@ -173,6 +277,29 @@ describe("runTaskStep", () => {
       { sessionRef },
     );
     expect(result.checkpointId).toBe("leaf-xyz");
+  });
+});
+
+describe("isUsableWorktreeDirectory", () => {
+  it("returns false for empty, missing, and non-directory candidates", async () => {
+    const filePath = join(tmpdir(), `fn-8464-helper-file-${Date.now()}`);
+    await writeFile(filePath, "not a directory");
+    try {
+      expect(isUsableWorktreeDirectory(undefined)).toBe(false);
+      expect(isUsableWorktreeDirectory(join(tmpdir(), `fn-8464-helper-missing-${Date.now()}`))).toBe(false);
+      expect(isUsableWorktreeDirectory(filePath)).toBe(false);
+    } finally {
+      await rm(filePath, { force: true });
+    }
+  });
+
+  it("returns true for an existing directory", async () => {
+    const worktreePath = await mkdtemp(join(tmpdir(), "fn-8464-helper-directory-"));
+    try {
+      expect(isUsableWorktreeDirectory(worktreePath)).toBe(true);
+    } finally {
+      await rm(worktreePath, { recursive: true, force: true });
+    }
   });
 });
 

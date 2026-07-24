@@ -1,7 +1,7 @@
 import "./PlanningModeModal.css";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { useState, useCallback, useEffect, useRef, useMemo, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo, type CSSProperties, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Task, PlanningQuestion, PlanningSummary, TaskPriority, ThinkingLevel } from "@fusion/core";
@@ -42,6 +42,7 @@ import {
   type ModelInfo,
   type ConversationHistoryEntry,
   type AiSessionSummary,
+  type PlanningContextualComment,
 } from "../api";
 import { subscribeSse } from "../sse-bus";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
@@ -79,6 +80,27 @@ const PLANNING_SIDEBAR_MAX_WIDTH = 560;
 const PLANNING_SIDEBAR_STORAGE_KEY = "fusion:planning-sidebar-width";
 
 const MAX_PLANNING_AUTO_RETRIES = 3;
+
+/*
+FNXC:PlanningRetry 2026-07-22-21:00:
+The auto-retry budget must survive remounts. Every app-tab switch unmounts the Planning view,
+and a ref-scoped budget was re-granted on each return, so a session stuck in a persisted error
+state regenerated its full turn (agent rebuild + history replay) on every visit — the reported
+"leave and come back duplicates the generation infinitely". Attempts are tracked per session in
+module scope; success paths (question/summary/new session) still clear the entry.
+*/
+const planningAutoRetryAttemptsBySession = new Map<string, number>();
+
+/*
+FNXC:PlanningTestIsolation 2026-07-23-09:15:
+Automatic retry budgets deliberately outlive ordinary modal remounts, so test cases using the
+same synthetic session ID need an explicit module-state reset at their isolation boundary. This
+narrow test seam must never be called by component cleanup or production navigation.
+*/
+export function resetPlanningAutoRetryAttemptsForTests(): void {
+  planningAutoRetryAttemptsBySession.clear();
+}
+
 const MAX_PLANNING_CREATE_CLAIM_RETRIES = 20;
 
 function isPlanningCreateClaimConflict(error: unknown): boolean {
@@ -119,6 +141,16 @@ interface PlanningModeModalProps {
   onViewTask?: (task: Task) => void;
   tasks: Task[];
   initialPlan?: string;
+  /**
+  FNXC:PlanningMode 2026-07-23-00:00:
+  Called exactly once when the auto-start effect actually consumes `initialPlan`, so the owner
+  (useModalManager) can clear the payload. The seeded plan is a one-shot handoff: embedded
+  Planning fully unmounts on main-content navigation, which resets the in-component
+  hasAutoStartedRef guard — without owner-side clearing, every navigate-back remount (and the
+  project-switch remount key) re-fired auto-start and created a duplicate planning session while
+  the original session was silently abandoned.
+  */
+  onInitialPlanConsumed?: () => void;
   projectId?: string;
   /** Active workflow lane selected when Planning Mode was opened. */
   workflowId?: string | null;
@@ -141,32 +173,100 @@ type ViewState =
   | { type: "plan_review"; session: PlanningSession; summary: PlanningSummary }
   | { type: "creating_task"; session: PlanningSession; summary: PlanningSummary }
   | { type: "create_retry"; session: PlanningSession; summary: PlanningSummary; errorMessage: string }
-  | { type: "task_created"; taskId: string; task?: Task }
+  | { type: "task_created"; taskId: string; task?: Task; sessionId?: string }
   | { type: "error"; session: PlanningSession; errorMessage: string }
   | { type: "breakdown"; sessionId: string; originalSubtasks: SubtaskItem[]; subtasks: SubtaskItem[]; dirty: boolean }
-  | { type: "loading" };
+  | { type: "loading" }
+  /*
+  FNXC:PlanningMode 2026-07-23-00:00:
+  Fetching a persisted session from the database is not generation. `session_loading` renders a
+  neutral "Loading session…" spinner during that fetch; the `loading` state (with its
+  "Generating…" copy, Stop button, elapsed timer, and 8s missed-SSE watchdog) is reserved for
+  turns the server is actually generating. Before this split, every reload/reopen flashed
+  "Generating initial plan…" while merely hydrating from the DB.
+  */
+  | { type: "session_loading" };
 
 type PlanningGenerationActivity = "initial_plan" | "plan_update" | "question";
 
 /**
  * FNXC:PlanningMode 2026-07-20-00:00:
  * A persisted planning `result` is an evolving running plan, not proof that the interview ended.
- * Only the explicit Validate action writes this durable marker, so reload and poll paths must use
- * it before exposing terminal summary/create-task UI.
+ * Only the explicit Validate action writes the durable terminal markers, so reload and poll paths
+ * must use them before exposing create-task UI.
+ *
+ * FNXC:PlanningMode 2026-07-24-05:45:
+ * `status === "complete"` is written only by validateSession, so it is authoritative terminal
+ * evidence even when a stale/malformed inputPayload omits `validated: true` (that mismatch was
+ * stranding reopen on "still being prepared", then Retry hit "already been validated"). Prefer
+ * status, then the payload marker, and always recover complete rows to task-created / create-retry
+ * / plan-review rather than a generation-retry dead end.
  */
-function isValidatedPlanningSession(session: { inputPayload?: string | null }): boolean {
+function parsePlanningInputPayload(session: { inputPayload?: string | null }): {
+  validated: boolean;
+  createdTaskId?: string;
+} {
   try {
-    const payload: unknown = JSON.parse(session.inputPayload ?? "");
+    const payload = JSON.parse(session.inputPayload ?? "{}") as {
+      validated?: unknown;
+      createdTaskId?: unknown;
+      createdTaskIds?: unknown;
+    };
+    if (typeof payload !== "object" || payload === null) {
+      return { validated: false };
+    }
     /*
-    FNXC:PlanningMode 2026-07-20-01:15:
-    Terminal Planning UI is an explicit user-validation privilege, not a legacy-session inference.
-    Missing or malformed persistence may contain a running plan, so only a durable `validated: true`
-    marker can reveal SummaryView and task-creation actions after reload, polling, or SSE updates.
+    FNXC:PlanningMultiTask 2026-07-24-01:40:
+    Epoch rotation clears createdTaskId (it archives into createdTaskIds), so a resumed
+    mid-epoch session would lose its banner without this fallback to the newest archived
+    task id (review finding).
     */
-    return typeof payload === "object" && payload !== null && (payload as { validated?: unknown }).validated === true;
+    const archivedIds = Array.isArray(payload.createdTaskIds)
+      ? payload.createdTaskIds.filter((id): id is string => typeof id === "string")
+      : [];
+    return {
+      validated: payload.validated === true,
+      createdTaskId: typeof payload.createdTaskId === "string"
+        ? payload.createdTaskId
+        : archivedIds.length > 0 ? archivedIds[archivedIds.length - 1] : undefined,
+    };
   } catch {
-    return false;
+    return { validated: false };
   }
+}
+
+type CompletePlanningResume =
+  | { kind: "plan_review"; summary: PlanningSummary; linkedTaskId?: string }
+  | { kind: "unrecoverable" };
+
+function resolveCompletePlanningResume(
+  session: { status?: string; result?: string | null; inputPayload?: string | null },
+  summaryFallback?: PlanningSummary | null,
+): CompletePlanningResume {
+  let summary: PlanningSummary | null = summaryFallback ?? null;
+  if (!summary && session.result) {
+    try {
+      summary = normalizePlanningSummary(JSON.parse(session.result) as PlanningSummary);
+    } catch {
+      summary = null;
+    }
+  }
+  if (!summary) return { kind: "unrecoverable" };
+
+  const { createdTaskId } = parsePlanningInputPayload(session);
+  /*
+  FNXC:PlanningReopenAfterValidate 2026-07-23-23:30:
+  A finished plan must never resume into a do-nothing screen: every recoverable complete
+  session lands on the full plan review workspace — read the plan, keep refining or
+  commenting (the server reopens a validated session on any new turn), and Proceed at any
+  time. The create_retry view remains solely the transient failure screen of a live Proceed.
+
+  FNXC:PlanningMultiTask 2026-07-24-00:20:
+  Sessions whose task already exists resume to plan review too, carrying the linked task for
+  the banner. Proceed without editing idempotently returns that task; editing rotates the
+  server-side creation epoch so the next Proceed creates a fresh task from the evolved plan.
+  */
+  return { kind: "plan_review", summary, ...(createdTaskId ? { linkedTaskId: createdTaskId } : {}) };
 }
 
 function getExamplePlans(t: TFunction<"app">): string[] {
@@ -366,7 +466,7 @@ function parseModelSelection(value: string): { provider?: string; modelId?: stri
   };
 }
 
-export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreated, onViewTask, tasks, initialPlan: initialPlanProp, projectId, workflowId, resumeSessionId, initialSessions, presentation = "modal" }: PlanningModeModalProps) {
+export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreated, onViewTask, tasks, initialPlan: initialPlanProp, onInitialPlanConsumed, projectId, workflowId, resumeSessionId, initialSessions, presentation = "modal" }: PlanningModeModalProps) {
   const { t } = useTranslation("app");
   // FNXC:EmbeddedPresentation 2026-06-22-12:00: shared hook supplies isEmbedded (DOM branching) plus the modal-only gates.
   // Note: the Escape handler intentionally does NOT gate on embedded here — embedded planning preserves its historical
@@ -380,6 +480,10 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const [_activePlanPrompt, setActivePlanPrompt] = useState("");
   const [view, setView] = useState<ViewState>({ type: "initial" });
   const [error, setError] = useState<string | null>(null);
+  // FNXC:PlanningMultiTask 2026-07-24-00:20: latest task created from this plan, shown as a plan-review banner; editing the plan rotates the server-side creation epoch so Proceed can create another.
+  const [linkedTaskId, setLinkedTaskId] = useState<string | null>(null);
+  // FNXC:PlanningMultiTask 2026-07-24-01:40: the just-created Task object, so the banner's View task works immediately after creation without waiting for the tasks prop to refresh (review finding).
+  const [linkedTask, setLinkedTask] = useState<Task | null>(null);
   const [, setResponseHistory] = useState<QuestionResponse[]>([]);
   const [conversationHistory, setConversationHistory] = useState<ConversationHistoryEntry[]>([]);
   const conversationHistoryRef = useRef<ConversationHistoryEntry[]>([]);
@@ -397,6 +501,10 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   // re-initialized on each render, ensuring the auto-start effect runs correctly.
   const hasAutoStartedRef = useRef(false);
   const hasLoadedPersistedRef = useRef(false);
+  // FNXC:PlanningMode 2026-07-23-00:00: latest-callback ref so the auto-start effect does not
+  // re-fire when the parent re-renders with a new onInitialPlanConsumed identity.
+  const onInitialPlanConsumedRef = useRef(onInitialPlanConsumed);
+  onInitialPlanConsumedRef.current = onInitialPlanConsumed;
   const [streamingOutput, setStreamingOutput] = useState<string>("");
   const [showThinking, setShowThinking] = useState(true);
   const [isRetrying, setIsRetrying] = useState(false);
@@ -453,20 +561,15 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   */
   const startPlanningInFlightRef = useRef(false);
   /*
-  FNXC:PlanningRetry 2026-07-15-00:00:
-  FN-8332 permits automatic retry only for a generation this mounted Planning
-  Mode instance started. A reloaded session may reconnect to observe a server
-  turn, but its persisted error must stay manual instead of spending another
-  generation.
-  */
-  const liveGenerationSessionIdRef = useRef<string | null>(null);
-  /*
-  FNXC:PlanningRetry 2026-07-13-00:00:
-  FN-7946 requires stuck or terminal Planning Mode generation errors to auto-retry at most three times before the permanent error view appears. Keep the budget in refs for async SSE/poll/loadSession handlers, mirror the current attempt in state for the visible "Retrying" loading message, and reset the budget when successful progress reaches question or summary.
+  FNXC:PlanningRetry 2026-07-21-10:00:
+  Persisted, polled, and SSE-reported Planning stream errors share one bounded retry path. Key
+  in-flight ownership to the session and invocation token so a stale load/retry cannot clear or
+  mutate the newly selected session, while successful progress still resets the three-attempt budget.
   */
   const planningAutoRetryAttemptRef = useRef(0);
-  const planningAutoRetryInFlightRef = useRef(false);
-  const startPlanningAutoRetryRef = useRef<(sessionId: string, errorMessage: string) => Promise<boolean>>(async () => false);
+  const planningAutoRetryOwnerRef = useRef<{ sessionId: string; token: symbol } | null>(null);
+  const startPlanningAutoRetryRef = useRef<(sessionId: string) => Promise<boolean>>(async () => false);
+  const planningSessionLoadEpochRef = useRef(0);
   /*
   FNXC:PlanningMode 2026-07-02-07:56:
   Refine Further is a single-flight completed-summary turn. Guard synchronously with a ref so duplicate click, touch, or keyboard activations cannot submit a second refine request or close the active stream with a generation-in-progress error before React renders the disabled state.
@@ -519,12 +622,19 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     };
   }, [isOpen, newSessionFocusSignal]);
 
-  const resetPlanningAutoRetryBudget = useCallback(() => {
+  const resetPlanningAutoRetryAttempts = useCallback(() => {
     planningAutoRetryAttemptRef.current = 0;
-    planningAutoRetryInFlightRef.current = false;
+    // Clear the remount-durable budget too, so successful progress re-arms auto-retry.
+    const sessionId = currentSessionIdRef.current;
+    if (sessionId) planningAutoRetryAttemptsBySession.delete(sessionId);
     setAutoRetryAttempt(0);
     setIsAutoRetrying(false);
   }, []);
+
+  const resetPlanningAutoRetryBudget = useCallback(() => {
+    resetPlanningAutoRetryAttempts();
+    planningAutoRetryOwnerRef.current = null;
+  }, [resetPlanningAutoRetryAttempts]);
   /*
   FNXC:PlanningMultiTab 2026-07-14-00:00:
   Planning Mode has no cross-tab coordination. The persisted session row is the single source
@@ -618,14 +728,13 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const isCompactInterview = viewportMode !== "desktop" || isShortViewport();
   /*
   FNXC:PlanningModeMobile 2026-07-20-10:30:
-  FN-8427 makes the saved-session list a real compact destination. Both Back and Sessions
-  enter this one mode, which must unmount the active interview plan so it cannot consume
-  flex height beneath session rows. Desktop preserves its three-pane interview until its
-  explicit Sessions toggle requests the same list destination.
+  FN-8427 makes the saved-session list a real destination. Back enters this mode and unmounts
+  the active interview plan so it cannot consume flex height beneath session rows.
   */
   const isSessionListMode = showSessionList || (isCompactInterview && !mobileShowDetail);
-  // FNXC:PlanningModeMobile 2026-07-20-10:30: Empty mobile state opens the composer because no saved destination exists; once sessions exist, every compact detail surface gets this single Back-to-list escape.
-  const canReturnToSessionList = isCompactInterview && mobileShowDetail && planningSessions.length > 0;
+  // FNXC:PlanningSessionBack 2026-07-21-11:15: Back covers selected details on every viewport and drafts whenever saved sessions exist; list mode removes it instead of leaving an orphaned control.
+  const canReturnToSessionList = !isSessionListMode
+    && (selectedSessionId !== null || planningSessions.length > 0);
   const [isRefineMenuOpen, setIsRefineMenuOpen] = useState(false);
   const [mobileWorkspaceTab, setMobileWorkspaceTab] = useState<"question" | "plan">("question");
   /*
@@ -635,6 +744,108 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   non-whitespace text before submission.
   */
   const [refinementPrompt, setRefinementPrompt] = useState("");
+  const [contextualComments, setContextualComments] = useState<PlanningContextualComment[]>([]);
+  const [selectedPlanQuote, setSelectedPlanQuote] = useState<string | null>(null);
+  /*
+  FNXC:PlanningComments 2026-07-24-06:30:
+  Composer content uses a frozen quote, not the live selection. Tapping Add-comment-to-selection
+  collapses the native selection before click on many mobile browsers; selectionchange then cleared
+  selectedPlanQuote and unmounted the editor (`isCommentEditorOpen && selectedPlanQuote`) on the
+  same open — flash open then dismiss. openCommentQuote is snapshotted on open intent and only
+  cleared on cancel/add/session change.
+  */
+  const [openCommentQuote, setOpenCommentQuote] = useState<string | null>(null);
+  const [commentDraft, setCommentDraft] = useState("");
+  const [isCommentEditorOpen, setIsCommentEditorOpen] = useState(false);
+  const contextualCommentInFlightRef = useRef(false);
+  const contextualCommentSubmissionRef = useRef(false);
+  const planDocumentRef = useRef<HTMLDivElement>(null);
+  const commentInputRef = useRef<HTMLTextAreaElement>(null);
+  const commentEditorRef = useRef<HTMLDivElement>(null);
+  const addCommentTriggerRef = useRef<HTMLButtonElement>(null);
+  const mobileAddCommentTriggerRef = useRef<HTMLButtonElement>(null);
+  const restoreCommentTriggerFocusRef = useRef(false);
+  const isCommentEditorOpenRef = useRef(false);
+  const pendingOpenCommentQuoteRef = useRef<string | null>(null);
+
+  const setCommentEditorOpen = useCallback((open: boolean) => {
+    /*
+    FNXC:PlanningComments 2026-07-23-17:05:
+    Flip the lock ref synchronously with the state write. Waiting for useEffect left a window
+    where focusing the suggestion field emitted selectionchange while the ref was still false,
+    which cleared the quote and unmounted the composer before the operator could type.
+    */
+    isCommentEditorOpenRef.current = open;
+    setIsCommentEditorOpen(open);
+  }, []);
+
+  const openCommentEditor = useCallback(() => {
+    const quote = (selectedPlanQuote ?? pendingOpenCommentQuoteRef.current)?.trim() || null;
+    if (!quote) return;
+    pendingOpenCommentQuoteRef.current = quote;
+    setOpenCommentQuote(quote);
+    setSelectedPlanQuote(quote);
+    setCommentEditorOpen(true);
+  }, [selectedPlanQuote, setCommentEditorOpen]);
+
+  const handleOpenCommentEditorPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    /*
+    FNXC:PlanningComments 2026-07-24-06:30:
+    Snapshot the quote on pointerdown before the touch gesture collapses the native selection and
+    selectionchange clears selectedPlanQuote. preventDefault also reduces selection loss on the
+    open control (same role as mousedown preventDefault for desktop).
+    */
+    if (event.pointerType !== "mouse") {
+      event.preventDefault();
+    }
+    if (selectedPlanQuote) {
+      pendingOpenCommentQuoteRef.current = selectedPlanQuote;
+    }
+  }, [selectedPlanQuote]);
+
+  const closeCommentEditor = useCallback((options?: { restoreTriggerFocus?: boolean }) => {
+    if (options?.restoreTriggerFocus) {
+      restoreCommentTriggerFocusRef.current = true;
+    }
+    setCommentDraft("");
+    setOpenCommentQuote(null);
+    pendingOpenCommentQuoteRef.current = null;
+    setCommentEditorOpen(false);
+  }, [setCommentEditorOpen]);
+
+  const focusAddCommentTrigger = useCallback(() => {
+    /*
+    FNXC:PlanningComments 2026-07-24-05:35:
+    Tablet and phone both expose the action-rail trigger; only wide desktop uses the document
+    variant. Match the 1024px CSS gate so focus restore lands on the visible control.
+    */
+    const usesRailTrigger = window.matchMedia?.("(max-width: 1024px)").matches ?? false;
+    (usesRailTrigger ? mobileAddCommentTriggerRef : addCommentTriggerRef).current?.focus();
+  }, []);
+
+  /*
+  FNXC:PlanningComments 2026-07-23-09:30:
+  Closing the conditional comment editor unmounts its trigger during the state transition. Restore focus only in the post-render effect when Cancel leaves a live plan selection and remounts the trigger.
+  */
+  useEffect(() => {
+    if (isCommentEditorOpen || !restoreCommentTriggerFocusRef.current) return;
+    restoreCommentTriggerFocusRef.current = false;
+    queueMicrotask(() => {
+      if (addCommentTriggerRef.current || mobileAddCommentTriggerRef.current) {
+        focusAddCommentTrigger();
+      }
+    });
+  }, [focusAddCommentTrigger, isCommentEditorOpen]);
+
+  useEffect(() => {
+    // A batch belongs to one visible session; never carry comments into another plan.
+    setContextualComments([]);
+    setSelectedPlanQuote(null);
+    setOpenCommentQuote(null);
+    pendingOpenCommentQuoteRef.current = null;
+    setCommentDraft("");
+    setCommentEditorOpen(false);
+  }, [selectedSessionId, setCommentEditorOpen]);
 
   useEffect(() => {
     if (isMobile && workspaceQuestion) {
@@ -745,9 +956,122 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     persistSidebarWidth(nextWidth);
   }, [isMobile, persistSidebarWidth, sidebarWidth]);
 
+  /*
+  FNXC:PlanningComments 2026-07-24-06:05:
+  Track the soft keyboard on phone always, and on tablet while the selection comment composer
+  is open. Tablet is wider than isMobileDevice()'s 768 gate, so allowNonMobileViewport is
+  required or the first focus would open the OS keyboard with the composer still off-screen
+  (in-document at the plan foot) and never lift it.
+  */
+  const commentComposerNeedsKeyboardLift = isCommentEditorOpen && viewportMode !== "desktop";
   const { keyboardOverlap, viewportHeight, viewportOffsetTop, keyboardOpen } =
-    useMobileKeyboard({ enabled: viewportMode === "mobile" });
+    useMobileKeyboard({
+      enabled: isOpen && (viewportMode === "mobile" || commentComposerNeedsKeyboardLift),
+      allowNonMobileViewport: commentComposerNeedsKeyboardLift && viewportMode === "tablet",
+    });
   useMobileScrollLock(viewportMode === "mobile" && isOpen && scrollLockEnabled);
+
+  /*
+  FNXC:PlanningComments 2026-07-24-06:40:
+  Phone only: live visualViewport frame while the composer is open. `position:fixed; bottom`
+  is layout-viewport-relative, so when the soft keyboard opens the panel sits under the
+  keyboard (or outside the visible visual viewport) and looks "dismissed". Re-measure on
+  vv resize/scroll so we can pin with `top` inside the visual viewport instead.
+  */
+  const [mobileVvFrame, setMobileVvFrame] = useState<{ offsetTop: number; height: number; layoutHeight: number } | null>(null);
+  useEffect(() => {
+    if (!isCommentEditorOpen || viewportMode !== "mobile") {
+      setMobileVvFrame(null);
+      return;
+    }
+    const vv = window.visualViewport;
+    if (!vv) {
+      setMobileVvFrame(null);
+      return;
+    }
+    const update = () => {
+      setMobileVvFrame({
+        offsetTop: vv.offsetTop,
+        height: vv.height,
+        layoutHeight: window.innerHeight || document.documentElement.clientHeight || 0,
+      });
+    };
+    update();
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    window.addEventListener("resize", update);
+    return () => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+      window.removeEventListener("resize", update);
+    };
+  }, [isCommentEditorOpen, viewportMode]);
+
+  const commentEditorStyle = useMemo((): CSSProperties | undefined => {
+    if (!commentComposerNeedsKeyboardLift) return undefined;
+
+    /*
+    FNXC:PlanningComments 2026-07-24-06:40:
+    Tablet: simple bottom lift (resizes-content / wider shell) — leave as keyboardOverlap.
+    Phone: anchor with `top` from visualViewport so the panel stays in the visible area above
+    the keyboard. Using only `bottom: keyboardOverlap` left the box under the keyboard on first
+    open (layout vs visual viewport mismatch).
+    */
+    if (viewportMode === "tablet") {
+      if (!keyboardOpen) return undefined;
+      const style: CSSProperties = {
+        bottom: `calc(${Math.max(keyboardOverlap, 0)}px + var(--space-md))`,
+      };
+      if (viewportHeight != null && viewportHeight > 0) {
+        style.maxHeight = `min(${Math.round(viewportHeight * 0.55)}px, calc(var(--space-2xl) * 12))`;
+      }
+      return style;
+    }
+
+    if (viewportMode !== "mobile") return undefined;
+
+    const vvHeight = mobileVvFrame?.height ?? viewportHeight ?? 0;
+    const vvOffsetTop = mobileVvFrame?.offsetTop ?? viewportOffsetTop ?? 0;
+    const layoutHeight = mobileVvFrame?.layoutHeight
+      ?? (typeof window !== "undefined" ? (window.innerHeight || document.documentElement.clientHeight || 0) : 0);
+
+    const keyboardLikelyOpen = keyboardOpen
+      || (vvHeight > 0 && layoutHeight > 0 && vvHeight < layoutHeight - 80);
+    if (!keyboardLikelyOpen || vvHeight <= 0) return undefined;
+
+    const gap = 12;
+    const maxHeight = Math.max(140, Math.min(Math.round(vvHeight * 0.5), 320));
+    const top = Math.round(vvOffsetTop + Math.max(gap, vvHeight - maxHeight - gap));
+    return {
+      top: `${top}px`,
+      bottom: "auto",
+      maxHeight: `${maxHeight}px`,
+    };
+  }, [
+    commentComposerNeedsKeyboardLift,
+    keyboardOpen,
+    keyboardOverlap,
+    mobileVvFrame,
+    viewportHeight,
+    viewportMode,
+    viewportOffsetTop,
+  ]);
+
+  useEffect(() => {
+    if (!isCommentEditorOpen) return;
+    /*
+    FNXC:PlanningComments 2026-07-23-17:05:
+    The compact composer is position:fixed; preventScroll keeps the plan markdown under the
+    selection instead of scrolling to the editor's former in-flow slot.
+
+    FNXC:PlanningComments 2026-07-24-06:05:
+    Focus after paint so the fixed tablet/phone panel is mounted before the keyboard targets it.
+    */
+    const frame = requestAnimationFrame(() => {
+      commentInputRef.current?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [isCommentEditorOpen]);
 
   // Drive --vv-height / --keyboard-overlap / --vv-offset-top imperatively
   // rather than via React's style prop. Reason: when React removes a CSS
@@ -827,6 +1151,26 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     return () => clearInterval(timer);
   }, [generationStartTime, view.type]);
 
+  /*
+  FNXC:PlanningMultiTask 2026-07-24-01:40:
+  Single application point for a complete-session resume (review finding: this exact
+  setRunningSummary + setLinkedTaskId + setView block was duplicated verbatim at the poll,
+  retry-refresh, and loadSession call sites, and grew a new line in all three copies).
+  */
+  const applyCompletePlanningResume = useCallback(
+    (sessionId: string, resume: { summary: PlanningSummary; linkedTaskId?: string }) => {
+      setRunningSummary(resume.summary);
+      setLinkedTaskId(resume.linkedTaskId ?? null);
+      setLinkedTask(null);
+      setView({
+        type: "plan_review",
+        session: { sessionId, currentQuestion: null, summary: resume.summary },
+        summary: resume.summary,
+      });
+    },
+    [],
+  );
+
   // Fallback for missed SSE 'question'/'summary' events: when the loading
   // state lingers, periodically refetch the session and transition the view
   // if the server has already moved past generating. Without this, a dropped
@@ -895,28 +1239,21 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           });
           setStreamingOutput("");
         } else if (session.status === "complete" && session.result) {
-          const summary = normalizePlanningSummary(JSON.parse(session.result) as PlanningSummary);
-          setRunningSummary(summary);
-          if (isValidatedPlanningSession(session)) {
-            resetPlanningAutoRetryBudget();
-            const inputPayload = JSON.parse(session.inputPayload ?? "{}") as { createdTaskId?: unknown };
-            if (typeof inputPayload.createdTaskId === "string") {
-              setView({ type: "task_created", taskId: inputPayload.createdTaskId });
-            } else {
-              setView({ type: "create_retry", session: { sessionId, currentQuestion: null, summary }, summary, errorMessage: t("planning.retryCreate", "Retry create") });
-            }
-          } else {
+          const resume = resolveCompletePlanningResume(session);
+          if (resume.kind === "unrecoverable") {
             setView({
               type: "error",
-              session: { sessionId, currentQuestion: null, summary },
-              errorMessage: t("planning.awaitingValidationState", "This plan is still being prepared. Retry to continue the interview."),
+              session: { sessionId, currentQuestion: null, summary: null },
+              errorMessage: t("planning.sessionUnrecoverableState", "This session could not be restored. Retry to continue the interview."),
             });
+          } else {
+            resetPlanningAutoRetryBudget();
+            applyCompletePlanningResume(sessionId, resume);
           }
           setStreamingOutput("");
         } else if (session.status === "error") {
           const errorMessage = session.error || t("planning.sessionFailed2", "Session failed");
-          const handled = liveGenerationSessionIdRef.current === sessionId
-            && await startPlanningAutoRetryRef.current(sessionId, errorMessage);
+          const handled = await startPlanningAutoRetryRef.current(sessionId);
           if (handled) return;
           if (cancelled || currentSessionIdRef.current !== sessionId) return;
           /*
@@ -964,6 +1301,8 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     setActivePlanPrompt("");
     setView({ type: "initial" });
     setError(null);
+    setLinkedTaskId(null);
+    setLinkedTask(null);
     setResponseHistory([]);
     setConversationHistory([]);
     setEditedSummary(null);
@@ -982,6 +1321,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     setPlanningModelId(undefined);
     setPlanningThinkingLevel("");
     currentSessionIdRef.current = null;
+    planningSessionLoadEpochRef.current += 1;
     startPlanningInFlightRef.current = false;
   }, [resetPlanningAutoRetryBudget]);
 
@@ -1056,6 +1396,16 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     (sessionId: string) => {
       const streamEpoch = ++streamConnectionEpochRef.current;
       streamConnectionRef.current?.close();
+      /*
+      FNXC:PlanningStreamCatchup 2026-07-22-21:00:
+      A brand-new stream connection replays the session's buffered thinking from the start
+      (the buffer is sized to hold a full turn). Whatever is currently on screen is a subset
+      of that replay, so it must be cleared first — appending the replay onto existing output
+      duplicated the visible generation on every reconnect (mobile tab switches unmount this
+      view, so this happened constantly).
+      */
+      setStreamingOutput("");
+      streamingOutputRef.current = "";
       // Guard handlers against late events from a connection the user has
       // already navigated away from (e.g. clicked "New Session" while the
       // previous SSE flushed a buffered question). currentSessionIdRef is
@@ -1146,6 +1496,12 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           */
           runningSummaryRef.current = normalizedSummary;
           setRunningSummary(normalizedSummary);
+          setSelectedPlanQuote(null);
+          setIsCommentEditorOpen(false);
+          if (contextualCommentSubmissionRef.current) {
+            contextualCommentSubmissionRef.current = false;
+            setContextualComments([]);
+          }
           setView((previous) => previous.type === "question"
               ? { ...previous, session: { ...previous.session, summary: normalizedSummary } }
               : previous);
@@ -1177,16 +1533,12 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
             if (isStaleEvent()) return;
 
             /*
-            FNXC:PlanningRetry 2026-07-15-00:00:
-            FN-8332 limits the stuck-turn retry budget to generations started by
-            this mounted UI. A resumed stream may observe a terminal persisted
-            error, but it must surface the manual Retry/Dismiss panel instead;
-            overlapping live SSE and poll signals still share the single-flight guard.
+            FNXC:PlanningRetry 2026-07-21-10:00:
+            A stream failure is recoverable regardless of which mount started the generation.
+            Returning to Planning must use the same bounded, single-flight retry path as a live
+            turn so tab suspension or navigation never turns a resumable session into an error UI.
             */
-            if (
-              liveGenerationSessionIdRef.current === sessionId
-              && await startPlanningAutoRetryRef.current(sessionId, errorMessage)
-            ) {
+            if (await startPlanningAutoRetryRef.current(sessionId)) {
               return;
             }
             setIsRetrying(false);
@@ -1224,88 +1576,119 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   );
 
   const startPlanningRetry = useCallback(
-    async (retryTarget: { sessionId: string; currentQuestion: PlanningQuestion | null; summary: PlanningSummary | null }, options: { auto: boolean }) => {
+    async (
+      retryTarget: { sessionId: string; currentQuestion: PlanningQuestion | null; summary: PlanningSummary | null },
+      options: { auto: boolean; retryToken?: symbol },
+    ) => {
       setError(null);
       setIsRetrying(!options.auto);
       setIsAutoRetrying(options.auto);
       setStreamingOutput("");
       setGenerationStartTime(Date.now());
+      viewRef.current = { type: "loading" };
       setView({ type: "loading" });
 
       currentSessionIdRef.current = retryTarget.sessionId;
-      liveGenerationSessionIdRef.current = retryTarget.sessionId;
       connectToPlanningStream(retryTarget.sessionId);
 
       try {
         await retryPlanningSession(retryTarget.sessionId, projectId);
       } catch (err) {
+        const retryStillOwnsSession = () => currentSessionIdRef.current === retryTarget.sessionId
+          && (!options.auto || planningAutoRetryOwnerRef.current?.token === options.retryToken);
+        if (!retryStillOwnsSession()) return;
+
         let retryError: unknown = err;
         const retryErrorMessage = getErrorMessage(err) || "";
 
-        if (retryErrorMessage.includes("not in an error state")) {
+        /*
+        FNXC:PlanningTurnAdmission 2026-07-22-21:00:
+        A retry rejected because another turn already holds the session's turn slot means work is
+        in progress — rejoin it via the same session-refresh path instead of a terminal error.
+
+        FNXC:PlanningMode 2026-07-24-05:45:
+        "already been validated" is the same class of mismatch: generation retry is the wrong tool
+        for a finished plan. Refresh the durable row and route to create-retry / task-created /
+        plan-review instead of echoing the server exception.
+        */
+        if (
+          retryErrorMessage.includes("not in an error state")
+          || retryErrorMessage.includes("already in progress")
+          || retryErrorMessage.includes("already been validated")
+        ) {
           try {
             const session = await fetchAiSession(retryTarget.sessionId);
             if (!session) {
               throw new Error("Failed to refresh planning session.");
             }
+            if (!retryStillOwnsSession()) return;
 
             currentSessionIdRef.current = session.id;
 
             if (session.status === "generating") {
-              setStreamingOutput(session.thinkingOutput ?? "");
+              // FNXC:PlanningStreamCatchup 2026-07-22-21:00: rejoin through a clean stream
+              // (clear + buffered replay) instead of seeding persisted thinking alongside the
+              // in-flight replay, which raced and duplicated the visible output.
+              connectToPlanningStream(session.id);
               setView({ type: "loading" });
             } else if (session.status === "awaiting_input") {
-              if (!session.currentQuestion) {
-                throw new Error("Planning session is awaiting input but has no current question.");
-              }
               resetPlanningAutoRetryBudget();
-              const question = normalizeQuestionOptions(JSON.parse(session.currentQuestion) as PlanningQuestion);
               clearPlanningDescription(projectId);
-              setView({
-                type: "question",
-                session: { sessionId: session.id, currentQuestion: question, summary: null },
-              });
-              if (session.thinkingOutput) {
-                const trimmed = session.thinkingOutput.trim();
-                if (trimmed) {
-                  setConversationHistory((prev) => {
-                    const lastEntry = prev[prev.length - 1];
-                    if (lastEntry?.thinkingOutput === trimmed) return prev;
-                    return [...prev, { thinkingOutput: trimmed }];
-                  });
+              const summary = session.result
+                ? normalizePlanningSummary(JSON.parse(session.result) as PlanningSummary)
+                : retryTarget.summary;
+              if (summary) setRunningSummary(summary);
+              if (session.currentQuestion) {
+                const question = normalizeQuestionOptions(JSON.parse(session.currentQuestion) as PlanningQuestion);
+                setWorkspaceQuestion(question);
+                setView({
+                  type: "question",
+                  session: { sessionId: session.id, currentQuestion: question, summary },
+                });
+                if (session.thinkingOutput) {
+                  const trimmed = session.thinkingOutput.trim();
+                  if (trimmed) {
+                    setConversationHistory((prev) => {
+                      const lastEntry = prev[prev.length - 1];
+                      if (lastEntry?.thinkingOutput === trimmed) return prev;
+                      return [...prev, { thinkingOutput: trimmed }];
+                    });
+                  }
                 }
-              }
-              if (!streamConnectionRef.current?.isConnected()) {
-                connectToPlanningStream(session.id);
+                if (!streamConnectionRef.current?.isConnected()) {
+                  connectToPlanningStream(session.id);
+                }
+              } else if (summary) {
+                /*
+                FNXC:PlanningMode 2026-07-24-05:45:
+                Plan-review rows are awaiting_input with a running plan and no current question.
+                Treating that as fatal forced Retry into an unrecoverable error after stop/proceed.
+                */
+                setWorkspaceQuestion(null);
+                setView({
+                  type: "plan_review",
+                  session: { sessionId: session.id, currentQuestion: null, summary },
+                  summary,
+                });
+              } else {
+                throw new Error("Planning session is awaiting input but has no current question or plan.");
               }
             } else if (session.status === "complete") {
-              if (!session.result) {
+              const resume = resolveCompletePlanningResume(session, retryTarget.summary);
+              if (resume.kind === "unrecoverable") {
                 throw new Error("Planning session is complete but has no result.");
               }
-              const summary = normalizePlanningSummary(JSON.parse(session.result) as PlanningSummary);
-              setRunningSummary(summary);
-              if (isValidatedPlanningSession(session)) {
-                resetPlanningAutoRetryBudget();
-                clearPlanningDescription(projectId);
-                const inputPayload = JSON.parse(session.inputPayload ?? "{}") as { createdTaskId?: unknown };
-                if (typeof inputPayload.createdTaskId === "string") {
-                  setView({ type: "task_created", taskId: inputPayload.createdTaskId });
-                } else {
-                  setView({ type: "create_retry", session: { sessionId: session.id, currentQuestion: null, summary }, summary, errorMessage: t("planning.retryCreate", "Retry create") });
-                }
-              } else {
-                setView({
-                  type: "error",
-                  session: { sessionId: session.id, currentQuestion: null, summary },
-                  errorMessage: t("planning.awaitingValidationState", "This plan is still being prepared. Retry to continue the interview."),
-                });
-              }
+              resetPlanningAutoRetryBudget();
+              clearPlanningDescription(projectId);
+              applyCompletePlanningResume(session.id, resume);
             } else if (session.status === "error") {
-              setView({
+              const terminalView: ViewState = {
                 type: "error",
                 session: { sessionId: session.id, currentQuestion: null, summary: null },
                 errorMessage: session.error || t("planning.retryFailed", "Retry failed. Please try again."),
-              });
+              };
+              viewRef.current = terminalView;
+              setView(terminalView);
               setIsAutoRetrying(false);
             }
 
@@ -1315,45 +1698,73 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
           }
         }
 
+        if (!retryStillOwnsSession()) return;
         streamConnectionRef.current?.close();
         streamConnectionRef.current = null;
-        setView({
+        if (options.auto && (planningAutoRetryAttemptsBySession.get(retryTarget.sessionId) ?? 0) < MAX_PLANNING_AUTO_RETRIES) {
+          viewRef.current = { type: "loading" };
+          setView({ type: "loading" });
+          setIsAutoRetrying(true);
+          /*
+          FNXC:PlanningRetry 2026-07-23-09:45:
+          A rejected automatic attempt has settled before its bounded successor is queued, so
+          release only its matching token first. The successor can then acquire ownership, while
+          duplicate SSE/poll reports still coalesce only during a genuinely pending invocation;
+          a stale callback cannot clear a newer session's owner.
+          */
+          if (options.retryToken && planningAutoRetryOwnerRef.current?.token === options.retryToken) {
+            planningAutoRetryOwnerRef.current = null;
+          }
+          queueMicrotask(() => {
+            if (currentSessionIdRef.current === retryTarget.sessionId) {
+              void startPlanningAutoRetryRef.current(retryTarget.sessionId);
+            }
+          });
+          return;
+        }
+        const terminalView: ViewState = {
           type: "error",
           session: retryTarget,
           errorMessage: getErrorMessage(retryError) || t("planning.retryFailed", "Retry failed. Please try again."),
-        });
+        };
+        viewRef.current = terminalView;
+        setView(terminalView);
         setIsAutoRetrying(false);
       } finally {
         if (!options.auto) {
           setIsRetrying(false);
         }
-        planningAutoRetryInFlightRef.current = false;
+        if (options.retryToken && planningAutoRetryOwnerRef.current?.token === options.retryToken) {
+          planningAutoRetryOwnerRef.current = null;
+        }
       }
     },
     [connectToPlanningStream, projectId, resetPlanningAutoRetryBudget, t],
   );
 
   const startPlanningAutoRetry = useCallback(
-    async (sessionId: string, _errorMessage: string) => {
-      if (viewRef.current.type === "error") {
-        return false;
-      }
-      if (planningAutoRetryInFlightRef.current) {
+    async (sessionId: string) => {
+      if (planningAutoRetryOwnerRef.current?.sessionId === sessionId) {
         return true;
       }
-      if (planningAutoRetryAttemptRef.current >= MAX_PLANNING_AUTO_RETRIES) {
+      if (viewRef.current.type === "error") return false;
+      // FNXC:PlanningRetry 2026-07-22-21:00: budget is per-session and survives remounts.
+      const priorAttempts = planningAutoRetryAttemptsBySession.get(sessionId) ?? 0;
+      if (priorAttempts >= MAX_PLANNING_AUTO_RETRIES) {
         setIsAutoRetrying(false);
         return false;
       }
 
-      const attempt = planningAutoRetryAttemptRef.current + 1;
+      const attempt = priorAttempts + 1;
+      const retryToken = Symbol(`planning-auto-retry:${sessionId}:${attempt}`);
+      planningAutoRetryAttemptsBySession.set(sessionId, attempt);
       planningAutoRetryAttemptRef.current = attempt;
-      planningAutoRetryInFlightRef.current = true;
+      planningAutoRetryOwnerRef.current = { sessionId, token: retryToken };
       setAutoRetryAttempt(attempt);
       setIsAutoRetrying(true);
       await startPlanningRetry(
         { sessionId, currentQuestion: null, summary: null },
-        { auto: true },
+        { auto: true, retryToken },
       );
       return true;
     },
@@ -1426,7 +1837,6 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       );
       draftSessionIdRef.current = null;
       currentSessionIdRef.current = sessionId;
-      liveGenerationSessionIdRef.current = sessionId;
       setSelectedSessionId(sessionId);
       setShowSessionList(false);
       setMobileShowDetail(true);
@@ -1472,6 +1882,18 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       const timer = setTimeout(() => {
         // Only mark as auto-started when we actually start planning
         hasAutoStartedRef.current = true;
+        /*
+        FNXC:PlanningMode 2026-07-23-00:00:
+        Consuming the seeded plan is what prevents duplicate sessions: the owner clears
+        `planningInitialPlan` so a later remount (navigate away/back, project-switch key) takes
+        the stored-active-session restore path instead of auto-starting a second session.
+        Mark the stored-resume attempt as done BEFORE the parent clears the prop — the seeded
+        start owns this mount's destination, and without this the stored-resume effect would
+        re-fire on the prop clearing and load a previous session over the just-started plan
+        while startPlanningStreaming is still in flight.
+        */
+        hasAttemptedStoredResumeRef.current = true;
+        onInitialPlanConsumedRef.current?.();
         handleStartPlanning(initialPlanProp);
       }, 0);
       return () => clearTimeout(timer);
@@ -1497,12 +1919,22 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   // Load a specific persisted session into the right pane.
   const loadSession = useCallback(
     async (sessionId: string) => {
+      const loadEpoch = ++planningSessionLoadEpochRef.current;
       streamConnectionRef.current?.close();
       streamConnectionRef.current = null;
-      // Loading a database row never makes its in-flight turn local to this mount.
-      liveGenerationSessionIdRef.current = null;
+      currentSessionIdRef.current = sessionId;
 
       setError(null);
+      /*
+      FNXC:PlanningMultiTask 2026-07-24-01:40:
+      Review finding (confidence 100): the linked-task banner leaked across session switches —
+      only the complete branch below set linkedTaskId, so opening session B after a
+      task-linked session A showed "Task <A's task> was created from this plan" on B's plan
+      review with a working View task button. Clear it at load start; the complete branch
+      restores it for the session actually being loaded.
+      */
+      setLinkedTaskId(null);
+      setLinkedTask(null);
       setStreamingOutput("");
       setResponseHistory([]);
       setConversationHistory([]);
@@ -1514,10 +1946,14 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       setIsRefiningSummary(false);
       refineSummaryInFlightRef.current = false;
       setGenerationStartTime(null);
-      setView({ type: "loading" });
+      // FNXC:PlanningMode 2026-07-23-00:00: hydrate-from-DB shows the neutral session loader,
+      // not the generation pane — only a fetched status of "generating" enters `loading` below.
+      viewRef.current = { type: "session_loading" };
+      setView({ type: "session_loading" });
 
       try {
         const session = await fetchAiSession(sessionId);
+        if (planningSessionLoadEpochRef.current !== loadEpoch || currentSessionIdRef.current !== sessionId) return;
         if (!session) {
           // The session was deleted (commonly: this tab just turned it into
           // tasks via Create Task / Create Tasks). Quietly fall back to the
@@ -1596,16 +2032,32 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
         }
 
         if (session.status === "error") {
-          const errorMessage = session.error || t("planning.sessionFailed2", "Session failed");
           /*
-          FNXC:PlanningRetry 2026-07-15-00:00:
-          FN-8332 requires browser-reload/session-resume to render the durable planning state verbatim and never dispatch a new generation. Auto-retry remains exclusively for live in-session SSE and loading-poll failures; persisted errors must expose the manual Retry/Dismiss panel.
+          FNXC:PlanningRetry 2026-07-21-10:00:
+          Persisted stream errors are retryable work, not a terminal Planning destination. Re-enter
+          through the same generation retry path used by live stream failures while preserving the
+          hydrated running plan and the existing bounded single-flight protection.
           */
-          setView({
-            type: "error",
-            session: { sessionId, currentQuestion: null, summary: null },
-            errorMessage,
-          });
+          /*
+          FNXC:PlanningRetry 2026-07-22-21:00:
+          Do NOT reset the auto-retry budget here. Loading an errored session happens on every
+          remount (each app-tab switch unmounts this view), and a per-mount reset turned the
+          bounded three-attempt budget into an unbounded regeneration loop. The module-scoped
+          per-session budget carries across remounts; only real progress clears it.
+          */
+          if (planningAutoRetryOwnerRef.current?.sessionId !== sessionId) {
+            planningAutoRetryAttemptRef.current = planningAutoRetryAttemptsBySession.get(sessionId) ?? 0;
+            setAutoRetryAttempt(planningAutoRetryAttemptRef.current);
+          }
+          const autoRetryStarted = await startPlanningAutoRetry(sessionId);
+          if (!autoRetryStarted) {
+            // Budget exhausted: surface the persisted error with a manual Retry affordance.
+            setView({
+              type: "error",
+              session: { sessionId, currentQuestion: null, summary: persistedRunningSummary },
+              errorMessage: session.error || t("planning.sessionFailed", "Session failed while contacting the AI."),
+            });
+          }
           return;
         }
 
@@ -1668,30 +2120,37 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
             }
           }
         } else if (session.status === "complete" && session.result) {
-          const summary = persistedRunningSummary ?? normalizePlanningSummary(JSON.parse(session.result));
-          setRunningSummary(summary);
-          if (isValidatedPlanningSession(session)) {
-            const createdTaskId = inputPayload && typeof inputPayload.createdTaskId === "string" ? inputPayload.createdTaskId : undefined;
-            resetPlanningAutoRetryBudget();
-            clearPlanningDescription(projectId);
-            if (createdTaskId) {
-              setView({ type: "task_created", taskId: createdTaskId });
-            } else {
-              setView({ type: "create_retry", session: { sessionId, currentQuestion: null, summary }, summary, errorMessage: t("planning.retryCreate", "Retry create") });
-            }
-          } else {
+          const resume = resolveCompletePlanningResume(session, persistedRunningSummary);
+          if (resume.kind === "unrecoverable") {
             setView({
               type: "error",
-              session: { sessionId, currentQuestion: null, summary },
-              errorMessage: t("planning.awaitingValidationState", "This plan is still being prepared. Retry to continue the interview."),
+              session: { sessionId, currentQuestion: null, summary: persistedRunningSummary },
+              errorMessage: t("planning.sessionUnrecoverableState", "This session could not be restored. Retry to continue the interview."),
             });
+          } else {
+            resetPlanningAutoRetryBudget();
+            clearPlanningDescription(projectId);
+            applyCompletePlanningResume(sessionId, resume);
           }
         } else if (session.status === "generating") {
           setView({ type: "loading" });
-          if (session.thinkingOutput) setStreamingOutput(session.thinkingOutput);
+          // FNXC:PlanningStreamCatchup 2026-07-22-21:00: no pre-seed from persisted
+          // thinkingOutput — the stream replay reconstructs the loading view exactly once;
+          // seeding here and then replaying doubled the visible output on every reload.
           connectToPlanningStream(sessionId);
+        } else {
+          // FNXC:PlanningMode 2026-07-23-00:00: a persisted row none of the branches above
+          // recognize (e.g. awaiting_input with neither question nor summary, or complete
+          // without a result) used to strand the modal on the generation spinner forever.
+          // Surface it as a retryable error instead of an indefinite loader.
+          setView({
+            type: "error",
+            session: { sessionId, currentQuestion: null, summary: persistedRunningSummary },
+            errorMessage: t("planning.sessionUnrecoverableState", "This session could not be restored. Retry to continue the interview."),
+          });
         }
       } catch (err) {
+        if (planningSessionLoadEpochRef.current !== loadEpoch || currentSessionIdRef.current !== sessionId) return;
         currentSessionIdRef.current = sessionId;
         setActivePlanPrompt("");
         setError(null);
@@ -1702,7 +2161,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
         });
       }
     },
-    [connectToPlanningStream, projectId, resetPlanningAutoRetryBudget, t],
+    [connectToPlanningStream, projectId, resetPlanningAutoRetryAttempts, resetPlanningAutoRetryBudget, startPlanningAutoRetry, t],
   );
 
   // Resume the externally-requested session when the modal first opens.
@@ -1896,6 +2355,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   }, [projectId, resetDetailState, resumeSessionId, selectedSessionId]);
 
   const handleBackToList = useCallback(() => {
+    setIsHistoryOpen(false);
     setShowSessionList(true);
     setMobileShowDetail(false);
   }, []);
@@ -2235,7 +2695,36 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       const sessionId = session.sessionId;
       const activeQuestion = session.currentQuestion;
       if (!activeQuestion) {
-        setError(t("planning.noActiveQuestion", "No active question in session"));
+        /*
+        FNXC:PlanningQuestionRegeneration 2026-07-23-21:40:
+        Submitting with no active question is no longer a dead-end "No active question in
+        session" error. The server regenerates a fresh interview question from the accumulated
+        context, so forward the input and enter the loading state; the SSE question event (or
+        the HTTP payload for restored sessions without a live stream) restores the view. No
+        optimistic history entry is recorded because there is no question to pair it with.
+        */
+        setError(null);
+        resetPlanningAutoRetryBudget();
+        setGenerationActivity("question");
+        setGenerationStartTime(Date.now());
+        setView({ type: "loading" });
+        setStreamingOutput("");
+        currentSessionIdRef.current = sessionId;
+        if (!streamConnectionRef.current?.isConnected()) {
+          connectToPlanningStream(sessionId);
+        }
+        try {
+          const response = await respondToPlanning(sessionId, responses, projectId);
+          const responseQuestion = "type" in response ? response.data : response.currentQuestion;
+          if (responseQuestion) {
+            const nextQuestion = normalizeQuestionOptions(responseQuestion);
+            setWorkspaceQuestion(nextQuestion);
+            setView({ type: "question", session: { sessionId, currentQuestion: nextQuestion, summary: runningSummaryRef.current } });
+          }
+        } catch (err) {
+          setError(getErrorMessage(err) || t("planning.failedSubmitResponse", "Failed to submit response"));
+          setView({ type: "question", session: { sessionId, currentQuestion: null, summary: runningSummaryRef.current } });
+        }
         return;
       }
 
@@ -2278,7 +2767,6 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       setView({ type: "loading" });
       setStreamingOutput(""); // Clear old thinking output when entering loading state
       currentSessionIdRef.current = sessionId;
-      liveGenerationSessionIdRef.current = sessionId;
       if (!streamConnectionRef.current?.isConnected()) {
         connectToPlanningStream(sessionId);
       }
@@ -2362,7 +2850,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
         setView({ type: "question", session: { ...session, summary: runningSummaryRef.current } });
       }
     },
-    [connectToPlanningStream, conversationHistory, editingQuestionId, projectId, resetPlanningAutoRetryBudget, view]
+    [connectToPlanningStream, conversationHistory, editingQuestionId, projectId, resetPlanningAutoRetryBudget, t, view]
   );
 
   const handleStopGeneration = useCallback(async () => {
@@ -2375,7 +2863,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     const history = conversationHistoryRef.current;
 
     currentSessionIdRef.current = null;
-    liveGenerationSessionIdRef.current = null;
+    planningSessionLoadEpochRef.current += 1;
     streamConnectionEpochRef.current += 1;
     streamConnectionRef.current?.close();
     streamConnectionRef.current = null;
@@ -2450,7 +2938,6 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       }
     }
     currentSessionIdRef.current = sessionId;
-    liveGenerationSessionIdRef.current = sessionId;
     if (!streamConnectionRef.current?.isConnected()) {
       connectToPlanningStream(sessionId);
     }
@@ -2491,6 +2978,114 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     }
   }, [connectToPlanningStream, projectId, refinementInstructions, t, view, workspaceQuestion]);
 
+  /*
+  FNXC:PlanningComments 2026-07-23-17:05:
+  Plan selection must track document-level selectionchange (not only mouseup/touchend on the
+  markdown root). On mobile, the selection often finalizes after touchend, so waiting on the
+  element handlers left the Add-comment control missing until a later scroll/gesture. Collapsed
+  or out-of-plan selections clear the quote so the control dismisses when the selection is done.
+  While the comment editor is open the quote stays locked — opening the editor collapses the
+  native selection, and clearing here would unmount the composer mid-edit.
+  */
+  const capturePlanSelection = useCallback(() => {
+    /*
+    FNXC:PlanningComments 2026-07-24-06:30:
+    While the composer is open (or we already snapshotted an open quote on pointerdown), never
+    clear the live selection quote from selectionchange — that unmounted the fixed panel as soon
+    as the open gesture collapsed the native range.
+    */
+    if (isCommentEditorOpenRef.current || pendingOpenCommentQuoteRef.current) return;
+
+    const selection = window.getSelection();
+    const root = planDocumentRef.current;
+    if (
+      !selection
+      || selection.rangeCount === 0
+      || selection.isCollapsed
+      || !root
+      || !root.contains(selection.anchorNode)
+      || !root.contains(selection.focusNode)
+    ) {
+      setSelectedPlanQuote(null);
+      return;
+    }
+
+    const quote = selection.toString().replace(/\s+/g, " ").trim();
+    setSelectedPlanQuote(quote || null);
+  }, []);
+
+  useEffect(() => {
+    document.addEventListener("selectionchange", capturePlanSelection);
+    document.addEventListener("mouseup", capturePlanSelection);
+    document.addEventListener("touchend", capturePlanSelection);
+    document.addEventListener("keyup", capturePlanSelection);
+    return () => {
+      document.removeEventListener("selectionchange", capturePlanSelection);
+      document.removeEventListener("mouseup", capturePlanSelection);
+      document.removeEventListener("touchend", capturePlanSelection);
+      document.removeEventListener("keyup", capturePlanSelection);
+    };
+  }, [capturePlanSelection]);
+
+  useEffect(() => {
+    /*
+    FNXC:PlanningComments 2026-07-23-17:05:
+    Composer focus collapses the native selection. When the editor closes, re-sync so a done
+    selection dismisses the Add-comment control instead of leaving a sticky orphaned quote.
+    */
+    if (!isCommentEditorOpen) {
+      capturePlanSelection();
+    }
+  }, [capturePlanSelection, isCommentEditorOpen]);
+
+  const handleAddContextualComment = useCallback(() => {
+    const quote = openCommentQuote ?? selectedPlanQuote;
+    const suggestion = commentDraft.trim();
+    if (!quote || !suggestion) return;
+    setContextualComments((comments) => [...comments, { quote, suggestion }]);
+    /*
+    FNXC:PlanningComments 2026-07-23-17:05:
+    Adding a comment clears the native selection, so the quote must dismiss with it. Do not restore
+    focus onto a remounted trigger — that path only applies when Cancel keeps an active selection.
+    */
+    restoreCommentTriggerFocusRef.current = false;
+    setSelectedPlanQuote(null);
+    closeCommentEditor();
+    window.getSelection()?.removeAllRanges();
+  }, [closeCommentEditor, commentDraft, openCommentQuote, selectedPlanQuote]);
+
+  const handleSubmitContextualComments = useCallback(async () => {
+    const sessionId = currentSessionIdRef.current;
+    const summary = runningSummaryRef.current;
+    if (!sessionId || !summary || contextualComments.length === 0 || contextualCommentInFlightRef.current) return;
+    /* FNXC:PlanningComments 2026-07-23-12:00: A synchronous guard makes one batch one established plan-update turn despite rapid pointer or keyboard activation. */
+    contextualCommentInFlightRef.current = true;
+    contextualCommentSubmissionRef.current = true;
+    setError(null);
+    setGenerationActivity("plan_update");
+    setGenerationStartTime(Date.now());
+    setView({ type: "loading" });
+    if (!streamConnectionRef.current?.isConnected()) connectToPlanningStream(sessionId);
+    try {
+      const response = await respondToPlanning(sessionId, { contextualComments }, projectId);
+      const nextSummary = "type" in response ? null : response.summary;
+      if (nextSummary) {
+        const normalized = normalizePlanningSummary(nextSummary);
+        runningSummaryRef.current = normalized;
+        setRunningSummary(normalized);
+        contextualCommentSubmissionRef.current = false;
+        setContextualComments([]);
+        setView({ type: "plan_review", session: { sessionId, currentQuestion: null, summary: normalized }, summary: normalized });
+      }
+    } catch (err) {
+      contextualCommentSubmissionRef.current = false;
+      setError(getErrorMessage(err) || t("planning.failedSubmitResponse", "Failed to submit comments"));
+      setView({ type: "plan_review", session: { sessionId, currentQuestion: null, summary }, summary });
+    } finally {
+      contextualCommentInFlightRef.current = false;
+    }
+  }, [connectToPlanningStream, contextualComments, projectId, t]);
+
   const handleProceedWithPlan = useCallback(async () => {
     const sessionId = currentSessionIdRef.current;
     const summary = runningSummaryRef.current;
@@ -2504,7 +3099,9 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
         ...(workflowId !== undefined ? { workflowId } : {}),
       }));
       clearPlanningActiveSession(projectId);
-      setView({ type: "task_created", taskId: task.id, task });
+      setLinkedTaskId(task.id);
+      setLinkedTask(task);
+      setView({ type: "task_created", taskId: task.id, task, sessionId });
     } catch (err) {
       const errorMessage = getErrorMessage(err) || t("planning.failedCreateTask", "Failed to create task");
       setView({ type: "create_retry", session, summary, errorMessage });
@@ -2514,17 +3111,27 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   }, [projectId, t, workflowId, workspaceQuestion]);
 
   const handleMobileKeyboardActionPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (viewportMode !== "mobile" || event.pointerType === "mouse") return;
+    /*
+    FNXC:PlanningComments 2026-07-24-06:20:
+    Phone/tablet only: preventDefault on pointerdown so the focused composer does not blur and
+    the fixed panel does not jump before click. Do NOT run the action here — committing Add on
+    pointerdown closed the comment box immediately and raced keyboard metrics; Start Planning
+    uses this same prevent-blur / click-to-commit split.
+    */
+    if (viewportMode === "desktop" || event.pointerType === "mouse") return;
     event.preventDefault();
   }, [viewportMode]);
 
   const handleApplyRefinementPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (viewportMode !== "mobile" || event.pointerType === "mouse") return;
+    if (viewportMode === "desktop" || event.pointerType === "mouse") return;
     /*
     FNXC:PlanningModeMobile 2026-07-21-00:50:
     Preventing the touch pointer default suppresses the browser's compatibility click. Apply
     before the keyboard resize can move/remove the popup button; the single-flight guard above
     makes a browser that still emits click harmless.
+
+    FNXC:PlanningComments 2026-07-24-06:15: Same race applies on tablet while the comment/refine
+    composers are keyboard-backed, so this is no longer phone-only.
     */
     event.preventDefault();
     void handleRefineFromPlan();
@@ -2537,7 +3144,9 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     try {
       const task = await createTaskAfterActiveClaim(() => createTaskFromPlanning(view.session.sessionId, view.summary, projectId, { ...(workflowId !== undefined ? { workflowId } : {}) }));
       clearPlanningActiveSession(projectId);
-      setView({ type: "task_created", taskId: task.id, task });
+      setLinkedTaskId(task.id);
+      setLinkedTask(task);
+      setView({ type: "task_created", taskId: task.id, task, sessionId: view.session.sessionId });
     } catch (err) {
       setView({ ...view, errorMessage: getErrorMessage(err) || t("planning.failedCreateTask", "Failed to create task") });
     } finally {
@@ -2723,14 +3332,126 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     <section id="planning-plan-panel" className="planning-plan-pane" data-testid="planning-plan-pane" aria-label={t("planning.currentPlan", "Current plan")}>
       <div className="planning-view-scroll planning-summary-scroll planning-plan-scroll" data-testid="planning-plan-scroll">
         <article className="planning-plan-document">
-          <MailboxMessageContent
-            className="planning-plan-markdown markdown-body"
-            content={formatPlanningPlanMd(summary)}
-            testId="planning-plan-markdown"
-          />
+          {/*
+          FNXC:PlanningComments 2026-07-23-13:00:
+          Contextual quotes must originate exclusively in rendered plan Markdown. The editor and
+          action controls remain outside this selection root so typing or selecting a suggestion
+          cannot replace the captured plan quote.
+
+          FNXC:PlanningComments 2026-07-23-17:05:
+          Selection capture is document-level (selectionchange/mouseup/touchend/keyup). This root
+          only scopes which nodes count as plan text — handlers are not required on the element.
+          */}
+          <div ref={planDocumentRef} data-testid="planning-plan-selection-root">
+            <MailboxMessageContent
+              className="planning-plan-markdown markdown-body"
+              content={formatPlanningPlanMd(summary)}
+              testId="planning-plan-markdown"
+            />
+          </div>
+          {selectedPlanQuote && !isCommentEditorOpen && (
+            <button
+              ref={addCommentTriggerRef}
+              type="button"
+              className="btn planning-add-comment planning-add-comment--document"
+              onMouseDown={(event) => event.preventDefault()}
+              onPointerDown={handleOpenCommentEditorPointerDown}
+              onClick={openCommentEditor}
+            >
+              {/* FNXC:PlanningComments 2026-07-24-05:55: Match New-session / mobile rail glyph scale. */}
+              <MessageSquarePlus size={16} aria-hidden="true" />
+              {t("planning.addComment", "Add comment to selection")}
+            </button>
+          )}
+          {isCommentEditorOpen && openCommentQuote && (
+            <div
+              ref={commentEditorRef}
+              className={`planning-comment-editor${keyboardOpen && commentComposerNeedsKeyboardLift ? " planning-comment-editor--keyboard-open" : ""}`}
+              style={commentEditorStyle}
+              role="dialog"
+              aria-label={t("planning.addPlanComment", "Add plan comment")}
+              data-testid="planning-comment-editor"
+            >
+              <p className="planning-comment-quote">{openCommentQuote}</p>
+              <label className="planning-refine-menu-input">
+                <span>{t("planning.commentSuggestion", "Suggestion")}</span>
+                <textarea ref={commentInputRef} className="input" value={commentDraft} onChange={(event) => setCommentDraft(event.target.value)} />
+              </label>
+              <div className="planning-refine-menu-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onPointerDown={handleMobileKeyboardActionPointerDown}
+                  onClick={() => closeCommentEditor({ restoreTriggerFocus: true })}
+                >
+                  {t("common.cancel", "Cancel")}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={!commentDraft.trim()}
+                  onPointerDown={handleMobileKeyboardActionPointerDown}
+                  onClick={handleAddContextualComment}
+                >
+                  {t("planning.addComment", "Add comment")}
+                </button>
+              </div>
+            </div>
+          )}
         </article>
       </div>
       <div className="planning-actions planning-summary-actions planning-plan-actions" data-testid="planning-plan-actions">
+        {/*
+        FNXC:PlanningComments 2026-07-31-00:00:
+        FN-8533 keeps the selection-adjacent control on wide desktop, but compact shells need a
+        counterpart that cannot be lost under the document fold.
+
+        FNXC:PlanningComments 2026-07-24-05:50:
+        On tablet and phone (≤1024) the rail control stays in the plan action footer as a
+        full-width row above Refine/Proceed so a selection never requires scrolling past the
+        action baseline. Document-level selectionchange still dismisses it when the selection
+        collapses. CSS shows exactly one of the two variants; only established 768px/1024px
+        breakpoint literals are allowed here, while all other dimensions remain design-token based.
+
+        FNXC:PlanningComments 2026-07-24-05:55:
+        Tablet must keep the two-column grid (not flex nowrap) so Add comment stays a full-width
+        first row with the same MessageSquarePlus 16px glyph as phone.
+        */}
+        {selectedPlanQuote && !isCommentEditorOpen && (
+          <button
+            ref={mobileAddCommentTriggerRef}
+            type="button"
+            className="btn planning-add-comment planning-add-comment--mobile"
+            onMouseDown={(event) => event.preventDefault()}
+            onPointerDown={handleOpenCommentEditorPointerDown}
+            onClick={openCommentEditor}
+          >
+            <MessageSquarePlus size={16} aria-hidden="true" />
+            {t("planning.addComment", "Add comment to selection")}
+          </button>
+        )}
+        {contextualComments.length > 0 && (
+          <div className="planning-comment-tray" data-testid="planning-comment-tray">
+            <ul>
+              {contextualComments.map((comment, index) => (
+                <li key={`${comment.quote}-${index}`}>
+                  <blockquote>{comment.quote}</blockquote>
+                  <p>{comment.suggestion}</p>
+                  <button type="button" className="btn btn-icon" aria-label={t("planning.removeComment", "Remove comment")} onClick={() => setContextualComments((comments) => comments.filter((_, commentIndex) => commentIndex !== index))}><Trash2 /></button>
+                </li>
+              ))}
+            </ul>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={contextualCommentInFlightRef.current}
+              onPointerDown={handleMobileKeyboardActionPointerDown}
+              onClick={() => void handleSubmitContextualComments()}
+            >
+              {t("planning.submitComments", "Submit comments")}
+            </button>
+          </div>
+        )}
         {isRefineMenuOpen && (
           <div
             id="planning-refine-menu"
@@ -2812,13 +3533,13 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       <div className={isEmbedded ? "modal modal-lg planning-modal planning-modal--embedded" : "modal modal-lg planning-modal"} ref={modalRef}>
         {/*
         FNXC:PlanningMode 2026-06-22-00:00:
-        Embedded planning is a main-content destination, not a dialog: it drops the modal close button and renders a plain common title (modal-header--embedded) matching other embedded views like Command Center. The mobile back affordance stays because it navigates the session list, not the view.
+        Embedded planning is a main-content destination, not a dialog: it drops the modal close button and renders a plain common title (modal-header--embedded) matching other embedded views like Command Center. The session-list Back affordance stays because it navigates within Planning, not away from the view.
         */}
         <div className={isEmbedded ? "modal-header modal-header--embedded" : "modal-header"}>
           <div className="detail-title-row">
             {canReturnToSessionList && (
               <button
-                className="modal-back planning-mobile-back"
+                className="modal-back planning-session-back"
                 onClick={handleBackToList}
                 aria-label={t("planning.backToSessions", "Back to sessions")}
                 title={t("planning.backToSessions", "Back to sessions")}
@@ -2831,7 +3552,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
             Header icon mirrors MissionManager's <Target size={20} className="mission-manager__header-icon" />: same size (20) and same var(--todo) tint + flex-shrink:0, applied via the scoped .planning-modal--embedded .modal-header--embedded .detail-title-row > svg rule (it overrides the shared icon-triage brown so the two headers read as siblings).
             */}
             <Lightbulb size={20} className="icon-triage" />
-            {selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "error") && activeSessionTitle && isRenamingSession ? (
+            {selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "session_loading" || view.type === "error") && activeSessionTitle && isRenamingSession ? (
               <input
                 className="input planning-session-title-input"
                 aria-label={t("planning.renameSession", "Rename session")}
@@ -2842,31 +3563,18 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
                 autoFocus
               />
             ) : (
-              <><h3>{selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "error") && activeSessionTitle ? activeSessionTitle : t("planning.title", "Planning Mode")}</h3>
-              {selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "error") && activeSessionTitle && <button type="button" className="btn-icon" aria-label={t("planning.renameSession", "Rename session")} onClick={() => { setSessionTitleDraft(activeSessionTitle); setIsRenamingSession(true); }}><Pencil /></button>}</>
+              <><h3>{selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "session_loading" || view.type === "error") && activeSessionTitle ? activeSessionTitle : t("planning.title", "Planning Mode")}</h3>
+              {selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "session_loading" || view.type === "error") && activeSessionTitle && <button type="button" className="btn-icon" aria-label={t("planning.renameSession", "Rename session")} onClick={() => { setSessionTitleDraft(activeSessionTitle); setIsRenamingSession(true); }}><Pencil /></button>}</>
             )}
           </div>
           {/*
-          FNXC:PlanningModeMobileTablet 2026-07-20-09:12:
-          When the viewport cannot fit three interview panes, operators must still be able to return
-          to the session list and then back to the active question. Keep the list and detail state
-          synchronized on both transitions so a second Sessions press cannot leave the question pane
-          hidden by the mobile list CSS.
+          FNXC:PlanningSessionBack 2026-07-21-11:15:
+          History remains the only detail action in this group. Session-list navigation lives in the
+          title-row Back control on every viewport, avoiding a duplicate Sessions toggle and keeping
+          compact list/detail state synchronized through one handler.
           */}
-          {selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "error" || view.type === "plan_review" || view.type === "create_retry") && (
+          {selectedSessionId && (view.type === "question" || view.type === "loading" || view.type === "session_loading" || view.type === "error" || view.type === "plan_review" || view.type === "create_retry") && (
             <div className="planning-header-controls">
-              <button
-                type="button"
-                className="btn"
-                onClick={() => {
-                  const showList = !isSessionListMode;
-                  setIsHistoryOpen(false);
-                  setShowSessionList(showList);
-                  if (isCompactInterview) setMobileShowDetail(!showList);
-                }}
-              >
-                {t("planning.sessions", "Sessions")}
-              </button>
               <button
                 ref={historyTriggerRef}
                 type="button"
@@ -3171,6 +3879,13 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
             </div>
           )}
 
+          {view.type === "session_loading" && (
+            <div className="planning-loading" data-testid="planning-session-loading" role="status" aria-live="polite">
+              <Loader2 size={40} className="spin icon-todo" />
+              <p>{t("planning.loadingSession", "Loading session…")}</p>
+            </div>
+          )}
+
           {view.type === "loading" && !runningSummary && (
             <div className="planning-loading">
               <Loader2 size={40} className="spin icon-todo" />
@@ -3295,12 +4010,38 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
               {view.type === "loading" && (
                 <div className="planning-workspace-loader" role="status" aria-live="polite">
                   <Loader2 size={40} className="spin" />
-                  <strong>{t("planning.generatingPlan", "Generating plan…")}</strong>
+                  <strong>
+                    {generationActivity === "question"
+                      ? t("planning.generatingQuestion", "Generating next question…")
+                      : t("planning.generatingPlan", "Generating plan…")}
+                  </strong>
                   {generationStartTime && <span>{t("planning.thinkingElapsed", "Thinking… ({{seconds}}s)", { seconds: elapsedSeconds })}</span>}
                   <button className="btn planning-stop-btn" type="button" onClick={() => void handleStopGeneration()}>
                     <StopCircle size={14} />
                     <span className="icon-ml-6">{t("planning.stop", "Stop")}</span>
                   </button>
+                  {/*
+                  FNXC:PlanningThinkingVisibility 2026-07-23-22:45:
+                  Every Planning Mode generation step must stream the model's thinking/output to
+                  the operator, not only the first (pre-summary) turn. This workspace loader
+                  covers all follow-up turns — next question, refine, contextual comments, and
+                  question regeneration — and previously showed only a spinner with elapsed
+                  time. Reuse the same thinking container + toggle as the initial loading view.
+                  */}
+                  <div className="planning-thinking-container">
+                    <button
+                      className="planning-thinking-toggle"
+                      onClick={() => setShowThinking(!showThinking)}
+                      type="button"
+                    >
+                      {showThinking ? t("planning.hideThinking", "Hide thinking") : t("planning.showThinking", "Show thinking")}
+                    </button>
+                    {showThinking && streamingOutput && (
+                      <div className="planning-thinking-output" ref={thinkingOutputRef}>
+                        <pre>{streamingOutput}</pre>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -3308,6 +4049,33 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
           {view.type === "plan_review" && (
             <div className="planning-summary planning-plan-review" data-testid="planning-plan-review">
+              {/*
+              FNXC:PlanningMultiTask 2026-07-24-00:20:
+              A plan that already produced a task stays a live work surface. The banner links the
+              latest created task; continuing to edit rotates the server-side creation epoch, so
+              Proceed creates a fresh task from the evolved plan (unedited Proceed replays return
+              the same task).
+              */}
+              {linkedTaskId && (
+                <div className="planning-linked-task-note" data-testid="planning-linked-task-note" role="status">
+                  <CheckCircle size={16} />
+                  <span>
+                    {t("planning.linkedTaskNote", "Task {{taskId}} was created from this plan. Keep refining to create another.", { taskId: linkedTaskId })}
+                  </span>
+                  {/* FNXC:PlanningMultiTask 2026-07-24-01:40: resolve the just-created Task object first so View task is enabled immediately after creation, before the tasks prop refreshes (mirrors the task_created view's view.task ?? tasks.find pattern). */}
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={!onViewTask || !((linkedTask?.id === linkedTaskId ? linkedTask : null) ?? tasks.find((candidate) => candidate.id === linkedTaskId))}
+                    onClick={() => {
+                      const task = (linkedTask?.id === linkedTaskId ? linkedTask : null) ?? tasks.find((candidate) => candidate.id === linkedTaskId);
+                      if (task) onViewTask?.(task);
+                    }}
+                  >
+                    {t("planning.viewTask", "View task")}
+                  </button>
+                </div>
+              )}
               {renderPlanPane(view.summary)}
             </div>
           )}
@@ -3334,6 +4102,37 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
                   {t("planning.viewTask", "View task")}
                   <ArrowRight size={16} />
                 </button>
+                {/*
+                FNXC:PlanningMultiTask 2026-07-24-00:20:
+                Task creation is not the end of the plan. Continue planning returns to the plan
+                review workspace where the plan stays readable and editable; edits rotate the
+                creation epoch so Proceed can create another task from the evolved plan.
+                */}
+                {view.sessionId && runningSummary && (
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      const sessionId = view.sessionId!;
+                      /*
+                      FNXC:PlanningMultiTask 2026-07-24-01:40:
+                      Re-register the session as selected AND as the durable active session
+                      (task creation cleared it) so post-continue edits survive a reload and
+                      the sidebar selection matches the visible plan (review finding).
+                      */
+                      currentSessionIdRef.current = sessionId;
+                      setSelectedSessionId(sessionId);
+                      savePlanningActiveSession(sessionId, projectId);
+                      setView({
+                        type: "plan_review",
+                        session: { sessionId, currentQuestion: null, summary: runningSummary },
+                        summary: runningSummary,
+                      });
+                    }}
+                  >
+                    {t("planning.continuePlanning", "Continue planning")}
+                  </button>
+                )}
                 <button type="button" className="btn" onClick={handleBackToList}>
                   {t("planning.returnToSessions", "Return to sessions")}
                 </button>
@@ -3348,6 +4147,19 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
                 <div className="ai-error-panel" role="alert">
                   <div className="ai-error-message">{view.errorMessage}</div>
                   <button type="button" className="btn btn-primary" onClick={() => void handleRetryCreateTask()}>{t("planning.retryCreate", "Retry create")}</button>
+                  {/*
+                  FNXC:PlanningReopenAfterValidate 2026-07-23-23:30:
+                  A failed create attempt must not trap the operator on an error card. Back to
+                  plan returns to the full plan review workspace where the plan stays readable,
+                  editable, and creatable.
+                  */}
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => setView({ type: "plan_review", session: view.session, summary: view.summary })}
+                  >
+                    {t("planning.backToPlan", "Back to plan")}
+                  </button>
                 </div>
               </div>
             </div>

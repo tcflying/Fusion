@@ -20,6 +20,7 @@ import type {
   Task,
   TaskAttachment,
 } from "../types.js";
+import { taskDocumentContentHash } from "../task-document-concurrency.js";
 import type {
   ArtifactRow,
   BranchGroupRow,
@@ -77,6 +78,7 @@ export function rowToTask(row: TaskRow): Task {
     overlapBlockedBy: row.overlapBlockedBy || undefined,
     paused: row.paused ? true : undefined,
     pausedReason: row.pausedReason || undefined,
+    wedgeNotification: fromJson<Task["wedgeNotification"]>(row.wedgeNotification) ?? undefined,
     userPaused: row.userPaused ? true : undefined,
     baseBranch: row.baseBranch || undefined,
     executionStartBranch: row.executionStartBranch || undefined,
@@ -444,6 +446,7 @@ export function rowToTaskDocument(row: TaskDocumentRow): import("../types.js").T
     key: row.key,
     content: row.content,
     revision: row.revision,
+    contentHash: taskDocumentContentHash(row.content),
     author: row.author,
     metadata: fromJson<Record<string, unknown>>(row.metadata),
     createdAt: row.createdAt,

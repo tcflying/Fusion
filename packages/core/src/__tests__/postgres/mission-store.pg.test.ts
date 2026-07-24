@@ -13,8 +13,11 @@
  * gate (test:pg-gate).
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
-import { sql } from "drizzle-orm";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
+import { eq, sql } from "drizzle-orm";
+import { readFile } from "node:fs/promises";
+import type { DbTransaction } from "../../postgres/data-layer.js";
+import type { TaskCreateInput } from "../../types/task-core.js";
 
 import {
   pgDescribe,
@@ -115,6 +118,33 @@ pgTest("MissionStore (PostgreSQL backend mode)", () => {
       expect(await getMissionRow(tx, "M-SHARED")).toBeUndefined();
     });
     expect((await readProject("project-b")).missions.map(({ title }) => title)).toEqual(["Project B mission"]);
+  });
+
+  it("atomically audits status and autopilot transitions with attributed before/after values", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Audited transitions" });
+    const actor = { type: "operator" as const, id: "user-42", displayName: "Operator", source: "dashboard" };
+
+    await m.updateMission(mission.id, { status: "active", autopilotEnabled: true }, { actor });
+    // Unchanged sensitive values must not add noise to the activity feed.
+    await m.updateMission(mission.id, { status: "active", autopilotEnabled: true }, { actor });
+    await m.updateMission(mission.id, { status: "blocked", autopilotEnabled: false }, { actor });
+
+    const events = (await m.getMissionEvents(mission.id, { limit: 20 })).events;
+    expect(events).toHaveLength(4);
+    expect(events.map((event) => event.eventType)).toEqual([
+      "autopilot_disabled", "mission_status_changed", "autopilot_enabled", "mission_status_changed",
+    ]);
+    const statusEvents = events.filter((event) => event.eventType === "mission_status_changed");
+    expect(statusEvents.map((event) => event.metadata)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "status", from: "planning", to: "active", source: "dashboard", actor }),
+      expect.objectContaining({ field: "status", from: "active", to: "blocked", source: "dashboard", actor }),
+    ]));
+    const autopilotEvents = events.filter((event) => event.eventType.startsWith("autopilot_"));
+    expect(autopilotEvents.map((event) => event.metadata)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ field: "autopilotEnabled", from: false, to: true, actor }),
+      expect.objectContaining({ field: "autopilotEnabled", from: true, to: false, actor }),
+    ]));
   });
 
   it("createMission → addMilestone → addSlice → addFeature assembles getMissionWithHierarchy tree", async () => {
@@ -244,6 +274,227 @@ pgTest("MissionStore (PostgreSQL backend mode)", () => {
     expect(unlinked.status).toBe("defined");
   });
 
+  it("does not overwrite an existing task directory on a creation collision", async () => {
+    const taskStore = h.store();
+    const existing = await taskStore.createTask({ description: "the existing task must keep its prompt" });
+    const existingDir = taskStore.taskDir(existing.id);
+    const originalPrompt = await readFile(`${existingDir}/PROMPT.md`, "utf8");
+    const allocator = {
+      reserveDistributedTaskId: vi.fn().mockResolvedValue({ taskId: existing.id, reservationId: "duplicate-id-reservation" }),
+      commitDistributedTaskIdReservation: vi.fn().mockResolvedValue(undefined),
+      abortDistributedTaskIdReservation: vi.fn().mockResolvedValue(undefined),
+    };
+    const allocatorSpy = vi.spyOn(taskStore, "getDistributedTaskIdAllocator").mockReturnValue(allocator as ReturnType<typeof taskStore.getDistributedTaskIdAllocator>);
+    try {
+      await expect(taskStore.createTask({ description: "a competing task must not overwrite files" }))
+        .rejects.toThrow(`Task ID already exists: ${existing.id}`);
+
+      /* FNXC:MissionAdmission 2026-07-23-19:00: a task-row collision leaves the winner's final artifacts untouched because the loser wrote only its staging directory. */
+      await expect(readFile(`${existingDir}/PROMPT.md`, "utf8")).resolves.toBe(originalPrompt);
+    } finally {
+      allocatorSpy.mockRestore();
+    }
+  });
+
+  it("does not claim a defined feature when task-file materialization fails", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Bootstrap file failure" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Target feature" });
+    const taskStore = h.store();
+    const claim = vi.fn(async (tx: DbTransaction, taskId: string) =>
+      m.claimDefinedFeatureTaskInTransaction(tx, {
+        featureId: feature.id,
+        taskId,
+        missionId: mission.id,
+        sliceId: slice.id,
+      }),
+    );
+    const writeTaskJson = vi.spyOn(taskStore, "writeTaskJsonFile").mockRejectedValueOnce(new Error("injected task-file failure"));
+
+    try {
+      await expect(taskStore.createTask({
+        description: "must not become a partial feature bootstrap",
+        missionId: mission.id,
+        sliceId: slice.id,
+        afterTaskInsert: (tx: DbTransaction, task: { id: string }) => claim(tx, task.id),
+      } as TaskCreateInput & { afterTaskInsert: (tx: DbTransaction, task: { id: string }) => Promise<void> })).rejects.toThrow("injected task-file failure");
+    } finally {
+      writeTaskJson.mockRestore();
+    }
+
+    /* FNXC:MissionAdmission 2026-07-23-17:10: filesystem failure precedes the insert-and-claim transaction, so no feature promotion can survive a failed task create. */
+    expect(claim).not.toHaveBeenCalled();
+    expect(await m.getFeature(feature.id)).toMatchObject({ status: "defined", taskId: undefined });
+    expect((await taskStore.listTasks()).some((task) => task.description === "must not become a partial feature bootstrap")).toBe(false);
+  });
+
+  it("rejects an unlinked duplicate canonical even when its mission and slice match", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Bootstrap duplicate guard" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Target feature" });
+    const task = await h.store().createTask({
+      description: "existing work for another feature",
+      missionId: mission.id,
+      sliceId: slice.id,
+    });
+
+    /*
+    FNXC:MissionAdmission 2026-07-23-17:20:
+    A duplicate canonical does not inherit a feature merely because it shares a
+    slice. Only the insert transaction may claim a defined feature for a new
+    task; retry reconciliation requires an existing bidirectional link.
+    */
+    await expect(m.claimDefinedFeatureTask({
+      featureId: feature.id,
+      taskId: task.id,
+      missionId: mission.id,
+      sliceId: slice.id,
+    })).rejects.toThrow("is not linked to this feature");
+    expect(await m.getFeature(feature.id)).toMatchObject({ status: "defined", taskId: undefined });
+  });
+
+  it("preserves a late bootstrap duplicate already linked to another feature", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Bootstrap sibling ownership" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const firstFeature = await m.addFeature(slice.id, { title: "First feature" });
+    const siblingFeature = await m.addFeature(slice.id, { title: "Sibling feature" });
+    const taskStore = h.store();
+    const claimedTask = await taskStore.createTask({
+      description: "same fingerprint work",
+      missionId: mission.id,
+      sliceId: slice.id,
+    });
+    await m.linkFeatureToTask(firstFeature.id, claimedTask.id);
+    const siblingTask = await taskStore.createTask({
+      description: "same fingerprint work",
+      missionId: mission.id,
+      sliceId: slice.id,
+    });
+    await m.linkFeatureToTask(siblingFeature.id, siblingTask.id);
+
+    await m.archiveDefinedFeatureBootstrapDuplicate({
+      featureId: firstFeature.id,
+      taskId: claimedTask.id,
+      duplicateTaskId: siblingTask.id,
+    });
+
+    /* FNXC:MissionAdmission 2026-07-23-21:10: a late same-fingerprint task claimed by another feature is not a duplicate eligible for archival. */
+    expect(await taskStore.getTask(siblingTask.id)).toMatchObject({ id: siblingTask.id, column: "triage" });
+    expect(await m.getFeature(siblingFeature.id)).toMatchObject({ taskId: siblingTask.id, status: "triaged" });
+    expect(await m.getFeature(firstFeature.id)).toMatchObject({ taskId: claimedTask.id, status: "triaged" });
+  });
+
+  /*
+  FNXC:MissionReconciliation 2026-07-20-08:34:
+  Regression coverage exercises every terminal-evidence representation through the real PostgreSQL store. Reconciliation must never route through ordinary triage linking, mutate loop attempts or mission controls, or partially commit when the transaction fails.
+  */
+  it("atomically reconciles live done evidence and remains idempotent", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Parked repair" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Delivered" });
+    const task = await h.store().createTask({ description: "shipped", column: "done" });
+    const taskCount = (await h.store().listTasks()).length;
+
+    const reconciled = await m.reconcileFeatureDoneWithTerminalTask(feature.id, task.id);
+
+    expect(reconciled).toMatchObject({ taskId: task.id, status: "done", loopState: "idle", implementationAttemptCount: 0 });
+    expect(await m.getSlice(slice.id)).toMatchObject({ status: "complete" });
+    expect(await m.getMilestone(milestone.id)).toMatchObject({ status: "complete" });
+    expect(await m.getMission(mission.id)).toMatchObject({ status: "planning", autopilotEnabled: false, autoAdvance: false });
+    expect(await h.store().getTask(task.id)).toMatchObject({ missionId: mission.id, sliceId: slice.id, column: "done" });
+    expect((await h.store().listTasks()).length).toBe(taskCount);
+
+    const firstUpdatedAt = reconciled.updatedAt;
+    const idempotent = await m.reconcileFeatureDoneWithTerminalTask(feature.id, task.id);
+    expect(idempotent.updatedAt).toBe(firstUpdatedAt);
+    expect(idempotent).toEqual(reconciled);
+
+    const duplicate = await m.addFeature(slice.id, { title: "Corrupt duplicate" });
+    await m.updateFeature(duplicate.id, { taskId: task.id });
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, task.id)).rejects.toMatchObject({ code: "TASK_FEATURE_CONFLICT" });
+    expect(await m.getFeature(feature.id)).toEqual(reconciled);
+  });
+
+  it("accepts a supported archived tombstone without resurrecting or back-linking it", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Archived repair" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Archived delivery" });
+    const task = await h.store().createTask({ description: "archived shipped work", column: "done" });
+    await h.store().archiveTask(task.id, { cleanup: false });
+
+    const reconciled = await m.reconcileFeatureDoneWithTerminalTask(feature.id, task.id);
+
+    expect(reconciled).toMatchObject({ taskId: task.id, status: "done", loopState: "idle", implementationAttemptCount: 0 });
+    expect(await h.store().getTask(task.id)).toMatchObject({ column: "archived" });
+    const tombstones = await h.layer().db
+      .select({ column: schema.project.tasks.column, deletedAt: schema.project.tasks.deletedAt, missionId: schema.project.tasks.missionId, sliceId: schema.project.tasks.sliceId })
+      .from(schema.project.tasks)
+      .where(eq(schema.project.tasks.id, task.id));
+    expect(tombstones).toEqual([{ column: "archived", deletedAt: expect.any(String), missionId: null, sliceId: null }]);
+    expect(await m.getMission(mission.id)).toMatchObject({ status: "planning", autopilotEnabled: false, autoAdvance: false });
+  });
+
+  it("rejects missing, nonterminal, invalid-deleted, feature mismatch, and duplicate task links without mutation", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Guarded repair" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const [feature, other] = await Promise.all([
+      m.addFeature(slice.id, { title: "Canonical" }),
+      m.addFeature(slice.id, { title: "Other" }),
+    ]);
+    const nonterminal = await h.store().createTask({ description: "active", column: "todo" });
+    const invalidDeleted = await h.store().createTask({ description: "deleted without archive", column: "done" });
+    await h.layer().db.update(schema.project.tasks).set({ deletedAt: new Date().toISOString() })
+      .where(eq(schema.project.tasks.id, invalidDeleted.id));
+    const linkedTask = await h.store().createTask({ description: "already linked", column: "done" });
+    await m.reconcileFeatureDoneWithTerminalTask(other.id, linkedTask.id);
+
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, "FN-MISSING")).rejects.toMatchObject({ code: "TASK_NOT_FOUND" });
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, nonterminal.id)).rejects.toMatchObject({ code: "TASK_NOT_TERMINAL" });
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, invalidDeleted.id)).rejects.toMatchObject({ code: "TASK_ARCHIVE_INVALID" });
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, linkedTask.id)).rejects.toMatchObject({ code: "TASK_FEATURE_CONFLICT" });
+
+    const canonicalTask = await h.store().createTask({ description: "canonical", column: "done" });
+    await m.linkFeatureToTask(feature.id, nonterminal.id);
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, canonicalTask.id)).rejects.toMatchObject({ code: "FEATURE_TASK_CONFLICT" });
+    expect(await m.getFeature(feature.id)).toMatchObject({ taskId: nonterminal.id, status: "triaged", loopState: "implementing" });
+    expect(await m.getMission(mission.id)).toMatchObject({ autopilotEnabled: false, autoAdvance: false });
+  });
+
+  it("rolls back feature linkage and rollups when reconciliation fails after its writes", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Rollback repair" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Rollback" });
+    const task = await h.store().createTask({ description: "done", column: "done" });
+    const layer = h.layer();
+    const original = layer.transactionImmediate.bind(layer);
+    const transaction = vi.spyOn(layer, "transactionImmediate").mockImplementation(async (callback) => original(async (tx) => {
+      await callback(tx);
+      throw new Error("injected post-write failure");
+    }));
+
+    await expect(m.reconcileFeatureDoneWithTerminalTask(feature.id, task.id)).rejects.toThrow("injected post-write failure");
+    transaction.mockRestore();
+
+    expect(await m.getFeature(feature.id)).toMatchObject({ taskId: undefined, status: "defined", loopState: "idle", implementationAttemptCount: 0 });
+    expect(await m.getSlice(slice.id)).toMatchObject({ status: "pending" });
+    expect(await m.getMilestone(milestone.id)).toMatchObject({ status: "planning" });
+    expect(await h.store().getTask(task.id)).toMatchObject({ missionId: undefined, sliceId: undefined });
+  });
+
   it("addContractAssertion appears in listContractAssertions", async () => {
     const m = missions();
     const mission = await m.createMission({ title: "Asserted" });
@@ -315,6 +566,117 @@ pgTest("MissionStore (PostgreSQL backend mode)", () => {
     expect(reaped.status).toBe("error");
     expect(reaped.summary).toBe("owner disappeared");
     expect((await m.getFeature(fix.id))?.loopState).toBe("needs_fix");
+  });
+
+  it("shares the root retry budget across fix-of-fix lineage", async () => {
+    /* FNXC:MissionLineageBudget 2026-07-22-12:00: deterministic remediation chains must exhaust the original feature, never restart at each child. */
+    const m = missions();
+    const mission = await m.createMission({ title: "Root budget" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const root = await m.addFeature(slice.id, { title: "F" });
+    let source = root;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await m.transitionLoopState(source.id, "implementing");
+      const run = await m.startValidatorRun(source.id, "scheduled");
+      await m.completeValidatorRun(run.id, "failed", "deterministic failure");
+      source = await m.createGeneratedFixFeature(source.id, run.id, [], "deterministic failure");
+      expect((await m.getFeature(root.id))?.implementationAttemptCount).toBe(attempt);
+    }
+    await m.transitionLoopState(source.id, "implementing");
+    const fourthRun = await m.startValidatorRun(source.id, "scheduled");
+    await m.completeValidatorRun(fourthRun.id, "failed", "deterministic failure");
+    await expect(m.createGeneratedFixFeature(source.id, fourthRun.id, [], "deterministic failure"))
+      .rejects.toThrow("MISSION_REMEDIATION_STOPPED: budget-exhausted");
+    expect(await m.getFeature(root.id)).toMatchObject({ loopState: "blocked", implementationStopReason: "budget-exhausted", implementationAttemptCount: 3 });
+  });
+
+  it("records generated-task archive as a durable root stop before unlinking", async () => {
+    /*
+    FNXC:MissionLineageBudget 2026-07-22-15:30:
+    Task archive is a supported removal surface. Its archive transaction must
+    retain the root stop even though it clears the generated feature's task link.
+    */
+    const m = missions();
+    const mission = await m.createMission({ title: "Generated task stop" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const root = await m.addFeature(slice.id, { title: "F" });
+    const run = await m.startValidatorRun(root.id, "scheduled");
+    await m.completeValidatorRun(run.id, "failed", "repair");
+    const fix = await m.createGeneratedFixFeature(root.id, run.id, [], "repair");
+    const task = await h.store().createTask({ description: "Generated fix task" });
+    await m.linkFeatureToTask(fix.id, task.id);
+
+    await h.store().archiveTask(task.id, { cleanup: false });
+
+    expect(await m.getFeature(root.id)).toMatchObject({
+      loopState: "blocked",
+      implementationStopReason: "operator-intervention",
+    });
+    expect(await m.getFeature(fix.id)).toMatchObject({ taskId: undefined });
+    const stops = await h.layer().db.select().from(schema.project.missionLineageStops)
+      .where(sql`${schema.project.missionLineageStops.rootFeatureId} = ${root.id}`);
+    expect(stops).toMatchObject([{ reason: "operator-intervention", origin: "task-archive" }]);
+  });
+
+  it("records generated-feature deletion as a durable root stop and resumes only explicitly", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Operator stop" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const root = await m.addFeature(slice.id, { title: "F" });
+    await m.transitionLoopState(root.id, "implementing");
+    const run = await m.startValidatorRun(root.id, "scheduled");
+    await m.completeValidatorRun(run.id, "failed", "repair");
+    const fix = await m.createGeneratedFixFeature(root.id, run.id, [], "repair");
+    await m.deleteFeature(fix.id);
+    expect(await m.getFeature(root.id)).toMatchObject({ loopState: "blocked", implementationStopReason: "operator-intervention", implementationAttemptCount: 1 });
+    const stops = await h.layer().db.select().from(schema.project.missionLineageStops)
+      .where(sql`${schema.project.missionLineageStops.rootFeatureId} = ${root.id}`);
+    expect(stops).toHaveLength(1);
+    await m.updateMission(mission.id, { status: "blocked" });
+    await expect(m.resumeMission(mission.id)).resolves.toMatchObject({ status: "active" });
+    expect(await m.getFeature(root.id)).toMatchObject({ loopState: "needs_fix", implementationAttemptCount: 1, implementationStopReason: undefined });
+  });
+
+  it("allows startup recovery to move an interrupted validation back to implementing", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Interrupted validation" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Feature" });
+
+    await m.transitionLoopState(feature.id, "implementing");
+    const interruptedRun = await m.startValidatorRun(feature.id, "scheduled");
+    expect((await m.getFeature(feature.id))?.loopState).toBe("validating");
+
+    await expect(m.transitionLoopState(feature.id, "implementing")).resolves.toMatchObject({
+      id: feature.id,
+      loopState: "implementing",
+      lastValidatorStatus: "error",
+    });
+    await expect(m.getValidatorRun(interruptedRun.id)).resolves.toMatchObject({
+      status: "error",
+      summary: "Interrupted validation was superseded by loop-state recovery",
+    });
+    expect((await m.listStaleRunningValidatorRuns(-1)).map((run) => run.id)).not.toContain(interruptedRun.id);
+  });
+
+  it("rejects an unknown persisted loop state with the normal transition error", async () => {
+    const m = missions();
+    const mission = await m.createMission({ title: "Legacy state" });
+    const milestone = await m.addMilestone(mission.id, { title: "MS" });
+    const slice = await m.addSlice(milestone.id, { title: "SL" });
+    const feature = await m.addFeature(slice.id, { title: "Feature" });
+    await h.layer().db
+      .update(schema.project.missionFeatures)
+      .set({ loopState: "legacy_state" as never })
+      .where(sql`${schema.project.missionFeatures.id} = ${feature.id}`);
+
+    await expect(m.transitionLoopState(feature.id, "implementing")).rejects.toThrow(
+      "Invalid loop state transition from 'legacy_state' to 'implementing'. Allowed transitions from 'legacy_state': none",
+    );
   });
 
   it("allows exactly one terminal validator transition when completion races the stale reaper", async () => {

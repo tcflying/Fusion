@@ -335,6 +335,7 @@ const defaultSessionState = {
   tabs: [defaultTab],
   activeTab: defaultTab,
   isReady: true,
+  autoCreateDisabled: false,
   bootstrapError: null,
   createTab: vi.fn(),
   closeTab: vi.fn(),
@@ -1218,6 +1219,156 @@ describe("TerminalModal", () => {
     });
   });
 
+  it("keeps a keyboard-shrunken touch tablet floating, movable, and resizable", async () => {
+    const projectId = "touch-tablet-terminal-geometry";
+    const previousInnerWidth = window.innerWidth;
+    const previousInnerHeight = window.innerHeight;
+    const previousScreen = Object.getOwnPropertyDescriptor(window, "screen");
+    const previousMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    const previousVisualViewport = window.visualViewport;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1200 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 900 });
+    Object.defineProperty(window, "screen", { configurable: true, value: { width: 1024, height: 768 } });
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    Object.defineProperty(window, "visualViewport", {
+      configurable: true,
+      value: { width: 900, height: 400, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+    });
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: query === "(max-height: 480px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    window.localStorage.setItem(`fusion:terminal-display-mode-${projectId}`, "floating");
+
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} projectId={projectId} />);
+      const modal = await screen.findByTestId("terminal-modal");
+      await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+      expect(modal).toHaveClass("terminal-modal--floating");
+      expect(screen.getByTestId("terminal-floating-resize-se")).toHaveAttribute("aria-label", "Resize terminal window");
+
+      const fitCallBaseline = mockFitAddonFit.mock.calls.length;
+      const resizeHandle = screen.getByTestId("terminal-floating-resize-se") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      resizeHandle.setPointerCapture = vi.fn();
+      resizeHandle.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(resizeHandle, { pointerId: 41, pointerType: "touch", clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(resizeHandle, { pointerId: 99, pointerType: "touch", clientX: 300, clientY: 300 });
+      fireEvent.pointerMove(resizeHandle, { pointerId: 41, pointerType: "touch", clientX: 180, clientY: 170 });
+      fireEvent.pointerUp(resizeHandle, { pointerId: 41, pointerType: "touch" });
+
+      await waitFor(() => {
+        expect(window.localStorage.getItem(`fusion:terminal-modal-size-${projectId}`)).toBe(JSON.stringify({ width: 1040, height: 630 }));
+        expect(mockFitAddonFit.mock.calls.length).toBeGreaterThan(fitCallBaseline);
+      });
+
+      const header = modal.querySelector(".terminal-header") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      header.setPointerCapture = vi.fn();
+      header.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(header, { pointerId: 42, pointerType: "touch", clientX: 300, clientY: 100 });
+      fireEvent.pointerMove(header, { pointerId: 42, pointerType: "touch", clientX: 200, clientY: 140 });
+      fireEvent.pointerUp(header, { pointerId: 42, pointerType: "touch" });
+
+      await waitFor(() => {
+        expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-pos-${projectId}`) ?? "{}")).toEqual({ x: 44, y: 56 });
+      });
+
+      fireEvent.pointerDown(header, { pointerId: 43, pointerType: "touch", clientX: 200, clientY: 140 });
+      fireEvent.pointerMove(header, { pointerId: 43, pointerType: "touch", clientX: 100, clientY: 140 });
+      fireEvent.pointerCancel(header, { pointerId: 43, pointerType: "touch" });
+      expect(JSON.parse(window.localStorage.getItem(`fusion:terminal-float-pos-${projectId}`) ?? "{}")).toEqual({ x: 16, y: 56 });
+      expect(header.releasePointerCapture).toHaveBeenCalledWith(43);
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: previousInnerWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousInnerHeight });
+      if (previousScreen) Object.defineProperty(window, "screen", previousScreen);
+      if (previousMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", previousMaxTouchPoints);
+      Object.defineProperty(window, "visualViewport", { configurable: true, value: previousVisualViewport });
+    }
+  });
+
+  it("keeps a touch tablet at the 768px boundary floating, movable, and resizable", async () => {
+    const projectId = "tablet-boundary-terminal-geometry";
+    const previousInnerWidth = window.innerWidth;
+    const previousInnerHeight = window.innerHeight;
+    const previousScreen = Object.getOwnPropertyDescriptor(window, "screen");
+    const previousMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 768 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 1024 });
+    Object.defineProperty(window, "screen", { configurable: true, value: { width: 768, height: 1024 } });
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      matches: query === "(max-width: 768px)",
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    window.localStorage.setItem(`fusion:terminal-display-mode-${projectId}`, "floating");
+    const styleEl = document.createElement("style");
+    styleEl.textContent = loadAllAppCss();
+    document.head.appendChild(styleEl);
+
+    try {
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} projectId={projectId} />);
+      const modal = await screen.findByTestId("terminal-modal");
+      await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+      expect(modal).toHaveClass("terminal-modal--tablet", "terminal-modal--floating");
+      // The 768px CSS fallback is full-screen only for true phones. A known
+      // tablet must win that cascade with its stored floating geometry.
+      const modalStyle = getComputedStyle(modal);
+      expect(modalStyle.width).toBe("var(--terminal-float-width)");
+      expect(modalStyle.height).toBe("var(--terminal-float-height)");
+      expect(modalStyle.maxWidth).toBe("calc(100vw - (var(--space-lg) * 2))");
+
+      const resizeHandle = screen.getByTestId("terminal-floating-resize-se") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      resizeHandle.setPointerCapture = vi.fn();
+      resizeHandle.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(resizeHandle, { pointerId: 51, pointerType: "touch", clientX: 200, clientY: 200 });
+      fireEvent.pointerMove(resizeHandle, { pointerId: 51, pointerType: "touch", clientX: 120, clientY: 180 });
+      fireEvent.pointerUp(resizeHandle, { pointerId: 51, pointerType: "touch" });
+      await waitFor(() => {
+        expect(window.localStorage.getItem(`fusion:terminal-modal-size-${projectId}`)).toBe(JSON.stringify({ width: 656, height: 540 }));
+      });
+
+      const header = modal.querySelector(".terminal-header") as HTMLElement & {
+        setPointerCapture: (pointerId: number) => void;
+        releasePointerCapture: (pointerId: number) => void;
+      };
+      header.setPointerCapture = vi.fn();
+      header.releasePointerCapture = vi.fn();
+      fireEvent.pointerDown(header, { pointerId: 52, pointerType: "touch", clientX: 100, clientY: 100 });
+      fireEvent.pointerMove(header, { pointerId: 52, pointerType: "touch", clientX: 180, clientY: 140 });
+      fireEvent.pointerUp(header, { pointerId: 52, pointerType: "touch" });
+      await waitFor(() => {
+        expect(window.localStorage.getItem(`fusion:terminal-float-pos-${projectId}`)).toBe(JSON.stringify({ x: 96, y: 56 }));
+      });
+    } finally {
+      styleEl.remove();
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: previousInnerWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: previousInnerHeight });
+      if (previousScreen) Object.defineProperty(window, "screen", previousScreen);
+      if (previousMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", previousMaxTouchPoints);
+    }
+  });
+
   it("keeps the floating terminal touch-draggable with theme-controlled shadow", () => {
     const panelRule = terminalModalCss.match(/\.modal\.terminal-modal\.terminal-modal--floating\s*\{([^}]*)\}/)?.[1] ?? "";
     const headerRule = terminalModalCss.match(/\.terminal-header--draggable\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -1264,6 +1415,116 @@ describe("TerminalModal", () => {
     await waitFor(() => {
       expect(screen.getByTestId("terminal-loading")).toBeTruthy();
     });
+  });
+
+  /*
+  FNXC:Terminal 2026-07-23-14:30:
+  GitHub #2121/#2307: Windows browser clients never auto-create the first tab,
+  so an indefinite "Starting terminal..." spinner is a dead end. The modal must
+  render an explicit start action instead.
+  */
+  it("shows a Start terminal action instead of the endless spinner when auto-create is disabled", async () => {
+    const createTab = vi.fn().mockResolvedValue(defaultTab);
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      autoCreateDisabled: true,
+      createTab,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-manual-start")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("terminal-loading")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("terminal-manual-start-btn"));
+    expect(createTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a manual-start failure and re-enables the button instead of silently no-oping", async () => {
+    const createTab = vi.fn().mockRejectedValue(new Error("spawn failed"));
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      autoCreateDisabled: true,
+      createTab,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-manual-start")).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByTestId("terminal-manual-start-btn"));
+
+    // The Windows bootstrap-failure cohort is exactly where creates fail — a
+    // rejected createTab must render the existing terminal-error banner, not
+    // leave a button that silently does nothing.
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-error").textContent).toContain("spawn failed");
+    });
+    const button = screen.getByTestId("terminal-manual-start-btn") as HTMLButtonElement;
+    await waitFor(() => {
+      expect(button.disabled).toBe(false);
+    });
+  });
+
+  it("ignores rapid Start-terminal clicks while a create is already in flight", async () => {
+    let resolveCreate: (tab: typeof defaultTab) => void = () => {};
+    const createTab = vi.fn().mockImplementation(
+      () => new Promise((resolve) => {
+        resolveCreate = resolve;
+      }),
+    );
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      tabs: [],
+      activeTab: null,
+      autoCreateDisabled: true,
+      createTab,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-manual-start")).toBeTruthy();
+    });
+
+    const button = screen.getByTestId("terminal-manual-start-btn") as HTMLButtonElement;
+    fireEvent.click(button);
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    // One PTY session per user intent: while the first create is pending the
+    // button is disabled and the handler short-circuits.
+    expect(createTab).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(button.disabled).toBe(true);
+    });
+
+    await act(async () => {
+      resolveCreate(defaultTab);
+      await Promise.resolve();
+    });
+  });
+
+  it("keeps the normal xterm surface when auto-create is disabled but a tab already exists", async () => {
+    mockUseTerminalSessions.mockReturnValue({
+      ...defaultSessionState,
+      autoCreateDisabled: true,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("terminal-container")).toBeTruthy();
+    });
+    expect(screen.queryByTestId("terminal-manual-start")).toBeNull();
   });
 
   it("shows error with retry and refresh buttons when bootstrap fails instead of stuck loading", async () => {
@@ -5008,6 +5269,7 @@ describe("TerminalModal — FN-1234 mobile tab switch with keyboard", () => {
     write: vi.fn(),
     clear: vi.fn(),
     focus: vi.fn(),
+    refresh: vi.fn(),
     options: { fontSize: 14 },
     cols,
     rows,
@@ -7468,19 +7730,99 @@ describe("TerminalModal — xterm focus initialization (FN-1602)", () => {
         expect(terminalDataHandler).not.toBeNull();
       });
 
-      const handled = terminalKeyEventHandler?.(
-        new KeyboardEvent("keydown", { key: "v", ...modifier }),
-      );
+      const pasteEvent = new KeyboardEvent("keydown", { key: "v", ...modifier, cancelable: true });
+      const handled = terminalKeyEventHandler?.(pasteEvent);
 
       expect(handled).toBe(false);
+      // Returning false only skips xterm's key handling; without preventDefault
+      // the browser's own paste fires xterm's helper-textarea paste listener
+      // and the payload reaches the PTY twice.
+      expect(pasteEvent.defaultPrevented).toBe(true);
       await waitFor(() => expect(readText).toHaveBeenCalledTimes(1));
-      expect(mockSendInput).toHaveBeenCalledTimes(1);
-      expect(mockSendInput).toHaveBeenCalledWith("npm test\n");
+      // Delivery must go through terminal.paste() (bracketed-paste wrapping,
+      // \n -> \r normalization), which feeds onData -> sendInput in real xterm —
+      // never through a raw sendInput that bypasses paste semantics.
+      await waitFor(() => expect(mockTerminalInstance.paste).toHaveBeenCalledTimes(1));
+      expect(mockTerminalInstance.paste).toHaveBeenCalledWith("npm test\n");
+      expect(mockSendInput).not.toHaveBeenCalled();
     },
   );
 
   it.each([
-    ["missing clipboard", undefined],
+    ["missing clipboard API", undefined],
+    ["clipboard without readText (Firefox / non-HTTPS)", { writeText: vi.fn() }],
+  ] as const)(
+    "falls back to xterm's native paste path for %s instead of swallowing the shortcut",
+    async (_label, clipboard) => {
+      Object.defineProperty(navigator, "platform", {
+        value: "Win32",
+        configurable: true,
+      });
+      Object.defineProperty(navigator, "clipboard", {
+        value: clipboard,
+        configurable: true,
+      });
+
+      render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+      await waitFor(() => {
+        expect(terminalKeyEventHandler).not.toBeNull();
+      });
+
+      const pasteEvent = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
+      const handled = terminalKeyEventHandler?.(pasteEvent);
+
+      // Without an async clipboard read the browser's native paste into
+      // xterm's helper textarea is the ONLY working paste path. The handler
+      // must return false WITHOUT preventDefault: false skips xterm's key
+      // handling (whose non-mac Ctrl+V path would inject \x16 into the PTY
+      // and cancel the browser paste), while the un-prevented default paste
+      // fires xterm's helper-textarea paste listener exactly once.
+      expect(handled).toBe(false);
+      expect(pasteEvent.defaultPrevented).toBe(false);
+      expect(mockSendInput).not.toHaveBeenCalled();
+      expect(mockTerminalInstance.paste).not.toHaveBeenCalled();
+    },
+  );
+
+  it("routes Ctrl+V through the native paste path after a clipboard permission denial (sticky)", async () => {
+    const readText = vi.fn().mockRejectedValue(new DOMException("denied"));
+    Object.defineProperty(navigator, "platform", {
+      value: "Win32",
+      configurable: true,
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      value: { readText },
+      configurable: true,
+    });
+
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+
+    await waitFor(() => {
+      expect(terminalKeyEventHandler).not.toBeNull();
+    });
+
+    // First Ctrl+V: custom path preventDefaults, read rejects (denied) — this
+    // one paste is lost, and the denial must be remembered.
+    const firstPaste = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
+    expect(terminalKeyEventHandler?.(firstPaste)).toBe(false);
+    expect(firstPaste.defaultPrevented).toBe(true);
+    await waitFor(() => expect(readText).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Second Ctrl+V: the sticky denial marker must route through the native
+    // helper-textarea paste (no preventDefault, no further readText attempts)
+    // instead of preventDefaulting into a read that will reject again —
+    // otherwise permission-denied users have zero working paste path.
+    const secondPaste = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
+    expect(terminalKeyEventHandler?.(secondPaste)).toBe(false);
+    expect(secondPaste.defaultPrevented).toBe(false);
+    expect(readText).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
     ["rejected clipboard", { readText: vi.fn().mockRejectedValue(new DOMException("denied")) }],
     ["empty clipboard", { readText: vi.fn().mockResolvedValue("") }],
   ] as const)("fails safely for %s physical paste while preserving xterm input", async (_label, clipboard) => {
@@ -9172,5 +9514,51 @@ describe("TerminalModal — FN-7620 mobile blank render (zero-geometry xterm con
       expect(mockTerminalInstance.cols).toBe(Math.max(2, Math.floor(640 / CHAR_WIDTH_PX)));
       expect(mockTerminalInstance.rows).toBe(Math.max(1, Math.floor(400 / CHAR_HEIGHT_PX)));
     });
+  });
+
+  /*
+  FNXC:Terminal 2026-07-23-21:05:
+  Blank-until-keypress recurrence: on some systems the renderer stalls during init while the shell
+  prompt sits in xterm's buffer, and the container's box never CHANGES — so fit() computes the same
+  cols/rows and xterm's internal resize-driven repaint never fires. The observer-driven fit path must
+  therefore ALWAYS follow fit with an explicit full-viewport `refresh(0, rows-1)`; before this fix the
+  only paths that repainted were user input (new PTY output), a manual font-size change (refitTerminal's
+  refresh), or opening a new tab (fresh renderer).
+  */
+  it("repaints (terminal.refresh) on a container notification even when fit() leaves dimensions UNCHANGED (blank-until-keypress stall)", async () => {
+    render(<TerminalModal isOpen={true} onClose={mockOnClose} />);
+    await waitFor(() => expect(mockTerminalInstance.open).toHaveBeenCalled());
+
+    const container = screen.getByTestId("terminal-xterm");
+    overrideContainerBox(container, { width: 640, height: 400 });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await Promise.resolve();
+    });
+
+    // Settle geometry once via the container observer.
+    const settledCols = Math.max(2, Math.floor(640 / CHAR_WIDTH_PX));
+    const settledRows = Math.max(1, Math.floor(400 / CHAR_HEIGHT_PX));
+    expect(fireResizeObserverFor("terminal-xterm")).toBe(true);
+    await waitFor(() => {
+      expect(mockTerminalInstance.cols).toBe(settledCols);
+      expect(mockTerminalInstance.rows).toBe(settledRows);
+    });
+
+    // The stalled-renderer scenario: buffer has content, nothing painted, and
+    // a later ResizeObserver notification arrives with the SAME box. fit()
+    // recomputes identical cols/rows — the repair must come from an explicit
+    // refresh, not from a resize side effect.
+    mockTerminalInstance.refresh.mockClear();
+    expect(fireResizeObserverFor("terminal-xterm")).toBe(true);
+
+    await waitFor(() => {
+      expect(mockTerminalInstance.refresh).toHaveBeenCalledWith(0, settledRows - 1);
+    });
+    // Dimensions genuinely unchanged — proving the refresh was not a
+    // consequence of a resize.
+    expect(mockTerminalInstance.cols).toBe(settledCols);
+    expect(mockTerminalInstance.rows).toBe(settledRows);
   });
 });

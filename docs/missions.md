@@ -23,6 +23,14 @@ Mission: Improve Reliability
         Task: FN-214
 ```
 
+## Agent task-creation admission
+
+Mission lineage is an admission requirement only for **autonomous no-task heartbeat** creates and delegations. Those idle patrol calls must supply a valid active Mission → Milestone → Slice → Feature chain; an allow rule for `task_agent_mutation` cannot bypass this requirement. Missing or invalid lineage is rejected before a task is persisted with an explicit mission-lineage remedy.
+
+Interactive/user-supervised, task-scoped heartbeat, executor, triage, and workflow-step calls may create or delegate freeform tasks without lineage. They remain governed by the normal `task_agent_mutation` permission policy, including category and exact-tool allow, approval, and block rules.
+
+A valid active lineage may name a hand-authored `defined` feature only for its first task. Fusion atomically claims the feature, links that exact task, and promotes the feature to `triaged`; an already-linked feature rejects rather than overwriting its canonical task. This bootstrap exception does not make `defined` executable: later scheduler and symbol-lock admission still uses the stricter contract below.
+
 ## Canonical lineage approval for autonomous symbol locks
 
 Before autonomous scheduler work may acquire a symbol lock, it resolves the task's Mission → Milestone → Slice → Feature lineage and evaluates the single `@fusion/core` contract: `evaluateMissionLineageApproval`. Resolution and lock acquisition remain scheduler responsibilities; downstream schedulers must not redefine the approval rule.
@@ -32,7 +40,7 @@ Approval requires every one of these statuses:
 - Mission: `active`
 - Milestone: `active`
 - Slice: `active`
-- Feature: `triaged` or `in-progress`
+- Feature: `triaged` or `in-progress` (never `defined`; defined is only allowed at the first-task bootstrap boundary)
 
 When the scheduler passes `planApprovalRequired: true`, the linked task must also have an `approvedPlanFingerprint` that is a non-empty string after trimming whitespace. The predicate does not recompute the fingerprint; `plan-approval.ts` owns its generation and validation. When plan approval is not required, the fingerprint is ignored.
 
@@ -342,6 +350,8 @@ Typical flow:
 
 If validation cannot run (unexpected loop state, duplicate trigger, blocked validation, or validator error), Fusion logs a mission `warning`/`error` event with structured metadata so the stuck state is visible in mission events.
 
+Mission `status` and `autopilotEnabled` transitions are atomically written with a mission activity event. The event records stable actor type/id, optional display name, source, and before/after values; unchanged values create no transition event. Dashboard controls identify an operator, tools identify an agent when they expose a sensitive mutation, and autonomous engine paths identify the system/autopilot.
+
 ## `autopilotEnabled` vs `autoAdvance`
 
 - **`autopilotEnabled`**: primary control for autopilot behavior — enables background monitoring, orchestration, and automatic slice activation when a slice completes. Also triggers auto-planning (converting features to tasks) when a slice is activated.
@@ -386,21 +396,26 @@ Use this endpoint when a feature's delivery task has already shipped and is now 
 **Safety gate behavior:**
 
 - Validates `featureId` and requires a non-empty string `taskId`.
-- Looks up the feature and the delivery task in the request's scoped project store.
-- Only allows reconciliation when the delivery task column is `done` or `archived`.
-- If feature has no `taskId`, the endpoint links it first, then marks feature status `done` via `updateFeatureStatus` (which recomputes slice status).
-- If feature already has a different `taskId`, returns `409` (conflict).
+- Resolves the feature and terminal delivery evidence in the request's scoped PostgreSQL project.
+- Accepts either a live, non-deleted task in `done`, or a supported archived task represented by both its retained soft-deleted `column=archived` project-task tombstone and its project-scoped cold archive snapshot. A deletion without both archive representations is not delivery evidence.
+- Atomically validates conflicts, writes the canonical feature→task link, marks the feature `done`, updates the live task's reverse mission/slice link when applicable, and recomputes slice/milestone rollups. Any validation or write failure rolls back the complete operation.
+- Archived evidence remains archived and read-only: reconciliation intentionally leaves its retained task tombstone without a writable reverse backlink rather than resurrecting the task.
+- Repeating the same terminal task against the same completed feature is idempotent. A feature linked to another task, or a task linked to another feature, returns `409` without mutation.
+- The repair path never enters ordinary triage/implementation state, changes loop attempts, creates or moves a task, activates/watches the mission, or changes mission `status`, `autopilotEnabled`, or `autoAdvance`.
+
+<!-- FNXC:MissionReconciliation 2026-07-20-08:34: Operators need a supported atomic terminal-evidence repair because unarchive/move workarounds enter ordinary task lifecycle observers and can wake a parked mission or generate duplicate work. -->
+**Safe duplicate cleanup:** preserve the first `409`; verify through supported APIs that the current linked task is generated duplicate work with no unique delivery or lineage value; call `POST /api/missions/features/:featureId/unlink-task`; archive only the proven duplicate through the supported task archive API; then call `reconcile-done` with the canonical terminal task. Never overwrite a mismatched link, unarchive/move canonical delivery evidence, or use direct storage edits. If the duplicate is ambiguous, leave it untouched and escalate for evidence.
 
 **How this differs from `PATCH /api/missions/features/:featureId`:**
 
 - `PATCH` keeps the execution-status guard and rejects `done`/`triaged`/`in-progress`/`blocked` when no linked task exists.
-- `reconcile-done` is a dedicated, evidence-gated path for shipped work where the delivery task is already terminal.
+- `reconcile-done` is a dedicated, evidence-gated transaction for already-shipped work. It is not a shortcut for active work or mission execution.
 
 **Error responses:**
 
 - `400` — invalid feature ID format or missing/empty `taskId`.
-- `404` — feature not found or delivery task not found.
-- `409` — feature/task mismatch or delivery task is not in `done`/`archived` (use normal PATCH/triage/link flow for active work).
+- `404` — feature not found or no task/archive evidence exists for the supplied task ID.
+- `409` — feature/task mismatch, task already linked to another feature, nonterminal task, or a deleted/archived task lacking the supported retained tombstone plus cold snapshot. Every `409` leaves feature, task, rollups, and mission controls unchanged.
 
 ## Validation Contract Lifecycle
 
@@ -433,6 +448,8 @@ interface MissionContractAssertion {
   id: string;              // e.g., "CA-A3B7CD-E9F2"
   milestoneId: string;     // Parent milestone
   sourceFeatureId?: string;// Store-managed feature assertion owner
+  scope: "feature" | "milestone";
+  origin: "authored" | "imported" | "derived_milestone_acceptance";
   title: string;           // Human-readable title
   assertion: string;       // Behavioral plan
   status: AssertionStatus; // pending | passed | failed | blocked
@@ -471,7 +488,9 @@ interface MilestoneValidationRollup {
 
 #### Completion Gate Contract
 
-Canonical authored feature criteria live on `MissionFeature.acceptanceCriteria`, but mission autopilot enforcement runs through each feature's **linked contract assertions** (store-managed per-feature assertion plus any additive linked milestone assertions). `milestone.acceptanceCriteria` remains authored milestone pass-bar text for humans, while validator gating/advance decisions follow assertion linkage and outcomes; see [Mission Completion Gate Contract](./missions-completion-contract.md) for the authoritative enforced-vs-informational surface map and zero-assertion behavior.
+Canonical authored feature criteria live on `MissionFeature.acceptanceCriteria`, and each feature validator derives its verdict only from its **linked feature-scoped assertions**. Model summary prose, milestone prose, and behavioral results that are not mapped to a linked behavioral assertion cannot override that verdict.
+
+Milestone prose is synchronized to one canonical milestone-scoped assertion with `origin: "derived_milestone_acceptance"`. PostgreSQL restricts uniqueness to that derived origin per project/milestone; authored, imported, and migrated legacy milestone assertions stay independent, are never inferred from title/text, and require no feature links. The rollup evaluates all milestone-scoped assertions after feature coverage and feature assertion passes are ready; unmet parent criteria therefore block milestone completion without failing an already-passing feature. See [Mission Completion Gate Contract](./missions-completion-contract.md).
 
 ### Phase 3: Feature Execution Loop
 
@@ -552,7 +571,11 @@ interface MissionValidatorRun {
 
 ### Phase 5: Fix-Feature Retries
 
-When validation fails, `MissionStore.createGeneratedFixFeature()` creates a fix feature with lineage tracking:
+Validation always records failed runs and diagnostics. Remediation is separately opt-in: Fusion creates and auto-triages a Fix Feature only when `autopilotEnabled === true || autoAdvance === true`. With both flags false or unset, validation is **report-only**: the failed validator run and `validation_failed`/`validation_report_only` mission events remain visible, but Fusion does not mint a Fix Feature, create or plan a task, triage work, or dispatch remediation. This same predicate applies to completion, startup recovery, and periodic recovery, so a restart cannot bypass supervised mode.
+
+`autoAdvance` remains the legacy compatible opt-in. New missions should prefer `autopilotEnabled`.
+
+When the opt-in is enabled and validation fails, `MissionStore.createGeneratedFixFeature()` creates a fix feature with lineage tracking:
 
 ```typescript
 interface MissionFixFeatureLineage {
@@ -563,9 +586,9 @@ interface MissionFixFeatureLineage {
 }
 ```
 
-The fix feature is **auto-planned** (converted to tasks) for immediate execution. Each fix increments `implementationAttemptCount`.
+The fix feature is **auto-planned** (converted to tasks) for immediate execution. Each fix increments the **canonical root feature's** `implementationAttemptCount`; generated fixes never receive a fresh budget. With the default retry budget of 3 (`DEFAULT_IMPLEMENTATION_RETRY_BUDGET`), requests 1–3 mint one remediation each and request 4 mints nothing, records `budget-exhausted`, and blocks the root.
 
-**Default retry budget:** 3 (`DEFAULT_IMPLEMENTATION_RETRY_BUDGET`). When `implementationAttemptCount >= maxRetryBudget`, the feature transitions to `blocked`.
+Missing, cyclic, or legacy blocked lineage fails closed. A pre-migration blocked root without an explicit stop reason cannot mint remediation and cannot be implicitly resumed.
 
 ### Phase 6: Blocked Handoff
 
@@ -578,6 +601,8 @@ A feature transitions to `blocked` when:
 - Autopilot stops advancing the slice containing the blocked feature
 - `MilestoneValidationRollup.state` reflects `blocked` assertions
 - The feature remains in `blocked` state until operator intervention
+- Deleting a generated fix, or archiving/deleting its generated task, records a durable root-scoped `operator-intervention` stop in the same transaction as unlink/removal. Recovery, duplicate delivery, unarchive, task/root recreation, and relinking cannot mint a sibling. The stop remains even if a hierarchy cascade removes root and lineage rows.
+- `POST /api/missions/:missionId/resume` is the sole resume seam. It atomically clears only operator-intervention stops, preserves attempt counts, moves extant roots to `needs_fix`, and activates the mission. If any root is budget-exhausted or legacy-unknown, it returns a typed `MISSION_RESUME_CONFLICT` with canonical root IDs/reason categories and changes no root, tombstone, counter, or mission state.
 
 On engine restart, `recoverActiveMissions()` re-enqueues features in `validating` or `needs_fix` states, ensuring no validation work is lost. It also re-triggers `implementing` features whose linked task is already `done`/`archived` and whose assertion validation has not passed yet. When the stale-run reaper has already converted an abandoned validator run into `needs_fix`, `processTaskOutcome()` promotes the feature back through `implementing` and re-validates instead of skipping it. The same recovery path is replayed during periodic self-heal maintenance, so historically stranded `implementing` features can self-heal without requiring an engine restart.
 
@@ -652,6 +677,23 @@ interface MissionAssertionFailureRecord {
 
 **Full state snapshots:** `MissionFeatureLoopSnapshot` captures complete loop state including all validator runs and lineage chains for post-mortem analysis.
 
+### Validation failure diagnostics
+
+A `validation_failed` Mission activity event includes `metadata.validationDiagnostics`, the typed source of truth for failure reporting. It contains the validator `runId`, `sourceFeatureId`, overall outcome, next action, and ordered per-assertion verdicts with expected, observed, message, and evidence references. The visible event text is derived from this object—not an AI summary—so a failed event always names failed assertion IDs and labels any separately blocked assertion IDs as blocked (never as failed).
+
+Evidence is secret-redacted before persistence. Each assertion retains at most 16 evidence entries and every message, expected, observed, and evidence text field is capped at 4,096 UTF-8 bytes. Bounded fields carry `truncated: true`, excess evidence is reported as `omittedEvidenceCount`, project paths become project-relative, and external or disposable absolute paths become `[external path omitted]`.
+
+Generated fix features and their triaged tasks include the same **Validation cause** section with source feature, validator run, failed assertion IDs, bounded observations, and evidence. SQLite `MissionStore` and PostgreSQL `AsyncMissionStore` use the shared renderer, so a retry does not produce backend-specific causes or duplicate sections. A fix that is already linked to a canonical task is an idempotent race; otherwise Mission activity tells the operator to inspect and retry triage rather than exposing internal exception/loop-state prose.
+
+The loop state is internal scheduling context, not an operator diagnosis. Its public meanings and actions are:
+
+| Public state | Meaning | Operator action |
+|---|---|---|
+| validating | A validator run is evaluating the landed implementation. | Inspect the run only if it remains active beyond the stale-run window. |
+| needs_fix | A validator found a remediable assertion failure. | Review the event’s Validation diagnostics and triage the generated Fix feature/task. |
+| blocked | Validation could not obtain sufficient proof, or retry budget is exhausted. | Resolve the stated external constraint or root cause, then retry/triage the feature. |
+| implementing | A task is carrying out the feature or its generated remediation. | Follow the linked task; duplicate validator triggers with a canonical task are ignored. |
+
 ### Operator Troubleshooting
 
 | Symptom | Diagnosis | Resolution |
@@ -700,4 +742,4 @@ A completed cited research finding may become a normal Mission Feature. Its feat
 
 ### Autonomous mission admission
 
-Heartbeat agents may create or delegate implementation work only with an approved Feature → Slice → Milestone → Mission lineage. The created task stores that lineage as task metadata; it does not replace the canonical feature `taskId` link. Missing or invalid lineage is rejected before a task is persisted. Roadmap reconciliation marks done tasks done, returns cancelled/requeued tasks to triaged, keeps failed work non-complete, and treats archives as non-promoting no-ops.
+Autonomous no-task heartbeat agents may create or delegate implementation work only with an approved Feature → Slice → Milestone → Mission lineage. Interactive and task-scoped calls remain governed by `task_agent_mutation` policy as described in [Agent task-creation admission](#agent-task-creation-admission). The created task stores that lineage as task metadata; it does not replace the canonical feature `taskId` link except at the documented `defined`-feature first-task bootstrap. Missing or invalid autonomous lineage is rejected before a task is persisted. Roadmap reconciliation marks done tasks done, returns cancelled/requeued tasks to triaged, keeps failed work non-complete, and treats archives as non-promoting no-ops.

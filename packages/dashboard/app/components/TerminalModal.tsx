@@ -34,6 +34,7 @@ import {
 import { useTerminal } from "../hooks/useTerminal";
 import { useTerminalSessions } from "../hooks/useTerminalSessions";
 import { useWorkspaces } from "../hooks/useWorkspaces";
+import { getViewportMode, isMobileViewport } from "../hooks/useViewportMode";
 import { nextFloatingZ, currentFloatingZ } from "./floatingWindowStack";
 import { getPathBasename } from "../utils/pathDisplay";
 import {
@@ -336,16 +337,6 @@ function getTerminalViewportWidth(hasTouchScreen = false): number {
   return layoutWidth;
 }
 
-function getTerminalViewportHeight(hasTouchScreen = false): number {
-  if (typeof window === "undefined") return Number.POSITIVE_INFINITY;
-  const layoutHeight = window.innerHeight;
-  const visualHeight = window.visualViewport?.height;
-  if (hasTouchScreen && typeof visualHeight === "number" && visualHeight > 0) {
-    return Math.min(layoutHeight, visualHeight);
-  }
-  return layoutHeight;
-}
-
 /** Whether the current device is likely mobile (touch-primary, small viewport). */
 function isMobileDevice(): boolean {
   if (typeof window === "undefined") return false;
@@ -356,13 +347,15 @@ function isMobileDevice(): boolean {
 }
 
 function isTerminalMobileViewport(): boolean {
-  if (typeof window === "undefined") return false;
-  const hasTouchScreen = "ontouchstart" in window || navigator.maxTouchPoints > 0;
   /*
-  FNXC:Terminal 2026-07-01-11:46:
-  Android foldables can expose a tablet-sized layout viewport while the current visualViewport is the folded phone pane. Treat touch-primary visualViewport width as the terminal mobile breakpoint so the first xterm fit uses the fullscreen/mobile shell and keyboard vars before any unfold/orientation event can repair stale desktop geometry.
+  FNXC:TerminalModalControls 2026-07-24-12:30:
+  The global terminal must use the canonical viewport contract rather than a terminal-local
+  visual-height shortcut. A software keyboard can shrink a tablet below the phone landscape
+  height without changing its physical screen, so it must retain docked/floating move and resize
+  controls. Canonical detection still makes true narrow phones, short phone landscapes, and folded
+  touch panes full-screen while preserving stored tablet/desktop geometry through transitions.
   */
-  return window.innerWidth <= 768 || (hasTouchScreen && (getTerminalViewportWidth(true) <= 768 || getTerminalViewportHeight(true) <= 480));
+  return isMobileViewport();
 }
 
 interface TabsOverflowMeasurement {
@@ -551,6 +544,8 @@ interface TerminalModalProps {
 export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandGeneration = 0, projectId, embedded = false, defaultCwd, scopeId, footerVisible = false }: TerminalModalProps) {
   const { t } = useTranslation("app");
   const [error, setError] = useState<string | null>(null);
+  // FNXC:Terminal 2026-07-23-20:10: In-flight guard for the manual "Start terminal" action (GitHub #2121/#2307 review): rapid clicks must not create duplicate PTY sessions, and the Windows bootstrap-failure cohort this button serves must SEE createTab failures instead of a silently dead button.
+  const [isStartingTerminal, setIsStartingTerminal] = useState(false);
   const [exitCode, setExitCode] = useState<number | null>(null);
   const [xtermReady, setXtermReady] = useState(false);
   const [xtermInitError, setXtermInitError] = useState<string | null>(null);
@@ -584,6 +579,7 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
   const [floatingSize, setFloatingSize] = useState<TerminalFloatSize>(() => readTerminalFloatSize(projectId));
   const [floatingPosition, setFloatingPosition] = useState<TerminalFloatPosition>(() => readTerminalFloatPosition(readTerminalFloatSize(projectId), projectId));
   const [isMobileTerminal, setIsMobileTerminal] = useState(() => isTerminalMobileViewport());
+  const [isTabletTerminal, setIsTabletTerminal] = useState(() => getViewportMode() === "tablet");
   const [tabsOverflow, setTabsOverflow] = useState(false);
   /*
   FNXC:Terminal 2026-07-10-00:00:
@@ -619,6 +615,8 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
   // (which under StrictMode/Vite Fast Refresh could leak a stale listener
   // on the same xterm instance and cause per-character input doubling).
   const sendInputRef = useRef<(data: string) => void>(() => {});
+  // FNXC:Terminal 2026-07-23-20:10: Sticky marker set when navigator.clipboard.readText rejects (permission denied). Once set, Ctrl/Cmd+V routes through the browser's native paste into xterm's helper textarea instead of retrying a read that will keep rejecting — at most one paste is lost, at denial time.
+  const clipboardReadBlockedRef = useRef(false);
   // Window resize listener tied to the live xterm instance — tracked here so
   // it can be removed in step with xterm disposal (modal close, tab switch).
   const windowResizeListenerRef = useRef<(() => void) | null>(null);
@@ -663,6 +661,7 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
     */
     const updateViewportMode = () => {
       setIsMobileTerminal(isTerminalMobileViewport());
+      setIsTabletTerminal(getViewportMode() === "tablet");
     };
     updateViewportMode();
     window.addEventListener("resize", updateViewportMode);
@@ -927,6 +926,7 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
           try {
             (fitAddonRef.current as InstanceType<typeof import("@xterm/addon-fit").FitAddon>).fit();
             resizeRef.current?.(xtermRef.current.cols, xtermRef.current.rows);
+            xtermRef.current.refresh(0, Math.max(0, xtermRef.current.rows - 1));
           } catch {
             // Ignore fit errors during viewport transitions
           }
@@ -940,6 +940,18 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
       if (currentResize) {
         currentResize(currentXterm.cols, currentXterm.rows);
       }
+      /*
+      FNXC:Terminal 2026-07-23-21:05:
+      Blank-first-terminal recurrence: on some systems the renderer stalls at init (WebGL activation on a
+      zero-sized canvas, or context-loss fallback to the DOM renderer) while the shell prompt sits unpainted
+      in xterm's buffer. Every automatic recovery path funnels through this fit — but when fit() computes an
+      UNCHANGED cols/rows, xterm skips its internal resize event and never repaints, so the stall was
+      permanent until the user typed (new output), changed font size (the only path that refreshed), or
+      opened a new tab (fresh renderer). Always follow fit with an explicit full-viewport refresh so the
+      FN-7620 container ResizeObserver's guaranteed initial notification — and every later geometry event —
+      repairs a stalled renderer even when dimensions did not change. refresh() is cheap and idempotent.
+      */
+      currentXterm.refresh(0, Math.max(0, currentXterm.rows - 1));
     } catch {
       // Ignore fit errors during viewport transitions
     }
@@ -1076,10 +1088,11 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
   }, [fitAndResizeForSession, isOpen]);
 
   // Use the session management hook
-  const { 
-    tabs, 
-    activeTab, 
+  const {
+    tabs,
+    activeTab,
     isReady,
+    autoCreateDisabled,
     bootstrapError,
     createTab, 
     closeTab, 
@@ -1679,6 +1692,8 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
         // Initial fit
         setTimeout(() => {
           fitAddon.fit();
+          // FNXC:Terminal 2026-07-23-21:05: Explicit refresh after the first fit — see fitAndResizeForSession. A renderer that stalled during open() (zero-sized canvas WebGL activation / context-loss fallback) must be repainted here even when fit() left cols/rows unchanged, or the already-buffered shell prompt stays invisible until user input.
+          terminal.refresh(0, Math.max(0, terminal.rows - 1));
           // FNXC:Terminal 2026-06-22-22:00: After the first synchronous fit, schedule one deferred re-fit so a terminal opened mid-fold (narrow foldable, where the container width has not settled to its final integer box yet) re-measures columns once layout stabilizes — preventing the collapsed-column spaced-glyph render. Guarded by container width and live session so jsdom/tab-teardown paths stay no-ops.
           if ((terminalRef.current?.clientWidth ?? 0) > 0) {
             requestAnimationFrame(() => {
@@ -1690,6 +1705,7 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
                 try {
                   fitAddon.fit();
                   resizeRef.current?.(terminal.cols, terminal.rows);
+                  terminal.refresh(0, Math.max(0, terminal.rows - 1));
                 } catch {
                   // Ignore fit errors during viewport transitions
                 }
@@ -1766,21 +1782,30 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
           if (key === "v") {
             /*
             FNXC:Terminal 2026-07-04-10:24:
-            GitHub #1902 showed that relying only on xterm's helper-textarea paste can swallow physical Ctrl/Cmd+V before clipboard text reaches the PTY. Own platform paste here, then return false so the browser/xterm native paste path cannot also emit duplicate input.
+            GitHub #1902 showed that relying only on xterm's helper-textarea paste can swallow physical Ctrl/Cmd+V before clipboard text reaches the PTY. Own platform paste here when the async clipboard API is available.
+
+            FNXC:Terminal 2026-07-23-20:10:
+            Paste contract (GitHub #2121/#2307 review), verified against xterm 5.5.0 source:
+            - returning false from attachCustomKeyEventHandler skips xterm's key handling but does NOT cancel the browser's default paste — that default fires xterm's helper-textarea `paste` listener (single delivery). Never return true for paste: on non-mac, xterm's own _keyDown turns Ctrl+V into a \x16 data event and cancels the browser paste.
+            - When readText is available: call event.preventDefault() so the custom clipboard read is the SINGLE delivery path (without it the payload reached the PTY twice), and deliver via terminal.paste() so bracketed-paste wrapping and \n→\r normalization apply.
+            - When readText is missing (non-HTTPS remote, older Firefox) or a prior read was denied: return false with NO preventDefault so the native helper-textarea paste delivers exactly once.
             */
             const readText = navigator.clipboard?.readText;
-            if (!readText) {
+            if (!readText || clipboardReadBlockedRef.current) {
               return false;
             }
+            event.preventDefault();
             readText.call(navigator.clipboard)
               .then((text) => {
                 if (!text || xtermInitializedRef.current !== currentSessionId) {
                   return;
                 }
-                sendInputRef.current(text);
+                terminal.paste(text);
               })
               .catch(() => {
-                // Ignore clipboard permission/errors so terminal input stays responsive.
+                // Permission denied (or transient failure): stop preventDefaulting future
+                // Ctrl/Cmd+V so the native paste path stays functional.
+                clipboardReadBlockedRef.current = true;
               });
             return false;
           }
@@ -2443,9 +2468,24 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
   // Once a tab exists we keep the xterm container visible while UI init runs,
   // avoiding a retry-loop spinner flash after bootstrap recovery.
   const isLoading = !isReady || (!activeTab && !bootstrapError);
+  /*
+  FNXC:Terminal 2026-07-23-14:30:
+  GitHub #2121/#2307: when the sessions hook will never auto-create the first
+  tab (Windows browser clients), the bootstrap spinner has nothing to wait for.
+  Render an explicit "Start terminal" action instead of an indefinite
+  "Starting terminal..." state whose only escape was discovering the tab-strip
+  "+" button.
+  */
+  const showManualStart = isReady && autoCreateDisabled && !activeTab && !bootstrapError;
   // FNXC:Terminal 2026-06-23-04:30: Always carry the base `terminal-modal-overlay` class so the no-dim/no-blur rule applies in EVERY mode (docked, floating, AND the mobile/default sheet that is neither) — the terminal must never dim the page behind it.
   const overlayClassName = `modal-overlay open terminal-modal-overlay${isDockedMode ? " terminal-modal-overlay--docked" : ""}${isFloatingMode ? " terminal-modal-overlay--floating" : ""}`;
-  const modalClassName = `modal terminal-modal${isMobileTerminal && !embedded ? " terminal-modal--mobile" : ""}${isDockedMode ? " terminal-modal--docked" : ""}${isFloatingMode ? " terminal-modal--floating" : ""}${isBelowMode ? " terminal-modal--below" : ""}${embedded ? " terminal-modal--embedded" : ""}`;
+  /*
+  FNXC:TerminalModalControls 2026-07-24-01:10:
+  CSS still has a width-based phone media query for true-phone fallback. Mark a known tablet
+  explicitly so its floating/docked geometry wins at the 768px boundary rather than inheriting
+  the phone full-screen shell. Embedded terminals remain parent-owned and never receive this chrome.
+  */
+  const modalClassName = `modal terminal-modal${isMobileTerminal && !embedded ? " terminal-modal--mobile" : ""}${isTabletTerminal && !isMobileTerminal && !embedded ? " terminal-modal--tablet" : ""}${isDockedMode ? " terminal-modal--docked" : ""}${isFloatingMode ? " terminal-modal--floating" : ""}${isBelowMode ? " terminal-modal--below" : ""}${embedded ? " terminal-modal--embedded" : ""}`;
   /*
   FNXC:TerminalWorkspaces 2026-07-13-00:00:
   The workspace picker menu is portaled to `document.body`, so floating terminal mode must compare it in the same root stacking context as the panel. Keep the menu one layer above the panel's shared `floatingZ`; otherwise the fixed CSS fallback band sits below the 10100+ floating stack and the menu appears invisible behind the modal.
@@ -2887,10 +2927,40 @@ export function TerminalModal({ isOpen, onClose, initialCommand, initialCommandG
 
         {/* Terminal container */}
         <div className="terminal-container" data-testid="terminal-container">
-          {isLoading && !bootstrapError && (
+          {isLoading && !bootstrapError && !showManualStart && (
             <div className="terminal-loading" data-testid="terminal-loading">
               <div className="terminal-spinner" />
               <span>{t("terminal.startingTerminal", "Starting terminal...")}</span>
+            </div>
+          )}
+          {showManualStart && (
+            <div className="terminal-loading" data-testid="terminal-manual-start">
+              <div className="terminal-error-content">
+                <span>{t("terminal.manualStartHint", "The terminal is ready — start a session to begin.")}</span>
+                <div className="terminal-error-actions">
+                  <button
+                    className="terminal-retry-btn"
+                    onClick={() => {
+                      if (isStartingTerminal) return;
+                      setIsStartingTerminal(true);
+                      setError(null);
+                      createTab()
+                        .catch((err) => {
+                          const message = getErrorMessage(err);
+                          setError(t("terminal.manualStartError", "Failed to start terminal: {{message}}", { message }));
+                        })
+                        .finally(() => {
+                          setIsStartingTerminal(false);
+                        });
+                    }}
+                    disabled={isStartingTerminal}
+                    data-testid="terminal-manual-start-btn"
+                  >
+                    <Plus size={14} />
+                    {t("terminal.startTerminal", "Start terminal")}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
           {bootstrapError && !activeTab && (

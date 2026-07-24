@@ -71,8 +71,8 @@ html {
    recommended by Apple HIG and WCAG 2.5.8. Apply to interactive
    elements that are too small on mobile (links, small buttons, icons). */
 .touch-target {
-  min-width: 44px;
-  min-height: 44px;
+  min-width: var(--touch-target-min-size);
+  min-height: var(--touch-target-min-size);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -145,6 +145,13 @@ html {
   --space-lg: 16px;
   --space-xl: 24px;
   --space-2xl: 32px;
+
+  /*
+  FNXC:DashboardStyling 2026-07-23-13:05:
+  Mobile action controls need one shared minimum hit-area token so compact layouts can retain the
+  44px accessibility floor without embedding a raw dimension in component-specific rules.
+  */
+  --touch-target-min-size: 44px;
 
   /*
   FNXC:QuickAddActionRow 2026-07-16-14:00:
@@ -222,6 +229,12 @@ html {
   --z-popover: 60;
   --z-dropdown: 1000;
   --z-modal: 1100;
+
+  /*
+  FNXC:PluginOverlayLayering 2026-07-23-01:21:
+  Plugin overlays need a stable ceiling above the dashboard's 10000–10001 page-overlay band, 10100+ session-monotonic utility-window stack, the 10500 toast/feedback layer, and the 11000 body-portaled model-combobox dropdown. The 11001 boot floor is available before JavaScript runs; floatingWindowStack.ts raises an inline documentElement value when its utility counter grows past this floor.
+  */
+  --fusion-max-z: 11001;
 
   --shadow-glow: 0 0 8px color-mix(in srgb, var(--todo) 30%, transparent);
   --glow-success: 0 0 8px color-mix(in srgb, var(--cta-border) 30%, transparent);
@@ -376,8 +389,11 @@ svg.spinning {
   --provider-openai: #10a37f;
   --provider-gemini: #4285f4;
   --provider-openrouter: #6f4cff;
+  --provider-brave: #fb542b;
+  --provider-tavily: #4f46e5;
   --provider-minimax: #e73562;
   --provider-zai: #1a6dff;
+  --provider-xiaomi: #ff6900;
   --provider-kimi: #6c5ce7;
   --provider-bedrock: #ff9900;
   --provider-opencode: #38bdf8;
@@ -396,9 +412,16 @@ svg.spinning {
   --provider-cursor-cli: #7c3aed;
   --provider-ollama: #d4a27f;
   /* Runtime-plugin marks. */
-  --provider-omp: var(--text);
+  --provider-omp-gradient-start: #ed4abf;
+  --provider-omp-gradient-mid: #9b4dff;
+  --provider-omp-gradient-end: #5ad8e6;
+  --provider-omp: var(--provider-omp-gradient-mid);
   --provider-hermes: #d4961c;
   --provider-openclaw: #ff4f40;
+  --provider-openclaw-outline: #3a0a0d;
+  --provider-openclaw-highlight: #ff775f;
+  --provider-openclaw-eye: #081016;
+  --provider-openclaw-eye-highlight: #f5fbff;
   --provider-paperclip: var(--text);
   --provider-icon-contrast: var(--bg);
 
@@ -1172,6 +1195,15 @@ body {
 .dot-triage {
   background: var(--triage);
 }
+
+/*
+FNXC:CodingIdeasWorkflow 2026-07-21-23:42:
+The non-legacy Coding (Ideas) manual-intake ID already uses the shared Column dot.
+Map it to the established triage token so the decorative header indicator remains visible across themes.
+*/
+.dot-ideas {
+  background: var(--triage);
+}
 .dot-todo {
   background: var(--todo);
 }
@@ -1221,10 +1253,18 @@ body {
   animation: count-flash-bg 1400ms ease-out;
 }
 
+/*
+FNXC:WorkflowColumnDescriptions 2026-07-22-12:35:
+Custom workflow descriptions are author-entered explanatory text shared by selected,
+aggregate, and archived board columns. Preserve explicit line breaks and break long
+unspaced values so narrow desktop and mobile lanes do not clip the copy.
+*/
 .column-desc {
   font-size: 0.6875rem;
   color: var(--text-dim);
   padding: var(--space-xs) calc(var(--space-lg) - 2px) calc(var(--space-md) - 2px);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .column-body {
@@ -1805,14 +1845,6 @@ FN-7825 makes .settings-navigation the sole owner of Settings rail width and rem
   margin-top: var(--space-xl);
 }
 
-
-/* Scope indicators in sidebar nav items */
-.settings-scope-icon {
-  margin-right: 6px;
-  display: inline-flex;
-  vertical-align: middle;
-  color: var(--text-muted);
-}
 
 /* Scope banner above section content */
 
@@ -2806,6 +2838,17 @@ Task cards reuse the compact badge chip dimensions for GitLab links, but stale G
   padding: 12px 0;
 }
 
+/*
+FNXC:PluginOverlayLayering 2026-07-23-01:21:
+The supported plugin overlay mount spans the viewport in the root stacking context and follows the live dashboard ceiling through --fusion-max-z. It is empty and click-through by default, so existing layout and interactions remain unchanged; interactive plugin children must opt back into pointer events.
+*/
+#plugin-overlay-root {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--fusion-max-z, 11001) + 1);
+  pointer-events: none;
+}
+
 /* === Toasts === */
 /*
 FNXC:ToastTheming 2026-06-21-00:00:
@@ -3608,7 +3651,13 @@ Toast text must contrast its status background across every dashboard theme and 
     scroll-snap-type: x proximity;
     overflow-anchor: none;
     scroll-padding-inline: calc(50% - 150px);
-    scroll-behavior: smooth;
+    /*
+    FNXC:BoardNavigation 2026-07-22-14:20:
+    Mobile board column paging uses a short JS ease-out snap. CSS scroll-behavior:smooth
+    stacked with browser smooth scroll made settle feel laggy; keep auto so free-pan
+    inertia and the hook's animation stay snappy.
+    */
+    scroll-behavior: auto;
     scrollbar-width: none;
     padding: var(--space-md);
     padding-bottom: var(--space-md);
@@ -3794,10 +3843,6 @@ Toast text must contrast its status background across every dashboard theme and 
   /* Hide group headers on mobile - they don't fit well in horizontal scroll row */
   .settings-group-header {
     display: none;
-  }
-
-  .settings-scope-icon {
-    margin-right: 0;
   }
 
   .settings-content {

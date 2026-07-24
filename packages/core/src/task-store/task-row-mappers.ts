@@ -33,7 +33,7 @@ export function getTaskSelectClauseImpl2(store: TaskStore, slim: boolean, tableA
     const prefix = tableAlias ? `${tableAlias}.` : "";
     return [
       "id", "lineageId", "title", "description", "priority", "\"column\"", "status", "size", "reviewLevel", "currentStep",
-      "worktree", "blockedBy", "overlapBlockedBy", "paused", "pausedReason", "userPaused", "baseBranch", "branch", "autoMerge", "autoMergeProvenance", "executionStartBranch", "baseCommitSha",
+      "worktree", "blockedBy", "overlapBlockedBy", "paused", "pausedReason", "wedgeNotification", "userPaused", "baseBranch", "branch", "autoMerge", "autoMergeProvenance", "executionStartBranch", "baseCommitSha",
       "modelPresetId", "modelProvider", "modelId",
       "validatorModelProvider", "validatorModelId",
       "planningModelProvider", "planningModelId", "mergerModelProvider", "mergerModelId",
@@ -230,6 +230,12 @@ export function rowToWorkflowWorkItemImpl(store: TaskStore, row: WorkflowWorkIte
       leaseExpiresAt: row.leaseExpiresAt,
       lastError: row.lastError,
       blockedReason: row.blockedReason,
+      stableWorkflowRunId: row.stableWorkflowRunId,
+      continuationSequence: row.continuationSequence,
+      waitReason: row.waitReason === "planning" || row.waitReason === "capacity" ? row.waitReason : null,
+      sourceColumn: row.sourceColumn,
+      targetColumn: row.targetColumn,
+      irHash: row.irHash,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
     };

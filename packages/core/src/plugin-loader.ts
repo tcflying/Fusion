@@ -32,6 +32,7 @@ import type {
   PluginInstallation,
   PluginManifest,
   PluginSkillContribution,
+  PluginMcpServerContribution,
   PluginWorkflowStepContribution,
   PluginTraitContribution,
   PluginPromptContribution,
@@ -194,6 +195,12 @@ export interface PluginErrorEvent {
   error: Error;
 }
 
+interface ProcessPluginLifecycle {
+  promise: Promise<FusionPlugin>;
+  owner: PluginLoader;
+  participants: Set<PluginLoader>;
+}
+
 export class PluginLoader extends EventEmitter<{
   "plugin:loaded": [PluginLoadedEvent];
   "plugin:unloaded": [PluginUnloadedEvent];
@@ -211,6 +218,18 @@ export class PluginLoader extends EventEmitter<{
   private pluginRoots: Map<string, string> = new Map();
   private pluginSchemaContracts: Map<string, LoadedPluginSchemaContract> = new Map();
 
+  /*
+  FNXC:PluginLoader 2026-07-22-10:15:
+  Dashboard/serve/daemon boot a host PluginLoader while InProcessRuntime boots a
+  second loader for the same project. `plugins.has()` only protects one loader
+  after publication, so this process-wide lifecycle registry coalesces the
+  import and onLoad work before either loader can publish. Successful entries
+  intentionally persist until stop/reload begins a fresh lifecycle; rejected
+  entries are removed so an intentional retry is never poisoned.
+  */
+  private static readonly processPluginLifecycles = new Map<string, ProcessPluginLifecycle>();
+  private static readonly processPluginLifecycleTails = new Map<string, Promise<void>>();
+
   private readonly log = createLogger("plugin-loader");
 
   constructor(private options: PluginLoaderOptions) {
@@ -227,7 +246,9 @@ export class PluginLoader extends EventEmitter<{
   }
 
   private getProjectRoot(): string {
-    return this.options.taskStore.getRootDir();
+    // Lightweight loader harnesses historically omit this TaskStore accessor.
+    // Production stores always provide it; cwd preserves their single-project semantics.
+    return this.options.taskStore.getRootDir?.() ?? process.cwd();
   }
 
   // ── Context Creation ───────────────────────────────────────────────
@@ -346,7 +367,49 @@ export class PluginLoader extends EventEmitter<{
 
     // Resolve plugin path
     const pluginPath = this.resolvePluginPath(installation.path);
+    const lifecycleKey = this.getProcessLifecycleKey(pluginId, pluginPath);
+    const existingLifecycle = PluginLoader.processPluginLifecycles.get(lifecycleKey);
+    if (existingLifecycle) {
+      existingLifecycle.participants.add(this);
+      const plugin = await existingLifecycle.promise;
+      return this.adoptProcessLoadedPlugin(pluginId, pluginPath, plugin);
+    }
 
+    const lifecycle = this.loadPluginFresh(pluginId, installation, pluginPath);
+    const processLifecycle: ProcessPluginLifecycle = {
+      promise: lifecycle,
+      owner: this,
+      participants: new Set([this]),
+    };
+    PluginLoader.processPluginLifecycles.set(lifecycleKey, processLifecycle);
+    try {
+      return await lifecycle;
+    } catch (error) {
+      // Only remove our own rejected promise; a later retry may already own this key.
+      if (PluginLoader.processPluginLifecycles.get(lifecycleKey) === processLifecycle) {
+        PluginLoader.processPluginLifecycles.delete(lifecycleKey);
+      }
+      throw error;
+    }
+  }
+
+  private getProcessLifecycleKey(pluginId: string, pluginPath: string): string {
+    return `${resolve(this.getProjectRoot())}\u0000${pluginId}\u0000${resolve(pluginPath)}`;
+  }
+
+  private adoptProcessLoadedPlugin(pluginId: string, pluginPath: string, plugin: FusionPlugin): FusionPlugin {
+    plugin.state = "started";
+    this.plugins.set(pluginId, plugin);
+    this.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+    this.emit("plugin:loaded", { pluginId, plugin });
+    return plugin;
+  }
+
+  private async loadPluginFresh(
+    pluginId: string,
+    installation: PluginInstallation,
+    pluginPath: string,
+  ): Promise<FusionPlugin> {
     try {
       if (installation.aiScanOnLoad) {
         const scanResult = await scanPluginSecurity({ pluginId, pluginPath });
@@ -579,19 +642,90 @@ export class PluginLoader extends EventEmitter<{
     pluginId: string,
     options?: { timeoutMs?: number },
   ): Promise<FusionPlugin> {
+    const installation = await this.options.pluginStore.getPlugin(pluginId);
+    const pluginPath = this.resolvePluginPath(installation.path);
+    const lifecycleKey = this.getProcessLifecycleKey(pluginId, pluginPath);
+    const processLifecycle = PluginLoader.processPluginLifecycles.get(lifecycleKey);
+    const precedingLifecycle = processLifecycle?.promise;
+
+    const reload = this.enqueueProcessLifecycleOperation(lifecycleKey, async () => {
+      await precedingLifecycle;
+      const owner = processLifecycle?.owner ?? this;
+      const plugin = await owner.reloadPluginFresh(pluginId, installation, pluginPath, options);
+      if (processLifecycle) {
+        this.synchronizeProcessPlugin(processLifecycle, pluginId, pluginPath, plugin);
+      }
+      return plugin;
+    });
+    if (processLifecycle) processLifecycle.promise = reload;
+    try {
+      return await reload;
+    } catch (error) {
+      if (processLifecycle && PluginLoader.processPluginLifecycles.get(lifecycleKey) === processLifecycle) {
+        // reloadPluginFresh restores the canonical owner when rollback succeeds.
+        const restored = processLifecycle.owner.plugins.get(pluginId);
+        if (restored) {
+          processLifecycle.promise = Promise.resolve(restored);
+          this.synchronizeProcessPlugin(processLifecycle, pluginId, pluginPath, restored);
+        } else {
+          PluginLoader.processPluginLifecycles.delete(lifecycleKey);
+        }
+      }
+      throw error;
+    }
+  }
+
+  /*
+  FNXC:PluginLoader 2026-07-22-16:20:
+  A process lifecycle is shared by host and engine loaders, not merely its
+  initial onLoad promise. Stop and reload must update every adopter so no
+  loader retains an old active instance after another surface changes it.
+  */
+  private synchronizeProcessPlugin(
+    lifecycle: ProcessPluginLifecycle,
+    pluginId: string,
+    pluginPath: string,
+    plugin: FusionPlugin,
+  ): void {
+    for (const loader of lifecycle.participants) {
+      if (loader === lifecycle.owner) continue;
+      loader.plugins.set(pluginId, plugin);
+      loader.pluginRoots.set(pluginId, resolvePluginRootFromEntryPath(pluginPath));
+      loader.pluginSchemaContracts.delete(pluginId);
+    }
+  }
+
+  private async enqueueProcessLifecycleOperation<T>(
+    lifecycleKey: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const predecessor = PluginLoader.processPluginLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
+    const queued = predecessor.catch(() => undefined).then(operation);
+    const tail = queued.then(() => undefined, () => undefined);
+    PluginLoader.processPluginLifecycleTails.set(lifecycleKey, tail);
+    void tail.finally(() => {
+      if (PluginLoader.processPluginLifecycleTails.get(lifecycleKey) === tail) {
+        PluginLoader.processPluginLifecycleTails.delete(lifecycleKey);
+      }
+    });
+    return await queued;
+  }
+
+  private async reloadPluginFresh(
+    pluginId: string,
+    installation: PluginInstallation,
+    pluginPath: string,
+    options?: { timeoutMs?: number },
+  ): Promise<FusionPlugin> {
     const timeoutMs = options?.timeoutMs ?? 5000;
 
-    // Get existing plugin
+    // A concurrent startup load may have completed on another loader.
     const oldPlugin = this.plugins.get(pluginId);
     if (!oldPlugin) {
       throw Object.assign(new Error(`Plugin "${pluginId}" is not loaded`), {
         code: "PLUGIN_NOT_LOADED",
       });
     }
-
-    // Get installation record for path
-    const installation = await this.options.pluginStore.getPlugin(pluginId);
-    const pluginPath = this.resolvePluginPath(installation.path);
 
     this.log.log(`Reloading plugin: ${pluginId}`);
 
@@ -882,18 +1016,46 @@ export class PluginLoader extends EventEmitter<{
    * Stop and unload a single plugin.
    */
   async stopPlugin(pluginId: string): Promise<void> {
+    let installation: PluginInstallation;
+    try {
+      installation = await this.options.pluginStore.getPlugin(pluginId);
+    } catch {
+      this.log.log(`Plugin not loaded: ${pluginId}`);
+      return;
+    }
+    const pluginPath = this.resolvePluginPath(installation.path);
+    const lifecycleKey = this.getProcessLifecycleKey(pluginId, pluginPath);
+    const processLifecycle = PluginLoader.processPluginLifecycles.get(lifecycleKey);
+    if (!processLifecycle) {
+      await this.stopPluginFresh(pluginId, pluginPath);
+      return;
+    }
+
+    await this.enqueueProcessLifecycleOperation(lifecycleKey, async () => {
+      try {
+        await processLifecycle.promise;
+      } catch {
+        // A rejected load has already cleaned its local state.
+      }
+      await processLifecycle.owner.stopPluginFresh(pluginId, pluginPath);
+      for (const loader of processLifecycle.participants) {
+        if (loader === processLifecycle.owner) continue;
+        loader.discardProcessPlugin(pluginId, pluginPath);
+      }
+      if (PluginLoader.processPluginLifecycles.get(lifecycleKey) === processLifecycle) {
+        PluginLoader.processPluginLifecycles.delete(lifecycleKey);
+      }
+    });
+  }
+
+  private async stopPluginFresh(pluginId: string, pluginPath: string): Promise<void> {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) {
       this.log.log(`Plugin not loaded: ${pluginId}`);
       return;
     }
 
-    // Get the plugin path for cache invalidation
-    const installation = await this.options.pluginStore.getPlugin(pluginId);
-    const pluginPath = this.resolvePluginPath(installation.path);
-
     try {
-      // Call onUnload hook
       const ctx = await this.createContext(plugin);
       await this.withTimeout(
         this.safeCallHook(plugin, "onUnload", [ctx]),
@@ -905,17 +1067,16 @@ export class PluginLoader extends EventEmitter<{
     }
 
     await this.updatePluginState(pluginId, "stopped");
+    this.discardProcessPlugin(pluginId, pluginPath);
+    this.emit("plugin:unloaded", { pluginId });
+    this.emit("plugin:stopped", pluginId);
+  }
 
-    // Remove from loaded plugins
+  private discardProcessPlugin(pluginId: string, pluginPath: string): void {
     this.plugins.delete(pluginId);
     this.pluginRoots.delete(pluginId);
     this.pluginSchemaContracts.delete(pluginId);
-
-    // Invalidate module cache for clean re-import
     this.invalidateModuleCache(pluginPath);
-
-    this.emit("plugin:unloaded", { pluginId });
-    this.emit("plugin:stopped", pluginId); // Backward compatibility
   }
 
   /**
@@ -1379,6 +1540,29 @@ export class PluginLoader extends EventEmitter<{
       }
     }
     return skills;
+  }
+
+  /**
+   * Get raw MCP contributions from loaded plugins. Consumers must still apply
+   * project_plugin_states before session or UI use.
+   *
+   * FNXC:PluginMcpServers 2026-07-22-12:00:
+   * FN-8491 keeps loader enumeration intentionally raw so one project-scoped
+   * provider can enforce enablement consistently for every caller.
+   */
+  getPluginMcpServers(): Array<{ pluginId: string; server: PluginMcpServerContribution }> {
+    const servers: Array<{ pluginId: string; server: PluginMcpServerContribution }> = [];
+    for (const [pluginId, plugin] of this.plugins) {
+      /*
+       * FNXC:PluginMcpServers 2026-07-22-15:35:
+       * FN-8491 must isolate malformed runtime plugin contribution containers;
+       * only arrays are iterable, while individual malformed servers are
+       * filtered by the shared mapper later in MCP resolution.
+       */
+      if (!Array.isArray(plugin.mcpServers)) continue;
+      for (const server of plugin.mcpServers) servers.push({ pluginId, server });
+    }
+    return servers;
   }
 
   /**

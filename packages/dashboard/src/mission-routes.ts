@@ -14,7 +14,14 @@
 
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { TaskStore, resolvePlanningSettingsModel, AgentStore, THINKING_LEVELS } from "@fusion/core";
+import {
+  TaskStore,
+  resolvePlanningSettingsModel,
+  AgentStore,
+  THINKING_LEVELS,
+  MissionResumeConflictError,
+  TerminalTaskReconciliationError,
+} from "@fusion/core";
 import type { Goal, Settings, ThinkingLevel } from "@fusion/core";
 import { listEligibleExecutorAgents, resolvePlanningThinkingLevel } from "@fusion/engine";
 import {
@@ -73,6 +80,19 @@ export function resolveMissionInterviewThinkingLevel(
 }
 
 // ── Validation Utilities ────────────────────────────────────────────────────
+
+/*
+FNXC:MissionAutonomyAudit 2026-07-23-14:20:
+Dashboard lifecycle controls represent a human/operator intent. Pass the stable
+actor through the store so status and autopilot transitions are atomically
+attributed instead of relying on unaudited route-local side effects.
+*/
+const DASHBOARD_MISSION_ACTOR = {
+  type: "operator" as const,
+  id: "dashboard",
+  displayName: "Dashboard operator",
+  source: "dashboard",
+};
 
 function validateMissionId(id: string): boolean {
   // Accept generated format: M-{base36timestamp}-{random} (e.g. M-LZ7DN0-A2B5)
@@ -1151,7 +1171,7 @@ export function createMissionRouter(
       try {
         const existingMission = await missionStore.getMission(missionId);
         const mission = Object.keys(updates).length > 0
-          ? await missionStore.updateMission(missionId, updates)
+          ? await missionStore.updateMission(missionId, updates, { actor: DASHBOARD_MISSION_ACTOR })
           : await requireMission(missionId);
         if (missionAutopilot && updates.autopilotEnabled === true && existingMission?.autopilotEnabled !== true) {
           missionAutopilot.watchMission(missionId);
@@ -2735,48 +2755,30 @@ export function createMissionRouter(
         throw badRequest("Invalid feature ID format");
       }
 
-      const existing = await missionStore.getFeature(featureId);
-      if (!existing) {
-        throw notFound("Feature not found");
-      }
-
       if (typeof taskId !== "string" || !taskId.trim()) {
         throw badRequest("taskId is required and must be a non-empty string");
       }
 
       const normalizedTaskId = taskId.trim();
-
-      if (existing.taskId && existing.taskId !== normalizedTaskId) {
-        throw conflict(
-          `Feature ${featureId} is already linked to ${existing.taskId}; cannot reconcile against ${normalizedTaskId}`
-        );
-      }
-
       const { store: scopedStore } = await getProjectContext(req);
-      let task: Awaited<ReturnType<typeof scopedStore.getTask>>;
+      const scopedMissionStore = scopedStore.getMissionStore();
+      if (!("reconcileFeatureDoneWithTerminalTask" in scopedMissionStore)) {
+        throw internalError("Terminal-task reconciliation requires the PostgreSQL mission store");
+      }
+
+      /*
+      FNXC:MissionReconciliation 2026-07-20-08:34:
+      Route validation stays project-scoped, but all terminal-evidence checks, mismatch guards, linkage, and rollups belong to one store transaction. Never pre-link or move/unarchive a shipped task here because those ordinary lifecycle paths can wake a parked mission.
+      */
       try {
-        task = await scopedStore.getTask(normalizedTaskId);
-      } catch (err: unknown) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errMsg.includes("not found")) {
-          throw notFound("Delivery task not found");
-        }
-        throw err;
+        const feature = await scopedMissionStore.reconcileFeatureDoneWithTerminalTask(featureId, normalizedTaskId);
+        res.json(feature);
+      } catch (error: unknown) {
+        if (!(error instanceof TerminalTaskReconciliationError)) throw error;
+        if (error.code === "FEATURE_NOT_FOUND") throw notFound("Feature not found");
+        if (error.code === "TASK_NOT_FOUND") throw notFound("Delivery task not found");
+        throw conflict(error.message);
       }
-
-      if (task.column !== "done" && task.column !== "archived") {
-        throw conflict(
-          `Delivery task ${normalizedTaskId} must be in done or archived to reconcile feature to done. ` +
-          "Use PATCH /api/missions/features/:featureId or triage/link-task endpoints for active work."
-        );
-      }
-
-      if (!existing.taskId) {
-        await missionStore.linkFeatureToTask(featureId, normalizedTaskId);
-      }
-
-      const feature = await missionStore.updateFeatureStatus(featureId, "done");
-      res.json(feature);
     })
   );
 
@@ -2932,7 +2934,7 @@ export function createMissionRouter(
         throw badRequest("Mission is already paused (blocked)");
       }
 
-      const updated = await missionStore.updateMission(missionId, { status: "blocked" });
+      const updated = await missionStore.updateMission(missionId, { status: "blocked" }, { actor: DASHBOARD_MISSION_ACTOR });
       res.json(updated);
     })
   );
@@ -2959,7 +2961,18 @@ export function createMissionRouter(
         throw badRequest("Mission is not paused (status must be 'blocked' to resume)");
       }
 
-      await missionStore.updateMission(missionId, { status: "active" });
+// FNXC:MissionLineageBudget 2026-07-22-15:45: resumeMission performs the all-or-nothing root-stop classification; generic activation must not clear a lineage stop.
+      try {
+        await missionStore.resumeMission(missionId);
+      } catch (error) {
+        if (error instanceof MissionResumeConflictError) {
+          throw conflict("Mission has non-resumable lineage stops", {
+            code: "MISSION_RESUME_CONFLICT",
+            blockers: error.blockers,
+          });
+        }
+        throw error;
+      }
 
       // Re-engage autopilot if enabled and autopilot instance is available.
       // The autopilot may have been stopped or the mission unwatched during
@@ -2997,7 +3010,7 @@ export function createMissionRouter(
       }
 
       // Set mission status to blocked
-      const updated = await missionStore.updateMission(missionId, { status: "blocked" });
+      const updated = await missionStore.updateMission(missionId, { status: "blocked" }, { actor: DASHBOARD_MISSION_ACTOR });
 
       // Pause all tasks linked to features in this mission
       const pausedTaskIds: string[] = [];
@@ -3079,7 +3092,7 @@ export function createMissionRouter(
         autopilotEnabled: true,
         autoAdvance: true, // kept for backward compat with existing mission data
         status: "active",
-      });
+      }, { actor: DASHBOARD_MISSION_ACTOR });
 
       // Activate the first pending slice (triggers auto-triage via activateSlice)
       await missionStore.activateSlice(nextSlice.id);
@@ -3153,7 +3166,7 @@ export function createMissionRouter(
       }
 
       // Update the mission's autopilotEnabled field
-      await missionStore.updateMission(missionId, { autopilotEnabled: enabled });
+      await missionStore.updateMission(missionId, { autopilotEnabled: enabled }, { actor: DASHBOARD_MISSION_ACTOR });
 
       if (missionAutopilot) {
         if (enabled) {

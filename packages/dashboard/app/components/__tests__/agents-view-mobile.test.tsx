@@ -35,6 +35,13 @@ function extractMobileMediaBlocks(content: string): string {
   return blocks.join("\n");
 }
 
+/*
+FNXC:DashboardTests 2026-07-24-03:15:
+AgentsView imports isAgentHeartbeatEnabled / withAgentHeartbeatEnabled for bulk and
+per-card heartbeat toggles. A wholesale ../../api mock must re-export them or the
+view throws on mount and the tree collapses to an empty <div /> (Board/List/Controls
+queries fail with "no accessible roles").
+*/
 vi.mock("../../api", () => ({
   fetchAgents: vi.fn(),
   fetchAgentStats: vi.fn(),
@@ -48,6 +55,15 @@ vi.mock("../../api", () => ({
   fetchOrgTree: vi.fn(),
   fetchSettings: vi.fn(() => Promise.resolve({ heartbeatMultiplier: 1 })),
   updateSettings: vi.fn(() => Promise.resolve({})),
+  isAgentHeartbeatEnabled: (agent: { runtimeConfig?: { enabled?: boolean } }) =>
+    agent.runtimeConfig?.enabled !== false,
+  withAgentHeartbeatEnabled: (
+    agent: { runtimeConfig?: Record<string, unknown> },
+    enabled: boolean,
+  ) => ({
+    ...agent,
+    runtimeConfig: { ...(agent.runtimeConfig ?? {}), enabled },
+  }),
 }));
 /*
 FNXC:RuntimeFallbackUI 2026-07-11-00:00:
@@ -312,6 +328,18 @@ describe("agents-view mobile CSS", () => {
     expect(mobileMediaBlock).toContain(".agents-view-title");
     const block = extractRuleBlock(mobileMediaBlock, ".agents-view-title");
     expect(block).toContain("flex-wrap: wrap");
+  });
+
+  it("stacks card identity and populated badges on narrow mobile cards", () => {
+    const headerBlock = extractRuleBlock(mobileMediaBlock, ".agents-view .agent-card-header");
+    expect(headerBlock).toContain("flex-direction: column");
+    expect(headerBlock).toContain("align-items: stretch");
+
+    const infoBlock = extractRuleBlock(mobileMediaBlock, ".agents-view .agent-info");
+    expect(infoBlock).toContain("min-width: 0");
+
+    const badgesBlock = extractRuleBlock(mobileMediaBlock, ".agents-view .agent-badges");
+    expect(badgesBlock).toContain("justify-content: flex-start");
   });
 
   it("defines mobile org chart sizing and pan/zoom controls rules", () => {

@@ -8,9 +8,10 @@
  */
 import {TaskStore, storeLog} from "../store.js";
 import {InvalidFileScopeError, SelfDefeatingDependencyError, detectSelfDefeatingDependency, TombstonedTaskResurrectionError} from "./errors.js";
-import {mkdir, rm, writeFile} from "node:fs/promises";
+import {mkdir, rename, rm, writeFile} from "node:fs/promises";
 import {join} from "node:path";
 import {existsSync} from "node:fs";
+import {randomUUID} from "node:crypto";
 import type {Task, TaskCreateInput, Settings} from "../types.js";
 import "../builtin-traits.js";
 import {applyReviewLevelPreset} from "../review-level-preset.js";
@@ -29,6 +30,17 @@ import {withTaskBranchContextInSourceMetadata} from "../task-store/branch-contex
 import {resolveCreateDeclaredSymbols} from "../task-symbol-resolution.js";
 import {softDeleteTaskRow as softDeleteTaskRowAsync, insertTaskRowInTransaction, isTaskIdConflictError} from "../task-store/async-persistence.js";
 import {recordRunAuditEvent as recordRunAuditEventAsync} from "../task-store/async-audit.js";
+import type {DbTransaction} from "../postgres/data-layer.js";
+
+type CreateTaskWithAfterInsert = TaskCreateInput & {
+  /** Internal transaction hook; never persisted in task source metadata. */
+  afterTaskInsert?: (tx: DbTransaction, task: Task) => Promise<void>;
+  /**
+   * Internal bootstrap escape hatch. The caller supplies an equivalent
+   * transactionally-safe duplicate reconciliation after the feature claim.
+   */
+  skipSameAgentDuplicateIntake?: boolean;
+};
 
 function ensureSqliteProposalClaimUniqueness(store: TaskStore): void {
   /*
@@ -371,6 +383,81 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
     }
 
     const dir = store.taskDir(id);
+    const stagingDir = `${dir}.creating-${randomUUID()}`;
+    let ownsStagingDirectory = false;
+    let ownsPromotedTaskDirectory = false;
+    const cleanupPreparedTaskFiles = async () => {
+      if (store.isWatching) store.taskCache.delete(id);
+      if (ownsStagingDirectory && existsSync(stagingDir)) {
+        await rm(stagingDir, { recursive: true, force: true });
+      }
+      // A rollback after promotion removes only this create's final directory.
+      // A conflicting existing row never reaches promotion, so its files survive.
+      if (ownsPromotedTaskDirectory && existsSync(dir)) {
+        await rm(dir, { recursive: true, force: true });
+      }
+    };
+
+    /*
+    FNXC:MissionAdmission 2026-07-23-17:10:
+    Materialize task files before the transaction that inserts and claims a
+    defined feature. Filesystem writes cannot join PostgreSQL; this ordering
+    means a write failure cannot commit a triaged feature pointing at a deleted
+    task, while the database transaction still makes task insert + feature claim
+    indivisible.
+    */
+    try {
+      /*
+      FNXC:MissionAdmission 2026-07-23-19:00:
+      PostgreSQL ID/proposal collisions are discovered at row insert, while a
+      defined-feature bootstrap needs all task artifacts to be writable before
+      its transaction can commit. Materialize into a unique staging directory;
+      only the successful insert atomically promotes it to the task directory.
+      A losing proposal therefore cannot overwrite its winner's task files.
+      */
+      await mkdir(stagingDir, { recursive: true });
+      ownsStagingDirectory = true;
+
+      // Write task.json for backward compatibility and debugging.
+      if (store.isWatching) store.taskCache.set(id, { ...task });
+      await store.writeTaskJsonFile(stagingDir, task);
+
+      // Write PROMPT.md (same logic as SQLite path).
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-05-19:45:
+      A freshly created task needs the bootstrap stub only when it lands in a
+      column the triage service will plan from — the legacy "triage" intake or a
+      workflow's resolved manual intake (e.g. Coding (Ideas) → "ideas"). Direct
+      creates into other columns keep generateSpecifiedPrompt (main parity).
+      */
+      const isIntakeColumn = task.column === "triage"
+        || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn);
+      const usedBootstrapPrompt = !options?.promptOverride && isIntakeColumn;
+      const prompt = options?.promptOverride
+        ?? (isIntakeColumn
+          ? buildBootstrapPrompt(id, task.title, task.description)
+          : store.generateSpecifiedPrompt(task));
+      /*
+      FNXC:FileScopeClassification 2026-07-21-18:05:
+      Bootstrap intake prompts are freeform descriptions (GitHub issue bodies, paste dumps).
+      Do not hard-fail create on incidental `## File Scope` tokens in that prose — triage
+      will write a real planned PROMPT.md later. Strict validation still applies to
+      promptOverride and generateSpecifiedPrompt paths.
+      */
+      if (!usedBootstrapPrompt) {
+        const validation = validateFileScopeInPromptContent(prompt);
+        if (validation.invalid.length > 0) {
+          throw new InvalidFileScopeError(id, validation.invalid);
+        }
+      }
+      await writeFile(join(stagingDir, "PROMPT.md"), prompt);
+    } catch (error) {
+      await cleanupPreparedTaskFiles();
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`Task ID already exists: ${task.id}`);
+      }
+      throw error;
+    }
 
     // FNXC:RuntimeTaskOrchestrationAsync 2026-06-24-13:30:
     // Insert the task row via async Drizzle insert inside a transaction.
@@ -382,8 +469,21 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
         // FNXC:MultiProjectIsolation 2026-07-10: stamp the bound projectId so the
         // new task row is attributed to (and later filtered under) this project.
         await insertTaskRowInTransaction(tx, task as unknown as Record<string, unknown>, context, layer.projectId);
+        /*
+        FNXC:MissionAdmission 2026-07-23-19:00:
+        The row insert establishes this task as the sole winner before its staged
+        artifacts replace any stale directory. Promotion remains inside the same
+        transaction as the defined-feature claim, so a filesystem or claim
+        failure rolls back the row and cleans only this attempt's files.
+        */
+        if (existsSync(dir)) await rm(dir, { recursive: true, force: true });
+        await rename(stagingDir, dir);
+        ownsStagingDirectory = false;
+        ownsPromotedTaskDirectory = true;
+        await (input as CreateTaskWithAfterInsert).afterTaskInsert?.(tx, task);
       });
     } catch (error) {
+      await cleanupPreparedTaskFiles();
       /*
       FNXC:EphemeralAgentTaskCreation 2026-07-30-18:30:
       Proposal creation retries can race after a creation lease is released while
@@ -406,47 +506,17 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
       throw error;
     }
 
-    // FNXC:ReservationAtomicity 2026-07-12-00:00:
-    // Wrap post-insert filesystem/prompt work so any failure rolls back the
-    // inserted row. Without this, a writeTaskJsonFile or prompt-validation throw
-    // leaves a live row paired with an aborted reservation (FN-7074 invariant).
-    try {
-      // Write task.json for backward compatibility and debugging.
-      if (store.isWatching) store.taskCache.set(id, { ...task });
-      await store.writeTaskJsonFile(dir, task);
-
-      // Write PROMPT.md (same logic as SQLite path).
-      /*
-      FNXC:CodingIdeasWorkflow 2026-07-05-19:45:
-      A freshly created task needs the bootstrap stub only when it lands in a
-      column the triage service will plan from — the legacy "triage" intake or a
-      workflow's resolved manual intake (e.g. Coding (Ideas) → "ideas"). Direct
-      creates into other columns keep generateSpecifiedPrompt (main parity).
-      */
-      const isIntakeColumn = task.column === "triage"
-        || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn);
-      const prompt = options?.promptOverride
-        ?? (isIntakeColumn
-          ? buildBootstrapPrompt(id, task.title, task.description)
-          : store.generateSpecifiedPrompt(task));
-      const validation = validateFileScopeInPromptContent(prompt);
-      if (validation.invalid.length > 0) {
-        throw new InvalidFileScopeError(id, validation.invalid);
-      }
-      await mkdir(dir, { recursive: true });
-      await writeFile(join(dir, "PROMPT.md"), prompt);
-    } catch (error) {
-      // Rollback: soft-delete the inserted row and remove the directory.
-      await softDeleteTaskRowAsync(layer, id, new Date().toISOString());
-      if (store.isWatching) store.taskCache.delete(id);
-      if (existsSync(dir)) {
-        await rm(dir, { recursive: true, force: true });
-      }
-      throw error;
+    /*
+    FNXC:MissionAdmission 2026-07-23-20:00:
+    A defined-feature first task has already claimed feature.taskId in the insert
+    transaction. The ordinary same-agent intake may archive that claimed row
+    after commit, so this narrow internal opt-out delegates duplicate resolution
+    to the bootstrap caller, which preserves the claimed canonical atomically.
+    */
+    if (!(input as CreateTaskWithAfterInsert).skipSameAgentDuplicateIntake) {
+      // Auto-archive dedup (best-effort, same as SQLite path but using async reads).
+      await store._maybeAutoArchiveSameAgentDuplicateBackend(task, input);
     }
-
-    // Auto-archive dedup (best-effort, same as SQLite path but using async reads).
-    await store._maybeAutoArchiveSameAgentDuplicateBackend(task, input);
 
     store.emitTaskLifecycleEventSafely("task:created", [task]);
     if (options?.invokeTaskCreatedHook !== false) {
@@ -985,19 +1055,29 @@ export async function _createTaskInternalImpl(store: TaskStore, input: TaskCreat
     */
     const isIntakeColumn = task.column === "triage"
       || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn);
+    const usedBootstrapPrompt = !options?.promptOverride && isIntakeColumn;
     const prompt = options?.promptOverride
       ?? (isIntakeColumn
         ? buildBootstrapPrompt(id, task.title, task.description)
         : store.generateSpecifiedPrompt(task));
-    const validation = validateFileScopeInPromptContent(prompt);
-    if (validation.invalid.length > 0) {
-      if (store.isWatching) store.taskCache.delete(id);
-      store.deleteTaskById(id);
-      const { rm } = await import("node:fs/promises");
-      if (existsSync(dir)) {
-        await rm(dir, { recursive: true, force: true });
+    /*
+    FNXC:FileScopeClassification 2026-07-21-18:05:
+    Bootstrap intake prompts are freeform descriptions (GitHub issue bodies, paste dumps).
+    Do not hard-fail create on incidental `## File Scope` tokens in that prose — triage
+    will write a real planned PROMPT.md later. Strict validation still applies to
+    promptOverride and generateSpecifiedPrompt paths.
+    */
+    if (!usedBootstrapPrompt) {
+      const validation = validateFileScopeInPromptContent(prompt);
+      if (validation.invalid.length > 0) {
+        if (store.isWatching) store.taskCache.delete(id);
+        store.deleteTaskById(id);
+        const { rm } = await import("node:fs/promises");
+        if (existsSync(dir)) {
+          await rm(dir, { recursive: true, force: true });
+        }
+        throw new InvalidFileScopeError(id, validation.invalid);
       }
-      throw new InvalidFileScopeError(id, validation.invalid);
     }
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, "PROMPT.md"), prompt);

@@ -911,6 +911,19 @@ The old Quick Chat panel is replaced by the full ChatView inside a movable Float
 }
 
 /*
+FNXC:QuickChat 2026-07-24-00:00:
+Tablet Quick Chat keeps its delegated ViewHeader drag handle but needs a modestly taller touch target
+than canonical desktop chrome. Scope the token-based height to the movable tablet band so phone sheets,
+desktop geometry, and every other ViewHeader consumer remain unchanged.
+*/
+@media (min-width: 769px) and (max-width: 1024px) and (min-height: 481px) {
+  .chat-view--floating .view-header {
+    min-height: calc(var(--view-header-min-height) + var(--space-sm));
+    height: calc(var(--view-header-min-height) + var(--space-sm));
+  }
+}
+
+/*
 FNXC:ChatModal 2026-06-22-14:38:
 Floating Chat can become narrow while the browser viewport remains desktop-sized. Mirror the mobile one-pane layout with a class driven by the modal ResizeObserver so a narrow pop-out hides the sidebar and shows the mobile thread/list surfaces.
 */
@@ -1035,11 +1048,20 @@ The thread-wide Markdown/plain render toggle (`.chat-thread-header-render-toggle
   word-break: break-word;
 }
 
+/*
+FNXC:ChatView 2026-07-22-00:00:
+The Latest button is centered with transform: translateX(-50%), so the global .btn:active { transform: scale(0.97) } rule must not replace that transform wholesale — doing so shifted the button half its width sideways on mousedown, out from under the cursor mid-click. Compose both transforms on :active instead (same fix as .devserver-log-viewer__new-logs-button).
+
+FNXC:ChatView 2026-07-23-18:15:
+Compose-on-:active was still fragile: same specificity as `.btn:active` can lose the cascade war (SelectionCommentPopover regressed the same way), and the shared `.btn { transition: transform }` made any transform churn feel like the chip jumps when the cursor moves near/over it in Quick Chat and full Chat. Center with left/right + margin-inline auto + width: fit-content so positioning no longer owns `transform`. Global `.btn:active` scale then applies in place around the geometric center without a sideways teleport. Covers session + room jump buttons (shared class), floating Quick Chat, main Chat view, and mobile.
+*/
 .chat-jump-to-latest {
   position: absolute;
-  left: 50%;
+  left: 0;
+  right: 0;
+  width: fit-content;
+  margin-inline: auto;
   bottom: calc(var(--space-xl) * 3);
-  transform: translateX(-50%);
   z-index: 2;
 }
 

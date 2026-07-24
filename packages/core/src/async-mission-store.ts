@@ -9,7 +9,7 @@ import { EventEmitter } from "node:events";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
-import { normalizeMissionAssertionType } from "./mission-types.js";
+import { FEATURE_LOOP_TRANSITIONS, normalizeMissionAssertionType, renderValidationCause } from "./mission-types.js";
 import type {
   Mission,
   Milestone,
@@ -39,6 +39,9 @@ import type {
   ContractAssertionCreateInput,
   ContractAssertionUpdateInput,
   FeatureLoopState,
+  ValidationDiagnostics,
+  MissionTransitionActor,
+  MissionUpdateOptions,
 } from "./mission-types.js";
 import type { Goal } from "./goal-types.js";
 import {
@@ -64,6 +67,7 @@ export * from "./async-mission-store-queries.js";
 import {
   DEFAULT_IMPLEMENTATION_RETRY_BUDGET,
   missionBranchStrategyDefaults,
+  missionProjectId,
   QueryHandle,
   AssertionRow,
   assertionColumns,
@@ -98,7 +102,9 @@ import {
   updateFeature,
   deleteFeature,
   getFeatureByTaskId,
+  getConflictingFeatureByTaskId,
   unlinkFeatureFromTaskId,
+  getTerminalTaskEvidence,
   getMaxEventSeq,
   insertMissionEvent,
   countMissionEvents,
@@ -145,6 +151,7 @@ import {
   setTaskMissionLinkage,
   clearTaskMissionLinkage,
   listFailedTaskIds,
+  recordGeneratedFixOperatorStop,
 } from "./async-mission-store-queries.js";
 
 // ════════════════════════════════════════════════════════════════════
@@ -180,6 +187,40 @@ import {
  * Validator-run and generated-fix events are emitted after their PostgreSQL
  * transactions commit, matching the synchronous store's observable contract.
  */
+export type TerminalTaskReconciliationErrorCode =
+  | "FEATURE_NOT_FOUND"
+  | "TASK_NOT_FOUND"
+  | "TASK_NOT_TERMINAL"
+  | "TASK_ARCHIVE_INVALID"
+  | "FEATURE_TASK_CONFLICT"
+  | "TASK_FEATURE_CONFLICT";
+
+export class TerminalTaskReconciliationError extends Error {
+  constructor(
+    public readonly code: TerminalTaskReconciliationErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TerminalTaskReconciliationError";
+  }
+}
+
+/** Typed no-mint result used by the execution loop instead of parsing errors. */
+export class MissionRemediationStoppedError extends Error {
+  constructor(public readonly reason: "budget-exhausted" | "operator-intervention" | "legacy-unknown-stop") {
+    super(`MISSION_REMEDIATION_STOPPED: ${reason}`);
+    this.name = "MissionRemediationStoppedError";
+  }
+}
+
+/** Stable mission-wide conflict payload for the sole explicit lineage-stop resume seam. */
+export class MissionResumeConflictError extends Error {
+  constructor(public readonly blockers: Array<{ id: string; reason: string }>) {
+    super("Mission resume is blocked by non-resumable lineage stops");
+    this.name = "MissionResumeConflictError";
+  }
+}
+
 export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
   private idSequence = 0;
   private readonly milestonesMissingStructuredAssertions = new Set<string>();
@@ -510,26 +551,126 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     return getMissionEventsPage(this.db, missionId, options);
   }
 
-  async updateMission(id: string, updates: Partial<Mission>): Promise<Mission> {
-    const mission = await getMission(this.db, id);
-    if (!mission) throw new Error(`Mission ${id} not found`);
-    const updated: Mission = {
-      ...mission,
-      ...updates,
-      id,
-      createdAt: mission.createdAt,
-      updatedAt: new Date().toISOString(),
+  /**
+   * FNXC:MissionAutonomyAudit 2026-07-23-14:20:
+   * A status or `autopilotEnabled` change can arm autonomous remediation.
+   * Persist its before/after audit event in the same PostgreSQL transaction as
+   * the mutation; callers that predate attribution receive a conservative
+   * system identity instead of silently creating an unaudited transition.
+   */
+  async updateMission(id: string, updates: Partial<Mission>, options: MissionUpdateOptions = {}): Promise<Mission> {
+    const actor: MissionTransitionActor = options.actor ?? {
+      type: "system",
+      id: "mission-store",
+      displayName: "Mission store",
+      source: "mission-store",
     };
-    await updateMission(this.db, updated);
+    const { updated, events } = await this.layer.transactionImmediate(async (tx) => {
+      const mission = await getMission(tx, id);
+      if (!mission) throw new Error(`Mission ${id} not found`);
+      const updated: Mission = {
+        ...mission,
+        ...updates,
+        id,
+        createdAt: mission.createdAt,
+        updatedAt: new Date().toISOString(),
+      };
+      const transitions: Array<{ eventType: MissionEventType; description: string; metadata: Record<string, unknown> }> = [];
+      if (mission.status !== updated.status) {
+        transitions.push({
+          eventType: "mission_status_changed",
+          description: `Mission status changed from ${mission.status} to ${updated.status}`,
+          metadata: { source: actor.source, actor, field: "status", from: mission.status, to: updated.status },
+        });
+      }
+      // FNXC:MissionAutonomyAudit 2026-07-23-14:20: Legacy rows may omit this
+      // flag; undefined and false are the same disabled autonomy state and must
+      // not fabricate a transition event when a caller normalizes storage.
+      const wasAutopilotEnabled = mission.autopilotEnabled === true;
+      const isAutopilotEnabled = updated.autopilotEnabled === true;
+      if (wasAutopilotEnabled !== isAutopilotEnabled) {
+        transitions.push({
+          eventType: isAutopilotEnabled ? "autopilot_enabled" : "autopilot_disabled",
+          description: `Autopilot ${isAutopilotEnabled ? "enabled" : "disabled"}`,
+          metadata: { source: actor.source, actor, field: "autopilotEnabled", from: wasAutopilotEnabled, to: isAutopilotEnabled },
+        });
+      }
+      await updateMission(tx, updated);
+      if (transitions.length === 0) return { updated, events: [] as MissionEvent[] };
+      let seq = await getMaxEventSeq(tx);
+      const events = await Promise.all(transitions.map(async (transition) => {
+        const event: MissionEvent = {
+          id: this.generateId("ME"), missionId: id, eventType: transition.eventType,
+          description: transition.description, metadata: transition.metadata,
+          timestamp: new Date().toISOString(), seq: ++seq,
+        };
+        await insertMissionEvent(tx, event);
+        return event;
+      }));
+      return { updated, events };
+    });
     this.emit("mission:updated", updated);
+    for (const event of events) this.emit("mission:event", event);
     return updated;
   }
 
   async deleteMission(id: string): Promise<void> {
     const mission = await getMission(this.db, id);
     if (!mission) throw new Error(`Mission ${id} not found`);
-    await deleteMission(this.db, id);
+    const features: MissionFeature[] = [];
+    for (const milestone of await listMilestones(this.db, id)) {
+      for (const slice of await listSlices(this.db, milestone.id)) features.push(...await listFeatures(this.db, slice.id));
+    }
+    await this.layer.transactionImmediate(async (tx) => {
+      /* FNXC:MissionLineageBudget 2026-07-22-14:55: Mission-level cascades retain generated-fix stops even though every hierarchy row is about to disappear. */
+      for (const feature of features) {
+        if (feature.generatedFromFeatureId) await recordGeneratedFixOperatorStop(tx, feature, "feature-delete");
+      }
+      await deleteMission(tx, id);
+    });
     this.emit("mission:deleted", id);
+  }
+
+  /**
+   * FNXC:MissionLineageBudget 2026-07-22-12:00:
+   * Resume is the only seam that clears operator intervention. Classify every
+   * stopped root before mutating so a budget or unknown legacy root cannot
+   * partially reactivate a mission.
+   */
+  async resumeMission(id: string): Promise<Mission> {
+    const result = await this.layer.transactionImmediate(async (tx) => {
+      const mission = await getMission(tx, id);
+      if (!mission) throw new Error(`Mission ${id} not found`);
+      const allFeatures = await listAllFeatures(tx);
+      const featureMission = new Map<string, string>();
+      for (const feature of allFeatures) {
+        const slice = await getSlice(tx, feature.sliceId);
+        const milestone = slice ? await getMilestone(tx, slice.milestoneId) : undefined;
+        if (milestone) featureMission.set(feature.id, milestone.missionId);
+      }
+      const stops = await tx.select().from(schema.project.missionLineageStops)
+        .where(and(eq(schema.project.missionLineageStops.projectId, missionProjectId()), eq(schema.project.missionLineageStops.missionId, id))).for("update");
+      const roots = allFeatures.filter((feature) => featureMission.get(feature.id) === id && !feature.generatedFromFeatureId && feature.loopState === "blocked");
+      const stopIds = new Set(stops.map((stop) => stop.rootFeatureId));
+      const blockers = roots.filter((root) => root.implementationStopReason !== "operator-intervention")
+        .map((root) => ({ id: root.id, reason: root.implementationStopReason ?? "legacy-unknown-stop" }));
+      for (const stop of stops) if (stop.reason !== "operator-intervention") blockers.push({ id: stop.rootFeatureId, reason: stop.reason });
+      if (blockers.length > 0) {
+        const stable = blockers.sort((a, b) => a.id.localeCompare(b.id));
+        throw new MissionResumeConflictError(stable);
+      }
+      for (const root of roots) {
+        if (root.implementationStopReason === "operator-intervention" || stopIds.has(root.id)) {
+          await updateFeature(tx, { ...root, loopState: "needs_fix", implementationStopReason: undefined, implementationStoppedAt: undefined, implementationStopOrigin: undefined, updatedAt: new Date().toISOString() });
+        }
+      }
+      if (stops.length > 0) await tx.delete(schema.project.missionLineageStops).where(and(eq(schema.project.missionLineageStops.projectId, missionProjectId()), eq(schema.project.missionLineageStops.missionId, id)));
+      const updated = { ...mission, status: "active" as MissionStatus, updatedAt: new Date().toISOString() };
+      await updateMission(tx, updated);
+      return updated;
+    });
+    this.emit("mission:updated", result);
+    return result;
   }
 
   async updateMissionInterviewState(id: string, state: InterviewState): Promise<Mission> {
@@ -619,6 +760,7 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     };
     const created = await createMilestone(handle, milestone);
     this.emit("milestone:created", created);
+    await this.synchronizeMilestoneAcceptanceAssertion(created);
     return created;
   }
 
@@ -643,8 +785,43 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     };
     await updateMilestone(this.db, updated);
     this.emit("milestone:updated", updated);
+    if (updates.acceptanceCriteria !== undefined) {
+      await this.synchronizeMilestoneAcceptanceAssertion(updated);
+    }
     await this.recomputeMissionStatus(updated.missionId);
     return updated;
+  }
+
+  /*
+  FNXC:MissionValidation 2026-07-23-14:30:
+  Acceptance prose has exactly one store-managed milestone assertion selected by
+  durable origin. Authored/imported rows are never selected by text or title and
+  survive criteria edits/removal unchanged.
+  */
+  private async synchronizeMilestoneAcceptanceAssertion(milestone: Milestone): Promise<void> {
+    const existing = (await listContractAssertions(this.db, milestone.id))
+      .find((assertion) => assertion.origin === "derived_milestone_acceptance");
+    const criteria = milestone.acceptanceCriteria?.trim();
+    if (!criteria) {
+      if (existing) await this.deleteContractAssertion(existing.id);
+      return;
+    }
+    if (!existing) {
+      await this.addContractAssertion(milestone.id, {
+        title: "Milestone acceptance criteria",
+        assertion: criteria,
+        scope: "milestone",
+        origin: "derived_milestone_acceptance",
+      });
+      return;
+    }
+    if (existing.assertion !== criteria) {
+      await this.updateContractAssertion(existing.id, {
+        title: "Milestone acceptance criteria",
+        assertion: criteria,
+        status: "pending",
+      });
+    }
   }
 
   async deleteMilestone(id: string, force = false): Promise<void> {
@@ -660,13 +837,19 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
         `Milestone ${id} has features linked to live tasks: ${blockingLinks.map((link) => `${link.featureId}->${link.taskId}`).join(", ")}; pass force to delete anyway`,
       );
     }
-    if (force) {
-      for (const link of blockingLinks) {
-        await unlinkFeatureFromTaskId(this.db, link.featureId);
-        await clearTaskMissionLinkage(this.db, link.taskId);
+    await this.layer.transactionImmediate(async (tx) => {
+      /* FNXC:MissionLineageBudget 2026-07-22-14:50: Cascade deletion records every generated descendant's root stop before FK cascades erase lineage. */
+      for (const feature of features) {
+        if (feature.generatedFromFeatureId) await recordGeneratedFixOperatorStop(tx, feature, "feature-delete");
       }
-    }
-    await deleteMilestone(this.db, id);
+      if (force) {
+        for (const link of blockingLinks) {
+          await unlinkFeatureFromTaskId(tx, link.featureId);
+          await clearTaskMissionLinkage(tx, link.taskId);
+        }
+      }
+      await deleteMilestone(tx, id);
+    });
     this.emit("milestone:deleted", id);
     await this.recomputeMissionStatus(missionId);
   }
@@ -756,13 +939,19 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
         `Slice ${id} has features linked to live tasks: ${blockingLinks.map((link) => `${link.featureId}->${link.taskId}`).join(", ")}; pass force to delete anyway`,
       );
     }
-    if (force) {
-      for (const link of blockingLinks) {
-        await unlinkFeatureFromTaskId(this.db, link.featureId);
-        await clearTaskMissionLinkage(this.db, link.taskId);
+    await this.layer.transactionImmediate(async (tx) => {
+      /* FNXC:MissionLineageBudget 2026-07-22-14:50: Cascade deletion records every generated descendant's root stop before FK cascades erase lineage. */
+      for (const feature of features) {
+        if (feature.generatedFromFeatureId) await recordGeneratedFixOperatorStop(tx, feature, "feature-delete");
       }
-    }
-    await deleteSlice(this.db, id);
+      if (force) {
+        for (const link of blockingLinks) {
+          await unlinkFeatureFromTaskId(tx, link.featureId);
+          await clearTaskMissionLinkage(tx, link.taskId);
+        }
+      }
+      await deleteSlice(tx, id);
+    });
     this.emit("slice:deleted", id);
     await this.recomputeMilestoneStatus(milestoneId);
   }
@@ -894,15 +1083,24 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     const sliceId = feature.sliceId;
     const slice = await getSlice(this.db, sliceId);
     const milestoneId = slice?.milestoneId;
-    if (force && feature.taskId) {
-      await unlinkFeatureFromTaskId(this.db, id);
-      await clearTaskMissionLinkage(this.db, feature.taskId);
-    }
-    if (milestoneId) {
-      const managed = (await listContractAssertions(this.db, milestoneId)).find((a) => a.sourceFeatureId === feature.id);
-      if (managed) await this.deleteContractAssertion(managed.id);
-    }
-    await deleteFeature(this.db, id);
+    await this.layer.transactionImmediate(async (tx) => {
+      /*
+      FNXC:MissionLineageBudget 2026-07-22-14:45:
+      Feature removal and its durable intervention record share one transaction.
+      Force-unlinking and assertion cleanup therefore cannot leave a deletion
+      committed after the generated-fix ancestry has been discarded.
+      */
+      if (feature.generatedFromFeatureId) await recordGeneratedFixOperatorStop(tx, feature, "feature-delete");
+      if (force && feature.taskId) {
+        await unlinkFeatureFromTaskId(tx, id);
+        await clearTaskMissionLinkage(tx, feature.taskId);
+      }
+      if (milestoneId) {
+        const managed = (await listContractAssertions(tx, milestoneId)).find((a) => a.sourceFeatureId === feature.id);
+        if (managed) await deleteContractAssertion(tx, managed.id);
+      }
+      await deleteFeature(tx, id);
+    });
     this.emit("feature:deleted", id);
     await this.recomputeSliceStatus(sliceId);
   }
@@ -915,25 +1113,282 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     return updated;
   }
 
-  async linkFeatureToTask(featureId: string, taskId: string): Promise<MissionFeature> {
-    const feature = await getFeature(this.db, featureId);
-    if (!feature) throw new Error(`Feature ${featureId} not found`);
-    const liveTask = await getLiveTaskById(this.db, taskId);
-    if (!liveTask) {
-      throw new Error(
-        `Cannot link feature ${featureId} to task ${taskId}: task is not on the active board (it may be archived, deleted, or never existed). Only active tasks can be linked to features.`,
-      );
+  /**
+   * FNXC:MissionReconciliation 2026-07-20-08:34:
+   * Shipped-delivery repair is a dedicated transaction, not ordinary feature linking. It accepts only a live done row or the supported retained archived tombstone+cold snapshot, preserves conflict guards, leaves loop attempts and mission run controls untouched, and updates only the live task backlink because archived evidence must never be resurrected.
+   */
+  async reconcileFeatureDoneWithTerminalTask(featureId: string, taskId: string): Promise<MissionFeature> {
+    const outcome = await this.layer.transactionImmediate(async (tx) => {
+      const feature = await getFeature(tx, featureId);
+      if (!feature) {
+        throw new TerminalTaskReconciliationError("FEATURE_NOT_FOUND", `Feature ${featureId} not found`);
+      }
+      if (feature.taskId && feature.taskId !== taskId) {
+        throw new TerminalTaskReconciliationError(
+          "FEATURE_TASK_CONFLICT",
+          `Feature ${featureId} is already linked to ${feature.taskId}; cannot reconcile against ${taskId}`,
+        );
+      }
+
+      const evidence = await getTerminalTaskEvidence(tx, taskId);
+      if (evidence.kind === "missing") {
+        throw new TerminalTaskReconciliationError("TASK_NOT_FOUND", `Delivery task ${taskId} not found`);
+      }
+      if (evidence.kind === "nonterminal") {
+        throw new TerminalTaskReconciliationError(
+          "TASK_NOT_TERMINAL",
+          `Delivery task ${taskId} must be in done or supported archived state, not ${evidence.column}`,
+        );
+      }
+      if (evidence.kind === "invalid-deleted") {
+        throw new TerminalTaskReconciliationError(
+          "TASK_ARCHIVE_INVALID",
+          `Delivery task ${taskId} is deleted or archived without a valid retained tombstone and archive snapshot`,
+        );
+      }
+
+      const taskFeature = await getConflictingFeatureByTaskId(tx, taskId, featureId);
+      if (taskFeature) {
+        throw new TerminalTaskReconciliationError(
+          "TASK_FEATURE_CONFLICT",
+          `Delivery task ${taskId} is already linked to feature ${taskFeature.id}`,
+        );
+      }
+
+      const slice = await getSlice(tx, feature.sliceId);
+      if (!slice) throw new TerminalTaskReconciliationError("FEATURE_NOT_FOUND", `Slice ${feature.sliceId} not found`);
+      const milestone = await getMilestone(tx, slice.milestoneId);
+      if (!milestone) throw new TerminalTaskReconciliationError("FEATURE_NOT_FOUND", `Milestone ${slice.milestoneId} not found`);
+      const mission = await getMission(tx, milestone.missionId);
+      if (!mission) throw new TerminalTaskReconciliationError("FEATURE_NOT_FOUND", `Mission ${milestone.missionId} not found`);
+
+      const now = new Date().toISOString();
+      const featureChanged = feature.taskId !== taskId || feature.status !== "done";
+      const reconciledFeature: MissionFeature = featureChanged
+        ? { ...feature, taskId, status: "done", updatedAt: now }
+        : feature;
+      if (featureChanged) await updateFeature(tx, reconciledFeature);
+
+      if (evidence.kind === "done") {
+        await setTaskMissionLinkage(tx, taskId, mission.id, slice.id);
+      }
+
+      const sliceStatus = await this.computeSliceStatusWithHandle(tx, slice.id);
+      const reconciledSlice = slice.status === sliceStatus ? slice : { ...slice, status: sliceStatus, updatedAt: now };
+      if (reconciledSlice !== slice) await updateSlice(tx, reconciledSlice);
+
+      const milestoneStatus = await this.computeMilestoneStatusWithHandle(tx, milestone.id);
+      const reconciledMilestone = milestone.status === milestoneStatus
+        ? milestone
+        : { ...milestone, status: milestoneStatus, updatedAt: now };
+      if (reconciledMilestone !== milestone) await updateMilestone(tx, reconciledMilestone);
+
+      return {
+        feature: reconciledFeature,
+        featureChanged,
+        linked: feature.taskId !== taskId,
+        slice: reconciledSlice !== slice ? reconciledSlice : undefined,
+        milestone: reconciledMilestone !== milestone ? reconciledMilestone : undefined,
+      };
+    });
+
+    if (outcome.featureChanged) this.emit("feature:updated", outcome.feature);
+    if (outcome.linked) this.emit("feature:linked", { feature: outcome.feature, taskId });
+    if (outcome.slice) this.emit("slice:updated", outcome.slice);
+    if (outcome.milestone) this.emit("milestone:updated", outcome.milestone);
+    return outcome.feature;
+  }
+
+  /**
+   * Atomically claim a hand-authored defined feature for a task already inserted
+   * in the caller's transaction. This is intentionally narrower than
+   * linkFeatureToTask(): existing manual links may establish task lineage,
+   * whereas a duplicate bootstrap canonical must already prove this lineage.
+   */
+  async claimDefinedFeatureTaskInTransaction(
+    tx: import("./postgres/data-layer.js").DbTransaction,
+    input: { featureId: string; taskId: string; missionId: string; sliceId: string; requireExistingFeatureLink?: boolean },
+  ): Promise<MissionFeature> {
+    /*
+    FNXC:MissionAdmission 2026-07-23-15:30:
+    Defined is creation-admissible only at the first-task claim boundary. Check
+    the project-scoped task's existing lineage before updating either record so
+    a deterministic duplicate from another mission can never be repurposed.
+    */
+    /*
+    FNXC:MissionAdmission 2026-08-10-00:00:
+    Concurrent bootstrap requests must serialize on the defined Feature before
+    either inserts its task. READ COMMITTED alone permits both readers to claim
+    it; this row lock makes the second request re-read the committed taskId and
+    reject, preserving one exclusive first-task claim.
+    */
+    const lockedFeatures = await tx
+      .select({ id: schema.project.missionFeatures.id })
+      .from(schema.project.missionFeatures)
+      .where(eq(schema.project.missionFeatures.id, input.featureId))
+      .for("update");
+    if (lockedFeatures.length === 0) throw new Error(`Feature ${input.featureId} not found`);
+    const feature = await getFeature(tx, input.featureId);
+    if (!feature) throw new Error(`Feature ${input.featureId} not found`);
+    if (feature.sliceId !== input.sliceId) throw new Error(`Feature ${input.featureId} does not belong to slice ${input.sliceId}`);
+    if (feature.taskId && feature.taskId !== input.taskId) {
+      throw new Error(`Feature ${input.featureId} is already linked to task ${feature.taskId}`);
     }
-    const linkage = await this.resolveTaskLinkage(feature.sliceId);
+    if (feature.status !== "defined" && feature.taskId !== input.taskId) {
+      throw new Error(`Feature ${input.featureId} is not available for first-task bootstrap`);
+    }
+    /*
+    FNXC:MissionAdmission 2026-07-23-17:20:
+    A duplicate canonical was not inserted in this transaction. It may be
+    reused only after this feature already owns it; allowing an arbitrary
+    unlinked task from the same slice would silently assign another feature's
+    work to this bootstrap request.
+    */
+    if (input.requireExistingFeatureLink === true && feature.taskId !== input.taskId) {
+      throw new Error(`Cannot bootstrap feature ${input.featureId}: pre-existing task ${input.taskId} is not linked to this feature`);
+    }
+
+    const projectId = this.layer.projectId;
+    if (!projectId) throw new Error("Defined-feature bootstrap requires a project-scoped data layer");
+    const taskRows = await tx
+      .select({ id: schema.project.tasks.id, missionId: schema.project.tasks.missionId, sliceId: schema.project.tasks.sliceId, column: schema.project.tasks.column })
+      .from(schema.project.tasks)
+      .where(and(
+        eq(schema.project.tasks.projectId, projectId),
+        eq(schema.project.tasks.id, input.taskId),
+        sql`${schema.project.tasks.deletedAt} is null`,
+      ));
+    const task = taskRows[0];
+    if (!task || task.column === "archived") {
+      throw new Error(`Cannot bootstrap feature ${input.featureId}: task ${input.taskId} is not active in this project`);
+    }
+    if (task.missionId !== input.missionId || task.sliceId !== input.sliceId) {
+      throw new Error(`Cannot bootstrap feature ${input.featureId}: task ${input.taskId} has unrelated mission lineage`);
+    }
+    const conflict = await getConflictingFeatureByTaskId(tx, input.taskId, input.featureId);
+    if (conflict) throw new Error(`Task ${input.taskId} is already linked to feature ${conflict.id}`);
+
+    const now = new Date().toISOString();
     const shouldTransitionLoop = !feature.loopState || feature.loopState === "idle";
-    const loopStateUpdates: Partial<MissionFeature> = shouldTransitionLoop
-      ? { loopState: "implementing", implementationAttemptCount: 1 }
-      : {};
-    const updated = await this.updateFeature(featureId, { taskId, status: "triaged", ...loopStateUpdates });
-    await setTaskMissionLinkage(this.db, taskId, linkage.missionId, linkage.sliceId);
-    await this.recomputeSliceStatus(updated.sliceId);
-    this.emit("feature:linked", { feature: updated, taskId });
+    const updated: MissionFeature = {
+      ...feature,
+      taskId: input.taskId,
+      status: "triaged",
+      ...(shouldTransitionLoop ? { loopState: "implementing", implementationAttemptCount: 1 } : {}),
+      updatedAt: now,
+    };
+    await updateFeature(tx, updated);
+    // The inserted task already carries this verified linkage; retain this write
+    // for retry parity when the same canonical is claimed again.
+    await setTaskMissionLinkage(tx, input.taskId, input.missionId, input.sliceId);
     return updated;
+  }
+
+  async claimDefinedFeatureTask(input: { featureId: string; taskId: string; missionId: string; sliceId: string }): Promise<MissionFeature> {
+    const feature = await this.layer.transactionImmediate((tx) => this.claimDefinedFeatureTaskInTransaction(tx, { ...input, requireExistingFeatureLink: true }));
+    this.emit("feature:updated", feature);
+    this.emit("feature:linked", { feature, taskId: input.taskId });
+    await this.recomputeSliceStatus(feature.sliceId);
+    return feature;
+  }
+
+  /**
+   * Keep the task that atomically claimed a defined Feature as the sole live
+   * deterministic-duplicate canonical. This compensates for a duplicate that
+   * became visible only after the create preflight, without ever allowing the
+   * generic intake path to archive feature.taskId.
+   */
+  async archiveDefinedFeatureBootstrapDuplicate(input: { featureId: string; taskId: string; duplicateTaskId: string }): Promise<void> {
+    /*
+    FNXC:MissionAdmission 2026-07-23-21:10:
+    Project-agnostic legacy stores remain scoped to their reserved RLS
+    partition, so reconciliation never falls back to an unscoped task ID.
+    */
+    const projectId = this.layer.projectId || "__legacy_unscoped__";
+    await this.layer.transactionImmediate(async (tx) => {
+      /*
+      FNXC:MissionAdmission 2026-07-23-20:00:
+      A late deterministic duplicate must not reverse the first-task claim and
+      archive feature.taskId. Verify that the feature still owns the claimed,
+      project-scoped live task, then archive only the competing live task in
+      this transaction. `defined` remains scheduler-ineligible throughout.
+      */
+      const feature = await getFeature(tx, input.featureId);
+      if (!feature || feature.taskId !== input.taskId || feature.status !== "triaged") {
+        throw new Error(`Cannot reconcile defined-feature bootstrap duplicate for ${input.featureId}`);
+      }
+      const claimed = await tx.select({ id: schema.project.tasks.id })
+        .from(schema.project.tasks)
+        .where(and(
+          eq(schema.project.tasks.projectId, projectId),
+          eq(schema.project.tasks.id, input.taskId),
+          sql`${schema.project.tasks.deletedAt} is null`,
+          sql`${schema.project.tasks.column} <> 'archived'`,
+        ));
+      if (!claimed[0]) throw new Error(`Cannot reconcile defined-feature bootstrap duplicate: claimed task ${input.taskId} is not live`);
+      /*
+      FNXC:MissionAdmission 2026-07-23-21:10:
+      Fingerprint equality does not make work interchangeable across Features.
+      A late sibling already claimed by another Feature remains live; archiving
+      it here would corrupt that Feature's canonical task. Keep both tasks and
+      let each feature retain its own transactional bootstrap claim.
+      */
+      const duplicateFeature = await getConflictingFeatureByTaskId(tx, input.duplicateTaskId, input.featureId);
+      if (duplicateFeature) return;
+      await tx.update(schema.project.tasks)
+        .set({ column: "archived", updatedAt: new Date().toISOString() })
+        .where(and(
+          eq(schema.project.tasks.projectId, projectId),
+          eq(schema.project.tasks.id, input.duplicateTaskId),
+          sql`${schema.project.tasks.deletedAt} is null`,
+          sql`${schema.project.tasks.column} <> 'archived'`,
+        ));
+    });
+  }
+
+  async linkFeatureToTask(featureId: string, taskId: string): Promise<MissionFeature> {
+    /*
+    FNXC:MissionAdmission 2026-07-23-12:00:
+    First-task bootstrap must claim the feature, promote it, and backlink the
+    exact project-scoped task as one transaction. Never overwrite a feature's
+    existing taskId: retries may reuse only that same canonical task.
+    */
+    const outcome = await this.layer.transactionImmediate(async (tx) => {
+      const feature = await getFeature(tx, featureId);
+      if (!feature) throw new Error(`Feature ${featureId} not found`);
+      if (feature.taskId && feature.taskId !== taskId) {
+        throw new Error(`Feature ${featureId} is already linked to task ${feature.taskId}`);
+      }
+      const liveTask = await getLiveTaskById(tx, taskId);
+      if (!liveTask) {
+        throw new Error(
+          `Cannot link feature ${featureId} to task ${taskId}: task is not on the active board (it may be archived, deleted, or never existed). Only active tasks can be linked to features.`,
+        );
+      }
+      const conflictingFeature = await getConflictingFeatureByTaskId(tx, taskId, featureId);
+      if (conflictingFeature) {
+        throw new Error(`Task ${taskId} is already linked to feature ${conflictingFeature.id}`);
+      }
+      const slice = await getSlice(tx, feature.sliceId);
+      const milestone = slice ? await getMilestone(tx, slice.milestoneId) : undefined;
+      if (!slice || !milestone) throw new Error(`Feature ${featureId} has incomplete mission hierarchy`);
+      const shouldTransitionLoop = !feature.loopState || feature.loopState === "idle";
+      const now = new Date().toISOString();
+      const updated: MissionFeature = {
+        ...feature,
+        taskId,
+        status: "triaged",
+        ...(shouldTransitionLoop ? { loopState: "implementing", implementationAttemptCount: 1 } : {}),
+        updatedAt: now,
+      };
+      await updateFeature(tx, updated);
+      await setTaskMissionLinkage(tx, taskId, milestone.missionId, slice.id);
+      return updated;
+    });
+    this.emit("feature:updated", outcome);
+    this.emit("feature:linked", { feature: outcome, taskId });
+    await this.recomputeSliceStatus(outcome.sliceId);
+    return outcome;
   }
 
   async unlinkFeatureFromTask(featureId: string): Promise<MissionFeature> {
@@ -1089,18 +1544,46 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     return ids.map((id) => featuresById.get(id)).find((feature) => feature && feature.status !== "done" && feature.status !== "blocked");
   }
 
+  /**
+   * FNXC:MissionLineageBudget 2026-07-22-12:00:
+   * A generated fix is never a new budget owner. Resolve its parent chain while
+   * the caller transaction is open; missing or cyclic evidence fails closed.
+   */
+  private async resolveFixRoot(handle: QueryHandle, feature: MissionFeature): Promise<MissionFeature> {
+    const seen = new Set<string>();
+    let current = feature;
+    while (current.generatedFromFeatureId) {
+      if (seen.has(current.id)) throw new Error("MISSION_LINEAGE_UNRESOLVED: cyclic generated-fix lineage");
+      seen.add(current.id);
+      const parent = await getFeature(handle, current.generatedFromFeatureId);
+      if (!parent) throw new Error("MISSION_LINEAGE_UNRESOLVED: missing generated-fix ancestor");
+      current = parent;
+    }
+    if (seen.has(current.id)) throw new Error("MISSION_LINEAGE_UNRESOLVED: cyclic generated-fix lineage");
+    return current;
+  }
+
+  private async getRootStop(handle: QueryHandle, rootFeatureId: string) {
+    const rows = await handle.select().from(schema.project.missionLineageStops)
+      .where(and(eq(schema.project.missionLineageStops.projectId, missionProjectId()), eq(schema.project.missionLineageStops.rootFeatureId, rootFeatureId)));
+    return rows[0];
+  }
+
   async createGeneratedFixFeature(
     sourceFeatureId: string,
     runId: string,
     failedAssertionIds: string[],
     failureReason?: string,
     title?: string,
+    diagnostics?: ValidationDiagnostics,
   ): Promise<MissionFeature> {
     const run = await getValidatorRun(this.db, runId);
     if (!run) throw new Error(`Validator run ${runId} not found`);
     if (run.featureId !== sourceFeatureId) throw new Error(`Validator run ${runId} belongs to feature ${run.featureId}, expected ${sourceFeatureId}`);
     const now = new Date().toISOString();
     const reasonText = failureReason?.trim();
+    // FNXC:MissionValidationDiagnostics 2026-07-23-12:00: PostgreSQL remediation uses the identical shared cause renderer as SQLite to prevent backend-specific operator diagnostics.
+    const causeText = diagnostics ? renderValidationCause(diagnostics) : undefined;
     /*
     FNXC:MissionFixIdempotency 2026-07-14-18:45:
     Generated remediation is one source/run operation. Lock the source feature, re-check lineage/open fixes under that lock, and increment the retry counter in the same transaction so concurrent validator workers cannot create duplicates or consume two attempts.
@@ -1109,15 +1592,34 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
       | { kind: "existing"; feature: MissionFeature }
       | { kind: "created"; feature: MissionFeature }
       | { kind: "exhausted" }
+      | { kind: "stopped"; reason: string }
     > => {
       const locked = await tx
         .select({ id: schema.project.missionFeatures.id })
         .from(schema.project.missionFeatures)
-        .where(eq(schema.project.missionFeatures.id, sourceFeatureId))
+        .where(and(
+          eq(schema.project.missionFeatures.projectId, missionProjectId()),
+          eq(schema.project.missionFeatures.id, sourceFeatureId),
+        ))
         .for("update");
       if (locked.length === 0) throw new Error(`Feature ${sourceFeatureId} not found`);
       const source = await getFeature(tx, sourceFeatureId);
       if (!source) throw new Error(`Feature ${sourceFeatureId} not found`);
+      const root = await this.resolveFixRoot(tx, source);
+      // Lock the canonical owner, not the generated child that happened to fail.
+      const rootLocked = await tx.select({ id: schema.project.missionFeatures.id }).from(schema.project.missionFeatures)
+        .where(and(
+          eq(schema.project.missionFeatures.projectId, missionProjectId()),
+          eq(schema.project.missionFeatures.id, root.id),
+        )).for("update");
+      if (rootLocked.length !== 1) throw new Error("MISSION_LINEAGE_UNRESOLVED: canonical root disappeared");
+      const lockedRoot = await getFeature(tx, root.id);
+      if (!lockedRoot) throw new Error("MISSION_LINEAGE_UNRESOLVED: canonical root disappeared");
+      const durableStop = await this.getRootStop(tx, root.id);
+      if (durableStop) return { kind: "stopped", reason: durableStop.reason };
+      if (lockedRoot.loopState === "blocked") {
+        return { kind: "stopped", reason: lockedRoot.implementationStopReason ?? "legacy-unknown-stop" };
+      }
 
       const exactId = await findFixFeatureId(tx, sourceFeatureId, runId);
       if (exactId) {
@@ -1129,8 +1631,15 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
       const open = openFeatures.find((candidate) => candidate.status !== "done" && candidate.status !== "blocked");
       if (open) return { kind: "existing", feature: open };
 
-      if ((source.implementationAttemptCount ?? 0) >= DEFAULT_IMPLEMENTATION_RETRY_BUDGET) {
-        await updateFeature(tx, { ...source, loopState: "blocked", updatedAt: now });
+      if ((lockedRoot.implementationAttemptCount ?? 0) >= DEFAULT_IMPLEMENTATION_RETRY_BUDGET) {
+        await updateFeature(tx, {
+          ...lockedRoot,
+          loopState: "blocked",
+          implementationStopReason: "budget-exhausted",
+          implementationStoppedAt: now,
+          implementationStopOrigin: "retry-budget",
+          updatedAt: now,
+        });
         return { kind: "exhausted" };
       }
 
@@ -1138,7 +1647,7 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
         id: this.generateId("F"),
         sliceId: source.sliceId,
         title: title ?? `Fix: ${source.title}`,
-        description: reasonText ? `${source.description ? `${source.description}\n\n` : ""}## Verification failure detail\n${reasonText}` : source.description,
+        description: [source.description, causeText ?? (reasonText ? `## Verification failure detail\n${reasonText}` : undefined)].filter(Boolean).join("\n\n") || undefined,
         acceptanceCriteria: source.acceptanceCriteria,
         status: "defined",
         createdAt: now,
@@ -1159,18 +1668,26 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
           updatedAt: now,
         })
         .where(and(
-          eq(schema.project.missionFeatures.id, sourceFeatureId),
+          eq(schema.project.missionFeatures.projectId, missionProjectId()),
+          eq(schema.project.missionFeatures.id, root.id),
           sql`${schema.project.missionFeatures.implementationAttemptCount} < ${DEFAULT_IMPLEMENTATION_RETRY_BUDGET}`,
         ))
         .returning({ id: schema.project.missionFeatures.id });
-      if (bumped.length !== 1) throw new Error(`Feature ${sourceFeatureId} retry budget changed while creating its generated fix`);
+      if (bumped.length !== 1) throw new Error(`Feature ${root.id} retry budget changed while creating its generated fix`);
       return { kind: "created", feature };
     });
     if (outcome.kind === "existing") return outcome.feature;
     if (outcome.kind === "exhausted") {
       const updatedSource = await getFeature(this.db, sourceFeatureId);
       if (updatedSource) this.emit("feature:updated", updatedSource);
-      throw new Error(`Feature ${sourceFeatureId} has exhausted its retry budget (${DEFAULT_IMPLEMENTATION_RETRY_BUDGET} attempts). Transitioning to 'blocked' state.`);
+      throw new MissionRemediationStoppedError("budget-exhausted");
+    }
+    if (outcome.kind === "stopped") {
+      throw new MissionRemediationStoppedError(
+        outcome.reason === "budget-exhausted" || outcome.reason === "operator-intervention"
+          ? outcome.reason
+          : "legacy-unknown-stop",
+      );
     }
     const feature = outcome.feature;
     this.emit("feature:created", feature);
@@ -1230,11 +1747,53 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     const feature = await getFeature(this.db, featureId);
     if (!feature) throw new Error(`Feature ${featureId} not found`);
     const current = feature.loopState ?? "idle";
-    const valid: Record<FeatureLoopState, FeatureLoopState[]> = { idle: ["implementing"], implementing: ["validating"], validating: ["needs_fix", "passed", "blocked"], needs_fix: ["implementing"], passed: [], blocked: [] };
-    if (!valid[current].includes(newState)) throw new Error(`Invalid loop state transition from '${current}' to '${newState}'. Allowed transitions from '${current}': ${valid[current].join(", ") || "none"}`);
+    const allowedNextStates = FEATURE_LOOP_TRANSITIONS[current] || [];
+    if (!allowedNextStates.includes(newState)) throw new Error(`Invalid loop state transition from '${current}' to '${newState}'. Allowed transitions from '${current}': ${allowedNextStates.join(", ") || "none"}`);
     if (newState === "implementing" && (feature.implementationAttemptCount ?? 0) >= DEFAULT_IMPLEMENTATION_RETRY_BUDGET) {
       await this.updateFeature(featureId, { loopState: "blocked" });
       throw new Error(`Feature ${featureId} has exhausted its retry budget (${DEFAULT_IMPLEMENTATION_RETRY_BUDGET} attempts). Transitioning to 'blocked' state.`);
+    }
+
+    /*
+    FNXC:MissionRecovery 2026-07-21-21:30:
+    Recovering validating to implementing must terminalize the interrupted validator run in the same transaction as the feature transition. A stale reaper or delayed validator completion must not overwrite the resumed feature with an outcome from the abandoned validation cycle.
+    */
+    if (current === "validating" && newState === "implementing" && feature.lastValidatorRunId) {
+      const run = await getValidatorRun(this.db, feature.lastValidatorRunId);
+      if (run?.status === "running") {
+        const now = new Date().toISOString();
+        const interruptedRun: MissionValidatorRun = {
+          ...run,
+          status: "error",
+          summary: "Interrupted validation was superseded by loop-state recovery",
+          completedAt: now,
+          updatedAt: now,
+        };
+        const won = await this.layer.transactionImmediate(async (tx) => {
+          const terminalRun = await transitionRunningValidatorRun(tx, interruptedRun);
+          if (!terminalRun) return false;
+          await updateFeature(tx, {
+            ...feature,
+            loopState: "implementing",
+            lastValidatorStatus: "error",
+            updatedAt: now,
+          });
+          return true;
+        });
+        if (won) {
+          const updated = await getFeature(this.db, featureId);
+          if (!updated) throw new Error(`Feature ${featureId} not found after recovery`);
+          this.emit("feature:updated", updated);
+          this.emit("validator-run:completed", interruptedRun, "error", Math.max(0, Date.parse(now) - Date.parse(run.startedAt)));
+          return updated;
+        }
+
+        const freshFeature = await getFeature(this.db, featureId);
+        const freshCurrent = freshFeature?.loopState ?? "idle";
+        if (freshCurrent !== "validating") {
+          throw new Error(`Invalid loop state transition from '${freshCurrent}' to '${newState}'. Allowed transitions from '${freshCurrent}': ${(FEATURE_LOOP_TRANSITIONS[freshCurrent] || []).join(", ") || "none"}`);
+        }
+      }
     }
     return this.updateFeature(featureId, { loopState: newState });
   }
@@ -1271,13 +1830,25 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
   async addContractAssertion(milestoneId: string, input: ContractAssertionCreateInput): Promise<MissionContractAssertion> {
     const milestone = await getMilestone(this.db, milestoneId);
     if (!milestone) throw new Error(`Milestone ${milestoneId} not found`);
-    const now = new Date().toISOString();
+    const origin = input.origin ?? "authored";
     const existing = await listContractAssertions(this.db, milestoneId);
+    if (origin === "derived_milestone_acceptance"
+      && existing.some((assertion) => assertion.origin === "derived_milestone_acceptance")) {
+      /*
+      FNXC:MissionValidation 2026-07-23-17:20:
+      Reject duplicate canonical provenance before insert; PostgreSQL also
+      enforces this at rest, while authored/imported rows stay non-unique.
+      */
+      throw new Error(`Milestone ${milestoneId} already has a derived milestone acceptance assertion`);
+    }
+    const now = new Date().toISOString();
     const orderIndex = existing.length > 0 ? Math.max(...existing.map((a) => a.orderIndex)) + 1 : 0;
     const assertion: MissionContractAssertion = {
       id: this.generateId("CA"),
       milestoneId,
       sourceFeatureId: input.sourceFeatureId,
+      scope: input.scope ?? "feature",
+      origin,
       title: input.title,
       assertion: input.assertion,
       status: input.status || "pending",
@@ -1340,6 +1911,10 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
     if (!feature) throw new Error(`Feature ${featureId} not found`);
     const assertion = await getContractAssertion(this.db, assertionId);
     if (!assertion) throw new Error(`Assertion ${assertionId} not found`);
+    // FNXC:MissionValidation 2026-07-23-15:05: Rollup-owned assertions are never feature evidence.
+    if (assertion.scope === "milestone") {
+      throw new Error(`Milestone-scoped assertion ${assertionId} cannot be linked to feature ${featureId}`);
+    }
     if (await featureAssertionLinkExists(this.db, featureId, assertionId)) {
       throw new Error(`Feature ${featureId} is already linked to assertion ${assertionId}`);
     }
@@ -1479,7 +2054,9 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
         case "blocked": blockedAssertions++; break;
         case "pending": pendingAssertions++; break;
       }
-      if (!linkedAssertionIds.has(assertion.id)) unlinkedAssertions++;
+      // Rollup assertions are milestone-owned and intentionally have no
+      // feature link; only feature-scoped assertions need coverage.
+      if (assertion.scope !== "milestone" && !linkedAssertionIds.has(assertion.id)) unlinkedAssertions++;
     }
 
     /*
@@ -1719,10 +2296,14 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
 
   // ════════════════ STATUS ROLLUP ════════════════
   async computeSliceStatus(sliceId: string): Promise<SliceStatus> {
-    const features = await listFeatures(this.db, sliceId);
+    return this.computeSliceStatusWithHandle(this.db, sliceId);
+  }
+
+  private async computeSliceStatusWithHandle(handle: QueryHandle, sliceId: string): Promise<SliceStatus> {
+    const features = await listFeatures(handle, sliceId);
     if (features.length === 0) return "pending";
     /* FNXC:MissionStatusPerformance 2026-07-14-18:45: Slice reconciliation loads assertion membership for the whole feature set once; status rollups must not issue one assertion query per feature. */
-    const featureIdsWithAssertions = await listFeatureIdsWithAssertions(this.db, features.map((feature) => feature.id));
+    const featureIdsWithAssertions = await listFeatureIdsWithAssertions(handle, features.map((feature) => feature.id));
     let allDone = true;
     for (const feature of features) {
       if (feature.status !== "done") { allDone = false; break; }
@@ -1739,7 +2320,11 @@ export class AsyncMissionStore extends EventEmitter<MissionStoreEvents> {
   }
 
   async computeMilestoneStatus(milestoneId: string): Promise<MilestoneStatus> {
-    const slices = await listSlices(this.db, milestoneId);
+    return this.computeMilestoneStatusWithHandle(this.db, milestoneId);
+  }
+
+  private async computeMilestoneStatusWithHandle(handle: QueryHandle, milestoneId: string): Promise<MilestoneStatus> {
+    const slices = await listSlices(handle, milestoneId);
     if (slices.length === 0) return "planning";
     const allComplete = slices.every((s) => s.status === "complete");
     if (allComplete) return "complete";

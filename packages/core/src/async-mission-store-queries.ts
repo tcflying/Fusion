@@ -42,10 +42,10 @@
  *   These helpers are the production MissionStore persistence path and program
  *   against AsyncDataLayer rather than a synchronous SQLite database.
  */
-import { and, asc, desc, eq, inArray, sql, type AnyColumn, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, sql, type AnyColumn, type SQL } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
-import { normalizeMissionAssertionType } from "./mission-types.js";
+import { normalizeMissionAssertionOrigin, normalizeMissionAssertionScope, normalizeMissionAssertionType } from "./mission-types.js";
 import type {
   Mission,
   MissionBranchStrategy,
@@ -106,7 +106,7 @@ export type QueryHandle = AsyncDataLayer["db"] | DbTransaction;
 FNXC:MissionProjectIsolation 2026-07-14-21:35:
 Mission data lives in the shared PostgreSQL project schema, so every mission-owned insert and predicate must use the session's authoritative project partition even when an administrative connection bypasses row-level security. An unbound maintenance session is confined to the explicit legacy quarantine rather than becoming a cross-project reader.
 */
-function missionProjectId(): SQL<string> {
+export function missionProjectId(): SQL<string> {
   return sql<string>`COALESCE(NULLIF(current_setting('fusion.project_id', true), ''), '__legacy_unscoped__')`;
 }
 
@@ -178,6 +178,9 @@ interface FeatureRow {
   loopState: string | null;
   implementationAttemptCount: number | null;
   validatorAttemptCount: number | null;
+  implementationStopReason: string | null;
+  implementationStoppedAt: string | null;
+  implementationStopOrigin: string | null;
   lastValidatorRunId: string | null;
   lastValidatorStatus: string | null;
   generatedFromFeatureId: string | null;
@@ -221,6 +224,8 @@ export interface AssertionRow {
   type: string | null;
   orderIndex: number;
   sourceFeatureId: string | null;
+  scope: string | null;
+  origin: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -333,6 +338,9 @@ const featureColumns = {
   loopState: schema.project.missionFeatures.loopState,
   implementationAttemptCount: schema.project.missionFeatures.implementationAttemptCount,
   validatorAttemptCount: schema.project.missionFeatures.validatorAttemptCount,
+  implementationStopReason: schema.project.missionFeatures.implementationStopReason,
+  implementationStoppedAt: schema.project.missionFeatures.implementationStoppedAt,
+  implementationStopOrigin: schema.project.missionFeatures.implementationStopOrigin,
   lastValidatorRunId: schema.project.missionFeatures.lastValidatorRunId,
   lastValidatorStatus: schema.project.missionFeatures.lastValidatorStatus,
   generatedFromFeatureId: schema.project.missionFeatures.generatedFromFeatureId,
@@ -367,6 +375,8 @@ export const assertionColumns = {
   type: schema.project.missionContractAssertions.type,
   orderIndex: schema.project.missionContractAssertions.orderIndex,
   sourceFeatureId: schema.project.missionContractAssertions.sourceFeatureId,
+  scope: schema.project.missionContractAssertions.scope,
+  origin: schema.project.missionContractAssertions.origin,
   createdAt: schema.project.missionContractAssertions.createdAt,
   updatedAt: schema.project.missionContractAssertions.updatedAt,
 };
@@ -492,6 +502,9 @@ function rowToFeature(row: FeatureRow): MissionFeature {
     loopState: (row.loopState as FeatureLoopState) || "idle",
     implementationAttemptCount: row.implementationAttemptCount ?? 0,
     validatorAttemptCount: row.validatorAttemptCount ?? 0,
+    implementationStopReason: (row.implementationStopReason ?? undefined) as MissionFeature["implementationStopReason"],
+    implementationStoppedAt: row.implementationStoppedAt ?? undefined,
+    implementationStopOrigin: row.implementationStopOrigin ?? undefined,
     lastValidatorRunId: row.lastValidatorRunId ?? undefined,
     lastValidatorStatus: (row.lastValidatorStatus as ValidatorRunStatus) ?? undefined,
     generatedFromFeatureId: row.generatedFromFeatureId ?? undefined,
@@ -535,6 +548,8 @@ export function rowToAssertion(row: AssertionRow): MissionContractAssertion {
     id: row.id,
     milestoneId: row.milestoneId,
     sourceFeatureId: row.sourceFeatureId ?? undefined,
+    scope: normalizeMissionAssertionScope(row.scope),
+    origin: normalizeMissionAssertionOrigin(row.origin),
     title: row.title,
     assertion: row.assertion,
     status: row.status as MissionContractAssertion["status"],
@@ -935,6 +950,9 @@ export async function createFeature(handle: QueryHandle, feature: MissionFeature
     loopState: feature.loopState ?? "idle",
     implementationAttemptCount: feature.implementationAttemptCount ?? 0,
     validatorAttemptCount: feature.validatorAttemptCount ?? 0,
+    implementationStopReason: feature.implementationStopReason ?? null,
+    implementationStoppedAt: feature.implementationStoppedAt ?? null,
+    implementationStopOrigin: feature.implementationStopOrigin ?? null,
     lastValidatorRunId: feature.lastValidatorRunId ?? null,
     lastValidatorStatus: feature.lastValidatorStatus ?? null,
     generatedFromFeatureId: feature.generatedFromFeatureId ?? null,
@@ -1030,6 +1048,9 @@ export async function updateFeature(handle: QueryHandle, feature: MissionFeature
       loopState: feature.loopState ?? "idle",
       implementationAttemptCount: feature.implementationAttemptCount ?? 0,
       validatorAttemptCount: feature.validatorAttemptCount ?? 0,
+      implementationStopReason: feature.implementationStopReason ?? null,
+      implementationStoppedAt: feature.implementationStoppedAt ?? null,
+      implementationStopOrigin: feature.implementationStopOrigin ?? null,
       lastValidatorRunId: feature.lastValidatorRunId ?? null,
       lastValidatorStatus: feature.lastValidatorStatus ?? null,
       generatedFromFeatureId: feature.generatedFromFeatureId ?? null,
@@ -1048,6 +1069,92 @@ export async function deleteFeature(handle: QueryHandle, id: string): Promise<bo
     .where(and(missionProjectScope(schema.project.missionFeatures.projectId), eq(schema.project.missionFeatures.id, id)))
     .returning({ id: schema.project.missionFeatures.id });
   return result.length > 0;
+}
+
+/**
+ * FNXC:MissionLineageBudget 2026-07-22-14:30:
+ * Removal of a generated remediation is explicit operator intervention for its
+ * canonical root. This transaction-scoped helper records that fact before any
+ * feature/task unlink or hierarchy cascade can erase the ancestry needed to
+ * resolve the root; its standalone stop row deliberately survives root removal.
+ */
+export async function recordGeneratedFixOperatorStop(
+  handle: QueryHandle,
+  feature: MissionFeature,
+  origin: "feature-delete" | "task-archive" | "task-delete",
+): Promise<boolean> {
+  if (!feature.generatedFromFeatureId) return false;
+
+  const seen = new Set<string>();
+  let root = feature;
+  while (root.generatedFromFeatureId) {
+    if (seen.has(root.id)) throw new Error("MISSION_LINEAGE_UNRESOLVED: cyclic generated-fix lineage");
+    seen.add(root.id);
+    const parent = await getFeature(handle, root.generatedFromFeatureId);
+    if (!parent) throw new Error("MISSION_LINEAGE_UNRESOLVED: missing generated-fix ancestor");
+    root = parent;
+  }
+  if (seen.has(root.id)) throw new Error("MISSION_LINEAGE_UNRESOLVED: cyclic generated-fix lineage");
+
+  /*
+  FNXC:MissionLineageBudget 2026-08-03-00:00:
+  Deletion/archive must acquire the same project-scoped canonical-root lock as
+  generated-fix creation before recording its durable stop. This serializes an
+  intervention with remediation admission, so a waiting creator re-reads the
+  committed stop instead of minting a child from a stale no-stop observation.
+  */
+  const rootLocked = await handle
+    .select({ id: schema.project.missionFeatures.id })
+    .from(schema.project.missionFeatures)
+    .where(and(
+      missionProjectScope(schema.project.missionFeatures.projectId),
+      eq(schema.project.missionFeatures.id, root.id),
+    ))
+    .for("update");
+  if (rootLocked.length !== 1) {
+    throw new Error("MISSION_LINEAGE_UNRESOLVED: canonical root disappeared");
+  }
+  const lockedRoot = await getFeature(handle, root.id);
+  if (!lockedRoot) throw new Error("MISSION_LINEAGE_UNRESOLVED: canonical root disappeared");
+
+  const slice = await getSlice(handle, lockedRoot.sliceId);
+  const milestone = slice ? await getMilestone(handle, slice.milestoneId) : undefined;
+  const now = new Date().toISOString();
+  await handle.insert(schema.project.missionLineageStops).values({
+    projectId: missionProjectId(),
+    rootFeatureId: root.id,
+    missionId: milestone?.missionId ?? null,
+    reason: "operator-intervention",
+    stoppedAt: now,
+    origin,
+  }).onConflictDoNothing();
+  await updateFeature(handle, {
+    ...lockedRoot,
+    loopState: "blocked",
+    implementationStopReason: "operator-intervention",
+    implementationStoppedAt: now,
+    implementationStopOrigin: origin,
+    updatedAt: now,
+  });
+  return true;
+}
+
+/** Return a different feature already using the task, if one exists. */
+export async function getConflictingFeatureByTaskId(
+  handle: QueryHandle,
+  taskId: string,
+  featureId: string,
+): Promise<MissionFeature | undefined> {
+  const rows = await handle
+    .select(featureColumns)
+    .from(schema.project.missionFeatures)
+    .where(and(
+      missionProjectScope(schema.project.missionFeatures.projectId),
+      eq(schema.project.missionFeatures.taskId, taskId),
+      ne(schema.project.missionFeatures.id, featureId),
+    ))
+    .limit(1);
+  return rows[0] ? rowToFeature(rows[0] as FeatureRow) : undefined;
 }
 
 /** Get a feature by its linked taskId (null if no feature is linked). */
@@ -1338,6 +1445,8 @@ export async function createContractAssertion(
     type: normalizeMissionAssertionType(assertion.type),
     orderIndex: assertion.orderIndex,
     sourceFeatureId: assertion.sourceFeatureId ?? null,
+    scope: assertion.scope ?? "feature",
+    origin: assertion.origin ?? "authored",
     createdAt: assertion.createdAt,
     updatedAt: assertion.updatedAt,
   });
@@ -1888,6 +1997,9 @@ export async function upsertFeature(handle: QueryHandle, feature: MissionFeature
       loopState: feature.loopState ?? "idle",
       implementationAttemptCount: feature.implementationAttemptCount ?? 0,
       validatorAttemptCount: feature.validatorAttemptCount ?? 0,
+      implementationStopReason: feature.implementationStopReason ?? null,
+      implementationStoppedAt: feature.implementationStoppedAt ?? null,
+      implementationStopOrigin: feature.implementationStopOrigin ?? null,
       lastValidatorRunId: feature.lastValidatorRunId ?? null,
       lastValidatorStatus: feature.lastValidatorStatus ?? null,
       generatedFromFeatureId: feature.generatedFromFeatureId ?? null,
@@ -1908,6 +2020,9 @@ export async function upsertFeature(handle: QueryHandle, feature: MissionFeature
         loopState: sql`excluded.loop_state`,
         implementationAttemptCount: sql`excluded.implementation_attempt_count`,
         validatorAttemptCount: sql`excluded.validator_attempt_count`,
+        implementationStopReason: sql`excluded.implementation_stop_reason`,
+        implementationStoppedAt: sql`excluded.implementation_stopped_at`,
+        implementationStopOrigin: sql`excluded.implementation_stop_origin`,
         lastValidatorRunId: sql`excluded.last_validator_run_id`,
         lastValidatorStatus: sql`excluded.last_validator_status`,
         generatedFromFeatureId: sql`excluded.generated_from_feature_id`,
@@ -2007,7 +2122,12 @@ export async function listAssertionsForFeature(handle: QueryHandle, featureId: s
         eq(schema.project.missionContractAssertions.id, schema.project.missionFeatureAssertions.assertionId),
       ),
     )
-    .where(and(missionProjectScope(schema.project.missionFeatureAssertions.projectId), eq(schema.project.missionFeatureAssertions.featureId, featureId)))
+    // FNXC:MissionValidation 2026-07-23-17:20: Ignore legacy milestone links so parent scope cannot re-enter feature grading.
+    .where(and(
+      missionProjectScope(schema.project.missionFeatureAssertions.projectId),
+      eq(schema.project.missionFeatureAssertions.featureId, featureId),
+      sql`${schema.project.missionContractAssertions.scope} <> 'milestone'`,
+    ))
     .orderBy(
       asc(schema.project.missionContractAssertions.orderIndex),
       asc(schema.project.missionContractAssertions.createdAt),
@@ -2051,6 +2171,46 @@ export async function listLiveLinkedTaskIds(handle: QueryHandle, taskIds: string
       ),
     );
   return new Set(rows.map((row) => row.id));
+}
+
+export type TerminalTaskEvidence =
+  | { kind: "done"; id: string; column: "done" }
+  | { kind: "archived"; id: string; column: "archived" }
+  | { kind: "nonterminal"; id: string; column: string }
+  | { kind: "invalid-deleted"; id: string; column?: string }
+  | { kind: "missing" };
+
+/**
+ * FNXC:MissionReconciliation 2026-07-20-08:34:
+ * Terminal evidence repair must distinguish a supported archive (the retained archived task tombstone plus its project-scoped cold snapshot) from an arbitrary soft/hard deletion. Read both representations on the caller's transaction handle so validation and feature linkage share one snapshot.
+ */
+export async function getTerminalTaskEvidence(handle: QueryHandle, taskId: string): Promise<TerminalTaskEvidence> {
+  const taskRows = await handle
+    .select({
+      id: schema.project.tasks.id,
+      column: schema.project.tasks.column,
+      deletedAt: schema.project.tasks.deletedAt,
+    })
+    .from(schema.project.tasks)
+    .where(and(missionProjectScope(schema.project.tasks.projectId), eq(schema.project.tasks.id, taskId)))
+    .limit(1);
+  const archiveRows = await handle
+    .select({ id: schema.archive.archivedTasks.id })
+    .from(schema.archive.archivedTasks)
+    .where(and(missionProjectScope(schema.archive.archivedTasks.projectId), eq(schema.archive.archivedTasks.id, taskId)))
+    .limit(1);
+  const task = taskRows[0];
+  const hasArchiveSnapshot = archiveRows.length > 0;
+
+  if (!task) return hasArchiveSnapshot ? { kind: "invalid-deleted", id: taskId } : { kind: "missing" };
+  if (task.deletedAt === null && task.column === "done") return { kind: "done", id: task.id, column: "done" };
+  if (task.deletedAt !== null && task.column === "archived" && hasArchiveSnapshot) {
+    return { kind: "archived", id: task.id, column: "archived" };
+  }
+  if (task.deletedAt !== null || task.column === "archived") {
+    return { kind: "invalid-deleted", id: task.id, column: task.column };
+  }
+  return { kind: "nonterminal", id: task.id, column: task.column };
 }
 
 /** Get a live (non-deleted) task's id + column, or undefined. */

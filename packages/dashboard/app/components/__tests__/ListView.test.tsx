@@ -55,14 +55,16 @@ vi.mock("../QuickEntryBox", () => ({
     workflowId,
     workflowOptions,
     defaultWorkflowId,
+    onMoveTask,
   }: {
-    onCreate?: (input: { description: string; workflowId?: string | null }) => Promise<unknown>;
+    onCreate?: (input: { description: string; workflowId?: string | null; column?: string }) => Promise<unknown>;
     addToast: (message: string, type?: "error" | "success" | "info" | "warning") => void;
     onPlanningMode?: (initialPlan: string, workflowId?: string | null) => void;
     onSubtaskBreakdown?: (description: string, workflowId?: string | null) => void;
     workflowId?: string | null;
     workflowOptions?: { id: string; name: string }[];
     defaultWorkflowId?: string | null;
+    onMoveTask?: (id: string, column: string) => Promise<unknown>;
   }) => {
     const [value, setValue] = useState("");
     const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null | undefined>(
@@ -144,6 +146,12 @@ vi.mock("../QuickEntryBox", () => ({
           <span data-testid="quick-entry-workflow-props" data-workflow-id={workflowId ?? ""} data-default-workflow-id={defaultWorkflowId ?? ""} data-workflow-options={JSON.stringify((workflowOptions ?? []).map((option) => option.id))} />
           <button type="button" data-testid="quick-entry-save" onClick={() => void submit()}>
             Save
+          </button>
+          <button type="button" data-testid="quick-entry-start" onClick={() => void onCreate?.({ description: "Started task", workflowId: "builtin:coding-ideas", column: "todo" })}>
+            Start
+          </button>
+          <button type="button" data-testid="quick-entry-move" onClick={() => void onMoveTask?.("FN-created", "todo")}>
+            Move
           </button>
         </div>
         {modelMenuOpen ? (
@@ -412,6 +420,16 @@ describe("ListView", () => {
     localStorage.clear();
     showAllColumnsByDefault();
     ensureMatchMedia();
+    /*
+    FNXC:ViewportMode 2026-07-24-02:30:
+    FN-8557 (973c978f9) made isMobileViewport treat `window.innerWidth <= 768`
+    as a mobile signal alongside matchMedia. mockMobileViewport stamps
+    innerWidth=375 via defineProperty and its spy restore only resets
+    matchMedia, so the leaked width flipped every later test into the mobile
+    card layout (no <tr> rows). Reset innerWidth to a desktop width here so the
+    per-test viewport helpers stay authoritative.
+    */
+    Object.defineProperty(window, "innerWidth", { value: 1280, configurable: true });
     vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       matches: false,
       media: query,
@@ -2169,16 +2187,16 @@ describe("ListView", () => {
     expect(screen.queryByText("Reviewing")).not.toBeInTheDocument();
   });
 
-  it("FN-8170 suppresses stale planning only on Todo and In Progress table rows", () => {
+  it("FN-8475 renders Todo planning in desktop table rows without a placeholder", () => {
     const matchMediaSpy = mockDesktopViewport();
     try {
       renderListView({
         tasks: [
-          createMockTask({ id: "FN-8170-todo", column: "todo", status: "planning" }),
-          createMockTask({ id: "FN-8170-active", column: "in-progress", status: "planning" }),
-          createMockTask({ id: "FN-8170-triage", column: "triage", status: "planning" }),
+          createMockTask({ id: "FN-8475-todo", column: "todo", status: "planning" }),
+          createMockTask({ id: "FN-8475-active", column: "in-progress", status: "planning" }),
+          createMockTask({ id: "FN-8475-triage", column: "triage", status: "planning" }),
           createMockTask({
-            id: "FN-8170-executing",
+            id: "FN-8475-executing",
             column: "in-progress",
             status: "executing",
             steps: [{ name: "Running step", status: "in-progress" }],
@@ -2186,15 +2204,53 @@ describe("ListView", () => {
         ],
       });
 
-      for (const id of ["FN-8170-todo", "FN-8170-active"]) {
+      for (const id of ["FN-8475-todo", "FN-8475-active", "FN-8475-triage"]) {
         const row = screen.getByText(id).closest("tr") as HTMLElement;
-        expect(within(row).queryByText("planning")).toBeNull();
-        expect(row.querySelector(".list-status-badge")).toHaveTextContent("-");
+        expect(within(row).getByText("planning")).toHaveClass("list-status-badge");
+        expect(row.querySelector(".list-status-badge")).not.toHaveTextContent("-");
       }
-      expect(within(screen.getByText("FN-8170-triage").closest("tr") as HTMLElement).getByText("planning")).toBeInTheDocument();
-      expect(within(screen.getByText("FN-8170-executing").closest("tr") as HTMLElement).getByText("executing")).toBeInTheDocument();
+      expect(within(screen.getByText("FN-8475-executing").closest("tr") as HTMLElement).getByText("executing")).toBeInTheDocument();
     } finally {
       matchMediaSpy.mockRestore();
+    }
+  });
+
+  it("FN-8475 renders Todo planning in grouped mobile cards", () => {
+    const matchMediaSpy = mockMobileViewport();
+    try {
+      renderListView({
+        tasks: [createMockTask({ id: "FN-8475-todo-mobile", column: "todo", status: "planning" })],
+      });
+
+      const card = screen.getByText("FN-8475-todo-mobile").closest(".list-card") as HTMLElement;
+      expect(within(card).getByText("planning")).toHaveClass("list-status-badge");
+    } finally {
+      matchMediaSpy.mockRestore();
+    }
+  });
+
+  it("FN-8493 renders Revising, not Replan, for bare needs-replan list rows on desktop and mobile", () => {
+    const task = createMockTask({ id: "FN-8493-needs-replan", column: "triage", status: "needs-replan" });
+
+    const desktopViewport = mockDesktopViewport();
+    try {
+      const { unmount } = renderListView({ tasks: [task] });
+      const row = screen.getByText(task.id).closest("tr") as HTMLElement;
+      expect(within(row).getByText("Revising")).toHaveClass("list-status-badge");
+      expect(within(row).queryByText("Replan")).not.toBeInTheDocument();
+      unmount();
+    } finally {
+      desktopViewport.mockRestore();
+    }
+
+    const mobileViewport = mockMobileViewport();
+    try {
+      renderListView({ tasks: [task] });
+      const card = screen.getByText(task.id).closest(".list-card") as HTMLElement;
+      expect(within(card).getByText("Revising")).toHaveClass("list-status-badge");
+      expect(within(card).queryByText("Replan")).not.toBeInTheDocument();
+    } finally {
+      mobileViewport.mockRestore();
     }
   });
 
@@ -2210,6 +2266,8 @@ describe("ListView", () => {
   it.each([
     { status: "executing", column: "in-progress" as const, label: "executing" },
     { status: "merging-fix", column: "in-review" as const, label: "Merging fixes…" },
+    { status: "needs-replan", column: "triage" as const, label: "Revising" },
+    { status: "needs-replan", column: "todo" as const, label: "Revising" },
   ])("renders agent-active tasks with static highlight styling for $status", ({ status, column, label }) => {
     const tasks = [
       createMockTask({
@@ -3630,6 +3688,39 @@ describe("ListView Quick Entry", () => {
     expect(tableContainer?.contains(quickEntry)).toBe(true);
   });
 
+  it("preserves the explicit Coding Ideas Start column through the list host", async () => {
+    const onQuickCreate = vi.fn().mockResolvedValue(createMockTask({ id: "FN-started", column: "todo" }));
+    vi.mocked(fetchBoardWorkflows).mockResolvedValue({
+      flagEnabled: true,
+      defaultWorkflowId: "builtin:coding-ideas",
+      workflows: [{
+        id: "builtin:coding-ideas",
+        name: "Coding (Ideas)",
+        columns: [
+          { id: "ideas", name: "Ideas", flags: { intake: true } },
+          { id: "todo", name: "Todo", flags: { hold: true } },
+        ],
+      }],
+      taskWorkflowIds: {},
+    });
+    renderListView({ onQuickCreate });
+    await screen.findByTestId("quick-entry-box");
+    fireEvent.click(screen.getByTestId("quick-entry-start"));
+
+    await waitFor(() => expect(onQuickCreate).toHaveBeenCalledWith(expect.objectContaining({
+      description: "Started task",
+      workflowId: "builtin:coding-ideas",
+      column: "todo",
+    })));
+  });
+
+  it("wires QuickEntry Start moves through the list host callback", async () => {
+    const onMoveTask = vi.fn().mockResolvedValue(createMockTask({ id: "FN-created", column: "todo" }));
+    renderListView({ onQuickCreate: vi.fn(), onMoveTask });
+    fireEvent.click(screen.getByTestId("quick-entry-move"));
+    await waitFor(() => expect(onMoveTask).toHaveBeenCalledWith("FN-created", "todo"));
+  });
+
   it("shows model selector control when QuickEntryBox is expanded", async () => {
     const mockOnQuickCreate = vi.fn().mockResolvedValue(undefined);
     renderListView({ onQuickCreate: mockOnQuickCreate });
@@ -4140,6 +4231,8 @@ describe("ListView - Bulk Selection", () => {
     for (const key of Object.keys(listViewSseHandlers)) delete listViewSseHandlers[key];
     localStorage.clear();
     ensureMatchMedia();
+    // FNXC:ViewportMode 2026-07-24-02:30: FN-8557 innerWidth leak reset (see the main ListView beforeEach comment).
+    Object.defineProperty(window, "innerWidth", { value: 1280, configurable: true });
     vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       matches: false,
       media: query,
@@ -5170,7 +5263,7 @@ describe("ListView - Bulk Selection", () => {
       expect(within(card as HTMLElement).getByText("executing")).toBeInTheDocument();
     });
 
-    it("FN-8170 suppresses stale planning only on Todo and In Progress mobile cards", () => {
+    it("FN-8475 renders Todo and In Progress planning in mobile cards", () => {
       mockMobileViewport();
 
       const { container } = renderListView({
@@ -5187,10 +5280,9 @@ describe("ListView - Bulk Selection", () => {
         ],
       });
 
-      for (const id of ["FN-8170-mobile-todo", "FN-8170-mobile-active"]) {
-        expect(within(container.querySelector(`[data-id="${id}"]`) as HTMLElement).queryByText("planning")).toBeNull();
+      for (const id of ["FN-8170-mobile-todo", "FN-8170-mobile-active", "FN-8170-mobile-triage"]) {
+        expect(within(container.querySelector(`[data-id="${id}"]`) as HTMLElement).getByText("planning")).toHaveClass("list-status-badge");
       }
-      expect(within(container.querySelector('[data-id="FN-8170-mobile-triage"]') as HTMLElement).getByText("planning")).toBeInTheDocument();
       expect(within(container.querySelector('[data-id="FN-8170-mobile-executing"]') as HTMLElement).getByText("executing")).toBeInTheDocument();
     });
 
@@ -5341,6 +5433,8 @@ describe("ListView - Bulk Selection", () => {
     it.each([
       { status: "executing", column: "in-progress" as const },
       { status: "merging-fix", column: "in-review" as const },
+      { status: "needs-replan", column: "triage" as const },
+      { status: "needs-replan", column: "todo" as const },
     ])("applies agent-active class to mobile cards for active states (%s)", ({ status, column }) => {
       mockMobileViewport();
 

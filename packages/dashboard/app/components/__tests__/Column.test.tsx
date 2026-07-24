@@ -1,4 +1,6 @@
 import React from "react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -32,7 +34,7 @@ vi.mock("../WorktreeGroup", () => ({
   ),
 }));
 vi.mock("../QuickEntryBox", () => ({
-  QuickEntryBox: ({ favoriteProviders, favoriteModels, onToggleFavorite, onToggleModelFavorite, autoExpand, onCreate }: { favoriteProviders?: string[]; favoriteModels?: string[]; onToggleFavorite?: (provider: string) => void; onToggleModelFavorite?: (modelId: string) => void; autoExpand?: boolean; onCreate?: (input: { description: string }) => void }) => (
+  QuickEntryBox: ({ favoriteProviders, favoriteModels, onToggleFavorite, onToggleModelFavorite, autoExpand, onCreate, onMoveTask }: { favoriteProviders?: string[]; favoriteModels?: string[]; onToggleFavorite?: (provider: string) => void; onToggleModelFavorite?: (modelId: string) => void; autoExpand?: boolean; onCreate?: (input: { description: string; workflowId?: string; column?: string }) => void; onMoveTask?: (id: string, column: string) => Promise<unknown> }) => (
     <div
       data-testid="quick-entry-box"
       data-favorite-providers={JSON.stringify(favoriteProviders ?? [])}
@@ -42,6 +44,8 @@ vi.mock("../QuickEntryBox", () => ({
       data-auto-expand={autoExpand === false ? "false" : "true"}
     >
       <button type="button" onClick={() => onCreate?.({ description: "Quick task" })}>create</button>
+      <button type="button" onClick={() => onCreate?.({ description: "Started task", workflowId: "builtin:coding-ideas", column: "todo" })}>start</button>
+      <button type="button" data-testid="quick-entry-move" onClick={() => void onMoveTask?.("FN-created", "todo")}>move</button>
     </div>
   ),
 }));
@@ -109,9 +113,11 @@ describe("Column count-flash", () => {
     const tasks = [makeTask("FN-001")];
     render(<Column {...defaultProps} tasks={tasks} />);
 
-    const badge = screen.getByText("1");
+    // Badge is active/total (0/1 for triage without a live planner).
+    const badge = screen.getByText("1").parentElement!;
     expect(badge.className).toContain("column-count");
     expect(badge.className).not.toContain("count-flash");
+    expect(badge).toHaveTextContent("0/1");
   });
 
   it("applies count-flash class when task count increases", () => {
@@ -121,8 +127,9 @@ describe("Column count-flash", () => {
     const moreTasks = [makeTask("FN-001"), makeTask("FN-002")];
     rerender(<Column {...defaultProps} tasks={moreTasks} />);
 
-    const badge = screen.getByText("2");
+    const badge = screen.getByText("2").parentElement!;
     expect(badge.className).toContain("count-flash");
+    expect(badge).toHaveTextContent("0/2");
   });
 
   it("does not apply count-flash class when task count decreases", () => {
@@ -132,12 +139,176 @@ describe("Column count-flash", () => {
     const fewerTasks = [makeTask("FN-001")];
     rerender(<Column {...defaultProps} tasks={fewerTasks} />);
 
-    const badge = screen.getByText("1");
+    const badge = screen.getByText("1").parentElement!;
     expect(badge.className).not.toContain("count-flash");
+  });
+
+  it("shows accurate executing/total for WIP (unpaused active over card total)", () => {
+    const tasks = [
+      { ...makeTask("FN-001"), column: "in-progress" as ColumnType },
+      { ...makeTask("FN-002"), column: "in-progress" as ColumnType },
+      { ...makeTask("FN-003"), column: "in-progress" as ColumnType, paused: true },
+      { ...makeTask("FN-004"), column: "in-progress" as ColumnType, userPaused: true },
+    ];
+    render(
+      <Column
+        {...defaultProps}
+        column={"in-progress" as ColumnType}
+        columnFlags={{ countsTowardWip: true }}
+        tasks={tasks}
+      />,
+    );
+
+    expect(screen.getByLabelText("2 executing of 4")).toHaveTextContent("2/4");
+  });
+
+  it("counts only live planners as executing in todo (queued is not executing)", () => {
+    const tasks = [
+      { ...makeTask("FN-001"), column: "todo" as ColumnType, status: "planning" as any },
+      { ...makeTask("FN-002"), column: "todo" as ColumnType, status: "queued" as any },
+      { ...makeTask("FN-003"), column: "todo" as ColumnType, status: "queued" as any },
+      { ...makeTask("FN-004"), column: "todo" as ColumnType, status: "queued" as any },
+    ];
+    render(
+      <Column
+        {...defaultProps}
+        column={"todo" as ColumnType}
+        columnFlags={{ hold: true }}
+        tasks={tasks}
+      />,
+    );
+
+    expect(screen.getByLabelText("1 executing of 4")).toHaveTextContent("1/4");
+  });
+
+  it("counts cards with active chrome — a REVISING (needs-replan) todo card and a live code-review gate", () => {
+    // Header must equal the number of visibly active cards (FN-8494 keeps REVISING chrome on
+    // parked replans; a live gate session runs with null status and a pending step lease).
+    const tasks = [
+      { ...makeTask("FN-001"), column: "todo" as ColumnType, status: "needs-replan" as any },
+      { ...makeTask("FN-002"), column: "todo" as ColumnType },
+    ];
+    render(
+      <Column
+        {...defaultProps}
+        column={"todo" as ColumnType}
+        columnFlags={{ hold: true }}
+        tasks={tasks}
+      />,
+    );
+    expect(screen.getByLabelText("1 executing of 2")).toHaveTextContent("1/2");
+  });
+
+  it("counts an in-review card whose code-review gate holds a pending step lease", () => {
+    const tasks = [
+      {
+        ...makeTask("FN-001"),
+        column: "in-review" as ColumnType,
+        workflowStepResults: [{ workflowStepId: "code-review", workflowStepName: "Code Review", status: "pending" as const, startedAt: new Date().toISOString() }],
+      },
+      { ...makeTask("FN-002"), column: "in-review" as ColumnType },
+    ];
+    render(
+      <Column
+        {...defaultProps}
+        column={"in-review" as ColumnType}
+        columnFlags={{ mergeBlocker: true }}
+        tasks={tasks}
+      />,
+    );
+    expect(screen.getByLabelText("1 executing of 2")).toHaveTextContent("1/2");
+  });
+});
+
+/*
+FNXC:CodingIdeasWorkflow 2026-07-21-23:42:
+Coding (Ideas) uses the canonical non-legacy `ideas` intake ID. Cover empty and
+populated real Column markup here because Board selected/aggregate views and Lane
+all compose this shared renderer; duplicate consumer tests would not add another path.
+*/
+describe("Column Coding (Ideas) header indicator", () => {
+  it.each([
+    ["empty", []],
+    ["populated", [{ ...makeTask("FN-IDEA-1"), column: "ideas" as ColumnType }]],
+  ])("renders one Ideas dot before the heading for a %s intake column", (_state, tasks) => {
+    render(
+      <Column
+        {...defaultProps}
+        column={"ideas" as ColumnType}
+        workflowMode
+        columnDisplayName="Ideas"
+        columnFlags={{ intake: true }}
+        tasks={tasks}
+      />,
+    );
+
+    const heading = screen.getByRole("heading", { name: "Ideas", level: 2 });
+    const header = heading.closest(".column-header");
+    expect(header?.querySelectorAll(".column-dot.dot-ideas")).toHaveLength(1);
+    expect(heading.previousElementSibling).toHaveClass("column-dot", "dot-ideas");
+  });
+
+  it("maps the canonical Ideas dot to the shared triage token", () => {
+    const css = readFileSync(resolve(__dirname, "../../styles.css"), "utf8");
+    expect(css).toMatch(/\.dot-ideas\s*\{\s*background:\s*var\(--triage\);\s*\}/);
+  });
+});
+
+/*
+FNXC:BoardColumnDescriptions 2026-07-21-00:00:
+Todo and In Review omit redundant readiness prose, and the shared Column renderer
+must leave no empty description shell across desktop/mobile and task-data states.
+*/
+describe("Column legacy descriptions", () => {
+  it.each([
+    ["Todo", "todo" as ColumnType, "Specified and ready to start"],
+    ["In Review", "in-review" as ColumnType, "Complete — ready to merge"],
+  ])("omits the description shell for an empty %s column", (label, column, removedDescription) => {
+    render(<Column {...defaultProps} column={column} tasks={[]} />);
+
+    expect(screen.getByRole("heading", { name: label, level: 2 })).toBeInTheDocument();
+    expect(screen.queryByText(removedDescription)).not.toBeInTheDocument();
+    expect(document.querySelector(".column-desc")).toBeNull();
+  });
+
+  it.each([
+    ["Todo", "todo" as ColumnType, "Specified and ready to start"],
+    ["In Review", "in-review" as ColumnType, "Complete — ready to merge"],
+  ])("omits the description shell for a populated %s column", (label, column, removedDescription) => {
+    render(<Column {...defaultProps} column={column} tasks={[{ ...makeTask("FN-8480"), column }]} />);
+
+    expect(screen.getByRole("heading", { name: label, level: 2 })).toBeInTheDocument();
+    expect(screen.queryByText(removedDescription)).not.toBeInTheDocument();
+    expect(document.querySelector(".column-desc")).toBeNull();
+  });
+
+  it("retains the description for Planning", () => {
+    render(<Column {...defaultProps} tasks={[]} />);
+
+    expect(screen.getByText("Raw ideas — AI will plan these")).toHaveClass("column-desc");
   });
 });
 
 describe("Column workflow mode (U9)", () => {
+  it("preserves multiline workflow descriptions and uses overflow-safe board styling", () => {
+    const description = `Send work to this lane.\nhttps://example.test/${"unbroken-token-".repeat(24)}`;
+    render(
+      <Column
+        {...defaultProps}
+        column={"custom-col" as ColumnType}
+        workflowMode
+        columnDisplayName="Custom lane"
+        columnDescription={description}
+        tasks={[]}
+      />,
+    );
+
+    const descriptionElement = document.querySelector(".column-desc");
+    expect(descriptionElement?.textContent).toBe(description);
+    const css = readFileSync(resolve(__dirname, "../../styles.css"), "utf8");
+    expect(css).toMatch(/\.column-desc\s*\{[\s\S]*white-space:\s*pre-wrap;[\s\S]*overflow-wrap:\s*anywhere;/);
+  });
+
   it("uses the workflow column display name instead of the legacy label", () => {
     render(
       <Column
@@ -538,6 +709,26 @@ describe("Column QuickEntryBox", () => {
     render(<Column {...defaultProps} tasks={tasks} onQuickCreate={vi.fn()} />);
     const quickEntry = screen.getByTestId("quick-entry-box");
     expect(quickEntry.getAttribute("data-auto-expand")).toBe("false");
+  });
+
+  it("wires QuickEntry Start moves through the host state-updating callback", async () => {
+    const onMoveTask = vi.fn().mockResolvedValue(makeTask("FN-created"));
+    render(<Column {...defaultProps} tasks={[]} onQuickCreate={vi.fn()} onMoveTask={onMoveTask} />);
+    fireEvent.click(screen.getByTestId("quick-entry-move"));
+    await waitFor(() => expect(onMoveTask).toHaveBeenCalledWith("FN-created", "todo"));
+  });
+
+  it("preserves the explicit Coding Ideas Start column in workflow mode", async () => {
+    const onQuickCreate = vi.fn().mockResolvedValue({});
+    render(<Column {...defaultProps} column="ideas" workflowMode workflowId="builtin:coding-ideas" tasks={[]} onQuickCreate={onQuickCreate} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "start" }));
+
+    await waitFor(() => expect(onQuickCreate).toHaveBeenCalledWith({
+      description: "Started task",
+      workflowId: "builtin:coding-ideas",
+      column: "todo",
+    }));
   });
 
   it("preserves selected built-in workflow id when quick-creating in workflow mode", async () => {
@@ -998,7 +1189,7 @@ describe("Column same-column drop", () => {
     // Dropping into "in-review" column (which has 0 tasks)
     render(<Column {...defaultProps} column="in-review" tasks={tasksInTargetColumn} onMoveTask={onMoveTask} addToast={addToast} />);
 
-    const columnEl = screen.getByText("0").closest(".column") as HTMLElement;
+    const columnEl = screen.getAllByText("0")[0].closest(".column") as HTMLElement;
     const dataTransfer = {
       getData: vi.fn().mockReturnValue("FN-001"),
       dropEffect: "move",

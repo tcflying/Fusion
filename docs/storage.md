@@ -8,8 +8,16 @@ See the [2026-07-14 PostgreSQL runtime cutover review](./postgres-migration-revi
 
 - During a first-boot cutover, `fn dashboard`, `fn serve`, and `fn daemon --port <port>` keep their known HTTP port available with a migration holding page. Open dashboard tabs poll `/api/health` and show the migration banner with live progress.
 - After a successful cutover, the usual dismissible data-migrated notice may appear. If the durable cutover marker remains `running` or `failed`, real-server `/api/health` reports `status: "degraded"` with migration detail and the dashboard keeps the migration banner visible. Do not delete retained legacy `.fusion/fusion.db` backups; check logs and run `fn db migrate` after fixing a failure.
+- Retained `fusion.db`, `archive.db`, and `fusion-central.db` files are migration inputs and operator backups only. Startup reads a source only while its matching `fusion_sqlite_migrations` key is incomplete: `project:<projectId>` gates core/archive/identity work, `central:legacy-sqlite` gates central work, and `project-plugins:<canonical project path>` independently gates plugin adoption. A completed core marker never suppresses a still-incomplete plugin bridge.
+- Root-directory startup resolves a core key from an explicit project ID or the PostgreSQL `central.projects` rootDir mapping before using the deterministic fallback. A migration that learns an ID from legacy central SQLite must first materialize the same canonical rootDir-to-ID mapping in PostgreSQL before recording completion, so future boots never need the retained database to rediscover identity.
 
 ## Embedded PostgreSQL startup resources
+
+### Windows owned-cluster recovery (FN-8522)
+
+- Windows readiness uses bounded TCP probes. Runner-log reads are diagnostic open/read/close snapshots only; Fusion keeps no persistent runner-log handle, so PostgreSQL can retain its own `pg_ctl` log without a Fusion-induced sharing-violation retry.
+- Each Windows PostgreSQL child gets the bundled native `bin` directory prepended to its own case-insensitive `PATH`; Fusion does not mutate the dashboard process environment.
+- After readiness, an **owned** cluster that logs the complete `0xC0000142` backend exception plus PostgreSQL shutdown sequence gets one lifecycle-scoped restart on the same initialized data directory and port. Joiners are never restarted or stopped. A second incident, shutdown, or failed recovery is terminal and leaves the original data directory intact.
 
 - The zero-config embedded PostgreSQL lifecycle uses mmap-backed primary shared memory to avoid exhausted SysV shared-memory IDs on constrained hosts.
 - The supported, tested constrained-host floor is **64MB `/dev/shm`**. Both `fn serve` and boot smoke inherit this lifecycle default; an explicit later PostgreSQL `-c shared_memory_type=…` flag remains an operator override.
@@ -87,13 +95,34 @@ See the [2026-07-14 PostgreSQL runtime cutover review](./postgres-migration-revi
 - For forensic reads, soft-deleted parents remain accessible through `readTaskFromDb(id, { includeDeleted: true })`.
 - Agent-facing tool layer (FN-7661): the `fn_task_archive` and `fn_task_delete` pi/CLI tools (`packages/cli/src/extension.ts`) both accept an optional `removeLineageReferences` boolean and forward it to `store.archiveTask` / `store.deleteTask`, so an agent that hits `TaskHasLineageChildrenError` can retry with `{ removeLineageReferences: true }` to clear the block — matching the recovery path the error message already advertises.
 
-### Documents under soft-deleted tasks (FN-5140)
+### Documents under soft-deleted tasks (FN-5140, FX-005)
 
-- Soft-deleting a task preserves its `task_documents` and `task_document_revisions` rows; document storage is not hard-deleted as part of `TaskStore.deleteTask`.
-- Normal live-reader APIs must hide those rows by enforcing the parent-task active filter through `ACTIVE_TASKS_WHERE`: `getAllDocuments`, `getTaskDocuments`, `getTaskDocument`, and `getTaskDocumentRevisions` all treat a soft-deleted parent as out of scope for ordinary reads.
-- The HTTP surface inherits the same contract: `GET /api/documents` excludes documents whose parent task is soft-deleted, while per-task document GET routes behave like "task not found" (`[]` for list/revisions and `404 Document not found` for the single-document read).
-- No public forensic flag is exposed on document read methods or routes. Forensic access remains an internal/operator concern via `readTaskFromDb(id, { includeDeleted: true })` plus direct SQL against the preserved document tables.
-- Write semantics stay intentionally asymmetric: `upsertTaskDocument` still refuses soft-deleted parents, while `deleteTaskDocument` remains allowed so forensic cleanup can scrub preserved document rows when needed.
+- Soft-deleting a task preserves its project-scoped `task_documents` and `task_document_revisions` rows; document storage is not hard-deleted as part of `TaskStore.deleteTask`.
+- Editable registries remain live-only: `getAllDocuments`, `getTaskDocuments`, `GET /api/documents`, and `GET /api/tasks/:id/documents` hide rows whose parent is archived or soft-deleted. Archived documents therefore do not reappear in dashboard desktop/mobile editors.
+- Direct named evidence reads include retained archived rows: `getTaskDocument` / `GET /api/tasks/:id/documents/:key` return the current document, and `getTaskDocumentRevisions` / `GET .../:key/revisions` return immutable history. Missing parents/keys remain `404` for current and `[]` for history; every predicate includes `project_id`.
+- Ordinary writes remain forbidden: `upsertTaskDocument`, `deleteTaskDocument`, comments, artifacts, task moves/updates, and agent `fn_task_document_write` tools cannot mutate an archived parent.
+
+A single PostgreSQL-only exception, `publishArchivedTaskDocumentAddition` and `POST /api/tasks/:id/documents/:key/archived-publications`, appends an operator correction. It requires an existing project-scoped task tombstone with `column=archived` and non-null `deleted_at`, the matching `archive.archived_tasks` snapshot, and an existing current document. The request supplies non-empty `appendContent`, `author`, and `reason`, plus mandatory positive `expectedRevision` and canonical `expectedContentHash`; replacement `content`, metadata, and bypass fields are rejected.
+
+Under one transaction Fusion locks the composite parent and current document, checks both FX-004 expectations, archives the exact previous current row, and writes `priorContent + "\\n\\n" + appendContent` without trimming or normalizing either content string. Creation identity and metadata remain intact, revision advances exactly once, and one concurrent publisher wins. A stale or duplicate retry returns `TASK_DOCUMENT_PRECONDITION_FAILED` with safe revision/hash details and creates no row or side effect.
+
+The transaction changes only `task_documents`, `task_document_revisions`, and one `task-document:archived-addition-published` run-audit row. Audit metadata is ids/outcomes-only (`projectId`, `key`, previous/new revision, `reasonProvided`, `outcome`) and stores neither reason nor document content. Task timestamps/state, archive snapshots, mission/slice/feature/link state, comments, artifacts, citations, task events, workflow state, and scheduler wakeups are unchanged.
+
+The HTTP publication route is available only when daemon bearer authentication is active and is never auth-exempt. `--no-auth` fails closed with `403`; malformed input is `400`, missing parent/document is `404`, non-archived or inconsistent retained state is `409`, and stale CAS is structured `409`. Server bearer middleware rejects absent/invalid credentials before the route. The API returns `201` only after the transaction commits.
+
+### Conditional task-document writes
+
+Current `TaskDocument` responses include `contentHash`, the SHA-256 digest of the exact UTF-8 content formatted as `sha256:<64 lowercase hex>`. Whitespace and line endings are significant; Fusion does not normalize either before hashing.
+
+`TaskDocumentCreateInput`, `PUT /api/tasks/:id/documents/:key`, and the runtime document tools accept optional compare-and-swap expectations:
+
+- omitted expectations preserve legacy unconditional writes;
+- `expectedRevision: 0` requires the document not to exist;
+- a positive `expectedRevision` requires an existing equal revision;
+- `expectedContentHash` requires an existing document with an equal canonical hash;
+- when both are present, both must match. Negative/fractional revisions and non-canonical hashes are validation errors.
+
+The PostgreSQL writer locks the active `(project_id, task_id)` parent row before reading `(project_id, task_id, key)`. The comparison, exact prior-snapshot archive, and current-row replacement occur in one transaction. Thus concurrent creates or updates from the same baseline have exactly one conditional winner. A stale writer receives `TASK_DOCUMENT_PRECONDITION_FAILED` with safe identity, supplied expectations, and current revision/hash (or `null` for absence); it creates no revision, current mutation, task event, citation scan, or success response. Document content is never included in conflict details.
 
 ### Artifact registry (FN-6777)
 

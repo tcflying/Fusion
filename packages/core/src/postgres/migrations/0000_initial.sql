@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS project.tasks (
   paused integer DEFAULT 0,
   user_paused integer DEFAULT 0,
   paused_reason text,
+  -- FNXC:TaskWedgeNotifications 2026-10-19-00:00: Fresh PostgreSQL baselines must include the durable terminal-wedge episode field that upgrade migration 0033 adds to existing databases.
+  wedge_notification text,
   base_branch text,
   branch text,
   auto_merge integer,
@@ -545,6 +547,12 @@ CREATE TABLE IF NOT EXISTS project.workflow_work_items (
   lease_expires_at text,
   last_error text,
   blocked_reason text,
+  stable_workflow_run_id text,
+  continuation_sequence integer,
+  wait_reason text,
+  source_column text,
+  target_column text,
+  ir_hash text,
   created_at text NOT NULL,
   updated_at text NOT NULL,
   CONSTRAINT workflow_work_items_task_id_fkey
@@ -1431,6 +1439,8 @@ CREATE TABLE IF NOT EXISTS project.mission_contract_assertions (
   type text NOT NULL DEFAULT 'static',
   order_index integer NOT NULL DEFAULT 0,
   source_feature_id text,
+  scope text NOT NULL DEFAULT 'feature',
+  origin text NOT NULL DEFAULT 'authored',
   created_at text NOT NULL,
   updated_at text NOT NULL
 );
@@ -2028,4 +2038,3 @@ CREATE INDEX IF NOT EXISTS "idxArchivedTasksCreatedAt"
 -- GIN index on the archive search_vector (VAL-SEARCH-005).
 CREATE INDEX IF NOT EXISTS "idxArchivedTasksSearchVector"
   ON archive.archived_tasks USING gin(search_vector);
-

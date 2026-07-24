@@ -13,11 +13,14 @@ docker build -t fusion .
 
 ## Run the dashboard
 
-Mount your project into `/project` and publish the dashboard port:
+Mount your project into `/workspace` and publish the dashboard port:
 
 ```bash
-docker run -p 4040:4040 -v /path/to/project:/project fusion
+docker run -p 4040:4040 -v /path/to/project:/workspace fusion
 ```
+
+The application itself is installed under `/app`; `/workspace` is reserved for
+your project and is the container's working directory. Do not mount over `/app`.
 
 By default, the container runs:
 
@@ -65,22 +68,31 @@ docker run -p 8080:8080 fusion dashboard --port 8080
 
 ## Persistence
 
-Fusion state lives in `.fusion` under the mounted project. You can mount it explicitly:
+Fusion keeps state in two places inside the container:
+
+- **Per-project state** — `.fusion/` under the mounted project (`/workspace/.fusion`).
+  This is covered automatically by the `/workspace` project mount.
+- **Global state** — `/home/node/.fusion` (embedded PostgreSQL data, global
+  settings, agents). This is *not* under `/workspace`, so mount it separately if
+  you want it to survive container removal:
 
 ```bash
 docker run -p 4040:4040 \
-  -v /path/to/project:/project \
-  -v /path/to/project/.fusion:/project/.fusion \
+  -v /path/to/project:/workspace \
+  -v fusion-home:/home/node/.fusion \
   fusion
 ```
+
+The named volume `fusion-home` persists the embedded database across
+`docker run` invocations; a host directory bind mount works too.
 
 ## Complete example
 
 ```bash
 docker run --rm \
   -p 4040:4040 \
-  -v /path/to/project:/project \
-  -v /path/to/project/.fusion:/project/.fusion \
+  -v /path/to/project:/workspace \
+  -v fusion-home:/home/node/.fusion \
   -e ANTHROPIC_API_KEY=your_key \
   -e OPENAI_API_KEY=your_key \
   -e GITHUB_TOKEN=your_token \
@@ -91,4 +103,5 @@ docker run --rm \
 
 - The container runs as the non-root `node` user.
 - `git` must be available in the container runtime. The mounted project volume must preserve `.git` metadata and repository history for worktree operations; Fusion initializes missing repositories during project registration.
-- The root `Dockerfile` installs with `pnpm install --frozen-lockfile` before copying full source, so every workspace package/plugin manifest in `pnpm-workspace.yaml` must have a corresponding `COPY <path>/package.json` line in the builder stage.
+- The root `Dockerfile` installs with `pnpm install --frozen-lockfile` before copying full source, so every current workspace package/plugin manifest selected by `pnpm-workspace.yaml` must be covered by a builder-stage `COPY` before that install. Keep the manifest-only dependency-cache layer; the runner's intentionally filtered production install does not provide builder coverage.
+- `scripts/__tests__/dockerfile-workspace-manifests.test.mjs` expands the current workspace entries and rejects missing or duplicate builder pre-install COPY sources. Run it with `pnpm test:scripts -- scripts/__tests__/dockerfile-workspace-manifests.test.mjs` whenever workspace membership or Docker manifest copies change.

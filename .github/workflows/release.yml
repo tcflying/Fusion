@@ -24,7 +24,10 @@ jobs:
   build-binaries:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # FNXC:Release 2026-07-23-23:05: 45 min (was 30): the desktop pnpm-deploy closure staging
+    # inside the CLI full-package build can take >10 min alone on cold-store macOS runners
+    # (killed every v0.73.0-beta.* bun-darwin-arm64 leg); tsup now allows it 30 min.
+    timeout-minutes: 45
     # Job-level env so the signing steps' `if:` can detect whether the
     # signing certificate secrets are configured (secrets can't be read in `if:` directly).
     env:
@@ -197,7 +200,10 @@ jobs:
         # FNXC:UpdateChannels 2026-07-19-13:30: beta tags (v*-beta.N) build with
         # publish.channel=beta so electron-builder emits beta*.yml update manifests;
         # beta-channel desktop installs read those, stable installs keep latest*.yml.
-        run: pnpm --filter @fusion/desktop exec electron-builder --projectDir deploy --win --publish never ${{ contains(github.ref_name, '-beta') && '-c.publish.channel=beta' || '' }}
+        # FNXC:UpdateChannels 2026-07-23-21:35: the flag must be quoted on Windows —
+        # pwsh tokenizes bare `-c.publish.channel=beta` into `-c` + `.publish.channel=beta`,
+        # which electron-builder then reads as a config FILE path (ENOENT, v0.73.0-beta.5).
+        run: pnpm --filter @fusion/desktop exec electron-builder --projectDir deploy --win --publish never ${{ contains(github.ref_name, '-beta') && '"-c.publish.channel=beta"' || '' }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

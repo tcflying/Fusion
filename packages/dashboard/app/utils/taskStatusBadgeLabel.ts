@@ -6,17 +6,13 @@ import type { TFunction } from "i18next";
 import { isActiveMergeStatus } from "../../../core/src/active-merge-status";
 
 /*
-FNXC:TaskStatusBadge 2026-07-16-12:00:
-FN-8170 requires the raw "planning" status badge to stay off Todo and In Progress cards while preserving it in triage. Suppression is unconditional because Coding (Ideas) in-place planning writes only status:"planning", with no durable client-visible active-planner signal; the additive Reviewing Plan Review badge remains independent.
+FNXC:TaskStatusBadge 2026-08-19-00:00:
+FN-8475 restores truthful status visibility: Coding (Ideas) deliberately plans in Todo,
+so a real non-queued task status must not be hidden based only on its board column.
+Queued remains an intake-only presentation exclusion at TaskCard and ListView call sites.
 */
-export function shouldSuppressPlanningStatusBadge({
-  status,
-  column,
-}: {
-  status?: string | null;
-  column: string;
-}): boolean {
-  return status === "planning" && (column === "todo" || column === "in-progress");
+export function hasTaskStatusBadge(status: string | null | undefined): boolean {
+  return typeof status === "string" && status.trim().length > 0;
 }
 
 export function getTaskStatusBadgeLabel(
@@ -47,12 +43,12 @@ export function getTaskStatusBadgeLabel(
   if (workflowStepLabel) return workflowStepLabel;
   if (!status) return "";
   /*
-  FNXC:TaskStatusBadge 2026-07-28-00:00:
-  FN-8195 requires the raw engine status "needs-replan" to appear as "Replan" on board cards
-  and list rows. Keep the task.status token unchanged and map centrally so both consumers agree.
+  FNXC:TaskStatusBadge 2026-07-22-09:22:
+  FN-8493 requires operator copy "Revising" while a revise/replan cycle is in progress. Keep the
+  engine token "needs-replan" unchanged and map centrally so board cards and list rows agree.
   */
   if (status === "needs-replan") {
-    return t("tasks.statusReplan", "Replan");
+    return t("tasks.statusReplan", "Revising");
   }
   return status;
 }

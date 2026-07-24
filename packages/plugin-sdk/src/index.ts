@@ -82,6 +82,7 @@ export type {
   PluginContext,
   PluginLogger,
   PluginSkillContribution,
+  PluginMcpServerContribution,
   PluginWorkflowStepContribution,
   PluginTraitContribution,
   PluginTraitHookDescriptor,

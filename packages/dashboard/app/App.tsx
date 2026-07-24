@@ -29,6 +29,8 @@ import { useBackgroundSessions } from "./hooks/useBackgroundSessions";
 import { useGitHubStarPromptShown, markGitHubStarPromptShown } from "./hooks/useGitHubStarPrompt";
 import { useSessionBannersHidden } from "./hooks/useSessionBannerPref";
 import { useTasks } from "./hooks/useTasks";
+import { useBoardWorkflows } from "./hooks/useBoardWorkflows";
+import type { ExecutorColumnFlags } from "./hooks/useExecutorStats";
 import { useProjects } from "./hooks/useProjects";
 import { useAgents } from "./hooks/useAgents";
 import { useNodes } from "./hooks/useNodes";
@@ -233,7 +235,7 @@ export function getBoardTaskOpenRoute(options: {
   rightDockActive: boolean;
   initialTab?: DetailTaskTab;
 }): BoardTaskOpenRoute {
-  if (!options.initialTab && options.openMobileTasksInPopup) {
+  if (options.openMobileTasksInPopup) {
     return "popup";
   }
   if (shouldOpenBoardTaskInDock(options.openTasksInRightSidebar, options.rightDockActive, options.initialTab)) {
@@ -576,6 +578,29 @@ function AppInner() {
       sseEnabled: taskSseEnabled,
     }
   );
+  const { boardWorkflows: footerBoardWorkflows } = useBoardWorkflows({ projectId: currentProject?.id });
+  const footerTasks = isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks;
+  const footerColumnFlagsByTaskId = useMemo(() => {
+    const index = new Map<string, ExecutorColumnFlags>();
+    // FNXC:ConcurrencyIndicators 2026-08-04-10:00: remote tasks belong to a
+    // different store, so local board-workflow metadata must never be applied to
+    // their ids. Until the remote node supplies its own traits, use only the
+    // documented literal fallback rather than fabricate custom lifecycle state.
+    if (isRemote || !footerBoardWorkflows) return index;
+    const workflowsById = new Map(footerBoardWorkflows.workflows.map((workflow) => [workflow.id, workflow]));
+    // Build traits for the exact local rows supplied to the footer.
+    for (const task of footerTasks) {
+      const workflow = workflowsById.get(footerBoardWorkflows.taskWorkflowIds[task.id] ?? footerBoardWorkflows.defaultWorkflowId);
+      const flags = workflow?.columns.find((column) => column.id === task.column)?.flags;
+      if (flags) index.set(task.id, flags);
+    }
+    return index;
+  }, [footerBoardWorkflows, footerTasks, isRemote]);
+  /*
+  FNXC:ConcurrencyIndicators 2026-08-03-12:00:
+  FN-8453 threads board workflow traits into the footer so custom intake,
+  complete, WIP, and merge columns share the same live-agent predicate as the engine.
+  */
 
   /*
   FNXC:Navigation 2026-06-22-00:00:
@@ -591,7 +616,7 @@ function AppInner() {
   FNXC:FloatingWindow 2026-07-15-15:20:
   FN-8016 identifies a popped-out task detail by task id plus origin view. The same task can therefore coexist in separate view-scoped FloatingWindows while re-opening it on one view refreshes only that entry.
   */
-  const { entries: poppedOutTaskEntries, popOut: popOutTaskDetail, close: closePoppedOutTask } = usePoppedOutTasks();
+  const { entries: poppedOutTaskEntries, popOut: popOutTaskDetail, close: closePoppedOutTask, closeAll: closeAllPoppedOutTasks } = usePoppedOutTasks();
   const popupNavCloseRef = useRef(new Map<string, () => void>());
 
   /*
@@ -611,7 +636,7 @@ function AppInner() {
     closePoppedOutTask(taskId, originTaskView);
   }, [closePoppedOutTask, removeNav]);
 
-  const popOutTaskDetailForCurrentView = useCallback((task: Task | TaskDetail) => {
+  const popOutTaskDetailForCurrentView = useCallback((task: Task | TaskDetail, initialTab?: DetailTaskTab) => {
     const identityKey = taskPopupIdentityKey(task.id, taskView);
     const alreadyOpen = poppedOutTaskEntries.some((entry) => entry.task.id === task.id && entry.originTaskView === taskView);
     if (isMobile && !alreadyOpen) {
@@ -622,7 +647,7 @@ function AppInner() {
       popupNavCloseRef.current.set(identityKey, closeFromHistory);
       pushNav({ type: "modal", close: closeFromHistory });
     }
-    popOutTaskDetail(task, taskView);
+    popOutTaskDetail(task, taskView, initialTab);
   }, [isMobile, poppedOutTaskEntries, popOutTaskDetail, pushNav, closePoppedOutTask, taskView]);
 
   const boardSourceTasks = isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks;
@@ -982,6 +1007,18 @@ function AppInner() {
     openSettings: modalManager.openSettings,
   });
 
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  Project-scoped task-detail surfaces are not all owned by modalManager: depending on
+  settings, tasks open as popped-out FloatingWindows, in the main panel (task-detail view),
+  or in the right dock, and Quick Chat is an App-level floating window. A project swap must
+  dismiss ALL of them, so useProjectActions receives this composite via a ref — the pieces
+  it closes (main-panel detail, right dock) are constructed later in this component, and
+  the ref keeps the callback stable while always invoking the latest wiring.
+  */
+  const closeProjectScopedUiRef = useRef<() => void>(() => {});
+  const closeProjectScopedUi = useCallback(() => closeProjectScopedUiRef.current(), []);
+
   const {
     handleSelectProject,
     handleViewAllProjects,
@@ -1008,6 +1045,7 @@ function AppInner() {
     openSetupWizard: modalManager.openSetupWizard,
     closeSetupWizard: modalManager.closeSetupWizard,
     closeModelOnboarding: modalManager.closeModelOnboarding,
+    closeProjectScopedModals: closeProjectScopedUi,
   });
 
   const { handleDetailClose } = useDeepLink({
@@ -1157,14 +1195,22 @@ function AppInner() {
     handleChangeTaskView("board");
   }, [handleChangeTaskView, removeNav, requestRestore]);
 
+  /*
+  FNXC:TaskPopupDeepTabs 2026-07-21-00:00:
+  FN-8478 makes every board TaskCard deep-tab action, including files changed, honor Open tasks as popups. Route once to the popup with its requested tab so a click never opens both a FloatingWindow and a main-panel/modal detail surface.
+  */
   const handleOpenDetailWithTab = useCallback((task: Task | TaskDetail, initialTab: "changes" | "retries" | "workflow") => {
+    if (openMobileTasksInPopup) {
+      popOutTaskDetailForCurrentView(task, initialTab);
+      return;
+    }
     if (initialTab === "changes") {
       openTaskDetailInMainPanel(task, "changes");
       return;
     }
     modalManager.openDetailTask(task, initialTab);
     pushNav({ type: "modal", close: modalManager.closeDetailTask });
-  }, [modalManager, openTaskDetailInMainPanel, pushNav]);
+  }, [modalManager, openMobileTasksInPopup, openTaskDetailInMainPanel, popOutTaskDetailForCurrentView, pushNav]);
 
   /*
   FNXC:Settings 2026-06-22-00:00:
@@ -1505,8 +1551,8 @@ function AppInner() {
   FNXC:OpenTasksInRightSidebar 2026-06-28-00:00:
   Board card clicks are the only task-open path governed by openTasksInRightSidebar. When the project setting is enabled and the tablet/desktop right dock is active, the board keeps its current view and asks the dock controller to render task detail; otherwise the existing full main-panel replacement remains the fallback, including mobile and hidden-footer states.
 
-  FNXC:MobileTaskPopups 2026-07-01-12:00:
-  Board-card clicks on every viewport may opt into the existing task pop-out path, but only for ordinary task opens with no deep initial tab. The route is intentionally ordered as all-viewport popup, then tablet/desktop right dock, then main-panel fallback so the popup setting keeps the board visible when requested while deep-tab opens and non-board handlers keep their existing behavior.
+  FNXC:MobileTaskPopups 2026-07-21-00:00:
+  FN-8478 makes board TaskCard deep-tab opens use the all-viewport popup route when enabled, preserving the requested tab. Popup routing remains first so neither dock nor main-panel detail can double-open behind the FloatingWindow.
   */
   const openBoardTaskDetail = useCallback((task: Task | TaskDetail, initialTab?: DetailTaskTab) => {
     const route = getBoardTaskOpenRoute({
@@ -1518,7 +1564,7 @@ function AppInner() {
     });
 
     if (route === "popup") {
-      popOutTaskDetailForCurrentView(task);
+      popOutTaskDetailForCurrentView(task, initialTab);
       return;
     }
 
@@ -1535,6 +1581,24 @@ function AppInner() {
       rightDock.closeDockTask();
     }
   }, [openTasksInRightSidebar, rightDock]);
+
+  /*
+  FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+  The composite project-switch reset. Beyond modalManager's project-scoped modals, dismiss
+  every task-detail surface the open-task routing can target (popped-out FloatingWindows,
+  main-panel task-detail view, right-dock task) and close the Quick Chat floating window —
+  all of these showed the previous project's content over the new project. Assigned each
+  render so the ref-stable callback handed to useProjectActions always sees current state.
+  */
+  closeProjectScopedUiRef.current = () => {
+    modalManager.closeProjectScopedModals();
+    closeAllPoppedOutTasks();
+    if (mainPanelDetailTask) {
+      closeTaskDetailMainPanel();
+    }
+    rightDock.closeDockTask();
+    setQuickChatOpen(false);
+  };
 
   const mainContentProps: MainContentProps = {
     showBackendConnectionErrorPage,
@@ -1903,8 +1967,9 @@ function AppInner() {
       {rightDock.modal}
       {executorFooterVisible && currentProject && (
         <ExecutorStatusBar
-          tasks={isRemote && remoteData.tasks.length > 0 ? remoteData.tasks : tasks}
+          tasks={footerTasks}
           projectId={currentProject.id}
+          columnFlagsByTaskId={footerColumnFlagsByTaskId}
           taskStuckTimeoutMs={taskStuckTimeoutMs}
           staleHighFanoutBlockerAgeThresholdMs={staleHighFanoutBlockerAgeThresholdMs}
           lastFetchTimeMs={lastFetchTimeMs}
@@ -2054,7 +2119,7 @@ function AppInner() {
       FNXC:TaskPopupViewGating 2026-07-15-15:20:
       Rendering uses only the active view's scoped entries; state keeps hidden snapshots so returning remounts them with shared geometry. Each FloatingWindow key includes its origin so identical task ids never collide across views.
       */}
-      {visiblePoppedOutTaskEntries.map(({ task: snapshot, originTaskView }) => {
+      {visiblePoppedOutTaskEntries.map(({ task: snapshot, originTaskView, initialTab }) => {
         const liveTask = tasks.find((candidate) => candidate.id === snapshot.id) ?? snapshot;
         const popupKey = taskPopupIdentityKey(snapshot.id, originTaskView);
         const close = () => closePoppedOutTaskWithNav(snapshot.id, originTaskView);
@@ -2074,6 +2139,7 @@ function AppInner() {
           >
             <TaskDetailContent
               task={liveTask}
+              initialTab={initialTab}
               projectId={currentProject?.id}
               tasks={tasks}
               embedded

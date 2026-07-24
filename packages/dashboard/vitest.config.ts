@@ -337,6 +337,12 @@ The array stays empty; add new entries here only with a matching ledger row.
 FNXC:DashboardTestQuarantine 2026-07-16-09:00:
 FN-8077 removed routes-system.test.ts from this list and the ledger in lockstep. Its test now explicitly advances a fake Date-only clock between CPU samples, so unrelated route clock reads cannot stretch elapsed time under the loaded API lane; assertions and timeout policy are unchanged.
 */
+/*
+FNXC:DashboardTestQuarantine 2026-07-31-00:00:
+FN-8533 restores planning-browser-e2e after its teardown now closes Vite's listening socket,
+HMR channel, watcher, and plugin container deterministically. Browser viewport assertions are a
+required responsive acceptance lane, so the test must not remain excluded from dashboard-api.
+*/
 const quarantinedDashboardTests: string[] = [
   /*
   FNXC:DashboardTestQuarantine 2026-07-17-16:50:

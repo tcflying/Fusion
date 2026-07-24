@@ -391,7 +391,17 @@ export function AppModals({
         </ModalErrorBoundary>
       )}
 
+      {/*
+      FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+      Key the always-mounted GitHub Import modal by project. Its persist effect depends on
+      projectId, so a project swap (close + new projectId in one render) re-fired it with the
+      OLD project's provider/labels/repo selections and wrote them under the NEW project's
+      kb-dashboard-github-import-state key. Keying remounts instead; unmount writes nothing,
+      so each project's last persisted import state stays under its own key. The embedded
+      Import Tasks view already unmounts on navigation and was never affected.
+      */}
       <GitHubImportModal
+        key={projectId ?? "no-project"}
         isOpen={modalManager.githubImportOpen}
         onClose={closeGitHubImportWithNav}
         onImport={taskHandlers.handleGitHubImport}
@@ -402,7 +412,18 @@ export function AppModals({
       />
 
       <ModalErrorBoundary>
+        {/*
+        FNXC:ProjectSwitchModalReset 2026-07-23-00:00:
+        Key the subtask breakdown by project so a project swap remounts it, mirroring the
+        embedded Planning view. Without the remount, the swap flipped isOpen=false and the
+        NEW projectId in the same render, so resetState persisted the old project's draft
+        description under the new project's storage key and kept it in memory — reopening
+        the breakdown in the new project showed the previous project's draft. The old
+        instance's unmount cleanup closes its stream and saves the draft under its own
+        project key.
+        */}
         <SubtaskBreakdownModal
+          key={projectId ?? "no-project"}
           isOpen={modalManager.isSubtaskOpen}
           onClose={closeSubtaskWithNav}
           initialDescription={modalManager.subtaskInitialDescription ?? ""}

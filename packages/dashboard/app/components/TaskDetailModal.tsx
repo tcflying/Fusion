@@ -79,6 +79,7 @@ import { getRelativeTimeBucket } from "../utils/relativeTimeAgo";
 import { isReviewBudgetExhaustedApproval } from "../utils/reviewBudgetApproval";
 import { ACTIVE_STATUSES, resolveEffectiveExecutor, resolveEffectivePlanning, resolveEffectiveValidator, type ModelSelection } from "./effective-model-resolution";
 import { TaskContextMenu, buildTaskActionMenuModel, getTaskPrAutomationLabel } from "./TaskContextMenu";
+import type { TaskContextMenuColumnFlags, TaskContextMenuColumnMetadata } from "./TaskContextMenu";
 import { FLOATING_WINDOW_GEOMETRY_CHANGE_EVENT } from "./FloatingWindow";
 import { useFileBrowser } from "../context/FileBrowserContext";
 import type { DetailTaskInitialActionRequest } from "../hooks/useModalManager";
@@ -393,9 +394,9 @@ export interface TaskDetailModalProps {
   /** Project setting: true restores Chat-first tab order/default; false or missing uses Activity-first. */
   taskDetailChatFirst?: boolean;
   /** Pre-resolved workflow field defs for this task's workflow (U13/KTD-14).
-   *  When provided (e.g. threaded from a Board that already holds the payload)
-   *  the modal skips its own board-workflows fetch entirely. Falls back to the
-   *  self-fetch when absent (e.g. modal opened from non-board contexts). */
+   *  When provided, these remain authoritative for custom-field rendering.
+   *  Move metadata still resolves independently because field definitions do not
+   *  identify the selected workflow's ordered columns. */
   workflowFieldDefs?: WorkflowFieldDefinition[] | null;
 }
 
@@ -511,13 +512,27 @@ function normalizeTaskPriorityValue(priority: Task["priority"]): TaskPriority {
     : DEFAULT_TASK_PRIORITY;
 }
 
-function resolveTaskWorkflowMetadata(payload: BoardWorkflowsPayload, taskId: string): { id: string; name: string; icon?: string; fields: WorkflowFieldDefinition[] | null } | null {
+interface TaskWorkflowMetadata {
+  id: string;
+  name: string;
+  icon?: string;
+  fields: WorkflowFieldDefinition[] | null;
+  moveColumns: TaskContextMenuColumnMetadata[];
+  currentColumnFlags?: TaskContextMenuColumnFlags;
+}
+
+function resolveTaskWorkflowMetadata(payload: BoardWorkflowsPayload, task: Pick<Task, "id" | "column">): TaskWorkflowMetadata | null {
   if (payload.flagEnabled !== true) return null;
-  const workflowId = payload.taskWorkflowIds[taskId] ?? payload.defaultWorkflowId;
+  const workflowId = payload.taskWorkflowIds[task.id] ?? payload.defaultWorkflowId;
   const workflow = payload.workflows.find((candidate) => candidate.id === workflowId);
   const name = workflow?.name?.trim();
   if (!workflow || !name) return null;
-  return { id: workflow.id, name, icon: workflow.icon, fields: workflow.fields ?? null };
+
+  const moveColumns = workflow.columns
+    .filter((column) => column.flags.hiddenFromBoard !== true)
+    .map((column) => ({ id: column.id as ColumnId, label: column.name, flags: column.flags }));
+  const currentColumnFlags = moveColumns.find((column) => column.id === task.column)?.flags;
+  return { id: workflow.id, name, icon: workflow.icon, fields: workflow.fields ?? null, moveColumns, currentColumnFlags };
 }
 
 function normalizeExecutionModeValue(executionMode: Task["executionMode"]): "standard" | "fast" {
@@ -534,6 +549,7 @@ function requiresExecutionModeReplan(column: Task["column"]): boolean {
 
 interface ProvenanceDisplay {
   label: string;
+  labelHref?: string;
   parentTaskId?: string;
   contextInfo?: string;
   contextHref?: string;
@@ -549,19 +565,6 @@ interface ProvenanceLabelOptions {
 function getIssueUrlFromMetadata(metadata: Task["sourceMetadata"]): string | undefined {
   const issueUrl = metadata?.issueUrl;
   return isStringValue(issueUrl) && issueUrl.length > 0 ? issueUrl : undefined;
-}
-
-function parseGithubIssueLabel(url: string): { label: string; href: string } | null {
-  const match = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(issues|pull)\/(\d+)(?:$|[/?#])/);
-  if (!match) {
-    return null;
-  }
-
-  const [, owner, repo, , number] = match;
-  return {
-    label: `${owner}/${repo}#${number}`,
-    href: url,
-  };
 }
 
 function getResearchContextInfo(metadata: Task["sourceMetadata"]): string | undefined {
@@ -600,12 +603,13 @@ function getProvenanceLabel(task: Task | TaskDetail, options: ProvenanceLabelOpt
       return { label: tr ? tr("taskDetail.provenance.workflowStep", "Workflow Step") : "Workflow Step" };
     case "github_import": {
       const issueUrl = getIssueUrlFromMetadata(task.sourceMetadata);
-      const parsedIssue = issueUrl ? parseGithubIssueLabel(issueUrl) : null;
+      /*
+      FNXC:TaskProvenance 2026-07-23-12:20:
+      GitHub import provenance owns its source-issue link on the visible GitHub Import label. Do not restore a parsed repository/issue suffix: a missing URL must remain plain text, while a usable URL gets the sole external click target.
+      */
       return {
         label: tr ? tr("taskDetail.provenance.githubImport", "GitHub Import") : "GitHub Import",
-        contextInfo: issueUrl ? (parsedIssue?.label ?? (tr ? tr("taskDetail.provenance.openIssue", "Open issue") : "Open issue")) : undefined,
-        contextHref: issueUrl,
-        contextInfoFull: issueUrl,
+        labelHref: issueUrl,
       };
     }
     case "research": {
@@ -644,7 +648,16 @@ function getProvenanceLabel(task: Task | TaskDetail, options: ProvenanceLabelOpt
 // #1403: widened to ColumnId so `.has(task.column)` accepts custom column ids
 // (non-members correctly resolve to false → not editable).
 const EDITABLE_COLUMNS: Set<ColumnId> = new Set<ColumnId>(["triage", "todo"]);
-const GITHUB_TRACKING_EDITABLE_COLUMNS: Set<ColumnId> = new Set<ColumnId>(["triage", "todo", "in-progress", "in-review"]);
+const GITHUB_TRACKING_EDITABLE_COLUMNS: Set<ColumnId> = new Set<ColumnId>(["triage", "todo", "in-progress", "in-review", "ideas"]);
+const CODING_IDEAS_WORKFLOW_ID = "builtin:coding-ideas";
+
+/*
+FNXC:GitHubTracking 2026-07-22-00:46:
+Ideas tasks must be able to opt into or out of GitHub tracking before planning, whether they remain in the Ideas intake column or have advanced in Coding (Ideas). Use the resolved workflow ID rather than its display name so localized names and arbitrary custom workflows cannot gain this editing capability.
+*/
+function canTaskEditGithubTracking(column: ColumnId, workflowId: string | undefined): boolean {
+  return GITHUB_TRACKING_EDITABLE_COLUMNS.has(column) || workflowId === CODING_IDEAS_WORKFLOW_ID;
+}
 
 export function TaskDetailContent({
   task,
@@ -940,13 +953,18 @@ export function TaskDetailContent({
   /*
   FNXC:WorkflowBadges 2026-06-29-00:00:
   Task details need a stable workflow-name badge because aggregate Board cards can mix tasks from multiple workflows. Resolve the badge name and custom field definitions from the same board-workflows payload so detail headers do not issue duplicate workflow-metadata fetches.
+
+  FNXC:CodingIdeasWorkflow 2026-07-21-00:00:
+  Coding (Ideas) intake cards need selected-workflow columns to derive their truthful
+  move target through TaskContextMenu. Callers may supply field definitions, but fields
+  cannot encode ordered columns, so resolve move metadata independently without replacing
+  the caller-owned field definitions.
   */
   const [taskWorkflowBadge, setTaskWorkflowBadge] = useState<{ id: string; name: string; icon?: string } | null>(null);
+  const [workflowMoveMetadata, setWorkflowMoveMetadata] = useState<Pick<TaskWorkflowMetadata, "moveColumns" | "currentColumnFlags"> | null>(null);
   // Custom field definitions (U13/KTD-14). Resolved for this task's workflow
   // from the board-workflows payload; absent when the workflow declares none,
   // in which case the fields section renders nothing (today's UI byte-identical).
-  // When `workflowFieldDefsProp` is provided by the caller (e.g. the Board
-  // already holds the payload) we skip the self-fetch entirely.
   const [customFieldDefs, setCustomFieldDefs] = useState<WorkflowFieldDefinition[] | null>(
     workflowFieldDefsProp !== undefined ? (workflowFieldDefsProp ?? null) : null,
   );
@@ -958,40 +976,45 @@ export function TaskDetailContent({
     setCustomFieldValues(task.customFields ?? {});
   }, [task.id, task.customFields]);
 
-  // Resolve this task's workflow field definitions and display name once per task. Skipped when
-  // the caller supplies `workflowFieldDefs` directly (Board context). Best-effort:
-  // a failed fetch (or flag-OFF empty payload) leaves defs/name null → no section/badge.
+  // Resolve selected-workflow display and move metadata once per task. A supplied fields prop
+  // avoids a duplicate field lookup, but cannot replace this ordered-column lookup.
   useEffect(() => {
-    if (workflowFieldDefsProp !== undefined) {
-      // Prop-driven path: keep in sync if the prop changes (task switch etc.).
-      setCustomFieldDefs(workflowFieldDefsProp ?? null);
-      setTaskWorkflowBadge(null);
-      return;
-    }
     /*
     FNXC:WorkflowBadges 2026-06-29-16:48:
-    Mounted task-detail hosts can swap from one task to another (List split-pane, right dock, floating windows). Clear the previous workflow badge before the shared board-workflows lookup resolves so aggregate-board context never shows a stale cross-workflow label.
+    Mounted task-detail hosts can swap from one task to another (List split-pane, right dock, floating windows). Clear the previous workflow badge and move metadata before the shared board-workflows lookup resolves so aggregate-board context never shows stale cross-workflow labels or targets.
     */
-    setCustomFieldDefs(null);
+    if (workflowFieldDefsProp !== undefined) {
+      setCustomFieldDefs(workflowFieldDefsProp ?? null);
+    } else {
+      setCustomFieldDefs(null);
+    }
     setTaskWorkflowBadge(null);
+    setWorkflowMoveMetadata(null);
     let cancelled = false;
     void fetchBoardWorkflows(projectId)
       .then((payload) => {
         if (cancelled) return;
-        const metadata = resolveTaskWorkflowMetadata(payload, task.id);
-        setCustomFieldDefs(metadata?.fields ?? null);
+        const metadata = resolveTaskWorkflowMetadata(payload, task);
+        if (workflowFieldDefsProp === undefined) {
+          setCustomFieldDefs(metadata?.fields ?? null);
+        }
         setTaskWorkflowBadge(metadata ? { id: metadata.id, name: metadata.name, icon: metadata.icon } : null);
+        setWorkflowMoveMetadata(metadata ? {
+          moveColumns: metadata.moveColumns,
+          currentColumnFlags: metadata.currentColumnFlags,
+        } : null);
       })
       .catch(() => {
         if (!cancelled) {
-          setCustomFieldDefs(null);
+          if (workflowFieldDefsProp === undefined) setCustomFieldDefs(null);
           setTaskWorkflowBadge(null);
+          setWorkflowMoveMetadata(null);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [task.id, projectId, workflowFieldDefsProp]);
+  }, [task, projectId, workflowFieldDefsProp]);
 
   /*
   FNXC:PlannerOversight 2026-07-04-17:00:
@@ -1602,7 +1625,7 @@ export function TaskDetailContent({
 
   // Check if task can be edited
   const canEdit = EDITABLE_COLUMNS.has(task.column) && !isSaving;
-  const canEditGithubTracking = GITHUB_TRACKING_EDITABLE_COLUMNS.has(task.column) && !isSaving;
+  const canEditGithubTracking = canTaskEditGithubTracking(task.column, taskWorkflowBadge?.id) && !isSaving;
   const githubTrackingEnabled = githubTrackingEnabledDraft ?? (workingTask.githubTracking?.enabled === true);
   const githubTrackedIssue = workingTask.githubTracking?.issue;
   const gitlabTrackedItem = workingTask.gitlabTracking?.item;
@@ -3525,6 +3548,8 @@ export function TaskDetailContent({
     task,
     t,
     columnLabel,
+    currentColumnFlags: workflowMoveMetadata?.currentColumnFlags,
+    workflowMoveColumns: workflowMoveMetadata?.moveColumns,
     canRetryTask,
     hasDuplicateHandler: Boolean(onDuplicateTask),
     hasRetryHandler: Boolean(onRetryTask),
@@ -3549,6 +3574,7 @@ export function TaskDetailContent({
     task,
     t,
     columnLabel,
+    workflowMoveMetadata,
     canRetryTask,
     onDuplicateTask,
     onRetryTask,
@@ -3570,7 +3596,8 @@ export function TaskDetailContent({
     handleCheckPrStatus,
     handleBypassReview,
   ]);
-  const primaryMoveTransition = taskActionMenuModel.moveTransitions[0]?.column;
+  const primaryMoveAction = taskActionMenuModel.moveTransitions[0];
+  const primaryMoveTransition = primaryMoveAction?.column;
   const secondaryMoveTransitions = taskActionMenuModel.moveTransitions.slice(1);
   const hasSecondaryMoveOptions = secondaryMoveTransitions.length > 0;
   const reviewAction = taskActionMenuModel.reviewAction;
@@ -4659,7 +4686,20 @@ export function TaskDetailContent({
                           )}
                         </>
                       ) : (
-                        <>{t("taskDetail.provenance.createdVia", "Created via")} {provenanceDisplay.label}</>
+                        <>
+                          {t("taskDetail.provenance.createdVia", "Created via")} {provenanceDisplay.labelHref ? (
+                            <a
+                              className="detail-provenance-link"
+                              href={provenanceDisplay.labelHref}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              {provenanceDisplay.label}
+                            </a>
+                          ) : (
+                            provenanceDisplay.label
+                          )}
+                        </>
                       )}
                       {provenanceDisplay.parentTaskId && (
                         <>
@@ -6336,7 +6376,9 @@ export function TaskDetailContent({
                     aria-haspopup="menu"
                     aria-expanded={showActionsMenu}
                   >
-                    {t("taskDetail.actions.menuBtn", "Actions")}
+                    <span className="detail-footer-button-label">
+                      {t("taskDetail.actions.menuBtn", "Actions")}
+                    </span>
                     <ChevronDown size={12} />
                   </button>
                   {showActionsMenu && (
@@ -6374,12 +6416,12 @@ export function TaskDetailContent({
                         onClick={handleMoveButtonClick}
                         onKeyDown={handleMoveButtonKeyDown}
                         disabled={!primaryMoveTransition}
-                        aria-label={primaryMoveTransition ? t("taskDetail.move.moveTo", "Move to {{column}}", { column: columnLabel(primaryMoveTransition) }) : undefined}
+                        aria-label={primaryMoveAction?.primaryLabel}
                         aria-haspopup={hasSecondaryMoveOptions ? "menu" : undefined}
                         aria-expanded={hasSecondaryMoveOptions ? showMoveMenu : undefined}
                       >
                         <span className="detail-move-btn__label">
-                          {t("taskDetail.move.moveTo", "Move to {{column}}", { column: primaryMoveTransition ? columnLabel(primaryMoveTransition) : "" })}
+                          {primaryMoveAction?.primaryLabel ?? t("taskDetail.move.moveTo", "Move to {{column}}", { column: "" })}
                         </span>
                         {hasSecondaryMoveOptions && (
                           <span className="detail-move-btn__arrow" aria-hidden="true">
@@ -6409,7 +6451,9 @@ export function TaskDetailContent({
                         onClick={reviewAction.onSelect}
                         disabled={reviewAction.disabled}
                       >
-                        {reviewAction.label}
+                        <span className="detail-footer-button-label">
+                          {reviewAction.label}
+                        </span>
                       </button>
                     )}
                   </div>
@@ -6421,12 +6465,12 @@ export function TaskDetailContent({
                       onClick={handleMoveButtonClick}
                       onKeyDown={handleMoveButtonKeyDown}
                       disabled={!primaryMoveTransition}
-                      aria-label={primaryMoveTransition ? t("taskDetail.move.moveTo", "Move to {{column}}", { column: columnLabel(primaryMoveTransition) }) : undefined}
+                      aria-label={primaryMoveAction?.primaryLabel}
                       aria-haspopup={hasSecondaryMoveOptions ? "menu" : undefined}
                       aria-expanded={hasSecondaryMoveOptions ? showMoveMenu : undefined}
                     >
                       <span className="detail-move-btn__label">
-                        {t("taskDetail.move.moveTo", "Move to {{column}}", { column: primaryMoveTransition ? columnLabel(primaryMoveTransition) : "" })}
+                        {primaryMoveAction?.primaryLabel ?? t("taskDetail.move.moveTo", "Move to {{column}}", { column: "" })}
                       </span>
                       {hasSecondaryMoveOptions && (
                         <span className="detail-move-btn__arrow" aria-hidden="true">

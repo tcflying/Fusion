@@ -42,6 +42,8 @@ export interface BoardWorkflowColumnFlags {
   hold?: boolean;
   intake?: boolean;
   mergeBlocker?: boolean;
+  /** Merge/review lane membership used by the shared live-agent predicate. */
+  mergeOrchestration?: boolean;
   humanReview?: boolean;
   [key: string]: boolean | undefined;
 }
@@ -49,6 +51,8 @@ export interface BoardWorkflowColumnFlags {
 export interface BoardWorkflowColumn {
   id: string;
   name: string;
+  /** Optional author-defined explanatory copy from the workflow IR. */
+  description?: string;
   flags: BoardWorkflowColumnFlags;
 }
 

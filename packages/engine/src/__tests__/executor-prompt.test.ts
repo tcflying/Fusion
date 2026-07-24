@@ -731,8 +731,9 @@ describe("summarizeToolArgs", () => {
     expect(summarizeToolArgs("Bash", {})).toBeUndefined();
   });
 
-  it("returns undefined when no string args found", () => {
-    expect(summarizeToolArgs("unknown", { count: 42, flag: true })).toBeUndefined();
+  it("returns compact JSON when only non-string args are present", () => {
+    // FNXC:StuckDetector 2026-07-22-20:20: structured custom-tool args need a distinct summary.
+    expect(summarizeToolArgs("unknown", { count: 42, flag: true })).toBe('{"count":42,"flag":true}');
   });
 });
 
@@ -797,11 +798,17 @@ describe("TaskExecutor pause behavior", () => {
     // Should move to todo, NOT mark as failed.
     // FNXC:ExecutorMoveTaskOptions 2026-07-12: executor.ts:11622-11625 now always passes a moveTask options object built from conditional spreads.
     /*
-    FNXC:EngineTests 2026-07-19-03:12 (U10b):
-    A pause-abort bounce to todo must never discard progress the run already recorded.
-    Under graph-owned execution the workflow materializes its steps and marks the running one `in-progress` before the implementation session, so every aborted run has resumable progress and the bounce must carry `preserveResumeState` — the pre-graph "empty steps => discard worktree+branch" shape is unreachable.
+    FNXC:EngineTests 2026-07-23-21:40 (FN-8464 / #2403):
+    A pause-abort bounce to todo preserves resume state ONLY when the run recorded resumable
+    progress (currentStep > 0 or a step marked done/in-progress). A FRESH task's first
+    implementation pass now OWNS the step projection: `runProjectedGraphTaskStep` defers the
+    atomic `startStep` in-progress write until the task has a real worktree (FN-8464 baseline
+    cwd gating) and #2403 routed step starts through the dependency-gated `store.startStep`.
+    A pause landing during that first session therefore finds every step still `pending`,
+    so the bounce carries no `preserveResumeState` — the conditional spreads collapse to `{}`.
+    The protective intent is unchanged: pause parks in todo and never marks the task failed.
     */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveResumeState: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {});
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
@@ -1500,6 +1507,86 @@ describe("swallowed async store failure observability", () => {
   beforeEach(() => {
     resetExecutorMocks();
     mockedWithRateLimitRetry.mockImplementation((fn: () => Promise<unknown>) => fn());
+  });
+
+  /*
+   * FNXC:StepLifecycle 2026-07-22-10:30:
+   * A legacy inversion leaves the target in-progress even when the predecessor guard rejects
+   * its restart. The executor must consume the atomic verdict instead of inferring acceptance
+   * from that unchanged target status.
+   */
+  it("turns a blocked corrupted in-progress start into a failed step-session result", async () => {
+    const store = createMockStore();
+    const task = {
+      id: "FN-8490",
+      title: "Ordered step start",
+      description: "Do not execute a rejected later step",
+      column: "in-progress" as const,
+      dependencies: [] as string[],
+      steps: [
+        { name: "Step 0", status: "in-progress" as const },
+        { name: "Step 1", status: "in-progress" as const },
+      ],
+      currentStep: 0,
+      log: [] as any[],
+      prompt: "# test\n## Steps\n### Step 0: Preflight\n- [ ] check\n### Step 1: Implement\n- [ ] build",
+      worktree: "/tmp/test/.worktrees/fn-8490",
+      baseCommitSha: "abc123",
+      enabledWorkflowSteps: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    store.getSettings.mockResolvedValue({
+      maxConcurrent: 2,
+      maxWorktrees: 4,
+      pollIntervalMs: 15_000,
+      groupOverlappingFiles: false,
+      autoMerge: false,
+      runStepsInNewSessions: true,
+      maxParallelSteps: 1,
+    });
+    store.getTask.mockResolvedValue(task);
+    store.startStep
+      .mockResolvedValueOnce({
+        task,
+        accepted: true,
+        disposition: "resumed",
+      })
+      .mockResolvedValueOnce({
+        task,
+        accepted: false,
+        disposition: "blocked",
+        blockingStepIndex: 0,
+      });
+    mockExecuteAll.mockImplementation(async () => {
+      const options = mockedStepSessionExecutor.mock.calls.at(-1)?.[0] as {
+        onStepStart?: (stepIndex: number) => Promise<void | boolean>;
+      };
+      const accepted = await options.onStepStart?.(1);
+      return accepted === false
+        ? [{ stepIndex: 1, success: false, error: "start rejected", retries: 0 }]
+        : [{ stepIndex: 1, success: true, retries: 0 }];
+    });
+
+    const onError = vi.fn();
+    const executor = new TaskExecutor(store, "/tmp/test", { onError });
+    await executor.execute(task);
+
+    expect(store.startStep).toHaveBeenLastCalledWith("FN-8490", 1, undefined);
+    expect(
+      store.updateStep.mock.calls.some(
+        ([taskId, stepIndex, status]) => taskId === "FN-8490" && stepIndex === 0 && status === "done",
+      ),
+    ).toBe(false);
+    expect(store.moveTask).toHaveBeenCalledWith(
+      "FN-8490",
+      "todo",
+      expect.objectContaining({ preserveProgress: true, recoveryRehome: true }),
+    );
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "FN-8490" }),
+      expect.objectContaining({ message: "Step 1: start rejected" }),
+    );
   });
 
   it("logs warning when rate-limit retry logEntry fails in step-session mode", async () => {
@@ -2215,11 +2302,14 @@ describe("TaskExecutor global pause behavior", () => {
 
     // FNXC:ExecutorMoveTaskOptions 2026-07-12: executor.ts:11622-11625 now always passes a moveTask options object (conditional spreads collapse to {} when nothing to preserve); previously undefined. Intent (not marked failed) unchanged.
     /*
-    FNXC:EngineTests 2026-07-19-03:14 (U10b):
-    A global-pause abort must park the task in todo without failing it AND without throwing away the progress the run already recorded.
-    Graph-owned execution always has a materialized in-progress workflow step by the time the pause lands, so the bounce carries `preserveResumeState`.
+    FNXC:EngineTests 2026-07-23-21:40 (FN-8464 / #2403):
+    A global-pause abort must park the task in todo without failing it. Resume state is
+    preserved only when the run recorded resumable progress; a fresh task's first
+    implementation pass owns the step projection (startStep is deferred until a real
+    worktree exists), so a pause during that first session leaves all steps `pending`
+    and the bounce options collapse to `{}`.
     */
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", { preserveResumeState: true });
+    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "todo", {});
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-001", { status: "failed" });
   });
 
@@ -2327,31 +2417,34 @@ describe("TaskExecutor global pause behavior", () => {
     const watchdogSpy = vi.spyOn(executor as any, "scheduleCompletedTaskWatchdog");
     await executor.execute(todoTask as any);
 
-    expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
-      paused: false,
-      pausedByAgentId: null,
-      status: null,
-      // FNXC:Lifecycle 2026-07-17-06:15: FN-8141 clears skip-bypass taint on accepted completion.
-      bulkCompletionRefusalAt: null,
-    });
-    expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
+    /*
+    FNXC:EngineTests 2026-07-23-21:40 (#2371):
+    User-paused dispatch stops: a paused todo task is no longer dispatched at all —
+    execute() ends the graph run benignly with the row still parked and paused, so no
+    agent session exists and `fn_task_done` is unreachable from this shape. The
+    protective intent survives on the surfaces that remain: the card is never handed to
+    `in-review` under global pause, no completion watchdog is armed, the pause is never
+    cleared by the refused dispatch, and the run narrates the benign paused park.
+    */
+    expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+    expect(taskDoneResult).toBeUndefined();
+    expect(store.updateTask).not.toHaveBeenCalledWith(
+      "FN-001",
+      expect.objectContaining({ paused: false }),
+    );
     expect(store.moveTask).not.toHaveBeenCalledWith("FN-001", "in-review");
+    expect(store.moveTask).not.toHaveBeenCalledWith(
+      "FN-001",
+      "in-review",
+      expect.anything(),
+    );
     expect(watchdogSpy).not.toHaveBeenCalledWith("FN-001", "fn_task_done");
     expect(
       store.logEntry.mock.calls.some(
         ([id, action]: [string, string]) =>
-          id === "FN-001" && action.includes("fn_task_done called while task was in todo during pause"),
+          id === "FN-001" && action.includes("parked in todo — benign, paused awaiting explicit unpause"),
       ),
     ).toBe(true);
-    /*
-    FNXC:EngineTests 2026-07-19-05:12 (U10b):
-    Deleted assertion: the executor's own "Completion handoff deferred — global pause active" log line.
-    That line belongs to the pre-graph completion path, which the graph short-circuits at the implementation-complete boundary (`graphCompletion`) before any executor-side defer check runs — the executor no longer owns the handoff, so it no longer narrates deferring it.
-    The REQUIREMENT it stood for is still asserted here, on the surfaces that survive: the card is never handed to `in-review` under global pause, no completion watchdog is armed, and `fn_task_done` tells the agent the handoff is deferred until the pause clears.
-    */
-    expect(taskDoneResult.content[0].text).toBe(
-      "Task marked complete. Completion handoff deferred until pause is cleared.",
-    );
   });
 
   describe("fn_task_done with paused state (FN-3964 / FN-4167 regression)", () => {
@@ -2406,31 +2499,35 @@ describe("TaskExecutor global pause behavior", () => {
 
       await executor.execute(todoTask as any);
 
-      // FN-4145: explicit agent completion always clears task-level pause state.
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
-        paused: false,
-        pausedByAgentId: null,
-        status: null,
-        // FNXC:Lifecycle 2026-07-17-06:15: FN-8141 clears skip-bypass taint on accepted completion.
-        bulkCompletionRefusalAt: null,
-      });
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
-      expect(store.moveTask).toHaveBeenCalledWith(
+      /*
+      FNXC:EngineTests 2026-07-23-21:40 (#2371):
+      User-paused dispatch stops supersede the FN-3964/FN-4167 shape for ALREADY-paused
+      todo rows: execute() no longer dispatches a paused task, so no agent session is
+      created and `fn_task_done` cannot fire from this shape. Explicit-completion pause
+      clearing (FN-4145) still holds for a pause that lands MID-session — covered by
+      "completes in-progress + paused tasks after clearing task-level pause state".
+      Here the row must stay parked and paused: no in-review handoff, no watchdog, no
+      pause clear, and the run narrates the benign paused park.
+      */
+      expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(taskDoneResult).toBeUndefined();
+      expect(store.updateTask).not.toHaveBeenCalledWith(
+        "FN-001",
+        expect.objectContaining({ paused: false }),
+      );
+      expect(store.moveTask).not.toHaveBeenCalledWith(
         "FN-001",
         "in-review",
         expect.objectContaining({ workflowMoveSource: "workflow-graph" }),
       );
-      expect(watchdogSpy).toHaveBeenCalledWith("FN-001", "fn_task_done");
+      expect(watchdogSpy).not.toHaveBeenCalledWith("FN-001", "fn_task_done");
       expect(
         store.logEntry.mock.calls.some(
           ([id, action]: [string, string]) =>
-            id === "FN-001" && action.includes("Completion handoff deferred — global pause active"),
+            id === "FN-001" && action.includes("parked in todo — benign, paused awaiting explicit unpause"),
         ),
-      ).toBe(false);
-      expect(taskDoneResult.content[0].text).toBe(
-        "Task marked complete with summary. All steps done. Moving to in-review.",
-      );
-      // globalPause:true deferred behavior is intentionally covered by the test above.
+      ).toBe(true);
+      // globalPause:true refused-dispatch behavior is intentionally covered by the test above.
     });
 
     it("completes in-progress + paused tasks after clearing task-level pause state", async () => {
@@ -2563,27 +2660,30 @@ describe("TaskExecutor global pause behavior", () => {
 
       await executor.execute(todoTask as any);
 
-      expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
-        paused: false,
-        pausedByAgentId: null,
-        status: null,
-        // FNXC:Lifecycle 2026-07-17-06:15: FN-8141 clears skip-bypass taint on accepted completion.
-        bulkCompletionRefusalAt: null,
-      });
-      expect(store.moveTask).toHaveBeenCalledWith("FN-001", "in-progress");
-      expect(store.moveTask).toHaveBeenCalledWith(
+      /*
+      FNXC:EngineTests 2026-07-23-21:40 (#2371):
+      Same paused-dispatch-stop contract as the sibling describe: an already-paused todo
+      row is never dispatched, `fn_task_done` is unreachable, the pause is preserved, and
+      the run parks benignly in todo.
+      */
+      expect(mockedCreateFnAgent).not.toHaveBeenCalled();
+      expect(store.updateTask).not.toHaveBeenCalledWith(
+        "FN-001",
+        expect.objectContaining({ paused: false }),
+      );
+      expect(store.moveTask).not.toHaveBeenCalledWith(
         "FN-001",
         "in-review",
         expect.objectContaining({ workflowMoveSource: "workflow-graph" }),
       );
-      expect(watchdogSpy).toHaveBeenCalledWith("FN-001", "fn_task_done");
+      expect(watchdogSpy).not.toHaveBeenCalledWith("FN-001", "fn_task_done");
       expect(
         store.logEntry.mock.calls.some(
           ([id, action]: [string, string]) =>
-            id === "FN-001" && action.includes("Completion handoff deferred — global pause active"),
+            id === "FN-001" && action.includes("parked in todo — benign, paused awaiting explicit unpause"),
         ),
-      ).toBe(false);
-      // globalPause:true deferred behavior is intentionally covered by the test above.
+      ).toBe(true);
+      // globalPause:true refused-dispatch behavior is intentionally covered by the test above.
     });
 
     it("completes in-progress + paused tasks after clearing task-level pause state", async () => {
@@ -2789,6 +2889,30 @@ describe("fn_task_update bare-call guard (P1 api-contract)", () => {
     expect(text).toContain("Step 0");
     expect(text).toContain("skipped");
     expect(store.appendAgentLog).not.toHaveBeenCalled();
+  });
+
+  // FNXC:StepLifecycle 2026-07-22-09:50: Rejected starts must clearly preserve
+  // lifecycle invariants so agents do not execute work for a pending step.
+  it("explains that a rejected out-of-order start preserves lifecycle invariants", async () => {
+    const { store, tool } = makeTool();
+    store.getTask.mockResolvedValue(createMockTaskDetail({
+      steps: [
+        { name: "Preflight", status: "in-progress" },
+        { name: "Implement", status: "pending" },
+      ],
+    }));
+    store.updateStep.mockResolvedValue(createMockTaskDetail({
+      steps: [
+        { name: "Preflight", status: "in-progress" },
+        { name: "Implement", status: "pending" },
+      ],
+    }));
+
+    const result = await tool.execute("call-1", { step: 1, status: "in-progress" });
+
+    const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+    expect(text).toContain("remains pending");
+    expect(text).toContain("ignored to preserve step lifecycle invariants");
   });
 });
 

@@ -15,6 +15,12 @@ The Fusion dashboard is the main control plane for tasks, agents, missions, sett
 
 When Fusion detects a newer `@runfusion/fusion` release, the Settings modal footer shows the available version with **Learn more** and **Update now** actions. **Update now** installs the latest global package with npm; after it succeeds, both the Settings update-success state and dashboard update banner offer a one-click **Restart Fusion** action because the already-running dashboard server is unchanged until restart. When Fusion is unsupervised (for example, started with `--no-supervise`), either action remains disabled and explains that Fusion must be restarted manually.
 
+### Supervised source-checkout rebuilds
+
+For a capability that has just merged, rebuild only after its commit is present in the fixed source checkout reported by `GET /api/system` as `sourceWorkspaceRoot`. Confirm `rebuildSupported` and supervision, then send authenticated `POST /api/system/rebuild` with `{ "scope": "app", "restart": true }`. Poll `GET /api/system/rebuild/current` until the build succeeds and restart is scheduled; expect the connection to drop, reconnect to the supervised process, and verify `GET /api/health` before capability probes.
+
+Never copy worktree files into the reported checkout, rebuild an unmerged branch, kill port 4040, use `nohup`, or replace the daemon with a raw detached process. An implementation task running inside Fusion cannot continue after stopping its own host, so post-merge restart and live verification belong to a separate operator-run/dependent task with the deployed commit, source workspace, health response, and probe evidence recorded.
+
 ## Settings discovery
 
 <!-- FNXC:SettingsSearchDocs 2026-07-04-00:00: Settings search is section-discovery, not a global command palette. Document that it filters visible Settings sections by section names and setting keywords while preserving feature-gated hidden sections. -->
@@ -44,7 +50,7 @@ The Settings footer includes a **Reset Settings** button, next to Import/Export,
 
 Both actions are irreversible; there is no undo after confirming. The dialog closes and the form refreshes to show the reset values immediately after a successful reset.
 
-**Excluded sections.** Some sections are not a simple settings form and are intentionally excluded from **Reset this menu** (the button is disabled with an explanatory tooltip when one of these is the active section), because each already has its own dedicated management flow: **Secrets**, **MCP Servers** (global and project), **Plugins**, **Memory**, **Authentication**, **Prompts**, **CLI Agents**, and the **Hermes**/**OpenClaw**/**Paperclip** runtime sections. **Reset all project settings** is unaffected by this exclusion list since it resets the underlying project settings values directly, not through any of those sections' own flows.
+**Excluded sections.** Some sections are not a simple settings form and are intentionally excluded from **Reset this menu** (the button is disabled with an explanatory tooltip when one of these is the active section), because each already has its own dedicated management flow: **Secrets**, **MCP Servers** (global and project), **Plugins**, **Memory**, **Authentication**, **Prompts**, **CLI Agents**, and the **Hermes**/**OpenClaw**/**Paperclip** runtime sections. Runtime pages appear only when their runtime plugin is installed; an installed but disabled runtime stays visible so it can be inspected or re-enabled. Settings hides runtime pages while its installed-plugin list is loading or unavailable, then refreshes the navigation after plugin lifecycle changes while Settings remains open. **Reset all project settings** is unaffected by this exclusion list since it resets the underlying project settings values directly, not through any of those sections' own flows.
 
 ## Keyboard shortcuts
 
@@ -94,7 +100,7 @@ On mobile board-card detail, **Back to board** also restores the prior board/car
 
 ### Mobile Kanban column snapping
 
-After a horizontal swipe on the mobile Kanban board, Fusion smoothly settles the viewport on the nearest column so it does not rest between two columns. During the user pan, the board temporarily suspends native CSS `scroll-snap-type: x proximity`; the JavaScript scroll-end handler is the single magnetism authority and resolves drag-end to exactly one centered column before restoring the proximity baseline. This user-scroll-end behavior does not run for refreshes, resizes, or restored pages, which preserve the column position you chose. It supersedes FN-8235's competing native-drag/JS-drop behavior and intentionally avoids `x mandatory`, because mandatory snapping reintroduced the FN-001 iOS corner-rendering regression during layout changes.
+On the mobile Kanban board, free-scroll while your finger is down and keep native fling/momentum after lift. Direction is locked at finger-up from the net swipe (not rubber-band ticks). When motion stops, Fusion hard-jumps to the next column **in that scroll direction** (right when scrolling forward, left when scrolling back) and pins until the next touch. If a user pan ends off-center without a usable direction, it hard-jumps to the nearest column instead, so it never rests between columns. CSS proximity stays suspended after a page. During the user pan, the board temporarily suspends native CSS `scroll-snap-type: x proximity`; the JavaScript scroll-end handler is the single magnetism authority and resolves drag-end to exactly one centered column before restoring the proximity baseline. This user-scroll-end behavior does not run for refreshes, resizes, or restored pages, which preserve the column position you chose. It supersedes FN-8235's competing native-drag/JS-drop behavior and intentionally avoids `x mandatory`, because mandatory snapping reintroduced the FN-001 iOS corner-rendering regression during layout changes.
 
 <!-- FNXC:BoardNavigationDocs 2026-07-16-08:35: Issue #2245 / #2303 requires one mobile board magnetism: suspend native proximity during a user pan, let JS resolve exactly one centered column at drag-end, then restore proximity without using prohibited x mandatory so FN-001 corner rendering remains intact. -->
 <!-- FNXC:BoardNavigationDocs 2026-07-15-13:30: Mobile Kanban documentation must describe the user-only JS scroll-end snap and its FN-001 proximity-CSS rationale so operators understand why layout changes never force a column. -->
@@ -136,12 +142,12 @@ When enabled on desktop or tablet project screens, the right dock is a persisten
 
 If **Settings → Appearance → Open tasks in the right sidebar** is enabled, board task-card clicks open task detail inside this right dock and keep the board visible. The setting is default off; mobile or hidden/inactive dock states automatically fall back to the existing full-panel task detail unless the task-popup setting below is enabled, and non-board task-open paths keep their existing behavior.
 
-<!-- FNXC:MobileTaskPopups 2026-07-13-00:00 (FN-7945): Board-card and List row/card task opens have a separate default-off popup setting so operators on desktop, tablet, and mobile can opt into the existing FloatingWindow task popup when they want the board or List view visible; ordinary popup routing takes precedence over the right dock, while deep-tab, context-menu, and non-board/List opens keep their existing paths.
+<!-- FNXC:MobileTaskPopups 2026-07-21-00:00 (FN-8478): Board-card and List row/card task opens have a separate default-off popup setting so operators on desktop, tablet, and mobile can opt into the existing FloatingWindow task popup when they want the board or List view visible; board-card deep-tab chips now preserve their requested tab in the popup, while context-menu and non-board/List opens keep their existing paths.
 FNXC:TaskPopupGeometry 2026-07-03-00:00: Desktop/tablet task popups share a persisted geometry key across task IDs so operators can size and place the popup once, then open other tasks without repeating that setup. Mobile remains a full-screen sheet regardless of saved desktop geometry.
 FNXC:RightDockTaskPopup 2026-07-03-00:00: The same task-popup preference also applies to ordinary clicks in the right-dock Tasks list so that opted-in operators never lose the list to embedded detail by clicking a dock task row.
 FNXC:TaskPopupLayer 2026-07-17-15:55: Task popups and Quick Chat share the board/task-detail interaction stack, so the most recently clicked or focused overlapping surface appears on top. Terminal, Files, New Task, workflow editor, and other utility windows retain their separate higher utility stacking.
 FNXC:TaskPopupViewGating 2026-07-15-15:20: FN-8016 makes popup view scoping default-on for every dashboard view. Hidden popups are render-only hidden, not closed, so snapshots and shared geometry survive navigation; same-task popups remain independently addressable by origin view. -->
-**Settings → Appearance → Open tasks as popups** changes ordinary board task-card clicks, List row/card opens, and right-dock Tasks-list clicks across desktop, tablet, and mobile viewports. When enabled, those clicks use the existing task popup/FloatingWindow surface on the board/task-detail layer instead of the full-panel task detail, List split-detail/docked detail, or right-dock task detail, keeping the board, List view, or dock list visible in the background. Overlapping Quick Chat and task popups interleave by the most-recent pointer or focus interaction; other utility windows retain their higher global stacking. On desktop and tablet, task popups restore the last saved popup size and position between tasks; on mobile, task popups stay full-screen sheets. Deep `changes`/`retries`/`workflow` opens, List context-menu/refine actions, task-detail links, plugin/graph opens, and explicit pop-out actions keep their existing paths.
+**Settings → Appearance → Open tasks as popups** changes ordinary board task-card clicks, List row/card opens, and right-dock Tasks-list clicks across desktop, tablet, and mobile viewports. When enabled, those clicks use the existing task popup/FloatingWindow surface on the board/task-detail layer instead of the full-panel task detail, List split-detail/docked detail, or right-dock task detail, keeping the board, List view, or dock list visible in the background. Overlapping Quick Chat and task popups interleave by the most-recent pointer or focus interaction; other utility windows retain their higher global stacking. On desktop and tablet, task popups restore the last saved popup size and position between tasks; on mobile, task popups stay full-screen sheets. Board task-card `changes`/`retries`/`workflow` chips open the popup with the requested tab. List context-menu/refine actions, task-detail links, plugin/graph opens, and explicit pop-out actions keep their existing paths.
 
 **Settings → Appearance → Keep task popups on the view where they were opened** is enabled by default. Every task-detail popup is attached to its exact originating view, including Planning, Agents, Command Center, Documents, Missions, and plugin views: navigating elsewhere hides it without closing it, and returning re-shows it in the same saved position. You can open the same task independently in more than one view; closing or pressing Escape on one popup does not affect the other. Disable this setting only to restore legacy globally shared popups. Legacy saved popups without an origin remain visible everywhere for compatibility.
 
@@ -372,8 +378,14 @@ Use GitHub import on mobile:
 
 1. Open the compact Header actions or bottom **More** sheet and select **Import from GitHub**.
    Expected outcome: the same import workflow opens in the mobile modal layout.
+<!--
+FNXC:GitHubImportDocs 2026-07-23-13:20:
+The mobile issue detail preserves the complete Close issue, Plan, Chat, and Import as task action set
+on one touch-safe row. Labels may wrap inside their own actions rather than being hidden or moved to
+an inaccessible second row.
+-->
 2. Choose the repository, issue/PR tab, candidate row, and detail action. For GitHub issues, choose **Import as task** for direct tracked creation or **Plan** to start Planning Mode with the issue context.
-   Expected outcome: direct import creates the board task with the same GitHub provenance/tracking metadata as the desktop/tablet **Import Tasks** view; Plan opens the Planning Mode interview without source-issue tracking.
+   Expected outcome: direct import creates the board task with the same GitHub provenance/tracking metadata as the desktop/tablet **Import Tasks** view; Plan opens the Planning Mode interview without source-issue tracking. When all GitHub issue actions are available, their full labels remain on one touch-safe action row.
 3. While a candidate detail sheet is open, use the platform Back gesture or control.
    Expected outcome: the first Back dismisses only the issue, pull request, or GitLab detail and returns to the import candidate list; a second Back dismisses the import form.
 
@@ -433,7 +445,7 @@ Behavior:
 FNXC:WorkflowEditor 2026-06-29-21:10: Optional-group template entry/exit ownership remains visual-only. Non-editable boundary connector lines must explain how template children attach to the container without persisting fake edges into workflow IR. -->
 - Optional-group, foreach, and loop containers show their template nodes inside the block. Canvas connections between the surrounding workflow and the block attach to the container boundary; connections between template nodes stay inside the block. Optional groups also draw non-editable entry/exit connector lines between the boundary and the template entry/exit nodes so single-step blocks such as Plan Review and Code Review do not look disconnected; those visual connectors are not saved into workflow IR.
 - The Settings panel is value-first for built-in workflows and groups workflow settings by Models, Review & Approval, Step Execution, and Advanced. Known workflow model values use the same model dropdown picker as **Settings → Project Models** so provider/model pairs and their inline Thinking Level companions are saved together; custom or non-model string values can still use typed inputs. Definitions remain available for custom workflow schema authoring.
-- The main Settings modal also exposes the default workflow's Plan/Triage, Executor, Reviewer, and declared Planning/Reviewer fallback model lanes from **Project Models**; those dropdown values auto-save as workflow setting values for the active default workflow. Project Models also includes project-scoped **Merger** and **Title Summarization** lanes (not workflow-moved). Settings fallback model pickers (Global Fallback Model, workflow fallbacks, and project Title Summarizer Fallback) include the same inline Thinking Level selector when their companion key exists.
+- The main Settings modal exposes project-baseline Plan/Triage, Executor, Reviewer, and declared fallback model lanes from **Project Models**. Those dropdown values auto-save on the active default workflow and are inherited by every workflow. Resolution is task-specific selection → project baseline → global lane → selected-workflow value; Project Models therefore wins over values configured in a workflow's **Settings → Values**. Project Models also includes project-scoped **Merger** and **Title Summarization** lanes (not workflow-moved). Settings fallback model pickers (Global Fallback Model, workflow fallbacks, and project Title Summarizer Fallback) include the same inline Thinking Level selector when their companion key exists.
 - On desktop, the editor uses a multi-panel canvas layout for editing the graph and adjacent workflow metadata. The **Show simple editor** toggle switches that same workflow into the graph-outline editor with dedicated **Graph**, **Add**, **Settings**, **Fields**, **Columns**, and **Actions** tabs.
 - On viewports `<=768px`, the editor switches to a full-screen mobile sheet. Global workflow entry points open to the workflow list with no workflow preselected and prompt users to select a workflow to edit; the Board/List workflow dropdown row edit action opens directly to the selected workflow editor when that selected workflow is available.
 - Simple/mobile editing uses a graph outline instead of making the canvas the primary control. The outline shows nodes, branch/rework edges, column placement, and optional-group/foreach/loop template children as tappable rows and chips that open the same node and edge detail editors as desktop. The structural **start** node opens an inspector for the workflow entry column when the workflow defines columns; the **Name** field remains unavailable because the start label is structural. For custom workflows, editable outline rows also expose **Move up** and **Move down** controls that reorder steps within their current column or template parent; built-in workflows remain read-only and hide those controls.
@@ -528,7 +540,8 @@ When an active Planning AI generation appears stuck, Planning Mode automatically
 <!-- FNXC:PlanningMode 2026-07-19-15:55: FN-8400 replaces the duplicate prompt-recovery controls with a focused three-pane interview; restarting remains a deliberate New session action. -->
 Use **New session** to restart planning with a different idea.
 
-Planning Mode uses the selected workflow's `planning` seam—the same triage template used for newly added tasks—as its quality bar, then layers the user-controlled interview adapter on top. An explicitly configured `planning-system` prompt override replaces that full system prompt.
+<!-- FNXC:PlanningMode 2026-07-23-11:50: Planning Mode must preserve a collaborative discovery identity instead of inheriting triage/workflow execution specifications. -->
+Planning Mode uses a dedicated collaborative system prompt. It investigates relevant repository and board context, explores assumptions and tradeoffs, considers decomposition choices without automatically creating child tasks, and sharpens concrete deliverables with observable acceptance criteria. This is separate from task triage and the executor-ready **PROMPT.md** generated after task creation. An explicitly configured nonblank `planning-system` prompt override replaces the complete dedicated system prompt; blank or absent values retain the default interview.
 
 <!-- FNXC:PlanningMode 2026-07-20-15:45: FN-8442 replaces the simultaneous three-pane interview with a sequential plan-review and question loop. -->
 Planning Mode is a single-surface sequence: enter an idea, wait while Fusion generates a concrete initial plan, then review that evolving work product before deciding whether clarification is needed. Plan review shows the title, description, explicit **What to change** and **Acceptance criteria** sections, and deliverables, plus model-suggested **Focus the next question** choices and **Write your own focus**. Choose **Refine** to ask one high-impact question or **Validate** to accept the current plan. Answering a question shows **Updating plan…** and returns to plan review rather than automatically starting another question. The active generation purpose and running plan are persisted, so refreshing or navigating away during generation restores the correct progress state and eventual review.
@@ -561,12 +574,16 @@ Create requests never send an explicit `column`. The task store resolves the lan
 
 Optional workflow steps declared by the active workflow are available from the quick-add action row and the **New Task** dialog's inline quick buttons. For example, the coding workflow's browser verification option appears as a quick drop-down when that workflow is active; each option is seeded from the workflow step's `defaultOn` setting and is sent with the task's `enabledWorkflowSteps` payload at creation time.
 
-<!-- FNXC:QuickAddAttachments 2026-07-16-00:00: Quick Add attachments use a compact icon-only paperclip while keeping the Attach action and pending image count in accessible labels. The same pending preview/upload path accepts image selection, paste, and direct drag/drop onto the Quick Add box. Compact pending-image thumbnails are accessible open controls that show the full image in a movable/resizable window, which becomes a full-screen sheet on mobile. -->
+<!-- FNXC:QuickAddAttachments 2026-08-03-00:00: Quick Add's compact paperclip accepts the same task-store-supported photos and files through picker, paste, and drag/drop. Images retain accessible floating previews; non-image files expose a filename and remove action without an empty open control. -->
 <!-- FNXC:QuickAddPriorityIndicator 2026-07-10-21:45: Quick Add keeps status controls in the bottom action cluster: GitHub tracking sits beside the paperclip attach button, Priority is icon-only with low/down, normal/flag, high/up, urgent/alert glyphs, and Fast is an icon-only lightning button.
 FNXC:PriorityColorCoding 2026-07-11-00:00: Priority glyphs share urgency colors across Quick Add, the New Task inline row, and task-card badges: low=info/blue, normal=muted, high=warning/amber, urgent=error/red. -->
 Quick Add and Inline Create model selection include Plan, Executor, Reviewer, and Merger lanes. Each lane can inherit its default or select a task-specific model; Plan, Reviewer, and Merger also provide independent thinking-level overrides.
 
-Quick Add image attachments use the paperclip icon button in the action row. Supported image files (`png`, `jpeg`, `gif`, `webp`) can be selected from that control, pasted into the Quick Add input, or dragged onto the Quick Add box; all three paths show compact pending previews before task creation and upload the images to the created task afterward. Select a pending preview to inspect the full image in a movable, resizable window (a full-screen sheet on mobile); close it with Escape or the close control to return to the preview. The same bottom action row places the GitHub tracking override beside the paperclip; Priority is an icon-only control whose glyph changes by selected level (down arrow for low, flag for normal, up arrow for high, alert for urgent) and is color-coded by urgency (low blue/info, normal muted, high amber/warning, urgent red/error), and Fast is an icon-only lightning control. These icon-only controls keep accessible labels and the same create-payload behavior as the previous text chips.
+<!-- FNXC:QuickAddStart 2026-07-22-17:45: Coding (Ideas) Start is an atomic Todo create, while ordinary Save and Enter remain create-only in Ideas. -->
+
+Quick Add **Save** supports a **Start** menu on touch/pen long-press or mouse right-click only when the exact selected workflow has complete runtime metadata: a real non-sentinel id, nonempty ordered columns with unique nonblank ids, and an object `flags` value on every column. It is eligible only for validated `builtin:coding-ideas` or a validated workflow whose first visible column is a hold. Start snapshots that exact definition and id before duplicate confirmation and submits it unchanged; later selection or metadata refreshes cannot alter routing. For Coding (Ideas), Start proves that visible ordered metadata places a non-intake, non-complete **Todo** after **Ideas**, then includes Todo in the original Board/List create request—there is no follow-up move. Missing, hidden, malformed, reordered, or ambiguous metadata fails closed to create-only behavior. Ordinary Save and Enter still create in Ideas. Other eligible hold workflows retain their matching-returned-task promotion through the host Board/List move path only to the first later visible working column, skipping intake, hold, and complete columns; no forward target also remains create-only.
+
+Quick Add's paperclip accepts supported photos and files: PNG, JPEG, GIF, WebP, MP4, WebM, QuickTime video, plain text, Markdown, JSON, YAML, TOML, CSV, and XML. Select files, paste them into the Quick Add input, or drag them onto the box; pending attachments upload to the newly created task sequentially. Image attachments show compact previews that open in a movable, resizable window (a full-screen sheet on mobile); file attachments show an accessible filename and remove action without an image-open control. Unsupported selections are ignored, and if one upload fails after task creation, the task remains created while Quick Add reports the filenames that need retrying. The same bottom action row places the GitHub tracking override beside the paperclip; Priority is an icon-only control whose glyph changes by selected level (down arrow for low, flag for normal, up arrow for high, alert for urgent) and is color-coded by urgency (low blue/info, normal muted, high amber/warning, urgent red/error), and Fast is an icon-only lightning control. These icon-only controls keep accessible labels and the same create-payload behavior as the previous text chips.
 
 Quick entry, inline quick-create, and the full **New Task** dialog all check for similar active tasks before creating. When possible duplicates exist, the warning lists each match by task description (falling back to title, then “No description”) and lets you open an existing task, cancel, or create anyway with the duplicates acknowledged.
 
@@ -642,6 +659,7 @@ Chat view provides project-scoped conversations with agents.
 - Assistant question tool calls now render as a shared in-chat response card instead of a generic tool-call disclosure. The card recognizes provider-native question tools and Fusion's `fn_ask_question`, supports select, multi-select, text, and yes/no prompts, sends the formatted answer back into the same direct or room thread, and renders historical answered questions read-only.
 - The desktop Chat view toggle and mobile Chat tab now show an unread-response indicator when a live assistant reply arrives for a visible direct or room chat after you leave Chat; opening Chat clears it immediately. Task-detail planner Chat replies stay task-local and do not light up the global Chat unread indicator while those sessions are hidden from the common Chat feed.
 - Agent-backed chat sessions now expose the same mailbox messaging tools (`fn_send_message`, `fn_read_messages`) used by runtime execution/heartbeat flows whenever the engine `MessageStore` is available; model-only chats continue to run without mailbox tools.
+- Main Chat and Chat Rooms accept the same supported photos and files as Quick Add through the paperclip, clipboard paste, or drag/drop. Pending images retain their preview/open behavior, while non-image files remain removable filename chips; failed sends preserve staged attachments for retry.
 - Chat attachments are included in agent-visible prompts for both direct sessions and rooms: supported text attachments are appended under an `Attachments` prompt section, and supported images (`png`, `jpeg`, `gif`, `webp`) are passed as image inputs to the model.
 - Chat attachments can be sent without accompanying text in both Quick Chat and Main Chat; fully empty sends with no text and no attachments are still blocked.
 <!-- FNXC:ChatMessageEdit 2026-07-12-23:20: Document the message-edit affordance and its resume-from-edit ("forget everything after") semantics, including the model-loop-only scope and inline timestamp placement. -->
@@ -746,7 +764,7 @@ Mailbox view shows inbox/outbox communication threads and unread state. When an 
 
 ## Interactive Terminal
 
-Fusion embeds a terminal using xterm.js. Desktop and tablet use the footer status bar as the terminal launcher; mobile keeps the full-screen terminal path.
+Fusion embeds a terminal using xterm.js. Desktop and tablet use the footer status bar as the terminal launcher; mobile keeps the full-screen terminal path. Known touch tablets, including at the 768px responsive boundary, retain docked/floating presentation rather than falling back to the phone sheet. Their saved floating size and position and touch drag/edge-or-corner resize controls stay available when a software keyboard shortens the visual viewport. True narrow phones, including folded panes and short phone landscapes, intentionally remain full-screen.
 
 <!-- FNXC:Terminal 2026-07-11-18:20: FN-7824 first-launch terminal sockets auto-retry with capped backoff until the first successful open, so the manual Reconnect affordance is reserved for terminal sessions that already connected and then exhaust their mid-session reconnect budget. -->
 On first launch or first open, the terminal keeps reconnecting automatically until its initial WebSocket opens; it should show **Reconnecting...** during that cold-start recovery rather than requiring a manual **Reconnect** click. If an already-connected terminal drops and exhausts its bounded reconnect budget, Fusion then parks it as **Disconnected** and surfaces the manual **Reconnect** control.
@@ -976,6 +994,7 @@ Features:
 - Error state: a failed artifact list request uses the shared `Failed to load artifacts: <error>` panel with a **Retry** action that re-runs the artifact fetch
 - Toggle between raw text and rendered markdown using the **Markdown/Plain** button
 - Highlight text in raw or rendered project-file previews or the selected Task Document's right pane, choose **Add comment**, and send the source path/key, selected snippet, and your comment to the **New Task** dialog
+- Task Detail creates documents with an absence precondition and edits using the revision/hash loaded with the draft. The global **Artifacts → Task Documents** editor uses the same conditional save. If another writer wins first, Fusion keeps the editor open and preserves the exact draft on desktop and mobile, refreshes the visible current revision, and asks the operator to review/rebase; it never silently retries or overwrites the newer document.
 
 Agent registrations also surface through the [Mailbox View](#mailbox-view): successful `fn_artifact_register` calls send a best-effort system inbox notification so users can discover new media even before opening the gallery. Artifact list live-refresh does not depend on that best-effort message; it listens to the registry registration event.
 
@@ -1121,6 +1140,8 @@ Features:
 - Agent list, live-agent, and detail task badges show the linked task ID with its current column when the task is non-terminal (for example `FN-6902 · Planning` or `FN-6902 · In Progress`). Terminal linked tasks are omitted, and unresolved column lookups render an explicit `Unresolved task` suffix so missing or deleted task links are not mistaken for healthy parked work.
 - First-run setup asks whether to create an optional project agent after project registration. The default template is **CEO**; users can choose another preset, use the AI interview when `experimentalFeatures.agentOnboarding` is enabled, or skip it. Fusion can still build tasks without an agent by starting temporary agents to plan, code, review, and merge task work.
 - Start, pause, stop, and trigger agent runs from the view and from detail panels
+- **Heartbeat controls** appear on every durable-agent List, Board, and Org chart card and in Agent detail settings. Heartbeats default to enabled unless `runtimeConfig.enabled` is explicitly `false`; changing this setting preserves the agent's other runtime configuration and does not pause, resume, or otherwise alter the agent lifecycle.
+- The Agents controls menu also provides **Enable all heartbeats** and **Disable all heartbeats** for every eligible durable agent in the current project, regardless of the active filter or layout. Each action confirms its target count, excludes ephemeral/task-worker agents, refreshes after completion, and reports skipped or failed updates rather than treating the batch as atomic.
 - In **Agent detail**, use the kebab **Bulk agent actions** button in the header utility cluster (next to **Refresh** and **Close**) to run project-wide lifecycle transitions for non-ephemeral agents in the current project — **Pause All Agents** targets agents in the `active` or `running` state, while **Resume All Agents** targets agents in the `paused` state only
 - In **Agent detail → Settings → Configuration**, the built-in-model picker includes a concrete **Thinking Level** selector; changing it autosaves to the agent's `runtimeConfig.thinkingLevel` alongside the provider/model choice.
 - Bulk menu items stay disabled when nothing is eligible and show an inline hint (`Loading eligible agents...`, `No active agents eligible`, `No paused agents eligible`, or the current eligible count such as `Pause 2 active/running agents`)
@@ -1258,7 +1279,7 @@ Features:
 <!-- FNXC:CommandCenter 2026-06-27-10:03: Tokens detail charts must show every model bucket returned by analytics for accurate spend attribution; Overview remains a compact top-model summary because its copy explicitly frames those cards as top consumers/share. -->
 <!-- FNXC:CommandCenterActivity 2026-06-30-00:00: Activity active-agent counts include both durable-agent usage events and ephemeral task-worker execution runs from agentRuns, because task execution can be visible without a matching usage_events row. -->
 <!-- FNXC:CommandCenterActivity 2026-07-01-00:00: Graph-owned workflow step sessions publish active-to-terminal agentRuns lifecycle rows with task lineage and step metadata, so daily activity and Activity throughput charts include new workflow execution without dashboard-side recounting. -->
-- **Overview controls dashboard** sits at the top of the Overview landing surface on desktop and mobile. It includes AI engine stop/start backed by `globalPause`, live scheduler status from executor stats, the shared Global Max Concurrent slider backed by `/api/global-concurrency`, range sliders for `maxConcurrent`, `maxTriageConcurrent`, and `maxWorktrees` that persist through `/api/settings`, and a compact theme dropdown with the same color-chip swatches and Shadcn variant list as Settings → Appearance. The four concurrency sliders ask for confirmation after a changed value settles; confirming persists the new cap, while cancel, backdrop, or Escape dismissal reverts to the last persisted value without saving. The global and current-project max-concurrent sliders show running-agent counts plus a current-use dot on the track once utilization data loads; triage and worktree sliders remain cap-only. These controls reuse existing APIs and App-level theme setters; they do not add a new backend route or second theme owner.
+- **Overview controls dashboard** includes AI engine stop/start backed by `globalPause`, the shared Global Max Concurrent slider, and current-project **Max concurrency** plus **Max worktrees** controls. Max concurrency caps top-level working agents across planning, execution, and review/merge; free capacity is admitted oldest-first within the project. The footer reports **Waiting**, **Running (N/max)**, and **Blocked**; column headers report executing/total (live agents in the lane over card count). Nested helper agents remain parent-internal and may temporarily exceed the displayed top-level count.
 <!-- FNXC:TeamArea 2026-07-18-12:30: FN-8351 moves organization export and import to the Team tab so team-level portability controls are not presented as Overview dashboard controls. -->
 - **Team tab — Org export / import** lets an operator download a portable organization JSON bundle or paste one for a dry-run preview before confirming the apply step. Exports are secret-scrubbed by default: credentials and tokens are never included, while safe secret references can remain for setup in the destination project.
 - **Configuration versions** lives in **Settings → Project → Configuration Versions**. It lists recorded project-setting revisions newest first; select **Roll back** on any revision and confirm once to restore it. The restore is recorded as a new forward revision, so it can itself be undone without manually reconstructing settings.
@@ -1373,7 +1394,7 @@ Features:
 - Enable/disable plugins, reload active plugins, and uninstall plugins
 - Inspect plugin runtime state and transition feedback
 - Edit and save plugin-defined settings schemas from the same panel
-- Built-in runtime plugins (Hermes, Paperclip, OpenClaw, Droid) always expose an interactive enable/disable toggle in the Built-in Plugins list, even before install. Disabling one registers it and disables it in the same action, and the decision survives restarts — a disabled runtime is not re-activated on the next startup. The Runtimes settings cards mirror this state instead of showing a stale detected/connected status.
+- A built-in runtime without an installed plugin record offers **Install** only. Once installed, it exposes project-scoped Enable/Disable, management, and uninstall controls; toggling never installs or reinstalls a runtime. The Runtimes settings cards mirror the installed runtime state instead of showing a stale detected/connected status.
 
 For full plugin lifecycle workflows (discovery, install, enable/disable, configure, update, uninstall, troubleshooting), see [Plugin Management](./plugin-management.md). For plugin-related settings and experimental toggles, see [Settings reference](./settings-reference.md).
 
@@ -1451,7 +1472,7 @@ Use this panel when upgrading a project with pre-FN-6245/FN-6277 in-review rows 
 <!-- FNXC:ExecutorStatusBar 2026-06-29-19:09: FN-7248 makes footer concurrency edits confirmation-gated like Command Center. Closing the popover, outside-clicking, pressing Escape, dismissing the backdrop, or unmounting must revert unconfirmed slider edits instead of saving them. -->
 <!-- FNXC:ExecutorStatusBar 2026-06-30-16:42: FN-7273 keeps the footer Engine Controls popover usable on mobile, narrow tablets, and tablet landscape by documenting that constrained screens use a full-width bottom panel above both fixed bottom bars instead of the compact desktop anchor. -->
 <!-- FNXC:GlobalConcurrencyControls 2026-07-15-17:30: FN-8007 keeps footer and dashboard current-use marker geometry aligned with the native range thumb, including its desktop and mobile thumb-size edge inset. -->
-The global AI engine stop/start control and triage pause/resume control live in the executor footer status bar rather than the header. Select the small engine-controls button beside the executor state badge, or select the state text such as **Running**, to open the footer popover. The popover includes **Stop AI engine** / **Start AI engine**, **Pause triage** / **Resume scheduling**, and live scheduler sliders for max concurrent tasks, max triage concurrency, and max worktrees. On mobile, narrow tablets, and tablet landscape, the same controls open as a full-width bottom panel above the executor footer and mobile navigation so the close button and sliders remain reachable. Use the visible **Close engine controls** X button, Escape, or outside-click to dismiss it. The global and current-project concurrency sliders also show how many agents are running, including actively-triaging planners (`triage` + `planning`, not paused), and a dot on the slider track for current use. The dot uses the same min-relative range coordinates and thumb-size edge inset as the native slider: it aligns to the cap-clamped running count, so one running agent at the slider minimum stays visible at the start and over-cap usage pins to the cap thumb instead of the expanded track end. Changed concurrency slider values ask for confirmation after the value settles. Confirming saves the global cap through `/api/global-concurrency` and project caps through `/api/settings`; cancel, backdrop dismissal, Escape, close, outside-click, or unmount reverts unconfirmed slider edits without saving. Multiple changed project sliders within one debounce window are summarized in one confirmation dialog, matching Command Center behavior.
+The global AI engine stop/start control and triage pause/resume control live in the executor footer status bar rather than the header. Select the small engine-controls button beside the executor state badge, or select the state text such as **Running**, to open the footer popover. The popover includes **Stop AI engine** / **Start AI engine**, **Pause triage** / **Resume scheduling**, and live scheduler sliders for **Max concurrency** and max worktrees. Max concurrency is the per-project top-level working-agent cap across planning, execution, and review/merge; nested helpers remain parent-internal and can temporarily exceed the displayed count. On mobile, narrow tablets, and tablet landscape, the same controls open as a full-width bottom panel above the executor footer and mobile navigation so the close button and sliders remain reachable. Use the visible **Close engine controls** X button, Escape, or outside-click to dismiss it. The global and current-project concurrency sliders show the shared live top-level agent count and a dot on the slider track for current use. The dot uses the same min-relative range coordinates and thumb-size edge inset as the native slider: it aligns to the cap-clamped running count, so one running agent at the slider minimum stays visible at the start and over-cap usage pins to the cap thumb instead of the expanded track end. Changed concurrency slider values ask for confirmation after the value settles. Confirming saves the global cap through `/api/global-concurrency` and project caps through `/api/settings`; cancel, backdrop dismissal, Escape, close, outside-click, or unmount reverts unconfirmed slider edits without saving. Multiple changed project sliders within one debounce window are summarized in one confirmation dialog, matching Command Center behavior.
 
 <!-- FNXC:ExecutorStatusBar 2026-06-27-00:00: FN-7163 makes footer stats loading initial-only so routine heartbeat refreshes keep the populated footer and open concurrency popover mounted instead of blinking to the loading branch. -->
 Brief, single-poll executor stats fetch blips keep showing the last good footer stats instead of flashing **Connecting…**. Routine executor stats heartbeats also keep the populated footer mounted after initial load, so an open engine/concurrency popover stays open while counts refresh. The footer only switches to **Connecting…** for sustained suspension-like stats failures, or to an explicit error state for non-transient failures.
@@ -1620,7 +1641,7 @@ For setup prerequisites, security caveats for tokenized URLs/QR links, and troub
 
 The Skills view now supports the full browse-and-install loop for skills.sh entries: use **Skills Catalog** to search the catalog, click **Install** on any card with a source repository, and the dashboard will run the same installer as the CLI (`npx skills add <owner/repo> -y -a pi`, with `--skill <slug>` when applicable). On success, the view refreshes **Discovered Skills** immediately so the newly installed skill appears without a page reload.
 
-The Skills API provides endpoints for managing execution skills. Skills are toggled via project-scoped settings in `.fusion/settings.json`.
+The Skills API provides endpoints for managing execution skills. Skills are toggled via project-scoped settings in `.fusion/settings.json`. Toggle entries match the skill body’s relative path beneath `skills/` (for example, `api/api-versioning/SKILL.md`), not just its displayed name. Stale flat-layout entries such as `-api-versioning/SKILL.md` are ignored for skills that now use a categorized body path, keeping the Skills view and agent-session manifest aligned.
 
 ![Skills view](./screenshots/skills-view.png)
 
@@ -1951,6 +1972,79 @@ Command Center chart surfaces are a stricter token-only zone: `CommandCenter.css
 
 Non-Command-Center dashboard CSS uses `--text` as the canonical primary text token. The undefined `--text-primary` alias is forbidden outside `components/command-center/**` and guarded by `packages/dashboard/app/__tests__/text-token-canonicalization.test.ts`.
 
+### Stable theme token contract (integrators & plugins)
+
+The following curated tokens are the supported dashboard theming contract for integrations and plugin-rendered UI. Each token is defined by `styles.css`; use these names rather than depending on internal or theme-data-only variables.
+
+<!-- fusion-theme-token-contract:start -->
+| Token | Stable meaning |
+|---|---|
+| `--space-xs` | Extra-small spacing step |
+| `--space-sm` | Small spacing step |
+| `--space-md` | Medium spacing step |
+| `--space-lg` | Large spacing step |
+| `--space-xl` | Extra-large spacing step |
+| `--space-2xl` | Largest shared spacing step |
+| `--radius-sm` | Small corner radius |
+| `--radius-md` | Medium corner radius |
+| `--radius-lg` | Large corner radius |
+| `--radius-xl` | Extra-large corner radius |
+| `--radius-pill` | Pill-shaped corner radius |
+| `--font-primary` | Dashboard UI font stack |
+| `--font-mono` | Dashboard monospace font stack |
+| `--font-size-xs` | Caption and help text size |
+| `--font-size-base` | Default body text size |
+| `--shadow-sm` | Subtle elevation shadow |
+| `--shadow-md` | Standard elevation shadow |
+| `--shadow-lg` | High elevation shadow |
+| `--focus-ring` | Subtle focus indicator shadow |
+| `--focus-ring-strong` | Emphasized focus indicator shadow |
+| `--duration-instant` | Instant motion duration |
+| `--duration-fast` | Fast motion duration |
+| `--duration-normal` | Standard motion duration |
+| `--duration-slow` | Slow motion duration |
+| `--transition-instant` | Instant duration and easing shorthand |
+| `--transition-fast` | Fast duration and easing shorthand |
+| `--transition-normal` | Standard duration and easing shorthand |
+| `--transition-slow` | Slow duration and easing shorthand |
+| `--bg` | Primary application background |
+| `--surface` | Primary raised surface |
+| `--card` | Card surface |
+| `--card-hover` | Hovered card surface |
+| `--surface-hover` | Neutral hovered surface |
+| `--bg-secondary` | Secondary application background |
+| `--bg-tertiary` | Tertiary application background |
+| `--border` | Default border color |
+| `--border-subtle` | Low-contrast border color |
+| `--border-strong` | High-contrast border color |
+| `--text` | Primary text color |
+| `--text-muted` | Secondary text color |
+| `--text-dim` | De-emphasized text color |
+| `--triage` | Triage workflow status color |
+| `--todo` | To-do workflow status color |
+| `--in-progress` | In-progress workflow status color |
+| `--in-review` | In-review workflow status color |
+| `--done` | Done workflow status color |
+| `--color-success` | Semantic success color |
+| `--color-error` | Semantic error color |
+| `--color-warning` | Semantic warning color |
+| `--color-info` | Semantic informational color |
+| `--color-muted` | Semantic muted color |
+| `--fusion-max-z` | Live dashboard floating-layer ceiling |
+<!-- fusion-theme-token-contract:end -->
+
+Color tokens resolve to raw color strings (e.g. `#161b22`), not shadcn-style HSL triples, so a token can be used directly as a `color`, `background`, or `border` value without wrapping it in `hsl(...)`.
+
+#### Overlay layering contract
+
+`--fusion-max-z` is always at least as high as the dashboard-managed floating layers covered by this contract: the page overlay/popover band at 10000–10001, the session-monotonic floating-utility stack starting at 10100, the reserved toast/feedback ceiling at 10500, and the body-portaled model-combobox dropdown at 11000. Its CSS boot value is 11001, one above the tallest static layer. `floatingWindowStack.ts` raises the inline value on `document.documentElement` whenever the utility stack grows beyond that floor, and CSS `var()` references re-resolve automatically. The separate task-detail popup band starting at 220 is intentionally not a source for updates because it remains below the utility band.
+
+For the simplest integration, append overlay content to `#plugin-overlay-root`. This fixed, viewport-sized mount point uses `z-index: calc(var(--fusion-max-z) + 1)` and is click-through by default; interactive children must set `pointer-events: auto`. A plugin that owns another root stacking context can apply the same z-index expression directly.
+
+A static mount-point z-index would eventually be overtaken by the unbounded, session-monotonic utility counter. The live custom property is therefore the layering primitive; the mount point is an inert convenience consumer. When empty, it does not alter layout, scrolling, or pointer behavior.
+
+Tokens in the table are stable. Renaming or removing one requires a deprecation note and a changeset; `theme-token-contract-docs.test.ts` guards that every documented token still has a CSS definition.
+
 ### Theme system
 
 <!-- FNXC:DashboardTheming 2026-06-21-00:00: FN-6840 synced the user-facing theme docs to the shipped expanded Shadcn family, the Shadcn Custom color-picker preset, and the sidebar accent behavior that follows each theme's --accent token. -->
@@ -1958,10 +2052,14 @@ Non-Command-Center dashboard CSS uses `--text` as the canonical primary text tok
 <!-- FNXC:DashboardTheming 2026-07-03-00:00: Fresh installs and reset-to-default use System mode so the dashboard follows the OS light/dark preference before and after hydration while keeping Shadcn Ember as the default color theme. -->
 <!-- FNXC:DashboardTheming 2026-07-16-00:00: FN-8151 adds Cobalt, Clay, and Moss; keep this inventory synchronized with the core COLOR_THEMES union and selector surfaces. -->
 <!-- FNXC:DashboardTheming 2026-07-16-14:30: FN-8146 restores historical Shadcn Mono as a persistent selector and makes the Settings current-theme row its single all-themes dropdown trigger while Command Center stays compact. -->
+<!-- FNXC:DashboardTheming 2026-07-20-00:00: Aurora is a built-in persisted palette with navy/teal/violet dark surfaces and a misty light counterpart; keep this inventory and its count synchronized with COLOR_THEMES. -->
+<!-- FNXC:DashboardTheming 2026-07-20-00:00: Calm is a built-in persisted palette with slate/sage dark surfaces and a misty blue-white light counterpart; keep this inventory and its count synchronized with COLOR_THEMES. -->
+<!-- FNXC:DashboardTheming 2026-07-20-00:00: Dawn is a built-in persisted palette with indigo/amber dark surfaces and a dawn-white light counterpart; keep this inventory and its count synchronized with COLOR_THEMES. -->
+<!-- FNXC:DashboardTheming 2026-07-21-12:20: FN-8471 keeps the Settings current-theme row and Command Center compact trigger on one filterable shared list so operators can discover any rendered theme name without changing the persisted selection until they choose an option. -->
 
-Dark/light modes via `data-theme`; fresh installs default to System mode so the resolved theme follows `prefers-color-scheme` until the user explicitly chooses Light, Dark, or System. 81 color themes via `data-color-theme` (lazy-loaded from `app/public/theme-data.css`), including Cobalt (saturated blue), Clay (warm terracotta), Moss (muted forest green), the Shadcn zinc-neutral theme with an orange default highlight/accent, Shadcn Custom (the same base with sanitized per-token color-picker overrides), and its color family: Shadcn Blue/Green/Red/Purple/Pink/Orange/Yellow, Shadcn Mono and Shadcn Mono Red/Blue/Green/Purple/Pink/Orange/Yellow (grayscale surfaces with color-specific accents; Shadcn Mono retains its selected id), Shadcn Black (pure black and white), Shadcn Gray (fully neutral zinc-gray accent), and Shadcn Gray Blue (blue-gray slate neutral surfaces with a muted slate-blue accent). Air is the minimal, borderless, paper-like preset with near-monochrome tokens and CSS-only chrome flattening. Glass Silver preserves the Glass theme's frosted translucent surfaces and transparent modal overlay behavior while using silver and graphite accents instead of purple/pink.
+Dark/light modes via `data-theme`; fresh installs default to System mode so the resolved theme follows `prefers-color-scheme` until the user explicitly chooses Light, Dark, or System. 84 color themes via `data-color-theme` (lazy-loaded from `app/public/theme-data.css`), including Cobalt (saturated blue), Clay (warm terracotta), Moss (muted forest green), Aurora (navy/teal/violet dark surfaces with a misty blue-white light counterpart), Calm (low-stimulation slate/sage dark surfaces with a misty blue-white light counterpart), and Dawn (indigo/plum dark surfaces with muted amber accents and a dawn-white light counterpart), the Shadcn zinc-neutral theme with an orange default highlight/accent, Shadcn Custom (the same base with sanitized per-token color-picker overrides), and its color family: Shadcn Blue/Green/Red/Purple/Pink/Orange/Yellow, Shadcn Mono and Shadcn Mono Red/Blue/Green/Purple/Pink/Orange/Yellow (grayscale surfaces with color-specific accents; Shadcn Mono retains its selected id), Shadcn Black (pure black and white), Shadcn Gray (fully neutral zinc-gray accent), and Shadcn Gray Blue (blue-gray slate neutral surfaces with a muted slate-blue accent). Air is the minimal, borderless, paper-like preset with near-monochrome tokens and CSS-only chrome flattening. Glass Silver preserves the Glass theme's frosted translucent surfaces and transparent modal overlay behavior while using silver and graphite accents instead of purple/pink.
 
-Choose color themes from **Settings → Appearance** or from the Command Center **Overview** theme card. Settings merges its selector into the current-theme row, which opens the full color-theme list; Command Center keeps the compact `ThemeDropdown` trigger. Both list every selectable color theme with the same labels and color-chip swatches. The left sidebar active-item highlight and resize accent use the active theme's `--accent`, so they follow the selected Shadcn accent instead of staying fixed blue.
+Choose color themes from **Settings → Appearance** or from the Command Center **Overview** theme card. Settings merges its selector into the current-theme row, which opens the full color-theme list; Command Center keeps the compact `ThemeDropdown` trigger. Both use the same filterable list: type a visible theme name to narrow the displayed labels and color-chip swatches, then select an option to change the theme. Filtering alone never changes the chosen theme. The left sidebar active-item highlight and resize accent use the active theme's `--accent`, so they follow the selected Shadcn accent instead of staying fixed blue.
 
 - **Base tokens** (`--bg`, `--surface`, etc.) — redefine in `:root`, `[data-theme="light"]`, and every theme block.
 - **Semantic tokens** (`--autopilot-pulse`, `--event-error-text`, `--badge-mission-*`, `--fab-*`) — `:root` + `[data-theme="light"]` only; no per-color-theme overrides.
@@ -2083,8 +2181,10 @@ The merge-advance notice includes an explicit **Push to origin** action for the 
 - Standard push is `git push origin refs/heads/<branch>:refs/heads/<branch>` with no plain `--force` path.
 - Advanced mode enables opt-in `--force-with-lease=refs/heads/<branch>:<localSha>` only.
 - Non-fast-forward and lease-stale failures surface actionable messaging with Smart Pull.
-- Every attempt records `mutationType: "push:origin"` run-audit metadata: `integrationBranch`, `remote`, `localSha`, `remoteSha`, `aheadCount`, `behindCount`, `forceWithLease`, `outcome`, optional `stderrPreview`, and `durationMs`.
-- Push remains explicit user authorization only through dashboard HTTP routes (no scheduler/heartbeat auto-push).
+- Every dashboard Smart Push attempt records `mutationType: "push:origin"` run-audit metadata: `integrationBranch`, `remote`, `localSha`, `remoteSha`, `aheadCount`, `behindCount`, `forceWithLease`, `outcome`, optional `stderrPreview`, and `durationMs`.
+- Automatic post-merge pushes also emit `push:origin`; failed and shutdown-aborted attempts use `outcome: "failed"` and `outcome: "aborted"`, respectively, while leaving the already-finalized task done.
+- When post-merge push detects remote divergence, `push:recovery-branch` records the remote safety-ref lifecycle with IDs/outcomes-only metadata: `taskId`, `remote`, `recoveryBranch`, `sha`, and `outcome` (`success`, `failed`, `deleted`, or `delete-failed`). The `fusion/<task-id>-stranded` ref is deleted after a successful target push and retained after failure or abort.
+- Dashboard Push remains explicit user authorization only through dashboard HTTP routes; the separate `pushAfterMerge` project setting controls automatic post-merge pushes.
 
 ## Shared branch groups
 
@@ -2133,7 +2233,7 @@ If the endpoint is unavailable on the running dashboard build, the response will
 
 <!-- FNXC:PlanningMode 2026-07-20-01:00: Planning interviews are always infinite and user-validated. The former follow-up toggle cannot suppress questions or produce a final summary; the dashboard starts each interview in the full questioning mode. -->
 
-Planning Mode asks another focused question after every answer until you select **Validate plan**. Each `awaiting_input` question can send the configured `planning-awaiting-input` ntfy event and delivers a dashboard mailbox message that links the operator back to the Planning view. Mailbox delivery does not depend on ntfy configuration and is deduplicated by session/question across restarts.
+Planning Mode asks another focused question after every answer until you select **Validate plan**. For a vague, subjective, preference-style, or symptom-only opener, it first inspects the relevant repository surface and offers materially distinct, concrete directions plus **Other** instead of an abstract clarification question. Each selected direction, multi-selection, or verbatim Other response rebuilds the evolving plan around that accumulated decision; the next question then narrows the selected direction one consequential level further with concrete options. The provisional plan does not falsely commit to an unselected alternative, and only the operator can validate the finished plan. Each `awaiting_input` question can send the configured `planning-awaiting-input` ntfy event.
 
 ### Mobile footer quick actions
 
@@ -2161,3 +2261,11 @@ Chat can queue `fn_task_request_verification` for an **in-progress** task that h
 
 
 Productivity duration uses total agent-active time: planning (`cumulativePlanningMs`) plus execution (`cumulativeActiveMs`); queued column dwell is not included.
+
+### Custom workflow column descriptions
+
+Custom workflow authors can add optional explanatory copy beneath each column name in the workflow editor. The description appears on selected, aggregate, and archived workflow board columns. Clearing it removes the custom metadata; columns then continue to use the standard lifecycle description when one exists.
+
+## Planning Mode contextual comments
+
+In plan review, select text inside the rendered plan and choose **Add comment to selection**. On mobile widths through 768px, the selection action appears in the bottom plan-action rail beside **Refine** and **Proceed with plan**; at 769px and wider it stays beside the selected plan content. Enter a suggestion to capture the selected quote and suggestion as a pending contextual comment. You can remove individual comments before choosing **Submit comments**; Fusion sends the ordered batch through the existing Planning Mode revision generation, so the agent revises the quoted areas while preserving unaffected plan content. A successful revised-plan update clears the batch; a failed submission retains it for retry.

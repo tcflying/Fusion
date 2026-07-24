@@ -47,12 +47,19 @@ import { extractVersionNotes, replaceVersionSection } from "./lib/extract-versio
 import { parseChangesetFile } from "./lib/changeset-schema.mjs";
 import { distillReleaseNotes } from "./lib/distill-release-notes.mjs";
 import { shouldPromptForVersion } from "./lib/release-prompt-gate.mjs";
+import { selectChannelChangesets } from "./lib/channel-changeset-scope.mjs";
 import {
   archivePointerLine,
   CHANGELOG_ARCHIVE_CUTOFF,
   CHANGELOG_ARCHIVE_FILE,
   partitionVersionsByCutoff,
 } from "./lib/changelog-archive.mjs";
+import {
+  buildRootChangelogLines,
+  collectDistilledBodies,
+  normalizeChangelogLines,
+  parseChangelog,
+} from "./lib/changelog-sync.mjs";
 
 const argv = process.argv.slice(2);
 const args = new Set(argv);
@@ -158,6 +165,12 @@ function run(cmd, { capture = false, allowFail = false, cwd } = {}) {
  *
  * FNXC:ReleaseChangelog 2026-07-13-22:55:
  * Cutoff is CHANGELOG_ARCHIVE_CUTOFF (currently 0.60.0) from scripts/lib/changelog-archive.mjs.
+ *
+ * FNXC:ReleaseChangelog 2026-07-21-20:22:
+ * Preserve already-distilled version bodies from the existing root CHANGELOG.md
+ * (and archive) when regenerating. Distillation only rewrites the current
+ * version; without this, every prior release loses its Highlights/New/Fixed
+ * summary on the next release sync and falls back to the raw package aggregate.
  */
 function syncRootChangelog() {
   const pkgsDir = "packages";
@@ -191,12 +204,22 @@ function syncRootChangelog() {
     }
   }
 
+  // Prefer already-distilled bodies so historical releases keep their summary.
+  const existingCurrent = existsSync("CHANGELOG.md")
+    ? readFileSync("CHANGELOG.md", "utf8")
+    : "";
+  const existingArchive = existsSync(CHANGELOG_ARCHIVE_FILE)
+    ? readFileSync(CHANGELOG_ARCHIVE_FILE, "utf8")
+    : "";
+  const preservedBodies = collectDistilledBodies([existingCurrent, existingArchive]);
+
   const { current, archived } = partitionVersionsByCutoff(versionOrder);
   const currentLines = buildRootChangelogLines({
     title: "# Fusion changelog",
     banner: "User-facing release notes aggregated across all packages. This file is auto-synced from each `packages/*/CHANGELOG.md` by `scripts/release.mjs` — do not edit by hand.",
     parsed,
     versionOrder: current,
+    preservedBodies,
   });
 
   if (archived.length > 0) {
@@ -208,60 +231,11 @@ function syncRootChangelog() {
     banner: `Archived release notes before ${CHANGELOG_ARCHIVE_CUTOFF}. This file is auto-synced from each \`packages/*/CHANGELOG.md\` by \`scripts/release.mjs\` — do not edit by hand.`,
     parsed,
     versionOrder: archived,
+    preservedBodies,
   });
 
   writeFileSync("CHANGELOG.md", normalizeChangelogLines(currentLines));
   writeFileSync(CHANGELOG_ARCHIVE_FILE, normalizeChangelogLines(archiveLines));
-}
-
-function buildRootChangelogLines({ title, banner, parsed, versionOrder }) {
-  const lines = [title, "", banner, ""];
-
-  for (const version of versionOrder) {
-    lines.push(`## ${version}`, "");
-    // Sort packages alphabetically within a version for deterministic output.
-    const pkgsForVersion = parsed
-      .filter((p) => p.versions.has(version))
-      .sort((a, b) => a.pkgName.localeCompare(b.pkgName));
-    for (const p of pkgsForVersion) {
-      const body = p.versions.get(version).trim();
-      if (!body) continue;
-      lines.push(`### ${p.pkgName}`, "");
-      // Bump heading levels by one so package sub-sections nest cleanly.
-      const bumped = body.replace(/^(#{1,5}) /gm, (_m, hashes) => `${hashes}# `);
-      lines.push(bumped, "");
-    }
-  }
-
-  return lines;
-}
-
-function normalizeChangelogLines(lines) {
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
-}
-
-/**
- * Parse a changeset-format CHANGELOG into { versions, order }.
- * Splits on top-level `## ` headings; the version key is the heading text
- * verbatim (e.g. "0.2.5", or "0.4.0 (pre-release, unpublished)").
- */
-function parseChangelog(raw) {
-  const versions = new Map();
-  const order = [];
-  // Strip out the first-line title and any horizontal rules so they don't
-  // pollute the first version section.
-  const stripped = raw.replace(/^# [^\n]*\n?/, "").replace(/^---\s*$/gm, "");
-  const sections = stripped.split(/^## /m).slice(1); // drop pre-first-version preamble
-  for (const section of sections) {
-    const nl = section.indexOf("\n");
-    const key = (nl === -1 ? section : section.slice(0, nl)).trim();
-    const body = nl === -1 ? "" : section.slice(nl + 1).trim();
-    if (!versions.has(key)) {
-      versions.set(key, body);
-      order.push(key);
-    }
-  }
-  return { versions, order };
 }
 
 /** Compare two semver-ish version strings ("0.2.5", "0.4.0 (pre-release)"). */
@@ -775,8 +749,42 @@ const changesetSummaries = readChangesetSummaries();
 if (changesetSummaries.length === 0) {
   fail("No pending changesets in .changeset/. Run `pnpm changeset` first.");
 }
-ok(`${changesetSummaries.length} pending changeset(s):`);
-for (const cs of changesetSummaries) {
+
+/*
+ * FNXC:Changelog 2026-07-23-10:40:
+ * Scope release notes to the channel. Pre-mode preserves every consumed
+ * changeset .md on disk, so on beta.N the directory holds the WHOLE cycle —
+ * feeding all of it to distillation made every beta's notes an aggregate of
+ * everything since the last stable (v0.73.0-beta.4 shipped the full cycle
+ * instead of its own fixes). Betas distill only changesets NOT yet recorded
+ * in pre.json's `changesets` array (i.e. new since the previous beta).
+ * Stable keeps the full set on purpose: its notes are the rollup of every
+ * change across all betas in the cycle.
+ */
+const preReleasedNames = IS_BETA && preJsonExists()
+  ? (JSON.parse(readFileSync(PRE_JSON_PATH, "utf8")).changesets ?? [])
+  : [];
+const { selected: noteChangesets, alreadyReleased } = selectChannelChangesets(
+  CHANNEL,
+  changesetSummaries,
+  preReleasedNames,
+);
+if (IS_BETA && noteChangesets.length === 0) {
+  fail(
+    `All ${changesetSummaries.length} pending changeset(s) were already released in a prior beta of this cycle. ` +
+    "Nothing new to release — land a changeset first, or run `pnpm release --channel stable` to promote.",
+  );
+}
+if (IS_BETA && alreadyReleased.length > 0) {
+  info(`${alreadyReleased.length} changeset(s) already released in earlier betas of this cycle (kept for the stable rollup; excluded from this beta's notes).`);
+}
+// pre.json survives `pre exit` (mode flips to "exit"); its presence on the
+// stable channel means this release promotes a beta cycle.
+if (!IS_BETA && existsSync(PRE_JSON_PATH)) {
+  info(`Stable notes will roll up all ${changesetSummaries.length} changeset(s) accumulated across the beta cycle.`);
+}
+ok(`${noteChangesets.length} changeset(s) new in this ${CHANNEL} release:`);
+for (const cs of noteChangesets) {
   console.log(`    ${color(33, `[${cs.bump}]`)} ${cs.summary}  ${color(90, `(${cs.file})`)}`);
 }
 
@@ -817,7 +825,7 @@ if (DRY_RUN) {
    * deterministic if no model is reachable) so operators can review the post
    * without authorizing a real publish.
    */
-  const dryEntries = changesetSummaries.map(({ file }) => {
+  const dryEntries = noteChangesets.map(({ file }) => {
     const raw = readFileSync(join(".changeset", file), "utf8");
     return parseChangesetFile(raw).parsed;
   }).filter(Boolean);
@@ -871,8 +879,13 @@ if (!(await confirm(`Proceed with ${CHANNEL} release v${chosenVersion} (build, p
  * Capture and parse structured changeset entries BEFORE `changeset version`
  * runs — versioning consumes and deletes the .changeset/*.md files.
  * The captured entries feed the post-version distillation step.
+ *
+ * FNXC:Changelog 2026-07-23-10:40:
+ * `noteChangesets` is channel-scoped (see selection above): a beta captures
+ * only changesets new since the previous beta; a stable capture is the full
+ * cross-beta rollup.
  */
-const capturedEntries = changesetSummaries.map(({ file }) => {
+const capturedEntries = noteChangesets.map(({ file }) => {
   const raw = readFileSync(join(".changeset", file), "utf8");
   return parseChangesetFile(raw).parsed;
 }).filter(Boolean);

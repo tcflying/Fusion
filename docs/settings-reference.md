@@ -52,7 +52,7 @@ Defaults from `DEFAULT_GLOBAL_SETTINGS`; key scope from `GLOBAL_SETTINGS_KEYS`.
 | Setting | Type | Default | Description |
 |---|---|---:|---|
 | `themeMode` | `"dark" \| "light" \| "system"` | `"system"` | Dashboard theme mode. Fresh installs follow the operating system light/dark preference until the user chooses Light, Dark, or System. |
-| `colorTheme` | `ColorTheme` | `"shadcn-ember"` | Dashboard color theme preset. Use `"shadcn-custom"` to show the custom shadcn color picker in Settings → Appearance and the Command Center theme card. |
+| `colorTheme` | `ColorTheme` | `"shadcn-ember"` | Dashboard color theme preset. Aurora is a built-in navy/teal/violet palette with a misty light counterpart; Calm is a low-stimulation slate/sage palette with a misty light counterpart; Dawn uses indigo/plum dark surfaces, amber accents, and dawn-white light surfaces. Use `"shadcn-custom"` to show the separate custom shadcn color picker in Settings → Appearance and the Command Center theme card. |
 | `shadcnCustomColors` | `Record<string, string>` | `undefined` | Optional shadcn design-token override map for `"shadcn-custom"` only. Keys are CSS token names such as `--accent`, `--bg`, `--surface`, `--card`, `--border`, `--text`, `--text-muted`, workflow status tokens, and `--color-success`/`--color-warning`/`--color-error`; values must be sanitized `#RGB` or `#RRGGBB` hex colors. Missing or invalid entries fall back to the `shadcn-custom` base defaults and are not applied to other themes. |
 | `language` | `"en" \| "zh-CN" \| "zh-TW" \| "fr" \| "es" \| "ko"` | `undefined` | UI language for the dashboard and TUI. When unset, the dashboard detects from localStorage → browser language and the CLI from `--lang` flag → environment locale, falling back to `en`. Validated at the store write boundary (`validateLocale`); invalid values are dropped. Reset to auto-detect via the dashboard's "Auto" language option or `fn settings set language auto` (clears the persisted key). |
 | `dashboardFontScalePct` | `number` | `100` | Dashboard font scale percentage used by Appearance settings. Valid range: `85` to `125`; applied pre-hydration via document root font-size so board typography (column headers/counts, task cards, and quick-entry text) scales with the setting from first paint. |
@@ -268,12 +268,15 @@ Some knobs that used to live in this Settings reference as project settings are 
 *how* tasks execute, so the timeouts, review gates, and per-phase model lanes that
 govern that execution belong to the workflow.
 
-**Where to set them.** The common model lanes for a project's default workflow are
-available directly in **Settings → Project Models → Default workflow model lanes**:
-Plan/Triage, Executor, Reviewer, and the Planning/Reviewer fallback lanes declared
+**Where to set them.** The common model lanes for every workflow in a project are
+available directly in **Settings → Project Models → Project workflow model lanes**:
+Plan/Triage, Executor, Reviewer, and their fallback lanes declared
 by the default workflow. Primary Plan/Triage, Executor, Reviewer, and declared fallback rows show an inline Thinking Level control when the workflow declares the companion `*ThinkingLevel` setting; unset means inherit. Those dropdown controls use the shared model picker and are auto-saved by the Settings modal after an edit, which writes
-workflow setting values for the active project's default workflow; they do not
-restore the old project settings keys. The global **Fallback Model** remains in
+workflow setting values on the active project's default workflow. Those stored
+values are the project model baseline inherited by every selected workflow. The
+baseline wins over global and per-workflow values; task-specific selections win
+over the baseline. They do
+not restore the old project settings keys. The global **Fallback Model** remains in
 Settings → General Models and includes its own inline Thinking Level selector for `fallbackThinkingLevel`; workflow-specific fallbacks are also editable from
 the workflow editor Values tab. Title summarization is separate: set it in
 **Settings → Project Models → AI Title and Git Commit Message Summarization**,
@@ -313,16 +316,19 @@ Actions. It has two tabs:
   heartbeat patrol task creation separately and defaults to `true`. Edits batch
   and commit through a single **Save** in the Values tab.
 
-**How values resolve.** The engine resolves *effective settings* per task as
-`stored value ?? declaration default`. The task-detail Workflow, Chat, and Agent
-Log model displays use the same per-task effective workflow values, so configured
-Plan/Triage, Executor, Reviewer, and fallback lanes match what task execution
-will use instead of falling back to the ambient project settings response. A
-built-in workflow with no stored value falls back to the declaration default,
+**How values resolve.** For non-model workflow settings, the engine resolves
+*effective settings* per task as `stored value ?? declaration default`. A built-in
+workflow with no stored non-model value falls back to the declaration default,
 which is byte-equal to the legacy project default — so an untuned project behaves
-exactly as before. Switching a project to a **new** custom workflow starts that
-workflow from its own declaration defaults, not the project's prior customized
-values.
+exactly as before. Switching a project to a **new** custom workflow starts those
+non-model settings from that workflow's own declaration defaults.
+
+Model lanes use the cross-workflow hierarchy instead: task-specific selection →
+project workflow-lane baseline stored on the active default workflow → global lane
+→ selected-workflow lane → project default override → global default. The
+task-detail Workflow, Chat, and Agent Log displays use this same effective model
+resolution, so their Plan/Triage, Executor, Reviewer, and fallback lanes match the
+sessions that actually run.
 
 **Built-in prompt overrides.** Built-in workflow prompt/gate node text has a similar project-scoped persistence model, but it is separate from workflow settings: prompt overrides are stored per `(workflowId, nodeId, projectId)` and resolve as `stored prompt ?? shipped prompt`. Resetting a prompt deletes the stored node override and restores the built-in IR text; graph structure and setting declarations remain read-only for built-ins. See [Workflow Steps → Overriding built-in workflow prompts](./workflow-steps.md#overriding-built-in-workflow-prompts).
 
@@ -398,10 +404,12 @@ The built-in workflows also declare triage/spec policy settings that were **not*
 
 When `triageProactiveSubtaskSplittingEnabled` is `true` (the default), triage may proactively replace a large task with 2-5 child tasks when the size, step-count, package breadth, file-scope, or remediation-batch signals justify the coordination overhead. When it is `false`, those automatic oversized-task signals are advisory only for writing a realistic single-task spec; triage must not split solely because the task is large. The per-task `breakIntoSubtasks: true` flag is separate and remains mandatory: if a user explicitly asks for subtask breakdown, triage still evaluates and creates child tasks when the work is meaningfully decomposable.
 
-In the dashboard Settings modal, Project Models exposes Plan/Triage, Executor,
-Reviewer, and declared fallback dropdown controls for the default workflow. The
-Settings modal auto-save persists pending default-workflow model lane
-overrides; there is no separate workflow-model save button. The workflow editor's
+In the dashboard Settings modal, Project Models exposes project-baseline
+Plan/Triage, Executor, Reviewer, and declared fallback dropdown controls. The
+Settings modal auto-save persists pending model lane values on the active default
+workflow, and every workflow inherits those values. Task-specific selections win,
+while global and per-workflow values are lower-priority fallbacks; there is no
+separate workflow-model save button. The workflow editor's
 Settings → Values tab uses the same dropdown picker for declared provider/model
 pairs, including fallbacks. Former locations for advanced workflow policy still
 show a short redirect stub linking to the workflow editor (for one release).
@@ -430,9 +438,9 @@ Security-sensitive file-browser escape hatches are project-only. `allowAbsoluteF
 | `globalPause` | `boolean` | `false` | Hard stop: terminate active engine sessions and pause scheduling immediately. |
 | `globalPauseReason` | `string` | `undefined` | Optional reason for `globalPause` (`"rate-limit"` for automatic pauses, `"manual"` for user-triggered pauses). Cleared on unpause. |
 | `enginePaused` | `boolean` | `false` | Soft pause: stop dispatching new work while letting active sessions finish. While paused (including shared pause windows with `globalPause`), stuck-task polling/timers are suspended so paused wall-clock time does not count against `taskStuckTimeoutMs`. Clearing pause state resumes runtime scheduling and gives tracked active sessions a fresh stuck-task grace window before normal detection resumes; when `autoMerge` is enabled, eligible `in-review` tasks are re-swept into the auto-merge queue (paused/blocked/failed review tasks remain skipped). |
-| `maxConcurrent` | `number` | `2` | Max concurrent task-lane AI agents (planning, executor, merge). Editable from Settings and the Command Center Overview controls dashboard. |
+| `maxConcurrent` | `number` | `2` | Max concurrency for top-level working agents per project across planning, execution, and review/merge. Nested helper agents remain parent-internal and may temporarily exceed this displayed count. Editable from Settings, Command Center, and Engine Control. |
 | `maxConcurrentVerifications` | `number` | `1` | Max concurrent verification subprocesses (`fn_run_verification`, merge test/build commands) process-wide. Caps stacked monorepo typecheck/build so concurrent tasks do not peg host CPU. Range **1–8** (clamped at runtime and in Settings). Editable from Settings → Scheduling. Each project engine registers its cap; the effective process limit is the **minimum** of registered project caps. |
-| `maxTriageConcurrent` | `number` | `2` | Max concurrent planning agents. Editable from Settings and the Command Center Overview controls dashboard. |
+| `maxTriageConcurrent` | `number` | `2` | Legacy persisted value; ignored. Planning shares `maxConcurrent` and no Max Triage control is displayed. |
 | `globalMaxConcurrent` | `number` | `4` | System-wide max concurrent agents across all projects. |
 | `maxWorktrees` | `number` | `4` | Max git worktrees. Editable from Settings and the Command Center Overview controls dashboard. |
 | `pollIntervalMs` | `number` | `15000` | Scheduler poll interval (ms). |
@@ -523,7 +531,7 @@ Sandbox backend precedence is:
 | `pushAfterMerge` | `boolean` | `false` | Auto-push after successful direct merges only. Pull-request strategy is excluded because PR mode publishes its task branch separately before PR creation. |
 | `pushRemote` | `string` | `"origin"` | Git remote target used when `pushAfterMerge` is enabled. Accepts `remote` (for example `origin`) or `remote branch` (for example `upstream main`). Empty/unset values fall back to `origin` plus the resolved merge integration branch. |
 
-When `pushAfterMerge` is enabled, a completed direct merge first runs `git pull --rebase <remote> <branch>` and then `git push <remote> <branch>`. For remote-only targets, Fusion resolves `<branch>` from the merge integration branch rather than the task worktree's incidental checkout, so reuse-task-worktree and detached-HEAD merge modes still push the intended branch. If the post-merge pull or push fails, the local merge remains completed and the done task records `pushedToRemote: false` with a `pushError` for operator follow-up.
+When `pushAfterMerge` is enabled, Fusion first tries a working-tree-independent ref push to the configured target. If the remote has diverged, Fusion force-updates `fusion/<task-id>-stranded` on that same remote to the approved local squash, rebases in a detached clean-room worktree, resolves conflicts, continues the rebase, and pushes the rebased `HEAD`. The recovery branch is deleted after the target push succeeds; it is intentionally retained as the recovery source when the push fails or is aborted. For remote-only targets, Fusion resolves `<branch>` from the merge integration branch rather than the task worktree's incidental checkout, so reuse-task-worktree and detached-HEAD merge modes still push the intended branch. Push problems remain non-fatal because the merge has already completed: the done task records `pushedToRemote: false` with a `pushError`, writes a durable task-log entry, and emits a non-success `push:origin` run-audit event for operator follow-up.
 | `worktreeInitCommand` | `string` | `undefined` | Shell command run after task worktree creation and in temporary merge worktrees before merge/review verification. In standalone AI merge, this runs inside each fresh `fusion-ai-merge-*` clean-room worktree after `git worktree add`; when unset, Fusion infers a package-manager install from the lockfile and may skip only when the install marker matches. Useful for project-specific setup beyond package install (for example `pnpm install --frozen-lockfile`, `cp .env.local .env`, or codegen/bootstrap scripts). |
 | `worktreeCopyFiles` | `string[]` | `[]` | Repository-root-relative regular files to copy into each newly assigned non-resume task worktree. Configure from Settings → Worktrees with editable rows or Browse (useful for `.env`-style files). Fusion copies these files after fresh creation or pooled-worktree preparation and before `worktreeInitCommand`, secrets-env materialization, and task execution. Blank/duplicate entries are ignored; absolute paths, `..` traversal, missing files, directories, and unreadable/non-regular sources are skipped as non-fatal task-log/audit diagnostics without logging file contents. Resume/existing worktrees are not overwritten. |
 | `testCommand` | `string` | `undefined` | Merge-time test command (hard gate). When unset, Fusion auto-detects from lockfile. |
@@ -531,7 +539,7 @@ When `pushAfterMerge` is enabled, a completed direct merge first runs `git pull 
 | `recycleWorktrees` | `boolean` | `false` | Default: off (opt-in). Reuse worktrees from a pool for faster startup. **Mutually exclusive with `worktreeNaming: "task-id"`** (task-pinned worktrees) — enabling both is rejected by the settings API/store, because pinning each task to its own directory is incompatible with the cross-task pool. Recycling is fully functional under `"random"` and `"task-title"` naming. |
 | `showWorktreeGrouping` | `boolean` | `false` | Default: off. When off, WIP/processing columns render plain task cards without worktree group shells or worktree-name labels in both legacy and workflow-mode boards. When on, every WIP/processing column groups tasks by worktree and shows worktree names, including workflow-mode columns flagged as counting toward WIP. |
 | `openTasksInRightSidebar` | `boolean` | `false` | Default: off. When off, board task-card clicks keep the existing full-panel task detail that replaces the board. When on and the right dock is active on desktop/tablet, board task-card clicks open the task detail in the right sidebar so the board stays visible; mobile or hidden/inactive right-dock states automatically fall back to the full-panel behavior. Non-board task-open paths, including list split detail, floating pop-outs, graph/plugin opens, and deep `changes`/`retries`/`workflow` opens, keep their existing behavior; ordinary right-dock Tasks-list cards are governed by `openMobileTasksInPopup` first and otherwise use embedded dock detail. |
-| `openMobileTasksInPopup` | `boolean` | `false` | Default: off. When off, ordinary board task-card clicks keep the existing fallback behavior: the full-panel task detail, or the right dock when `openTasksInRightSidebar` is on and the dock is active; List row/card opens keep the desktop split-detail pane or the mobile/tablet docked detail; ordinary right-dock Tasks-list clicks open embedded dock detail with the normal back-to-list controls. When on, ordinary board task-card clicks, List row/card opens, and right-dock Tasks-list clicks open the task in the existing task popup/FloatingWindow surface on desktop, tablet, and mobile so the board, List view, or dock list remains visible; this popup route takes precedence over right-dock routing for those ordinary clicks. Desktop/tablet task popups restore the last saved popup size and position across task IDs and use the board/task-detail layer rather than the global utility layer, while their Activity dropdown stays above and attached during popup drag/resize; mobile task popups remain full-screen sheets. Deep `changes`/`retries`/`workflow` opens, context-menu/refine/detail links, graph/plugin opens, nested task-detail opens, and explicit pop-out actions keep their existing behavior. |
+| `openMobileTasksInPopup` | `boolean` | `false` | Default: off. When off, ordinary board task-card clicks keep the existing fallback behavior: the full-panel task detail, or the right dock when `openTasksInRightSidebar` is on and the dock is active; List row/card opens keep the desktop split-detail pane or the mobile/tablet docked detail; ordinary right-dock Tasks-list clicks open embedded dock detail with the normal back-to-list controls. When on, ordinary board task-card clicks, List row/card opens, and right-dock Tasks-list clicks open the task in the existing task popup/FloatingWindow surface on desktop, tablet, and mobile so the board, List view, or dock list remains visible; this popup route takes precedence over right-dock routing for those ordinary clicks. Desktop/tablet task popups restore the last saved popup size and position across task IDs and use the board/task-detail layer rather than the global utility layer, while their Activity dropdown stays above and attached during popup drag/resize; mobile task popups remain full-screen sheets. Board task-card deep `changes`/`retries`/`workflow` chips also open the popup with their requested tab; context-menu/refine/detail links, graph/plugin opens, nested task-detail opens, and explicit pop-out actions keep their existing behavior. |
 | `taskPopupsBoardListOnly` | `boolean` | `false` | Project-scoped Appearance setting. Default: off, so open task popups remain visible over every main-content view. When on, each open task-detail popup is attached to the Board or List view where it was opened: switching to Command Center, Agents, Settings, another task view, or the other Board/List view hides it without closing or clearing popup state; returning to the originating Board/List view re-renders the same popup with its shared persisted size/position. |
 | `showCostBadgeOnCards` | `boolean` | `false` | Default: off. When enabled from Settings → Appearance, board cards with positive recorded token usage show a read-time derived model-cost badge beside the execution-time badge. Unpriced models display `—`, and tasks with no token usage render no badge shell. |
 | `executorAllowSiblingBranchRename` | `boolean` | `false` | Opt back into the legacy executor behavior that silently allocates sibling branches (`fusion/<task-id>-2`, `-2-2`, …) when the canonical task branch is already checked out elsewhere. When disabled (default), branch conflicts fail loudly and leave the task in `todo` with `status: "failed"` so operators can resolve conflicting branches/worktrees with git tooling before retrying. See [Task Management → Branch conflict handling](./task-management.md#branch-conflict-handling). The dashboard Settings modal exposes the same toggle with warning copy because this legacy mode is discouraged. |
@@ -847,7 +855,40 @@ Anthropic has three independent authentication/routing paths:
 
 Anthropic can be connected with a raw API key from both Model Onboarding and **Settings → Authentication**. Anthropic API-key auth appears as a separate **Anthropic API Key** card, while Claude subscription OAuth appears as **Anthropic Subscription** with Login/Logout controls. On Fusion desktop, Anthropic Subscription OAuth login URLs are delegated to the operating system browser instead of an Electron child window so the existing polling/callback flow can complete. `/api/auth/status` returns only masked key hints for the API-key card.
 
-### Authentication troubleshooting (mobile OAuth fallback)
+### CLI local OpenAI-compatible registry
+
+`fn onboard` can add a local/custom endpoint to pi's model registry without
+replacing existing fields. It writes to `~/.fusion/agent/models.json`, unless an
+existing legacy `~/.pi/agent/models.json` or `~/.pi/models.json` is selected by
+the compatibility resolver. For an unauthenticated server, omit `apiKey`:
+
+```json
+{
+  "providers": {
+    "local": {
+      "name": "Local server",
+      "api": "openai-completions",
+      "baseUrl": "http://localhost:8080/v1",
+      "models": [{
+        "id": "qwen3",
+        "reasoning": true,
+        "compat": {
+          "thinkingFormat": "qwen-chat-template",
+          "chatTemplateKwargs": {
+            "enable_thinking": { "$var": "thinking.enabled" }
+          }
+        }
+      }]
+    }
+  }
+}
+```
+
+Enable the Qwen option only when the upstream requires
+`chat_template_kwargs.enable_thinking`; the registry uses the schema-valid
+camel-case `compat.chatTemplateKwargs`, never a top-level compatibility field.
+
+## Authentication troubleshooting (mobile OAuth fallback)
 
 #### `/api/auth/login` response shape for device-code providers
 
@@ -1028,11 +1069,11 @@ Short-lived token bounds are enforced server-side:
 
 ## Model Selection Hierarchy
 
-Fusion resolves task models through workflow-backed lane values first, then global lane defaults, then the project/global default model fallback. The common workflow lanes are stored as setting values on the project's default workflow and can be edited with dropdown controls from Settings -> Project Models -> Default workflow model lanes (auto-saved by the Settings modal) or from workflow editor -> Settings -> Values for declared workflow lanes and fallbacks. General-scope fallback selection remains the global Fallback Model picker in Settings -> General Models.
+Fusion resolves task models as task-specific selection -> project workflow-model baseline -> global lane -> selected-workflow value -> project/global default model. The project baseline is stored as setting values on the project's active default workflow and can be edited from Settings -> Project Models -> Project workflow model lanes (auto-saved by the Settings modal). Lower-priority per-workflow values remain editable from Workflow editor -> Settings -> Values for declared workflow lanes and fallbacks. General-scope fallback selection remains the global Fallback Model picker in Settings -> General Models.
 
 Direct-chat defaults are project-scoped and independent of task workflow lanes. Configure them in **Settings -> Project Models -> Chat**. `chatDefaultKind: "agent"` resolves only when `chatDefaultAgentId` is set; `chatDefaultKind: "model"` resolves only when both `chatDefaultModelProvider` and `chatDefaultModelId` are set, with optional `chatDefaultThinkingLevel`. If `chatNewSessionMode` is `"always-default"` and that target resolves, every New Chat entry point creates the session directly. If the target is incomplete, or the mode is unset/`"prompt"`, Fusion opens the New Chat dialog instead and preselects the resolved default when one exists. Chat Rooms additionally support a per-room `thinkingLevel` default that applies to every room responder; clearing it inherits the resolved project/global default.
 
-Settings model lanes can also carry optional thinking/reasoning effort overrides in the same model dropdown. Primary workflow lanes declare `executionThinkingLevel`, `planningThinkingLevel`, or `validatorThinkingLevel` per `(workflow, project)`; executor/planning/reviewer fallback lanes declare `executionFallbackThinkingLevel`, `planningFallbackThinkingLevel`, and `validatorFallbackThinkingLevel`; global fallback uses `fallbackThinkingLevel`; and project title summarization fallback uses `titleSummarizerFallbackThinkingLevel`. Empty thinking values inherit through the lane/global/default chain and explicit values are cleared by the lane reset action. Runtime thinking precedence for task/workflow execution is node/step `config.thinkingLevel` > lane-specific task override (`planningThinkingLevel` or `validatorThinkingLevel`) > shared task `thinkingLevel` > workflow lane thinking override > global lane thinking override > project default thinking override > global `defaultThinkingLevel`; executor sessions continue to use shared task `thinkingLevel` directly. Model-mode Chat sessions use the same executor-lane resolver with session `thinkingLevel` in the task slot, so an empty chat-session value inherits project/global defaults while a concrete New Chat selection wins for that session. The resolved value still flows through pi.ts' existing thinking/reasoning-conflict fallback (Fusion retries without the explicit level when a provider rejects conflicting thinking parameters).
+Settings model lanes can also carry optional thinking/reasoning effort overrides in the same model dropdown. Primary workflow lanes declare `executionThinkingLevel`, `planningThinkingLevel`, or `validatorThinkingLevel` per `(workflow, project)`; executor/planning/reviewer fallback lanes declare `executionFallbackThinkingLevel`, `planningFallbackThinkingLevel`, and `validatorFallbackThinkingLevel`; global fallback uses `fallbackThinkingLevel`; and project title summarization fallback uses `titleSummarizerFallbackThinkingLevel`. Empty thinking values inherit through the lane/global/default chain and explicit values are cleared by the lane reset action. Runtime thinking precedence for task/workflow execution is node/step `config.thinkingLevel` > lane-specific task override (`planningThinkingLevel` or `validatorThinkingLevel`) > shared task `thinkingLevel` > project workflow-lane baseline > global lane thinking override > selected-workflow lane > project default thinking override > global `defaultThinkingLevel`; executor sessions continue to use shared task `thinkingLevel` directly. Model-mode Chat sessions use the same executor-lane resolver with session `thinkingLevel` in the task slot, so an empty chat-session value inherits project/global defaults while a concrete New Chat selection wins for that session. The resolved value still flows through pi.ts' existing thinking/reasoning-conflict fallback (Fusion retries without the explicit level when a provider rejects conflicting thinking parameters).
 
 Executor sessions, including workflow-step timeout/malformed-output recovery and durable heartbeats, resolve `executionFallbackProvider`/`executionFallbackModelId` first and otherwise inherit the global `fallbackProvider`/`fallbackModelId` pair. For a distinct complete fallback pair, model-selection recovery is bounded to **primary → fallback → primary**. If all three attempts fail, Fusion raises an operator-actionable terminal failure with the standard retry affordance; missing, incomplete, or equal fallback pairs remain terminal after the initial primary failure.
 
@@ -1057,21 +1098,25 @@ The three GPT-5.6 codenamed OpenAI Codex variants (`gpt-5.6-luna`, `gpt-5.6-sol`
 ### Planning model
 
 1. Per-task `planningModelProvider` + `planningModelId`
-2. Default workflow lane value `planningProvider` + `planningModelId`
+2. Project workflow-lane baseline `planningProvider` + `planningModelId` stored on the active default workflow
 3. Global `planningGlobalProvider` + `planningGlobalModelId`
-4. Project `defaultProviderOverride` + `defaultModelIdOverride`
-5. Global `defaultProvider` + `defaultModelId`
-6. Automatic provider/model resolution
+4. Selected-workflow lane value `planningProvider` + `planningModelId`
+5. Project `defaultProviderOverride` + `defaultModelIdOverride`
+6. Global `defaultProvider` + `defaultModelId`
+7. Automatic provider/model resolution
+
+Planning Mode uses this same complete-pair order for both a newly started session and an existing draft. When a workflow is selected in Planning Mode, its effective planning lane is loaded as the selected-workflow value; a complete request-level pair remains first, and incomplete/blank pairs are skipped rather than mixed with another level. Test mode still forces `mock` / `scripted` after resolution.
 
 ### Executor model
 
 1. Per-task `modelProvider` + `modelId`
-2. Default workflow lane value `executionProvider` + `executionModelId`
+2. Project workflow-lane baseline `executionProvider` + `executionModelId` stored on the active default workflow
 3. Global `executionGlobalProvider` + `executionGlobalModelId`
-4. Project `defaultProviderOverride` + `defaultModelIdOverride`
-5. Global `defaultProvider` + `defaultModelId`
-6. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set and no task/lane/default pair is configured
-7. Automatic provider/model resolution
+4. Selected-workflow lane value `executionProvider` + `executionModelId`
+5. Project `defaultProviderOverride` + `defaultModelIdOverride`
+6. Global `defaultProvider` + `defaultModelId`
+7. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set and no task/lane/default pair is configured
+8. Automatic provider/model resolution
 
 Workflow prompt steps and scheduled/manual AI-prompt automation steps use the same executor lane before falling back to project/global defaults; explicit step-level `modelProvider` + `modelId` values still take precedence for that individual step. Automation AI Prompt steps also apply an explicit step `thinkingLevel` at session creation, while Create Task automation steps copy that reasoning-effort value onto the spawned task; leaving it empty preserves the lane/default thinking-level inheritance. If a non-mock, non-test-mode session still reaches runtime creation without a complete provider/model pair, Fusion logs a warning and records `noModelResolved` plus `runtimeBuiltInFallbackModel` on `session:runtime-resolved` so the runtime's built-in fallback model is observable.
 
@@ -1079,23 +1124,25 @@ Workflow prompt steps and scheduled/manual AI-prompt automation steps use the sa
 
 Heartbeat sessions for durable agents use this order:
 
-1. Default workflow lane value `executionProvider` + `executionModelId`
+1. Project workflow-lane baseline `executionProvider` + `executionModelId` stored on the active default workflow
 2. Global `executionGlobalProvider` + `executionGlobalModelId`
-3. Project `defaultProviderOverride` + `defaultModelIdOverride`
-4. Global `defaultProvider` + `defaultModelId`
-5. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set and no execution/default pair is configured
-6. Automatic provider/model resolution
+3. Selected-workflow lane value `executionProvider` + `executionModelId`
+4. Project `defaultProviderOverride` + `defaultModelIdOverride`
+5. Global `defaultProvider` + `defaultModelId`
+6. Assigned durable agent runtime model (`runtimeConfig.model` or `runtimeConfig.modelProvider` + `runtimeConfig.modelId`) when both provider and model ID are set and no execution/default pair is configured
+7. Automatic provider/model resolution
 
 On timer-triggered runs, unrecoverable missing-provider credential/registry failures complete as `heartbeat_model_unavailable` instead of permanently setting the durable agent to `state=error`.
 
 ### Reviewer model
 
 1. Per-task `validatorModelProvider` + `validatorModelId`
-2. Default workflow lane value `validatorProvider` + `validatorModelId`
+2. Project workflow-lane baseline `validatorProvider` + `validatorModelId` stored on the active default workflow
 3. Global `validatorGlobalProvider` + `validatorGlobalModelId`
-4. Project `defaultProviderOverride` + `defaultModelIdOverride`
-5. Global `defaultProvider` + `defaultModelId`
-6. Automatic provider/model resolution
+4. Selected-workflow lane value `validatorProvider` + `validatorModelId`
+5. Project `defaultProviderOverride` + `defaultModelIdOverride`
+6. Global `defaultProvider` + `defaultModelId`
+7. Automatic provider/model resolution
 
 Mission validation sessions use this same validator lane; assigned durable agent runtime models are only used as a fallback when no complete validator/default pair is configured.
 
@@ -1731,13 +1778,14 @@ Project-scoped policy for ephemeral/runtime-managed task workers calling `fn_tas
 
 ## Model selection hierarchy
 
-All three lanes (planning / executor / reviewer) follow the same 5-tier precedence:
+All three lanes (planning / executor / reviewer) follow the same precedence:
 
 1. Per-task override (`planningModelProvider`/`Id`, `modelProvider`/`Id`, `validatorModelProvider`/`Id`)
-2. Default workflow lane value (`planningProvider`/`Id`, `executionProvider`/`Id`, `validatorProvider`/`Id`)
+2. Project workflow-lane baseline (`planningProvider`/`Id`, `executionProvider`/`Id`, `validatorProvider`/`Id`) stored on the active default workflow
 3. Global lane (`planningGlobalProvider`/`Id`, `executionGlobalProvider`/`Id`, `validatorGlobalProvider`/`Id`)
-4. Project `defaultProviderOverride` / `defaultModelIdOverride`
-5. Global `defaultProvider` / `defaultModelId` → automatic resolution
+4. Selected-workflow lane (`planningProvider`/`Id`, `executionProvider`/`Id`, `validatorProvider`/`Id`)
+5. Project `defaultProviderOverride` / `defaultModelIdOverride`
+6. Global `defaultProvider` / `defaultModelId` → automatic resolution
 
 ## Mock provider (test mode)
 
@@ -1793,3 +1841,7 @@ Escalation is enabled only when the toggle is true and either a complete provide
 ### `mobileNavPrimaryItems`
 
 Project-scoped ordered list of up to six mobile footer quick actions. The default remains `command-center`, `tasks`, `agents`, `missions`, `chat`, `mailbox`. Settings shows selected items in order with move/remove controls and an add dropdown for eligible navigation destinations (including More-sheet actions and gated views); edits preview in the live footer and auto-save after editing. Unknown ids plus `more`, Terminal/scripts, shell controls, plugin views, and separators are ignored. Omitted available destinations remain reachable in More, whose trailing footer tab is always present. Disabled feature-gated destinations render nowhere until their feature is enabled.
+
+### Plugin-provided MCP servers
+
+Enabled plugins may declare `mcpServers` declaratively. The contribution is project-scoped: only plugins enabled in that project's plugin state participate. Resolution is global → enabled plugin declarations → project settings, by server `name`; later declarations win and a project `enabled:false` entry removes an inherited plugin server. The Global MCP card never includes plugin declarations. Project MCP UI identifies them as `plugin:<id>` and writes only project overrides or tombstones.

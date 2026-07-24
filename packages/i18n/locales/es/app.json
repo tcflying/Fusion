@@ -1128,7 +1128,24 @@
     "notGranted": "Not granted",
     "toggleCapabilityGrant": "Toggle explicit grant for {{permission}}",
     "capabilityPermissionsUpdated": "Capability grants updated",
-    "capabilityPermissionsFailed": "Failed to update capability grants: {{error}}"
+    "capabilityPermissionsFailed": "Failed to update capability grants: {{error}}",
+    "disableHeartbeat": "Desactivar latido",
+    "enableHeartbeat": "Activar latido",
+    "heartbeatActionForAgent": "{{action}} para {{name}}",
+    "heartbeatUpdating": "Actualizando latido…",
+    "heartbeatEnabledForAgent": "Latido activado para {{name}}",
+    "heartbeatUpdateFailed": "No se pudo actualizar el latido: {{error}}",
+    "enableAllHeartbeats": "Activar todos los latidos",
+    "disableAllHeartbeats": "Desactivar todos los latidos",
+    "enableAllHeartbeatsConfirm": "¿Activar los latidos de {{count}} agentes del proyecto?",
+    "disableAllHeartbeatsConfirm": "¿Desactivar los latidos de {{count}} agentes del proyecto?",
+    "noHeartbeatsToEnable": "No hay latidos que activar",
+    "noHeartbeatsToDisable": "No hay latidos que desactivar",
+    "enableHeartbeatsSummary": "Se activaron {{count}} latidos; se omitieron {{skipped}}",
+    "disableHeartbeatsSummary": "Se desactivaron {{count}} latidos; se omitieron {{skipped}}",
+    "enableHeartbeatsCountHint": "Activar {{count}} latidos desactivados",
+    "disableHeartbeatsCountHint": "Desactivar {{count}} latidos activados",
+    "bulkFailures": "fallaron {{count}}"
   },
   "app": {
     "backendError": {
@@ -1370,7 +1387,8 @@
     "noModelsAvailable": "No models available",
     "currentAgentTarget": "Current agent: {{name}}",
     "currentModelTarget": "Current model: {{model}}",
-    "currentDefaultTarget": "Using the default chat target"
+    "currentDefaultTarget": "Using the default chat target",
+    "newNotAllowedForTaskChat": ""
   },
   "chatRooms": {
     "error": {
@@ -5964,7 +5982,8 @@
       "reportDiscussionCategoryHelp": "Obligatoria al enviar a Discusiones de GitHub. Las categorías se cargan desde el repositorio configurado.",
       "reportDiscussionCategorySelect": "Selecciona una categoría de discusión",
       "reportDiscussionCategoryUnavailable": "Las categorías de discusión no están disponibles para el repositorio configurado.",
-      "reportDiscussionCategoryEmpty": "No hay categorías de discusión disponibles para el repositorio configurado."
+      "reportDiscussionCategoryEmpty": "No hay categorías de discusión disponibles para el repositorio configurado.",
+      "reportTargetByActionHelp": ""
     },
     "globalGeneral": {
       "andShowsUpdateNoticesInTheCLIAnd": "",
@@ -6010,7 +6029,11 @@
       "skipConfirmationDialogs": "",
       "skipConfirmationDialogsHint": "",
       "enableProactiveTaskChat": "",
-      "enableProactiveTaskChatHint": ""
+      "enableProactiveTaskChatHint": "",
+      "releaseChannel": "",
+      "releaseChannelHelp": "",
+      "channelStable": "",
+      "channelBeta": ""
     },
     "globalModels": {
       "allow": "",
@@ -6839,10 +6862,11 @@
       "allProjectResetSuccess": ""
     },
     "database": {
-      "embeddedConnectionCapHelp": "Máximo de conexiones de servidor para el PostgreSQL integrado de Fusion. Se aplica al reiniciar Fusion. Rango: 32–2.000. Predeterminado: 500. PostgreSQL externo usa el límite de su proveedor.",
+      "embeddedConnectionCapHelp": "Máximo de conexiones de servidor para el PostgreSQL integrado de Fusion. Se aplica al reiniciar Fusion. Rango: 32–2.000. Sin valor establecido por defecto: Fusion elige 500, o 150 en Windows, donde cada conexión es un proceso independiente y límites más altos pueden bloquear los procesos backend. PostgreSQL externo usa el límite de su proveedor.",
       "embeddedConnectionCap": "Límite de conexiones de PostgreSQL integrado",
       "embeddedConnectionCapError": "Introduce un valor entre 32 y 2.000.",
-      "advanced": "Ajustes avanzados de base de datos"
+      "advanced": "Ajustes avanzados de base de datos",
+      "embeddedConnectionCapPlaceholder": "auto"
     },
     "configVersions": {
       "title": "Versiones de configuración",
@@ -7819,7 +7843,12 @@
       "createdVia": "Creado mediante",
       "parentTaskOf": "",
       "createdToUndo": "",
-      "undoTask": ""
+      "undoTask": "",
+      "creatingAgent": "",
+      "importedFrom": "",
+      "nearDuplicateOf": "",
+      "parentTask": "",
+      "title": ""
     },
     "recoveryState": "Estado de recuperación",
     "refine": {
@@ -8502,6 +8531,9 @@
     "resetPreferences": "",
     "shortcuts": "Atajos",
     "startingTerminal": "Iniciando terminal...",
+    "manualStartHint": "La terminal está lista: inicia una sesión para comenzar.",
+    "manualStartError": "No se pudo iniciar la terminal: {{message}}",
+    "startTerminal": "Iniciar terminal",
     "statusConnected": "Conectado",
     "statusConnecting": "Conectando...",
     "statusDisconnected": "Desconectado",

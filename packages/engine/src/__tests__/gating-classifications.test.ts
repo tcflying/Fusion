@@ -158,6 +158,7 @@ describe("gating-classifications parity", () => {
         "fn_task_list",
         "fn_task_log",
         "fn_task_logs_read",
+        "fn_task_prompt_write",
         "fn_task_search",
         "fn_task_show",
         "fn_task_verification_status",
@@ -176,6 +177,22 @@ describe("gating-classifications parity", () => {
   it("classifies fn_ask_question in both gate source sets", () => {
     expect(READONLY_FN_TOOLS.has("fn_ask_question")).toBe(true);
     expect((COORDINATION_EXEMPT_TOOLS as readonly string[]).includes("fn_ask_question")).toBe(true);
+  });
+
+  it("classifies fn_task_prompt_write as coordination-exempt so plan persistence is not approval-gated", () => {
+    expect(READONLY_FN_TOOLS.has("fn_task_prompt_write")).toBe(true);
+    expect((COORDINATION_EXEMPT_TOOLS as readonly string[]).includes("fn_task_prompt_write")).toBe(true);
+    expect(classifyPermanentAgentToolCall("fn_task_prompt_write")).toEqual({ category: "none", recognized: true });
+    expect(resolvePermanentAgentToolDecision({
+      toolName: "fn_task_prompt_write",
+      gating: { permissionPolicy: approvalRequiredPolicy },
+    })).toMatchObject({ category: "none", disposition: "allow", recognized: true });
+    expect(evaluateAgentActionGate({
+      agentId: "a1",
+      toolName: "fn_task_prompt_write",
+      args: { content: "# Plan" },
+      permissionPolicy: approvalRequiredPolicy,
+    })).toMatchObject({ category: "exempt", disposition: "allow" });
   });
 
   it("ensures coordination exempt tools are recognized and allowed in permanent gating", () => {
@@ -227,25 +244,31 @@ describe("gating-classifications parity", () => {
       recognized: true,
     });
 
-    for (const [permissionPolicy, disposition] of policyMatrix) {
-      expect(resolvePermanentAgentToolDecision({
-        toolName: "fn_task_create",
-        args: { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } },
-        gating: { permissionPolicy },
-      })).toMatchObject({
-        category: "task_agent_mutation",
-        disposition,
-        recognized: true,
-      });
-      expect(evaluateAgentActionGate({
-        agentId: "a1",
-        toolName: "fn_task_create",
-        args: { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } },
-        permissionPolicy,
-      })).toMatchObject({
-        category: "task_agent_mutation",
-        disposition,
-      });
+    /*
+    FNXC:EngineTests 2026-07-22-13:07:
+    Cover freeform (no lineage) and mission-linked args: both follow policy disposition.
+    */
+    for (const args of [{}, { mission_lineage: { mission_id: "M-1", slice_id: "SL-1", feature_id: "F-1" } }]) {
+      for (const [permissionPolicy, disposition] of policyMatrix) {
+        expect(resolvePermanentAgentToolDecision({
+          toolName: "fn_task_create",
+          args,
+          gating: { permissionPolicy },
+        })).toMatchObject({
+          category: "task_agent_mutation",
+          disposition,
+          recognized: true,
+        });
+        expect(evaluateAgentActionGate({
+          agentId: "a1",
+          toolName: "fn_task_create",
+          args,
+          permissionPolicy,
+        })).toMatchObject({
+          category: "task_agent_mutation",
+          disposition,
+        });
+      }
     }
   });
 

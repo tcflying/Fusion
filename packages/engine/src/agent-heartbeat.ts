@@ -49,6 +49,7 @@ import { resolveHeartbeatPromptTemplate, resolveHeartbeatScopeDisciplineMode, se
 import { buildPromptLayers, collapsePromptLayers } from "./prompt-layers.js";
 import { resolveAndEmitGoalContext } from "./goal-injection-diagnostics.js";
 import { createLogger, heartbeatLog, formatError } from "./logger.js";
+import { mergeEffectiveSettings, mergeProjectWorkflowModelLaneBaseline } from "./effective-settings.js";
 import {
   extractConcurrentSoftDeleteRaceDetails,
   isConcurrentSoftDeleteRaceError,
@@ -2528,7 +2529,17 @@ export class HeartbeatMonitor {
 
           // Agent delegation tools
           heartbeatTools.push(createListAgentsTool(this.store));
-          heartbeatTools.push(createDelegateTaskTool(this.store, taskStore, { rootDir: this.rootDir, sourceAgentId: agentId }));
+          /*
+          FNXC:MissionAdmission 2026-07-22-13:07:
+          Idle-patrol delegation has no parent task to inherit lineage from.
+          Keep the same requireMissionLineage contract as fn_task_create so
+          freeform off-mission delegation cannot slip past FN-8307 via delegate.
+          */
+          heartbeatTools.push(createDelegateTaskTool(this.store, taskStore, {
+            rootDir: this.rootDir,
+            sourceAgentId: agentId,
+            requireMissionLineage: true,
+          }));
           heartbeatTools.push(createTaskAssignTool(this.store, taskStore));
           heartbeatTools.push(createGetAgentConfigTool(this.store, agentId));
           heartbeatTools.push(createUpdateAgentConfigTool(this.store, agentId));
@@ -2544,7 +2555,7 @@ export class HeartbeatMonitor {
             heartbeatTools.push(createPostRoomMessageTool(this.chatStore, agentId));
           }
 
-          heartbeatTools.push(...createMissionTools(taskStore));
+          heartbeatTools.push(...createMissionTools(taskStore, { agentId }));
           heartbeatTools.push(...createIdeationTools(taskStore));
           heartbeatTools.push(...createGoalRetrievalTools(taskStore, { runContext }));
           heartbeatTools.push(createReadEvaluationsTool(this.store, this.reflectionStore, agentId));
@@ -2868,6 +2879,10 @@ export class HeartbeatMonitor {
           }
         }
 
+        const heartbeatBaseSettings = heartbeatModelSettings ?? ({} as Settings);
+        heartbeatModelSettings = taskDetail
+          ? await mergeEffectiveSettings(taskStore, taskDetail, heartbeatBaseSettings)
+          : await mergeProjectWorkflowModelLaneBaseline(taskStore, heartbeatBaseSettings);
         const heartbeatSessionModels = resolveHeartbeatSessionModels(heartbeatModelSettings, agent.runtimeConfig);
         const heartbeatRuntimeHint = extractRuntimeHint(agent.runtimeConfig);
         /*
@@ -3847,7 +3862,7 @@ export class HeartbeatMonitor {
       tools.push(createPostRoomMessageTool(this.chatStore, agentId));
     }
 
-    tools.push(...createMissionTools(taskStore));
+    tools.push(...createMissionTools(taskStore, { agentId }));
     tools.push(...createIdeationTools(taskStore));
     tools.push(...createGoalRetrievalTools(taskStore, { runContext, taskId }));
     tools.push(createReadEvaluationsTool(this.store, this.reflectionStore, agentId));

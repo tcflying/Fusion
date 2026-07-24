@@ -1,25 +1,26 @@
 import { describe, expect, it } from "vitest";
 import type { TFunction } from "i18next";
-import { getTaskStatusBadgeLabel, shouldSuppressPlanningStatusBadge } from "../taskStatusBadgeLabel";
+import { getTaskStatusBadgeLabel, hasTaskStatusBadge } from "../taskStatusBadgeLabel";
 
 const t = ((key: string, fallback?: string) => fallback ?? key) as TFunction<"app">;
 
-describe("shouldSuppressPlanningStatusBadge", () => {
+describe("hasTaskStatusBadge", () => {
   it.each([
-    { status: "planning", column: "todo", suppressed: true },
-    { status: "planning", column: "in-progress", suppressed: true },
-    { status: "planning", column: "triage", suppressed: false },
-    { status: "executing", column: "todo", suppressed: false },
-    { status: "executing", column: "in-progress", suppressed: false },
-    { status: "reviewing", column: "todo", suppressed: false },
-    { status: "merging", column: "in-progress", suppressed: false },
-    { status: "failed", column: "todo", suppressed: false },
-    { status: "needs-replan", column: "in-progress", suppressed: false },
-    { status: "done", column: "todo", suppressed: false },
-    { status: null, column: "in-progress", suppressed: false },
-    { status: undefined, column: "todo", suppressed: false },
-  ])("suppresses only stale planning status for Todo and In Progress: $status/$column", ({ status, column, suppressed }) => {
-    expect(shouldSuppressPlanningStatusBadge({ status, column })).toBe(suppressed);
+    "planning",
+    "executing",
+    "reviewing",
+    "merging",
+    "failed",
+    "needs-replan",
+    "done",
+  ])("keeps a real status visible regardless of column placement: %s", (status) => {
+    expect(hasTaskStatusBadge(status)).toBe(true);
+  });
+
+  it("leaves null, undefined, and empty status badge-free", () => {
+    expect(hasTaskStatusBadge(null)).toBe(false);
+    expect(hasTaskStatusBadge(undefined)).toBe(false);
+    expect(hasTaskStatusBadge(" ")).toBe(false);
   });
 });
 
@@ -51,8 +52,10 @@ describe("getTaskStatusBadgeLabel", () => {
     expect(getTaskStatusBadgeLabel("needs-replan", t, "Plan Review")).toBe("Plan Review");
   });
 
-  it("maps needs-replan to the operator-facing Replan label", () => {
-    expect(getTaskStatusBadgeLabel("needs-replan", t)).toBe("Replan");
+  it("maps needs-replan to the operator-facing Revising label", () => {
+    const label = getTaskStatusBadgeLabel("needs-replan", t);
+    expect(label).toBe("Revising");
+    expect(label).not.toBe("Replan");
   });
 
   it("passes through non-merge statuses", () => {

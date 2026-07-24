@@ -251,6 +251,16 @@ function createMockStore(overrides: Partial<TaskStore> = {}): TaskStore {
     removePrInfoByNumber: vi.fn().mockResolvedValue(undefined),
     updateIssueInfo: vi.fn().mockResolvedValue(undefined),
     getRootDir: vi.fn().mockReturnValue("/fake/root"),
+    /*
+    FNXC:PluginMcpServers 2026-07-23-23:40:
+    FN-8491 (3cd023fa4) made resolveProjectContext bind a project-scoped plugin
+    MCP provider on every getProjectContext call. A store that already exposes
+    getProjectScopedPluginMcpServers is treated as runtime-owned and skips the
+    binder (which would otherwise call getPluginStore()); declare it here so the
+    route contracts under test stay isolated from plugin-loader bootstrapping.
+    Same alignment as remote-access-routes.test.ts (d7752931b).
+    */
+    getProjectScopedPluginMcpServers: vi.fn().mockResolvedValue([]),
     listWorkflowSteps: vi.fn().mockResolvedValue([]),
     createWorkflowStep: vi.fn(),
     getWorkflowStep: vi.fn(),
@@ -1974,6 +1984,15 @@ describe("projectId store scoping regressions", () => {
       initialPlan: "Scoped initial plan",
       history: [],
       thinkingOutput: "",
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-task requires validated sessions.
+      validated: true,
+      summary: {
+        title: "Scoped planned task",
+        description: "Create task in scoped project",
+        suggestedSize: "M",
+        suggestedDependencies: [],
+        keyDeliverables: [],
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     } as any);
@@ -1985,6 +2004,17 @@ describe("projectId store scoping regressions", () => {
       keyDeliverables: [],
     });
     vi.spyOn(planningModule, "cleanupSession").mockImplementation(() => {});
+    /*
+    FNXC:PlanningMode 2026-07-23-23:55:
+    FN-8442 (36b318096) routes create-task through durable create-claim plumbing
+    (getDurablePlanningSession + updatePlanningCreateClaim). Those functions call the
+    REAL module-internal getSession (a namespace spy cannot intercept intra-module
+    calls), so the spied session above is invisible to them and they throw
+    SessionNotFoundError. This test's contract is scoped-store routing of createTask,
+    not claim persistence, so stub the claim plumbing to inert no-ops here.
+    */
+    vi.spyOn(planningModule, "getDurablePlanningSession").mockResolvedValue(undefined);
+    vi.spyOn(planningModule, "updatePlanningCreateClaim").mockResolvedValue(undefined);
 
     (scopedStore.createTask as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...FAKE_TASK_DETAIL,
@@ -2010,6 +2040,8 @@ describe("projectId store scoping regressions", () => {
       id: "plan-session-2",
       initialPlan: "Scoped multi task plan",
       history: [],
+      // FNXC:PlanningMode 2026-07-19-01:45: FN-8341 create-tasks requires validated sessions.
+      validated: true,
       summary: {
         title: "Plan",
         description: "Plan description",

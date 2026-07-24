@@ -256,6 +256,8 @@ vi.mock("@earendil-works/pi-ai", () => ({
     Object: (props: Record<string, unknown>) => ({ type: "object", properties: props }),
     String: (opts?: unknown) => ({ type: "string", ...((opts as object) ?? {}) }),
     Number: (opts?: unknown) => ({ type: "number", ...((opts as object) ?? {}) }),
+    // FNXC:EngineTests 2026-07-23-21:20: f21d3ce13 (#2375) added Type.Integer to agent-tools document CAS schemas (expected_revision); partial Type mocks must cover it or these files fail at collect time.
+    Integer: (opts?: unknown) => ({ type: "integer", ...((opts as object) ?? {}) }),
     Boolean: (opts?: unknown) => ({ type: "boolean", ...((opts as object) ?? {}) }),
     Optional: (schema: unknown) => schema,
     Array: (schema: unknown, opts?: unknown) => ({ type: "array", items: schema, ...((opts as object) ?? {}) }),
@@ -384,6 +386,26 @@ function createMockStore(overrides: Record<string, any> = {}) {
       return { ...(patches.get(id) ?? {}), id };
     }),
     moveTask: makeWriteThroughMoveTask(),
+    /*
+    FNXC:EngineTests 2026-07-23-21:20:
+    Scheduler dispatch now goes through the atomic `moveTaskIf` (user-paused dispatch fix, commit 0818fc1da #2371).
+    The fake evaluates the live-row predicate against the write-through `getTask` view and delegates to the mock
+    `moveTask` (forwarding the options bag) so existing dispatch assertions on `store.moveTask` — including the
+    `allocateWorktree` option — stay meaningful.
+    */
+    moveTaskIf: vi.fn(
+      async (
+        id: string,
+        column: string,
+        predicate: (live: Task) => boolean | Promise<boolean>,
+        opts?: Record<string, unknown>,
+      ) => {
+        const live = await store.getTask(id);
+        if (!live || !(await predicate(live))) return { task: live, moved: false };
+        const moved = await store.moveTask(id, column, opts);
+        return { task: moved ?? live, moved: true };
+      },
+    ),
     recordActivity: vi.fn().mockResolvedValue({}),
     mergeTask: vi.fn().mockResolvedValue({}),
     getWorkflowStep: vi.fn().mockResolvedValue(undefined),
@@ -437,6 +459,14 @@ function createMockStore(overrides: Record<string, any> = {}) {
     }),
     deleteTask: vi.fn().mockResolvedValue(undefined),
     getActiveMergingTask: vi.fn().mockReturnValue(undefined),
+    /*
+    FNXC:EngineTests 2026-07-19-01:20:
+    FN-8296 reads pending verification before createFnAgent; restart fakes must
+    stub claim/finish surfaces or resumeOrphaned execute paths fail before session creation.
+    getAgentLogCount / getAgentLogs / getTaskVerificationRequestAsync are declared above.
+    */
+    claimTaskVerificationRequest: vi.fn().mockResolvedValue(null),
+    finishTaskVerificationRequest: vi.fn().mockResolvedValue(undefined),
     _trigger(event: string, ...args: any[]) {
       for (const fn of listeners.get(event) || []) fn(...args);
     },
@@ -633,29 +663,78 @@ describe("In-progress task resume after restart", () => {
   it("resumed task with step progress includes RESUMING section in agent prompt", async () => {
     const store = createMockStore();
     const steps = makeSteps("done", "done", "done", "in-progress", "pending");
+    /*
+    FNXC:EngineTests 2026-07-21-17:58:
+    Graph parse rewrites steps from PROMPT.md / getTaskDocument. Fixture must carry the same five
+    step headings as makeSteps so resume progress is not collapsed to a single Preflight row.
+    */
+    const multiStepPrompt = [
+      "# test",
+      "## Steps",
+      "### Step 0: Step 0",
+      "### Step 1: Step 1",
+      "### Step 2: Step 2",
+      "### Step 3: Step 3",
+      "### Step 4: Step 4",
+      "## Review Level: 0",
+    ].join("\n");
     const task = makeTask("FN-020", "in-progress", { steps, currentStep: 3 });
     store.listTasks.mockResolvedValue([task]);
+    store.getTaskDocument.mockImplementation(async (_taskId: string, key: string) =>
+      key === "PROMPT.md" ? { content: multiStepPrompt } : undefined,
+    );
     store.getTask.mockResolvedValue(makeTaskDetail("FN-020", "in-progress", {
       steps,
       currentStep: 3,
+      prompt: multiStepPrompt,
     }));
+    /*
+    FNXC:EngineTests 2026-07-21-18:00:
+    Graph parse-steps rewrites every step to pending. In production, resume then reconciles done
+    statuses from git history; this harness has no real commits, so preserve fixture statuses by
+    name when parse projects the matching step list.
+    */
+    const baseUpdateTask = store.updateTask;
+    store.updateTask = vi.fn(async (id: string, patch: Record<string, any>) => {
+      let next = patch;
+      if (Array.isArray(patch?.steps) && patch.steps.length === steps.length) {
+        next = {
+          ...patch,
+          steps: patch.steps.map((s: { name: string; status: string }, i: number) => ({
+            ...s,
+            status: steps[i]?.status ?? s.status,
+          })),
+          currentStep: 3,
+        };
+      }
+      return baseUpdateTask(id, next);
+    });
 
-    let capturedPrompt = "";
+    /*
+    FNXC:EngineTests 2026-07-21-00:20:
+    Graph ownership opens multiple sessions (parse/plan/step/impl). Capture every prompt
+    and assert the RESUMING section appears on the implementation prompt rather than the last session only.
+    */
+    const prompts: string[] = [];
     mockedCreateFnAgent.mockResolvedValue({
       session: {
         prompt: vi.fn().mockImplementation(async (prompt: string) => {
-          capturedPrompt = prompt;
+          prompts.push(prompt);
         }),
         dispose: vi.fn(),
+        subscribe: vi.fn(),
+        sessionManager: { getLeafId: vi.fn().mockReturnValue(null) },
+        state: {},
       },
     } as any);
 
     const executor = new TaskExecutor(store, "/tmp/test");
     await executor.resumeOrphaned();
     await waitForAsyncExpectation(() => {
-      expect(capturedPrompt).toContain("⚠️ RESUMING");
+      expect(prompts.some((p) => p.includes("⚠️ RESUMING"))).toBe(true);
     });
 
+    const capturedPrompt = prompts.find((p) => p.includes("⚠️ RESUMING")) ?? "";
     expect(capturedPrompt).toContain("⚠️ RESUMING");
     expect(capturedPrompt).toContain("Step 0 (Step 0): **done**");
     expect(capturedPrompt).toContain("Step 3 (Step 3): **in-progress**");
@@ -1601,12 +1680,15 @@ describe("Crash scenario edge cases", () => {
 
     await executor.resumeOrphaned();
     await waitForAsyncExpectation(() => {
-      expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
+      expect(mockedCreateFnAgent.mock.calls.length).toBeGreaterThanOrEqual(1);
     });
 
-    // Exactly one agent created for the re-resume, proving the task was eligible
-    // and completed without retry inflation.
-    expect(mockedCreateFnAgent).toHaveBeenCalledTimes(1);
+    /*
+    FNXC:EngineTests 2026-07-21-00:20:
+    Graph ownership may open multiple sessions on re-resume (step/impl). The invariant is
+    eligibility + at least one agent session, not a single-session count from the pre-graph era.
+    */
+    expect(mockedCreateFnAgent.mock.calls.length).toBeGreaterThanOrEqual(1);
 
     // Re-resume should have logged again (behavioral guarantee)
     expect(store.logEntry).toHaveBeenCalledWith("FN-090", "Resumed after engine restart");
@@ -2019,11 +2101,19 @@ describe("Engine pause/unpause cycle", () => {
     }) as any));
 
     const executor = new TaskExecutor(store, "/tmp/test");
+    /*
+    FNXC:EngineTests 2026-07-21-17:58:
+    Graph merge node fails closed with merge-unavailable (and rebounds to todo) when no mergeRequester
+    is wired. Production always injects one; this soft-pause case only needs the boundary reached so
+    completion can hand off without treating enginePaused as a hard cancel.
+    */
+    executor.setMergeRequester(async () => ({ merged: false, noOp: false, reason: "queued" } as any));
     await executor.execute(task);
 
     // Soft pause: agent sessions continue and may complete to in-review; do not fail the task.
-    expect(store.moveTask).toHaveBeenCalledWith("FN-EP1", "in-review");
-    expect(store.moveTask).not.toHaveBeenCalledWith("FN-EP1", "todo");
+    // FNXC:EngineTests 2026-07-21-00:20: moveTask may include options bag as 3rd arg under graph merge handoff.
+    expect(store.moveTask.mock.calls.some((c: unknown[]) => c[0] === "FN-EP1" && c[1] === "in-review")).toBe(true);
+    expect(store.moveTask.mock.calls.some((c: unknown[]) => c[0] === "FN-EP1" && c[1] === "todo")).toBe(false);
     expect(store.updateTask).not.toHaveBeenCalledWith("FN-EP1", { status: "failed" });
   });
 

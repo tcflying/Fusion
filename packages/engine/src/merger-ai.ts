@@ -76,6 +76,7 @@ import {
   buildAutostashLabel,
   captureSingleCommitLandedMetadata,
   isNonFastForwardPushError,
+  isRebaseInProgress,
   parsePushRemoteTarget,
   pushToRemoteAfterMerge,
   runMergeAdvanceAutoSync,
@@ -159,6 +160,29 @@ function taskHasApprovedAiMergeReview(task: Task | undefined): boolean {
     typeof entry.action === "string"
     && /AI merge review \(pass \d+\): approved/.test(entry.action)
   );
+}
+
+function getOutstandingBlockingMergeReasons(task: Task | undefined): string[] {
+  const actions = task?.log?.map((entry) => entry.action).filter((action): action is string => typeof action === "string") ?? [];
+  const reasons: string[] = [];
+  const addReasons = (value: string): void => {
+    for (const reason of value.split(/;\s*/).map((part) => part.trim()).filter(Boolean)) {
+      if (!reasons.includes(reason)) reasons.push(reason);
+    }
+  };
+  for (let index = actions.length - 1; index >= 0; index--) {
+    const action = actions[index];
+    if (/AI merge: (?:landed|finalized).*task → done/i.test(action)) return [];
+    if (/AI merge review \(pass \d+\): approved/i.test(action)) return [];
+    const blocked = action.match(/AI merge BLOCKED .*?unresolved correctness concern:\s*(.+)$/i);
+    if (blocked?.[1]) {
+      addReasons(blocked[1]);
+      return reasons;
+    }
+    const rejected = action.match(/AI merge review \(pass \d+\): rejected \(blocking\) —\s*(.+)$/i);
+    if (rejected?.[1]) addReasons(rejected[1]);
+  }
+  return reasons;
 }
 
 function matchesApprovedAiMergeSha(squashSha: string, approvedShas: Set<string>): boolean {
@@ -795,6 +819,8 @@ export async function landOneRepo(
     await log(`AI merge: pre-merge prune failed: ${getErrorMessage(err)}`);
   }
   let advanceRetries = 0;
+  const taskAtStart = await store.getTask(taskId);
+  let outstandingReviewReasons = getOutstandingBlockingMergeReasons(taskAtStart);
   while (true) {
     throwIfAborted(signal, taskId);
     const tipSha = await git(["rev-parse", "--verify", `refs/heads/${integrationBranch}`], repoRootDir);
@@ -807,7 +833,11 @@ export async function landOneRepo(
     // exhaustion and the card is parked failed. Only short-circuit on a CONFIDENT
     // 0: a git failure yields "" → parseInt → NaN (≠ 0) and falls through.
     const aheadRaw = await git(["rev-list", "--count", `${integrationBranch}..${branch}`], repoRootDir).catch(() => "");
-    if (Number.parseInt(aheadRaw.trim(), 10) === 0) {
+    /*
+    FNXC:MergeReviewBlockers 2026-07-21-21:45:
+    Zero commits ahead is only an unconditional no-op when no durable blocker remains. A retry after reset, rebase, or prior integration must still review the complete integration tree before clearing previously rejected correctness concerns.
+    */
+    if (Number.parseInt(aheadRaw.trim(), 10) === 0 && outstandingReviewReasons.length === 0) {
       await audit.git({ type: "merge:ai-empty", target: integrationBranch, metadata: { taskId, tipSha } });
       return { outcome: "empty", tipSha, integrationBranch };
     }
@@ -906,10 +936,13 @@ export async function landOneRepo(
       await log(`[timing] AI merge dependency sync completed in ${Date.now() - depsSyncStartedAt}ms${depsSyncResult ? (depsSyncResult.installCommand ? ` (${depsSyncResult.skipped ? "skipped" : "ran"}: ${depsSyncResult.installCommand})` : " (no command)") : " (failed — non-fatal, deps unavailable)"}`);
 
       // 2 + 3. Merge + review loop (corrective passes).
-      const squashSha = await mergeAndReview({
+      const reviewResult = await mergeAndReview({
         mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId,
         maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal,
+        initialPriorReasons: outstandingReviewReasons,
       });
+      const squashSha = reviewResult.squashSha;
+      outstandingReviewReasons = reviewResult.priorReasons;
 
       if (!squashSha) {
         // Branch had no net changes vs the tip — nothing to land. The caller
@@ -1436,9 +1469,20 @@ async function runPushAfterMergeStep(input: {
     }
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "MergeAbortedError") {
-      // The task already finalized — an abort mid-push must not re-surface as a
-      // failed/aborted merge. Skip quietly; the next merge's push reconciles.
-      aiMergeLog.warn(`${taskId}: push after merge aborted by shutdown signal — skipping (merge already finalized)`);
+      /*
+      FNXC:MergePush 2026-07-22-18:48:
+      Tchori-Labs/Fusion#5 requires shutdown aborts after finalization to remain non-fatal but never silent. The remote recovery branch preserves the approved squash; MergeResult, task log, and run-audit identify that the target push did not complete.
+      */
+      const message = "Push after merge aborted by shutdown signal; the local merge remains finalized and its divergence recovery branch is retained";
+      result.pushedToRemote = false;
+      result.pushError = message;
+      aiMergeLog.warn(`${taskId}: ${message}`);
+      await audit.git({
+        type: "push:origin",
+        target: taskId,
+        metadata: { integrationBranch, remote: settings.pushRemote ?? "origin", outcome: "aborted" },
+      }).catch(() => undefined);
+      await store.logEntry(taskId, message, "PushToRemoteFailed").catch(() => undefined);
       return;
     }
     const message = getErrorMessage(err);
@@ -1993,9 +2037,10 @@ async function mergeAndReview(input: {
   setStatus: (status: string | null) => Promise<unknown>;
   store: TaskStore;
   signal?: AbortSignal;
-}): Promise<string | null> {
+  initialPriorReasons?: string[];
+}): Promise<{ squashSha: string | null; priorReasons: string[] }> {
   const { mergeRoot, branch, integrationBranch, tipSha, taskTitle, includeTaskId, trailers, taskId, maxPasses, mergeAgent, reviewAgent, audit, log, setStatus, store, signal } = input;
-  let priorReasons: string[] = [];
+  let priorReasons = [...(input.initialPriorReasons ?? [])];
 
   for (let attempt = 0; ; attempt++) {
     throwIfAborted(signal, taskId);
@@ -2017,13 +2062,16 @@ async function mergeAndReview(input: {
     }));
 
     let head = await git(["rev-parse", "HEAD"], mergeRoot);
-    if (head === tipSha) return null; // empty merge — nothing landed
+    const emptyMerge = head === tipSha;
+    if (emptyMerge && priorReasons.length === 0) return { squashSha: null, priorReasons }; // empty initial merge — nothing landed
 
     // Guarantee the squash's task metadata (task-id subject prefix + board
     // association trailers) even if the agent omitted it — this amends HEAD, so
     // re-read the sha afterwards.
-    await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers);
-    head = await git(["rev-parse", "HEAD"], mergeRoot);
+    if (!emptyMerge) {
+      await ensureCommitTaskMetadata(mergeRoot, taskId, includeTaskId, trailers);
+      head = await git(["rev-parse", "HEAD"], mergeRoot);
+    }
 
     await setStatus("reviewing");
     const diffStat = await git(["diff", "--stat", `${tipSha}..${head}`], mergeRoot);
@@ -2041,24 +2089,32 @@ async function mergeAndReview(input: {
 
     if (verdict.verdict === "approve") {
       await log(`AI merge review (pass ${attempt + 1}): approved squash ${head}`);
-      return head;
+      return { squashSha: emptyMerge ? null : head, priorReasons };
     }
 
+    /*
+    FNXC:MergeReviewBlockers 2026-07-21-21:30:
+    Every rejected blocker remains part of the corrective contract until a reviewer approves the complete result. Review an empty corrective rebuild instead of treating it as an unreviewed no-op, and accumulate newly discovered blockers so a later pass cannot regress an earlier concern.
+
+    FNXC:MergeReviewBlockers 2026-07-21-21:45:
+    Persist the accumulated set in every rejection log so crash recovery restores all outstanding concerns rather than only the latest pass.
+    */
+    const unresolvedReasons = [...new Set([...priorReasons, ...verdict.reasons])];
     const budgetExhausted = attempt >= maxPasses;
     if (budgetExhausted) {
       if (verdict.severity === "blocking") {
-        await audit.git({ type: "merge:ai-review-blocked", target: integrationBranch, metadata: { taskId, attempt, reasons: verdict.reasons } });
-        await log(`AI merge BLOCKED after ${attempt} corrective pass(es) — unresolved correctness concern: ${verdict.reasons.join("; ")}`);
-        throw new AiMergeBlockedError(taskId, verdict.reasons);
+        await audit.git({ type: "merge:ai-review-blocked", target: integrationBranch, metadata: { taskId, attempt, reasons: unresolvedReasons } });
+        await log(`AI merge BLOCKED after ${attempt} corrective pass(es) — unresolved correctness concern: ${unresolvedReasons.join("; ")}`);
+        throw new AiMergeBlockedError(taskId, unresolvedReasons);
       }
       // Advisory: land the squash with the concern logged.
-      await audit.git({ type: "merge:ai-review-landed-with-concerns", target: integrationBranch, metadata: { taskId, attempt, reasons: verdict.reasons, squashSha: head } });
-      await log(`AI merge: landing with unresolved advisory concern(s): ${verdict.reasons.join("; ")}`);
-      return head;
+      await audit.git({ type: "merge:ai-review-landed-with-concerns", target: integrationBranch, metadata: { taskId, attempt, reasons: unresolvedReasons, squashSha: head } });
+      await log(`AI merge: landing with unresolved advisory concern(s): ${unresolvedReasons.join("; ")}`);
+      return { squashSha: emptyMerge ? null : head, priorReasons: unresolvedReasons };
     }
 
-    priorReasons = verdict.reasons;
-    await log(`AI merge review (pass ${attempt + 1}): rejected (${verdict.severity}) — ${verdict.reasons.join("; ")}`);
+    priorReasons = unresolvedReasons;
+    await log(`AI merge review (pass ${attempt + 1}): rejected (${verdict.severity}) — ${unresolvedReasons.join("; ")}`);
   }
 }
 
@@ -2128,6 +2184,43 @@ export async function pushAfterMergeToRemote(input: {
     return { pushed: false, remote, targetBranch, error: fastPathError };
   }
 
+  /*
+  FNXC:MergePush 2026-07-22-18:42:
+  Tchori-Labs/Fusion#5 requires approved content to reach durable remote storage before the divergence clean room starts. Force-updating a task-scoped recovery ref makes retries idempotent and preserves the pre-rebase squash across aborts or process death without changing the non-fatal post-finalization push contract.
+  */
+  const recoveryBranch = `fusion/${taskId.toLowerCase()}-stranded`;
+  const recoveryRef = `refs/heads/${recoveryBranch}`;
+  // Both the create and delete recovery-ref paths record the same
+  // {audit event + task-log entry} pair, differing only in outcome/message/
+  // action — keep them in one place so the paths can't drift apart.
+  const recordRecoveryBranch = async (
+    outcome: "success" | "failed" | "deleted" | "delete-failed",
+    logMessage: string,
+    logAction: "PushRecoveryBranch" | "PushRecoveryBranchFailed",
+  ): Promise<void> => {
+    await audit.git({
+      type: "push:recovery-branch",
+      target: taskId,
+      metadata: { taskId, remote, recoveryBranch, sha: localSha, outcome },
+    }).catch(() => undefined);
+    await store.logEntry(taskId, logMessage, logAction).catch(() => undefined);
+  };
+  try {
+    await git(["push", "--force", remote, `${localSha}:${recoveryRef}`], projectRootDir, { timeout: 120_000 });
+    await recordRecoveryBranch(
+      "success",
+      `Push after merge: preserved the approved pre-rebase squash on ${remote}/${recoveryBranch} at ${localSha}`,
+      "PushRecoveryBranch",
+    );
+  } catch (recoveryError: unknown) {
+    const message = getErrorMessage(recoveryError);
+    await recordRecoveryBranch(
+      "failed",
+      `Push after merge: could not preserve the approved squash on recovery branch ${remote}/${recoveryBranch}; continuing the non-fatal divergence rebase: ${message}`,
+      "PushRecoveryBranchFailed",
+    );
+  }
+
   // 2. Divergence path: remote moved ahead — rebase in a detached clean room.
   await log(`Push after merge: ${remote}/${targetBranch} has diverged — rebasing in a clean room before pushing`);
   let pushRoot: string | undefined;
@@ -2161,6 +2254,32 @@ export async function pushAfterMergeToRemote(input: {
     });
     if (!pushResult.pushed) {
       return { pushed: false, remote, targetBranch, error: pushResult.error };
+    }
+
+    // The approved content is now on the target branch, so clean up the
+    // temporary recovery ref. Deletion remains best-effort: a cleanup problem
+    // must not turn a successful target push into a failed merge outcome.
+    // The create push above uses --force, so a restarted/concurrent attempt
+    // for this taskId can force-update the ref to a newer value; lease the
+    // delete to this attempt's localSha so an ownership change fails
+    // harmlessly here instead of destroying a newer safety copy.
+    try {
+      await git(
+        ["push", `--force-with-lease=${recoveryRef}:${localSha}`, remote, `:${recoveryRef}`],
+        canonicalPushRoot,
+        { timeout: 120_000 },
+      );
+      await recordRecoveryBranch(
+        "deleted",
+        `Push after merge: deleted recovery branch ${remote}/${recoveryBranch} after the target push succeeded`,
+        "PushRecoveryBranch",
+      );
+    } catch (recoveryDeleteError: unknown) {
+      await recordRecoveryBranch(
+        "delete-failed",
+        `Push after merge: target push succeeded but recovery branch ${remote}/${recoveryBranch} could not be deleted: ${getErrorMessage(recoveryDeleteError)}`,
+        "PushRecoveryBranchFailed",
+      );
     }
 
     // The clean-room HEAD is what the remote now has. Advance the local
@@ -2203,6 +2322,18 @@ export async function pushAfterMergeToRemote(input: {
     }
     return { pushed: true, remote, targetBranch, refAdvanced: true, rebasedSha };
   } finally {
+    /*
+    FNXC:MergePush 2026-07-22-18:48:
+    The divergence clean room must never survive an unexpected exit with staged, uncommitted rebase state. This outer guard complements the resolver helper's catch so cleanup is safe even when a future throw bypasses that helper.
+    */
+    if (pushRoot && worktreeAdded && (await isRebaseInProgress(pushRoot))) {
+      try {
+        await git(["rebase", "--abort"], pushRoot, { timeout: 120_000 });
+        await log("Push after merge: aborted the unfinished clean-room rebase before cleanup");
+      } catch (abortError: unknown) {
+        aiMergeLog.warn(`${taskId}: failed to abort unfinished push rebase before cleanup: ${getErrorMessage(abortError)}`);
+      }
+    }
     for (const registeredPath of registeredPaths) {
       activeSessionRegistry.unregisterPath(registeredPath);
     }

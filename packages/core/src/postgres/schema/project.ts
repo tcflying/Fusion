@@ -86,6 +86,7 @@ export const tasks = projectSchema.table("tasks", {
   paused: integer("paused").default(0),
   userPaused: integer("user_paused").default(0),
   pausedReason: text("paused_reason"),
+  wedgeNotification: text("wedge_notification"),
   baseBranch: text("base_branch"),
   branch: text("branch"),
   autoMerge: integer("auto_merge"),
@@ -877,6 +878,12 @@ export const workflowWorkItems = projectSchema.table("workflow_work_items", {
   leaseExpiresAt: text("lease_expires_at"),
   lastError: text("last_error"),
   blockedReason: text("blocked_reason"),
+  stableWorkflowRunId: text("stable_workflow_run_id"),
+  continuationSequence: integer("continuation_sequence"),
+  waitReason: text("wait_reason"),
+  sourceColumn: text("source_column"),
+  targetColumn: text("target_column"),
+  irHash: text("ir_hash"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
@@ -887,6 +894,9 @@ export const workflowWorkItems = projectSchema.table("workflow_work_items", {
   index("idx_workflow_work_items_due").on(t.state, t.retryAfter, t.createdAt),
   index("idx_workflow_work_items_leaseExpiresAt").on(t.leaseExpiresAt),
   index("idx_workflow_work_items_task_run").on(t.taskId, t.runId),
+  uniqueIndex("idx_workflow_work_items_one_active_task_continuation")
+    .on(t.projectId, t.taskId)
+    .where(sql`${t.kind} = 'task' AND ${t.state} IN ('runnable', 'running', 'held', 'retrying')`),
 ]);
 
 export const workflowRunBranches = projectSchema.table("workflow_run_branches", {
@@ -1460,6 +1470,10 @@ export const missionFeatures = projectSchema.table("mission_features", {
   loopState: text("loop_state").notNull().default("idle"),
   implementationAttemptCount: integer("implementation_attempt_count").notNull().default(0),
   validatorAttemptCount: integer("validator_attempt_count").notNull().default(0),
+  // FNXC:MissionLineageBudget 2026-07-22-12:00: Stops are explicit so legacy blocked roots never receive an inferred operator resume.
+  implementationStopReason: text("implementation_stop_reason"),
+  implementationStoppedAt: text("implementation_stopped_at"),
+  implementationStopOrigin: text("implementation_stop_origin"),
   lastValidatorRunId: text("last_validator_run_id"),
   lastValidatorStatus: text("last_validator_status"),
   generatedFromFeatureId: text("generated_from_feature_id"),
@@ -2016,6 +2030,7 @@ export const missionContractAssertions = projectSchema.table("mission_contract_a
   orderIndex: integer("order_index").notNull().default(0),
   sourceFeatureId: text("source_feature_id"),
   scope: text("scope").notNull().default("feature"),
+  origin: text("origin").notNull().default("authored"),
   createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 }, (t) => [
@@ -2089,6 +2104,23 @@ export const missionFixFeatureLineage = projectSchema.table("mission_fix_feature
   index("idxFixLineageSourceFeatureId").on(t.sourceFeatureId),
   index("idxFixLineageFixFeatureId").on(t.fixFeatureId),
   index("idxFixLineageRunId").on(t.runId),
+]);
+
+/*
+FNXC:MissionLineageBudget 2026-07-22-12:00:
+A root identity can outlive its hierarchy. Keep intervention evidence outside
+cascading mission rows so deleting a generated fix cannot silently authorize a sibling.
+*/
+export const missionLineageStops = projectSchema.table("mission_lineage_stops", {
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  rootFeatureId: text("root_feature_id").notNull(),
+  missionId: text("mission_id"),
+  reason: text("reason").notNull(),
+  stoppedAt: text("stopped_at").notNull(),
+  origin: text("origin").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.rootFeatureId] }),
+  index("idxMissionLineageStopsMissionId").on(t.projectId, t.missionId),
 ]);
 
 export const verificationCache = projectSchema.table("verification_cache", {

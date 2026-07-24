@@ -1,5 +1,7 @@
 # Full-loop agent tool-surface audit and delivery plan
 
+> **Status:** The mission-hierarchy and persisted-ideation gaps recorded below have been delivered. Current `fn_ideation_*` tools share the persisted factory across engine and eligible chat lanes; show/diverge text includes canonical candidate IDs and provenance so agents can converge an explicit candidate. Remaining entries are the historical delivery audit.
+
 [← Docs index](./README.md)
 
 <!--
@@ -9,7 +11,7 @@ FR-08 requires chat and agent sessions to reach the complete build loop through 
 
 ## Decision summary
 
-Fusion already has useful task, workflow, goal, research, execution, and verification tools. It does **not** yet give an engine agent or dashboard chat session a complete native route from an idea or research result into the execution-oriented mission hierarchy. In particular, `packages/engine/src/agent-tools.ts` has no `fn_mission_*`, `fn_milestone_*`, `fn_slice_*`, or `fn_feature_*` factory, and no ideation diverge/converge tool. Research can be run by qualifying sessions, but its current handoff ends at a task document/task action rather than an attributable roadmap feature.
+Fusion has useful task, workflow, goal, research, execution, verification, mission-hierarchy, and persisted ideation tools. Engine agents and eligible dashboard chat sessions can use shared mission and ideation factories to create or attach a Mission handoff. Ideation show/diverge text returns canonical candidate IDs and provenance so agents can pass an ID directly to convergence. Research can be run by qualifying sessions, but its current handoff ends at a task document/task action rather than an attributable roadmap feature.
 
 The mission hierarchy is **Mission → Milestone → Slice → Feature → Task** ([Missions](./missions.md)); it is not the separate lightweight `Roadmap → RoadmapMilestone → RoadmapFeature` model. This document uses “roadmap” to mean the execution-oriented mission hierarchy unless it explicitly says otherwise.
 
@@ -63,9 +65,9 @@ FR-07/FR-08 require one canonical operation beneath UI and tool callers. The par
 Fusion does not have a single-workflow-only scheduler by design. The scheduler can dispatch independent runnable tasks, but admission is bounded and serialized at specific safety gates:
 
 - `packages/engine/src/scheduler.ts` computes dispatch capacity from **`maxConcurrent`**, **`maxWorktrees`**, and the shared **`semaphore`** in `computeConcurrencyGateDiagnostic()`. The settings default to `maxConcurrent` 2 and `maxWorktrees` 4 when unspecified (scheduler dispatch path).
-- `AgentSemaphore` in `packages/engine/src/concurrency.ts` gates all top-level triage, execution, and merge agents. Its priority queue serves merge before execute before specification (`PRIORITY_MERGE`, `PRIORITY_EXECUTE`, `PRIORITY_SPECIFY`). A full semaphore can therefore make work appear serialized even with multiple runnable cards.
+- `AgentSemaphore` in `packages/engine/src/concurrency.ts` gates all top-level planning, execution, and merge/review agents. Per-project admission ranks eligible candidates by `createdAt` then task ID across lanes before claiming the shared capacity; lane priority is not a free-slot rank key. Nested helpers remain parent-internal and intentionally soft-breach this displayed top-level cap to avoid parent/child deadlocks.
 - The workflow hold/release sweep in `scheduler.ts` reserves worktree and semaphore capacity with `tryAcquire()` **before** moving a task to `in-progress`, then transfers that pre-held slot to the executor. This prevents a race but means the available minimum of all gates is authoritative.
-- `maxWorktrees` counts only `in-progress` tasks; in-review worktrees do not consume that execution-worktree limit. `maxConcurrent` counts execution slots, while the global semaphore also accounts for planning and active review top-level holders.
+- `maxWorktrees` counts only `in-progress` tasks; in-review worktrees do not consume that execution-worktree limit. `maxConcurrent` caps per-project top-level working agents across planning, execution, and active review/merge, while the host semaphore remains the process-global pool.
 - Runnable candidates are additionally filtered for paused state, unmet dependencies, recovery backoff, workflow hold/release state, and file-scope overlap via `isRunnableQueuedOverlapCandidate()` / `pathsOverlap()` in `scheduler.ts`. This is coarse path-scope serialization, not FR-48 symbol locking.
 - `packages/engine/src/workflow-work-scheduler.ts` claims one due workflow work item per call with a lease. The surrounding scheduler’s repeated dispatch and capacity gates determine aggregate concurrency; this helper alone does not fan out a batch.
 - `packages/engine/src/verification-concurrency.ts` separately defaults expensive verification subprocesses to one concurrent project-wide slot. Task execution can be parallel while heavy E2E verification intentionally queues.
