@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Pencil, Bot, X, ChevronDown, ChevronRight, GitBranch, ArrowLeft, Zap, Loader2, AlertTriangle, Sparkles, Maximize2, Minimize2, Send, Square, Info, Paperclip, Eye, EyeOff } from "lucide-react";
 import { useModalResizePersist } from "../hooks/useModalResizePersist";
+import { useViewportMode } from "../hooks/useViewportMode";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 import { useColumnLabel } from "../i18n/labels";
@@ -93,9 +94,8 @@ const ACTIVITY_VIEW_MENU_MIN_WIDTH = 160;
 const ACTIVITY_VIEW_MENU_MIN_HEIGHT = 120;
 const ACTIVITY_VIEW_MENU_MAX_HEIGHT = 320;
 const ACTIVITY_VIEW_MENU_OPEN_VIEWPORT_GUARD_MS = 350;
-// FNXC:TaskDetailSwipeBack 2026-07-05-12:30: FN-7587 — mobile breakpoint gating the presentation-only predictive-back slide/fade transition on the modal/list/nested task-detail surface; matches the `@media (max-width: 768px)` convention already used in this file.
+// FNXC:TaskDetailSwipeBack 2026-07-05-12:30: FN-7587 — mobile-mode gating the presentation-only predictive-back slide/fade transition on the modal/list/nested task-detail surface uses the shared viewport classifier, so known 768px tablets do not receive phone-only presentation.
 // FNXC:PlannerOversight 2026-07-05-00:00: FN-7604 — the OVERSIGHT_MENU_MOBILE_BREAKPOINT constant (formerly used to branch the oversight controls between an inline cluster and this overflow menu) was removed; the overflow-menu dropdown is now the single universal surface at every viewport, so no breakpoint gates it.
-const TASK_DETAIL_MOBILE_TRANSITION_BREAKPOINT = 768;
 
 type ActivityViewMenuPosition = {
   top: number;
@@ -6563,33 +6563,25 @@ export function TaskDetailContent({
 
 export function TaskDetailModal({ onClose, ...props }: TaskDetailModalProps) {
   const modalRef = useRef<HTMLDivElement>(null);
+  const viewportMode = useViewportMode();
   useModalResizePersist(modalRef, true, "task-detail-modal-size");
   useMobileScrollLock(true);
   const overlayDismissProps = useOverlayDismiss(onClose);
   /*
-  FNXC:TaskDetailSwipeBack 2026-07-05-12:30:
-  FN-7587 — track the mobile breakpoint locally (mirrors the same resize-listener pattern
-  used elsewhere in this file) so the list/modal/nested task-detail surface gets the same
-  presentation-only predictive-back slide/fade enter transition as the board main-panel
-  (MainContent.tsx), without threading a new isMobile prop through App.tsx/AppModals.tsx. This
-  is presentation-only: it never touches onClose/onRequestClose timing or the underlying
-  useNavigationHistory dismissal routing, and honors prefers-reduced-motion (see
-  TaskDetailModal.css). Defaults false so JSDOM/unit tests keep exercising the desktop (no
-  animation) branch unless a test explicitly narrows the viewport.
+  FNXC:TaskDetailSwipeBack 2026-08-07-00:00:
+  Gate predictive-back animation through useViewportMode, the same physical-screen-aware
+  classifier used for resize behavior. This preserves phone animation while keeping known
+  768px tablets in their desktop/tablet presentation.
   */
-  const [isMobileTransition, setIsMobileTransition] = useState(false);
-  useEffect(() => {
-    const updateIsMobileTransition = () => {
-      setIsMobileTransition(window.innerWidth <= TASK_DETAIL_MOBILE_TRANSITION_BREAKPOINT);
-    };
+  const isMobileTransition = viewportMode === "mobile";
 
-    updateIsMobileTransition();
-    window.addEventListener("resize", updateIsMobileTransition);
-
-    return () => {
-      window.removeEventListener("resize", updateIsMobileTransition);
-    };
-  }, []);
+  /*
+  FNXC:TaskModalResize 2026-08-07-00:00:
+  Known touch tablets at the 768px CSS boundary resolve to `tablet` through
+  useViewportMode. Carry that single classification into the modal class so CSS
+  can override phone-sheet rules without a second breakpoint or gesture system.
+  */
+  const isTabletTaskModal = viewportMode === "tablet";
 
   return (
     <div
@@ -6599,7 +6591,7 @@ export function TaskDetailModal({ onClose, ...props }: TaskDetailModalProps) {
       aria-modal="true"
     >
       <div
-        className={`modal modal-lg task-detail-modal${isMobileTransition ? " task-detail-modal--mobile-transition" : ""}`}
+        className={`modal modal-lg task-detail-modal${isTabletTaskModal ? " task-modal--tablet" : ""}${isMobileTransition ? " task-detail-modal--mobile-transition" : ""}`}
         ref={modalRef}
       >
         <TaskDetailContent

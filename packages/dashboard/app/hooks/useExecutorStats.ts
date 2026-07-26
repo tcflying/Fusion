@@ -26,16 +26,19 @@ export interface UseExecutorStatsResult {
 
 /**
  * Derive the executor state from globalPause, enginePaused, and runningTaskCount.
- * 
+ *
  * - "stopped": globalPause is true
- * - "idle": (enginePaused is true AND runningTaskCount is 0) OR not paused with nothing running
- * - "paused": enginePaused is true AND runningTaskCount > 0
+ * - "paused": enginePaused is true (regardless of runningTaskCount)
  * - "running": globalPause is false AND enginePaused is false AND runningTaskCount > 0
+ * - "idle": nothing paused and nothing running
  *
  * FNXC:EngineControls 2026-06-22-00:00:
  * `globalPause` dominates the footer state matrix so an operator-stopped engine is distinct from idle even if in-progress tasks still exist.
+ *
+ * FNXC:EngineControls 2026-07-24-18:35:
+ * A paused engine must read "Paused" even when nothing is running. The prior matrix mapped (enginePaused && runningTaskCount === 0) to "idle", so the footer was indistinguishable from a healthy engine waiting for work — and that is precisely the state a pause produces once in-flight tasks drain. Operators saw triage tasks sitting untouched with an "Idle" badge and no visible cause; the pause is only otherwise surfaced by the Engine Control menu item label, which requires opening the menu. Pause state now dominates run state: the badge reports the operator-set condition, and the separate running/queued counters already report throughput.
  */
-function deriveExecutorState(
+export function deriveExecutorState(
   globalPause: boolean,
   enginePaused: boolean,
   runningTaskCount: number
@@ -43,10 +46,7 @@ function deriveExecutorState(
   if (globalPause) {
     return "stopped";
   }
-  if (enginePaused && runningTaskCount === 0) {
-    return "idle";
-  }
-  if (enginePaused && runningTaskCount > 0) {
+  if (enginePaused) {
     return "paused";
   }
   // globalPause is false and enginePaused is false
@@ -121,7 +121,7 @@ function hasActionableBlockedBy(blockedBy: Task["blockedBy"] | string[] | null):
  * - Derives blockedTaskCount from tasks with blockedBy field set
  * - Derives stuckTaskCount using the project's `taskStuckTimeoutMs` setting;
  *   returns 0 when the setting is undefined/disabled
- * - Derives executorState from globalPause and enginePaused flags, with globalPause mapping to "stopped"
+ * - Derives executorState from globalPause and enginePaused flags, with globalPause mapping to "stopped" and enginePaused to "paused" at any running count
  * - Returns ExecutorStats object with reactive updates
  */
 const DEFAULT_API_DATA: Pick<ExecutorStats, "maxConcurrent" | "lastActivityAt"> & {

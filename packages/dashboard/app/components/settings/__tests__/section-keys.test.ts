@@ -42,6 +42,7 @@ const EXPECTED_KEY_OWNING_SECTIONS: Record<string, "global" | "project"> = {
   "agent-permissions": "project",
   backups: "project",
   "research-project": "project",
+  "voice-input": "project",
   "project-models": "project",
 };
 

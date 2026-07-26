@@ -1786,6 +1786,36 @@ FN-6500 fixes a tablet regression from FN-5599: the task-detail overlay offset a
     resize: none;
   }
 
+  /*
+  FNXC:TaskModalResize 2026-08-07-00:00:
+  Phone CSS also matches a known 768px touch tablet. The shared runtime class
+  records the physical-screen-aware tablet result, restoring bounded modal
+  geometry and the existing resize grip without weakening true-phone sheets.
+  */
+  .modal-overlay:has(.task-detail-modal.task-modal--tablet) {
+    --overlay-padding-top: 6vh;
+    padding-top: var(--overlay-padding-top);
+    align-items: flex-start;
+    justify-content: center;
+  }
+
+  .modal.task-detail-modal.task-modal--tablet {
+    width: 98vw;
+    min-width: 480px;
+    max-width: 98vw;
+    height: 92vh;
+    min-height: 480px;
+    max-height: calc(100dvh - var(--overlay-padding-top, 6vh) - var(--space-md));
+    margin: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    resize: both;
+  }
+
+  .task-modal--tablet .modal-resize-grip {
+    display: block;
+  }
+
   .detail-body--chat {
     display: flex;
     flex-direction: column;

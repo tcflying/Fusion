@@ -38,6 +38,10 @@ Every user-editable setting's help text (the `.settings-description`/`<small>` h
 <!-- FNXC:SettingsAutoSaveDocs 2026-08-02-20:55: FN-8395 removes the ambiguous Settings Save affordance. Operators need the persistence timing and close guarantee documented where Settings behavior is introduced. -->
 Settings form changes save automatically after a short pause. The footer no longer includes a **Save** button and closing Settings does not ask about unsaved changes: Close, Escape, and clicking outside the modal first flush any pending edit. The footer shows quiet **Saving…**, **Saved**, or save-failure status; correct the value and retry after a failure.
 
+## Voice Input
+
+**Settings → Voice Input** is visible in both Basic and Advanced settings. Voice mode is off by default; enabling it is an explicit project preference. The same section shows the locally managed Parakeet v3 model and lets an operator download or remove it. Its upstream `sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2` archive is about 465 MB and Fusion verifies its pinned SHA-256 before installing it; an unpinned or mismatched download is refused. Download progress is polled only while the model is downloading. When sherpa-onnx is unavailable, Settings preserves any saved enabled preference but presents voice mode as backend-enforced disabled with an explanation. If status cannot be determined, the section fails closed: voice mode stays disabled and model actions are not shown until status is available.
+
 ## Reset Settings
 
 <!-- FNXC:SettingsResetDocs 2026-07-04-00:00: Reset Settings is a DESTRUCTIVE action. Document both choices, the scope-precision guarantee, and which sections are excluded so operators understand exactly what a reset does and does not touch before they click it.
@@ -81,6 +85,11 @@ Press `Escape` to close the current/topmost dashboard popup. Popped-out task win
 
 <!-- FNXC:ModalGeometryPersistenceDocs 2026-07-16-00:40: Full-screen mobile FloatingWindow sheets must preserve, rather than overwrite, the movable desktop geometry record so a later desktop reopen restores the user's chosen location and size. -->
 Movable dashboard pop-outs remember their last desktop location and size, while centered resizable dialogs remember their size. When a pop-out becomes a full-screen sheet at mobile widths (or, for Artifact Gallery, its short-height sheet breakpoint), it leaves that desktop record untouched; reopening it on desktop restores the prior floating geometry.
+
+<!-- FNXC:TaskModalResizeDocs 2026-08-07-00:00: Known touch tablets at the 768px CSS boundary use the shared physical-screen-aware viewport classification, so documentation must distinguish their resize contract from true phones that share the CSS media query. -->
+### Task modal resizing on tablets
+
+Task Detail and New Task remain resizable on known touch tablets, including a 768px-wide tablet viewport. Task Detail exposes its accessible bottom-right resize grip; New Task keeps its draggable header and edge/corner resize controls. Their geometry stays within the viewport and is restored from browser storage on later tablet or desktop opens. True phones and narrow folded panes remain full-screen sheets without active resize controls so keyboard and safe-area behavior is unchanged.
 
 ## Mobile/PWA app icons
 
@@ -132,7 +141,10 @@ While the sidebar is active on desktop/tablet project screens, Board and List wo
 
 The active nav-item highlight and the resize-handle hover/focus accent track the active color theme's `--accent` token across all themes, so shadcn, forest, ocean, and other themes no longer show a fixed blue selected state. The Header retains the Fusion brand and project selector, keeps non-navigation controls, and hides duplicate desktop view-toggle entries while the sidebar is active.
 
-On mobile viewports (`<=768px`), the sidebar is not rendered even when the default-on setting is enabled. The existing bottom `MobileNavBar` remains the navigation surface, with mobile-only More-sheet entries for compact tools such as Git Manager, Terminal, Files, and **Import from GitHub**.
+On mobile viewports (`<=768px`), the sidebar is not rendered even when the default-on setting is enabled. The existing bottom `MobileNavBar` remains the navigation surface on project task screens, with mobile-only More-sheet entries for compact tools such as Git Manager, Terminal, Files, and **Import from GitHub**.
+
+<!-- FNXC:DashboardResponsiveDocs 2026-07-25-22:57: Project overview has no task destinations, so the mobile navigation and its published height must be absent rather than leaving dead bottom space. Document the 320px responsive and token conventions alongside the operator-visible behavior. -->
+On the **All Projects** overview, Fusion suppresses the mobile bottom nav because task tabs are not active there. It also clears `--mobile-nav-height`, so the overview does not reserve bottom-bar space. The overview reflows through 320px: headers, filters, stats, and card actions stack or wrap, while long project names and paths truncate rather than overflowing. Dashboard component styles use literal pixel values for media-query breakpoints (including `480px` and `380px`); declaration values within those blocks stay token-based.
 
 ## Right Dock (experimental, default on)
 
@@ -244,6 +256,7 @@ Features:
 <!-- FNXC:TaskActivity 2026-07-28-12:00: FN-8300 requires visual card activity to agree with fresh planner logs during status-null planning transitions; Board and List reuse their existing active affordances. -->
 - GitLab tracking badges on task cards for linked GitLab project issues, group issues, and merge requests; stale GitLab metadata uses a warning-colored badge while GitHub badges remain unchanged.
 - GitHub provenance marker on task cards imported from GitHub (`sourceType: github_import`), shown in the footer with other external-source metadata
+- Task cards show their creation time for today or local calendar day otherwise; done and archived cards also show their completion date.
 - Task card header meta badges group priority and fast mode in the header; priority badges include the shared urgency glyph/color language (low blue/info, high amber/warning, urgent red/error) while agent-created provenance renders in a dedicated bottom-left row ahead of workflow identity so the ID/status/actions header does not wrap on narrow cards. Agent labels prefer `sourceMetadata.agentName` over raw agent IDs.
 - **Settings → Appearance → Show cost badges on task cards** is default off. When enabled, board cards with recorded positive token usage show a compact derived-cost badge with the card's other footer/meta chips; unpriced models display `—`, and cards with no usage render no badge shell.
 <!-- FNXC:TaskCardCostBadge 2026-07-11-12:25: The card spend badge is opt-in because card footers are dense. It must remain guess-free (unpriced `—`, no fabricated `$0`) and absent for tasks without positive token usage. -->
@@ -579,9 +592,10 @@ Optional workflow steps declared by the active workflow are available from the q
 FNXC:PriorityColorCoding 2026-07-11-00:00: Priority glyphs share urgency colors across Quick Add, the New Task inline row, and task-card badges: low=info/blue, normal=muted, high=warning/amber, urgent=error/red. -->
 Quick Add and Inline Create model selection include Plan, Executor, Reviewer, and Merger lanes. Each lane can inherit its default or select a task-specific model; Plan, Reviewer, and Merger also provide independent thinking-level overrides.
 
-<!-- FNXC:QuickAddStart 2026-07-22-17:45: Coding (Ideas) Start is an atomic Todo create, while ordinary Save and Enter remain create-only in Ideas. -->
+<!-- FNXC:QuickAddStart 2026-07-22-17:45: Coding (Ideas) Start is an atomic Todo create, while ordinary Save and Enter remain create-only in Ideas.
+FNXC:QuickAddStart 2026-07-24-11:20: Start is now a visible action-row button for eligible workflows instead of a hidden long-press/right-click menu on Save; eligibility, snapshotting, and fail-closed routing are unchanged. -->
 
-Quick Add **Save** supports a **Start** menu on touch/pen long-press or mouse right-click only when the exact selected workflow has complete runtime metadata: a real non-sentinel id, nonempty ordered columns with unique nonblank ids, and an object `flags` value on every column. It is eligible only for validated `builtin:coding-ideas` or a validated workflow whose first visible column is a hold. Start snapshots that exact definition and id before duplicate confirmation and submits it unchanged; later selection or metadata refreshes cannot alter routing. For Coding (Ideas), Start proves that visible ordered metadata places a non-intake, non-complete **Todo** after **Ideas**, then includes Todo in the original Board/List create request—there is no follow-up move. Missing, hidden, malformed, reordered, or ambiguous metadata fails closed to create-only behavior. Ordinary Save and Enter still create in Ideas. Other eligible hold workflows retain their matching-returned-task promotion through the host Board/List move path only to the first later visible working column, skipping intake, hold, and complete columns; no forward target also remains create-only.
+Quick Add shows a visible **Start** button in its action row — next to Models/Agent, beside the right-aligned Save — only when the exact selected workflow has complete runtime metadata: a real non-sentinel id, nonempty ordered columns with unique nonblank ids, and an object `flags` value on every column. It is eligible only for validated `builtin:coding-ideas` or a validated workflow whose first visible column is a hold. Start snapshots that exact definition and id before duplicate confirmation and submits it unchanged; later selection or metadata refreshes cannot alter routing. For Coding (Ideas), Start proves that visible ordered metadata places a non-intake, non-complete **Todo** after **Ideas**, then includes Todo in the original Board/List create request—there is no follow-up move. Missing, hidden, malformed, reordered, or ambiguous metadata renders no Start button at all, so Save stays the only create affordance there. With an empty description Start is visible but disabled. Ordinary Save and Enter still create in Ideas. Other eligible hold workflows retain their matching-returned-task promotion through the host Board/List move path only to the first later visible working column, skipping intake, hold, and complete columns; no forward target also remains create-only.
 
 Quick Add's paperclip accepts supported photos and files: PNG, JPEG, GIF, WebP, MP4, WebM, QuickTime video, plain text, Markdown, JSON, YAML, TOML, CSV, and XML. Select files, paste them into the Quick Add input, or drag them onto the box; pending attachments upload to the newly created task sequentially. Image attachments show compact previews that open in a movable, resizable window (a full-screen sheet on mobile); file attachments show an accessible filename and remove action without an image-open control. Unsupported selections are ignored, and if one upload fails after task creation, the task remains created while Quick Add reports the filenames that need retrying. The same bottom action row places the GitHub tracking override beside the paperclip; Priority is an icon-only control whose glyph changes by selected level (down arrow for low, flag for normal, up arrow for high, alert for urgent) and is color-coded by urgency (low blue/info, normal muted, high amber/warning, urgent red/error), and Fast is an icon-only lightning control. These icon-only controls keep accessible labels and the same create-payload behavior as the previous text chips.
 
@@ -2269,3 +2283,13 @@ Custom workflow authors can add optional explanatory copy beneath each column na
 ## Planning Mode contextual comments
 
 In plan review, select text inside the rendered plan and choose **Add comment to selection**. On mobile widths through 768px, the selection action appears in the bottom plan-action rail beside **Refine** and **Proceed with plan**; at 769px and wider it stays beside the selected plan content. Enter a suggestion to capture the selected quote and suggestion as a pending contextual comment. You can remove individual comments before choosing **Submit comments**; Fusion sends the ordered batch through the existing Planning Mode revision generation, so the agent revises the quoted areas while preserving unaffected plan content. A successful revised-plan update clears the batch; a failed submission retains it for retry.
+
+## Voice dictation
+
+When **voiceInput.enabled** is enabled and the installed speech-to-text runtime confirms it is available, dashboard chat, Planning Mode, quick task entry, task forms, and task comments expose a microphone control beside their primary composer. The control is intentionally absent—not disabled—while voice input is off, status is still loading, status fails, or the runtime/model is unavailable.
+
+Dictation inserts a live partial transcript at the current caret (or replaces the current selection). Later partials and the final transcript replace that anchored preview in place, preserving surrounding text and the controlled textarea cursor. The mic button has accessible start/stop/error labels and announces its state for screen readers.
+
+### Conversation tags
+
+Direct conversations can be organized with reusable tags. Open a conversation's **More** menu to create a tag or toggle its assignments; a conversation can have multiple tags. Use the tag selector beside conversation search to filter pinned and recent conversations without affecting text search. Tags are project-scoped, and deleting a tag only removes its assignments—it never deletes conversations or messages. Chat Rooms do not use conversation tags.

@@ -373,6 +373,14 @@ export function archiveEntryToTask(
     planningStartedAt: entry.planningStartedAt,
     executionStartedAt: entry.executionStartedAt,
     executionCompletedAt: entry.executionCompletedAt,
+    /*
+    FNXC:ArchiveLifecycle 2026-07-24-11:02:
+    FN-8561 needs archived TaskCard completion fallback to use the immutable
+    archive transition, not the pre-archive columnMovedAt snapshot or updatedAt.
+    Preserve archivedAt on every slim and full archive read without changing
+    restore persistence semantics.
+    */
+    archivedAt: entry.archivedAt,
     modelPresetId: entry.modelPresetId,
     modelProvider: entry.modelProvider,
     modelId: entry.modelId,

@@ -1,5 +1,40 @@
 # @fusion-plugin-examples/linear-import
 
+## 0.1.14-beta.3
+
+### Patch Changes
+
+- @fusion/core@0.74.0-beta.3
+- @fusion/plugin-sdk@0.74.0-beta.3
+
+## 0.1.14-beta.2
+
+### Patch Changes
+
+- @fusion/core@0.74.0-beta.2
+- @fusion/plugin-sdk@0.74.0-beta.2
+
+## 0.1.14-beta.1
+
+### Patch Changes
+
+- @fusion/core@0.74.0-beta.1
+- @fusion/plugin-sdk@0.74.0-beta.1
+
+## 0.1.14-beta.0
+
+### Patch Changes
+
+- @fusion/core@0.74.0-beta.0
+- @fusion/plugin-sdk@0.74.0-beta.0
+
+## 0.1.13
+
+### Patch Changes
+
+- @fusion/core@0.73.0
+- @fusion/plugin-sdk@0.73.0
+
 ## 0.1.13-beta.6
 
 ### Patch Changes

@@ -130,4 +130,104 @@ describe("self-healing ghost branch reclaim", () => {
     expect(nullingCalls).toHaveLength(0);
     expect(store.logEntry).toHaveBeenCalledWith("FN-9001", expect.stringContaining("tip-already-merged cleanup failed"));
   });
+
+  /*
+  FNXC:SelfHealingReclaim 2026-07-25-09:40:
+  Regression contract for the inherited-tip invariant (FN-1406): the reclaim sweep's `tip-already-merged` arm must
+  classify a foreign `Fusion-Task-Id` trailer with merge-base diff proof, not on the trailer alone, so it shares one
+  decision (`foreignTipRejection`) with already-merged recovery and branch-misbound recovery.
+
+  Original symptom: FN-1406's branch `fusion/fn-1406` was cut from `main` at FN-1401's landed commit and planning
+  ended before any commit. Every sweep logged `[recovery] already-merged rejected FN-1406 ... owner=FN-1401
+  reason=foreign-task-tip` and left stale worktree/branch/baseCommitSha metadata on the card instead of reclaiming it.
+
+  Surfaces covered here: pristine inherited tip (reclaim), inherited tip where the base already carries THIS task's
+  own commit (still rejected — genuine misbinding), and foreign lineage trailers. The other two callers keep their
+  existing real-git rejection coverage in self-healing-already-merged.real-git.test.ts.
+  */
+  describe("inherited foreign tip on a branch with no unique content", () => {
+    const TIP = "9758daadff68aaaabbbbccccddddeeeeffff0000";
+
+    /** Drives the git seam the ownership + diff-proof classification reads: foreign trailer, empty merge-base diff. */
+    function mockInheritedForeignTip(options: { trailer: string; baseHasCurrentTask?: boolean }) {
+      execMock.mockImplementation(async (command: string) => {
+        if (command.includes("git show -s")) return `feat: previous task landed${options.trailer}\n`;
+        if (command.includes("git merge-base")) return `${TIP}\n`;
+        // `git diff --quiet <mergeBase>..<tip>` exits 0 → no unique task content on the branch.
+        if (command.includes("git diff --quiet")) return "";
+        if (command.includes("git log --grep")) return options.baseHasCurrentTask ? "deadbeefdeadbeef\n" : "";
+        return "";
+      });
+    }
+
+    function mockTodoSweepTask(task: any) {
+      (store.listTasks as any)
+        .mockResolvedValueOnce([task])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([]);
+    }
+
+    it("reclaims a todo task whose zero-commit branch inherited a foreign task's landed tip", async () => {
+      mockInheritedForeignTip({ trailer: "Fusion-Task-Id: FN-1401" });
+      mockTodoSweepTask({ id: "FN-1406", column: "todo", checkedOutBy: null, branch: "fusion/fn-1406", worktree: "/tmp/fn-1406", baseCommitSha: TIP });
+      vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({
+        kind: "tip-already-merged",
+        livePath: null,
+        tipSha: TIP,
+        integrationRef: "main",
+      } as any);
+
+      const recovered = await manager.reclaimSelfOwnedBranchConflicts();
+
+      expect(recovered).toBe(1);
+      expect(store.updateTask).toHaveBeenCalledWith("FN-1406", expect.objectContaining({ worktree: null, branch: null, baseCommitSha: null }));
+      expect(store.logEntry).toHaveBeenCalledWith("FN-1406", expect.stringContaining("[recovery] tip-already-merged FN-1406"));
+      // The symptom line must be gone entirely.
+      expect((store.logEntry as any).mock.calls.some((c: any[]) => String(c[1]).includes("already-merged rejected"))).toBe(false);
+      expect((store as any).recordRunAuditEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ mutationType: "task:auto-recover-already-merged-rejected" }),
+      );
+    });
+
+    it("reclaims a zero-commit branch that inherited a foreign lineage tip", async () => {
+      mockInheritedForeignTip({ trailer: "Fusion-Task-Lineage: lin-other" });
+      mockTodoSweepTask({ id: "FN-1406", column: "todo", checkedOutBy: null, branch: "fusion/fn-1406", worktree: "/tmp/fn-1406", baseCommitSha: TIP, lineageId: "lin-1406" });
+      vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({
+        kind: "tip-already-merged",
+        livePath: null,
+        tipSha: TIP,
+        integrationRef: "main",
+      } as any);
+
+      await manager.reclaimSelfOwnedBranchConflicts();
+
+      expect(store.updateTask).toHaveBeenCalledWith("FN-1406", expect.objectContaining({ worktree: null, branch: null, baseCommitSha: null }));
+      expect((store.logEntry as any).mock.calls.some((c: any[]) => String(c[1]).includes("already-merged rejected"))).toBe(false);
+    });
+
+    it("still rejects a foreign tip when the base already carries this task's own commit", async () => {
+      mockInheritedForeignTip({ trailer: "Fusion-Task-Id: FN-1401", baseHasCurrentTask: true });
+      mockTodoSweepTask({ id: "FN-1406", column: "todo", checkedOutBy: null, branch: "fusion/fn-1406", worktree: "/tmp/fn-1406", baseCommitSha: TIP });
+      vi.spyOn(branchConflicts, "inspectBranchConflict").mockResolvedValueOnce({
+        kind: "tip-already-merged",
+        livePath: null,
+        tipSha: TIP,
+        integrationRef: "main",
+      } as any);
+
+      const recovered = await manager.reclaimSelfOwnedBranchConflicts();
+
+      expect(recovered).toBe(0);
+      expect(store.logEntry).toHaveBeenCalledWith(
+        "FN-1406",
+        expect.stringContaining("[recovery] already-merged rejected FN-1406"),
+      );
+      expect((store as any).recordRunAuditEvent).toHaveBeenCalledWith(expect.objectContaining({
+        mutationType: "task:auto-recover-already-merged-rejected",
+        metadata: expect.objectContaining({ reason: "foreign-task-tip", candidateOwner: "FN-1401", phase: "tip-already-merged" }),
+      }));
+      expect(store.updateTask).not.toHaveBeenCalledWith("FN-1406", expect.objectContaining({ branch: null }));
+      expect(execMock).not.toHaveBeenCalledWith(expect.stringContaining("git branch -D"), expect.anything());
+    });
+  });
 });

@@ -7,6 +7,7 @@
  */
 
 import { createInterface } from "node:readline";
+import { promptOutputStream } from "../output.js";
 
 /**
  * Prompt the user for a port number interactively.
@@ -26,7 +27,8 @@ export function promptForPort(
   return new Promise((resolve, reject) => {
     const rl = createInterface({
       input,
-      output: process.stdout,
+      /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream(),
     });
 
     // Handle Ctrl+C during prompt

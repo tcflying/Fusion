@@ -165,25 +165,31 @@ describe("PlanningModeModal CSS responsive action contract", () => {
     // FNXC:PlanningComments 2026-07-24-05:55: tablet keeps the 2-col grid so Add comment can span above Refine/Proceed.
     expectSomeRule(tabletCss, ".planning-plan-actions", /display\s*:\s*grid\s*;/);
     expectSomeRule(tabletCss, ".planning-plan-actions", /grid-template-columns\s*:\s*repeat\(2, minmax\(0, 1fr\)\)\s*;/);
-    expect(findRule(tabletCss, ".planning-plan-actions .btn.planning-add-comment--mobile")).toMatch(/grid-column\s*:\s*1\s*\/\s*-1\s*;/);
-    expect(findRule(tabletCss, ".planning-plan-actions .btn.planning-add-comment--mobile svg")).toMatch(/width\s*:\s*var\(--space-lg\)\s*;/);
+    expect(findRule(tabletCss, ".planning-plan-actions .btn.planning-add-comment")).toMatch(/grid-column\s*:\s*1\s*\/\s*-1\s*;/);
+    expect(findRule(tabletCss, ".planning-plan-actions .btn.planning-add-comment svg")).toMatch(/width\s*:\s*var\(--space-lg\)\s*;/);
   });
 
-  it("shows exactly one contextual comment trigger in the tablet/phone plan action rail", () => {
+  it("shows exactly one contextual comment trigger in the plan action rail at every breakpoint", () => {
     const css = loadPlanningCss();
     const compactCss = getMediaBlocks(css, "@media (max-width: 1024px)").join("\n");
     const mobileCss = getMediaBlocks(css, MOBILE_ACTIONS_QUERY).join("\n");
-    const railTriggerRule = findRule(compactCss, ".planning-plan-actions .btn.planning-add-comment--mobile");
+    const railTriggerRule = findRule(compactCss, ".planning-plan-actions .btn.planning-add-comment");
     const mobileEditorRule = findRule(mobileCss, ".planning-comment-editor");
 
-    expect(findRule(css, ".planning-add-comment--mobile")).toMatch(/display\s*:\s*none\s*;/);
-    expect(findRule(compactCss, ".planning-add-comment--document")).toMatch(/display\s*:\s*none\s*;/);
+    /*
+    FNXC:PlanningComments 2026-07-25-10:20:
+    The --document / --mobile variant pair is deleted: both rendered, so desktop showed a duplicate
+    Add-comment button at the end of the plan text. One rail trigger, never display:none'd.
+    */
+    expect(css).not.toMatch(/planning-add-comment--(document|mobile)/);
+    expect(findRule(css, ".planning-add-comment")).toMatch(/display\s*:\s*inline-flex\s*;/);
+    expect(findRule(css, ".planning-add-comment")).not.toMatch(/display\s*:\s*none\s*;/);
     expect(railTriggerRule).toMatch(/display\s*:\s*flex\s*;/);
     expect(railTriggerRule).toMatch(/grid-column\s*:\s*1\s*\/\s*-1\s*;/);
     expect(railTriggerRule).toMatch(/margin-top\s*:\s*0\s*;/);
-    expect(findRule(compactCss, ".planning-plan-actions .btn.planning-add-comment--mobile svg")).toMatch(/width\s*:\s*var\(--space-lg\)\s*;/);
+    expect(findRule(compactCss, ".planning-plan-actions .btn.planning-add-comment svg")).toMatch(/width\s*:\s*var\(--space-lg\)\s*;/);
     // FNXC:PlanningComments 2026-07-24-05:50: phone no longer overrides the rail trigger to fixed.
-    expect(findRule(mobileCss, ".planning-plan-actions .btn.planning-add-comment--mobile")).toBeUndefined();
+    expect(findRule(mobileCss, ".planning-plan-actions .btn.planning-add-comment")).toBeUndefined();
     // FNXC:PlanningComments 2026-07-24-06:05: tablet+phone pin the composer; phone clears nav when keyboard closed.
     expect(findRule(compactCss, ".planning-comment-editor")).toMatch(/position\s*:\s*fixed\s*;/);
     expect(findRule(mobileCss, ".planning-comment-editor:not(.planning-comment-editor--keyboard-open)")).toMatch(/var\(--mobile-nav-height/);

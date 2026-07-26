@@ -555,6 +555,14 @@ export type DatabaseMutationType =
   | "task:auto-recover-post-done-noncontinuable-wedge"
   | "task:auto-recover-post-done-noncontinuable-wedge-exhausted"
   | "task:auto-recover-worktree-session-exhausted"
+  /**
+   * FNXC:MissingWorktreeRecovery 2026-07-26-08:35:
+   * The preserve-vs-clear decision unusable-worktree recovery makes, as ids/outcomes-only facts.
+   * Without it the decision existed only in human log prose, so an agent could see a card's
+   * status/column change but never why its worktree/branch metadata was dropped.
+   * Metadata: { source, classification, recordedWorktreeStillUsable, clearedWorktreeMetadata, clearedBranch, retainedNonCanonicalBranch }
+   */
+  | "task:auto-recover-worktree-session-metadata"
   | "task:auto-recover-in-progress-limbo"
   /** Metadata: { taskId, branch, worktree, checkedOutBy, executionStartedAt, executionAgeMs, graceMs, liveWorktreeBoundBranch, reason } */
   | "task:auto-recover-in-progress-limbo-no-action"

@@ -1,6 +1,44 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
+export interface CompactLifecycleDate {
+  compact: string;
+  full: string;
+  dateTime: string;
+}
+
+/**
+ * Formats lifecycle timestamps against the viewer's local calendar, rather than
+ * UTC date boundaries. Invalid and missing legacy values intentionally produce
+ * no model so callers never render an Invalid Date shell.
+ */
+export function formatCompactLifecycleDate(
+  value: string | undefined,
+  locale: string,
+  now: Date = new Date(),
+): CompactLifecycleDate | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime()) || Number.isNaN(now.getTime())) return null;
+
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  const compact = sameDay
+    ? new Intl.DateTimeFormat(locale, { hour: "numeric", minute: "2-digit" }).format(date)
+    : new Intl.DateTimeFormat(locale, {
+      month: "short",
+      day: "numeric",
+      ...(date.getFullYear() !== now.getFullYear() ? { year: "numeric" } : {}),
+    }).format(date);
+
+  return {
+    compact,
+    full: new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(date),
+    dateTime: date.toISOString(),
+  };
+}
+
 /**
  * Locale-aware date/number formatting bound to the active i18n locale.
  *

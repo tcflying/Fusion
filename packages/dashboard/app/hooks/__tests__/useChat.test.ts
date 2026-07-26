@@ -14,6 +14,7 @@ import type { ChatSession, ChatMessage } from "@fusion/core";
 // Mock the API module
 vi.mock("../../api", () => ({
   fetchChatSessions: vi.fn(),
+  fetchChatTags: vi.fn().mockResolvedValue({ tags: [] }),
   fetchChatSession: vi.fn(),
   createChatSession: vi.fn(),
   fetchChatMessages: vi.fn(),

@@ -84,6 +84,42 @@ pgTest("createTask intake-column wiring (Coding (Ideas))", () => {
     expect(prompt).toBe(`# ${task.id}\n\n${task.description}\n`);
   });
 
+  /*
+  FNXC:CodingIdeasWorkflow 2026-07-25-14:20:
+  Regression for the stranded quick-add "Start" card (FN-8587). Start collapses create+promote into
+  one request — workflow id AND the post-intake `todo` column together — so the card never sits in
+  the manual intake column. It got generateSpecifiedPrompt, whose hard-coded boilerplate steps
+  ("Implement the required changes") no planner ever wrote. Triage then classified the non-seed
+  PROMPT.md as "already planned" and never planned it, so the card sat in Todo permanently with no
+  log line in any lane.
+
+  Surface enumeration (invariant: an unplanned card gets the seed no matter which column of a
+  manual-intake workflow it is created into, while pre-specified creates keep their spec):
+   - Create into the intake column itself (covered above) -> seed.
+   - Create straight into todo on a manual-intake workflow (this case, the Start path) -> seed.
+   - Promote intake -> todo via moveTask (covered below) -> seed preserved.
+   - Default-workflow direct create into todo -> still generateSpecifiedPrompt (next test).
+   - An explicit promptOverride always wins over all of the above.
+  */
+  it("writes a bootstrap PROMPT.md for a quick-add Start create landing straight in todo", async () => {
+    const store = h.store();
+    const task = await store.createTask({
+      description: "quick add start task",
+      workflowId: "builtin:coding-ideas",
+      column: "todo",
+    });
+    expect(task.column).toBe("todo");
+
+    const prompt = await readFile(
+      join(h.rootDir(), ".fusion", "tasks", task.id, "PROMPT.md"),
+      "utf-8",
+    );
+    expect(prompt).toBe(buildBootstrapPrompt(task.id, task.title, task.description));
+    // The placeholder-spec boilerplate that stranded FN-8587 must not appear.
+    expect(prompt).not.toContain("Implement the required changes");
+    expect(prompt).not.toContain("## Steps");
+  });
+
   it("keeps generateSpecifiedPrompt for a direct create into todo (not bootstrap)", async () => {
     const store = h.store();
     const task = await store.createTask({ description: "direct todo create", column: "todo" });

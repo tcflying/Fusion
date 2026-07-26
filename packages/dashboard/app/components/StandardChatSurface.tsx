@@ -13,6 +13,8 @@ import { ProviderIcon } from "./ProviderIcon";
 import { NativeStructurePreview } from "./NativeStructurePreview";
 import { openNativeStructure } from "./nativeStructureNavigation";
 import { nativeStructureChatRefMatcher, parseNativeStructureChatRef, splitNativeStructureChatRefMatch } from "./nativeStructureChatRef";
+import { MicButton } from "./MicButton";
+import { useComposerDictation } from "../hooks/useComposerDictation";
 
 export interface StandardRoomContext {
   roomName: string;
@@ -28,6 +30,8 @@ export interface StandardChatMessageItemProps {
   activeModelTag: string | null;
   activeModelProvider: string | null;
   activeSessionId: string | null;
+  /** The owning dashboard project keeps voice availability isolated in multi-project views. */
+  projectId?: string;
   mentionAgentsByName?: Map<string, Agent>;
   roomContext?: StandardRoomContext | null;
   copyAction?: ReactNode;
@@ -502,6 +506,69 @@ export function renderStandardAssistantContent(content: string, forcePlain: bool
   );
 }
 
+/**
+ * FNXC:VoiceInput 2026-07-25-04:15:
+ * Mount dictation only while the correction textarea is open. Message rows must not each poll
+ * voice availability while merely rendering history; this editor remains the shared Quick Chat path.
+ */
+function StandardChatMessageEditComposer({
+  value,
+  onChange,
+  onCancel,
+  onSave,
+  disabled,
+  saveDisabled,
+  messageId,
+  projectId,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onCancel: () => void;
+  onSave: () => void;
+  disabled: boolean;
+  saveDisabled: boolean;
+  messageId: string;
+  projectId?: string;
+}) {
+  const { t } = useTranslation("app");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // FNXC:VoiceInput 2026-07-25-12:15: Message correction dictation must resolve availability
+  // within the owning project; falling back to another project's settings can expose the mic incorrectly.
+  const dictation = useComposerDictation({ textareaRef, value, onChange, projectId });
+
+  useEffect(() => {
+    textareaRef.current?.focus();
+    textareaRef.current?.select();
+  }, []);
+
+  return (
+    <div className="chat-message-edit-editor" data-testid={`chat-message-edit-editor-${messageId}`}>
+      <textarea
+        ref={textareaRef}
+        className="input chat-message-edit-textarea"
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            onCancel();
+          } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            onSave();
+          }
+        }}
+        rows={3}
+      />
+      <div className="chat-message-edit-actions">
+        <MicButton {...dictation.micProps} disabled={disabled} />
+        <button type="button" className="btn btn-sm" data-testid={`chat-message-edit-cancel-${messageId}`} disabled={disabled} onClick={onCancel}>{t("chat.editMessageCancel", "Cancel")}</button>
+        <button type="button" className="btn btn-sm btn-primary" data-testid={`chat-message-edit-save-${messageId}`} disabled={saveDisabled} onClick={onSave}>{t("chat.editMessageSave", "Save")}</button>
+      </div>
+    </div>
+  );
+}
+
 export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   message,
   forcePlain,
@@ -522,6 +589,7 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   onEditMessage,
   canEdit = false,
   isTopClipped = false,
+  projectId,
 }: StandardChatMessageItemProps) {
   const { t } = useTranslation("app");
   const isAssistantMessage = message.role === "assistant";
@@ -538,7 +606,6 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
   const [isEditing, setIsEditing] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [editedText, setEditedText] = useState(message.content);
-  const editTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   const startEditing = useCallback(() => {
     setEditedText(message.content);
@@ -572,12 +639,6 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
     }
   }, [editedText, isSavingEdit, message.content, message.id, onEditMessage]);
 
-  useEffect(() => {
-    if (isEditing) {
-      editTextareaRef.current?.focus();
-      editTextareaRef.current?.select();
-    }
-  }, [isEditing]);
   const failureInfo = isAssistantMessage ? message.failureInfo : undefined;
   /*
    * FNXC:ChatEmptyMessage 2026-07-10-00:00:
@@ -661,29 +722,16 @@ export const StandardChatMessageItem = memo(function StandardChatMessageItem({
     <div className={`chat-message chat-message--${message.role}${failureInfo ? " chat-message--failure" : ""}${isEditing ? " chat-message--editing" : ""}`} data-testid={`chat-message-${message.id}`} data-message-id={message.id}>
       {showAssistantIdentity && <div className="chat-message-avatar">{activeModelProvider ? <ProviderIcon provider={activeModelProvider} size="sm" /> : <Bot size={14} />}<span>{agentName}</span>{showAssistantModelTag && activeModelTag && <span className="chat-model-tag">{activeModelTag}</span>}</div>}
       {isEditing ? (
-        <div className="chat-message-edit-editor" data-testid={`chat-message-edit-editor-${message.id}`}>
-          <textarea
-            ref={editTextareaRef}
-            className="input chat-message-edit-textarea"
-            value={editedText}
-            disabled={isSavingEdit}
-            onChange={(event) => setEditedText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                cancelEditing();
-              } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault();
-                void saveEdit();
-              }
-            }}
-            rows={3}
-          />
-          <div className="chat-message-edit-actions">
-            <button type="button" className="btn btn-sm" data-testid={`chat-message-edit-cancel-${message.id}`} disabled={isSavingEdit} onClick={cancelEditing}>{t("chat.editMessageCancel", "Cancel")}</button>
-            <button type="button" className="btn btn-sm btn-primary" data-testid={`chat-message-edit-save-${message.id}`} disabled={isSavingEdit || !editedText.trim() || editedText.trim() === message.content.trim()} onClick={() => void saveEdit()}>{t("chat.editMessageSave", "Save")}</button>
-          </div>
-        </div>
+        <StandardChatMessageEditComposer
+          value={editedText}
+          onChange={setEditedText}
+          onCancel={cancelEditing}
+          onSave={() => void saveEdit()}
+          disabled={isSavingEdit}
+          saveDisabled={isSavingEdit || !editedText.trim() || editedText.trim() === message.content.trim()}
+          messageId={message.id}
+          projectId={projectId}
+        />
       ) : (
         isAssistantMessage ? assistantBody : <div className="chat-message-content">{renderedUserContent}</div>
       )}

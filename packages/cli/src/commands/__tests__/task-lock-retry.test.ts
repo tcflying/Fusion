@@ -14,7 +14,7 @@
  * PostgreSQL has no portable whole-database writer lock; the retained fake-timer
  * and mocked-store tests cover retry, error, and close-on-every-exit behavior.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { retryOnLock, LockRetryExhaustedError, DEFAULT_CLI_LOCK_RETRY_MS } from "../../lock-retry.js";
 
@@ -107,112 +107,136 @@ describe("retryOnLock", () => {
  * whole-database writer lock, so the real-file reproduction is not portable.
  * The CLI-layer retry/teardown contract stays covered by the mocked-store
  * describes below (lock exhaustion, not-found, close-on-every-exit-path).
+ *
+ * FNXC:CliTests 2026-07-24-08:25:
+ * Full Suite shard 4 timed out the first runTaskShow exhaustion case at the
+ * default 5s budget (run 30096660913): each test re-imported task.js under
+ * fake timers, and the cold engine/dashboard graph transform alone consumed
+ * most of that budget on contended CI workers, leaving unhandled
+ * store.getTask / process.exit races after the timeout. Load task.js once
+ * per describe under real timers via a mutable store holder, and enable fake
+ * timers only around the retry/backoff body — never around the import.
  */
 describe("runTaskShow / runTaskMove — mocked-store lock exhaustion, not-found, and teardown (FN-7731)", () => {
-  beforeEach(() => {
+  let mod: typeof import("../task.js");
+  let closeProjectStore: ReturnType<typeof vi.fn>;
+  /** Mutable store surface returned by the mocked project-context helpers. */
+  let storeHolder: Record<string, unknown>;
+
+  beforeAll(async () => {
     // FNXC:CliBoardMutation 2026-07-19-18:20: mcp-lock-retry installs a
     // per-test @fusion/core factory. Clear it before importing task.js so
     // concurrent CLI test files cannot supply its secrets-store double here.
     vi.doUnmock("@fusion/core");
     vi.resetModules();
-  });
-
-  afterEach(() => {
-    vi.doUnmock("../../project-context.js");
-    vi.doUnmock("@fusion/core");
-    vi.restoreAllMocks();
-    delete process.env.FUSION_CLI_LOCK_RETRY_MS;
-  });
-
-  async function loadWithMockedStore(store: Record<string, unknown>) {
-    const closeProjectStore = vi.fn(async (context: { store: { close?: () => Promise<void> } }) => {
+    storeHolder = {};
+    closeProjectStore = vi.fn(async (context: { store: { close?: () => Promise<void> } }) => {
       await context.store.close?.().catch(() => {});
     });
-    const resolveProject = vi.fn().mockResolvedValue({
+    const resolveProject = vi.fn(async () => ({
       projectId: "proj_test",
       projectPath: "/proj",
       projectName: "proj",
       isRegistered: true,
-      store,
-    });
-    vi.doMock("../../project-context.js", () => ({ resolveProject, closeProjectStore, createLocalStore: vi.fn(async () => store as never) }));
-    const mod = await import("../task.js");
-    return { mod, closeProjectStore, resolveProject };
+      store: storeHolder,
+    }));
+    vi.doMock("../../project-context.js", () => ({
+      resolveProject,
+      closeProjectStore,
+      createLocalStore: vi.fn(async () => storeHolder as never),
+    }));
+    // Real timers only: the task.js graph pulls engine + dashboard and must
+    // not share the fake-timer clock used for lock backoff below.
+    mod = await import("../task.js");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    delete process.env.FUSION_CLI_LOCK_RETRY_MS;
+    for (const key of Object.keys(storeHolder)) {
+      delete storeHolder[key];
+    }
+    closeProjectStore.mockClear();
+  });
+
+  afterAll(() => {
+    vi.doUnmock("../../project-context.js");
+    vi.doUnmock("@fusion/core");
+    vi.resetModules();
+  });
+
+  function assignStore(methods: Record<string, unknown>) {
+    for (const [key, value] of Object.entries(methods)) {
+      storeHolder[key] = value;
+    }
+    if (typeof storeHolder.close !== "function") {
+      storeHolder.close = vi.fn().mockResolvedValue(undefined);
+    }
   }
 
   it("runTaskShow: bounded exhaustion across many fast lock retries fails clearly and closes the store", async () => {
+    process.env.FUSION_CLI_LOCK_RETRY_MS = "500";
+    const getTask = vi.fn().mockRejectedValue(new Error("database is locked"));
+    assignStore({ getTask });
+
     vi.useFakeTimers();
-    try {
-      process.env.FUSION_CLI_LOCK_RETRY_MS = "500";
-      const getTask = vi.fn().mockRejectedValue(new Error("database is locked"));
-      const store = { getTask, close: vi.fn().mockResolvedValue(undefined) };
-      const { mod, closeProjectStore } = await loadWithMockedStore(store);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-        throw new Error(`process.exit(${code})`);
-      }) as never);
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-      const promise = mod.runTaskShow("FN-9");
-      const assertion = expect(promise).rejects.toThrow(/process\.exit\(1\)/);
-      for (let i = 0; i < 10 && getTask.mock.calls.length < 2; i++) {
-        await vi.advanceTimersByTimeAsync(1_000);
-      }
+    const promise = mod.runTaskShow("FN-9");
+    const assertion = expect(promise).rejects.toThrow(/process\.exit\(1\)/);
+    for (let i = 0; i < 10 && getTask.mock.calls.length < 2; i++) {
       await vi.advanceTimersByTimeAsync(1_000);
-      await assertion;
-
-      expect(getTask.mock.calls.length).toBeGreaterThan(1);
-      const printed = errorSpy.mock.calls.flat().join("\n");
-      expect(printed).toContain("FN-9");
-      expect(printed).toMatch(/locked|FUSION_CLI_LOCK_RETRY_MS/i);
-      expect(closeProjectStore).toHaveBeenCalled();
-
-      exitSpy.mockRestore();
-      errorSpy.mockRestore();
-    } finally {
-      vi.useRealTimers();
     }
+    await vi.advanceTimersByTimeAsync(1_000);
+    await assertion;
+
+    expect(getTask.mock.calls.length).toBeGreaterThan(1);
+    const printed = errorSpy.mock.calls.flat().join("\n");
+    expect(printed).toContain("FN-9");
+    expect(printed).toMatch(/locked|FUSION_CLI_LOCK_RETRY_MS/i);
+    expect(closeProjectStore).toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
   it("runTaskMove: bounded exhaustion across many fast lock retries fails clearly and closes the store", async () => {
+    process.env.FUSION_CLI_LOCK_RETRY_MS = "500";
+    const moveTask = vi.fn().mockRejectedValue(new Error("SQLITE_BUSY: database is locked"));
+    assignStore({ moveTask });
+
     vi.useFakeTimers();
-    try {
-      process.env.FUSION_CLI_LOCK_RETRY_MS = "500";
-      const moveTask = vi.fn().mockRejectedValue(new Error("SQLITE_BUSY: database is locked"));
-      const store = { moveTask, close: vi.fn().mockResolvedValue(undefined) };
-      const { mod, closeProjectStore } = await loadWithMockedStore(store);
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-        throw new Error(`process.exit(${code})`);
-      }) as never);
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-      const promise = mod.runTaskMove("FN-10", "done");
-      const assertion = expect(promise).rejects.toThrow(/process\.exit\(1\)/);
-      for (let i = 0; i < 10 && moveTask.mock.calls.length < 2; i++) {
-        await vi.advanceTimersByTimeAsync(1_000);
-      }
+    const promise = mod.runTaskMove("FN-10", "done");
+    const assertion = expect(promise).rejects.toThrow(/process\.exit\(1\)/);
+    for (let i = 0; i < 10 && moveTask.mock.calls.length < 2; i++) {
       await vi.advanceTimersByTimeAsync(1_000);
-      await assertion;
-
-      expect(moveTask.mock.calls.length).toBeGreaterThan(1);
-      const printed = errorSpy.mock.calls.flat().join("\n");
-      expect(printed).toContain("FN-10");
-      expect(printed).toMatch(/locked|FUSION_CLI_LOCK_RETRY_MS/i);
-      expect(closeProjectStore).toHaveBeenCalled();
-
-      exitSpy.mockRestore();
-      errorSpy.mockRestore();
-    } finally {
-      vi.useRealTimers();
     }
+    await vi.advanceTimersByTimeAsync(1_000);
+    await assertion;
+
+    expect(moveTask.mock.calls.length).toBeGreaterThan(1);
+    const printed = errorSpy.mock.calls.flat().join("\n");
+    expect(printed).toContain("FN-10");
+    expect(printed).toMatch(/locked|FUSION_CLI_LOCK_RETRY_MS/i);
+    expect(closeProjectStore).toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
   it("runTaskShow: a not-found error does not retry-loop and propagates clearly, store still closed", async () => {
     process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
     const getTask = vi.fn().mockRejectedValue(new Error("Task FN-404 not found"));
-    const store = { getTask, close: vi.fn().mockResolvedValue(undefined) };
-    const { mod, closeProjectStore } = await loadWithMockedStore(store);
+    assignStore({ getTask });
 
     await expect(mod.runTaskShow("FN-404")).rejects.toThrow("Task FN-404 not found");
     expect(getTask).toHaveBeenCalledTimes(1);
@@ -221,8 +245,7 @@ describe("runTaskShow / runTaskMove — mocked-store lock exhaustion, not-found,
 
   it("runTaskMove: a move-to-same-column no-op succeeds on the first attempt and closes the store", async () => {
     const moveTask = vi.fn().mockResolvedValue({ id: "FN-5", column: "todo" });
-    const store = { moveTask, close: vi.fn().mockResolvedValue(undefined) };
-    const { mod, closeProjectStore } = await loadWithMockedStore(store);
+    assignStore({ moveTask });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     await mod.runTaskMove("FN-5", "todo");
@@ -245,8 +268,7 @@ describe("runTaskShow / runTaskMove — mocked-store lock exhaustion, not-found,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
-    const store = { getTask, close: vi.fn().mockResolvedValue(undefined) };
-    const { mod, closeProjectStore } = await loadWithMockedStore(store);
+    assignStore({ getTask });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     await mod.runTaskShow("FN-6");
@@ -277,97 +299,76 @@ describe("runTaskShow / runTaskMove — mocked-store lock exhaustion, not-found,
 // `getBoardCommandContext` falls through to the `asLocalProjectContext`
 // wrapper around a fresh, uncached `TaskStore`).
 describe("FN-7734: generalized retry+teardown across representative fn task subcommands", () => {
-  beforeEach(() => {
-    // FNXC:CliBoardMutation 2026-07-19-18:20: mcp-lock-retry installs a
-    // per-test @fusion/core factory. Clear it before importing task.js so
-    // concurrent CLI test files cannot supply its secrets-store double here.
-    vi.doUnmock("@fusion/core");
-    vi.resetModules();
-  });
+  /*
+   * FNXC:CliTests 2026-07-24-08:25:
+   * Cached-store cases share one task.js import (same cold-graph budget as
+   * FN-7731). Uncached CWD-fallback cases still re-import because they need a
+   * distinct project-context + @fusion/core TaskStore double.
+   */
+  describe("cached store resolution", () => {
+    let mod: typeof import("../task.js");
+    let closeProjectStore: ReturnType<typeof vi.fn>;
+    let storeHolder: Record<string, unknown>;
 
-  afterEach(() => {
-    vi.doUnmock("../../project-context.js");
-    vi.doUnmock("@fusion/core");
-    vi.restoreAllMocks();
-    delete process.env.FUSION_CLI_LOCK_RETRY_MS;
-  });
+    beforeAll(async () => {
+      vi.doUnmock("@fusion/core");
+      vi.resetModules();
+      storeHolder = {};
+      closeProjectStore = vi.fn(async (context: { store: { close?: () => Promise<void> } }) => {
+        await context.store.close?.().catch(() => {});
+      });
+      const resolveProject = vi.fn(async () => ({
+        projectId: "proj_test",
+        projectPath: "/proj",
+        projectName: "proj",
+        isRegistered: true,
+        store: storeHolder,
+      }));
+      vi.doMock("../../project-context.js", () => ({
+        resolveProject,
+        closeProjectStore,
+        createLocalStore: vi.fn(async () => storeHolder as never),
+      }));
+      mod = await import("../task.js");
+    });
 
-  /** Cached/registered-project store resolution branch (mirrors the existing mocked-store helper above). */
-  async function loadWithCachedStore(store: Record<string, unknown>) {
-    const closeProjectStore = vi.fn(async (context: { store: { close?: () => Promise<void> } }) => {
-      await context.store.close?.().catch(() => {});
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      delete process.env.FUSION_CLI_LOCK_RETRY_MS;
+      for (const key of Object.keys(storeHolder)) {
+        delete storeHolder[key];
+      }
+      closeProjectStore.mockClear();
     });
-    const resolveProject = vi.fn().mockResolvedValue({
-      projectId: "proj_test",
-      projectPath: "/proj",
-      projectName: "proj",
-      isRegistered: true,
-      store,
-    });
-    vi.doMock("../../project-context.js", () => ({ resolveProject, closeProjectStore, createLocalStore: vi.fn(async () => store as never) }));
-    const mod = await import("../task.js");
-    return { mod, closeProjectStore, resolveProject };
-  }
 
-  /** Uncached CWD-fallback store resolution branch: `resolveProject` rejects for both the explicit-name and default-project paths, forcing `getBoardCommandContext`'s catch branch (`asLocalProjectContext` wrapping a fresh store). */
-  async function loadWithUncachedFallbackStore(store: Record<string, unknown>) {
-    const closeProjectStore = vi.fn(async (context: { store: { close?: () => Promise<void> } }) => {
-      await context.store.close?.().catch(() => {});
+    afterAll(() => {
+      vi.doUnmock("../../project-context.js");
+      vi.doUnmock("@fusion/core");
+      vi.resetModules();
     });
-    const resolveProject = vi.fn().mockRejectedValue(new Error("no registered project"));
-    vi.doMock("../../project-context.js", () => ({
-      resolveProject,
-      closeProjectStore,
-      // FNXC:PostgresCutover 2026-07-10: the branch's cwd fallback boots via
-      // createLocalStore; hand back the same proxied mock store.
-      createLocalStore: vi.fn(async () => {
-        const proxied = new Proxy(store, {
-          get(target, prop) {
-            if (prop === "init") return async () => {};
-            return (target as Record<string, unknown>)[prop as string];
-          },
-        });
-        return proxied as never;
-      }),
-    }));
-    vi.doMock("@fusion/core", async () => {
-      const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
-      return {
-        ...actual,
-        TaskStore: class {
-          async init() {}
-          async close() {
-            await store.close?.();
-          }
-          constructor() {
-            return new Proxy(store, {
-              get(target, prop) {
-                if (prop === "init") return async () => {};
-                return (target as Record<string, unknown>)[prop as string];
-              },
-            });
-          }
-        },
-      };
-    });
-    const mod = await import("../task.js");
-    return { mod, closeProjectStore, resolveProject };
-  }
 
-  describe("runTaskUpdate (single-call board-mutation)", () => {
-    it("retries through a transient lock and succeeds once it clears, closing the store", async () => {
-      vi.useFakeTimers();
-      try {
+    function assignStore(methods: Record<string, unknown>) {
+      for (const [key, value] of Object.entries(methods)) {
+        storeHolder[key] = value;
+      }
+      if (typeof storeHolder.close !== "function") {
+        storeHolder.close = vi.fn().mockResolvedValue(undefined);
+      }
+    }
+
+    describe("runTaskUpdate (single-call board-mutation)", () => {
+      it("retries through a transient lock and succeeds once it clears, closing the store", async () => {
         process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
         const lockError = new Error("database is locked");
         const updateStep = vi
           .fn()
           .mockRejectedValueOnce(lockError)
           .mockResolvedValueOnce({ id: "FN-20", steps: [{ name: "step0", status: "done" }] });
-        const store = { updateStep, close: vi.fn().mockResolvedValue(undefined) };
-        const { mod, closeProjectStore } = await loadWithCachedStore(store);
+        assignStore({ updateStep });
         const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
+        vi.useFakeTimers();
         const promise = mod.runTaskUpdate("FN-20", "0", "done");
         for (let i = 0; i < 10 && updateStep.mock.calls.length < 2; i++) {
           await vi.advanceTimersByTimeAsync(1_000);
@@ -377,19 +378,14 @@ describe("FN-7734: generalized retry+teardown across representative fn task subc
         expect(updateStep).toHaveBeenCalledTimes(2);
         expect(closeProjectStore).toHaveBeenCalled();
         logSpy.mockRestore();
-      } finally {
-        vi.useRealTimers();
-      }
-    });
+      });
 
-    it("fails fast on lock-exhaustion with an actionable error, non-zero exit, and closes the store", async () => {
-      vi.useFakeTimers();
-      try {
+      it("fails fast on lock-exhaustion with an actionable error, non-zero exit, and closes the store", async () => {
         process.env.FUSION_CLI_LOCK_RETRY_MS = "500";
         const updateStep = vi.fn().mockRejectedValue(new Error("database is locked"));
-        const store = { updateStep, close: vi.fn().mockResolvedValue(undefined) };
-        const { mod, closeProjectStore } = await loadWithCachedStore(store);
+        assignStore({ updateStep });
 
+        vi.useFakeTimers();
         const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
           throw new Error(`process.exit(${code})`);
         }) as never);
@@ -411,37 +407,21 @@ describe("FN-7734: generalized retry+teardown across representative fn task subc
 
         exitSpy.mockRestore();
         errorSpy.mockRestore();
-      } finally {
-        vi.useRealTimers();
-      }
+      });
     });
 
-    it("a not-found error does not retry-loop and closes the store (uncached CWD-fallback branch)", async () => {
-      process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
-      const updateStep = vi.fn().mockRejectedValue(new Error("Task FN-22 not found"));
-      const store = { updateStep, close: vi.fn().mockResolvedValue(undefined) };
-      const { mod, closeProjectStore } = await loadWithUncachedFallbackStore(store);
-
-      await expect(mod.runTaskUpdate("FN-22", "0", "done")).rejects.toThrow("Task FN-22 not found");
-      expect(updateStep).toHaveBeenCalledTimes(1);
-      expect(closeProjectStore).toHaveBeenCalled();
-    });
-  });
-
-  describe("runTaskComments (single-call board-read)", () => {
-    it("retries through a transient lock and succeeds once it clears, closing the store", async () => {
-      vi.useFakeTimers();
-      try {
+    describe("runTaskComments (single-call board-read)", () => {
+      it("retries through a transient lock and succeeds once it clears, closing the store", async () => {
         process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
         const lockError = new Error("SQLITE_BUSY: database is locked");
         const getTask = vi
           .fn()
           .mockRejectedValueOnce(lockError)
           .mockResolvedValueOnce({ id: "FN-23", comments: [{ id: "c1", author: "user", text: "hi", createdAt: new Date().toISOString() }] });
-        const store = { getTask, close: vi.fn().mockResolvedValue(undefined) };
-        const { mod, closeProjectStore } = await loadWithCachedStore(store);
+        assignStore({ getTask });
         const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
+        vi.useFakeTimers();
         const promise = mod.runTaskComments("FN-23");
         for (let i = 0; i < 10 && getTask.mock.calls.length < 2; i++) {
           await vi.advanceTimersByTimeAsync(1_000);
@@ -451,37 +431,19 @@ describe("FN-7734: generalized retry+teardown across representative fn task subc
         expect(getTask).toHaveBeenCalledTimes(2);
         expect(closeProjectStore).toHaveBeenCalled();
         logSpy.mockRestore();
-      } finally {
-        vi.useRealTimers();
-      }
+      });
     });
 
-    it("the happy path (no lock contention, uncached CWD-fallback branch) adds no retry latency and closes the store once", async () => {
-      const getTask = vi.fn().mockResolvedValue({ id: "FN-24", comments: [] });
-      const store = { getTask, close: vi.fn().mockResolvedValue(undefined) };
-      const { mod, closeProjectStore } = await loadWithUncachedFallbackStore(store);
-      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-      await mod.runTaskComments("FN-24");
-
-      expect(getTask).toHaveBeenCalledTimes(1);
-      expect(closeProjectStore).toHaveBeenCalledTimes(1);
-      logSpy.mockRestore();
-    });
-  });
-
-  describe("runTaskDelete (MULTI-STEP mutation: existence check + confirm + terminal delete)", () => {
-    it("retries the terminal delete write through a transient lock without redoing the existence check, and closes the store", async () => {
-      vi.useFakeTimers();
-      try {
+    describe("runTaskDelete (MULTI-STEP mutation: existence check + confirm + terminal delete)", () => {
+      it("retries the terminal delete write through a transient lock without redoing the existence check, and closes the store", async () => {
         process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
         const getTask = vi.fn().mockResolvedValue({ id: "FN-25" });
         const lockError = new Error("database is locked");
         const deleteTask = vi.fn().mockRejectedValueOnce(lockError).mockResolvedValueOnce(undefined);
-        const store = { getTask, deleteTask, close: vi.fn().mockResolvedValue(undefined) };
-        const { mod, closeProjectStore } = await loadWithCachedStore(store);
+        assignStore({ getTask, deleteTask });
         const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
+        vi.useFakeTimers();
         const promise = mod.runTaskDelete("FN-25", true);
         for (let i = 0; i < 10 && deleteTask.mock.calls.length < 2; i++) {
           await vi.advanceTimersByTimeAsync(1_000);
@@ -494,20 +456,15 @@ describe("FN-7734: generalized retry+teardown across representative fn task subc
         expect(deleteTask).toHaveBeenCalledTimes(2);
         expect(closeProjectStore).toHaveBeenCalled();
         logSpy.mockRestore();
-      } finally {
-        vi.useRealTimers();
-      }
-    });
+      });
 
-    it("fails fast on lock-exhaustion during the terminal delete with an actionable error, non-zero exit, and closes the store", async () => {
-      vi.useFakeTimers();
-      try {
+      it("fails fast on lock-exhaustion during the terminal delete with an actionable error, non-zero exit, and closes the store", async () => {
         process.env.FUSION_CLI_LOCK_RETRY_MS = "500";
         const getTask = vi.fn().mockResolvedValue({ id: "FN-26" });
         const deleteTask = vi.fn().mockRejectedValue(new Error("database is locked"));
-        const store = { getTask, deleteTask, close: vi.fn().mockResolvedValue(undefined) };
-        const { mod, closeProjectStore } = await loadWithCachedStore(store);
+        assignStore({ getTask, deleteTask });
 
+        vi.useFakeTimers();
         const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
           throw new Error(`process.exit(${code})`);
         }) as never);
@@ -526,12 +483,90 @@ describe("FN-7734: generalized retry+teardown across representative fn task subc
 
         exitSpy.mockRestore();
         errorSpy.mockRestore();
-      } finally {
-        vi.useRealTimers();
-      }
+      });
+    });
+  });
+
+  describe("uncached CWD-fallback store resolution", () => {
+    afterEach(() => {
+      vi.doUnmock("../../project-context.js");
+      vi.doUnmock("@fusion/core");
+      vi.restoreAllMocks();
+      delete process.env.FUSION_CLI_LOCK_RETRY_MS;
     });
 
-    it("a not-found error at the existence-check step does not retry-loop, and closes the store (uncached CWD-fallback branch)", async () => {
+    /** Uncached CWD-fallback: `resolveProject` rejects, forcing `getBoardCommandContext`'s createLocalStore branch. */
+    async function loadWithUncachedFallbackStore(store: Record<string, unknown>) {
+      vi.doUnmock("@fusion/core");
+      vi.resetModules();
+      const closeProjectStore = vi.fn(async (context: { store: { close?: () => Promise<void> } }) => {
+        await context.store.close?.().catch(() => {});
+      });
+      const resolveProject = vi.fn().mockRejectedValue(new Error("no registered project"));
+      vi.doMock("../../project-context.js", () => ({
+        resolveProject,
+        closeProjectStore,
+        // FNXC:PostgresCutover 2026-07-10: the branch's cwd fallback boots via
+        // createLocalStore; hand back the same proxied mock store.
+        createLocalStore: vi.fn(async () => {
+          const proxied = new Proxy(store, {
+            get(target, prop) {
+              if (prop === "init") return async () => {};
+              return (target as Record<string, unknown>)[prop as string];
+            },
+          });
+          return proxied as never;
+        }),
+      }));
+      vi.doMock("@fusion/core", async () => {
+        const actual = await vi.importActual<typeof import("@fusion/core")>("@fusion/core");
+        return {
+          ...actual,
+          TaskStore: class {
+            async init() {}
+            async close() {
+              await (store.close as (() => Promise<void>) | undefined)?.();
+            }
+            constructor() {
+              return new Proxy(store, {
+                get(target, prop) {
+                  if (prop === "init") return async () => {};
+                  return (target as Record<string, unknown>)[prop as string];
+                },
+              });
+            }
+          },
+        };
+      });
+      const mod = await import("../task.js");
+      return { mod, closeProjectStore, resolveProject };
+    }
+
+    it("runTaskUpdate: a not-found error does not retry-loop and closes the store (uncached CWD-fallback branch)", async () => {
+      process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
+      const updateStep = vi.fn().mockRejectedValue(new Error("Task FN-22 not found"));
+      const store = { updateStep, close: vi.fn().mockResolvedValue(undefined) };
+      const { mod, closeProjectStore } = await loadWithUncachedFallbackStore(store);
+
+      await expect(mod.runTaskUpdate("FN-22", "0", "done")).rejects.toThrow("Task FN-22 not found");
+      expect(updateStep).toHaveBeenCalledTimes(1);
+      expect(closeProjectStore).toHaveBeenCalled();
+    });
+
+    it("runTaskComments: the happy path (no lock contention, uncached CWD-fallback branch) adds no retry latency and closes the store once", async () => {
+      const getTask = vi.fn().mockResolvedValue({ id: "FN-24", comments: [] });
+      const store = { getTask, close: vi.fn().mockResolvedValue(undefined) };
+      const { mod, closeProjectStore } = await loadWithUncachedFallbackStore(store);
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await mod.runTaskComments("FN-24");
+
+      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(closeProjectStore).toHaveBeenCalledTimes(1);
+      logSpy.mockRestore();
+    });
+
+    it("runTaskDelete: a not-found error at the existence-check step does not retry-loop, and closes the store (uncached CWD-fallback branch)", async () => {
       process.env.FUSION_CLI_LOCK_RETRY_MS = "5000";
       const getTask = vi.fn().mockRejectedValue(new Error("Task FN-27 not found"));
       const deleteTask = vi.fn();

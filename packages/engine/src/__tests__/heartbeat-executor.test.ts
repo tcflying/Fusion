@@ -277,6 +277,26 @@ describe("executeHeartbeat", () => {
       expect(section).toContain("healthy");
     });
 
+    it("FN-8569: renders error-unrecoverable reports as operator-actionable across desynced states", async () => {
+      const now = new Date().toISOString();
+      const store = createStoreWithAgentForExec();
+      vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
+        { id: "agent-paused", name: "Paused Report", state: "paused", pauseReason: "error-unrecoverable", lastHeartbeatAt: now, updatedAt: now } as Agent,
+        { id: "agent-active", name: "Active Desync", state: "active", pauseReason: "error-unrecoverable", lastHeartbeatAt: now, updatedAt: now } as Agent,
+        { id: "agent-running", name: "Running Desync", state: "running", pauseReason: "error-unrecoverable", lastHeartbeatAt: now, updatedAt: now } as Agent,
+      ]);
+      const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp" });
+
+      const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
+
+      expect(section).toContain("| Paused Report | paused |");
+      expect(section).toContain("| Active Desync | active |");
+      expect(section).toContain("| Running Desync | running |");
+      expect(section).toContain("**needs operator repair** (error-unrecoverable)");
+      expect(section).not.toMatch(/\| (Paused Report|Active Desync|Running Desync) \|[^\n]*\| healthy \|/);
+      expect(section).toContain("For reports that **need operator repair**: notify the operator");
+    });
+
     it("FN-8184: reports runtimeConfig cadence with one multiplier application and strict stale boundary", async () => {
       vi.useFakeTimers();
       const now = new Date("2026-01-01T12:00:00.000Z");
@@ -385,7 +405,7 @@ describe("executeHeartbeat", () => {
       expect(section).not.toContain("**stale** assignment");
     });
 
-    it("buildReportsHealthSection classifies stuck agents", async () => {
+    it("buildReportsHealthSection classifies error-state agents as operator-actionable", async () => {
       const now = Date.now();
       const store = createStoreWithAgentForExec();
       vi.mocked(store.getAgentsByReportsTo).mockResolvedValue([
@@ -394,10 +414,9 @@ describe("executeHeartbeat", () => {
       const monitor = new HeartbeatMonitor({ store, taskStore: mockTaskStore, rootDir: "/tmp", heartbeatTimeoutMs: 60_000 });
 
       const section = await (monitor as any).buildReportsHealthSection("agent-001", store);
-      expect(section).toContain("**stuck**");
+      expect(section).toContain("**needs operator repair**");
       expect(section).toContain("Actions for Unresponsive Reports");
-      expect(section).toContain("first check task-log/step progress, the active heartbeat run, and worktree/session liveness");
-      expect(section).toContain("If work is live, do not stop or reassign it");
+      expect(section).toContain("For reports that **need operator repair**: notify the operator");
     });
 
     it("buildReportsHealthSection classifies stale agents", async () => {

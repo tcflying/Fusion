@@ -243,6 +243,23 @@ afterEach(() => {
 });
 
 describe("TaskCard", () => {
+  it("renders creation on all cards and terminal completion from canonical lifecycle timestamps", () => {
+    const createdAt = new Date().toISOString();
+    const archivedAt = "2026-07-20T09:00:00.000Z";
+    const { rerender } = render(
+      <TaskCard task={makeTask({ createdAt })} onOpenDetail={noop} addToast={noop} />,
+    );
+
+    expect(screen.getByTestId("card-lifecycle-dates")).toHaveTextContent("Created");
+    expect(screen.queryByText(/Completed/)).not.toBeInTheDocument();
+
+    rerender(
+      <TaskCard task={makeTask({ column: "archived", createdAt, archivedAt, columnMovedAt: "2026-07-19T09:00:00.000Z" })} onOpenDetail={noop} addToast={noop} />,
+    );
+    expect(screen.getByTestId("card-lifecycle-dates")).toHaveTextContent("Completed");
+    expect(screen.getByTestId("card-lifecycle-dates").querySelectorAll("time")).toHaveLength(2);
+  });
+
   it("renders GitLab tracking badges for linked and stale items without dropping GitHub badges", () => {
     const gitlabItem = {
       kind: "merge_request" as const,
@@ -2609,6 +2626,98 @@ describe("TaskCard", () => {
 
     expect(container.querySelector('[data-testid="card-reviewing-FN-READY-QUEUED"]')).toBeNull();
     expect(container.querySelector('[data-testid="card-ready-FN-READY-QUEUED"]')).toBeNull();
+  });
+
+  /*
+  FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+  "Queued to plan" makes the planning-capacity wait visible. Symptom it fixes: a started card that
+  the concurrency pool had not admitted looked identical to a card nothing would happen to — the
+  throttle was only observable in the engine log.
+
+  Surface enumeration (invariant: exactly one of {planning status, Queued to plan, Ready} shows on
+  an idle Todo card, chosen by whether the card has steps and whether work is live):
+   - Unplanned idle Todo card -> Queued to plan, never Ready.
+   - Planned idle Todo card -> Ready, never Queued to plan (asserted in the Ready tests above).
+   - Planning in flight (status set) -> neither badge; the status badge owns the card.
+   - Plan Review running, agent-active, queued, and paused -> neither badge.
+   - Non-todo columns -> neither badge.
+  */
+  describe("Queued to plan badge", () => {
+    const queuedToPlanTask = (overrides: Partial<Task> = {}) => makeTask({
+      id: "FN-QUEUED-PLAN",
+      column: "todo",
+      status: null as any,
+      steps: [] as Task["steps"],
+      ...overrides,
+    });
+    const badge = (container: HTMLElement) =>
+      container.querySelector('[data-testid="card-queued-to-plan-FN-QUEUED-PLAN"]');
+
+    it("renders on an idle unplanned Todo card", () => {
+      const { container } = render(
+        <TaskCard task={queuedToPlanTask()} onOpenDetail={noop} addToast={noop} />,
+      );
+
+      expect(badge(container)).toHaveTextContent("Queued to plan");
+      // Mutually exclusive with Ready — a card is never both unplanned and planned.
+      expect(container.querySelector('[data-testid="card-ready-FN-QUEUED-PLAN"]')).toBeNull();
+    });
+
+    it("does not render once planning is in flight", () => {
+      const { container } = render(
+        <TaskCard task={queuedToPlanTask({ status: "planning" as any })} onOpenDetail={noop} addToast={noop} />,
+      );
+
+      expect(badge(container)).toBeNull();
+    });
+
+    it("does not render while Plan Review is running", () => {
+      const { container } = render(
+        <TaskCard
+          task={queuedToPlanTask({
+            enabledWorkflowSteps: ["plan-review"],
+            workflowStepResults: [{
+              workflowStepId: "plan-review",
+              workflowStepName: "Plan Review",
+              status: "pending",
+              startedAt: "2026-07-11T12:00:00.000Z",
+            }],
+          })}
+          onOpenDetail={noop}
+          addToast={noop}
+        />,
+      );
+
+      expect(badge(container)).toBeNull();
+    });
+
+    /*
+    FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+    Pause suppression matches the Ready badge exactly (`!isPaused`), for both pause flavors. The
+    board-level `queued` gate is deliberately NOT special-cased here, because Ready does not
+    special-case it either — a queued card is still genuinely waiting for a planning slot, and
+    forking a different suppression rule for the sibling badge in the same slot is the drift the
+    reuse rule exists to prevent.
+    */
+    it("does not render on a paused card, matching Ready", () => {
+      for (const pauseFlag of ["paused", "userPaused"] as const) {
+        const { container, unmount } = render(
+          <TaskCard task={queuedToPlanTask({ [pauseFlag]: true })} onOpenDetail={noop} addToast={noop} />,
+        );
+        expect(badge(container), pauseFlag).toBeNull();
+        unmount();
+      }
+    });
+
+    it("does not render outside the todo column", () => {
+      for (const column of ["triage", "in-progress", "in-review", "done"] as const) {
+        const { container, unmount } = render(
+          <TaskCard task={queuedToPlanTask({ column })} onOpenDetail={noop} addToast={noop} />,
+        );
+        expect(badge(container), column).toBeNull();
+        unmount();
+      }
+    });
   });
 
   it("renders the status badge after the card ID in DOM order", () => {
@@ -7869,6 +7978,32 @@ describe("TaskCard Start affordance (FN-7596)", () => {
 
     await waitFor(() => expect(addToast).toHaveBeenCalledWith(expect.stringContaining("FN-001"), "success"));
     await waitFor(() => expect(startButton).not.toBeDisabled());
+  });
+
+  /*
+  FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+  The Start toast must not claim planning has begun. Start performs a bare column move — it cannot
+  observe admission — so "Started planning {id}" reported an outcome that a busy concurrency pool
+  could defer indefinitely, which is what made a throttled card look broken.
+  */
+  it("reports the Start move as queued, not as planning already started", async () => {
+    const onMoveTask = vi.fn().mockResolvedValue(makeTask({ column: "todo" }));
+    const addToast = vi.fn();
+
+    render(
+      <TaskCard
+        task={makeTask({ column: "ideas" as any })}
+        taskColumnFlags={{ intake: true }}
+        onOpenDetail={noop}
+        addToast={addToast}
+        onMoveTask={onMoveTask}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("card-start-FN-001"));
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith("Queued FN-001 for planning", "success"));
+    expect(addToast).not.toHaveBeenCalledWith(expect.stringContaining("Started planning"), expect.anything());
   });
 
   it("shows an error toast when the Start move fails", async () => {

@@ -50,6 +50,8 @@ function sectionFiles(): string[] {
  */
 const SECTION_FILE_TO_ID: Record<string, string> = {
   "AppearanceSection.tsx": "appearance",
+  // FNXC:SettingsSearch 2026-07-24-23:15: anthropicAuthPreference descriptor row requires registration.
+  "AuthenticationSection.tsx": "authentication",
   "BackupsSection.tsx": "backups",
   "DatabaseBackupsSection.tsx": "backups-global",
   "CommandsSection.tsx": "commands",
@@ -71,6 +73,7 @@ const SECTION_FILE_TO_ID: Record<string, string> = {
   "SourceControlGlobalSection.tsx": "source-control-global",
   "SourceControlSection.tsx": "source-control",
   "WorktreesSection.tsx": "worktrees",
+  "VoiceInputSection.tsx": "voice-input",
 };
 
 describe("settings search index", () => {

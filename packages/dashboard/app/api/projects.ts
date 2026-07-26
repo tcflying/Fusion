@@ -84,9 +84,13 @@ export type ExecutorState = "idle" | "running" | "paused" | "stopped";
  * 
  * The executorState is derived from:
  * - "stopped": globalPause is true
- * - "idle": (enginePaused is true AND runningTaskCount is 0) OR not paused with nothing running
- * - "paused": enginePaused is true AND runningTaskCount > 0
+ * - "paused": enginePaused is true (regardless of runningTaskCount)
  * - "running": globalPause is false AND enginePaused is false AND runningTaskCount > 0
+ * - "idle": nothing paused and nothing running
+ *
+ * FNXC:EngineControls 2026-07-24-18:35: pause state dominates run state so a paused
+ * engine never reads "Idle" once in-flight work drains. See deriveExecutorState in
+ * app/hooks/useExecutorStats.ts for the rationale.
  */
 export interface ExecutorStats {
   /** Number of tasks currently in "in-progress" column */

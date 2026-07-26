@@ -5,6 +5,7 @@ import { getViewportMode, isFullScreenSheetViewport, isMobileViewport, MOBILE_ME
 const TABLET_MEDIA_QUERY = "(min-width: 769px) and (max-width: 1024px)";
 const MOBILE_WIDTH_MEDIA_QUERY = "(max-width: 768px)";
 const MOBILE_HEIGHT_MEDIA_QUERY = "(max-height: 480px)";
+const PHONE_WIDTH_MEDIA_QUERY = "(max-width: 600px)";
 const originalScreenDescriptor = Object.getOwnPropertyDescriptor(window, "screen");
 
 function stubScreen(width: number, height: number) {
@@ -148,6 +149,97 @@ describe("useViewportMode", () => {
 
     expect(getViewportMode()).toBe("tablet");
     expect(renderHook(() => useViewportMode()).result.current).toBe("tablet");
+  });
+
+  /*
+  FNXC:ViewportMode 2026-07-24-18:55:
+  Regression cover for large Android phones losing the bottom nav bar. `window.screen`
+  is not a reliable phone/tablet discriminator — these devices report a screen min edge
+  above the 480px phone threshold, so the tablet-class exclusion stripped mobile mode at
+  any CSS width. The invariant is width-based and asserted across every width signal the
+  classifier reads (media query, innerWidth, visualViewport), not just the reported case,
+  because each of the three can lead on a different device or update late on rotation.
+  */
+  describe("phone width floor overrides physical-screen tablet classification", () => {
+    const LARGE_PHONE_SCREEN: [number, number] = [1080, 2400];
+
+    function withTouch(run: () => void) {
+      const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+      Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 5 });
+      try {
+        run();
+      } finally {
+        if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+      }
+    }
+
+    function stubPhoneWidthMedia(phoneWidthMatches: boolean) {
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn((query: string) => ({
+          matches:
+            query === MOBILE_MEDIA_QUERY || query === MOBILE_WIDTH_MEDIA_QUERY
+              ? true
+              : query === PHONE_WIDTH_MEDIA_QUERY
+                ? phoneWidthMatches
+                : false,
+          media: query,
+          onchange: null,
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+        })),
+      );
+    }
+
+    it("stays mobile when the phone width media query matches", () => {
+      withTouch(() => {
+        stubScreen(...LARGE_PHONE_SCREEN);
+        stubPhoneWidthMedia(true);
+
+        expect(isMobileViewport()).toBe(true);
+        expect(getViewportMode()).toBe("mobile");
+      });
+    });
+
+    it("stays mobile on a narrow innerWidth even when the media query has not updated", () => {
+      withTouch(() => {
+        stubScreen(...LARGE_PHONE_SCREEN);
+        stubPhoneWidthMedia(false);
+        vi.stubGlobal("innerWidth", 430);
+
+        expect(isMobileViewport()).toBe(true);
+        expect(getViewportMode()).toBe("mobile");
+      });
+    });
+
+    it("stays mobile on a narrow visualViewport pane", () => {
+      withTouch(() => {
+        stubScreen(...LARGE_PHONE_SCREEN);
+        stubPhoneWidthMedia(false);
+        const originalVisualViewport = window.visualViewport;
+        Object.defineProperty(window, "visualViewport", {
+          configurable: true,
+          value: { width: 412, height: 915, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+        });
+
+        try {
+          expect(isMobileViewport()).toBe(true);
+          expect(getViewportMode()).toBe("mobile");
+        } finally {
+          Object.defineProperty(window, "visualViewport", { configurable: true, value: originalVisualViewport });
+        }
+      });
+    });
+
+    it("leaves the 601-768px tablet band to the physical-screen classification", () => {
+      withTouch(() => {
+        stubScreen(768, 1024);
+        stubPhoneWidthMedia(false);
+        vi.stubGlobal("innerWidth", 700);
+
+        expect(isMobileViewport()).toBe(false);
+      });
+    });
   });
 
   it("keeps a touch tablet at the 768px boundary out of the phone presentation", () => {

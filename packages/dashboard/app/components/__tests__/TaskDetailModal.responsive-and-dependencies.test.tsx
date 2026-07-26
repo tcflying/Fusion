@@ -843,6 +843,57 @@ describe("TaskDetailModal", () => {
       }
     });
 
+    it("keeps Task Detail resizable for a known touch tablet at 768px", () => {
+      const originalScreen = Object.getOwnPropertyDescriptor(window, "screen");
+      const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+      const originalMatchMedia = window.matchMedia;
+      Object.defineProperty(window, "screen", { configurable: true, value: { width: 768, height: 1024 } });
+      Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+      vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+        matches: query === "(max-width: 768px)" || query === "(max-width: 768px), (max-height: 480px)",
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })));
+
+      try {
+        const { container } = render(
+          <TaskDetailModal
+            task={makeTask({ column: "in-progress" as Column })}
+            onClose={noop}
+            onMoveTask={noopMove}
+            onDeleteTask={noopDelete}
+            onMergeTask={noopMerge}
+            onOpenDetail={noopOpenDetail}
+            addToast={noop}
+          />,
+        );
+        const modal = container.querySelector(".task-detail-modal");
+        expect(modal).toHaveClass("task-modal--tablet");
+        const grip = modal?.querySelector(".modal-resize-grip") as HTMLElement;
+        expect(grip).toHaveAttribute("aria-label", "Resize modal from bottom-right corner");
+        expect(grip).toHaveAttribute("tabindex", "0");
+
+        // FNXC:TaskModalResize 2026-07-24-19:20: The 768px tablet recovery must
+        // remain keyboard discoverable, not merely restore a touch-only grip.
+        modal!.style.width = "500px";
+        modal!.style.height = "400px";
+        grip.focus();
+        fireEvent.keyDown(grip, { key: "ArrowRight" });
+        fireEvent.keyDown(grip, { key: "ArrowDown" });
+
+        expect(modal!.style.width).toBe("516px");
+        expect(modal!.style.height).toBe("416px");
+        expect(grip).toHaveAttribute("aria-valuenow", "516");
+        expect(grip).toHaveAttribute("aria-valuetext", "Width 516 pixels, height 416 pixels");
+      } finally {
+        if (originalScreen) Object.defineProperty(window, "screen", originalScreen);
+        if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+        vi.stubGlobal("matchMedia", originalMatchMedia);
+      }
+    });
+
     it("renders responsive structural classes (modal-lg, overlay, spacer, tabs, detail-body)", () => {
       const { container } = render(
         <TaskDetailModal

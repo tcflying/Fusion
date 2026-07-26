@@ -58,6 +58,15 @@ test("attributeTestFile maps absolute paths to owning package, repo-relative", (
   assert.equal(attributeTestFile("/repo/tools/x.test.ts", PACKAGES, root), null);
 });
 
+test("attributeTestFile accepts CI absolute paths when their checkout differs", () => {
+  const got = attributeTestFile(
+    "/home/runner/work/Fusion/Fusion/packages/core/src/__tests__/a.test.ts",
+    PACKAGES,
+    "/local/worktree/Fusion",
+  );
+  assert.deepEqual(got, { pkg: "@fusion/core", file: "packages/core/src/__tests__/a.test.ts" });
+});
+
 test("extractFileDurations sums per-file durations and tolerates bad rows", () => {
   const root = "/repo";
   const report = {

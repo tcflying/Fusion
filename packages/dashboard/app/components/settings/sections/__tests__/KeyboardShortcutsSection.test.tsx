@@ -2,8 +2,9 @@ import { readFileSync } from "node:fs";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ShortcutCaptureInput } from "../ShortcutCaptureInput";
+import { readAppFile } from "../../../../test/cssFixture";
 
-const settingsModalCss = readFileSync("app/components/SettingsModal.css", "utf8");
+const settingsModalCss = readAppFile("components/SettingsModal.css");
 
 /*
 FNXC:DashboardShortcuts 2026-07-04-00:00:

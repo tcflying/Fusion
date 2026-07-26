@@ -1,14 +1,20 @@
 import { describe, it, expect } from "vitest";
 import { loadAllAppCss } from "../test/cssFixture";
-import { readFileSync } from "fs";
-import { resolve } from "path";
 
 const css = loadAllAppCss();
 
 describe("scroll-snap CSS", () => {
   describe("base (desktop) styles", () => {
-    it("contains scroll-snap-type: x proximity on .board", () => {
-      expect(css).toContain("scroll-snap-type: x proximity");
+    /*
+    FNXC:BoardNavigation 2026-07-24-10:05:
+    Desktop board scrolling is free-panning — the base `.board` rule must declare
+    `scroll-snap-type: none` so no browser snap settle animation slows a wheel/trackpad pan.
+    */
+    it("turns scroll snapping off on .board (desktop free-pan)", () => {
+      const boardBlock = css.match(/\.board\s*\{[^}]*\}/)?.[0];
+      expect(boardBlock).toBeDefined();
+      expect(boardBlock).toContain("scroll-snap-type: none");
+      expect(boardBlock).not.toContain("scroll-snap-type: x");
     });
 
     it("contains scroll-snap-align: center on .column", () => {

@@ -9,7 +9,7 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
-const { useLocaleFormat } = await import("../format");
+const { useLocaleFormat, formatCompactLifecycleDate } = await import("../format");
 
 describe("useLocaleFormat", () => {
   it("formats numbers with the active locale's separators", () => {
@@ -37,6 +37,23 @@ describe("useLocaleFormat", () => {
     });
     expect(en).toMatch(/January/);
     expect(fr).toMatch(/janvier/);
+  });
+
+  it("formats lifecycle timestamps as time today and calendar day otherwise", () => {
+    const now = new Date(2026, 6, 24, 12, 0);
+    const today = formatCompactLifecycleDate(new Date(2026, 6, 24, 9, 5).toISOString(), "en-US", now);
+    const previousDay = formatCompactLifecycleDate(new Date(2026, 6, 23, 9, 5).toISOString(), "en-US", now);
+    const priorYear = formatCompactLifecycleDate(new Date(2025, 6, 24, 9, 5).toISOString(), "en-US", now);
+
+    expect(today?.compact).toMatch(/9:05/);
+    expect(previousDay?.compact).toMatch(/Jul/);
+    expect(priorYear?.compact).toContain("2025");
+    expect(today?.full).toBeTruthy();
+  });
+
+  it("returns no lifecycle model for missing or invalid values", () => {
+    expect(formatCompactLifecycleDate(undefined, "en", new Date())).toBeNull();
+    expect(formatCompactLifecycleDate("not-a-date", "en", new Date())).toBeNull();
   });
 
   it("exposes the resolved locale", () => {

@@ -11,6 +11,7 @@ import type {
 } from "@fusion/core";
 import { BUILTIN_CODING_WORKFLOW_IR, PLAN_REVIEW_GROUP_ID, WorkflowIrError, getWorkflowExtensionRegistry, resolveMaxReworkCycles, isExperimentalFeatureEnabled, GRAPH_NATIVE_POST_MERGE_FLAG, isCompletionSummaryNode, classifyReviewLease, isWorkflowOptionalGroupEnabled } from "@fusion/core";
 import { isNonPlanDefectPlanReviewFailure } from "./transient-error-detector.js";
+import { isSessionContentionError } from "./transient-error-patterns.js";
 import { isRequiredArtifactReadFailedValue, parseRequiredArtifactMissingValue } from "./required-workflow-artifacts.js";
 
 import {
@@ -65,6 +66,16 @@ This is what makes the FN-1315 duplicate "Starting workflow step: Plan Review"
 interleaving impossible by construction (exactly one reviewer per gate per attempt).
 */
 export const PLAN_REVIEW_LEASE_HELD_VALUE = "plan-review-lease-held";
+
+/*
+FNXC:SessionContention 2026-07-25-21:30:
+A node that failed because another task holds the session path / sub-repo lease it needs is CONTENDED,
+not broken. It gets its own failure value so the executor can route it to a backoff hold that waits for
+the holder, instead of falling into the generic `exception` bucket — where Plan Review's classifier read
+it as a PROVIDER failure, retried twice with no delay, and parked the task once that budget was spent
+(the reported FN-1398/FN-1403 collision). Applies to EVERY node, not just Plan Review.
+*/
+export const SESSION_CONTENTION_HOLD_VALUE = "session-contention-hold";
 
 export type WorkflowNodeAbortKind = "engine-pause";
 
@@ -914,6 +925,27 @@ export class WorkflowGraphExecutor {
            * operator-actionable errors must remain visible in place so completed
            * execution work cannot bounce back to the planner column.
            */
+          /*
+           * FNXC:SessionContention 2026-07-25-21:30:
+           * Classified FIRST, and for EVERY optional group — not just Plan Review. A gate that could
+           * not start because another task holds its session path must neither traverse the failure
+           * edge to plan-replan (nothing about the plan is wrong) nor be labeled a provider failure
+           * (nothing about the provider is wrong). It becomes a contention hold the executor waits out.
+           */
+          const sessionContentionFailure =
+            stepStatus === "failed"
+            && (
+              verdictRaw === SESSION_CONTENTION_HOLD_VALUE
+              || isSessionContentionError(stepOutput ?? stepNotes ?? "")
+            );
+          if (sessionContentionFailure) {
+            this.deps.logTaskEntry?.(
+              `${logPrefix} ${groupName} is waiting on another task to release its session path — holding in place`,
+            );
+            context[`node:${node.id}:outcome`] = "failure";
+            context[`node:${node.id}:value`] = SESSION_CONTENTION_HOLD_VALUE;
+            return { outcome: "failure", value: SESSION_CONTENTION_HOLD_VALUE };
+          }
           const nonPlanDefectPlanReviewFailure =
             node.id === PLAN_REVIEW_GROUP_ID
             && stepStatus === "failed"
@@ -1482,6 +1514,13 @@ export class WorkflowGraphExecutor {
       } catch (error) {
         if (signal?.aborted) return this.withEnginePauseAbortContext(node, { outcome: "failure", value: "aborted" });
         lastError = error;
+        /*
+        FNXC:SessionContention 2026-07-25-21:30:
+        Immediate in-loop retries cannot clear a lease another task holds — they just burn the node's
+        attempt budget in milliseconds and erase the diagnostic behind a generic `exception`. Stop
+        retrying here and hand the executor a typed contention failure it can back off on.
+        */
+        if (isSessionContentionError(error instanceof Error ? error.message : String(error))) break;
       }
     }
 
@@ -1513,11 +1552,13 @@ export class WorkflowGraphExecutor {
       }
       return degraded;
     }
+    const lastErrorText = lastError instanceof Error ? lastError.message : String(lastError);
     const failureResult: WorkflowNodeResult = {
       outcome: "failure",
-      value: "exception",
+      // FNXC:SessionContention 2026-07-25-21:30: contention is a retryable hold, not an exception.
+      value: isSessionContentionError(lastErrorText) ? SESSION_CONTENTION_HOLD_VALUE : "exception",
       contextPatch: {
-        [`node:${node.id}:error`]: lastError instanceof Error ? lastError.message : String(lastError),
+        [`node:${node.id}:error`]: lastErrorText,
       },
     };
     if (recordProgress && this.shouldRecordNodeProgress(node)) {

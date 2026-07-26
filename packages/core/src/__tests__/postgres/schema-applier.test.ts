@@ -25,7 +25,6 @@ import { describe, it, expect, afterEach, beforeAll } from "vitest";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
-import { execSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -85,6 +84,7 @@ import {
   TASK_WEDGE_NOTIFICATION_VERSION,
   MILESTONE_ASSERTION_PROVENANCE_VERSION,
   MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
 } from "../../postgres/schema-applier.js";
 import { ProjectPartitionRekeyError, rekeyFallbackProjectPartition } from "../../postgres/migration-stamping.js";
 import type { PluginSchemaInitHook } from "../../postgres/plugin-schema-hook.js";
@@ -201,9 +201,19 @@ describe("schema-applier: immutable migration identities", () => {
   #2387 requires the runtime-role grants to run as an explicit forward migration;
   a baseline bump alone would leave already-created embedded clusters warn-spamming.
   */
-  it("registers runtime drained-marker grants at migration version 0032", () => {
-    expect(LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION).toBe("0032");
+  it("maps upstream runtime drained-marker grants after the published Room namespace", () => {
+    expect(LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION).toBe("0079");
     expect(Number(SCHEMA_BASELINE_VERSION)).toBeGreaterThanOrEqual(Number(LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION));
+  });
+
+  it("keeps every migration identity unique and the binary ceiling at the highest registered version", () => {
+    const versions = SCHEMA_MIGRATIONS.map((migration) => migration.version);
+    expect(new Set(versions).size).toBe(versions.length);
+    expect(SCHEMA_BASELINE_VERSION).toBe(
+      versions.reduce((highest, version) =>
+        Number(version) > Number(highest) ? version : highest
+      ),
+    );
   });
 
   /*
@@ -280,15 +290,55 @@ function uniqueDbName(): string {
 /*
 FNXC:PgTestAuthFix 2026-07-14-00:00:
 The inline adminExec used process.env.USER for the psql -U flag, which is 'runner' on GitHub Actions (not 'postgres'). Use the PG_TEST_URL_BASE connection string instead so credentials are always correct.
+
+FNXC:PgSchemaApplierSlowTest 2026-07-23-17:30:
+Slow-test fix: adminExec previously spawned a fresh `psql` subprocess per call via
+execSync. setupFreshDb made two such spawns (a redundant DROP + the CREATE) and
+teardownDb a third, so ~55 tests paid ~165 process starts — dominating this file's
+~90s wall-time. Route admin CREATE/DROP DATABASE through a short-lived postgres.js
+maintenance connection instead (postgres.js sends each statement as a simple query,
+so CREATE/DROP DATABASE runs fine outside any transaction — empirically verified).
+This mirrors the shared pg-test-harness `adminExecAsync` rationale: no shell
+children to orphan past the test timeout, and the call is timeout-bounded with a
+forced socket close so a stuck catalog lock cannot hang the vitest worker.
 */
-function adminExec(statement: string): void {
-  // psql via execSync for DDL that the postgres.js connection pool can't run
-  // (CREATE/DROP DATABASE cannot run inside a transaction). This is short
-  // deterministic DDL, the acceptable execSync use per AGENTS.md.
-  execSync(`psql "${PG_TEST_URL_BASE}/postgres" -v ON_ERROR_STOP=1 -c "${statement.replace(/"/g, '\\"')}"`, {
-    stdio: "pipe",
-    env: process.env,
-  });
+async function adminExec(statement: string, timeoutMs = 15_000): Promise<void> {
+  let timedOut = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let client: ReturnType<typeof postgres> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        client = postgres(`${PG_TEST_URL_BASE}/postgres`, {
+          max: 1,
+          prepare: false,
+          onnotice: () => {},
+        });
+        // Server-side cancel slightly before the JS race so PG stops the statement.
+        const serverTimeoutMs = Math.max(1_000, timeoutMs - 500);
+        await client.unsafe(`SET statement_timeout = ${serverTimeoutMs}`);
+        await client.unsafe(statement);
+      })(),
+      new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          // Force-close the socket so a late DROP/CREATE cannot outlive this call.
+          void client?.end({ timeout: 0 }).catch(() => {});
+          reject(new Error(`adminExec timed out after ${timeoutMs}ms: ${statement}`));
+        }, timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    if (timedOut) throw error;
+    throw new Error(
+      `adminExec failed: ${error instanceof Error ? error.message : String(error)}\nstatement: ${statement}`,
+    );
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (client) {
+      await client.end({ timeout: 5 }).catch(() => {});
+    }
+  }
 }
 
 interface TestContext {
@@ -300,12 +350,10 @@ interface TestContext {
 
 async function setupFreshDb(): Promise<TestContext> {
   const dbName = uniqueDbName();
-  try {
-    adminExec(`DROP DATABASE IF EXISTS "${dbName}"`);
-  } catch {
-    // ignore — may not exist
-  }
-  adminExec(`CREATE DATABASE "${dbName}"`);
+  // FNXC:PgSchemaApplierSlowTest 2026-07-23-17:30: uniqueDbName is pid+random, so
+  // the database can never pre-exist — the former DROP-before-CREATE was a pure
+  // wasted admin round-trip per test and is removed.
+  await adminExec(`CREATE DATABASE "${dbName}"`);
   const testUrl = `${PG_TEST_URL_BASE}/${dbName}`;
   const sqlConn = postgres(testUrl, { max: 2, prepare: false, onnotice: () => {} });
   const db = drizzle(sqlConn);
@@ -320,7 +368,7 @@ async function teardownDb(ctx: TestContext | null): Promise<void> {
     // best-effort
   }
   try {
-    adminExec(`DROP DATABASE IF EXISTS "${ctx.dbName}"`);
+    await adminExec(`DROP DATABASE IF EXISTS "${ctx.dbName}"`);
   } catch {
     // best-effort
   }
@@ -676,7 +724,7 @@ pgDescribe("schema-applier: VAL-SCHEMA-001 final-schema parity (table counts)", 
     // + 1 task_verification_requests + 1 durable symbol_locks table (FN-8305)
     // + 1 mission_lineage_stops (FNXC:MissionLineageBudget FN-8543 / migration 0035).
     // Plugin tables are added separately by the hook.
-    expect(bySchema.project).toBe(96);
+    expect(bySchema.project).toBe(98);
     expect(bySchema.central).toBe(18);
     expect(bySchema.archive).toBe(1);
   });
@@ -1646,6 +1694,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       MILESTONE_ASSERTION_PROVENANCE_VERSION,
       MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
     ]);
     expect((await applySchemaBaseline(ctx.db, { pluginHooks: [] })).applied).toBe(false);
   });
@@ -1707,6 +1756,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       MILESTONE_ASSERTION_PROVENANCE_VERSION,
       MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
     ]);
   });
 
@@ -1901,6 +1951,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       MILESTONE_ASSERTION_PROVENANCE_VERSION,
       MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
     ]);
   });
 
@@ -1976,6 +2027,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       MILESTONE_ASSERTION_PROVENANCE_VERSION,
       MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
     ]);
   });
 
@@ -2051,6 +2103,7 @@ pgDescribe("schema-applier: automation project-isolation upgrade", () => {
       TASK_WEDGE_NOTIFICATION_VERSION,
       MILESTONE_ASSERTION_PROVENANCE_VERSION,
       MISSION_LINEAGE_STOP_VERSION,
+  CHAT_SESSION_TAGS_VERSION,
     ]);
   });
 });

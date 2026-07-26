@@ -5,6 +5,7 @@ import type { BoardWorkflowDefinition } from "../../api";
 import { loadAllAppCssBaseOnly } from "../../test/cssFixture";
 import { computeMenuWidth, OPTION_DECORATIONS_WIDTH, WorkflowSwitcher } from "../WorkflowSwitcher";
 import type { WorkflowStatusCounts } from "../workflowStatusCounts";
+import { readAppFile } from "../../test/cssFixture";
 
 const workflows: BoardWorkflowDefinition[] = [
   {
@@ -150,7 +151,7 @@ describe("WorkflowSwitcher", () => {
     expect(triggerRule).toMatch(/max-width:\s*calc\(var\(--space-xl\) \* 12\)/);
     const currentNameRule = cssRuleFor(css, ".workflow-switcher-current-name,\n.workflow-switcher-option-name");
     expect(currentNameRule).toMatch(/text-overflow:\s*ellipsis/);
-    const switcherCss = readFileSync("app/components/WorkflowSwitcher.css", "utf8");
+    const switcherCss = readAppFile("components/WorkflowSwitcher.css");
     expect(switcherCss).toMatch(/@media\s*\(max-width:\s*768px\)[\s\S]*max-width:\s*calc\(100vw - var\(--space-xl\)\);/);
   });
 
@@ -486,7 +487,7 @@ describe("WorkflowSwitcher", () => {
 
   it("styles the merging indicator with a flashing animation and reduced-motion fallback", () => {
     const css = loadAllAppCssBaseOnly();
-    const switcherCss = readFileSync("app/components/WorkflowSwitcher.css", "utf8");
+    const switcherCss = readAppFile("components/WorkflowSwitcher.css");
     const indicatorRule = cssRuleFor(css, ".workflow-switcher-merging-indicator");
 
     expect(indicatorRule).toContain("background: var(--color-warning);");

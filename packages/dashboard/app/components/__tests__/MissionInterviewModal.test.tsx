@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MissionInterviewModal } from "../MissionInterviewModal";
+import { readAppFile } from "../../test/cssFixture";
 
-const missionInterviewCss = readFileSync("app/components/MissionInterviewModal.css", "utf8");
+const missionInterviewCss = readAppFile("components/MissionInterviewModal.css");
 
 const mockStartMissionInterview = vi.fn();
 const mockRespondToMissionInterview = vi.fn();

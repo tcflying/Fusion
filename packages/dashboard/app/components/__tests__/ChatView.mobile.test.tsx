@@ -24,6 +24,7 @@ import {
   installChatViewEnv,
   mockFetchModels,
 } from "./ChatView.test-harness";
+import { readAppFile } from "../../test/cssFixture";
 
 // Mock the hooks
 vi.mock("../../hooks/useChat");
@@ -2480,8 +2481,8 @@ describe("ChatView empty-state token guards", () => {
   });
 
   it("keeps ChatView source files free of deprecated secondary token", async () => {
-    const chatViewTsx = readFileSync("app/components/ChatView.tsx", "utf8");
-    const chatViewCss = readFileSync("app/components/ChatView.css", "utf8");
+    const chatViewTsx = readAppFile("components/ChatView.tsx");
+    const chatViewCss = readAppFile("components/ChatView.css");
     const legacyToken = `--text-${"secondary"}`;
 
     expect(chatViewTsx.includes(legacyToken)).toBe(false);

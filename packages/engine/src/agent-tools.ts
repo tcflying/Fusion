@@ -24,6 +24,8 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentReflectionService } from "./agent-reflection.js";
 import { createLogger } from "./logger.js";
+// FNXC:PlanArtifactPersistence 2026-07-26-03:55: PROMPT.md is filesystem-only; mirror plan writes into the DB.
+import { mirrorPlanToProjectDb } from "./plan-artifact-writeback.js";
 import { fetchWebContent, WebFetchError } from "./web-fetch.js";
 import type { RunAuditor } from "./run-audit.js";
 import { computeApprovalDedupeKey } from "./agent-action-gate.js";
@@ -252,6 +254,22 @@ export const workflowSelectParams = Type.Object({
 export const taskPromoteParams = Type.Object({
   task_id: Type.Optional(
     Type.String({ description: "Held task to promote. Defaults to the current task." }),
+  ),
+  /*
+  FNXC:WorkflowScheduling 2026-07-25-05:40:
+  Agent-native parity with the dashboard's force-promote override: an agent that
+  has read the card and judged the pending replan / Plan Review not worth waiting
+  for can start execution anyway. Opt-in per call and never defaulted on — the
+  automatic surfaces (hold-release sweep, webhook release) still cannot force, so
+  FN-7648 holds for everything that is not an explicit promote request.
+  */
+  force: Type.Optional(
+    Type.Boolean({
+      description:
+        "Start execution even when the task is still waiting on planning or plan review "
+        + "(rejection 'unplanned-for-execution'). Waives ONLY that gate — hold membership and "
+        + "downstream capacity still apply — and cancels the pending replan. Default false.",
+    }),
   ),
 });
 
@@ -958,6 +976,53 @@ async function getAgentMemoryWindow(rootDir: string, agentMemory: AgentMemoryCon
 }
 
 // ── Tool factory functions ────────────────────────────────────────────────
+
+/**
+ * FNXC:EphemeralAgentTaskCreation 2026-07-26-06:20:
+ * When the project policy is `deny`, an ephemeral/runtime task-worker must not merely
+ * be REFUSED at execute time — `fn_task_create` must not be registered for that session
+ * at all, so the model never sees the tool in its tool list.
+ *
+ * Incident: an executing agent under a `deny` project fired five parallel `fn_task_create`
+ * calls, reported them as timed out, retried them sequentially, and left ten tasks on a
+ * board whose operator had switched follow-up creation off. An execute-time-only refusal
+ * still invites the model to plan around the tool, burn turns retrying it, and — on any
+ * lane where `callerIsEphemeral` fails to reach the factory — create the tasks anyway.
+ * Suppressing registration makes the operator's Deny structural instead of advisory.
+ *
+ * `upon_validation` keeps the tool registered: that policy routes a proposal to the
+ * operator mailbox and is a supported agent action, not a prohibition.
+ */
+export function isAgentTaskCreateToolAvailable(
+  settings: Pick<Settings, "ephemeralAgentTaskCreationPolicy" | "ephemeralAgentsCanCreateTasks"> | undefined | null,
+  callerIsEphemeral: boolean | undefined,
+): boolean {
+  if (!callerIsEphemeral) return true;
+  return fusionCore.resolveEphemeralTaskCreationPolicy(settings ?? {}) !== "deny";
+}
+
+/**
+ * FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+ * `fn_delegate_task` creates a task through the same `createAgentTask` primitive as
+ * `fn_task_create`, so the follow-up-task policy must govern both or it governs neither.
+ * Code review of the first Deny fix found the gap: the tool validated only that the TARGET
+ * agent is non-ephemeral and never checked the CALLER, so under Deny an ephemeral worker
+ * could enumerate agents and delegate unlimited tasks to any permanent one — reproducing the
+ * ten-duplicate incident through a sibling tool name.
+ *
+ * Delegation is withheld under BOTH non-allow policies, which is stricter than the
+ * `fn_task_create` rule. `upon_validation` means "an operator approves before work is filed";
+ * delegation has no proposal channel of its own, so honoring it as an allow would launder a
+ * create past the very validation the operator asked for. Under `upon_validation` the agent
+ * still has the sanctioned path: `fn_task_create` remains registered and mails a proposal.
+ */
+export function isAgentDelegateTaskToolAvailable(
+  settings: Pick<Settings, "ephemeralAgentTaskCreationPolicy" | "ephemeralAgentsCanCreateTasks"> | undefined | null,
+  callerIsEphemeral: boolean | undefined,
+): boolean {
+  if (!callerIsEphemeral) return true;
+  return fusionCore.resolveEphemeralTaskCreationPolicy(settings ?? {}) === "allow";
+}
 
 type AgentTaskCreationOptions = {
   rootDir?: string;
@@ -1897,6 +1962,16 @@ export function createTaskPromptWriteTool(store: TaskStore, taskId: string, runC
         if (persisted?.prompt !== params.content) {
           throw new Error("authoritative PROMPT.md read-back did not match the requested content; persistence could not be verified");
         }
+        /*
+        FNXC:PlanArtifactPersistence 2026-07-26-03:55:
+        `updateTask({ prompt })` writes the project-root PROMPT.md and task.json, but `project.tasks` has
+        no `prompt` column — the spec would live only as a file in the project checkout. Mirror it into the
+        `plan` task document so the plan is durable in the project database too. Best-effort: a mirror
+        failure must not fail a write whose authoritative persistence was just verified above.
+        */
+        await mirrorPlanToProjectDb(store, taskId, params.content, {
+          author: runContext?.agentId ?? "agent",
+        });
         return {
           content: [{ type: "text" as const, text: `Updated PROMPT.md for ${taskId}.` }],
           details: {},
@@ -2781,6 +2856,13 @@ export function createWorkflowSelectTool(store: TaskStore, currentTaskId: string
  * Create a `fn_task_promote` tool that manually releases a held task out of its
  * hold column — the agent-native equivalent of the dashboard's "promote" action.
  * Defaults to the current task. Wraps {@link promoteHeldTask}.
+ *
+ * FNXC:WorkflowScheduling 2026-07-25-05:40:
+ * `force: true` mirrors the dashboard's confirm-dialog override for the
+ * `unplanned-for-execution` rejection. The rejection message names the flag so a
+ * caller that hit the gate can decide to waive it rather than guessing; the
+ * result text says so explicitly when a promote was forced, because "started
+ * without its plan review" is not a detail to bury.
  */
 export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): ToolDefinition {
   return {
@@ -2790,25 +2872,39 @@ export function createTaskPromoteTool(store: TaskStore, currentTaskId: string): 
       "Manually promote a held task out of its hold column, releasing it regardless of the " +
       "hold's release kind (the explicit operator action a 'manual' hold waits for). Defaults " +
       "to the current task. Returns the destination column, or a rejection reason when the task " +
-      "is not held or the destination is full.",
+      "is not held or the destination is full. Pass force:true to start execution even when " +
+      "planning or plan review is still outstanding (that waives the plan gate and cancels the " +
+      "pending replan; capacity still applies).",
     parameters: taskPromoteParams,
     execute: async (_id: string, params: Static<typeof taskPromoteParams>) => {
       const taskId = params.task_id?.trim() || currentTaskId;
+      const force = params.force === true;
       try {
-        const outcome = await promoteHeldTask(store, taskId);
+        const outcome = await promoteHeldTask(store, taskId, {}, { force });
         if (outcome.released) {
+          const forcedNote = outcome.forcedUnplanned
+            ? " Forced past the outstanding planning/plan review — the pending replan was cancelled."
+            : "";
           return {
             content: [{
               type: "text" as const,
-              text: `Promoted ${taskId} to column '${outcome.toColumn}'.`,
+              text: `Promoted ${taskId} to column '${outcome.toColumn}'.${forcedNote}`,
             }],
-            details: { taskId, released: true, toColumn: outcome.toColumn },
+            details: {
+              taskId,
+              released: true,
+              toColumn: outcome.toColumn,
+              forcedUnplanned: outcome.forcedUnplanned === true,
+            },
           };
         }
+        const forceHint = outcome.rejection === "unplanned-for-execution"
+          ? " Pass force:true to start execution anyway."
+          : "";
         return {
           content: [{
             type: "text" as const,
-            text: `ERROR: Could not promote ${taskId}: ${outcome.rejection ?? "unknown"}.`,
+            text: `ERROR: Could not promote ${taskId}: ${outcome.rejection ?? "unknown"}.${forceHint}`,
           }],
           details: { taskId, released: false, rejection: outcome.rejection },
           isError: true,
@@ -4766,6 +4862,29 @@ export function createDelegateTaskTool(
       "fn_workflow_list to discover valid IDs.",
     parameters: delegateTaskParams,
     execute: async (_id: string, params: Static<typeof delegateTaskParams>) => {
+      /*
+      FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+      Caller-side policy gate, mirroring fn_task_create. The target-agent check below is a
+      routing rule, not an authorization one — it never asked whether the CALLER may create
+      work at all. Fail open only on a settings read error so a store hiccup cannot strand
+      delegation for permanent agents.
+      */
+      if (options?.callerIsEphemeral) {
+        const settings = typeof (taskStore as { getSettings?: unknown }).getSettings === "function"
+          ? await taskStore.getSettings().catch(() => ({} as Settings))
+          : ({} as Settings);
+        if (!isAgentDelegateTaskToolAvailable(settings as Settings, true)) {
+          const policy = fusionCore.resolveEphemeralTaskCreationPolicy(settings as Settings);
+          const message = policy === "deny"
+            ? "Ephemeral task-worker agents are not allowed to create tasks (ephemeral agent task creation is denied for this project), and delegation creates a task."
+            : "Ephemeral task-worker agents must route new work through fn_task_create for operator validation; delegation cannot bypass that review.";
+          return {
+            content: [{ type: "text" as const, text: `ERROR: ${message}` }],
+            details: { error: message, rule: "ephemeral-agents-cannot-create-tasks", policy },
+            isError: true,
+          };
+        }
+      }
       // Validate target agent exists
       const agent = await agentStore.getAgent(params.agent_id);
       if (!agent) {

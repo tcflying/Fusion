@@ -4,16 +4,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act, cleanup } from "@testing-library/react";
 import { EngineControlMenu } from "../EngineControlMenu";
 import { ConfirmDialogProvider } from "../../hooks/useConfirm";
+import { readAppFile } from "../../test/cssFixture";
 
-const engineControlMenuCss = readFileSync(
-  join(process.cwd(), "app/components/EngineControlMenu.css"),
-  "utf8",
-);
+const engineControlMenuCss = readAppFile("components/EngineControlMenu.css");
 
-const commandCenterControlsCss = readFileSync(
-  join(process.cwd(), "app/components/command-center/CommandCenterControls.css"),
-  "utf8",
-);
+const commandCenterControlsCss = readAppFile("components/command-center/CommandCenterControls.css");
 
 const defaultSettings = {
   maxConcurrent: 2,

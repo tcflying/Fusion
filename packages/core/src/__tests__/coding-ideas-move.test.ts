@@ -68,6 +68,59 @@ pgDescribe("Coding (Ideas) custom-column moves (workflow-columns graduation)", (
     expect(moved.column).toBe("todo");
   });
 
+  /*
+  FNXC:CodingIdeasWorkflow 2026-07-25-10:05:
+  Regression for the one-way Ideas intake. The reverse move (Todo → Ideas) was rejected with
+  "Invalid transition: 'todo' → 'ideas'. Valid targets: in-progress, triage, archived" because `todo`
+  is a LEGACY column id, so validation used the closed VALID_TRANSITIONS map — which cannot know
+  about a workflow-declared "ideas" column — instead of the task's own workflow adjacency. Legacy
+  source columns now UNION both, so an operator can demote a card back to Ideas.
+
+  Surface enumeration (invariant: a legacy source column honors the task's workflow adjacency in
+  addition to the legacy table):
+   - Board drag / context menu / task detail / List view / CLI + tools all funnel through
+     store.moveTask, so the store-level assertions below cover every move surface.
+   - Both move sources (user and engine).
+   - Round-trip: the demoted card can be promoted again.
+   - Default (legacy-column) workflow parity: the union never widens builtin:coding, and a column
+     the workflow does not declare still rejects.
+  */
+  it("moves an ideas-workflow task back from todo to the ideas intake column", async () => {
+    const store = harness.store();
+    const task = await store.createTask({ description: "idea", workflowId: "builtin:coding-ideas" });
+    await store.moveTask(task.id, "todo", { moveSource: "user" });
+
+    const demoted = await store.moveTask(task.id, "ideas", { moveSource: "user" });
+    expect(demoted.column).toBe("ideas");
+
+    // Round-trip: still promotable after the demotion.
+    expect((await store.moveTask(task.id, "todo", { moveSource: "user" })).column).toBe("todo");
+  });
+
+  it("allows the todo → ideas move from an engine source too", async () => {
+    const store = harness.store();
+    const task = await store.createTask({ description: "idea", workflowId: "builtin:coding-ideas" });
+    await store.moveTask(task.id, "todo", { moveSource: "user" });
+
+    const demoted = await store.moveTask(task.id, "ideas", { moveSource: "engine" });
+    expect(demoted.column).toBe("ideas");
+  });
+
+  it("keeps the default workflow's legacy adjacency unchanged", async () => {
+    const store = harness.store();
+    const task = await store.createTask({ description: "legacy", workflowId: "builtin:coding" });
+
+    // A column the default workflow never declares is still rejected...
+    await expect(
+      store.moveTask(task.id, "ideas", { moveSource: "user" }),
+    ).rejects.toThrow(/Invalid transition: '.*' → 'ideas'/);
+    // ...and so is a legacy-but-non-adjacent target, with the verbatim legacy target list.
+    await store.moveTask(task.id, "todo", { moveSource: "user" });
+    await expect(
+      store.moveTask(task.id, "in-review", { moveSource: "user" }),
+    ).rejects.toThrow("Invalid transition: 'todo' → 'in-review'. Valid targets: in-progress, triage, archived");
+  });
+
   it("cancels an active task continuation when a user sends implementation back to todo", async () => {
     const store = harness.store();
     const task = await store.createTask({ description: "idea", workflowId: "builtin:coding-ideas" });

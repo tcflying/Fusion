@@ -320,30 +320,43 @@ describe("SettingsModal", () => {
       expect(await screen.findByText(/Restarting… Your connection will close shortly/)).toBeInTheDocument();
     });
 
-    it("keeps the restart button disabled with manual guidance when unsupported", async () => {
+    /*
+    FNXC:SettingsUpdate 2026-07-25-10:05:
+    Capability is advisory, not a hard block. An unsupported host shows the manual
+    guidance but the button still reaches the server, so the operator gets the real
+    refusal instead of a control that silently does nothing when clicked.
+    */
+    it("shows manual guidance but still surfaces the server refusal when unsupported", async () => {
       mockFetchSystemInfo.mockResolvedValue({ supervised: false, restartSupported: false });
+      mockRequestSystemRestart.mockRejectedValue(new Error("Restart is not available: no supervising parent."));
 
       const restartButton = await renderUpdatedSettings();
 
-      expect(restartButton).toBeDisabled();
-      expect(screen.getByText(/Needs a supervising parent/)).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByText(/Needs a supervising parent/)).toBeInTheDocument());
+      expect(restartButton).toBeEnabled();
+
+      await settingsModalUser.click(restartButton);
+
+      expect(mockRequestSystemRestart).toHaveBeenCalledWith("settings-update");
+      expect(await screen.findByText(/Restart is not available: no supervising parent\./)).toBeInTheDocument();
     });
 
-    it("keeps the restart button disabled while system information is loading", async () => {
+    it("still allows a restart attempt while system information is loading", async () => {
       mockFetchSystemInfo.mockReturnValue(new Promise(() => {}));
 
       const restartButton = await renderUpdatedSettings();
 
-      expect(restartButton).toBeDisabled();
+      expect(restartButton).toBeEnabled();
+      expect(screen.queryByText(/Needs a supervising parent/)).not.toBeInTheDocument();
     });
 
-    it("fails closed with manual guidance when system information cannot load", async () => {
+    it("shows manual guidance when system information cannot load", async () => {
       mockFetchSystemInfo.mockRejectedValue(new Error("unavailable"));
 
       const restartButton = await renderUpdatedSettings();
 
-      await waitFor(() => expect(restartButton).toBeDisabled());
-      expect(screen.getByText(/Needs a supervising parent/)).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByText(/Needs a supervising parent/)).toBeInTheDocument());
+      expect(restartButton).toBeEnabled();
     });
 
     it("disables the restart button and shows a spinner while scheduling", async () => {
@@ -374,6 +387,45 @@ describe("SettingsModal", () => {
 
       expect(await screen.findByText(/Restart could not be scheduled/)).toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Restart Fusion" })).toBeEnabled();
+    });
+
+    /*
+    FNXC:SettingsUpdate 2026-07-25-10:05:
+    Regression: restart capability is a property of the HOST, not of a particular
+    update check. Clicking "Check for updates" repeatedly (same updateAvailable
+    result each time) used to strand restartSupported at `undefined` — the probe
+    was keyed on updateAvailable flipping — so the post-install "Restart Fusion"
+    button was disabled with "Needs a supervising parent" on a supervised host.
+    The invariant asserted here is: on a supervised host the restart button is
+    enabled after an install regardless of how many checks preceded it.
+    */
+    it("keeps the restart button enabled after repeated update checks", async () => {
+      mockCheckForUpdates.mockResolvedValue(availableUpdate);
+      renderModal();
+      await waitForSettingsModalReady();
+
+      const checkButton = screen.getByRole("button", { name: "Check for updates" });
+      await settingsModalUser.click(checkButton);
+      await screen.findByRole("button", { name: "Update now" });
+      await settingsModalUser.click(checkButton);
+      await screen.findByRole("button", { name: "Update now" });
+
+      await settingsModalUser.click(screen.getByRole("button", { name: "Update now" }));
+
+      const restartButton = await screen.findByRole("button", { name: "Restart Fusion" });
+      await waitFor(() => expect(restartButton).toBeEnabled());
+      expect(screen.queryByText(/Needs a supervising parent/)).not.toBeInTheDocument();
+    });
+
+    it("clears stale unsupported guidance by re-probing after a successful install", async () => {
+      // Mount probe fails (fails closed to "unsupported"); the post-install re-probe
+      // proves the host is supervised after all.
+      mockFetchSystemInfo.mockRejectedValueOnce(new Error("unavailable"));
+
+      const restartButton = await renderUpdatedSettings();
+
+      await waitFor(() => expect(screen.queryByText(/Needs a supervising parent/)).not.toBeInTheDocument());
+      expect(restartButton).toBeEnabled();
     });
 
     it("keeps the retry path and hides restart when update installation fails", async () => {
@@ -1979,8 +2031,17 @@ describe("SettingsModal", () => {
       expect(screen.queryByRole("button", { name: /^Save$/i })).not.toBeInTheDocument();
     });
 
+    /*
+    FNXC:SettingsModalTests 2026-07-27-17:20:
+    Target the footer/mobile Close affordances by their scoped selectors (`.modal-actions-right button`,
+    `.settings-embedded-mobile-close`) rather than `*ByRole("button", { name: "Close" })`. The role+name
+    query recomputes the accessible name for every button in the large Settings tree, which added ~700ms
+    per dismissal test in the dashboard's slowest feedback-loop suite. The scoped selectors mirror the
+    already-fast header/Escape/backdrop siblings while keeping the flush-on-close assertions identical
+    (Standing Rule: do not add slow tests / prefer narrow seams over whole-tree walks).
+    */
     it.each([
-      ["footer Close", async (container: HTMLElement) => settingsModalUser.click(screen.getAllByRole("button", { name: "Close" }).at(-1)!)],
+      ["footer Close", async (container: HTMLElement) => settingsModalUser.click(container.querySelector(".modal-actions-right button") as HTMLButtonElement)],
       ["header close", async (container: HTMLElement) => settingsModalUser.click(container.querySelector(".modal-close") as HTMLButtonElement)],
       ["Escape", async () => { fireEvent.keyDown(document, { key: "Escape" }); }],
       ["backdrop", async (container: HTMLElement) => {
@@ -2007,10 +2068,11 @@ describe("SettingsModal", () => {
 
     it("flushes the latest edit through the embedded mobile close affordance", async () => {
       const onClose = vi.fn();
-      renderModal({ initialSection: "general", presentation: "embedded", onClose });
+      const { container } = renderModal({ initialSection: "general", presentation: "embedded", onClose });
       await waitForSettingsModalReady();
       changeProjectToggle();
-      await settingsModalUser.click(screen.getByRole("button", { name: "Close" }));
+      // FNXC:SettingsModalTests 2026-07-27-17:20: scoped selector avoids the whole-tree accessible-name walk of getByRole({ name: "Close" }).
+      await settingsModalUser.click(container.querySelector(".settings-embedded-mobile-close") as HTMLButtonElement);
 
       await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledWith(
         expect.objectContaining({ capacityRiskBannerEnabled: true }),
@@ -2055,16 +2117,27 @@ describe("SettingsModal", () => {
       mockUpdateSettings.mockRejectedValueOnce(new Error("offline"));
       renderModal({ initialSection: "general", addToast });
       await waitForSettingsModalReady();
+      /*
+      FNXC:SettingsModalTests 2026-07-25-18:20:
+      Drive the 500ms auto-save debounce deterministically with fake timers instead of a real-timer waitFor.
+      Waiting the debounce out on the wall clock (two cycles) added ~1s of dead time to the dashboard's
+      slowest feedback-loop suite for no added coverage; advancing fake timers keeps the retry semantics
+      identical while removing the artificial wait (Standing Rule: prefer fake timers over real time waits).
+      */
+      vi.useFakeTimers();
 
       changeProjectToggle();
-      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledTimes(1));
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
       expect(addToast).toHaveBeenCalledWith("offline", "error");
       expect(screen.getByRole("dialog")).toBeInTheDocument();
 
       changeProjectToggle();
       changeProjectToggle();
-      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledTimes(2));
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(mockUpdateSettings).toHaveBeenCalledTimes(2);
       expect(screen.queryByRole("button", { name: /^Save$/i })).not.toBeInTheDocument();
+      vi.useRealTimers();
     });
 
     it("trails an in-flight snapshot so an older response cannot overwrite the final edit", async () => {
@@ -2072,15 +2145,20 @@ describe("SettingsModal", () => {
       mockUpdateSettings.mockImplementationOnce(() => new Promise<void>((resolve) => { finishFirstSave = resolve; }));
       renderModal({ initialSection: "general" });
       await waitForSettingsModalReady();
+      // FNXC:SettingsModalTests 2026-07-25-18:20: fake timers flush the 500ms auto-save debounce without a real-timer wait; the trailing-snapshot persist still fires when the in-flight save resolves.
+      vi.useFakeTimers();
 
       changeProjectToggle();
-      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledTimes(1));
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(mockUpdateSettings).toHaveBeenCalledTimes(1);
       changeProjectToggle();
       await act(async () => { finishFirstSave?.(); });
 
-      await waitFor(() => expect(mockUpdateSettings).toHaveBeenCalledTimes(2));
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+      expect(mockUpdateSettings).toHaveBeenCalledTimes(2);
       expect(mockUpdateSettings.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ capacityRiskBannerEnabled: true }));
       expect(mockUpdateSettings.mock.calls[1]?.[0]).toEqual(expect.objectContaining({ capacityRiskBannerEnabled: false }));
+      vi.useRealTimers();
     });
   });
 

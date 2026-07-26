@@ -61,10 +61,16 @@ function expectTouchPanXY(css: string, selector: string): void {
   expect(block).not.toMatch(/touch-action:\s*pan-y\s*;/);
 }
 
-function expectContainmentScroller(block: string): void {
+/*
+FNXC:BoardNavigation 2026-07-24-10:05:
+Snap expectations split by tier: FN-6378 overscroll containment still holds on every board
+scroller, but proximity snapping is phone-tier only (desktop pans free, with no browser snap
+settle animation). `snap: "proximity"` asserts the mobile blocks, `snap: "none"` the base rules.
+*/
+function expectContainmentScroller(block: string, snap: "proximity" | "none" = "proximity"): void {
   expect(block).toContain("overflow-x: auto");
   expect(block).toContain("overscroll-behavior-x: contain");
-  expect(block).toContain("scroll-snap-type: x proximity");
+  expect(block).toContain(snap === "proximity" ? "scroll-snap-type: x proximity" : "scroll-snap-type: none");
   expect(block).not.toContain("scroll-snap-type: x mandatory");
 }
 
@@ -114,10 +120,10 @@ describe("mobile board column swipe target containment (FN-6389)", () => {
     expect(widthContainmentBlock).toContain("max-inline-size: 100%;");
   });
 
-  it("preserves FN-6378 horizontal overscroll containment and proximity snap", () => {
-    expectContainmentScroller(ruleBlock(baseCss, ".board"));
-    expectContainmentScroller(ruleBlock(mobileCss, ".board"));
-    expectContainmentScroller(ruleBlock(baseCss, ".board.board-workflow-columns"));
-    expectContainmentScroller(ruleBlock(baseCss, ".lane-columns"));
+  it("preserves FN-6378 horizontal overscroll containment, with proximity snap on phones and none on desktop", () => {
+    expectContainmentScroller(ruleBlock(baseCss, ".board"), "none");
+    expectContainmentScroller(ruleBlock(mobileCss, ".board"), "proximity");
+    expectContainmentScroller(ruleBlock(baseCss, ".board.board-workflow-columns"), "none");
+    expectContainmentScroller(ruleBlock(baseCss, ".lane-columns"), "none");
   });
 });

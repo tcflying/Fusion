@@ -67,6 +67,8 @@ import { useNavigationHistoryContext } from "../hooks/useNavigationHistory";
 import { useMobileScrollLock } from "../hooks/useMobileScrollLock";
 import { useAutosizeTextarea } from "../hooks/useAutosizeTextarea";
 import { useToast } from "../hooks/useToast";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 
 const WARNING_ICON = "⚠️";
 
@@ -529,6 +531,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const [generationActivity, setGenerationActivity] = useState<PlanningGenerationActivity>("initial_plan");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const initialPlanDictation = useComposerDictation({ textareaRef, value: initialPlan, onChange: setInitialPlan, projectId });
   // Align long-form planning composers with FN-5146's 640px chat convention so
   // multi-paragraph drafts stay visible; SummaryView keeps a larger expanded
   // cap so the two-tier collapsed/expanded editing UX remains intact.
@@ -763,10 +766,17 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   const commentInputRef = useRef<HTMLTextAreaElement>(null);
   const commentEditorRef = useRef<HTMLDivElement>(null);
   const addCommentTriggerRef = useRef<HTMLButtonElement>(null);
-  const mobileAddCommentTriggerRef = useRef<HTMLButtonElement>(null);
   const restoreCommentTriggerFocusRef = useRef(false);
   const isCommentEditorOpenRef = useRef(false);
   const pendingOpenCommentQuoteRef = useRef<string | null>(null);
+  /*
+  FNXC:PlanningComments 2026-07-25-10:20:
+  While a pointer drag is extending a plan selection, selectionchange fires on every mouse move.
+  Mounting/unmounting the Add-comment control on each of those intermediate ranges made the button
+  strobe under the cursor on desktop. This ref suppresses quote writes for the duration of the drag
+  so the control appears exactly once, when the selection is done (pointerup/pointercancel).
+  */
+  const planSelectionDragActiveRef = useRef(false);
 
   const setCommentEditorOpen = useCallback((open: boolean) => {
     /*
@@ -815,12 +825,12 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
   const focusAddCommentTrigger = useCallback(() => {
     /*
-    FNXC:PlanningComments 2026-07-24-05:35:
-    Tablet and phone both expose the action-rail trigger; only wide desktop uses the document
-    variant. Match the 1024px CSS gate so focus restore lands on the visible control.
+    FNXC:PlanningComments 2026-07-25-10:20:
+    One trigger at every breakpoint. The document-adjacent duplicate that sat at the end of the plan
+    text was removed (FN operator report: two "Add comment to selection" buttons), so focus restore
+    always targets the plan action rail control.
     */
-    const usesRailTrigger = window.matchMedia?.("(max-width: 1024px)").matches ?? false;
-    (usesRailTrigger ? mobileAddCommentTriggerRef : addCommentTriggerRef).current?.focus();
+    addCommentTriggerRef.current?.focus();
   }, []);
 
   /*
@@ -831,7 +841,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     if (isCommentEditorOpen || !restoreCommentTriggerFocusRef.current) return;
     restoreCommentTriggerFocusRef.current = false;
     queueMicrotask(() => {
-      if (addCommentTriggerRef.current || mobileAddCommentTriggerRef.current) {
+      if (addCommentTriggerRef.current) {
         focusAddCommentTrigger();
       }
     });
@@ -854,6 +864,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
   }, [isMobile, workspaceQuestion?.id]);
   const refineMenuRef = useRef<HTMLDivElement>(null);
   const refinementInputRef = useRef<HTMLTextAreaElement>(null);
+  const refinementDictation = useComposerDictation({ textareaRef: refinementInputRef, value: refinementPrompt, onChange: setRefinementPrompt, projectId });
   const refineTriggerRef = useRef<HTMLButtonElement>(null);
   const { addToast } = useToast();
   const { pushNav } = useNavigationHistoryContext();
@@ -2995,6 +3006,12 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     as the open gesture collapsed the native range.
     */
     if (isCommentEditorOpenRef.current || pendingOpenCommentQuoteRef.current) return;
+    /*
+    FNXC:PlanningComments 2026-07-25-10:20:
+    Mid-drag ranges are not a finished selection. Skip them entirely; the pointerup handler runs one
+    final capture so the control shows once the selection is done instead of flickering per movement.
+    */
+    if (planSelectionDragActiveRef.current) return;
 
     const selection = window.getSelection();
     const root = planDocumentRef.current;
@@ -3014,12 +3031,38 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
     setSelectedPlanQuote(quote || null);
   }, []);
 
+  /*
+  FNXC:PlanningComments 2026-07-25-10:20:
+  Selection-in-progress gate. A drag that starts inside the plan document hides any stale control and
+  freezes quote updates until the pointer is released; the release (or cancel) performs the single
+  capture. Drags that start outside the plan are left alone — their collapse still clears the quote
+  through the normal selectionchange path.
+  */
   useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      if (isCommentEditorOpenRef.current || pendingOpenCommentQuoteRef.current) return;
+      const root = planDocumentRef.current;
+      if (!root || !root.contains(event.target as Node)) return;
+      planSelectionDragActiveRef.current = true;
+      setSelectedPlanQuote(null);
+    };
+    const handlePointerRelease = () => {
+      if (!planSelectionDragActiveRef.current) return;
+      planSelectionDragActiveRef.current = false;
+      capturePlanSelection();
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("pointerup", handlePointerRelease);
+    document.addEventListener("pointercancel", handlePointerRelease);
     document.addEventListener("selectionchange", capturePlanSelection);
     document.addEventListener("mouseup", capturePlanSelection);
     document.addEventListener("touchend", capturePlanSelection);
     document.addEventListener("keyup", capturePlanSelection);
     return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("pointerup", handlePointerRelease);
+      document.removeEventListener("pointercancel", handlePointerRelease);
       document.removeEventListener("selectionchange", capturePlanSelection);
       document.removeEventListener("mouseup", capturePlanSelection);
       document.removeEventListener("touchend", capturePlanSelection);
@@ -3349,20 +3392,13 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
               testId="planning-plan-markdown"
             />
           </div>
-          {selectedPlanQuote && !isCommentEditorOpen && (
-            <button
-              ref={addCommentTriggerRef}
-              type="button"
-              className="btn planning-add-comment planning-add-comment--document"
-              onMouseDown={(event) => event.preventDefault()}
-              onPointerDown={handleOpenCommentEditorPointerDown}
-              onClick={openCommentEditor}
-            >
-              {/* FNXC:PlanningComments 2026-07-24-05:55: Match New-session / mobile rail glyph scale. */}
-              <MessageSquarePlus size={16} aria-hidden="true" />
-              {t("planning.addComment", "Add comment to selection")}
-            </button>
-          )}
+          {/*
+          FNXC:PlanningComments 2026-07-25-10:20:
+          The document-adjacent Add-comment trigger was REMOVED. It duplicated the plan action rail
+          control (operators saw two "Add comment to selection" buttons) and, sitting at the end of a
+          long plan, it was the harder of the two to reach. The rail trigger below is now the single
+          control at every breakpoint. Do not reintroduce a second trigger inside the plan document.
+          */}
           {isCommentEditorOpen && openCommentQuote && (
             <div
               ref={commentEditorRef}
@@ -3402,26 +3438,20 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
       </div>
       <div className="planning-actions planning-summary-actions planning-plan-actions" data-testid="planning-plan-actions">
         {/*
-        FNXC:PlanningComments 2026-07-31-00:00:
-        FN-8533 keeps the selection-adjacent control on wide desktop, but compact shells need a
-        counterpart that cannot be lost under the document fold.
-
-        FNXC:PlanningComments 2026-07-24-05:50:
-        On tablet and phone (≤1024) the rail control stays in the plan action footer as a
-        full-width row above Refine/Proceed so a selection never requires scrolling past the
-        action baseline. Document-level selectionchange still dismisses it when the selection
-        collapses. CSS shows exactly one of the two variants; only established 768px/1024px
-        breakpoint literals are allowed here, while all other dimensions remain design-token based.
+        FNXC:PlanningComments 2026-07-25-10:20:
+        The plan action rail holds the ONLY Add-comment trigger, at every breakpoint. It cannot be
+        lost under the document fold, and a selection never requires scrolling past the action
+        baseline. Document-level selectionchange still dismisses it when the selection collapses.
 
         FNXC:PlanningComments 2026-07-24-05:55:
-        Tablet must keep the two-column grid (not flex nowrap) so Add comment stays a full-width
-        first row with the same MessageSquarePlus 16px glyph as phone.
+        Tablet and phone keep the two-column grid (not flex nowrap) so Add comment stays a full-width
+        first row above Refine/Proceed with the same MessageSquarePlus 16px glyph.
         */}
         {selectedPlanQuote && !isCommentEditorOpen && (
           <button
-            ref={mobileAddCommentTriggerRef}
+            ref={addCommentTriggerRef}
             type="button"
-            className="btn planning-add-comment planning-add-comment--mobile"
+            className="btn planning-add-comment"
             onMouseDown={(event) => event.preventDefault()}
             onPointerDown={handleOpenCommentEditorPointerDown}
             onClick={openCommentEditor}
@@ -3476,6 +3506,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
                 placeholder={t("planning.refinePromptPlaceholder", "For example: add a staged rollout, cover failure recovery, and ask about migration risks.")}
                 rows={4}
               />
+              <MicButton {...refinementDictation.micProps} />
             </label>
             <div className="planning-refine-menu-actions">
               <button
@@ -3782,6 +3813,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
                       }
                     }}
                   />
+                  <MicButton {...initialPlanDictation.micProps} />
                 </div>
 
                 <div className="planning-examples">
@@ -3999,6 +4031,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
               {workspaceQuestion && (
                 <section id="planning-question-panel" className="planning-question planning-question-pane" data-testid="planning-question-pane" aria-label={t("planning.currentQuestion", "Current question")}>
                   <QuestionForm
+                    projectId={projectId}
                     question={workspaceQuestion}
                     initialResponse={editingQuestionId
                       ? conversationHistory.find((entry) => entry.question?.id === editingQuestionId)?.response
@@ -4167,6 +4200,7 @@ export function PlanningModeModal({ isOpen, onClose, onTaskCreated, onTasksCreat
 
           {view.type === "summary" && editedSummary && (
             <SummaryView
+              projectId={projectId}
               summary={editedSummary}
               historyEntries={conversationHistory}
               onSummaryChange={setEditedSummary}
@@ -4219,9 +4253,12 @@ interface QuestionFormProps {
   question: PlanningQuestion;
   initialResponse?: QuestionResponse;
   onSubmit: (responses: QuestionResponse) => void;
+  projectId?: string;
 }
 
-function QuestionForm({ question: rawQuestion, initialResponse, onSubmit }: QuestionFormProps) {
+// FNXC:VoiceInput 2026-07-25-19:20: Export the real interview surface for dictation
+// contract tests instead of substituting a fixture that could drift from this textarea.
+export function QuestionForm({ question: rawQuestion, initialResponse, onSubmit, projectId }: QuestionFormProps) {
   const { t } = useTranslation("app");
   const question = normalizeQuestionOptions(rawQuestion);
   const questionOptions = question.options ?? [];
@@ -4236,6 +4273,12 @@ function QuestionForm({ question: rawQuestion, initialResponse, onSubmit }: Ques
     maxHeight: 640,
     deps: [question.id],
   });
+  const textAnswerRef = useRef<HTMLTextAreaElement>(null);
+  const setTextAnswerRef = useCallback((node: HTMLTextAreaElement | null) => {
+    textAnswerRef.current = node;
+    textAnswerAutosizeRef(node);
+  }, [textAnswerAutosizeRef]);
+  const textAnswerDictation = useComposerDictation({ textareaRef: textAnswerRef, value: textValue, onChange: setTextValue, projectId });
   const { ref: commentAutosizeRef } = useAutosizeTextarea({
     value: commentValue,
     minHeight: 80,
@@ -4356,19 +4399,22 @@ function QuestionForm({ question: rawQuestion, initialResponse, onSubmit }: Ques
 
             <div className="planning-options">
               {question.type === "text" && (
-                <textarea
-                  ref={textAnswerAutosizeRef}
-                  className="planning-textarea"
-                  placeholder={t("planning.typeAnswerPlaceholder", "Type your answer here...")}
-                  value={textValue}
-                  onChange={(e) => setTextValue(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey && textValue.trim()) {
-                      e.preventDefault();
-                      handleSubmit();
-                    }
-                  }}
-                />
+                <>
+                  <textarea
+                    ref={setTextAnswerRef}
+                    className="planning-textarea"
+                    placeholder={t("planning.typeAnswerPlaceholder", "Type your answer here...")}
+                    value={textValue}
+                    onChange={(e) => setTextValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey && textValue.trim()) {
+                        e.preventDefault();
+                        handleSubmit();
+                      }
+                    }}
+                  />
+                  <MicButton {...textAnswerDictation.micProps} />
+                </>
               )}
 
               {question.type === "single_select" && (
@@ -4570,6 +4616,7 @@ function QuestionForm({ question: rawQuestion, initialResponse, onSubmit }: Ques
 }
 
 interface SummaryViewProps {
+  projectId?: string;
   summary: PlanningSummary;
   historyEntries: ConversationHistoryEntry[];
   onSummaryChange: (summary: PlanningSummary) => void;
@@ -4588,7 +4635,10 @@ interface SummaryViewProps {
   isRefiningSummary: boolean;
 }
 
-function SummaryView({
+// FNXC:VoiceInput 2026-07-25-19:20: Export the real summary surface for dictation
+// contract tests instead of substituting a fixture that could drift from this textarea.
+export function SummaryView({
+  projectId,
   summary: rawSummary,
   historyEntries,
   onSummaryChange,
@@ -4622,6 +4672,17 @@ function SummaryView({
     minHeight: isExpanded ? 200 : 120,
     maxHeight: isExpanded ? 800 : 640,
     deps: [isExpanded],
+  });
+  const descriptionRef = useRef<HTMLTextAreaElement>(null);
+  const setDescriptionRef = useCallback((node: HTMLTextAreaElement | null) => {
+    descriptionRef.current = node;
+    descriptionAutosizeRef(node);
+  }, [descriptionAutosizeRef]);
+  const descriptionDictation = useComposerDictation({
+    textareaRef: descriptionRef,
+    value: summary.description,
+    onChange: (description) => onSummaryChange({ ...summary, description }),
+    projectId,
   });
   const selectedPriority = normalizeTaskPriority(summary.priority);
   const isBranchNameRequired = branchMode === "existing" || branchMode === "custom-new";
@@ -4693,13 +4754,16 @@ function SummaryView({
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{summary.description}</ReactMarkdown>
               </div>
             ) : (
-              <textarea
-                id="planning-summary-description"
-                ref={descriptionAutosizeRef}
-                className={`planning-textarea ${isExpanded ? "expanded" : ""}`}
-                value={summary.description}
-                onChange={(e) => onSummaryChange({ ...summary, description: e.target.value })}
-              />
+              <>
+                <textarea
+                  id="planning-summary-description"
+                  ref={setDescriptionRef}
+                  className={`planning-textarea ${isExpanded ? "expanded" : ""}`}
+                  value={summary.description}
+                  onChange={(e) => onSummaryChange({ ...summary, description: e.target.value })}
+                />
+                <MicButton {...descriptionDictation.micProps} />
+              </>
             )}
           </div>
 

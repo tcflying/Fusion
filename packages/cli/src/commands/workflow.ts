@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { createTaskStoreForBackend, type TaskStore } from "@fusion/core";
 import { validateWorkflowIrDryRun } from "@fusion/engine";
 import { cleanupProjectResolution, getStore } from "../project-resolver.js";
+import { result } from "../output.js";
 
 export interface RunWorkflowValidateOptions {
   workflowId?: string;
@@ -30,7 +31,7 @@ async function resolveStore(projectName?: string): Promise<OwnedWorkflowStore> {
 }
 
 function printJsonAndExit(payload: unknown, code: number): never {
-  console.log(JSON.stringify(payload, null, 2));
+  result(JSON.stringify(payload, null, 2) + "\n");
   process.exit(code);
 }
 
@@ -53,7 +54,7 @@ export async function runWorkflowValidate(opts: RunWorkflowValidateOptions): Pro
     const store = owned.store;
     /* FNXC:PostgresCliLifecycle 2026-07-14-19:10: Workflow validation must await the exact startup owner before any process exit; a finally block is insufficient because process.exit skips pending cleanup. */
     const exitWithStore = async (payload: unknown | undefined, code: number): Promise<never> => {
-      if (payload !== undefined) console.log(JSON.stringify(payload, null, 2));
+      if (payload !== undefined) result(JSON.stringify(payload, null, 2) + "\n");
       const current = owned;
       owned = undefined;
       await current!.shutdown();
@@ -81,14 +82,14 @@ export async function runWorkflowValidate(opts: RunWorkflowValidateOptions): Pro
       ir = def.ir;
     }
 
-    const result = await validateWorkflowIrDryRun(store, ir, false);
-    if (opts.json) return await exitWithStore(result.valid ? { valid: true } : { valid: false, errors: result.errors }, result.valid ? 0 : 1);
-    if (result.valid) {
+    const validation = await validateWorkflowIrDryRun(store, ir, false);
+    if (opts.json) return await exitWithStore(validation.valid ? { valid: true } : { valid: false, errors: validation.errors }, validation.valid ? 0 : 1);
+    if (validation.valid) {
       console.log("✓ Workflow IR is valid. No workflow was created or mutated.");
       return await exitWithStore(undefined, 0);
     }
     console.error("✗ Workflow IR is invalid:");
-    for (const error of result.errors) console.error(`  - ${error.message}`);
+    for (const error of validation.errors) console.error(`  - ${error.message}`);
     return await exitWithStore(undefined, 1);
   } finally {
     const current = owned;

@@ -31,8 +31,19 @@ describe("reliability interaction: starved refinement x triage poll", () => {
     await mkdir(join(root, ".fusion", "tasks"), { recursive: true });
 
     try {
+      /*
+      FNXC:EngineTests 2026-07-26-20:55:
+      Recovery requires updatedAt older than STARVED_REFINEMENT_ESCALATION_COOLDOWN_MS (40m).
+      Keep createdAt/updatedAt well below the fake now (11:00) so grace + cooldown pass.
+      */
       const tasks: Task[] = [
-        triageTask({ id: "FN-R1", sourceType: "task_refine" }),
+        triageTask({
+          id: "FN-R1",
+          sourceType: "task_refine",
+          priority: "low",
+          createdAt: "2026-05-15T09:00:00.000Z",
+          updatedAt: "2026-05-15T09:00:00.000Z",
+        }),
         ...Array.from({ length: 6 }, (_, idx) => triageTask({ id: `FN-B${idx + 1}`, createdAt: `2026-05-15T09:${String(10 + idx).padStart(2, "0")}:00.000Z`, priority: "normal" })),
         triageTask({ id: "FN-P1", column: "todo", sourceType: "dashboard_ui", updatedAt: "2026-05-15T10:15:00.000Z" }),
         triageTask({ id: "FN-P2", column: "todo", sourceType: "dashboard_ui", updatedAt: "2026-05-15T10:16:00.000Z" }),

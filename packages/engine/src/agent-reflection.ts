@@ -13,6 +13,7 @@ import type {
   TaskStore,
 } from "@fusion/core";
 import { createLogger } from "./logger.js";
+import { resolveProjectDefaultModel } from "@fusion/core";
 import { createFnAgent, promptWithFallback } from "./pi.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
 import { createRunAuditor, generateSyntheticRunId, type EngineRunContext, type RunAuditor } from "./run-audit.js";
@@ -78,6 +79,7 @@ export class AgentReflectionService {
   private readonly reflectionStore: ReflectionStore;
   private readonly rootDir: string;
   private readonly modelProvider?: string;
+
   private readonly modelId?: string;
 
   constructor(options: AgentReflectionServiceOptions) {
@@ -87,6 +89,23 @@ export class AgentReflectionService {
     this.rootDir = options.rootDir;
     this.modelProvider = options.modelProvider;
     this.modelId = options.modelId;
+  }
+
+  private async resolveReflectionModel(): Promise<{ provider?: string; modelId?: string }> {
+    if (this.modelProvider && this.modelId) {
+      return { provider: this.modelProvider, modelId: this.modelId };
+    }
+    try {
+      const settings = await this.taskStore.getSettings();
+      const resolved = resolveProjectDefaultModel(settings);
+      if (resolved.provider && resolved.modelId) {
+        return { provider: resolved.provider, modelId: resolved.modelId };
+      }
+    } catch (error) {
+      reflectionLog.warn(`Failed to resolve reflection model from settings: ${String(error)}`);
+    }
+    reflectionLog.warn("No provider/model pair resolved for reflection; the runtime will use its built-in default model");
+    return {};
   }
 
   async generateReflection(
@@ -117,12 +136,24 @@ export class AgentReflectionService {
 
       let responseText = "";
       // FNXC:McpConfig 2026-06-25-23:05: Agent-reflection sessions receive the resolved MCP set for the reflected agent identity while preserving the no-secret-logging contract at the runtime forwarding seam.
+      /*
+      FNXC:LaneModelResolution 2026-07-24-17:40:
+      `modelProvider`/`modelId` are optional constructor options that NO production caller
+      supplies (in-process runtime and both dashboard reflection routes construct this service
+      with only the stores + rootDir), so every reflection ran on the runtime's own built-in
+      default model — leaving the operator's configured provider, failing with
+      `401 invalid x-api-key` where no raw Anthropic key exists, and bypassing test-mode
+      forcing. Fall back to the project default pair when no explicit pair was injected.
+      Both halves are required because the runtime treats a half-set pair as unset.
+      */
+      const reflectionModel = await this.resolveReflectionModel();
       const { session } = await createFnAgent({
         cwd: this.rootDir,
         systemPrompt: REFLECTION_SYSTEM_PROMPT,
         tools: "readonly",
-        defaultProvider: this.modelProvider,
-        defaultModelId: this.modelId,
+        ...(reflectionModel.provider && reflectionModel.modelId
+          ? { defaultProvider: reflectionModel.provider, defaultModelId: reflectionModel.modelId }
+          : {}),
         mcpServers: (await resolveMcpServersForStore(this.taskStore, { agentId })).servers,
         onText: (delta: string) => {
           responseText += delta;

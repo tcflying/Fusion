@@ -6,9 +6,13 @@
  * becomes high and high becomes max, leveraging their superior reasoning capability.
  *
  * FNXC:DroidThinking 2026-07-16-18:20:
- * Fusion now resolves pi 0.81.1 workspace-wide, whose ThinkingLevel includes `max`.
- * Keep both exhaustive mappings explicit: non-Opus must still avoid the CLI's max
- * effort, while Opus may use it.
+ * Pi's ThinkingLevel includes `max`. Keep both exhaustive mappings explicit:
+ * non-Opus must still avoid the CLI's max effort, while Opus may use it.
+ *
+ * FNXC:DroidThinking 2026-07-24-12:00:
+ * FN-8564 updates the workspace runtime to Pi 0.82.0 while retaining `max`.
+ * Keep these exhaustive maps aligned with the installed type rather than casting
+ * unknown thinking levels through the Droid CLI boundary.
  *
  * IMPORTANT: The CLI does NOT support --thinking-budget. Only --effort is supported.
  */

@@ -1130,6 +1130,14 @@ body {
 }
 
 /* === Board === */
+/*
+FNXC:BoardNavigation 2026-07-24-10:05:
+Desktop board scrolling must be free-panning: no scroll snapping at all. Trackpad/wheel scrolls
+were being captured by the browser's proximity-snap settle animation, which reads as a slow,
+sticky drag toward a column center. Snapping stays a phone-tier affordance only (re-declared in
+the mobile media block alongside the JS column pager), so the base rule turns it off explicitly
+rather than relying on the absence of a declaration.
+*/
 .board {
   box-sizing: border-box;
   display: grid;
@@ -1143,7 +1151,7 @@ body {
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
-  scroll-snap-type: x proximity;
+  scroll-snap-type: none;
   scroll-padding-inline: 50%;
   scrollbar-color: var(--border) transparent;
   scrollbar-width: thin;

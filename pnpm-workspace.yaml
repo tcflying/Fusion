@@ -23,8 +23,10 @@ overrides:
   # workspace cannot resolve conflicting pi type surfaces.
   # FNXC:ModelCatalog 2026-07-22-12:00: Bumped workspace override pin 0.80.10 → 0.81.1
   # to match guarded package manifests (cli/core/engine/dashboard/pi-claude-cli).
-  '@earendil-works/pi-ai': 0.81.1
-  '@earendil-works/pi-coding-agent': 0.81.1
+  # FNXC:ModelCatalog 2026-07-24-12:00: FN-8564 advances the matched runtime pair
+  # to 0.82.0. Wildcard consumers must resolve the exact guarded Pi API surface.
+  '@earendil-works/pi-ai': 0.82.0
+  '@earendil-works/pi-coding-agent': 0.82.0
 # FNXC:DesktopEmbeddedPostgres 2026-07-14-09:30:
 # Desktop release jobs cross-build Intel and ARM64 artifacts on one host. Install
 # optional native payloads for both CPU families on the current OS so each

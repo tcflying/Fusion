@@ -210,6 +210,7 @@ vi.mock("../TaskDetailModal", () => ({
 }));
 
 import { fetchTaskDetail, batchUpdateTaskModels, fetchBoardWorkflows, fetchNodes, refreshPrStatus, updateTask } from "../../api";
+import { readAppFile } from "../../test/cssFixture";
 
 const mockConfirm = vi.fn();
 const mockConfirmWithChoice = vi.fn();
@@ -564,7 +565,7 @@ describe("ListView", () => {
     expect(screen.getByText("First Task")).toBeDefined();
     expect(screen.getByText("FN-002")).toBeDefined();
     expect(screen.getByText("Second Task")).toBeDefined();
-    const listTitleTextRule = readFileSync("app/components/ListView.css", "utf8").match(/\.list-title-text\s*\{[^}]*\}/)?.[0] ?? "";
+    const listTitleTextRule = readAppFile("components/ListView.css").match(/\.list-title-text\s*\{[^}]*\}/)?.[0] ?? "";
     expect(listTitleTextRule).toContain("display: -webkit-box");
     expect(listTitleTextRule).toContain("-webkit-line-clamp: 2");
     expect(listTitleTextRule).toContain("-webkit-box-orient: vertical");
@@ -2537,7 +2538,7 @@ describe("ListView", () => {
   });
 
   it("keeps the primary list action cluster on one physical row when the pane narrows", () => {
-    const css = readFileSync("app/components/ListView.css", "utf8");
+    const css = readAppFile("components/ListView.css");
     const actionClusterRule = css.match(/\.list-action-cluster,\s*\n\.list-sidebar-controls__actions\s*\{[^}]*\}/)?.[0] ?? "";
     const toolbarRule = css.match(/\.list-sidebar-controls__toolbar\s*\{[^}]*\}/)?.[0] ?? "";
     const singlePaneToolbarRule = css.match(/@media\s*\(max-width:\s*1024px\)[\s\S]*?\.list-toolbar\s*\{[^}]*padding:\s*var\(--space-sm\) var\(--space-md\);[^}]*\}/)?.[0] ?? "";

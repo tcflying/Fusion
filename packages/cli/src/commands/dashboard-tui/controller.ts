@@ -30,6 +30,14 @@ import type {
 } from "./state.js";
 import { SECTION_ORDER } from "./state.js";
 
+/*
+FNXC:DashboardTui 2026-07-24-18:40:
+Window in which the second Utilities [t] press confirms an engine pause. Long
+enough to read the warning line in the log pane, short enough that an unrelated
+`t` minutes later cannot land on an armed confirmation.
+*/
+export const PAUSE_CONFIRM_WINDOW_MS = 5_000;
+
 // ── DashboardTUI ─────────────────────────────────────────────────────────────
 //
 // Public API is identical to the old imperative class so dashboard.ts requires
@@ -80,6 +88,15 @@ export class DashboardTUI {
   private lastAutoKillAt = 0;
   clipboardFlash: { ok: boolean; at: number } | null = null;
   private clipboardFlashTimer: ReturnType<typeof setTimeout> | null = null;
+  /*
+  FNXC:DashboardTui 2026-07-24-18:40:
+  Pausing the engine from Utilities [t] is a silent, board-wide stop: triage and
+  planning stall while in-flight tasks drain, so the board keeps moving for
+  minutes and the cause is invisible from the terminal. One unmodified keystroke
+  must not do that — the first `t` arms this deadline and only a second `t`
+  inside the window pauses. Resuming is not destructive and stays single-press.
+  */
+  private pausePendingConfirmUntil = 0;
   interactiveData: InteractiveData | null = null;
   interactiveView: InteractiveView = "board";
   interactiveInputLocked = false;
@@ -587,6 +604,23 @@ export class DashboardTUI {
       : all.filter((e) => e.level === this.logsSeverityFilter);
   }
 
+  /**
+   * Two-press confirmation for an engine pause initiated from Utilities [t].
+   *
+   * Returns true when the caller may pause: either a prior press armed the
+   * window and it has not expired, or this call arms it and returns false so the
+   * caller can prompt. Any successful confirmation disarms, so a third press
+   * re-arms rather than toggling twice.
+   */
+  private consumePauseConfirmation(now: number = Date.now()): boolean {
+    if (this.pausePendingConfirmUntil > now) {
+      this.pausePendingConfirmUntil = 0;
+      return true;
+    }
+    this.pausePendingConfirmUntil = now + PAUSE_CONFIRM_WINDOW_MS;
+    return false;
+  }
+
   async handleUtilityAction(key: string): Promise<void> {
     if (!this.callbacks) return;
 
@@ -601,6 +635,13 @@ export class DashboardTUI {
       case "t":
         if (this.systemInfo) {
           const newPaused = this.systemInfo.engineMode !== "paused";
+          if (newPaused && !this.consumePauseConfirmation()) {
+            this.warn(
+              `Press [t] again within ${Math.round(PAUSE_CONFIRM_WINDOW_MS / 1000)}s to pause the engine (stops triage, planning, and new dispatch).`,
+              "engine",
+            );
+            break;
+          }
           const newSettings = await this.callbacks.onTogglePause(newPaused);
           const newEngineMode = newSettings.enginePaused ? "paused" : "active";
           this.setSystemInfo({ ...this.systemInfo, engineMode: newEngineMode });

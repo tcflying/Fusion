@@ -15,6 +15,7 @@ import type {
   GithubIssueAction,
   CliSession,
   NotificationPayload,
+  WorkflowWorkItem,
 } from "@fusion/core";
 import {
   ChatStore,
@@ -22,6 +23,7 @@ import {
   isEphemeralAgent,
   isSessionRoomControlPlaneEnabled,
   MissionStore,
+  resolveWorkflowIrForTask,
 } from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
 import type { PrMonitor, PrComment } from "../pr-monitor.js";
@@ -72,6 +74,7 @@ import { validateProjectNodeMapping } from "../node-dispatch-validation.js";
 import { attachAgentLinkSync } from "../task-agent-sync.js";
 import { createRunAuditor, generateSyntheticRunId } from "../run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
+import { seedPreReleasePlanReviewContinuation } from "../plan-review-continuation.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
@@ -204,6 +207,52 @@ export async function bootstrapRoomSessionConnectors(
 
 export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
+
+export interface PlanningContinuationCandidate {
+  item: WorkflowWorkItem;
+  task: Task | null | undefined;
+}
+
+export function isPlanningContinuationTaskDispatchable(
+  task: Task | null | undefined,
+): task is Task {
+  if (task == null || task.paused === true || task.userPaused === true || task.deletedAt) return false;
+  return task.column !== "archived" && task.column !== "done";
+}
+
+export type PlanningContinuationResolution =
+  | { kind: "actionable"; item: WorkflowWorkItem; task: Task }
+  | { kind: "skip"; item: WorkflowWorkItem; reason: "not-planning" | "paused" }
+  | { kind: "orphan"; item: WorkflowWorkItem; reason: "task-not-found" | "task-terminal" };
+
+export function resolvePlanningContinuationCandidate(
+  item: WorkflowWorkItem,
+  task: Task | null | undefined,
+  opts?: { taskLookupFailed?: boolean },
+): PlanningContinuationResolution {
+  if (opts?.taskLookupFailed === true || task == null) {
+    return { kind: "orphan", item, reason: "task-not-found" };
+  }
+  if (task.deletedAt || task.column === "archived" || task.column === "done") {
+    return { kind: "orphan", item, reason: "task-terminal" };
+  }
+  if (item.waitReason !== "planning") {
+    return { kind: "skip", item, reason: "not-planning" };
+  }
+  if (task.paused === true || task.userPaused === true) {
+    return { kind: "skip", item, reason: "paused" };
+  }
+  return { kind: "actionable", item, task };
+}
+
+export function selectActionablePlanningContinuations(
+  candidates: readonly PlanningContinuationCandidate[],
+): Array<{ item: WorkflowWorkItem; task: Task }> {
+  return candidates.flatMap((candidate) => {
+    const resolved = resolvePlanningContinuationCandidate(candidate.item, candidate.task);
+    return resolved.kind === "actionable" ? [{ item: resolved.item, task: resolved.task }] : [];
+  });
+}
 
 export interface CliAgentAwaitingInputNotificationInfo {
   sessionId: string;
@@ -379,6 +428,8 @@ export class InProcessRuntime
   private missionExecutionLoop?: MissionExecutionLoop;
   private missionAutopilot?: MissionAutopilot;
   private triageProcessor?: TriageProcessor;
+  private workflowContinuationTimer?: ReturnType<typeof setInterval>;
+  private workflowContinuationDrainActive = false;
   private messageStore?: MessageStore;
   private chatStore?: ChatStore;
   private detachAgentLinkSync?: () => void;
@@ -1259,6 +1310,9 @@ export class InProcessRuntime
           pluginRunner: this.pluginRunner,
           globalCapacityLegacyRecoveryGate,
           globalCapacityLegacyDispatchControl,
+          // FNXC:NodeWorktreeIsolation 2026-07-25-22:10: planning acquires (or reuses) the task's own
+          // worktree through the executor's acquisition path, so no lane runs in the shared checkout.
+          acquirePlanningWorktree: (taskId) => this.executor.ensureTaskWorktreeForPlanning(taskId),
           onSpecifyStart: (t) => {
             this.recordActivity();
             runtimeLog.log(`Specifying ${t.id}...`);
@@ -1266,6 +1320,15 @@ export class InProcessRuntime
           onSpecifyComplete: (t) => {
             this.recordActivity();
             runtimeLog.log(`Specified ${t.id} → todo`);
+            void (async () => {
+              const live = await this.taskStore.getTask(t.id);
+              if (!live || live.paused || live.userPaused) return;
+              const ir = await resolveWorkflowIrForTask(this.taskStore, live.id);
+              await seedPreReleasePlanReviewContinuation(this.taskStore, live, ir);
+              this.kickWorkflowContinuationProcessor();
+            })().catch((error) => {
+              runtimeLog.error(`Failed to start Todo plan review for ${t.id}:`, error);
+            });
           },
           onSpecifyError: (t, e) => {
             runtimeLog.error(`Triage failed for ${t.id}: ${e.message}`);
@@ -1336,6 +1399,9 @@ export class InProcessRuntime
         getExecutingTaskIds: () => this.executor?.getExecutingTaskIds() ?? new Set<string>(),
         clearPhantomExecutorBinding: (taskId: string, options?: { preserveWorktrees?: boolean }) => this.executor?.clearPhantomExecutorBinding(taskId, options),
         listWorktreeHolders: () => this.executor?.listWorktreeHolders() ?? [],
+        // FNXC:PlanningEvacuation 2026-07-25-23:00: the executor owns the release safety conditions.
+        releasePreExecutionWorktree: (taskId, reason) =>
+          this.executor?.releasePreExecutionWorktree(taskId, reason) ?? Promise.resolve(false),
         recoverApprovedTriageTask: (task) => this.triageProcessor?.recoverApprovedTask(task) ?? Promise.resolve(false),
         getPlanningTaskIds: () => this.triageProcessor?.getProcessingTaskIds() ?? new Set<string>(),
         evictStaleTriageProcessing: () => this.triageProcessor?.evictStaleProcessing() ?? new Set<string>(),
@@ -1502,6 +1568,11 @@ export class InProcessRuntime
       }
 
       this.setStatus("active");
+      this.workflowContinuationTimer = setInterval(() => {
+        this.kickWorkflowContinuationProcessor();
+      }, 2_000);
+      this.workflowContinuationTimer.unref?.();
+      this.kickWorkflowContinuationProcessor();
       runtimeLog.log(`InProcessRuntime started for project ${this.config.projectId}`);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -1540,6 +1611,10 @@ export class InProcessRuntime
     runtimeLog.log(`Stopping InProcessRuntime for project ${this.config.projectId}`);
 
     try {
+      if (this.workflowContinuationTimer) {
+        clearInterval(this.workflowContinuationTimer);
+        this.workflowContinuationTimer = undefined;
+      }
       // 1. Remove concurrency change listener (if we registered one)
       if (this.concurrencyChangedListener && typeof this.centralCore.off === "function") {
         this.centralCore.off("concurrency:changed", this.concurrencyChangedListener);
@@ -2066,6 +2141,75 @@ export class InProcessRuntime
    */
   getMissionExecutionLoop(): MissionExecutionLoop | undefined {
     return this.missionExecutionLoop;
+  }
+
+  private kickWorkflowContinuationProcessor(): void {
+    queueMicrotask(() => {
+      void this.drainWorkflowContinuations().catch((error) => {
+        runtimeLog.error("Workflow continuation processor failed:", error);
+      });
+    });
+  }
+
+  private async drainWorkflowContinuations(): Promise<void> {
+    if (this.workflowContinuationDrainActive || this.status !== "active") return;
+    this.workflowContinuationDrainActive = true;
+    try {
+      const items = await this.taskStore.listDueWorkflowWorkItems({
+        kinds: ["task"],
+        states: ["runnable", "retrying"],
+        limit: 20,
+      });
+      for (const item of items) {
+        let task: Task | undefined;
+        let taskLookupFailed = false;
+        try {
+          task = await this.taskStore.getTask(item.taskId);
+        } catch (error) {
+          taskLookupFailed = true;
+          runtimeLog.warn(
+            `Workflow continuation ${item.id}: getTask(${item.taskId}) failed; treating as orphan: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        const resolved = resolvePlanningContinuationCandidate(item, task, { taskLookupFailed });
+        if (resolved.kind === "orphan") {
+          await this.cancelOrphanedWorkflowWorkItem(resolved.item, resolved.reason);
+          continue;
+        }
+        if (resolved.kind !== "actionable") continue;
+        void this.executor.execute(resolved.task).catch((error) => {
+          runtimeLog.error(`Workflow continuation ${resolved.item.id} failed:`, error);
+        });
+      }
+    } finally {
+      this.workflowContinuationDrainActive = false;
+    }
+  }
+
+  private async cancelOrphanedWorkflowWorkItem(
+    item: WorkflowWorkItem,
+    reason: "task-not-found" | "task-terminal",
+  ): Promise<void> {
+    if (typeof this.taskStore.transitionWorkflowWorkItem !== "function") return;
+    try {
+      await this.taskStore.transitionWorkflowWorkItem(item.id, "cancelled", {
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: `orphaned-continuation:${reason}`,
+        blockedReason: reason,
+      });
+      runtimeLog.log(
+        `Cancelled orphaned workflow work item ${item.id} (task=${item.taskId}, node=${item.nodeId}, reason=${reason})`,
+      );
+    } catch (error) {
+      runtimeLog.warn(
+        `Failed to cancel orphaned workflow work item ${item.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**

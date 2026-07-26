@@ -1195,6 +1195,7 @@
       "mergeBlocked": "",
       "promoteRejected": "",
       "unknownColumn": "",
+      "unplannedForExecution": "",
       "workflowMismatch": ""
     },
     "todo": "할 일",
@@ -1505,6 +1506,10 @@
     "preserveProgressMessage": "이 작업에는 완료된 단계가 있습니다. 이동하기 전에 진행 상황을 유지하시겠습니까?",
     "preserveProgressMoveTodoMessage": "일부 작업에 완료된 단계가 있습니다. 할 일로 이동하기 전에 진행 상황을 유지하시겠습니까?",
     "preserveProgressTitle": "진행 상황을 유지하시겠습니까?",
+    "promoteUnplannedCancel": "",
+    "promoteUnplannedConfirm": "",
+    "promoteUnplannedMessage": "",
+    "promoteUnplannedTitle": "",
     "replanAll": "모두 재계획",
     "replanAllHint_one": "",
     "replanAllHint_other": "",
@@ -5755,7 +5760,13 @@
       "statusActive": "✓ 활성",
       "statusNotConnected": "✗ 연결되지 않음",
       "title": "인증",
-      "waitingForLogin": "로그인을 기다리는 중…"
+      "waitingForLogin": "로그인을 기다리는 중…",
+      "anthropicPreferenceLabel": "Anthropic credential to use",
+      "anthropicPreferenceHint": "You have both an Anthropic API key and a Claude subscription connected. Choose which one Fusion sends when a lane calls Anthropic directly. Default: API key.",
+      "anthropicPreferenceApiKey": "API key",
+      "anthropicPreferenceSubscription": "Claude subscription",
+      "credentialInUse": "In use",
+      "credentialOverridden": "Overridden below"
     },
     "authentication": {
       "enterAPIKey": "",
@@ -6360,7 +6371,8 @@
       },
       "globalMcp": "MCP Servers · Global",
       "mcp": "MCP Servers · Project",
-      "configVersions": "구성 버전"
+      "configVersions": "구성 버전",
+      "voiceInput": "Voice Input"
     },
     "nodeRouting": {
       "blockExecution": "",
@@ -6880,6 +6892,25 @@
       "confirmTitle": "구성을 롤백할까요?",
       "confirmMessage": "이 버전을 복원할까요? 롤백은 새 버전으로 기록됩니다.",
       "confirmRollback": "롤백"
+    },
+    "voiceInput": {
+      "title": "Voice Input",
+      "enable": "Enable voice input",
+      "enableHelp": "Default: off. Voice dictation uses the operator-managed Parakeet v3 model.",
+      "modelStatus": "Parakeet v3 model status",
+      "modelStatusHelp": "The speech model is installed and managed locally on this device.",
+      "modelActions": "Model management",
+      "modelActionsHelp": "Download or remove the Parakeet v3 speech model.",
+      "statusUnavailable": "Voice runtime status could not be determined; voice mode stays disabled.",
+      "runtimeUnavailable": "Voice runtime unavailable",
+      "unknown": "Status unavailable",
+      "downloading": "Downloading model…",
+      "downloadingProgress": "Downloading: {{progress}}%",
+      "installed": "Installed",
+      "notInstalled": "Not installed",
+      "download": "Download",
+      "remove": "Remove",
+      "error": "Model error: {{message}}"
     }
   },
   "setup": {
@@ -8306,6 +8337,10 @@
     "closeIssue": "이슈 닫기",
     "collapse": "접기",
     "createdByAgent": "에이전트가 생성함",
+    "createdAt": "생성됨 {{date}}",
+    "createdAtTitle": "생성됨 {{date}}",
+    "completedAt": "완료됨 {{date}}",
+    "completedAtTitle": "완료됨 {{date}}",
     "createdByAgentNamed": "에이전트가 생성함: {{name}}",
     "createdPr": "PR #{{number}} 생성됨",
     "createFailed": "작업 생성에 실패했습니다",

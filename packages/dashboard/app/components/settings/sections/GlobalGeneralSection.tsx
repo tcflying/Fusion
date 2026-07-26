@@ -147,6 +147,23 @@ export function GlobalGeneralSection({ form, setForm }: GlobalGeneralSectionProp
             updateChannel: v as "stable" | "beta",
         }))}
       />
+      {/*
+        FNXC:AutoUpdate 2026-07-25-10:05:
+        Operator opt-in for unattended updates, placed directly under the release channel it
+        follows. Default OFF: Fusion must not replace its own install and bounce the process
+        without being told to. Only effective on a supervised host (`fn dashboard`), which is
+        the default launch path; the server-side watcher logs and skips otherwise.
+      */}
+      <SettingsToggleRow
+        descriptor={{
+          key: "autoUpdateAndRestart",
+          label: t("settings.globalGeneral.autoUpdateAndRestart", " Auto-update and restart "),
+          help: t("settings.globalGeneral.autoUpdateAndRestartHelp", " When enabled, Fusion installs available updates on the selected release channel by itself and then restarts to apply them — the same install + restart the \"Update now\" button performs, without asking. Requires a supervising parent (the default for `fn dashboard`); hosts started with --no-supervise skip the install. Default: disabled. "),
+          scope: "global",
+        }}
+        value={form.autoUpdateAndRestart === true}
+        onChange={(v) => setForm((f) => ({ ...f, autoUpdateAndRestart: v === true }))}
+      />
       <SettingsToggleRow
         descriptor={{
           key: "autoReloadOnVersionChange",

@@ -334,6 +334,21 @@ async function runBin(args: string[]) {
 }
 
 describe("bin command routing and fallbacks", () => {
+  it("keeps an absent quiet flag undefined while stripping either quiet spelling", async () => {
+    const previous = process.env.FUSION_CLI_SKIP_MAIN;
+    process.env.FUSION_CLI_SKIP_MAIN = "1";
+    try {
+      const { extractGlobalProjectFlag } = await import("../bin.ts?quiet-parser");
+      expect(extractGlobalProjectFlag(["task", "list"]).quiet).toBeUndefined();
+      expect(extractGlobalProjectFlag(["task", "--quiet", "list"]).cleanedArgs).toEqual(["task", "list"]);
+      expect(extractGlobalProjectFlag(["serve", "-q", "--port", "0"]).cleanedArgs).toEqual(["serve", "--port", "0"]);
+      expect(extractGlobalProjectFlag(["--quiet", "serve", "--project", "name"]).cleanedArgs).toEqual(["serve", "--project", "name"]);
+    } finally {
+      if (previous === undefined) delete process.env.FUSION_CLI_SKIP_MAIN;
+      else process.env.FUSION_CLI_SKIP_MAIN = previous;
+    }
+  });
+
   const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
   const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 

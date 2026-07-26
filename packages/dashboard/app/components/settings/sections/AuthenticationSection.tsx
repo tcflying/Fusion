@@ -14,6 +14,8 @@ import { LoadingSpinner } from "../../LoadingSpinner";
 import { OAuthManualCodeForm } from "../../OAuthManualCodeForm";
 import { CustomProvidersSection } from "../../CustomProvidersSection";
 import { SettingsHelpTip } from "../SettingsHelpTip";
+import { SettingsSelectRow } from "../SettingsSelectRow";
+import type { SectionBaseProps } from "./context";
 import { copyTextToClipboard } from "../../../utils/copyToClipboard";
 import { appendTokenQuery } from "../../../auth";
 import { openExternalUrl } from "../../../utils/open-external";
@@ -48,7 +50,12 @@ export interface AuthenticationSectionData {
 }
 export interface AuthenticationSectionProps {
     auth: AuthenticationSectionData;
+    /** Shell-owned settings form; used only for the Anthropic credential-precedence row. */
+    form?: SectionBaseProps["form"];
+    setForm?: SectionBaseProps["setForm"];
 }
+const ANTHROPIC_API_KEY_PROVIDER_ID = "anthropic-api-key";
+const ANTHROPIC_SUBSCRIPTION_PROVIDER_ID = "anthropic-subscription";
 const ANTHROPIC_AUTH_PROVIDER_PRIORITY: Record<string, number> = {
     "claude-cli": 0,
     "anthropic-subscription": 1,
@@ -75,7 +82,7 @@ const compareAuthProviderDisplayOrder = (a: AuthProvider, b: AuthProvider) => {
     }
     return a.id.localeCompare(b.id);
 };
-export function AuthenticationSection({ auth }: AuthenticationSectionProps) {
+export function AuthenticationSection({ auth, form, setForm }: AuthenticationSectionProps) {
     const { t } = useTranslation("app");
     const { projectId, addToast, authProviders, authLoading, authActionInProgress, apiKeyInputs, setApiKeyInputs, apiKeyErrors, opencodeApiKeyRefreshStatus, deviceCodes, loginInstructions, manualCodeConfigs, manualCodeInputs, setManualCodeInputs, manualCodeSubmitInProgress, loadAuthStatus, handleLogin, handleLogout, handleCancelLogin, handleSaveApiKey, handleClearApiKey, handleSubmitManualCode, onReopenOnboarding, } = auth;
     const hasSeparatedAnthropicProvider = authProviders.some((p) => p.id === "anthropic-subscription" || p.id === "anthropic-api-key");
@@ -127,6 +134,59 @@ export function AuthenticationSection({ auth }: AuthenticationSectionProps) {
         }
         return (<LlamaCppProviderCard key={provider.id} compact authenticated={provider.authenticated} onToggled={handleCliProviderToggled}/>);
     };
+    /*
+    FNXC:ProviderAuth 2026-07-24-17:05:
+    Anthropic is the one provider an operator can hold two live credentials for at once — a
+    raw API key AND a Claude subscription OAuth login. Runtime auth has to pick one, and the
+    choice was previously invisible: a saved key silently won, so an operator who logged in
+    with their subscription but still had a stale/revoked key stored got `401 invalid
+    x-api-key` from lanes that call the Anthropic endpoint directly, with nothing on this
+    screen explaining why. Surface the conflict where the credentials are managed and let the
+    operator pick. The row renders only when BOTH are actually connected — with one credential
+    there is nothing to disambiguate and the control would be noise.
+    */
+    const anthropicApiKeyConnected = authProviders.some((p) => p.id === ANTHROPIC_API_KEY_PROVIDER_ID && p.authenticated);
+    const anthropicSubscriptionConnected = authProviders.some((p) => p.id === ANTHROPIC_SUBSCRIPTION_PROVIDER_ID && p.authenticated);
+    const showAnthropicPrecedence = Boolean(form && setForm) && anthropicApiKeyConnected && anthropicSubscriptionConnected;
+    const anthropicAuthPreference = form?.anthropicAuthPreference === "subscription" ? "subscription" : "api-key";
+    const preferenceIsInEffect = (providerId: string) => showAnthropicPrecedence
+        && (anthropicAuthPreference === "subscription"
+            ? providerId === ANTHROPIC_SUBSCRIPTION_PROVIDER_ID
+            : providerId === ANTHROPIC_API_KEY_PROVIDER_ID);
+    /*
+    Live state, not description: which of two connected credentials the engine will actually
+    send. Rendered on the card itself so the answer is where the operator is looking.
+    */
+    const renderAnthropicPrecedenceBadge = (provider: AuthProvider) => {
+        if (!showAnthropicPrecedence) {
+            return null;
+        }
+        if (provider.id !== ANTHROPIC_API_KEY_PROVIDER_ID && provider.id !== ANTHROPIC_SUBSCRIPTION_PROVIDER_ID) {
+            return null;
+        }
+        return preferenceIsInEffect(provider.id)
+            ? (<span className="auth-status-badge authenticated" data-testid={`auth-precedence-active-${provider.id}`}>
+          {t("settings.auth.credentialInUse", "In use")}
+        </span>)
+            : (<span className="auth-key-hint" data-testid={`auth-precedence-overridden-${provider.id}`}>
+          {t("settings.auth.credentialOverridden", "Overridden below")}
+        </span>);
+    };
+    const renderAnthropicPrecedenceRow = () => showAnthropicPrecedence
+        ? (<SettingsSelectRow descriptor={{
+                key: "anthropicAuthPreference",
+                label: t("settings.auth.anthropicPreferenceLabel", "Anthropic credential to use"),
+                help: t("settings.auth.anthropicPreferenceHint", "You have both an Anthropic API key and a Claude subscription connected. Choose which one Fusion sends when a lane calls Anthropic directly. Default: API key."),
+                scope: "global",
+                options: [
+                    { value: "api-key", label: t("settings.auth.anthropicPreferenceApiKey", "API key") },
+                    { value: "subscription", label: t("settings.auth.anthropicPreferenceSubscription", "Claude subscription") },
+                ],
+            }} value={anthropicAuthPreference} onChange={(value) => setForm?.((f) => ({
+                ...f,
+                anthropicAuthPreference: value === "subscription" ? "subscription" : "api-key",
+            }))}/>)
+        : null;
     const showAuthenticatedGroup = authenticatedProviders.length > 0;
     const showAvailableGroup = unauthenticatedProviders.length > 0;
     const providerSupportsApiKey = (provider: AuthProvider) => provider.type === "api_key";
@@ -234,12 +294,14 @@ export function AuthenticationSection({ auth }: AuthenticationSectionProps) {
                       <span data-testid={`auth-status-${provider.id}`} className={`auth-status-badge ${provider.authenticated ? "authenticated" : "not-authenticated"}`}>
                         {t("settings.auth.statusActive", "✓ Active")}
                       </span>
+                      {renderAnthropicPrecedenceBadge(provider)}
                       {provider.authenticated && provider.keyHint && (<span className="auth-key-hint">{t("settings.authentication.key", "Key: ")}{provider.keyHint}</span>)}
                     </div>
                     {provider.type !== "api_key" && <div>{renderAuthenticatedOAuthActions(provider)}{renderProviderAuthError(provider)}</div>}
                     {providerSupportsApiKey(provider) && renderApiKeySection(provider)}
                   </div>
                 </div>))}
+              {renderAnthropicPrecedenceRow()}
             </div>)}
           {showAvailableGroup && (<div className="auth-provider-group">
               <div className="auth-group-label">{t("settings.auth.groupAvailable", "Available")}</div>

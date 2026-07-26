@@ -3,11 +3,12 @@ import { join } from "node:path";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ReportActionMenu } from "../ReportActionMenu";
+import { readAppFile } from "../../test/cssFixture";
 
 describe("ReportActionMenu", () => {
   it("defines the portal stacking contract instead of relying on an undefined z-index", () => {
-    const styles = readFileSync(join(process.cwd(), "app/styles.css"), "utf8");
-    const menuStyles = readFileSync(join(process.cwd(), "app/components/ReportActionMenu.css"), "utf8");
+    const styles = readAppFile("styles.css");
+    const menuStyles = readAppFile("components/ReportActionMenu.css");
 
     expect(styles).toMatch(/--z-dropdown:\s*\d+/);
     expect(styles).toMatch(/--z-modal:\s*\d+/);
@@ -16,8 +17,8 @@ describe("ReportActionMenu", () => {
   });
 
   it("uses defined opaque surface tokens for both shared render homes", () => {
-    const styles = readFileSync(join(process.cwd(), "app/styles.css"), "utf8");
-    const menuStyles = readFileSync(join(process.cwd(), "app/components/ReportActionMenu.css"), "utf8");
+    const styles = readAppFile("styles.css");
+    const menuStyles = readAppFile("components/ReportActionMenu.css");
 
     for (const token of ["card", "border", "text", "surface-hover", "space-xs", "space-sm", "space-md", "space-2xl"]) {
       expect(styles).toMatch(new RegExp(`--${token}:\\s*[^;]+;`));

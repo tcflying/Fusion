@@ -2,6 +2,414 @@
 
 User-facing release notes aggregated across all packages. This file is auto-synced from each `packages/*/CHANGELOG.md` by `scripts/release.mjs` — do not edit by hand.
 
+## 0.74.0-beta.3
+
+### Highlights
+
+- Plans written in a task worktree now save back to the project and database
+- Promote on a held card says why it was refused and can force past a pending replan
+- Small mobile board swipes no longer jump several columns at once
+- Mobile Settings footer buttons scroll sideways by touch when they overflow
+- Cards no longer stay stuck with stale worktree metadata after an aborted plan
+
+### New
+
+- Promote on a held card now explains why the promotion was refused instead of showing a raw translation key, and offers a confirmed force option that pushes the card into execution past a pending replan. Force waives only the unplanned-for-execution gate — capacity, hold membership, and slot reservation still decide. Available from the board, the promote API, and the promote tool.
+
+### Fixed
+
+- Plans a planner writes inside a task worktree are now reconciled back to the main project before triage finalizes, and the authoritative plan is also stored as a task document, so plans no longer silently vanish.
+- Cards are no longer left with stale worktree metadata when their branch inherited another task's commit. A branch cut from the base that never committed anything — planning aborted, card moved back to todo — was repeatedly rejected as foreign contamination on every self-healing sweep.
+- Small horizontal swipes on the mobile board now advance one column instead of flinging several; extra pages require real gesture travel, not just release speed.
+- The mobile Settings footer rail scrolls sideways by touch again when its buttons overflow the screen, including on landscape phones.
+
+## 0.74.0-beta.2
+
+### Highlights
+
+- Two tasks can run Plan Review at the same time instead of one failing and parking
+- Planning and every review step run in the task's own worktree, never the shared checkout
+- Moving a card out of Todo mid-plan stops planning, clears the badge, and frees the worktree
+- Session contention now waits and requeues on a 10-attempt ladder instead of parking the task
+- Mobile Settings footer no longer clips the update notice and buttons
+
+### Fixed
+
+- Concurrent tasks no longer collide in Plan Review: the second task used to surface a provider failure and burn its retry budget. Sessions are now scoped per task even outside workspace mode.
+- Planning and all review steps acquire the task's own worktree instead of degrading to the shared repo root; Plan Review re-acquires a worktree if its recorded one is gone.
+- Remaining contention is treated as transient: the engine waits on a 10-attempt ladder from 5s to 60s and ends in a benign requeue rather than parking the task.
+- Moving a card backward out of Todo while it is planning now aborts the in-flight planning run, clears the planning badge, and releases the pre-execution worktree.
+- A new self-healing sweep reclaims parked pre-execution worktrees only after 30 days of complete inactivity, skipping todo, executing, paused, blocked, and recovery-scheduled tasks.
+- On mobile, the Settings update-check result renders on its own row above the action buttons instead of being cut off; desktop and tablet keep it inline next to the version button.
+
+## 0.74.0-beta.1
+
+### Highlights
+
+- Voice dictation in dashboard composers, opt-in with a checksum-pinned Parakeet v3 model
+- Execution starts the moment planning finishes instead of waiting out the 15s engine poll
+- Quick-add Start no longer strands tasks in Todo that could never be planned
+- Open on duplicate-task warnings now actually opens the task
+- Restart all agents in the System panel works again instead of erroring
+
+### New
+
+- Voice dictation across dashboard composers, gated behind a project-scoped Voice Input setting and disabled by default; the mic button stays inert until you turn it on.
+- Voice Input settings panel for enabling dictation and managing the Parakeet v3 model, with live download and status controls.
+- Parakeet v3 model downloads are verified against a pinned upstream SHA-256 checksum before use, and cached in a shared location across projects.
+- Voice transcription API with project-bound audio endpoints and a lazily loaded speech runtime, so nothing extra is initialized unless dictation is on.
+- Quiet CLI mode that suppresses informational stdout chatter, via the new quiet flag or the FUSION_QUIET environment variable.
+
+### Fixed
+
+- Starting a task now kicks off planning immediately from every surface (board drag, context menu, CLI, tools, API move) instead of waiting up to 15 seconds for the next planning poll. Todo cards still waiting on a planning slot show a "Queued to plan" badge, and the Start toast now honestly says "Queued for planning" rather than claiming planning began.
+- Once planning finishes, the scheduler wakes and dispatches right away; plan-in-place workflows such as Coding (Ideas) previously sat idle until the next engine poll.
+- Quick-add Start on a manual-intake workflow no longer creates tasks with placeholder steps that planning would skip forever, leaving them stuck in Todo with no log line.
+- Coding (Ideas) boards can move cards back from Todo to Ideas again; the move check now respects the workflow's own column adjacency.
+- The Open button on possible-duplicate task warnings works from every surface it appears on, and unresolvable task ids now show a toast instead of silently doing nothing.
+- Restart all agents in the System panel no longer fails with a storage removal error.
+- Planning Mode shows a single "Add comment to selection" button, and only after the selection is finished, so it no longer flickers mid-drag or duplicates on mobile.
+- Creating a chat tag from the context menu applies it to the open conversation immediately.
+- Reports Health Check now surfaces unrecoverable direct-report failures instead of hiding them behind stale state.
+- Task composers no longer fire duplicate project-settings requests when the dictation button is present.
+
+### Internal
+
+- Hold-release sweeps log how long each card was held, a per-sweep summary with prefetch cost broken out, and a warning when a sweep exceeds 2 seconds.
+
+## 0.74.0-beta.0
+
+### Highlights
+- Choose Anthropic API key vs. subscription per lane, with a clear "in use" indicator
+- Fixed: AI helper lanes (subtasks, milestones, goals, reflections) no longer silently fall back to the wrong Anthropic model
+- Fixed: Planning Mode no longer fails mid-interview with an auth error on a model you never picked
+- Board scrolling is snappier — no more snap-lock on desktop, instant paging on phone swipes
+- Tag and filter Direct chat conversations in the sidebar
+
+### New
+- Choose whether Anthropic lanes use your API key or your Claude subscription, with an "in use" marker in Settings → Authentication
+- Board scrolling feels faster: desktop no longer snaps mid-drag, and phone swipes page immediately instead of coasting
+- Task cards now show creation and completion dates directly
+- Organize Direct chat conversations with reusable, project-scoped tags and sidebar filtering
+- Quick Add now shows a visible Start button for workflows with a waiting column, instead of a hidden long-press menu
+
+### Fixed
+- Windows: direct-chat Agent selection now switches visibly and reliably
+- New Task dialogs close without a discard confirmation when nothing was actually touched
+- Tablets: Task Detail and New Task regain touch resizing
+- AI helper lanes (interviews, subtask breakdown, agent generation, text refine, goal drafting, reflections) now run on your configured model instead of silently falling back to a default Anthropic model and erroring out for custom-provider or subscription users
+- Large phones no longer lose the mobile bottom nav bar after being misclassified as tablets
+- The footer now reads "Paused" instead of "Idle" when the engine is paused, and pausing from the terminal now takes two presses to avoid accidental toggles
+- Planning Mode no longer fails mid-interview with a provider auth error tied to a model you never selected
+- Switching projects now fully resets Planning, Chat, Missions, subtask breakdown, GitHub import, and any open modals so nothing leaks across projects
+- Tablets: the Quick Chat header is easier to grab and drag
+- Terminal windows no longer open blank until a keypress, font-size change, or new tab
+
+### Internal
+- Updated bundled Pi runtime dependencies to the matched 0.82.0 pair
+
+## 0.73.0
+
+### Highlights
+
+- Remove the Planning Mode deepening checkpoint and fixed interview depth caps.
+- Scrub top-level report activityTrace before filing so paths and tokens never reach the pipeline.
+- Quality hub now shows task verification videos when review artifacts are enabled.
+- Add beta and stable release channels — pick your update track in Settings or with `fn update --channel <stable|beta>`.
+- Agent chat now investigates the live codebase with tools before answering architecture and code questions.
+
+### New
+
+- Quality hub now shows task verification videos when review artifacts are enabled.
+- Add beta and stable release channels — pick your update track in Settings or with `fn update --channel <stable|beta>`.
+- Agent chat now investigates the live codebase with tools before answering architecture and code questions.
+- Let operators set the embedded PostgreSQL connection cap in Advanced Settings.
+- Add an optional Task chat progress feed for task steps, failures, reviews, and rollbacks.
+- Add mailbox approval for ephemeral agent follow-up tasks.
+- Add a mission auto-merge override so a mission's features share one branch and one PR.
+- Mission auto-merge controls now explain merge behavior and show shared branch PR status.
+- Add guided in-app Bug, Feedback, Idea, and Help reporting.
+- Add durable configuration revision history primitives.
+- Add portable secret-scrubbed organization export and import commands.
+- Add review artifact controls and deliverable galleries.
+- Add reusable native structure preview payloads and dashboard cards.
+- Auto-generate a short feature-video artifact for user-facing task deliverables.
+- Preview supported missions, findings, evals, and goals directly in chat.
+- Attach reviewable native structures to mailbox messages.
+- Add drag-to-attach native structures and AI narrative drafting to Mail.
+- Expose Mission hierarchy tools to engine agents and dashboard chat.
+- Add persisted ideation sessions with atomic Mission handoff.
+- Request and observe task E2E verification from chat.
+- Promote completed research findings into mission roadmap features.
+- Schedule approved mission work with symbol-level concurrency control.
+- Require approved mission lineage for autonomous task creation and delegation.
+- Let operators choose GitHub Issues or Discussions for in-app reports.
+- Add scrubbed activity context and optional local report screenshots.
+- Deduplicate in-app reports against open public-roadmap issues.
+- Add consent-based screenshots and activity context to in-app reports.
+- Add opt-in reviewed screenshots and scrubbed activity traces to in-app reports.
+- Let operators prevent duplicate in-app reports with optional roadmap matching.
+- File Feedback and Help reports as Issues when GitHub Discussions is disabled.
+- Make Planning Mode an infinite interview validated explicitly by the user.
+- Move configuration version history and rollback controls into Settings.
+- Move the org export / import card from Command Center Overview to the Team tab.
+- Ideation is now a top-level experimental sidebar/mobile view instead of a Command Center tab.
+- Preview roadmap items and open their hosted Roadmaps destination.
+- Rebuild Planning Mode into a three-pane interview with always-visible plan and Validate.
+- Dashboard chat agents can edit files and run bash with coding workspace tools.
+- Show WhatsApp pairing QR and setup instructions in plugin settings.
+- Planning Mode plan.md is now distinct from triage PROMPT.md on task create.
+- Simplify Planning Mode to a sequential Q&A and plan-review flow with focus-steered refine.
+- Unify max concurrency across planning/execution/review and simplify board capacity indicators.
+- Let operators select the Aurora dashboard theme.
+- Add the Calm dashboard theme with slate, sage, and misty light palettes.
+- Add the Dawn indigo-and-amber dashboard color theme.
+- Filter dashboard color themes by name in Settings and Command Center.
+- Let operators enable or disable GitHub tracking from Coding Ideas task details.
+- Honor skill-executor config on foreach step-execute sessions so per-step skills load like top-level nodes.
+- Add a gesture-only Quick Add Start action for eligible workflows.
+- Show Xiaomi branding for Xiaomi and MiMo provider labels.
+- Add photo and file attachments to Quick Add and Main Chat.
+- Keep default Code Review remediation retries unlimited and show the active policy.
+- Add optional explanatory descriptions to custom workflow board columns.
+- Add contextual comments to Planning Mode plan reviews.
+- Make Planning Mode refine plans through codebase-grounded direction choices.
+- Add guided setup for local OpenAI-compatible model providers.
+- Add per-agent and project-wide heartbeat enable controls.
+- Let agent-card heartbeat controls disable and re-enable scheduling.
+- Add conditional task-document writes that reject stale publishers without changing revision history.
+- Add authenticated append-only corrections for documents retained on archived tasks.
+- Embed opted-in report screenshots in filed GitHub reports.
+- Your workflow now drives the board — cards move through the columns you defined, not a fixed six.
+- Tasks left mid-flight by an older Fusion are now adopted on upgrade instead of sitting stuck.
+- One plan can now create multiple tasks — in the dashboard, the CLI, and agent tools alike.
+- Let enabled plugins declaratively provide project MCP servers.
+- Store in-app report screenshots as validated local artifacts.
+- Task Stats tab now shows creation provenance — source type, parent task, creating agent, and duplicate flags.
+- Add stable dashboard theme tokens and plugin overlay layering with --fusion-max-z.
+- Preserve parent lineage and reuse duplicate tasks created from planning breakdowns.
+- Add a simple Ideas-to-Done workflow with truthful, resumable column transitions.
+
+### Fixed
+
+- Show SQLite→PostgreSQL migration status on the dashboard while cutover is not done.
+- Stop showing Reconnecting status text in Planning Mode.
+- Beta release notes now list only that beta's changes; stable notes roll up the whole beta cycle.
+- Fix broken beta binary builds — bun executables and the Windows desktop EXE package again.
+- Board column headers now count REVISING (replan) cards and other visibly active cards in the processing count.
+- Preserve approved task scope during review and committed work during worktree recovery.
+- Prevent retried agent steps from creating duplicate follow-up tasks.
+- Fix Compound Engineering sessions dying with "AI returned no valid JSON" when turns race; add retry and diagnostics.
+- Stop the Chat/Quick Chat "Latest" button from jumping when the cursor moves near or presses it.
+- Recover in-review tasks stranded by a restart that killed an in-flight review step, instead of failing them.
+- Duplicate follow-up tasks naming the same failing file now converge at creation across parent tasks.
+- Boards built on custom workflows now show and move cards in their own columns.
+- Plugin API routes now work for plugins enabled after startup or enabled only in a non-launch project.
+- Fix embedded PostgreSQL crash-recovery boot on Windows — no self-shutdown race, no 30s .pgrunner log stall.
+- Allow planning sessions to persist PROMPT.md without an approval gate.
+- Fix built-in workflows sending cards backward to Todo and stalling the PR workflow.
+- Allow freeform chat task creation without mission lineage.
+- Fix a crash where chat messages and mailbox sends containing a raw NUL byte would abort mid-conversation.
+- Report when the server Claude CLI needs login instead of waiting a minute and showing a false usage timeout.
+- Show Codex weekly usage when OpenAI reports it as the primary quota window.
+- Prevent review-contract retry instructions from replacing workflow completion summaries.
+- Prevent fn_task_show timeouts when another Fusion process already owns embedded PostgreSQL.
+- Honor forced GitHub transport selection for GraphQL discussion queries and mutations.
+- Apply planning actions on the first mobile tap and create tasks without a separate validation step.
+- Workflows without a merge step now finish in their completion column instead of stalling one column short.
+- Fix tasks with no saved workflow selection being unable to move between columns.
+- Allow dependency-ready workflow steps to finalize when earlier independent steps are still running.
+- Wait for the AI-authored Planning Mode plan before enabling review actions.
+- Fix Planning reopen after a finished session so Retry no longer dead-ends.
+- Keep Planning plan-review Add-comment controls on-screen on mobile after text selection.
+- Make plan refinement submit reliably from stopped, active, restored, and mobile planning states.
+- Keep planning timers session-specific and return cleanly from stopped generations.
+- Resume initial planning cleanly after stopping generation and preserve session timers across refreshes.
+- Finish plan task creation automatically and show links to the task or planning sessions.
+- Prevent stale worktree ownership metadata from blocking commits after a pooled checkout is reassigned.
+- Restore automatic task lifecycle entries in PostgreSQL activity logs.
+- Prevent transient dashboard failures when multiple projects initialize PostgreSQL concurrently.
+- Settings Check for updates now finds newer beta releases when the beta channel is selected.
+- Hide task-card overseer eyes immediately after workflow oversight is turned off.
+- Accept task completion regardless of wording in the completion summary.
+- Let task planning persist complete specifications before Plan Review starts.
+- Make Windows updates actionable and restore Compound Engineering agent personas in npm installs.
+- Restore the Simplified and Traditional Chinese labels for duplicate roadmap reports.
+- Hide the task-card overseer eye when a workflow only uses the default (unconfigured) oversight level.
+- Preserve archived shared-branch landing proof during PostgreSQL promotion checks.
+- Planning Mode no longer accepts a truncated final plan with empty deliverables.
+- Oh My Pi (omp) model selections now run via the OMP ACP runtime instead of failing.
+- The task-detail oversight eye icon now reflects the session advisor's on/off state even when planner oversight is off.
+- Keep workflow chips and HTML mockup previews visually consistent across themes.
+- Mobile Kanban swipes now settle on exactly one column with no stuck-between-columns state.
+- Task detail action buttons now render at a consistent size across all themes.
+- Restore token recovery for installed PWAs after an unauthorized backend response.
+- Foreign-language GitHub/GitLab issues authored via issue forms now auto-translate and offer the Translate button.
+- Move the task-card cost badge below the Promote button in the bottom-right corner.
+- Planning Mode now always asks clarifying questions before producing a plan.
+- Resume saved Planning Mode progress after reload without automatically re-running generation.
+- Allow manual scrolling during generation in task chat, agent logs, and chat.
+- Allow manual scrolling during generation in task Planner Chat.
+- Allow manual scrolling during generation in the task Workflow tab live log.
+- Preserve manual scrolling in System Controls and Dev Server live logs.
+- Fix mobile model dropdown so the list stays scrollable after searching.
+- Fix tasks stuck on "Needs your decision" when their duplicate is already done.
+- Fix task token counts inflated by reused or resumed agent sessions.
+- Fix GitHub issue imports so edited descriptions cannot hide or falsely match prior imports.
+- Fix dashboard build failure caused by missing html2canvas dependency.
+- Save Settings edits automatically and safely flush pending changes when closing.
+- Task detail inline action icons now render at a consistent size on tablet screens.
+- Separate pinned chat conversations in the list and fix message edit Save.
+- Show Compound Engineering in navigation when the enabled plugin starts.
+- Preserve task work while recovering checkouts created outside the configured worktree directory.
+- Same-agent near-duplicates stay on the board by default on all create paths (no silent auto-archive).
+- Fix Report menu stacking and move Command Center reports to System.
+- Restore Settings Configuration Versions translations for es/fr/ko/zh-CN/zh-TW after FN-8350 key move.
+- Install @agentclientprotocol/sdk with @runfusion/fusion so the Claude CLI pi extension can load.
+- Fix mission interview start crashing when thinking level is left at Default.
+- Fix startup crash when a project has both fallback and registered partition data.
+- Keep Planning Mode interviews open until you explicitly validate the running plan.
+- Task detail Oversight/Fast and chat send heights match sibling controls on tablet.
+- Fix Grok and Claude Fusion tools MCP bridge packaging and model markers
+- Show only one agent name badge when a task is assigned to its creator.
+- Return CLI chat replies to the terminal and expose dashboard inbox reads.
+- Make fn chat a named mailbox conversation with a stable conversation id.
+- Make Planning Mode usable on mobile and tablet with progressive interview layout.
+- Keep workflow tasks paused while an agent question is awaiting an operator response.
+- Restore mobile navigation back to the Planning session list without a stuck Running plan screen.
+- Stop the dashboard TUI Logs tab from showing detailed timestamps on each log line.
+- Give the Report menu an opaque background so page content no longer shows through.
+- Planning Mode tablet tabs match mobile; mobile main shows sessions before running plan.
+- Planning Mode running plan shows an evolving plan, not repeated interview questions.
+- Restore in-progress Planning Mode interviews after leave/return, including mid-generation.
+- Planning Mode now drafts an initial running plan from your idea and refines it after each answer.
+- Planning Mode now uses the same workflow triage planning prompt template as newly added tasks.
+- Persist operator duplicate decisions so Fusion does not re-ask for the same task.
+- Deliver enabled plugin skills in dashboard chat the same way task sessions do (include skill body paths).
+- Include planning-lane AI time and tokens in task cost and duration totals.
+- Keep Planning Mode compact interview view tabs pinned to the top on Answered questions.
+- Keep dismissed GitHub Copilot re-login banners hidden permanently.
+- Android and browser Back from a GitHub import detail returns to the issue list first.
+- Planning Mode history now collapses AI thinking by default.
+- Reject unknown `fn update` flags and document the beta install bootstrap.
+- Stop false CE skill-load warnings when plugin skills resolve without FUSION_CE_SKILLS_DIR.
+- Stop legacy-adoption drained-marker warn spam on every CLI open under embedded Postgres.
+- Accept root-level File Scope files with extensions such as global.json and solution files.
+- Stop spurious per-task `spawn /bin/sh ENOENT` noise during step baseline capture.
+- Ignore stale flat skill-toggle keys so session skills match the Skills view after category layouts.
+- Allow session Read tool to open host-advertised plugin skill body paths under worktree boundary.
+- Keep plugin enable state consistent across UI and loaders after toggle.
+- Load each enabled plugin once per process startup (no duplicate onLoad).
+- Stop workflow-definition creates from failing when a WF-id is already taken.
+- Restore the Coding Ideas board header color indicator.
+- Remove excess right padding from task popups on tablets.
+- Show Planning status badges for active Coding Ideas Todo tasks.
+- Restore the Coding Ideas detail action to move parked ideas to Todo.
+- Show Planning (not Triage) in task activity model-using logs.
+- Remove redundant readiness descriptions from Todo and In Review board headers.
+- Remove ellipses from merging status badges on task cards.
+- Mobile board swipes always settle on a single centered column, never between columns.
+- Keep task detail footer actions on a single row on mobile.
+- Show Revising instead of Replan on needs-replan task status badges.
+- Keep task-card active glow during replan and revise while agents work.
+- Mobile board pan/fling always settles on one centered column, never between.
+- Fix macOS embedded PostgreSQL startup when bundled ICU compatibility links are missing.
+- Align mobile task-detail Move actions with the footer edge.
+- Restore active chat thinking and partial response state when returning to a conversation.
+- Notify operators when a task is terminally blocked or exhausts automated recovery.
+- Create Coding Ideas Start tasks directly in Todo.
+- Hide uninstalled runtime pages from Settings integrations.
+- Prevent plugin toggles from reinstalling uninstalled runtimes.
+- Prevent Windows embedded PostgreSQL log contention and recover once from DLL initialization crashes.
+- Stop completed PostgreSQL migrations from re-scanning retained SQLite backups at startup.
+- Make imported task links in Stats follow the active dashboard theme.
+- Keep Planning Mode selected-text comments reachable in the mobile action rail.
+- Honor selected workflow planning models in Planning Mode.
+- Keep Planning Mode recovery retries safely bounded after failed attempts.
+- Keep Planning Refine and Proceed actions visible on mobile.
+- Give Planning Mode a dedicated collaborative prompt instead of task-triage instructions.
+- Show complete mission hierarchies in agent mission lookup results.
+- Show failed mission assertions and safe validator evidence in remediation work.
+- Scope feature validation to linked assertions instead of unfinished milestone work.
+- Bound generated mission fixes to one root feature retry budget.
+- Keep supervised mission validation report-only until autonomy is explicitly enabled.
+- Fix supervised task creation and defined-feature mission bootstrap admission.
+- Make ideation candidate IDs discoverable for direct convergence.
+- Keep GitHub issue import actions on one usable mobile row.
+- Reconcile completed mission features safely against archived delivery tasks.
+- Lower the embedded PostgreSQL default connection cap to 150 on Windows to prevent 0xC0000142 backend crashes.
+- Grok CLI fallback models now engage only when the primary model actually fails, instead of replacing it up front.
+- Keep Grok ACP process cleanup armed once per process, without listener growth.
+- Prevent unfinished prose-only plans from advancing into implementation and merge.
+- Improve Planning Mode refinement and replace Validate with Proceed with plan.
+- Add mobile Planning tabs, one-click task creation, and answer/reasoning history.
+- Install the agent-browser binary with Fusion on Windows, Linux, and macOS.
+- Keep healthy AI providers running and resume provider-paused tasks when capacity returns.
+- Push-after-merge no longer silently strands approved merges when the remote diverged.
+- Stop the legacy-adoption sweep from clearing live task statuses (planning, queued, merging, stuck-killed) on store open.
+- Board column and footer running counts now include live Code Review, Plan Review, and other gate sessions.
+- Keep tasks running when an MCP server is temporarily unavailable.
+- Keep unresolved merge-review blockers active across concurrent-main rebuilds and later retries.
+- Fix mobile board snapping after interrupted swipes, flings, and vertical card scrolling.
+- Keep OMP ACP process cleanup armed once per process, without listener growth.
+- Prevent executors from starting ordered task steps before their required predecessors finish.
+- Orphaned in-flight review steps are now marked failed for re-review instead of silently skipped at merge.
+- Recover missing workflow plans before review instead of approving or stranding tasks.
+- Prevent Plan Review tasks from blocking each other after a missing-worktree fallback.
+- Deleting a task created from a plan no longer dead-ends the plan — Proceed creates a fresh task.
+- Fix duplicate planning sessions created when navigating away from and back to Planning.
+- Make Planning Mode generate a durable initial plan before asking optional refinement questions.
+- Planning Mode no longer hangs on "Generating plan" after a provider error; it surfaces a retryable error.
+- Planning, mission, milestone, and onboarding interviews regenerate a question instead of "No active question" errors.
+- Planning sessions now show Complete instead of Needs input after their task is created.
+- Planning mode now shows a neutral session loader while restoring a saved session instead of "Generating…".
+- Stopping a plan now also cancels generations that haven't started streaming yet.
+- Every Planning Mode generation step now streams AI thinking/output, not just the first turn.
+- Fix Planning Mode duplicating generations and "AI returned no valid JSON" errors after leaving and returning mid-run.
+- Keep Planning Mode questions and the running plan in sync after each answer.
+- A finished plan is never a dead end — read it, keep refining, and create the task at any time.
+- Improve Planning Mode with scrollable Markdown plans and mobile bottom actions.
+- Report PostgreSQL health failures accurately without false database-corruption guidance.
+- Fix engine restarts stranding replan-loop tasks in To Do by clearing their needs-replan signal.
+- Prevent agents from filing duplicate active diagnostic follow-ups discovered by different tasks.
+- Switching projects now fully resets Planning, Chat, Missions, subtask breakdown, GitHub import, and open modals.
+- Apply project workflow model lanes to every workflow ahead of global and workflow values.
+- Close the Quick Add agent picker when clicking outside it.
+- Stop active task processing before a user move to Todo becomes visible.
+- Prevent Plan Review replans from stranding completed tasks in Triage and recover affected tasks automatically.
+- Stop PostgreSQL permission errors when the dashboard reads SQLite migration health.
+- Keep manually parked tasks out of scheduler and remembered-owner dispatch until explicitly unpaused.
+- Resume mission features that were interrupted during validation after an engine restart.
+- Automatically retry interrupted Planning sessions when operators return to them.
+- Isolate automated tests and global test-mode runs from the normal Fusion database.
+- Prevent concurrent tasks from falling back when an Anthropic OAuth token rotates.
+- Send only one in-progress update per Fusion task on its linked GitHub tracking issue.
+- A custom Merging column now receives the card at merge instead of being sent to In-review.
+- Task chat step narration now shows 1-based step numbers matching the task card's step count.
+- Keep secondary locale catalogs in sync with heartbeat controls and settings provenance labels.
+- Open task card files-changed links in the task popup when Open tasks as popups is enabled.
+- /new and /clear in Chat no longer wipe a task-bound planner chat's history.
+- Hide empty chat verification status and move active results below task metadata.
+- Terminal now auto-starts a session from Windows browsers when the dashboard host is not Windows.
+- Terminal no longer sticks on "Starting terminal..." on Windows and Ctrl/Cmd+V paste is delivered exactly once.
+- Stop Planning Mode questions from filling Mailbox and tighten desktop planning pane spacing.
+- Show every suggested Planning Mode refinement category instead of limiting choices to three.
+- Replace the Planning Sessions toggle with a consistent Back-to-sessions control.
+- Preserve workflow lifecycle state and start execution steps only after worktree creation.
+
+### Breaking
+
+- Remove the Planning Mode deepening checkpoint and fixed interview depth caps.
+
+### Security
+
+- Scrub top-level report activityTrace before filing so paths and tokens never reach the pipeline.
+
+### Internal
+
+- Bump the bundled pi runtime to 0.81.1 for newer models, providers, and session reliability.
+- Review gates now run only as workflow nodes — the in-session step reviewer is gone.
+
 ## 0.73.0-beta.6
 
 ### Highlights

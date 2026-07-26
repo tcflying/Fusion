@@ -37,11 +37,11 @@ const allowlist: AllowlistEntry[] = [
   { file: "src/already-merged-detector.ts", line: 223, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${shellQuote(branchTip)} ${shellQuote(baseBranch)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/already-merged-detector.ts", line: 270, primitive: "execSync", signature: "branchTip = execSync(`git rev-parse --verify ${shellQuote(branchName)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/already-merged-detector.ts", line: 345, primitive: "execSync", signature: "execSync(`git rev-parse --verify ${shellQuote(treeBranchName)}`, {", reason: SHORT_GIT_PLUMBING },
-  // FNXC:EngineProcessRules 2026-07-22-17:30: refreshed drifted line numbers for these unchanged git-plumbing call-sites (self-healing.ts 4187/4193/4230/12705, executor.ts 15808) after FN-8490 + graph-owned-cutover follow-ups shifted lines above them. The call-site-level allowlist keys on file:line:signature, so a legitimate call moving lines reads as unmatched-site + stale-entry until the line is re-pinned here.
-  { file: "src/self-healing.ts", line: 4215, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4221, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 4258, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
-  { file: "src/self-healing.ts", line: 12839, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  // FNXC:EngineProcessRules 2026-07-26-20:50: re-pin drifted short git-plumbing lines after plan-worktree + branch-reclaim work (self-healing inspect/delete, executor baseCommitSha ancestry).
+  { file: "src/self-healing.ts", line: 4289, primitive: "execSync", signature: "const tipSha = String(execSync(`git rev-parse --verify ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4295, primitive: "execSync", signature: "const uniqueCommitCount = Number.parseInt(String(execSync(`git rev-list --count ${shellQuote(branch)} --not ${shellQuote(\"main\")}`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 4332, primitive: "execSync", signature: "const branchesRaw = String(execSync(\"git branch --list 'fusion/*'\", {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/self-healing.ts", line: 12977, primitive: "execSync", signature: "execSync(`git branch -d ${shellQuote(branch)}`, {", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger-workspace-test-commands.ts", line: 204, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/merger-workspace-test-commands.ts", line: 301, primitive: "execSync", signature: "changedFilesOutput = execSync(", reason: BOUNDED_GIT_DIFF },
   { file: "src/integration-branch.ts", line: 71, primitive: "execSync", signature: "const stdout = execSync(\"git symbolic-ref --short refs/remotes/origin/HEAD\", {", reason: SHORT_GIT_PLUMBING },
@@ -63,7 +63,7 @@ const allowlist: AllowlistEntry[] = [
   { file: "src/merger.ts", line: 10211, primitive: "execSync", signature: "const squashIsEmpty = execSync(", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 10245, primitive: "execSync", signature: "const squashIsEmpty = execSync(", reason: SHORT_GIT_PLUMBING },
   { file: "src/merger.ts", line: 10432, primitive: "execSync", signature: "execSync(\"git reset --merge\", { cwd: rootDir, stdio: \"pipe\" });", reason: SHORT_GIT_PLUMBING },
-  { file: "src/executor.ts", line: 16296, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {", reason: SHORT_GIT_PLUMBING },
+  { file: "src/executor.ts", line: 16585, primitive: "execSync", signature: "execSync(`git merge-base --is-ancestor ${task.baseCommitSha} HEAD`, {", reason: SHORT_GIT_PLUMBING },
 ];
 
 function scanSource(file: string, source: string): ShelloutSite[] {

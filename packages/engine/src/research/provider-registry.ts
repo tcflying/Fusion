@@ -47,8 +47,23 @@ export class ResearchProviderRegistry {
     const maxResults = Number(this.settings.researchGlobalMaxSearchResults ?? 10);
     const fetchTimeoutMs = Number(this.settings.researchGlobalFetchTimeoutMs ?? 30_000);
     const userAgent = this.settings.researchGlobalUserAgent ?? "FusionResearchBot/1.0";
-    const synthesisProvider = this.settings.researchGlobalDefaults?.synthesisProvider ?? this.settings.defaultProvider;
-    const synthesisModelId = this.settings.researchGlobalDefaults?.synthesisModelId ?? this.settings.defaultModelId;
+    /*
+    FNXC:LaneModelResolution 2026-07-24-17:40:
+    Resolve the synthesis provider and model as a PAIR. Resolving each half independently let a
+    `researchGlobalDefaults.synthesisProvider` with no `synthesisModelId` (or the reverse) produce
+    a half-set pair, which the runtime treats as fully unset (`resolveConfiguredModel` returns
+    undefined unless BOTH are present) and silently replaces with its own built-in Anthropic
+    default. Fall back to the project default pair only when the research override is incomplete.
+    */
+    const researchSynthesisPair = this.settings.researchGlobalDefaults?.synthesisProvider
+      && this.settings.researchGlobalDefaults?.synthesisModelId
+      ? {
+        provider: this.settings.researchGlobalDefaults.synthesisProvider,
+        modelId: this.settings.researchGlobalDefaults.synthesisModelId,
+      }
+      : undefined;
+    const synthesisProvider = researchSynthesisPair?.provider ?? this.settings.defaultProvider;
+    const synthesisModelId = researchSynthesisPair?.modelId ?? this.settings.defaultModelId;
 
     this.providers = new Map<ResearchProviderType, ResearchProvider>([
       [

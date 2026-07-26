@@ -30,6 +30,10 @@ vi.mock("@fusion/engine", () => ({
     skillSource: "role-fallback" as const,
   }),
   createFnAgent: vi.fn(),
+  // FNXC:PlanningRuntimeResolution 2026-07-24-16:20: planning builds sessions through the
+  // shared runtime-resolving seam; these suites drive it via __setCreateFnAgent, so the
+  // engine export only needs to exist on the mock factory.
+  createResolvedAgentSession: vi.fn(),
   createWorkflowAuthoringTools: () => [],
   createChatTaskDocumentTools: () => [],
   createChatTaskLogsReadTool: () => ({}),

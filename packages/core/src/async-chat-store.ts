@@ -16,6 +16,7 @@
  *   flip. These helpers are the async target the PostgreSQL integration tests
  *   consume.
  */
+import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, ilike, inArray, isNull, lte, ne, or as orFn, sql as drizzleSql } from "drizzle-orm";
 import * as schema from "./postgres/schema/index.js";
 import type { AsyncDataLayer, DbTransaction } from "./postgres/data-layer.js";
@@ -31,6 +32,9 @@ import type {
   ChatRoomStatus,
   ChatSession,
   ChatSessionStatus,
+  ChatTag,
+  ChatTagCreateInput,
+  ChatTagUpdateInput,
   RoomMemberRole,
 } from "./chat-types.js";
 
@@ -39,9 +43,14 @@ type QueryHandle = AsyncDataLayer["db"] | DbTransaction;
 
 // ── Row → Entity converters ──
 
+function rowToTag(row: Record<string, unknown>): ChatTag {
+  return { id: row.id as string, projectId: (row.ownerProjectId as string) === "__default__" ? null : row.ownerProjectId as string, name: row.name as string, createdAt: row.createdAt as string, updatedAt: row.updatedAt as string };
+}
+
 function rowToSession(row: Record<string, unknown>): ChatSession {
   return {
     id: row.id as string,
+    tags: [],
     agentId: row.agentId as string,
     title: (row.title as string | null) ?? null,
     status: row.status as ChatSessionStatus,
@@ -147,7 +156,7 @@ export async function getChatSession(handle: QueryHandle, id: string): Promise<C
     .select()
     .from(schema.project.chatSessions)
     .where(eq(schema.project.chatSessions.id, id));
-  return rows[0] ? rowToSession(rows[0]) : undefined;
+  return rows[0] ? attachTags(handle, rowToSession(rows[0])) : undefined;
 }
 
 /**
@@ -167,18 +176,120 @@ export async function listChatSessions(
     .from(schema.project.chatSessions)
     .orderBy(desc(schema.project.chatSessions.updatedAt));
   const rows = conditions.length > 0 ? await query.where(and(...conditions)) : await query;
-  return rows.map(rowToSession);
+  return attachTagsToSessions(handle, rows.map(rowToSession));
 }
 
 /**
  * Delete a chat session by id. Returns true if a row was deleted.
  */
 export async function deleteChatSession(handle: QueryHandle, id: string): Promise<boolean> {
+  const [session] = await handle.select({ projectId: schema.project.chatSessions.projectId })
+    .from(schema.project.chatSessions).where(eq(schema.project.chatSessions.id, id));
+  if (!session) return false;
+  const sessionProjectId = session.projectId;
+  if (!sessionProjectId) throw new Error("Chat session is missing its required project partition");
+  // FNXC:ChatTags 2026-08-05-12:15: cleanup retains the session's RLS partition even for bypass/admin handles; an unqualified ID could delete another project's assignment.
+  await handle.delete(schema.project.chatSessionTags).where(and(
+    eq(schema.project.chatSessionTags.sessionId, id),
+    eq(schema.project.chatSessionTags.projectId, sessionProjectId),
+  ));
   const result = await handle
     .delete(schema.project.chatSessions)
-    .where(eq(schema.project.chatSessions.id, id))
+    .where(and(eq(schema.project.chatSessions.id, id), eq(schema.project.chatSessions.projectId, sessionProjectId)))
     .returning({ id: schema.project.chatSessions.id });
   return result.length > 0;
+}
+
+function tagScope(projectId: string | null | undefined): string { return projectId ?? "__default__"; }
+function normalizeTagName(name: string): { name: string; normalizedName: string } {
+  const cleaned = name.trim().replace(/\s+/g, " ");
+  if (!cleaned || cleaned.length > 64) throw new Error("Tag name must be between 1 and 64 characters");
+  return { name: cleaned, normalizedName: cleaned.toLocaleLowerCase() };
+}
+
+async function attachTags(handle: QueryHandle, session: ChatSession): Promise<ChatSession> {
+  const [attached] = await attachTagsToSessions(handle, [session]);
+  return attached ?? session;
+}
+
+async function attachTagsToSessions(handle: QueryHandle, sessions: ChatSession[]): Promise<ChatSession[]> {
+  if (!sessions.length) return sessions;
+  const rows = await handle.select({ sessionId: schema.project.chatSessionTags.sessionId, id: schema.project.chatTags.id, ownerProjectId: schema.project.chatTags.ownerProjectId, name: schema.project.chatTags.name, createdAt: schema.project.chatTags.createdAt, updatedAt: schema.project.chatTags.updatedAt })
+    .from(schema.project.chatSessionTags).innerJoin(schema.project.chatTags, and(
+      eq(schema.project.chatSessionTags.tagId, schema.project.chatTags.id),
+      eq(schema.project.chatSessionTags.projectId, schema.project.chatTags.projectId),
+    ))
+    .innerJoin(schema.project.chatSessions, and(
+      eq(schema.project.chatSessionTags.sessionId, schema.project.chatSessions.id),
+      eq(schema.project.chatSessionTags.projectId, schema.project.chatSessions.projectId),
+    ))
+    .where(inArray(schema.project.chatSessionTags.sessionId, sessions.map((session) => session.id))).orderBy(asc(schema.project.chatTags.normalizedName), asc(schema.project.chatTags.id));
+  const tagsBySession = new Map<string, ChatTag[]>();
+  for (const row of rows) { const tags = tagsBySession.get(row.sessionId) ?? []; tags.push(rowToTag(row)); tagsBySession.set(row.sessionId, tags); }
+  return sessions.map((session) => ({ ...session, tags: tagsBySession.get(session.id) ?? [] }));
+}
+
+/** FNXC:ChatTags 2026-08-05-10:55: Tags normalize whitespace/case and are always read in deterministic name order. */
+export async function listChatTags(handle: QueryHandle, projectId: string | null): Promise<ChatTag[]> {
+  const rows = await handle.select().from(schema.project.chatTags).where(eq(schema.project.chatTags.ownerProjectId, tagScope(projectId))).orderBy(asc(schema.project.chatTags.normalizedName), asc(schema.project.chatTags.id));
+  return rows.map(rowToTag);
+}
+
+export async function createChatTag(layer: AsyncDataLayer, input: ChatTagCreateInput): Promise<ChatTag> {
+  const { name, normalizedName } = normalizeTagName(input.name); const projectId = input.projectId ?? null; const now = new Date().toISOString();
+  return layer.transactionImmediate(async (tx) => {
+    const id = `chat-tag-${randomUUID().slice(0, 8)}`;
+    const rows = await tx.insert(schema.project.chatTags).values({ id, ownerProjectId: tagScope(projectId), name, normalizedName, createdAt: now, updatedAt: now }).onConflictDoNothing().returning();
+    if (!rows[0]) throw new Error("A tag with that name already exists");
+    return rowToTag(rows[0]);
+  });
+}
+
+export async function renameChatTag(layer: AsyncDataLayer, id: string, projectId: string | null, input: ChatTagUpdateInput): Promise<ChatTag | undefined> {
+  const { name, normalizedName } = normalizeTagName(input.name);
+  return layer.transactionImmediate(async (tx) => { const rows = await tx.update(schema.project.chatTags).set({ name, normalizedName, updatedAt: new Date().toISOString() }).where(and(eq(schema.project.chatTags.id, id), eq(schema.project.chatTags.ownerProjectId, tagScope(projectId)))).returning(); if (!rows[0]) return undefined; return rowToTag(rows[0]); });
+}
+
+export async function deleteChatTag(layer: AsyncDataLayer, id: string, projectId: string | null): Promise<boolean> {
+  return layer.transactionImmediate(async (tx) => {
+    const [tag] = await tx.select({ projectId: schema.project.chatTags.projectId })
+      .from(schema.project.chatTags)
+      .where(and(eq(schema.project.chatTags.id, id), eq(schema.project.chatTags.ownerProjectId, tagScope(projectId))));
+    if (!tag?.projectId) return false;
+    const tagProjectId = tag.projectId;
+    // FNXC:ChatTags 2026-08-05-12:15: validate the scoped parent before cleanup; bypass handles must not erase a same-ID tag assignment in another partition.
+    await tx.delete(schema.project.chatSessionTags).where(and(
+      eq(schema.project.chatSessionTags.tagId, id),
+      eq(schema.project.chatSessionTags.projectId, tagProjectId),
+    ));
+    return (await tx.delete(schema.project.chatTags)
+      .where(and(eq(schema.project.chatTags.id, id), eq(schema.project.chatTags.projectId, tagProjectId)))
+      .returning({ id: schema.project.chatTags.id })).length > 0;
+  });
+}
+
+export async function replaceChatSessionTags(layer: AsyncDataLayer, sessionId: string, projectId: string | null, tagIds: string[]): Promise<ChatSession | undefined> {
+  return layer.transactionImmediate(async (tx) => {
+    const session = await getChatSessionForUpdate(tx, sessionId); if (!session || session.projectId !== projectId) return undefined;
+    const ownerProjectCondition = projectId === null
+      ? isNull(schema.project.chatSessions.ownerProjectId)
+      : eq(schema.project.chatSessions.ownerProjectId, projectId);
+    const [sessionPartition] = await tx.select({ projectId: schema.project.chatSessions.projectId }).from(schema.project.chatSessions)
+      .where(and(eq(schema.project.chatSessions.id, sessionId), ownerProjectCondition)).for("update");
+    if (!sessionPartition?.projectId) return undefined;
+    const sessionProjectId = sessionPartition.projectId;
+    const uniqueIds = [...new Set(tagIds)];
+    const tags = uniqueIds.length ? await tx.select().from(schema.project.chatTags).where(and(
+      inArray(schema.project.chatTags.id, uniqueIds),
+      eq(schema.project.chatTags.ownerProjectId, tagScope(projectId)),
+      eq(schema.project.chatTags.projectId, sessionProjectId),
+    )) : [];
+    if (tags.length !== uniqueIds.length) throw new Error("One or more tags do not belong to this project");
+    // FNXC:ChatTags 2026-08-05-12:15: replacements are scoped by the locked session partition, preserving project isolation when the DB bypass role is active.
+    await tx.delete(schema.project.chatSessionTags).where(and(eq(schema.project.chatSessionTags.sessionId, sessionId), eq(schema.project.chatSessionTags.projectId, sessionProjectId)));
+    if (uniqueIds.length) await tx.insert(schema.project.chatSessionTags).values(uniqueIds.map((tagId) => ({ projectId: sessionProjectId, sessionId, tagId, assignedAt: new Date().toISOString() }))).onConflictDoNothing();
+    return attachTags(tx, session);
+  });
 }
 
 // ── Message CRUD ──

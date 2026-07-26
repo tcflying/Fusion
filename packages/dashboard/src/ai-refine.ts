@@ -16,6 +16,7 @@ import { resolvePrompt } from "@fusion/core";
 
 import { createFnAgent as engineCreateFnAgent, resolveMcpServersForStore } from "@fusion/engine";
 import { registerBeforeExitCleanup } from "./process-lifecycle.js";
+import { laneModelOptions, resolveLaneSessionModel } from "./lane-session-model.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const createFnAgent: any = engineCreateFnAgent;
@@ -338,11 +339,20 @@ export async function refineText(
    * FNXC:McpConfig 2026-06-26-16:55:
    * Text refinement is a readonly dashboard helper that receives the request-scoped TaskStore from routes. Resolve configured MCP servers at session creation and forward only the in-memory server set; keep no-store callers on an empty set and never log materialized secrets.
    */
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  Resolve an explicit provider/model pair. Without one the runtime silently substitutes its
+  own built-in default model (anthropic/claude-opus-4-8), leaving the operator's configured
+  provider and failing with `401 invalid x-api-key` for anyone with no raw Anthropic key —
+  and bypassing test-mode forcing. See lane-session-model.ts.
+  */
+  const refineModel = await resolveLaneSessionModel(store);
   const agentResult = await createFnAgent({
     cwd: rootDir,
     systemPrompt: effectivePrompt,
     tools: "readonly",
     mcpServers,
+    ...laneModelOptions(refineModel),
   });
 
   if (!agentResult?.session) {
@@ -411,11 +421,20 @@ export async function draftGoalDescription(
    * FNXC:McpConfig 2026-06-26-16:55:
    * Goal description drafting shares the text-refine readonly helper seam and now resolves MCP from the dashboard-scoped TaskStore when routes can provide it. No-store callers intentionally receive an empty server set; do not log env/header secret values.
    */
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  Resolve an explicit provider/model pair. Without one the runtime silently substitutes its
+  own built-in default model (anthropic/claude-opus-4-8), leaving the operator's configured
+  provider and failing with `401 invalid x-api-key` for anyone with no raw Anthropic key —
+  and bypassing test-mode forcing. See lane-session-model.ts.
+  */
+  const goalDraftModel = await resolveLaneSessionModel(store);
   const agentResult = await createFnAgent({
     cwd: rootDir,
     systemPrompt: GOAL_DRAFT_SYSTEM_PROMPT,
     tools: "readonly",
     mcpServers,
+    ...laneModelOptions(goalDraftModel),
   });
 
   if (!agentResult?.session) {

@@ -80,6 +80,7 @@ import {
   range7d,
   tokenFixture,
 } from "./areas.test-harness";
+import { readAppFile } from "../../../../test/cssFixture";
 
 describe("Command Center cost formatting", () => {
   it("shows priced subtotals when only part of the usage has known pricing", () => {
@@ -1231,7 +1232,7 @@ describe("ProductivityArea", () => {
   });
 
   it("keeps LOC backfill mobile actions stacked and full width in CSS", () => {
-    const css = readFileSync(join(process.cwd(), "app/components/command-center/CommandCenter.css"), "utf8");
+    const css = readAppFile("components/command-center/CommandCenter.css");
     expect(css).toMatch(/@media \(max-width: 768px\)[\s\S]*\.cc-productivity-backfill-actions[\s\S]*flex-direction: column;/);
     expect(css).toMatch(/@media \(max-width: 768px\)[\s\S]*\.cc-productivity-backfill-actions \.btn[\s\S]*inline-size: 100%;/);
   });

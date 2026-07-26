@@ -241,6 +241,60 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
     }
   });
 
+  /*
+  FNXC:ChatTags 2026-08-05-10:55:
+  Tags are a Direct-conversation taxonomy, not room metadata. Every endpoint
+  resolves the project-scoped ChatStore and passes its project identity into the
+  store mutation, preventing unqualified tag/session IDs from crossing scopes.
+  */
+  router.get("/chat/tags", rateLimit(RATE_LIMITS.api), async (req, res) => {
+    try {
+      const { projectId } = await getProjectContext(req);
+      const { chatStore } = await resolveScopedChatStore(projectId);
+      res.json({ tags: await chatStore.listTags(projectId ?? null) });
+    } catch (err) { rethrowAsApiError(err, "Failed to list chat tags"); }
+  });
+
+  router.post("/chat/tags", rateLimit(RATE_LIMITS.mutation), async (req, res) => {
+    try {
+      if (typeof req.body?.name !== "string") throw badRequest("name must be a string");
+      const { projectId } = await getProjectContext(req);
+      const { chatStore } = await resolveScopedChatStore(projectId);
+      const tag = await chatStore.createTag({ name: req.body.name, projectId: projectId ?? null });
+      res.status(201).json({ tag });
+    } catch (err) {
+      if (err instanceof ApiError) throw err;
+      const message = err instanceof Error ? err.message : "Invalid tag";
+      if (message.includes("tag") || message.includes("Tag")) throw badRequest(message);
+      rethrowAsApiError(err, "Failed to create chat tag");
+    }
+  });
+
+  router.patch("/chat/tags/:id", rateLimit(RATE_LIMITS.mutation), async (req, res) => {
+    try {
+      if (typeof req.body?.name !== "string") throw badRequest("name must be a string");
+      const { projectId } = await getProjectContext(req);
+      const { chatStore } = await resolveScopedChatStore(projectId);
+      const tag = await chatStore.renameTag(String(req.params.id), projectId ?? null, { name: req.body.name });
+      if (!tag) throw notFound("Chat tag not found");
+      res.json({ tag });
+    } catch (err) {
+      if (err instanceof ApiError) throw err;
+      const message = err instanceof Error ? err.message : "Invalid tag";
+      if (message.includes("tag") || message.includes("Tag")) throw badRequest(message);
+      rethrowAsApiError(err, "Failed to rename chat tag");
+    }
+  });
+
+  router.delete("/chat/tags/:id", rateLimit(RATE_LIMITS.mutation), async (req, res) => {
+    try {
+      const { projectId } = await getProjectContext(req);
+      const { chatStore } = await resolveScopedChatStore(projectId);
+      if (!await chatStore.deleteTag(String(req.params.id), projectId ?? null)) throw notFound("Chat tag not found");
+      res.json({ success: true });
+    } catch (err) { if (err instanceof ApiError) throw err; rethrowAsApiError(err, "Failed to delete chat tag"); }
+  });
+
   // ── Chat Routes ────────────────────────────────────────────────────────────
 
   /**
@@ -533,6 +587,7 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
         modelId: rawModelId,
         agentId: rawAgentId,
         pinned: rawPinned,
+        tagIds: rawTagIds,
       } = req.body as {
         title?: string;
         status?: string;
@@ -541,11 +596,16 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
         modelId?: string | null;
         agentId?: string;
         pinned?: boolean;
+        tagIds?: unknown;
       };
 
       // Validate status if provided
       if (status !== undefined && status !== "active" && status !== "archived") {
         throw badRequest("status must be 'active' or 'archived'");
+      }
+
+      if (rawTagIds !== undefined && (!Array.isArray(rawTagIds) || rawTagIds.some((id) => typeof id !== "string" || !id.trim()))) {
+        throw badRequest("tagIds must be an array of tag IDs");
       }
 
       if (rawPinned !== undefined && typeof rawPinned !== "boolean") {
@@ -595,6 +655,16 @@ export function registerChatRoutes(ctx: ApiRoutesContext, deps: ChatRouteDeps): 
       if (!session) {
         throw notFound(`Chat session ${sessionId} not found`);
       }
+      if (rawTagIds !== undefined) {
+        try {
+          session = await chatStore.replaceSessionTags(sessionId, session.projectId ?? null, rawTagIds.map((id) => id.trim()));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unable to update conversation tags";
+          throw badRequest(message);
+        }
+        if (!session) throw notFound(`Chat session ${sessionId} not found`);
+      }
+
       if (rawPinned !== undefined) {
         try {
           session = await chatStore.setSessionPinned(sessionId, rawPinned);

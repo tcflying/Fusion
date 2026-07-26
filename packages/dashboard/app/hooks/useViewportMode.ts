@@ -14,6 +14,19 @@ const MOBILE_WIDTH_MEDIA_QUERY = "(max-width: 768px)";
 const MOBILE_HEIGHT_MEDIA_QUERY = "(max-height: 480px)";
 
 /*
+FNXC:ViewportMode 2026-07-24-18:55:
+No tablet renders a viewport this narrow as its primary layout, so a CSS width at
+or below this is a phone regardless of what `window.screen` reports. The physical-
+screen heuristic below cannot be trusted on its own: large Android phones report a
+screen min edge above the 480px phone threshold, which classified them tablet-class
+and dropped the bottom nav bar entirely while `MobileNavBar.css` still displayed at
+`(max-width: 768px)` — JS and CSS disagreeing about the same device. The tablet
+carve-out only ever needed the 601-768px band (portrait tablets at the boundary).
+*/
+const PHONE_WIDTH_MEDIA_QUERY = "(max-width: 600px)";
+const PHONE_MAX_CSS_WIDTH = 600;
+
+/*
 FNXC:ModalGeometryPersistence 2026-07-15-19:30:
 Full-screen FloatingWindow sheets use only the CSS width breakpoint. This deliberately diverges from
 `isMobileViewport()`: its short landscape-phone clause still renders movable windows, whose desktop
@@ -64,6 +77,23 @@ function isTabletClassTouchScreen(): boolean {
   return hasTouchScreen() && hasKnownPhysicalScreenSize() && !isPhoneClassScreen();
 }
 
+/**
+ * Whether the CSS viewport is narrow enough to be a phone on width alone.
+ *
+ * FNXC:ViewportMode 2026-07-24-18:55:
+ * Overrides the physical-screen tablet classification: no `window.screen` value
+ * can turn a <=600px CSS viewport into a tablet presentation. Checks every width
+ * signal the module already trusts (visual viewport, media query, innerWidth) so
+ * a delayed media-query update on rotation cannot strand a phone in tablet mode.
+ */
+function isPhoneClassWidth(): boolean {
+  if (typeof window === "undefined") return false;
+  const visualWidth = getTouchVisualViewportWidth();
+  if (visualWidth !== null && visualWidth <= PHONE_MAX_CSS_WIDTH) return true;
+  if (typeof window.matchMedia === "function" && window.matchMedia(PHONE_WIDTH_MEDIA_QUERY).matches) return true;
+  return window.innerWidth > 0 && window.innerWidth <= PHONE_MAX_CSS_WIDTH;
+}
+
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
   const visualWidth = getTouchVisualViewportWidth();
@@ -82,7 +112,14 @@ export function isMobileViewport(): boolean {
   const hasNarrowWidth = window.innerWidth <= 768 ||
     window.matchMedia(MOBILE_WIDTH_MEDIA_QUERY).matches ||
     (visualWidth !== null && visualWidth <= 768);
-  return (hasNarrowWidth && !isTabletClassTouchScreen()) ||
+  /*
+  FNXC:ViewportMode 2026-07-24-18:55:
+  The tablet exclusion applies only above the phone width floor. Without that
+  guard every touch device whose reported physical screen exceeds the 480px phone
+  threshold — which includes large Android phones — lost mobile mode at any width,
+  taking the bottom nav bar with it.
+  */
+  return (hasNarrowWidth && (isPhoneClassWidth() || !isTabletClassTouchScreen())) ||
     ((window.matchMedia(MOBILE_HEIGHT_MEDIA_QUERY).matches || (visualHeight !== null && visualHeight <= 480)) && isPhoneClassScreen());
 }
 

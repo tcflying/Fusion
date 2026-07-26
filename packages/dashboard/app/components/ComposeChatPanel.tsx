@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import type { NativeStructureEmbed } from "@fusion/core";
 import { FN_AGENT_ID, useChat } from "../hooks/useChat";
 import "./ComposeChatPanel.css";
@@ -30,6 +32,8 @@ export function ComposeChatPanel({ projectId, embeds, draftBody, onUseDraft, onC
   const creatingSession = useRef(false);
   const closed = useRef(false);
   const archivedSessionId = useRef<string | null>(null);
+  const requestRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef: requestRef, value: request, onChange: setRequest, projectId });
   const restoredSessionId = useRef<string | null>(null);
 
   const archiveScratchSession = useCallback((id = scratchSessionId.current) => {
@@ -105,9 +109,9 @@ export function ComposeChatPanel({ projectId, embeds, draftBody, onUseDraft, onC
   return (
     <section id="compose-chat-panel" className="compose-chat-panel" aria-label="Compose chat narrative helper" data-testid="compose-chat-panel">
       <label className="message-composer-label" htmlFor="compose-chat-request">Draft narrative</label>
-      <textarea id="compose-chat-request" className="input compose-chat-panel__input" value={request} onChange={(event) => setRequest(event.target.value)} />
+      <textarea ref={requestRef} id="compose-chat-request" className="input compose-chat-panel__input" value={request} onChange={(event) => setRequest(event.target.value)} />
       <div className="compose-chat-panel__output" aria-live="polite">{latestDraft || "Ask the assistant to draft the narrative around your attached structures."}</div>
-      <div className="compose-chat-panel__actions">
+      <div className="compose-chat-panel__actions"><MicButton {...dictation.micProps} />
         <button className="btn btn-sm btn-primary" type="button" onClick={() => void send()} disabled={chat.isStreaming || isCreating || hasPendingPrompt || !request.trim()}>Draft</button>
         <button className="btn btn-sm btn-secondary" type="button" onClick={() => latestDraft && onUseDraft(latestDraft)} disabled={!latestDraft}>Use draft</button>
         <button className="btn btn-sm btn-secondary" type="button" onClick={close}>Close</button>

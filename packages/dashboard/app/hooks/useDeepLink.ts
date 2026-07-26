@@ -166,6 +166,69 @@ export function useDeepLink(options: UseDeepLinkOptions): UseDeepLinkResult {
     // deepLinkFetchedRef intentionally excluded - it's a mutable ref, not state
   ]);
 
+  /*
+  FNXC:DeepLink 2026-07-25-11:20:
+  `#/tasks/<id>` is the SECOND task deep-link shape in the app, and until now it had no
+  consumer at all. Five surfaces write it as their open-a-task-we-do-not-hold-in-memory
+  fallback — the duplicate-warning "Open" button in InlineCreateCard, NewTaskModal, and
+  QuickEntryBox, plus the Column and ListView quick-add `onOpenTask` fallbacks — so every
+  one of those Opens silently did nothing and the operator saw a frozen "Possible
+  duplicates" modal with an unresponsive button.
+
+  Invariant: writing `#/tasks/<id>` ALWAYS produces an observable outcome — the task opens,
+  or a toast explains why it could not. Never a silent no-op. Handled here rather than in a
+  new hook so the app keeps ONE deep-link authority owning both URL shapes.
+
+  Two behaviors differ deliberately from the `?task=` path above:
+    - No one-shot `deepLinkFetchedRef` guard. The hash form is a repeatable in-session
+      action (click Open, close detail, click Open again), not a once-per-load boot link.
+    - The id is resolved by fetch, not by an in-memory board lookup, because the duplicate
+      target is routinely outside the loaded slice (a `done` task, a collapsed column, a
+      filtered-out row) — the exact case an in-memory lookup would silently drop.
+  */
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    let cancelled = false;
+
+    const consumeTaskHash = () => {
+      const match = /^#\/tasks\/([^/?#]+)/.exec(window.location.hash);
+      if (!match) return;
+
+      let taskId = match[1];
+      try {
+        taskId = decodeURIComponent(taskId);
+      } catch {
+        // A malformed percent-escape still names a task the caller meant to open.
+      }
+
+      /*
+      Clear the hash BEFORE awaiting. `replaceState` does not itself fire `hashchange`, so
+      this is load-bearing twice: re-Opening the same task still produces a `hashchange`
+      event, and a stale hash cannot re-open the task on a later mount or project switch.
+      */
+      const existingState = window.history.state ?? {};
+      window.history.replaceState(existingState, "", `${window.location.pathname}${window.location.search}`);
+
+      fetchTaskDetail(taskId, projectId)
+        .then((detail) => {
+          if (cancelled) return;
+          openTaskDetail(detail);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          addToast(t("deepLink.taskNotFound", "Task {{id}} not found", { id: taskId }), "error");
+        });
+    };
+
+    consumeTaskHash();
+    window.addEventListener("hashchange", consumeTaskHash);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("hashchange", consumeTaskHash);
+    };
+  }, [addToast, openTaskDetail, projectId, t]);
+
   const handleDetailClose = useCallback(() => {
     if (deepLinkTaskIdRef.current) {
       const params = new URLSearchParams(window.location.search);

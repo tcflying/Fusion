@@ -8,6 +8,7 @@
  */
 import type { SettingsSearchEntry } from "./types";
 import { appearanceSearchEntries } from "../sections/AppearanceSection.search";
+import { authenticationSearchEntries } from "../sections/AuthenticationSection.search";
 import { backupsSearchEntries } from "../sections/BackupsSection.search";
 import { databaseBackupsSearchEntries } from "../sections/DatabaseBackupsSection.search";
 import { commandsSearchEntries } from "../sections/CommandsSection.search";
@@ -29,6 +30,7 @@ import { schedulingSearchEntries } from "../sections/SchedulingSection.search";
 import { sourceControlGlobalSearchEntries } from "../sections/SourceControlGlobalSection.search";
 import { sourceControlSearchEntries } from "../sections/SourceControlSection.search";
 import { worktreesSearchEntries } from "../sections/WorktreesSection.search";
+import { voiceInputSearchEntries } from "../sections/VoiceInputSection.search";
 
 /**
  * Flat index of every searchable setting. Order is not significant — results
@@ -36,6 +38,7 @@ import { worktreesSearchEntries } from "../sections/WorktreesSection.search";
  */
 export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   ...appearanceSearchEntries,
+  ...authenticationSearchEntries,
   ...backupsSearchEntries,
   ...databaseBackupsSearchEntries,
   ...commandsSearchEntries,
@@ -57,6 +60,7 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   ...sourceControlGlobalSearchEntries,
   ...sourceControlSearchEntries,
   ...worktreesSearchEntries,
+  ...voiceInputSearchEntries,
 ];
 
 /** Entries owned by one section id. */

@@ -343,12 +343,15 @@ describe("PlanningModeModal sequential flow", () => {
     };
     selectQuote("Build authentication system");
     const actionBar = screen.getByTestId("planning-plan-actions");
-    const documentTrigger = document.querySelector(".planning-add-comment--document");
-    const mobileTrigger = document.querySelector(".planning-add-comment--mobile");
-    expect(documentTrigger).toBeInstanceOf(HTMLElement);
-    expect(mobileTrigger).toBeInstanceOf(HTMLElement);
-    expect(documentTrigger?.closest(".planning-plan-document")).toContainElement(documentTrigger as HTMLElement);
-    expect(actionBar).toContainElement(mobileTrigger as HTMLElement);
+    /*
+    FNXC:PlanningComments 2026-07-25-10:20:
+    Exactly one trigger, and it lives in the plan action rail — never inside the plan document,
+    where it duplicated the rail control at the end of the plan text.
+    */
+    const triggers = document.querySelectorAll(".planning-add-comment");
+    expect(triggers).toHaveLength(1);
+    expect(actionBar).toContainElement(triggers[0] as HTMLElement);
+    expect(document.querySelector(".planning-plan-document .planning-add-comment")).toBeNull();
     const openTrigger = screen.getByRole("button", { name: "Add comment to selection" });
     fireEvent.pointerDown(openTrigger);
     // FNXC:PlanningComments 2026-07-24-06:30: selection collapse before click must not drop the frozen open quote.
@@ -422,6 +425,45 @@ describe("PlanningModeModal sequential flow", () => {
       document.dispatchEvent(new Event("selectionchange"));
     });
     await waitFor(() => expect(screen.queryByRole("button", { name: "Add comment to selection" })).toBeNull());
+  });
+
+  /*
+  FNXC:PlanningComments 2026-07-25-10:20:
+  Desktop drag-select emits selectionchange per mouse move. Showing the trigger on those intermediate
+  ranges strobed the button while the operator was still dragging; it must appear once, on release.
+  */
+  it("shows the selection comment trigger only after the drag selection is finished", async () => {
+    mockFetchAiSession.mockResolvedValue({
+      ...base,
+      status: "awaiting_input",
+      currentQuestion: JSON.stringify({ id: "q-1", type: "text", question: "Anything else?" }),
+      result: JSON.stringify(summaryWithRefinements),
+      inputPayload: "{}",
+    });
+    renderSession();
+    const documentNode = await screen.findByTestId("planning-plan-markdown");
+    const walker = document.createTreeWalker(documentNode, NodeFilter.SHOW_TEXT);
+    let textNode: Node | null = walker.nextNode();
+    while (textNode && !textNode.textContent?.includes("Build authentication system")) textNode = walker.nextNode();
+    expect(textNode).not.toBeNull();
+
+    act(() => {
+      fireEvent.pointerDown(documentNode);
+    });
+    // Intermediate ranges during the drag must not mount the trigger.
+    act(() => {
+      const range = document.createRange();
+      range.selectNodeContents(textNode!);
+      window.getSelection()?.removeAllRanges();
+      window.getSelection()?.addRange(range);
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    expect(screen.queryByRole("button", { name: "Add comment to selection" })).toBeNull();
+
+    act(() => {
+      fireEvent.pointerUp(documentNode);
+    });
+    expect(await screen.findByRole("button", { name: "Add comment to selection" })).toBeInTheDocument();
   });
 
   it("rehydrates a restored idle session when another tab advances its question", async () => {

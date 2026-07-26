@@ -53,6 +53,7 @@ import { MAX_AUTO_MERGE_RETRIES, type BlockerFanoutEntry } from "../hooks/useBlo
 import { useRetryWarning } from "../context/RetryWarningContext";
 import { useCostBadge } from "../context/CostBadgeContext";
 import { useColumnLabel } from "../i18n/labels";
+import { formatCompactLifecycleDate, useLocaleFormat } from "../i18n/format";
 import { WorkspaceWorktreesSummary, isWorkspaceTask } from "./WorkspaceWorktreesSummary";
 import { WorkflowIcon } from "./WorkflowIcon";
 import { TaskContextMenu, buildTaskActionMenuModel, getTaskPrAutomationLabel, type TaskContextMenuColumnFlags, type TaskContextMenuColumnMetadata, type TaskMenuActionDescriptor } from "./TaskContextMenu";
@@ -753,6 +754,12 @@ function areCommentsEqual(previous: Task["comments"], next: Task["comments"]): b
 
 // Keep this comparator aligned with the fields TaskCard renders directly and the
 // task metadata that influences child badge freshness/subscriptions.
+function millisecondsUntilNextLocalMidnight(now: Date): number {
+  const next = new Date(now);
+  next.setHours(24, 0, 0, 25);
+  return Math.max(1, next.getTime() - now.getTime());
+}
+
 function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): boolean {
   const previousTask = previous.task;
   const nextTask = next.task;
@@ -820,6 +827,8 @@ function areTaskCardPropsEqual(previous: TaskCardProps, next: TaskCardProps): bo
     previousTask.timedExecutionMs === nextTask.timedExecutionMs &&
     previousTask.updatedAt === nextTask.updatedAt &&
     previousTask.createdAt === nextTask.createdAt &&
+    previousTask.executionCompletedAt === nextTask.executionCompletedAt &&
+    previousTask.archivedAt === nextTask.archivedAt &&
     previousTask.status === nextTask.status &&
     previousTask.recentAgentActivityAt === nextTask.recentAgentActivityAt &&
     previousTask.priority === nextTask.priority &&
@@ -963,6 +972,7 @@ function TaskCardComponent({
   nearDuplicateCanonicalInactive,
 }: TaskCardProps) {
   const { t } = useTranslation("app");
+  const { locale } = useLocaleFormat();
   const columnLabel = useColumnLabel();
   const [dragging, setDragging] = useState(false);
   const [fileDragOver, setFileDragOver] = useState(false);
@@ -981,6 +991,27 @@ function TaskCardComponent({
   const [isAddressingPrFeedback, setIsAddressingPrFeedback] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [timeIndicatorNowMs, setTimeIndicatorNowMs] = useState(() => Date.now());
+  const [lifecycleNowMs, setLifecycleNowMs] = useState(() => Date.now());
+
+  /*
+  FNXC:TaskCardDates 2026-07-24-11:02:
+  FN-8561 requires compact lifecycle labels to change at the viewer's local
+  midnight even when memoized task props are unchanged. One boundary timer per
+  mounted card avoids stale "today" time labels and is always cleaned up.
+  */
+  useEffect(() => {
+    let timer: number | undefined;
+    const schedule = () => {
+      timer = window.setTimeout(() => {
+        setLifecycleNowMs(Date.now());
+        schedule();
+      }, millisecondsUntilNextLocalMidnight(new Date()));
+    };
+    schedule();
+    return () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
 
   const descTextareaRef = useRef<HTMLTextAreaElement>(null);
   const touchOpenHandledRef = useRef(false);
@@ -1386,6 +1417,24 @@ function TaskCardComponent({
     && (task.steps?.length ?? 0) > 0
     && !planReviewRunning
     && !isAgentActive;
+  /*
+  FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+  "Queued to plan" is the exact complement of Ready: same idle-in-Todo conditions, but the card has
+  NO steps yet, so it is unplanned and waiting for a PLANNING slot rather than a WIP slot. Without
+  it a started card that the concurrency pool has not admitted is visually identical to a card
+  nothing is going to happen to — the throttle was only observable in the engine log
+  ("Plan throttled by running-agent cap|global semaphore"), which is why a busy pool read as a bug.
+
+  Three Todo states are now distinguishable: planning in flight (the "planning" status badge),
+  unplanned and waiting for a planning slot (this badge), planned and waiting for a WIP slot
+  (Ready). The conditions are mutually exclusive by the steps count, so no card shows both.
+  */
+  const showQueuedToPlanBadge = !isPaused
+    && task.column === "todo"
+    && !visualStatus
+    && (task.steps?.length ?? 0) === 0
+    && !planReviewRunning
+    && !isAgentActive;
   // Native HTML5 drag is desktop-mouse only — it doesn't move cards via touch.
   // On touch-primary devices the `draggable` attribute still arms the browser's
   // touch-drag heuristic, which intermittently hijacks horizontal swipes meant
@@ -1621,6 +1670,16 @@ function TaskCardComponent({
       ariaLabel: t("tasks.executionTimeCompleted", "Execution time {{elapsed}}. Completed {{completedAt}}", { elapsed: elapsedLabel, completedAt }),
     };
   }, [task.column, task.status, task.columnMovedAt, task.timedExecutionMs, task.updatedAt, task.workflowStepResults, task.log, task.firstExecutionAt, task.cumulativeActiveMs, task.cumulativePlanningMs, task.planningStartedAt, task.executionStartedAt, task.executionCompletedAt, timeIndicatorNowMs]);
+
+  const lifecycleDates = useMemo(() => {
+    const created = formatCompactLifecycleDate(task.createdAt, locale, new Date(lifecycleNowMs));
+    const completionSource = task.executionCompletedAt
+      ?? (task.column === "archived" ? task.archivedAt : undefined);
+    const completed = (task.column === "done" || task.column === "archived")
+      ? formatCompactLifecycleDate(completionSource, locale, new Date(lifecycleNowMs))
+      : null;
+    return { created, completed };
+  }, [task.createdAt, task.executionCompletedAt, task.archivedAt, task.column, locale, lifecycleNowMs]);
 
   const liveBadgeData = badgeUpdates.get(`${projectId ?? "default"}:${task.id}`);
 
@@ -2698,7 +2757,14 @@ function TaskCardComponent({
     setIsStarting(true);
     try {
       await onMoveTask(task.id, startTargetColumn);
-      addToast(t("tasks.startedPlanning", "Started planning {{taskId}}", { taskId: task.id }), "success");
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+      Honest copy: Start performs a column move, not a plan dispatch. "Started planning" claimed an
+      outcome this handler cannot observe — the engine still has to admit the card, and a busy
+      concurrency pool (maxConcurrent / globalMaxConcurrent) can defer that indefinitely, which
+      made a throttled card look broken. The card's "Queued to plan" badge carries the live state.
+      */
+      addToast(t("tasks.queuedForPlanning", "Queued {{taskId}} for planning", { taskId: task.id }), "success");
     } catch (err) {
       addToast(getErrorMessage(err), "error");
     } finally {
@@ -2993,6 +3059,10 @@ function TaskCardComponent({
     || showStatusBadge
     || showOptionalGateBadge
     || showReadyBadge
+    // FNXC:CodingIdeasWorkflow 2026-07-25-12:05: the header wrapper only renders when it has a
+    // real child, so a new badge must be declared here or it never mounts (Queued to plan is the
+    // only badge on an unplanned idle Todo card — without this the whole cluster stays absent).
+    || showQueuedToPlanBadge
     || Boolean(hasInReviewStall && stallCopy)
     || cliWaitingOnInput
     || cliNeedsAttention
@@ -3188,6 +3258,24 @@ function TaskCardComponent({
         {showReadyBadge && (
           <span className="card-status-badge card-status-badge--todo ready" data-testid={`card-ready-${task.id}`}>
             {t("tasks.ready", "Ready")}
+          </span>
+        )}
+        {/*
+        FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+        Started-but-not-yet-planned. Reuses the Ready badge's primitives with the queued modifier
+        rather than forking a new badge variant. The title names both caps, since the per-project
+        maxConcurrent and the cross-project globalMaxConcurrent can each be the binding one.
+        */}
+        {showQueuedToPlanBadge && (
+          <span
+            className="card-status-badge card-status-badge--todo queued-to-plan"
+            data-testid={`card-queued-to-plan-${task.id}`}
+            title={t(
+              "tasks.queuedToPlanTitle",
+              "Waiting for a planning slot — planning starts when a concurrency slot frees up (maxConcurrent / globalMaxConcurrent)",
+            )}
+          >
+            {t("tasks.queuedToPlan", "Queued to plan")}
           </span>
         )}
         {hasInReviewStall && stallCopy && (
@@ -3673,6 +3761,20 @@ function TaskCardComponent({
           </>
         );
       })()}
+      {(lifecycleDates.created || lifecycleDates.completed) && (
+        <div className="card-lifecycle-dates" data-testid="card-lifecycle-dates">
+          {lifecycleDates.created && (
+            <time dateTime={lifecycleDates.created.dateTime} title={t("tasks.createdAtTitle", "Created {{date}}", { date: lifecycleDates.created.full })}>
+              {t("tasks.createdAt", "Created {{date}}", { date: lifecycleDates.created.compact })}
+            </time>
+          )}
+          {lifecycleDates.completed && (
+            <time dateTime={lifecycleDates.completed.dateTime} title={t("tasks.completedAtTitle", "Completed {{date}}", { date: lifecycleDates.completed.full })}>
+              {t("tasks.completedAt", "Completed {{date}}", { date: lifecycleDates.completed.compact })}
+            </time>
+          )}
+        </div>
+      )}
       {(footerHasLeadingContent || (footerRightHasContent && !placeFooterRightInMeta)) && (
         <div className={`card-footer-row${chipFarRight ? " card-footer-row--chip-far-right" : ""}`}>
           {filesChangedButton}

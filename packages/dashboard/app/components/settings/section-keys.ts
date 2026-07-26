@@ -178,6 +178,8 @@ const PROJECT_SECTION_KEYS: Record<string, readonly string[]> = {
     "memoryBackupScope",
   ],
   "research-project": ["researchSettings"],
+  /* FNXC:VoiceInput 2026-07-28-12:00: Voice input is a project preference; reset restores the inherited opt-in default without affecting the local model lifecycle. */
+  "voice-input": ["voiceInput"],
   "project-models": [
     "autoSelectModelPreset",
     "autoSummarizeTitles",

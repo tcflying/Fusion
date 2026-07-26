@@ -14,9 +14,20 @@ import { api } from "./client.js";
 import { withProjectId } from "./health.js";
 import type { DeleteTaskOptions, ArchiveTaskOptions } from "./tasks.js";
 
-/** Manually promote a held card out of its hold column (U9). */
-export function promoteTask(id: string, projectId?: string): Promise<Task> {
-  return api<Task>(withProjectId(`/tasks/${id}/promote`, projectId), { method: "POST" });
+/**
+ * Manually promote a held card out of its hold column (U9).
+ *
+ * FNXC:WorkflowScheduling 2026-07-25-04:55:
+ * `force` waives the `unplanned-for-execution` gate (pending replan / pre-release
+ * Plan Review) and starts execution anyway. It is only ever sent after the
+ * operator confirms the override dialog the plain promote's rejection raises;
+ * capacity is still enforced server-side, so a forced promote can still reject.
+ */
+export function promoteTask(id: string, projectId?: string, options?: { force?: boolean }): Promise<Task> {
+  return api<Task>(withProjectId(`/tasks/${id}/promote`, projectId), {
+    method: "POST",
+    body: JSON.stringify({ force: options?.force === true }),
+  });
 }
 
 /**

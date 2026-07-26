@@ -1195,6 +1195,7 @@
       "mergeBlocked": "",
       "promoteRejected": "",
       "unknownColumn": "",
+      "unplannedForExecution": "",
       "workflowMismatch": ""
     },
     "todo": "À faire",
@@ -1505,6 +1506,10 @@
     "preserveProgressMessage": "Cette tâche a des étapes terminées. Conserver la progression avant de déplacer ?",
     "preserveProgressMoveTodoMessage": "Certaines tâches ont des étapes terminées. Conserver la progression avant de déplacer vers À faire ?",
     "preserveProgressTitle": "Conserver la progression ?",
+    "promoteUnplannedCancel": "",
+    "promoteUnplannedConfirm": "",
+    "promoteUnplannedMessage": "",
+    "promoteUnplannedTitle": "",
     "replanAll": "Replanifier tout",
     "replanAllHint_one": "",
     "replanAllHint_other": "",
@@ -5755,7 +5760,13 @@
       "statusActive": "✓ Actif",
       "statusNotConnected": "✗ Non connecté",
       "title": "Authentification",
-      "waitingForLogin": "En attente de connexion…"
+      "waitingForLogin": "En attente de connexion…",
+      "anthropicPreferenceLabel": "Anthropic credential to use",
+      "anthropicPreferenceHint": "You have both an Anthropic API key and a Claude subscription connected. Choose which one Fusion sends when a lane calls Anthropic directly. Default: API key.",
+      "anthropicPreferenceApiKey": "API key",
+      "anthropicPreferenceSubscription": "Claude subscription",
+      "credentialInUse": "In use",
+      "credentialOverridden": "Overridden below"
     },
     "authentication": {
       "enterAPIKey": "",
@@ -6360,7 +6371,8 @@
       },
       "globalMcp": "MCP Servers · Global",
       "mcp": "MCP Servers · Project",
-      "configVersions": "Versions de configuration"
+      "configVersions": "Versions de configuration",
+      "voiceInput": "Voice Input"
     },
     "nodeRouting": {
       "blockExecution": "",
@@ -6880,6 +6892,25 @@
       "confirmTitle": "Revenir à une configuration antérieure ?",
       "confirmMessage": "Restaurer cette version ? Le retour est enregistré comme une nouvelle version.",
       "confirmRollback": "Revenir en arrière"
+    },
+    "voiceInput": {
+      "title": "Voice Input",
+      "enable": "Enable voice input",
+      "enableHelp": "Default: off. Voice dictation uses the operator-managed Parakeet v3 model.",
+      "modelStatus": "Parakeet v3 model status",
+      "modelStatusHelp": "The speech model is installed and managed locally on this device.",
+      "modelActions": "Model management",
+      "modelActionsHelp": "Download or remove the Parakeet v3 speech model.",
+      "statusUnavailable": "Voice runtime status could not be determined; voice mode stays disabled.",
+      "runtimeUnavailable": "Voice runtime unavailable",
+      "unknown": "Status unavailable",
+      "downloading": "Downloading model…",
+      "downloadingProgress": "Downloading: {{progress}}%",
+      "installed": "Installed",
+      "notInstalled": "Not installed",
+      "download": "Download",
+      "remove": "Remove",
+      "error": "Model error: {{message}}"
     }
   },
   "setup": {
@@ -8306,6 +8337,10 @@
     "closeIssue": "Fermer l'issue",
     "collapse": "Réduire",
     "createdByAgent": "Créé par un agent",
+    "createdAt": "Créée {{date}}",
+    "createdAtTitle": "Créée {{date}}",
+    "completedAt": "Terminée {{date}}",
+    "completedAtTitle": "Terminée {{date}}",
     "createdByAgentNamed": "Créé par l'agent : {{name}}",
     "createdPr": "PR #{{number}} créée",
     "createFailed": "Impossible de créer la tâche",

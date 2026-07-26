@@ -4,6 +4,18 @@ import { join, resolve } from "node:path";
 const APP_DIR = resolve(__dirname, "..");
 const COMPONENTS_DIR = join(APP_DIR, "components");
 
+/**
+ * FNXC:DashboardTests 2026-07-26-06:10:
+ * Dashboard test source reads MUST resolve from this module-relative app directory. Cwd-relative reads hard-crash an entire Vitest suite at import time under root-anchored invocations with ENOENT for paths such as app/components/QuickEntryBox.css.
+ */
+export function readAppFile(appRelativePath: string): string {
+  return readFileSync(resolve(APP_DIR, appRelativePath), "utf-8");
+}
+
+export function loadComponentCss(name: string): string {
+  return readAppFile(join("components", name));
+}
+
 let cached: string | null = null;
 let stylesCached: string | null = null;
 let themeDataCached: string | null = null;

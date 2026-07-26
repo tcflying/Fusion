@@ -59,6 +59,7 @@ import { SourceControlGlobalSection } from "./settings/sections/SourceControlGlo
 import { AgentPermissionsSection } from "./settings/sections/AgentPermissionsSection";
 import { MemorySection } from "./settings/sections/MemorySection";
 import { ResearchProjectSection } from "./settings/sections/ResearchProjectSection";
+import { VoiceInputSection } from "./settings/sections/VoiceInputSection";
 import { ProjectMcpSection } from "./settings/sections/ProjectMcpSection";
 import { BackupsSection } from "./settings/sections/BackupsSection";
 import { ConfigurationVersionsSection } from "./settings/sections/ConfigurationVersionsSection";
@@ -314,7 +315,8 @@ const RUNTIME_PLUGIN_SECTION_IDS: ReadonlyMap<string, string> = new Map([
 
 const RUNTIME_SETTINGS_SECTION_IDS = new Set(RUNTIME_PLUGIN_SECTION_IDS.values());
 
-const ADVANCED_SETTINGS_SECTION_IDS = new Set([
+/* FNXC:VoiceInput 2026-07-28-12:00: Voice Input is an opt-in end-user feature, so it stays visible in Basic Settings rather than joining this advanced-only set. */
+export const ADVANCED_SETTINGS_SECTION_IDS = new Set([
   "node-sync",
   "global-mcp",
   "cli-agents",
@@ -633,6 +635,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   { id: "memory", label: "Memory", labelKey: "settings.nav.memory", scope: "project", searchableText: ["memory backend", "Dreams", "long-term memory", "qmd", "memory file", "retrieval"] },
   { id: "research-global", label: "Research · Global", labelKey: "settings.nav.researchGlobal", scope: "global", searchableText: ["research providers", "external search providers", "fetch limits", "global research defaults", "citations"] },
   { id: "research-project", label: "Research · Project", labelKey: "settings.nav.researchProject", scope: "project", searchableText: ["project research", "research runs", "citations", "search limits", "fetch synthesis"] },
+  { id: "voice-input", label: "Voice Input", labelKey: "settings.nav.voiceInput", scope: "project", searchableText: ["voice", "dictation", "microphone", "speech to text", "parakeet", "transcription"] },
 
   { id: "__automation_header", label: "Automation", labelKey: "settings.nav.automationHeader", scope: undefined, isGroupHeader: true },
   /*
@@ -1978,7 +1981,16 @@ export function SettingsModal({
   const handleCheckForUpdates = useCallback(async () => {
     setUpdateCheckLoading(true);
     setUpdateInstallResult(null);
-    setRestartSupported(undefined);
+    /*
+    FNXC:SettingsUpdate 2026-07-25-10:05:
+    Do NOT clear restartSupported here. It is a property of the HOST (is there a
+    supervising parent?), not of this update check, and clearing it stranded the
+    post-update "Restart Fusion" button: the capability effect was keyed on
+    updateAvailable, so a second "Check now" that returned the same
+    updateAvailable=true left restartSupported permanently `undefined` and the
+    button disabled with "Needs a supervising parent" on a perfectly supervised
+    host. The probe below owns this state for the modal's lifetime.
+    */
     setRestartLoading(false);
     setRestartScheduled(false);
     setRestartError(null);
@@ -2022,6 +2034,17 @@ export function SettingsModal({
 
       if (result.updated) {
         addToast(t("settings.general.updateSuccessToast", "Update installed. Restart Fusion to apply it."), "success");
+        /*
+        FNXC:SettingsUpdate 2026-07-25-10:05:
+        Re-probe capability right before the restart button appears so a transient
+        /system/info failure at mount (which fails closed to `false`) cannot leave a
+        supervised host permanently unable to restart from Settings.
+        */
+        void fetchSystemInfo()
+          .then((info) => setRestartSupported(info.restartSupported))
+          .catch(() => {
+            // Keep whatever the mount probe resolved; the guidance text covers it.
+          });
       }
     } catch (error) {
       const message = getErrorMessage(error) || t("settings.general.updateFailed", "Update failed");
@@ -2037,13 +2060,17 @@ export function SettingsModal({
     }
   }, [addToast, appVersion, projectId, t, updateCheckResult]);
 
+  /*
+  FNXC:SettingsUpdate 2026-07-25-10:05:
+  Probe host restart capability once when Settings mounts — same unconditional
+  shape UpdateAvailableBanner and the Command Center System panel use. It used to
+  run only after an update became available, which made the state order-dependent
+  and left the restart button dead in the re-check case described above. Fetching
+  on mount means the capability is already resolved by the time an install
+  finishes, so the button is enabled the moment it appears.
+  */
   useEffect(() => {
-    if (!updateCheckResult?.updateAvailable && updateInstallResult?.updated !== true) {
-      return;
-    }
-
     let cancelled = false;
-    setRestartSupported(undefined);
 
     void fetchSystemInfo()
       .then((info) => {
@@ -2057,16 +2084,23 @@ export function SettingsModal({
     return () => {
       cancelled = true;
     };
-  }, [updateCheckResult?.updateAvailable, updateInstallResult?.updated]);
+  }, []);
 
   /*
   FNXC:SettingsUpdate 2026-07-16-00:00:
   After a successful in-app update, the Settings footer must offer the same supervised
-  one-click restart as SystemControlsArea. The FN-8134-deferred Settings surface keeps
-  the control disabled with manual-restart guidance unless restartSupported is true.
+  one-click restart as SystemControlsArea.
+
+  FNXC:SettingsUpdate 2026-07-25-10:05:
+  The control must never silently do nothing. It used to be hard-disabled on
+  `restartSupported !== true`, so any host whose capability probe answered false —
+  including a probe that merely failed, or a stale answer — left the operator with a
+  dead button and no way to learn why ("the restart button does nothing"). Now the
+  click always reaches the server and the server's own refusal is shown inline; the
+  supervising-parent line stays as advisory guidance rather than a hard block.
   */
   const handleRestart = useCallback(async () => {
-    if (restartLoading || restartSupported !== true) return;
+    if (restartLoading) return;
 
     setRestartLoading(true);
     setRestartError(null);
@@ -2082,7 +2116,7 @@ export function SettingsModal({
     } finally {
       setRestartLoading(false);
     }
-  }, [restartLoading, restartSupported, t]);
+  }, [restartLoading, t]);
 
   const renderUpdateCheckResultContent = useCallback(() => {
     if (!updateCheckResult) {
@@ -2128,7 +2162,7 @@ export function SettingsModal({
                   onClick={() => {
                     void handleRestart();
                   }}
-                  disabled={restartSupported !== true || restartLoading}
+                  disabled={restartLoading}
                 >
                   {restartLoading ? (
                     <>
@@ -2143,7 +2177,14 @@ export function SettingsModal({
                   )}
                 </button>
               )}
-              {restartSupported !== true && (
+              {/*
+                FNXC:SettingsUpdate 2026-07-25-10:05:
+                Advisory, not a block. The probe says this host reported no supervising
+                parent, so restarting will likely be refused — but the operator can still
+                press the button and read the server's actual reason instead of facing a
+                dead control.
+              */}
+              {restartSupported === false && (
                 <span className="settings-update-install-status" aria-live="polite">
                   {t("settings.general.restartUnavailable", "Needs a supervising parent — restart Fusion manually without --no-supervise.")}
                 </span>
@@ -2184,6 +2225,30 @@ export function SettingsModal({
 
     return t("settings.general.upToDate", "You're up to date ✓");
   }, [handleInstallUpdate, handleRestart, restartError, restartLoading, restartScheduled, restartSupported, t, updateCheckResult, updateInstallLoading, updateInstallResult]);
+
+  /*
+  FNXC:SettingsUpdate 2026-07-25-19:40:
+  The update-check result ("vX available · Learn more" plus the Update now / Restart controls) is one node rendered
+  in two places: inline next to the version button on desktop/tablet, and on its OWN full-width row above the footer
+  rail on mobile. The mobile footer is a single nowrap horizontally-scrolling rail (FN-7752); once an update banner
+  joined that rail its intrinsic width exceeded the viewport, so the banner itself was clipped mid-sentence and
+  Import/Export/Reset/Close were pushed off-screen behind a scroll affordance operators do not see. Giving the banner
+  its own row keeps the rail to the controls it was sized for, and the banner wraps normally instead of clipping.
+  */
+  const updateCheckResultNode = updateCheckResult ? (
+    <span
+      aria-live="polite"
+      className={`settings-update-result ${
+        updateCheckResult.error
+          ? "settings-update-result--error"
+          : updateCheckResult.updateAvailable
+            ? "settings-update-result--available"
+            : "settings-update-result--up-to-date"
+      }`}
+    >
+      {renderUpdateCheckResultContent()}
+    </span>
+  ) : null;
 
   // Load auth status when the authentication section is active
   const loadAuthStatus = useCallback(async () => {
@@ -4449,6 +4514,8 @@ export function SettingsModal({
             researchLimitError={researchLimitError}
           />
         );
+      case "voice-input":
+        return <VoiceInputSection form={form} setForm={setForm} />;
       case "cli-binary":
         return <CliBinarySection />;
       case "experimental":
@@ -4567,6 +4634,15 @@ export function SettingsModal({
               handleSubmitManualCode,
               onReopenOnboarding,
             }}
+            /*
+            FNXC:ProviderAuth 2026-07-24-17:05:
+            Authentication is presentational like every other section — the shell keeps
+            ownership of persistence. It needs the form only for the Anthropic
+            credential-precedence row, which belongs beside the two Anthropic cards
+            rather than buried in a general settings list.
+            */
+            form={form}
+            setForm={setForm}
           />
         );
       case "hermes-runtime":
@@ -4932,6 +5008,9 @@ export function SettingsModal({
             </div>
           </div>
         )}
+        {viewportMode === "mobile" && updateCheckResultNode && (
+          <div className="settings-modal-footer-update-row">{updateCheckResultNode}</div>
+        )}
         <div className="modal-actions">
           <div className="settings-modal-footer-version">
             <a
@@ -4968,20 +5047,7 @@ export function SettingsModal({
                   <RefreshCw size={12} className={updateCheckLoading ? "spinning" : undefined} />
                 </button>
               )}
-              {updateCheckResult && (
-                <span
-                  aria-live="polite"
-                  className={`settings-update-result ${
-                    updateCheckResult.error
-                      ? "settings-update-result--error"
-                      : updateCheckResult.updateAvailable
-                        ? "settings-update-result--available"
-                        : "settings-update-result--up-to-date"
-                  }`}
-                >
-                  {renderUpdateCheckResultContent()}
-                </span>
-              )}
+              {viewportMode !== "mobile" && updateCheckResultNode}
             </div>
           </div>
           <div className="modal-actions-left">

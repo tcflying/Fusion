@@ -16,6 +16,12 @@ vi.mock("../../sse-bus", () => ({
   subscribeSse: vi.fn(() => () => {}),
 }));
 
+/*
+FNXC:ChatTags 2026-07-24-23:05:
+useChat loads tags on mount via fetchChatTags/createChatTag/renameChatTag/deleteChatTag.
+Partial ../../api factories must stub those exports or CI fails with
+"No fetchChatTags export is defined on the mock" once tag APIs ship.
+*/
 vi.mock("../../api", () => ({
   fetchSettings: vi.fn().mockResolvedValue({}),
   fetchChatSessions: vi.fn(),
@@ -27,6 +33,10 @@ vi.mock("../../api", () => ({
   streamChatResponse: vi.fn(),
   attachChatStream: vi.fn(),
   cancelChatResponse: vi.fn(),
+  fetchChatTags: vi.fn().mockResolvedValue({ tags: [] }),
+  createChatTag: vi.fn().mockResolvedValue({ tag: { id: "tag-1", name: "t", createdAt: "2026-04-08T00:00:00.000Z" } }),
+  renameChatTag: vi.fn().mockResolvedValue({ tag: { id: "tag-1", name: "t", createdAt: "2026-04-08T00:00:00.000Z" } }),
+  deleteChatTag: vi.fn().mockResolvedValue({ success: true }),
   fetchAgents: vi.fn().mockResolvedValue([
     { id: "agent-001", name: "Alpha", role: "executor", state: "idle", icon: undefined, createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z", metadata: {} },
   ]),

@@ -4360,7 +4360,16 @@ export function DashboardApp({ controller }: DashboardAppProps) {
       return;
     }
 
-    if (input === "t" || input === "T") {
+    /*
+    FNXC:DashboardTui 2026-07-24-18:40:
+    `t` is overloaded: global → Git view, Utilities section → Toggle Engine Pause.
+    The global branch runs first in this same handler and returned unconditionally,
+    so `handleUtilityAction("t")` below was unreachable and the Utilities panel
+    advertised a shortcut that did nothing. Yield to the Utilities dispatch when
+    that section owns focus (matching the `f` / logs-focus precedent above).
+    */
+    const utilitiesOwnsInput = state.mode === "status" && state.activeSection === "utilities" && !logsFocused;
+    if ((input === "t" || input === "T") && !utilitiesOwnsInput) {
       controller.setMode("interactive");
       controller.setInteractiveView("git");
       return;

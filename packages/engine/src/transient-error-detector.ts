@@ -24,8 +24,8 @@ now live in the import-free leaf `transient-error-patterns.ts` so the merge clas
 one definition of "transient" without inheriting this module's logger chain (FN-8004).
 Re-exported here so every existing importer of this module keeps working unchanged.
 */
-import { isTransientAuthCredentialError, isTransientError } from "./transient-error-patterns.js";
-export { TRANSIENT_ERROR_PATTERNS, isTransientAuthCredentialError, isTransientError } from "./transient-error-patterns.js";
+import { isSessionContentionError, isTransientAuthCredentialError, isTransientError } from "./transient-error-patterns.js";
+export { TRANSIENT_ERROR_PATTERNS, SESSION_CONTENTION_PATTERNS, isSessionContentionError, isTransientAuthCredentialError, isTransientError } from "./transient-error-patterns.js";
 
 
 /*
@@ -48,6 +48,20 @@ export function isNonPlanDefectPlanReviewFailure(input: {
   failureValue?: string;
 }): boolean {
   if (input.verdict === "REVISE") return false;
+
+  /*
+  FNXC:SessionContention 2026-07-25-21:30:
+  Contention is NOT a provider failure and must never take the provider hold, whose budget is two
+  immediate retries followed by a park — retrying instantly cannot clear a lease another task holds.
+  Excluded at the source so a caller that forgets the dedicated contention check still cannot misroute
+  it; contention has its own backoff hold (SESSION_CONTENTION_HOLD_VALUE).
+  */
+  if (
+    input.failureValue?.trim().toLowerCase() === "session-contention-hold"
+    || (input.errorMessage ? isSessionContentionError(input.errorMessage) : false)
+  ) {
+    return false;
+  }
 
   const failureValue = input.failureValue?.trim().toLowerCase();
   if (failureValue === "exception" || failureValue === "aborted") return true;

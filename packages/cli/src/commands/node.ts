@@ -1,5 +1,6 @@
 import { CentralCore, type NodeConfig } from "@fusion/core";
 import { createInterface } from "node:readline/promises";
+import { promptOutputStream } from "../output.js";
 
 const GREEN = "\x1b[32m";
 const RED = "\x1b[31m";
@@ -362,7 +363,8 @@ export async function runNodeDisconnect(
     }
 
     if (!options.force) {
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
       const answer = await rl.question(`Disconnect node '${node.name}'? [y/N] `);
       rl.close();
 

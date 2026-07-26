@@ -1898,6 +1898,40 @@ export const chatSessions = projectSchema.table("chat_sessions", {
 }, (t) => [
   index("idxChatSessionsAgentId").on(t.agentId),
   index("idxChatSessionsProjectId").on(t.projectId),
+  uniqueIndex("uqChatSessionsProjectIdId").on(t.projectId, t.id),
+]);
+
+/*
+FNXC:ChatTags 2026-08-05-10:55:
+Tags deliberately retain an owner scope independent of the RLS partition. The
+canonical `__default__` scope makes nullable legacy session project IDs unique
+without relying on PostgreSQL's NULL-unique behavior.
+*/
+export const chatTags = projectSchema.table("chat_tags", {
+  id: text("id").notNull(),
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  ownerProjectId: text("owner_project_id").notNull(),
+  name: text("name").notNull(),
+  normalizedName: text("normalized_name").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (t) => [
+  primaryKey({ columns: [t.projectId, t.id] }),
+  uniqueIndex("uqChatTagsScopeName").on(t.projectId, t.normalizedName),
+  index("idxChatTagsScopeName").on(t.projectId, t.normalizedName),
+]);
+
+export const chatSessionTags = projectSchema.table("chat_session_tags", {
+  sessionId: text("session_id").notNull(),
+  tagId: text("tag_id").notNull(),
+  projectId: text("project_id").notNull().default(sql`current_setting('fusion.project_id', true)`),
+  assignedAt: text("assigned_at").notNull(),
+}, (t) => [
+  // FNXC:ChatTags 2026-08-05-12:15: both parents include the RLS partition, preventing bypass/admin access from joining a same-named ID in another project.
+  primaryKey({ columns: [t.projectId, t.sessionId, t.tagId] }),
+  foreignKey({ columns: [t.projectId, t.sessionId], foreignColumns: [chatSessions.projectId, chatSessions.id] }).onDelete("cascade"),
+  foreignKey({ columns: [t.projectId, t.tagId], foreignColumns: [chatTags.projectId, chatTags.id] }).onDelete("cascade"),
+  index("idxChatSessionTagsTag").on(t.projectId, t.tagId, t.sessionId),
 ]);
 
 export const cliSessions = projectSchema.table("cli_sessions", {

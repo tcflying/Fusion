@@ -13,6 +13,7 @@ import {
   type FinalizePlanOverride,
 } from "@fusion/engine";
 import { closeProjectStore, resolveProject, type ProjectContext } from "../project-context.js";
+import { result } from "../output.js";
 
 interface ExperimentFinalizeOptions {
   sessionId: string;
@@ -34,7 +35,7 @@ const EXIT_CODES = new Map<string, number>([
 ]);
 
 function printJson(payload: unknown): void {
-  console.log(JSON.stringify(payload, null, 2));
+  result(JSON.stringify(payload, null, 2) + "\n");
 }
 
 function printPlan(plan: Awaited<ReturnType<ExperimentFinalizeService["previewPlan"]>>): void {

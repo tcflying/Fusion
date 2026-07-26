@@ -1180,6 +1180,123 @@ describe("ChatView core interactions", () => {
     expect(screen.getByTestId("chat-context-delete")).toBeInTheDocument();
   });
 
+  function setupStatefulTagCreationMock(initialTags: Array<{ id: string; projectId: string; name: string; createdAt: string; updatedAt: string }> = []) {
+    const createdTag = { id: "tag-new", projectId: "proj-123", name: "New tag", createdAt: "2026-07-24T00:00:00.000Z", updatedAt: "2026-07-24T00:00:00.000Z" };
+    const createTag = vi.fn();
+    const setSessionTags = vi.fn();
+
+    mockUseChat.mockImplementation(() => {
+      const [tags, setTags] = useState(initialTags);
+      const [sessions, setSessions] = useState<ChatSessionInfo[]>([{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", tags: initialTags, createdAt: createdTag.createdAt, updatedAt: createdTag.updatedAt }]);
+      return {
+        ...defaultChatState,
+        tags,
+        sessions,
+        filteredSessions: sessions,
+        createTag: async (name) => {
+          createTag(name);
+          setTags((previous) => [...previous, createdTag]);
+          return createdTag;
+        },
+        setSessionTags: async (sessionId, tagIds) => {
+          setSessionTags(sessionId, tagIds);
+          setSessions((previous) => previous.map((session) => session.id === sessionId ? { ...session, tags: [...tags, createdTag].filter((tag) => tagIds.includes(tag.id)) } : session));
+        },
+      } as UseChatReturn;
+    });
+
+    return { createTag, createdTag, setSessionTags };
+  }
+
+  it("assigns a newly created tag from the context-menu Enter path", async () => {
+    const { createTag, createdTag, setSessionTags } = setupStatefulTagCreationMock();
+    await renderWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+    await userEvent.pointer({ target: screen.getByTestId("chat-session-session-001"), keys: "[MouseRight]" });
+
+    const input = screen.getByLabelText("New tag");
+    await userEvent.type(input, "  New tag  ");
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(createTag).toHaveBeenCalledWith("New tag"));
+    await waitFor(() => expect(setSessionTags).toHaveBeenCalledWith("session-001", [createdTag.id]));
+    expect(screen.getByTestId(`chat-context-tag-${createdTag.id}`)).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("chat-session-tags-session-001")).toHaveTextContent(createdTag.name);
+  });
+
+  it("assigns a newly created tag from the context-menu Add button", async () => {
+    const { createdTag, setSessionTags } = setupStatefulTagCreationMock();
+    await renderWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+    await userEvent.pointer({ target: screen.getByTestId("chat-session-session-001"), keys: "[MouseRight]" });
+
+    await userEvent.type(screen.getByLabelText("New tag"), "New tag");
+    await userEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(setSessionTags).toHaveBeenCalledWith("session-001", [createdTag.id]));
+    expect(screen.getByTestId(`chat-context-tag-${createdTag.id}`)).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("preserves existing tags when creating a context-menu tag", async () => {
+    const existingTag = { id: "tag-existing", projectId: "proj-123", name: "Existing", createdAt: "2026-07-24T00:00:00.000Z", updatedAt: "2026-07-24T00:00:00.000Z" };
+    const { createdTag, setSessionTags } = setupStatefulTagCreationMock([existingTag]);
+    await renderWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+    await userEvent.pointer({ target: screen.getByTestId("chat-session-session-001"), keys: "[MouseRight]" });
+
+    await userEvent.type(screen.getByLabelText("New tag"), "New tag");
+    await userEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() => expect(setSessionTags).toHaveBeenCalledWith("session-001", [existingTag.id, createdTag.id]));
+    expect(screen.getByTestId("chat-session-tags-session-001")).toHaveTextContent("Existing");
+    expect(screen.getByTestId("chat-session-tags-session-001")).toHaveTextContent(createdTag.name);
+  });
+
+  it("does not create or assign a blank context-menu tag", async () => {
+    const createTag = vi.fn();
+    const setSessionTags = vi.fn();
+    setupMockChat({
+      sessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-07-24T00:00:00.000Z", updatedAt: "2026-07-24T00:00:00.000Z" }],
+      filteredSessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", createdAt: "2026-07-24T00:00:00.000Z", updatedAt: "2026-07-24T00:00:00.000Z" }],
+      createTag,
+      setSessionTags,
+    });
+    await renderWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+    await userEvent.pointer({ target: screen.getByTestId("chat-session-session-001"), keys: "[MouseRight]" });
+
+    const input = screen.getByLabelText("New tag");
+    await userEvent.type(input, "   ");
+    fireEvent.keyDown(input, { key: "Enter" });
+    await userEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    expect(createTag).not.toHaveBeenCalled();
+    expect(setSessionTags).not.toHaveBeenCalled();
+  });
+
+  it("renders tag rename and deletion controls from the conversation menu", async () => {
+    const renameTag = vi.fn().mockResolvedValue(undefined);
+    const deleteTag = vi.fn().mockResolvedValue(undefined);
+    const tag = { id: "tag-topic", projectId: "proj-123", name: "Topic", createdAt: "2026-04-08T00:00:00.000Z", updatedAt: "2026-04-08T00:00:00.000Z" };
+    setupMockChat({
+      sessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", tags: [tag], createdAt: tag.createdAt, updatedAt: tag.updatedAt }],
+      filteredSessions: [{ id: "session-001", agentId: "agent-001", status: "active", title: "Test Chat", tags: [tag], createdAt: tag.createdAt, updatedAt: tag.updatedAt }],
+      tags: [tag],
+      renameTag,
+      deleteTag,
+    });
+
+    await renderWithAct(<ChatView projectId="proj-123" addToast={vi.fn()} />);
+    await userEvent.pointer({ target: screen.getByTestId("chat-session-session-001"), keys: "[MouseRight]" });
+
+    await userEvent.click(screen.getByTestId("chat-context-rename-tag-tag-topic"));
+    await userEvent.clear(screen.getByTestId("chat-rename-tag-input"));
+    await userEvent.type(screen.getByTestId("chat-rename-tag-input"), "Research");
+    await userEvent.click(screen.getByTestId("chat-rename-tag-save"));
+    expect(renameTag).toHaveBeenCalledWith("tag-topic", "Research");
+
+    await userEvent.pointer({ target: screen.getByTestId("chat-session-session-001"), keys: "[MouseRight]" });
+    await userEvent.click(screen.getByTestId("chat-context-delete-tag-tag-topic"));
+    await userEvent.click(screen.getByTestId("chat-delete-tag-confirm"));
+    expect(deleteTag).toHaveBeenCalledWith("tag-topic");
+  });
+
   it("calls archiveSession when clicking Archive in context menu", async () => {
     const archiveSession = vi.fn();
     setupMockChat({

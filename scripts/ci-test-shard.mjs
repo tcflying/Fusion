@@ -901,6 +901,19 @@ export function attributeTestFile(filePath, packages, projectRoot = process.cwd(
     if (normalized === pkg.dir || normalized.startsWith(`${pkg.dir}/`)) {
       return { pkg: pkg.name, file: normalized };
     }
+
+    /*
+     * FNXC:TestTimingRefresh 2026-07-24-11:00:
+     * Default-branch CI reporter paths are absolute under GitHub's checkout,
+     * while snapshot generation runs in a different local worktree. Attribute
+     * those reports from the package-directory suffix so complete, provenance-
+     * matched CI timing artifacts refresh the snapshot instead of yielding zero packages.
+     */
+    const packageStart = `/${pkg.dir}/`;
+    const packageOffset = normalized.lastIndexOf(packageStart);
+    if (packageOffset !== -1) {
+      return { pkg: pkg.name, file: normalized.slice(packageOffset + 1) };
+    }
   }
   return null;
 }

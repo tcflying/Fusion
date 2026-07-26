@@ -57,7 +57,12 @@
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
-  scroll-snap-type: x proximity;
+  /*
+  FNXC:BoardNavigation 2026-07-24-10:05:
+  Desktop/tablet workflow-column scrolling is free-panning — snapping (and its slow browser
+  settle animation) is reserved for the phone tier, where the JS column pager owns paging.
+  */
+  scroll-snap-type: none;
   touch-action: pan-x pan-y;
 }
 
@@ -125,7 +130,8 @@
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
-  scroll-snap-type: x proximity;
+  /* FNXC:BoardNavigation 2026-07-24-10:05: lane columns snap on phones only (see mobile block). */
+  scroll-snap-type: none;
   scrollbar-color: var(--border) transparent;
   scrollbar-width: thin;
   min-height: 0;
@@ -184,6 +190,19 @@
     min-height: 0;
     overflow-x: auto;
     overflow-y: hidden;
+    scroll-snap-type: none;
+  }
+}
+
+/*
+FNXC:BoardNavigation 2026-07-24-10:05:
+Phone tier keeps proximity snapping (paired with the JS column pager in useColumnScrollSnap) so a
+swipe still rests on exactly one column center. Mirrors the mobile `.board` block in styles.css and
+matches the mobile viewport query (max-width: 768px, max-height: 480px).
+*/
+@media (max-width: 768px), (max-height: 480px) {
+  .board.board-workflow-columns,
+  .lane-columns {
     scroll-snap-type: x proximity;
   }
 }

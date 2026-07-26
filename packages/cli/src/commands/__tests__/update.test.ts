@@ -1,6 +1,11 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 
-const { execAsyncMock, existsSyncMock, readFileSyncMock, getCachedUpdateStatusMock, getConfiguredUpdateChannelMock, persistUpdateChannelMock } = vi.hoisted(() => ({
+/*
+FNXC:CliQuietMode 2026-07-25-09:05:
+`fn update --json` writes through `result()` (raw stdout) so quiet mode cannot
+drop machine-readable payloads. Capture that seam instead of console.log.
+*/
+const { execAsyncMock, existsSyncMock, readFileSyncMock, getCachedUpdateStatusMock, getConfiguredUpdateChannelMock, persistUpdateChannelMock, resultSpy } = vi.hoisted(() => ({
   execAsyncMock: vi.fn<(...args: unknown[]) => Promise<{ stdout: string; stderr: string }>>(),
   existsSyncMock: vi.fn<(path: string) => boolean>(),
   readFileSyncMock: vi.fn<(path: string, encoding: BufferEncoding) => string>(),
@@ -12,7 +17,18 @@ const { execAsyncMock, existsSyncMock, readFileSyncMock, getCachedUpdateStatusMo
   } | null>(),
   getConfiguredUpdateChannelMock: vi.fn<() => Promise<"stable" | "beta">>(),
   persistUpdateChannelMock: vi.fn<(channel: "stable" | "beta") => Promise<void>>(),
+  resultSpy: vi.fn<(text: string) => void>(),
 }));
+
+vi.mock("../../output.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../output.js")>();
+  return {
+    ...actual,
+    result: (text: string) => {
+      resultSpy(text);
+    },
+  };
+});
 
 vi.mock("node:child_process", async () => {
   const { promisify } = await import("node:util");
@@ -47,6 +63,7 @@ describe("runUpdate", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resultSpy.mockClear();
     process.exitCode = 0;
 
     existsSyncMock.mockImplementation((path: string) => path.endsWith("package.json"));
@@ -103,7 +120,7 @@ describe("runUpdate", () => {
 
     await runUpdate({ json: true });
 
-    const output = logSpy.mock.calls[0]?.[0] as string;
+    const output = resultSpy.mock.calls[0]?.[0] as string;
     const parsed = JSON.parse(output) as {
       currentVersion: string;
       latestVersion: string;
@@ -272,11 +289,12 @@ describe("runUpdate", () => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ json: vi.fn().mockResolvedValue({ "dist-tags": { latest: testCase.latest } }) }));
       readFileSyncMock.mockReturnValueOnce(JSON.stringify({ name: "@runfusion/fusion", version: testCase.current }));
       logSpy.mockClear();
+      resultSpy.mockClear();
       process.exitCode = 0;
 
       await runUpdate({ check: true, json: true });
 
-      const output = logSpy.mock.calls[0]?.[0] as string;
+      const output = resultSpy.mock.calls[0]?.[0] as string;
       expect(JSON.parse(output), `${testCase.latest} vs ${testCase.current}`).toMatchObject({
         currentVersion: testCase.current,
         latestVersion: testCase.latest,
@@ -297,11 +315,12 @@ describe("runUpdate", () => {
         latestVersion,
       });
       logSpy.mockClear();
+      resultSpy.mockClear();
       process.exitCode = 0;
 
       await runUpdate({ check: true, json: true });
 
-      const output = logSpy.mock.calls.at(-1)?.[0] as string;
+      const output = resultSpy.mock.calls.at(-1)?.[0] as string;
       expect(JSON.parse(output)).toMatchObject({
         currentVersion: "1.2.3",
         latestVersion,
@@ -361,7 +380,7 @@ describe("runUpdate", () => {
 
       await runUpdate({ check: true, json: true });
 
-      const parsed = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as Record<string, unknown>;
+      const parsed = JSON.parse(resultSpy.mock.calls[0]?.[0] as string) as Record<string, unknown>;
       expect(parsed).toMatchObject({ latestVersion: "1.3.0-beta.2", updateAvailable: true, channel: "beta" });
       expect(process.exitCode).toBe(1);
     });
@@ -371,7 +390,7 @@ describe("runUpdate", () => {
 
       await runUpdate({ check: true, json: true });
 
-      const parsed = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as Record<string, unknown>;
+      const parsed = JSON.parse(resultSpy.mock.calls[0]?.[0] as string) as Record<string, unknown>;
       expect(parsed).toMatchObject({ latestVersion: "1.2.3", updateAvailable: false, channel: "stable" });
       expect(process.exitCode).toBe(0);
     });
@@ -462,11 +481,12 @@ describe("runUpdate", () => {
       expect(logSpy.mock.calls.flat().join("\n")).not.toContain("A newer beta");
 
       logSpy.mockClear();
+      resultSpy.mockClear();
       process.exitCode = 0;
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ json: vi.fn().mockResolvedValue({ "dist-tags": { latest: "1.2.3", beta: "1.3.0-beta.1" } }) }));
       await runUpdate({ check: true, json: true });
 
-      const output = logSpy.mock.calls[0]?.[0] as string;
+      const output = resultSpy.mock.calls[0]?.[0] as string;
       expect(JSON.parse(output)).toEqual({
         currentVersion: "1.2.3",
         latestVersion: "1.2.3",
@@ -475,6 +495,7 @@ describe("runUpdate", () => {
         channel: "stable",
       });
       expect(logSpy.mock.calls.flat().join("\n")).not.toContain("A newer beta");
+      expect(resultSpy.mock.calls.flat().join("\n")).not.toContain("A newer beta");
     });
   });
 });

@@ -204,7 +204,8 @@ export async function expectSettingPersists({ section, label, kind, value, scope
     fireEvent.change(control, { target: { value: String(value) } });
   }
 
-  fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+  // FNXC:SettingsModalTests 2026-07-27-17:20: click the header `.modal-close` directly; `getAllByRole("button", { name: "Close" })` recomputes accessible names across the whole Settings tree and added ~700ms per persist test.
+  fireEvent.click(document.querySelector(".modal-close") as HTMLButtonElement);
 
   if (scope === "global") {
     await waitFor(() => expect(mockUpdateGlobalSettings).toHaveBeenCalled());
@@ -227,7 +228,8 @@ export async function assertProjectModelSavePayload(provider: string, modelId: s
 
   fireEvent.change(screen.getByLabelText("Default Provider"), { target: { value: provider } });
   fireEvent.change(screen.getByLabelText("Default Model"), { target: { value: modelId } });
-  fireEvent.click(screen.getAllByRole("button", { name: "Close" })[0]);
+  // FNXC:SettingsModalTests 2026-07-27-17:20: scoped header-close selector avoids the whole-tree accessible-name walk of getAllByRole({ name: "Close" }).
+  fireEvent.click(document.querySelector(".modal-close") as HTMLButtonElement);
 
   await waitFor(() => {
     expect(mockUpdateSettings).toHaveBeenCalledWith(

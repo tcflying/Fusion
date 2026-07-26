@@ -11,6 +11,7 @@
 import { existsSync, statSync } from "node:fs";
 import { basename, dirname, join, normalize, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
+import { promptOutputStream, result as outputResult } from "./output.js";
 import {
   CentralCore,
   createTaskStoreForBackend,
@@ -144,11 +145,14 @@ async function promptProjectSelection(
   projects: RegisteredProject[],
   message = "Select a project:"
 ): Promise<RegisteredProject> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
 
-  console.log(`\n  ${message}`);
+  // FNXC:CliQuietMode 2026-07-16-01:00: Selection labels and validation are
+  // part of the interactive prompt, so they bypass quiet mode with readline.
+  outputResult(`\n  ${message}\n`);
   for (let i = 0; i < projects.length; i++) {
-    console.log(`    ${i + 1}. ${projects[i].name} (${projects[i].path})`);
+    outputResult(`    ${i + 1}. ${projects[i].name} (${projects[i].path})\n`);
   }
 
   while (true) {
@@ -160,7 +164,7 @@ async function promptProjectSelection(
       return projects[num - 1];
     }
 
-    console.log(`    Invalid selection. Please enter a number between 1 and ${projects.length}`);
+    outputResult(`    Invalid selection. Please enter a number between 1 and ${projects.length}\n`);
   }
 }
 
@@ -168,7 +172,7 @@ async function promptProjectSelection(
  * Prompt for yes/no confirmation.
  */
 async function promptConfirm(message: string, defaultYes = false): Promise<boolean> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
   const prompt = defaultYes ? "[Y/n]" : "[y/N]";
   const answer = await rl.question(`  ${message} ${prompt}: `);
   rl.close();
@@ -307,7 +311,7 @@ export async function resolveProject(options: ResolveOptions = {}): Promise<Reso
       const shouldRegister = await promptConfirm("Register this project now?", true);
 
       if (shouldRegister) {
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
         const defaultName = basename(fusionDir) || "unnamed";
         const name = await rl.question(`  Project name [${defaultName}]: `);
         rl.close();
@@ -741,7 +745,7 @@ export async function registerProjectInteractive(
   // Determine project name
   let name = options.name;
   if (!name && interactive) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     const suggested = suggestProjectName(absPath);
     const input = await rl.question(`  Project name [${suggested}]: `);
     rl.close();
@@ -793,7 +797,7 @@ export async function registerProjectInteractive(
     try {
       let prefix = suggestTaskPrefix(name);
       if (interactive) {
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
         const prefixInput = await rl.question(`\n  Task prefix [${prefix}]: `);
         rl.close();
         const rawPrefix = prefixInput.trim().toUpperCase().replace(/[^A-Z]/g, "");

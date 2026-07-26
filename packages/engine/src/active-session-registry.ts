@@ -181,6 +181,63 @@ export interface SelfOwnedReconcileOptions {
   now?: () => number;
 }
 
+/*
+FNXC:SessionContention 2026-07-25-21:30 (contention prevention — foreign-stale reclaim):
+Registration contention has exactly three shapes, and only one of them is legitimate:
+  1. Two tasks on the SHARED repo root. Not real contention — read-only root-rooted sessions need no
+     path exclusivity. Eliminated by construction: `sessionRegistryPath` task-scopes the root key.
+  2. A LEAKED entry whose owning task is dead (crashed run, torn-down executor, engine restart that
+     lost the session but not the map). Waiting for that holder is waiting forever — the holder will
+     never release. Reclaim it, which is what this seam does.
+  3. A LIVE holder on the same path. This is genuine serialization (the workspace sub-repo leases are
+     built on it) and the caller must wait, never overwrite.
+So: probe the holder for liveness, reclaim when it is provably dead AND the entry has aged past the
+FN-5256 staleness floor (a just-registered entry belongs to a warming session whose maps are not
+populated yet — treating it as dead would yank a live shell), and surface a typed contention error only
+for case 3. `holderLiveProbe` returning true is always respected; an unknown/throwing probe must be
+reported as LIVE by its caller so ambiguity refuses the reclaim.
+*/
+export type ForeignHolderLiveProbe = (holderTaskId: string, path: string) => boolean;
+
+export type AcquireActiveSessionPathOutcome =
+  | { action: "registered" }
+  | { action: "reclaimed-stale-foreign"; holderTaskId: string; ageMs: number }
+  | { action: "contended"; holderTaskId: string; holderKind: ActiveSessionKind; ageMs: number };
+
+export interface AcquireActiveSessionPathOptions {
+  /** Returns true when the foreign holder still has a live session/execution surface. */
+  holderLiveProbe?: ForeignHolderLiveProbe;
+  /** Minimum entry age before a foreign entry may be reclaimed. Defaults to `DEFAULT_SELF_OWNED_MIN_IDLE_MS`. */
+  minIdleMs?: number;
+  /** Test seam — defaults to `Date.now()`. */
+  now?: () => number;
+}
+
+export function acquireActiveSessionPath(
+  registry: ActiveSessionRegistry,
+  path: string,
+  registration: ActiveSessionRegistration,
+  options: AcquireActiveSessionPathOptions = {},
+): AcquireActiveSessionPathOutcome {
+  const existing = registry.lookupByPath(path);
+  if (!existing || existing.taskId === registration.taskId) {
+    registry.registerPath(path, registration);
+    return { action: "registered" };
+  }
+
+  const now = options.now?.() ?? Date.now();
+  const ageMs = now - existing.registeredAt;
+  const minIdleMs = options.minIdleMs ?? DEFAULT_SELF_OWNED_MIN_IDLE_MS;
+  const holderIsLive = options.holderLiveProbe?.(existing.taskId, path) ?? true;
+  if (holderIsLive || ageMs < minIdleMs) {
+    return { action: "contended", holderTaskId: existing.taskId, holderKind: existing.kind, ageMs };
+  }
+
+  registry.unregisterPath(path);
+  registry.registerPath(path, registration);
+  return { action: "reclaimed-stale-foreign", holderTaskId: existing.taskId, ageMs };
+}
+
 export function reconcileSelfOwnedActiveSessionForRemoval(
   registry: ActiveSessionRegistry,
   worktreePath: string,

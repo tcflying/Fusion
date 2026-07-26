@@ -13,16 +13,11 @@ import {and, eq, inArray} from "drizzle-orm";
 import type {WorkflowWorkItem, WorkflowWorkItemState, WorkflowWorkItemTransitionPatch, WorkflowWorkItemUpsertInput} from "../types.js";
 import "../builtin-traits.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
-import {replaceActiveTaskWorkflowContinuation as replaceActiveTaskWorkflowContinuationAsync, upsertWorkflowWorkItem as upsertWorkflowWorkItemAsync, transitionWorkflowWorkItem as transitionWorkflowWorkItemAsync, getWorkflowWorkItem as getWorkflowWorkItemAsync} from "../task-store/async-workflow-workitems.js";
+import {replaceActiveTaskWorkflowContinuation as replaceActiveTaskWorkflowContinuationAsync, seedStrandedPlanReviewContinuation as seedStrandedPlanReviewContinuationAsync, upsertWorkflowWorkItem as upsertWorkflowWorkItemAsync, transitionWorkflowWorkItem as transitionWorkflowWorkItemAsync, getWorkflowWorkItem as getWorkflowWorkItemAsync, withTaskWorkflowSerialization} from "../task-store/async-workflow-workitems.js";
 import type {WorkflowWorkItemRow} from "../task-store/row-types.js";
 import type {DbTransaction} from "../postgres/data-layer.js";
 
-export async function upsertWorkflowWorkItemImpl(store: TaskStore, input: WorkflowWorkItemUpsertInput, tx?: DbTransaction): Promise<WorkflowWorkItem> {
-    if (store.backendMode) {
-      const layer = store.asyncLayer!;
-      return upsertWorkflowWorkItemAsync(layer, input, tx);
-    }
-    return store.db.transactionImmediate(() => {
+function upsertWorkflowWorkItemSyncInTransaction(store: TaskStore, input: WorkflowWorkItemUpsertInput): WorkflowWorkItem {
       const existing = store.db
         .prepare("SELECT * FROM workflow_work_items WHERE runId = ? AND taskId = ? AND nodeId = ? AND kind = ?")
         .get(input.runId, input.taskId, input.nodeId, input.kind) as WorkflowWorkItemRow | undefined;
@@ -94,8 +89,14 @@ export async function upsertWorkflowWorkItemImpl(store: TaskStore, input: Workfl
         metadata: { id: row.id, nodeId: row.nodeId, kind: row.kind, state: row.state, attempt: row.attempt },
       });
       return store.rowToWorkflowWorkItem(row);
-    });
+}
+
+export async function upsertWorkflowWorkItemImpl(store: TaskStore, input: WorkflowWorkItemUpsertInput, tx?: DbTransaction): Promise<WorkflowWorkItem> {
+  if (store.backendMode) {
+    return upsertWorkflowWorkItemAsync(store.asyncLayer!, input, tx);
   }
+  return store.db.transactionImmediate(() => upsertWorkflowWorkItemSyncInTransaction(store, input));
+}
 
 export async function replaceActiveTaskWorkflowContinuationImpl(
   store: TaskStore,
@@ -124,6 +125,35 @@ export async function replaceActiveTaskWorkflowContinuationImpl(
   });
 }
 
+export async function seedStrandedPlanReviewContinuationImpl(store: TaskStore, input: WorkflowWorkItemUpsertInput & { kind: "task" }): Promise<{ seeded: boolean; reason?: "active-continuation" | "plan-review-passed"; workItemId?: string }> {
+  if (store.backendMode) return seedStrandedPlanReviewContinuationAsync(store.asyncLayer!, input);
+
+  /*
+  FNXC:WorkflowSerialization 2026-07-26-23:58:
+  The legacy embedded-store fallback preserves FN-8592's conditional-seed
+  invariant by holding SQLite's immediate write transaction across both
+  predicate reads and the insert. Do not await list/get/upsert helpers here:
+  their separate transactions would reopen the race that PostgreSQL closes
+  with withTaskWorkflowSerialization.
+  */
+  return store.db.transactionImmediate(() => {
+    const active = store.db.prepare(
+      `SELECT id FROM workflow_work_items
+       WHERE taskId = ? AND state IN ('runnable', 'running', 'held', 'retrying')`,
+    ).get(input.taskId);
+    if (active) return { seeded: false, reason: "active-continuation" as const };
+
+    const task = store.db.prepare("SELECT workflowStepResults FROM tasks WHERE id = ?").get(input.taskId) as { workflowStepResults: string | null } | undefined;
+    const results = task?.workflowStepResults ? JSON.parse(task.workflowStepResults) as Array<{ workflowStepId?: string; status?: string }> : [];
+    if (results.some((result) => result.workflowStepId === "plan-review" && result.status === "passed")) {
+      return { seeded: false, reason: "plan-review-passed" as const };
+    }
+
+    const item = upsertWorkflowWorkItemSyncInTransaction(store, input);
+    return { seeded: true, workItemId: item.id };
+  });
+}
+
 export async function transitionWorkflowWorkItemImpl(store: TaskStore, id: string, state: WorkflowWorkItemState, patch: WorkflowWorkItemTransitionPatch = {}, tx?: DbTransaction,): Promise<WorkflowWorkItem> {
     if (store.backendMode) {
       const layer = store.asyncLayer!;
@@ -142,26 +172,29 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
       const layer = store.asyncLayer!;
       const now = opts.now ?? new Date().toISOString();
       const leaseExpiresAt = new Date(new Date(now).getTime() + opts.leaseDurationMs).toISOString();
-      // The sync path uses a guarded UPDATE (state IN runnable/retrying/running
-      // + retryAfter/leaseExpiresAt passed). Use sql`` for the state-list guard.
-      const result = await layer.db
-        .update(schema.project.workflowWorkItems)
-        .set({
-          state: "running",
-          leaseOwner,
-          leaseExpiresAt,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(schema.project.workflowWorkItems.id, id),
-            inArray(schema.project.workflowWorkItems.state, ["runnable", "retrying", "running"]),
-          ),
-        );
-      // Check if any row was updated (postgres.js returns a result with count).
-      const updated = await getWorkflowWorkItemAsync(layer.db, id);
-      if (!updated || updated.leaseOwner !== leaseOwner) return null;
-      void result;
+      /*
+      FNXC:WorkflowSerialization 2026-07-27-00:15:
+      Claiming a due item changes it into the active `running` state, so it is
+      an FN-8592 protected writer too. Resolve its owner and take the shared
+      task lock before the guarded update; otherwise a lease could land between
+      conditional repair's idle check and insert.
+      */
+      const updated = await layer.transactionImmediate(async (tx) => {
+        const owner = await getWorkflowWorkItemAsync(tx, id);
+        if (!owner) return null;
+        return withTaskWorkflowSerialization(tx, layer.projectId, owner.taskId, async () => {
+          await tx
+            .update(schema.project.workflowWorkItems)
+            .set({ state: "running", leaseOwner, leaseExpiresAt, updatedAt: now })
+            .where(and(
+              eq(schema.project.workflowWorkItems.id, id),
+              inArray(schema.project.workflowWorkItems.state, ["runnable", "retrying", "running"]),
+            ));
+          const claimed = await getWorkflowWorkItemAsync(tx, id);
+          return claimed?.leaseOwner === leaseOwner ? claimed : null;
+        });
+      });
+      if (!updated) return null;
       // Record the audit event (fire-and-forget).
       void store.recordRunAuditEvent({
         taskId: updated.taskId,
@@ -170,7 +203,7 @@ export async function acquireWorkflowWorkItemLeaseImpl(store: TaskStore, id: str
         domain: "database",
         mutationType: "workflowWorkItem:lease-acquired",
         target: updated.id,
-        metadata: { id: updated.id, leaseOwner: updated.leaseOwner, leaseExpiresAt: updated.leaseExpiresAt },
+        metadata: { id: updated.id, leaseOwner: updated.leaseOwner, leaseExpiresAt },
       });
       return updated;
     }

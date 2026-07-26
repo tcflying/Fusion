@@ -79,8 +79,14 @@ describe("workspace concurrent session registration", () => {
   });
 
   it("still rejects a foreign-task overwrite for NON-workspace tasks (clobber guard preserved)", () => {
+    /*
+    FNXC:PlanReviewWorktree 2026-07-25-20:40:
+    The shared path under test must be a real per-task WORKTREE path, distinct from the executor's
+    rootDir — the root itself is now task-scoped in every mode (see sessionRegistryPath). Two tasks
+    landing on the identical worktree path is the cross-phase clobber this guard exists for.
+    */
     const sharedWorktree = "/tmp/fusion-test-single-repo-worktree";
-    const executor = new TaskExecutor(createStore(), sharedWorktree); // no workspaceConfig → singular path
+    const executor = new TaskExecutor(createStore(), "/tmp/fusion-test-single-repo-root"); // no workspaceConfig → singular path
 
     (executor as any).setActiveSession("FN-A", {}, sharedWorktree);
     // A second, different task on the identical real worktree path must still be rejected — this is the

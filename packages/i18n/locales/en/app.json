@@ -1205,6 +1205,7 @@
       "mergeBlocked": "This task is blocked from completing until its merge step finishes.",
       "promoteRejected": "This card could not be promoted.",
       "unknownColumn": "That column doesn't exist in this task's workflow.",
+      "unplannedForExecution": "This task isn't ready for execution yet — planning or plan review is still outstanding.",
       "workflowMismatch": "Drag can't move a card between workflows. Use the workflow switcher instead."
     },
     "todo": "To Do",
@@ -1515,6 +1516,10 @@
     "preserveProgressMessage": "This task has completed steps. Keep progress before moving?",
     "preserveProgressMoveTodoMessage": "Some tasks have completed steps. Keep progress before moving to Todo?",
     "preserveProgressTitle": "Preserve Progress?",
+    "promoteUnplannedCancel": "Keep Waiting",
+    "promoteUnplannedConfirm": "Start Anyway",
+    "promoteUnplannedMessage": "{{taskId}} is still waiting on planning or plan review. Promoting now starts execution with the current plan and cancels the pending replan.",
+    "promoteUnplannedTitle": "Start execution anyway?",
     "replanAll": "Replan All",
     "replanAllHint_one": "Move {{count}} task{{plural}} to Planning",
     "replanAllHint_other": "Move {{count}} task{{plural}} to Planning",
@@ -5765,7 +5770,13 @@
       "statusActive": "✓ Active",
       "statusNotConnected": "✗ Not connected",
       "title": "Authentication",
-      "waitingForLogin": "Waiting for login…"
+      "waitingForLogin": "Waiting for login…",
+      "anthropicPreferenceLabel": "Anthropic credential to use",
+      "anthropicPreferenceHint": "You have both an Anthropic API key and a Claude subscription connected. Choose which one Fusion sends when a lane calls Anthropic directly. Default: API key.",
+      "anthropicPreferenceApiKey": "API key",
+      "anthropicPreferenceSubscription": "Claude subscription",
+      "credentialInUse": "In use",
+      "credentialOverridden": "Overridden below"
     },
     "authentication": {
       "enterAPIKey": "Enter API key",
@@ -6056,6 +6067,8 @@
       "skipConfirmationDialogsHint": " When enabled, destructive actions such as deleting a task or resetting progress run immediately without a prompt. Default: disabled",
       "releaseChannel": "Release channel",
       "releaseChannelHelp": "Stable follows official releases. Beta follows pre-releases cut from main and also picks up each stable release once it overtakes the beta. Switching back to Stable never downgrades. Default: stable.",
+      "autoUpdateAndRestart": " Auto-update and restart ",
+      "autoUpdateAndRestartHelp": "When enabled, Fusion installs available updates on the selected release channel by itself and then restarts to apply them. Requires a supervising parent (the default for `fn dashboard`); hosts started with --no-supervise skip the install. Default: disabled.",
       "channelStable": "Stable (recommended)",
       "channelBeta": "Beta — early builds from main"
     },
@@ -6384,7 +6397,8 @@
       },
       "globalMcp": "MCP Servers · Global",
       "mcp": "MCP Servers · Project",
-      "configVersions": "Configuration Versions"
+      "configVersions": "Configuration Versions",
+      "voiceInput": "Voice Input"
     },
     "nodeRouting": {
       "blockExecution": "Block execution",
@@ -6890,6 +6904,25 @@
       "confirmTitle": "Roll back configuration?",
       "confirmMessage": "Restore this version? The rollback is recorded as a new version.",
       "confirmRollback": "Roll back"
+    },
+    "voiceInput": {
+      "title": "Voice Input",
+      "enable": "Enable voice input",
+      "enableHelp": "Default: off. Voice dictation uses the operator-managed Parakeet v3 model.",
+      "modelStatus": "Parakeet v3 model status",
+      "modelStatusHelp": "The speech model is installed and managed locally on this device.",
+      "modelActions": "Model management",
+      "modelActionsHelp": "Download or remove the Parakeet v3 speech model.",
+      "statusUnavailable": "Voice runtime status could not be determined; voice mode stays disabled.",
+      "runtimeUnavailable": "Voice runtime unavailable",
+      "unknown": "Status unavailable",
+      "downloading": "Downloading model…",
+      "downloadingProgress": "Downloading: {{progress}}%",
+      "installed": "Installed",
+      "notInstalled": "Not installed",
+      "download": "Download",
+      "remove": "Remove",
+      "error": "Model error: {{message}}"
     }
   },
   "setup": {
@@ -8325,6 +8358,10 @@
     "closeIssue": "Close Issue",
     "collapse": "Collapse",
     "createdByAgent": "Created by agent",
+    "createdAt": "Created {{date}}",
+    "createdAtTitle": "Created {{date}}",
+    "completedAt": "Completed {{date}}",
+    "completedAtTitle": "Completed {{date}}",
     "createdByAgentNamed": "Created by agent: {{name}}",
     "createdPr": "Created PR #{{number}}",
     "createFailed": "Failed to create task",

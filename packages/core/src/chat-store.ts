@@ -16,6 +16,9 @@ import * as schema from "./postgres/schema/index.js";
 import * as asyncChatStore from "./async-chat-store.js";
 import type {
   ChatSession,
+  ChatTag,
+  ChatTagCreateInput,
+  ChatTagUpdateInput,
   ChatSessionStatus,
   ChatMessage,
   ChatAttachment,
@@ -111,6 +114,7 @@ export class ChatStore extends EventEmitter<ChatStoreEvents> {
     const session: ChatSession = {
       id: `chat-${randomUUID().slice(0, 8)}`,
       agentId: input.agentId,
+      tags: [],
       title: input.title ?? null,
       status: "active",
       projectId: input.projectId ?? null,
@@ -313,6 +317,34 @@ export class ChatStore extends EventEmitter<ChatStoreEvents> {
       }
     }
     return deletedCount;
+  }
+
+  /*
+  FNXC:ChatTags 2026-08-05-10:55:
+  Direct-conversation tags are project-scoped by the session's owner project.
+  Tag mutations are transactional and return an enriched session so SSE clients
+  never receive an assignment update without its deterministic tag array.
+  */
+  async listTags(projectId: string | null = null): Promise<ChatTag[]> {
+    return asyncChatStore.listChatTags(this.asyncLayer.db, projectId);
+  }
+
+  async createTag(input: ChatTagCreateInput): Promise<ChatTag> {
+    return asyncChatStore.createChatTag(this.asyncLayer, input);
+  }
+
+  async renameTag(id: string, projectId: string | null, input: ChatTagUpdateInput): Promise<ChatTag | undefined> {
+    return asyncChatStore.renameChatTag(this.asyncLayer, id, projectId, input);
+  }
+
+  async deleteTag(id: string, projectId: string | null): Promise<boolean> {
+    return asyncChatStore.deleteChatTag(this.asyncLayer, id, projectId);
+  }
+
+  async replaceSessionTags(id: string, projectId: string | null, tagIds: string[]): Promise<ChatSession | undefined> {
+    const updated = await asyncChatStore.replaceChatSessionTags(this.asyncLayer, id, projectId, tagIds);
+    if (updated) this.emit("chat:session:updated", updated);
+    return updated;
   }
 
   // ── Message CRUD Operations ───────────────────────────────────────

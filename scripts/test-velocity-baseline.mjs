@@ -315,8 +315,7 @@ export async function measureCommands({ timeoutMs, cwd, stdout, stderr, commandR
   return { ...results, measurementFailures: failures };
 }
 
-function renderFromEntry(entry, previous, quarantine, { rootDir = repoRoot, now = new Date() } = {}) {
-  const slowest = entry?.slowestTop20 ?? [];
+function renderFromEntry(entry, previous, quarantine, { rootDir = repoRoot, now = new Date(), slowest = entry?.slowestTop20 ?? [], timingSnapshotCapturedAt = entry?.timingSnapshotCapturedAt ?? null } = {}) {
   return renderReport({
     gateMs: entry?.gateMs,
     bootSmokeMs: entry?.bootSmokeMs,
@@ -326,15 +325,13 @@ function renderFromEntry(entry, previous, quarantine, { rootDir = repoRoot, now 
     capturedAt: entry?.capturedAt,
     previous,
     measurementFailures: entry?.measurementFailures ?? [],
-    timingSnapshotCapturedAt: entry?.timingSnapshotCapturedAt ?? null,
-    timingNotes: Array.isArray(entry?.timingNotes)
-      ? entry.timingNotes
-      : timingSnapshotNotes({
-        slowest,
-        timingSnapshotCapturedAt: entry?.timingSnapshotCapturedAt ?? null,
-        rootDir,
-        now,
-      }),
+    timingSnapshotCapturedAt,
+    timingNotes: timingSnapshotNotes({
+      slowest,
+      timingSnapshotCapturedAt,
+      rootDir,
+      now,
+    }),
   });
 }
 
@@ -394,7 +391,19 @@ export async function main(argv = process.argv.slice(2), { rootDir = repoRoot, s
     }),
   });
   const previous = entries.length > 1 ? entries.at(-2) : null;
-  const report = renderFromEntry(latest, previous, quarantine, { rootDir, now });
+  /*
+   * FNXC:TestTimingRefresh 2026-07-24-12:20:
+   * Report-only velocity output preserves historical wall-time measurements,
+   * but its slowest-file table must describe the current committed timing
+   * snapshot. Otherwise a refreshed snapshot leaves operators seeing deleted
+   * paths from the last weekly measurement until the next recording cycle.
+   */
+  const report = renderFromEntry(latest, previous, quarantine, {
+    rootDir,
+    now,
+    slowest,
+    timingSnapshotCapturedAt: timings?.capturedAt ?? null,
+  });
 
   if (args.writeReport || args.reportOnly) {
     writeText(DEFAULT_REPORT_PATH, report, rootDir);

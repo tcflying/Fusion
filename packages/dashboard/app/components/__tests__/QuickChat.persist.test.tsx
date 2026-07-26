@@ -3,8 +3,9 @@ import { readFileSync } from "node:fs";
 import { useEffect, useRef, useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FloatingWindow } from "../FloatingWindow";
+import { readAppFile } from "../../test/cssFixture";
 
-const floatingWindowCss = readFileSync("app/components/FloatingWindow.css", "utf8");
+const floatingWindowCss = readAppFile("components/FloatingWindow.css");
 
 function cssRuleFor(selector: string): string {
   const start = floatingWindowCss.indexOf(`${selector} {`);

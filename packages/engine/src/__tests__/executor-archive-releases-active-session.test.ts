@@ -45,10 +45,16 @@ describe("archiving a task releases its active-session registry entries (FN-7717
   it("releases a workflow-step session held by a task archived from triage, letting a successor acquire the same path", async () => {
     const { executor, store } = makeExecutor();
 
-    // Task A registers a workflow-step (Plan Review) session on the shared root — the
-    // reported NEXT-508 case.
+    /*
+    FNXC:PlanReviewWorktree 2026-07-25-20:40:
+    A root-rooted session is now registered under a TASK-SCOPED synthetic key (sessionRegistryPath),
+    so assert release through `pathsForTask` — the bare-root key never exists. What archive must still
+    guarantee is unchanged: the task holds exactly one live entry before, and none after.
+    */
     (executor as any).setActiveWorkflowStepSession("TASK-A", {}, SHARED_ROOT);
-    expect(activeSessionRegistry.isPathActive(SHARED_ROOT)).toBe(true);
+    const [heldPath] = activeSessionRegistry.pathsForTask("TASK-A");
+    expect(heldPath).toBeDefined();
+    expect(activeSessionRegistry.isPathActive(heldPath)).toBe(true);
 
     // Drive the archive transition: to === "archived", from a NON-in-progress column
     // (Plan Review runs in triage), exactly like archiveTask emits.
@@ -57,12 +63,12 @@ describe("archiving a task releases its active-session registry entries (FN-7717
     // Await the disposal chain the handler kicked off via trackTaskDisposal.
     await (executor as any).pendingTaskDisposals.get("TASK-A");
 
-    expect(activeSessionRegistry.isPathActive(SHARED_ROOT)).toBe(false);
+    expect(activeSessionRegistry.isPathActive(heldPath)).toBe(false);
     expect(activeSessionRegistry.pathsForTask("TASK-A")).toHaveLength(0);
 
     // Successor task B can now register the same path without throwing.
     expect(() =>
-      activeSessionRegistry.registerPath(SHARED_ROOT, { taskId: "TASK-B", kind: "workflow-step", ownerKey: "TASK-B#workflow-step" }),
+      activeSessionRegistry.registerPath(heldPath, { taskId: "TASK-B", kind: "workflow-step", ownerKey: "TASK-B#workflow-step" }),
     ).not.toThrow();
   });
 
@@ -149,11 +155,18 @@ describe("archiving a task releases its active-session registry entries (FN-7717
   it("reproduces the original ActiveSessionPathHeldByForeignTaskError before archive, and confirms it is gone after", async () => {
     const { executor, store } = makeExecutor();
 
-    (executor as any).setActiveWorkflowStepSession("NEXT-508", {}, SHARED_ROOT);
+    /*
+    FNXC:PlanReviewWorktree 2026-07-25-20:40:
+    The original NEXT-508 symptom was reproduced on the shared ROOT. That path can no longer collide at
+    all (root keys are task-scoped), so the leak symptom is now reproduced on a per-task WORKTREE path,
+    where the foreign-task guard still applies and only archive can release the holder.
+    */
+    const heldWorktree = `${SHARED_ROOT}-next508-worktree`;
+    (executor as any).setActiveWorkflowStepSession("NEXT-508", {}, heldWorktree);
 
     // Before archive: a second task trying to register the same path is rejected.
     expect(() =>
-      activeSessionRegistry.registerPath(SHARED_ROOT, { taskId: "NEXT-433", kind: "workflow-step", ownerKey: "NEXT-433#workflow-step" }),
+      activeSessionRegistry.registerPath(heldWorktree, { taskId: "NEXT-433", kind: "workflow-step", ownerKey: "NEXT-433#workflow-step" }),
     ).toThrow(ActiveSessionPathHeldByForeignTaskError);
 
     store.emit("task:moved", { task: makeTask("NEXT-508"), from: "triage", to: "archived", source: "user" });
@@ -161,7 +174,7 @@ describe("archiving a task releases its active-session registry entries (FN-7717
 
     // After archive: the successor can now acquire the path.
     expect(() =>
-      activeSessionRegistry.registerPath(SHARED_ROOT, { taskId: "NEXT-433", kind: "workflow-step", ownerKey: "NEXT-433#workflow-step" }),
+      activeSessionRegistry.registerPath(heldWorktree, { taskId: "NEXT-433", kind: "workflow-step", ownerKey: "NEXT-433#workflow-step" }),
     ).not.toThrow();
   });
 });

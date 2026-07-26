@@ -33,7 +33,13 @@ Only the desktop FLOATING New Task dialog joins the shared cross-type floating s
 FNXC:NewTask 2026-06-22-20:30:
 Floating panel positioned by state-driven inline left/top/width/height. min/max keep content usable and the panel on-screen; `resize: none` because the corner/edge handles own resizing (the native grip conflicts with the pointer handlers). `pointer-events: auto` re-enables interaction on the panel only. Desktop only — mobile keeps the full-screen keyboard-aware sheet.
 */
-.new-task-modal--floating {
+/*
+FNXC:TaskModalResize 2026-08-07-00:00:
+The floating class is also applied to known tablets at the 768px CSS boundary.
+Keep this selector more specific than the global phone-sheet rule; the runtime
+viewport contract, not a duplicate CSS breakpoint, decides whether it applies.
+*/
+.modal.new-task-modal.new-task-modal--floating {
   --floating-window-shadow: var(--shadow-lg);
   position: fixed;
   display: flex;
@@ -74,10 +80,20 @@ Header is the drag handle. `touch-action: none` (matching the resize handles) ha
 FNXC:NewTask 2026-06-22-20:30:
 Edge + corner resize handles. touch-action:none keeps the drag from being hijacked by scroll/gestures so resizing stays smooth.
 */
+/*
+FNXC:TaskModalResize 2026-07-24-19:00:
+Resize grips are focusable separators on floating desktop and tablet task windows. Preserve a
+visible tokenized focus ring so keyboard users can discover the same controls touch users drag.
+*/
 .new-task-resize-handle {
   position: absolute;
   z-index: 2;
   touch-action: none;
+}
+
+.new-task-resize-handle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring-strong);
 }
 
 .new-task-resize-handle--n,

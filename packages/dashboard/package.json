@@ -1,6 +1,6 @@
 {
   "name": "@fusion/dashboard",
-  "version": "0.73.0-beta.6",
+  "version": "0.74.0-beta.3",
   "license": "MIT",
   "description": "Fusion dashboard: React UI and HTTP API server for monitoring and controlling the Fusion AI coding agent.",
   "homepage": "https://github.com/Runfusion/Fusion#readme",
@@ -106,7 +106,7 @@
     "@codemirror/state": "^6.5.2",
     "@codemirror/theme-one-dark": "^6.1.2",
     "@codemirror/view": "^6.36.4",
-    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@earendil-works/pi-coding-agent": "0.82.0",
     "@fusion-plugin-examples/claude-runtime": "workspace:*",
     "@fusion-plugin-examples/cli-printing-press": "workspace:*",
     "@fusion-plugin-examples/compound-engineering": "workspace:*",
@@ -155,6 +155,9 @@
     "unified": "^11.0.5",
     "ws": "^8.18.0",
     "zod": "^3.25.76"
+  },
+  "optionalDependencies": {
+    "sherpa-onnx-node": "^1.13.4"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",

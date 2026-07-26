@@ -9,6 +9,7 @@ import type {
   ChatRoomMember,
   ChatRoomMessage,
   EnrichedChatSession,
+  ChatTag,
 } from "@fusion/core";
 import { api, buildApiUrl } from "./client.js";
 import { withProjectId } from "./health.js";
@@ -26,6 +27,9 @@ export interface ChatSessionListResponse {
 export interface ChatSessionResponse {
   session: EnrichedChatSession;
 }
+
+export interface ChatTagListResponse { tags: ChatTag[]; }
+export interface ChatTagResponse { tag: ChatTag; }
 
 export interface ChatMessageListResponse {
   messages: ChatMessage[];
@@ -67,6 +71,19 @@ export interface FetchChatSessionsOptions {
   status?: string;
   q?: string;
   titleOnly?: boolean;
+}
+
+export function fetchChatTags(projectId?: string): Promise<ChatTagListResponse> {
+  return api<ChatTagListResponse>(withProjectId("/chat/tags", projectId));
+}
+export function createChatTag(name: string, projectId?: string): Promise<ChatTagResponse> {
+  return api<ChatTagResponse>(withProjectId("/chat/tags", projectId), { method: "POST", body: JSON.stringify({ name }) });
+}
+export function renameChatTag(id: string, name: string, projectId?: string): Promise<ChatTagResponse> {
+  return api<ChatTagResponse>(withProjectId(`/chat/tags/${encodeURIComponent(id)}`, projectId), { method: "PATCH", body: JSON.stringify({ name }) });
+}
+export function deleteChatTag(id: string, projectId?: string): Promise<{ success: boolean }> {
+  return api<{ success: boolean }>(withProjectId(`/chat/tags/${encodeURIComponent(id)}`, projectId), { method: "DELETE" });
 }
 
 /** Fetch all chat sessions for a project */
@@ -206,6 +223,7 @@ export function updateChatSession(
     agentId?: string;
     thinkingLevel?: string | null;
     pinned?: boolean;
+    tagIds?: string[];
   },
   projectId?: string,
 ): Promise<ChatSessionResponse> {

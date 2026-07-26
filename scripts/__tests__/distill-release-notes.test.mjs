@@ -17,6 +17,12 @@ import {
   fitTweetToBudget,
   SHORT_RELEASE_URL,
   HIGHLIGHTS_MAX,
+  BETA_TWEET_GUIDANCE,
+  DEFAULT_CLAUDE_MODEL,
+  RELEASE_LLM_TIMEOUT_MS,
+  TWEET_MAX_CHARS,
+  TWEET_TARGET_MIN_CHARS,
+  resolveClaudeDistillConfig,
 } from "../lib/distill-release-notes.mjs";
 
 // --- distillDeterministic ---
@@ -316,8 +322,13 @@ test("system prompt contains key instructions", () => {
   assert.match(DISTILLATION_SYSTEM_PROMPT, /### Highlights/);
   assert.match(DISTILLATION_SYSTEM_PROMPT, /### New/);
   assert.match(DISTILLATION_SYSTEM_PROMPT, /### Fixed/);
-  assert.match(DISTILLATION_SYSTEM_PROMPT, /engagement/i);
   assert.match(DISTILLATION_SYSTEM_PROMPT, /280/);
+  // FNXC:Changelog 2026-07-24-11:05 — the copy contract that keeps drafts usable:
+  // spend the character budget, stay concrete, and skip stock launch hype.
+  assert.match(DISTILLATION_SYSTEM_PROMPT, /USE THE BUDGET/);
+  assert.match(DISTILLATION_SYSTEM_PROMPT, /Banned as vague filler/);
+  assert.match(DISTILLATION_SYSTEM_PROMPT, /excited to announce/);
+  assert.match(DISTILLATION_SYSTEM_PROMPT, /SURFACE/);
 });
 
 // --- AI path (injected chatComplete; no live Claude required) ---
@@ -481,4 +492,79 @@ test("normalizeAiDistillResult uses short URL when AI tweet is over budget", () 
   assert.ok(normalized.tweet.length <= 280);
   assert.ok(normalized.tweet.includes(SHORT_RELEASE_URL));
   assert.doesNotMatch(normalized.tweet, /https?:\/\//);
+});
+
+/*
+FNXC:Changelog 2026-07-24-11:05:
+Release copy is written by Opus, aims at the full 280-char budget, and is
+produced for BOTH channels — a beta draft must read as a call for testers with
+the real opt-in command instead of a GA announcement.
+*/
+
+test("release copy is authored by opus, with an env override", () => {
+  assert.equal(DEFAULT_CLAUDE_MODEL, "opus");
+  assert.equal(resolveClaudeDistillConfig({}).model, "opus");
+  assert.equal(
+    resolveClaudeDistillConfig({ FUSION_RELEASE_CLAUDE_MODEL: "sonnet" }).model,
+    "sonnet",
+  );
+  // Opus is slower than the sonnet-era budget; a too-tight timeout silently
+  // demotes every release to the deterministic fallback.
+  assert.ok(RELEASE_LLM_TIMEOUT_MS >= 180_000);
+});
+
+test("the tweet budget band asks for most of the 280 characters", () => {
+  assert.equal(TWEET_MAX_CHARS, 280);
+  assert.ok(TWEET_TARGET_MIN_CHARS >= 180 && TWEET_TARGET_MIN_CHARS < TWEET_MAX_CHARS);
+});
+
+test("beta prompts carry tester-facing guidance and the opt-in command", () => {
+  const entries = [{ summary: "Board scrolls smoothly with 200+ tasks.", category: "performance" }];
+  const beta = buildDistillationPrompt(entries, "0.74.0-beta.0", "example.com/CHANGELOG.md", {
+    channel: "beta",
+  });
+  assert.match(beta, /Channel: beta/);
+  assert.ok(beta.includes(BETA_TWEET_GUIDANCE));
+  assert.match(beta, /fn update --channel beta/);
+  assert.match(BETA_TWEET_GUIDANCE, /never imply general availability/i);
+});
+
+test("stable prompts omit the beta guidance", () => {
+  const entries = [{ summary: "Board scrolls smoothly with 200+ tasks.", category: "performance" }];
+  const stable = buildDistillationPrompt(entries, "0.74.0", "example.com/CHANGELOG.md", {
+    channel: "stable",
+  });
+  assert.match(stable, /Channel: stable/);
+  assert.ok(!stable.includes(BETA_TWEET_GUIDANCE));
+  assert.doesNotMatch(stable, /fn update --channel beta/);
+  // No channel passed at all behaves like stable rather than throwing.
+  const defaulted = buildDistillationPrompt(entries, "0.74.0", "example.com/CHANGELOG.md");
+  assert.match(defaulted, /Channel: stable/);
+});
+
+test("prerelease tweet openers read as a beta, not a mangled patch version", () => {
+  assert.equal(formatTweetVersionLabel("0.74.0-beta.0"), "Fusion 0.74 beta");
+  assert.equal(formatTweetVersionLabel("v0.74.0-beta.3"), "Fusion 0.74 beta");
+  assert.equal(formatTweetVersionLabel("0.74.1-beta.0"), "Fusion 0.74.1 beta");
+  assert.equal(formatTweetVersionLabel("0.74.0-rc.1"), "Fusion 0.74 rc");
+  // Stable labels are unchanged.
+  assert.equal(formatTweetVersionLabel("0.74.0"), "Fusion 0.74");
+});
+
+test("distillWithAi forwards the channel into the prompt", async () => {
+  const entries = [{ summary: "Board scrolls smoothly with 200+ tasks.", category: "performance" }];
+  let seen = null;
+  await distillWithAi(entries, "0.74.0-beta.0", {
+    channel: "beta",
+    chatComplete: ({ user }) => {
+      seen = user;
+      return JSON.stringify({
+        highlights: ["Board scrolls smoothly with 200+ tasks"],
+        notes: "### Highlights\n\n- Board scrolls smoothly with 200+ tasks",
+        tweet: "Fusion 0.74 beta: board scrolls smoothly with 200+ tasks. fn update --channel beta",
+      });
+    },
+  });
+  assert.match(seen, /Channel: beta/);
+  assert.match(seen, /fn update --channel beta/);
 });

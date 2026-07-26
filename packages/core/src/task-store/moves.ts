@@ -655,15 +655,37 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
         column's targets from the task's own workflow adjacency instead, still throwing the same
         legacy-style bare Error (not TransitionRejectionError) so the flag-OFF characterization contract
         holds for legacy columns. Ported from main's FN-7591 fix into the extracted moves.ts.
+
+        FNXC:CodingIdeasWorkflow 2026-07-25-10:05:
+        A LEGACY source column must also honor the task's own workflow adjacency, not only
+        VALID_TRANSITIONS. Symptom: in Coding (Ideas) an operator could move Ideas → Todo but the
+        reverse drag/menu action ("Move to Ideas") failed with "Invalid transition: 'todo' → 'ideas'.
+        Valid targets: in-progress, triage, archived" — `todo` IS a legacy column, so the legacy branch
+        ran and VALID_TRANSITIONS (a closed six-id map that cannot know about "ideas") had the final
+        say. Both the Board drag pre-check and the context menu already offered the move, so the
+        rejection surfaced only after the optimistic move snapped back.
+        Fix: UNION the legacy targets with the workflow-resolved adjacency for legacy sources. This
+        only ever RELAXES (never narrows) the legacy set, so builtin:coding stays byte-identical — its
+        resolved adjacency reproduces VALID_TRANSITIONS verbatim — while any workflow that inserts its
+        own column beside a legacy one (Ideas ↔ Todo here) becomes freely movable in both directions.
+        The workflow IR is resolved lazily, only when VALID_TRANSITIONS alone would reject, so the
+        happy-path move cost is unchanged.
         */
-        const validTargets = sourceIsLegacy
+        const legacyTargets: readonly string[] = sourceIsLegacy
           ? (VALID_TRANSITIONS[task.column as Column] ?? [])
-          : resolveAllowedColumns(await resolveTaskWorkflowIrForMove(store, id), task.column);
-        if (!validTargets.includes(toColumn as Column)) {
-          throw new Error(
-            `Invalid transition: '${task.column}' → '${toColumn}'. ` +
-              `Valid targets: ${validTargets.join(", ") || "none"}`,
+          : [];
+        if (!legacyTargets.includes(toColumn)) {
+          const workflowTargets = resolveAllowedColumns(
+            await resolveTaskWorkflowIrForMove(store, id),
+            task.column,
           );
+          const validTargets = [...new Set([...legacyTargets, ...workflowTargets])];
+          if (!validTargets.includes(toColumn)) {
+            throw new Error(
+              `Invalid transition: '${task.column}' → '${toColumn}'. ` +
+                `Valid targets: ${validTargets.join(", ") || "none"}`,
+            );
+          }
         }
       }
 

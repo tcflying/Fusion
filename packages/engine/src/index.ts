@@ -7,6 +7,12 @@ export * from "./room-existing-session-spine.js";
 export * from "./room-existing-session-preflight.js";
 export * from "./room-evolution-runtime.js";
 export * from "./project-room-command-gateway.js";
+export {
+  classifyReportHealth,
+  type ReportHealthBucket,
+  type ReportHealthClassification,
+  type ReportHealthInput,
+} from "./reports-health.js";
 export { reloadExemptTools, addToExemptTools, getExemptToolNames } from "./agent-action-gate.js";
 export type { AgentActionGateContext } from "./agent-action-gate.js";
 export { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";

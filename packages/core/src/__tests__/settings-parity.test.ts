@@ -1,3 +1,4 @@
+import type { VoiceInputSettings, ProjectSettings } from "../types.js";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_GLOBAL_SETTINGS,
@@ -542,6 +543,7 @@ describe("settings key parity", () => {
     // GLOBAL_SETTINGS_KEYS order.
     expect(overlap).toEqual([
       "testMode",
+      "voiceInput",
       "mergeRequestContractShadowEnabled",
       "taskTokenBudget",
       "githubTrackingDefaultRepo",
@@ -715,6 +717,14 @@ describe("model lane key parity regression (FN-1729)", () => {
   it("testMode key is recognized in both project and global scopes", () => {
     expect(isProjectSettingsKey("testMode")).toBe(true);
     expect(isGlobalSettingsKey("testMode")).toBe(true);
+  });
+
+  it("exports voiceInput from the public type barrel in both scopes", () => {
+    const sample: VoiceInputSettings = { enabled: true, model: "parakeet-v3", language: "en" };
+    const projectValue: ProjectSettings["voiceInput"] = sample;
+    expect(projectValue).toEqual(sample);
+    expect(isProjectSettingsKey("voiceInput")).toBe(true);
+    expect(isGlobalSettingsKey("voiceInput")).toBe(true);
   });
 
   it("no model lane provider exists without its corresponding modelId key", () => {

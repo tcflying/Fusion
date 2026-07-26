@@ -1,3 +1,4 @@
+import { buildDesktopVitestArgs } from "./test-args";
 import { buildCore, buildDashboard, packageRoot, runWorkspaceBin } from "./workspace-tools";
 
 async function main(): Promise<void> {
@@ -8,7 +9,7 @@ async function main(): Promise<void> {
   await buildDashboard();
 
   console.log("[desktop:test] Running desktop Vitest suite...");
-  await runWorkspaceBin("vitest", ["run", "--silent=passed-only", "--reporter=dot"], packageRoot);
+  await runWorkspaceBin("vitest", buildDesktopVitestArgs(process.argv.slice(2)), packageRoot);
 }
 
 void main().catch((error) => {

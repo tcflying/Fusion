@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -157,6 +157,57 @@ describe("useModalResizePersist", () => {
     vi.advanceTimersByTime(200);
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}"))
       .toEqual({ width: 560, height: 445 });
+  });
+
+  it("resizes from a focused grip with arrow keys and exposes synchronized geometry", () => {
+    setViewport(900);
+    render(<Harness />);
+
+    const modal = screen.getByTestId("modal");
+    installModalGeometry(modal);
+    triggerResizeObservers();
+    const grip = modal.querySelector(".modal-resize-grip") as HTMLElement;
+    grip.focus();
+
+    expect(grip).toHaveFocus();
+    expect(grip).toHaveAttribute("tabindex", "0");
+    expect(grip).toHaveAttribute("aria-valuenow", "500");
+    expect(grip).toHaveAttribute("aria-valuetext", "Width 500 pixels, height 400 pixels");
+
+    fireEvent.keyDown(grip, { key: "ArrowRight" });
+    fireEvent.keyDown(grip, { key: "ArrowDown" });
+
+    expect(modal.style.width).toBe("516px");
+    expect(modal.style.height).toBe("416px");
+    expect(grip).toHaveAttribute("aria-valuenow", "516");
+    expect(grip).toHaveAttribute("aria-valuetext", "Width 516 pixels, height 416 pixels");
+
+    vi.advanceTimersByTime(200);
+    expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}"))
+      .toEqual({ width: 516, height: 416 });
+  });
+
+  it("keeps the grip active at the known touch-tablet 768px boundary", () => {
+    const originalMaxTouchPoints = Object.getOwnPropertyDescriptor(navigator, "maxTouchPoints");
+    setViewport(768, 1024);
+    Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 1 });
+
+    try {
+      render(<Harness />);
+      const modal = screen.getByTestId("modal");
+      installModalGeometry(modal);
+      const grip = modal.querySelector(".modal-resize-grip") as HTMLElement;
+
+      expect(grip).toBeTruthy();
+      dispatchPointerEvent(grip, "pointerdown", { clientX: 10, clientY: 10, pointerId: 7 });
+      dispatchPointerEvent(document, "pointermove", { clientX: 50, clientY: 30, pointerId: 7 });
+      dispatchPointerEvent(document, "pointerup", { clientX: 50, clientY: 30, pointerId: 7 });
+
+      expect(modal.style.width).toBe("540px");
+      expect(modal.style.height).toBe("420px");
+    } finally {
+      if (originalMaxTouchPoints) Object.defineProperty(navigator, "maxTouchPoints", originalMaxTouchPoints);
+    }
   });
 
   it("keeps desktop grip and native ResizeObserver persistence/restore behavior", () => {

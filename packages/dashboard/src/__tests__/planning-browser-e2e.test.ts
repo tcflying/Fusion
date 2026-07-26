@@ -222,10 +222,15 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
 
   async function verifyContextualCommentPlacement(
     viewport: { width: number; height: number },
-    options: { inFooter: boolean; positionFixed: boolean },
+    options: { compact: boolean },
     presentation: "embedded" | "modal",
   ): Promise<void> {
-    const { inFooter, positionFixed } = options;
+    /*
+    FNXC:PlanningComments 2026-07-25-10:20:
+    The trigger now lives in the plan action rail at EVERY viewport — the document-adjacent duplicate
+    that desktop used to render was removed. `compact` (<=1024) still selects the pinned composer.
+    */
+    const { compact } = options;
     const page = await browser.newPage({ viewport });
     await page.goto(`${baseUrl}app/planning-browser-e2e-fixture.html?surface=plan-review&presentation=${presentation}&reset=1`);
     if (viewport.width <= 768) await page.getByRole("tab", { name: "Plan preview" }).click();
@@ -277,25 +282,21 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
     });
 
     expect(placement).toMatchObject({
-      totalButtons: 2,
+      totalButtons: 1,
       visibleButtons: 1,
-      visibleInActions: inFooter,
-      positionFixed,
-      // Compact shells keep the control in the visual viewport without scrolling the plan.
-      triggerInsideViewport: inFooter ? true : expect.any(Boolean),
+      visibleInActions: true,
+      positionFixed: false,
+      // The rail keeps the control in the visual viewport without scrolling the plan.
+      triggerInsideViewport: true,
       triggerHasPreviousTabStop: true,
       hiddenButtonsTabbable: 0,
     });
-    if (inFooter) {
-      // In-flow rail row: Add comment sits above Refine/Proceed in the same footer.
-      expect(placement.actionLabels).toEqual(expect.arrayContaining([
-        "Add comment to selection",
-        "Refine",
-        "Proceed with plan",
-      ]));
-    } else {
-      expect(placement.actionLabels).not.toContain("Add comment to selection");
-    }
+    // In-flow rail row: Add comment sits with Refine/Proceed in the same footer at every viewport.
+    expect(placement.actionLabels).toEqual(expect.arrayContaining([
+      "Add comment to selection",
+      "Refine",
+      "Proceed with plan",
+    ]));
 
     let reachedTriggerByTab = false;
     for (let tabCount = 0; tabCount < 8; tabCount += 1) {
@@ -305,10 +306,10 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
     }
     expect(reachedTriggerByTab).toBe(true);
 
-    if (inFooter && presentation === "embedded" && process.env.FUSION_CAPTURE_DIR) await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-comment-mobile-selection.png` });
+    if (compact && presentation === "embedded" && process.env.FUSION_CAPTURE_DIR) await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-comment-mobile-selection.png` });
     await page.getByRole("button", { name: "Add comment to selection" }).click();
     await expectVisible(page.getByLabel("Add plan comment"));
-    if (inFooter && presentation === "embedded" && process.env.FUSION_CAPTURE_DIR) await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-comment-mobile-editor.png` });
+    if (compact && presentation === "embedded" && process.env.FUSION_CAPTURE_DIR) await page.screenshot({ path: `${process.env.FUSION_CAPTURE_DIR}/planning-comment-mobile-editor.png` });
     const afterOpen = await page.evaluate(() => {
       const editor = document.querySelector<HTMLElement>(".planning-comment-editor");
       const editorRect = editor?.getBoundingClientRect();
@@ -329,8 +330,8 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
       addCommentButtons: 0,
       actionChildren: 0,
       // Phone + tablet pin the composer; desktop keeps the in-document editor.
-      editorPosition: inFooter ? "fixed" : "static",
-      editorInsideViewport: inFooter ? true : expect.any(Boolean),
+      editorPosition: compact ? "fixed" : "static",
+      editorInsideViewport: compact ? true : expect.any(Boolean),
     });
 
     await page.evaluate(() => {
@@ -349,11 +350,11 @@ describe.runIf(executablePath)("Planning Mode browser E2E", () => {
   it("places the sole contextual comment trigger by viewport in embedded and modal Planning", async () => {
     for (const presentation of ["embedded", "modal"] as const) {
       // Phone + tablet: full-width action-rail row above Refine/Proceed.
-      await verifyContextualCommentPlacement({ width: 768, height: 900 }, { inFooter: true, positionFixed: false }, presentation);
-      await verifyContextualCommentPlacement({ width: 769, height: 900 }, { inFooter: true, positionFixed: false }, presentation);
-      await verifyContextualCommentPlacement({ width: 1024, height: 900 }, { inFooter: true, positionFixed: false }, presentation);
-      // Desktop: document-adjacent trigger only.
-      await verifyContextualCommentPlacement({ width: 1280, height: 900 }, { inFooter: false, positionFixed: false }, presentation);
+      await verifyContextualCommentPlacement({ width: 768, height: 900 }, { compact: true }, presentation);
+      await verifyContextualCommentPlacement({ width: 769, height: 900 }, { compact: true }, presentation);
+      await verifyContextualCommentPlacement({ width: 1024, height: 900 }, { compact: true }, presentation);
+      // Desktop: same single rail trigger, inline with Refine/Proceed.
+      await verifyContextualCommentPlacement({ width: 1280, height: 900 }, { compact: false }, presentation);
     }
   }, 30_000);
 });

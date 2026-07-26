@@ -1,5 +1,5 @@
 import "./NewTaskModal.css";
-import { useState, useCallback, useEffect, useRef, type CSSProperties, type ChangeEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useState, useCallback, useEffect, useRef, type CSSProperties, type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { DEFAULT_TASK_PRIORITY, type Task, type TaskPriority } from "@fusion/core";
@@ -21,7 +21,7 @@ import { Bot } from "lucide-react";
 import { useSetupReadiness } from "../hooks/useSetupReadiness";
 import { SetupWarningBanner } from "./SetupWarningBanner";
 import { LoadingSpinner } from "./LoadingSpinner";
-import { TaskForm, type BranchSelectionMode, type EnabledWorkflowStepsChangeMeta, type PendingImage } from "./TaskForm";
+import { TaskForm, type BranchSelectionMode, type EnabledWorkflowStepsChangeMeta, type PendingImage, type TaskFormValueChangeMeta } from "./TaskForm";
 import { DuplicateWarningModal } from "./DuplicateWarningModal";
 import { REPO_OVERRIDE_RE } from "./githubTracking";
 import { useConfirm } from "../hooks/useConfirm";
@@ -65,6 +65,11 @@ const NEW_TASK_DEFAULT_HEIGHT = 640;
 const NEW_TASK_MIN_WIDTH = 420;
 const NEW_TASK_MIN_HEIGHT = 360;
 const NEW_TASK_VIEWPORT_PADDING = 16;
+/*
+FNXC:TaskModalResize 2026-07-24-19:00:
+Keyboard resizing follows the existing viewport padding quantum, so focusable edge controls produce predictable, touch-safe geometry changes without a second sizing scale.
+*/
+const NEW_TASK_KEYBOARD_RESIZE_STEP = NEW_TASK_VIEWPORT_PADDING;
 
 interface FloatSize {
   width: number;
@@ -562,6 +567,34 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     captureTarget.addEventListener("pointercancel", handlePointerUp);
   }, [persistPosition, persistSize, position, size]);
 
+  /*
+  FNXC:TaskModalResize 2026-07-24-19:00:
+  Tablet resize handles must be keyboard-operable as well as touch-operable. Each focused edge
+  adjusts the dimensions it owns, clamps and persists exactly like a completed pointer resize,
+  and exposes the resulting geometry through its ARIA separator value.
+  */
+  const handleFloatingResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>, direction: FloatResizeDirection) => {
+    let widthDelta = 0;
+    let heightDelta = 0;
+    const step = NEW_TASK_KEYBOARD_RESIZE_STEP;
+
+    if (event.key === "ArrowRight") widthDelta = direction.includes("e") ? step : direction.includes("w") ? -step : 0;
+    if (event.key === "ArrowLeft") widthDelta = direction.includes("w") ? step : direction.includes("e") ? -step : 0;
+    if (event.key === "ArrowDown") heightDelta = direction.includes("s") ? step : direction.includes("n") ? -step : 0;
+    if (event.key === "ArrowUp") heightDelta = direction.includes("n") ? step : direction.includes("s") ? -step : 0;
+    if (widthDelta === 0 && heightDelta === 0) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const nextSize = clampFloatSize({ width: size.width + widthDelta, height: size.height + heightDelta });
+    const nextPosition = clampFloatPosition({
+      x: position.x + (direction.includes("w") ? size.width - nextSize.width : 0),
+      y: position.y + (direction.includes("n") ? size.height - nextSize.height : 0),
+    }, nextSize);
+    persistSize(nextSize);
+    persistPosition(nextPosition, nextSize);
+  }, [persistPosition, persistSize, position, size]);
+
   // FNXC:NewTask 2026-06-22-20:30: Run any active drag/resize teardown on unmount so element pointer listeners + a pending rAF never outlive the modal.
   useEffect(() => () => dragTeardownRef.current?.(), []);
 
@@ -589,6 +622,7 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   // from the selected workflow's defaultOn and lifts the enabled set up here.
   const [enabledWorkflowSteps, setEnabledWorkflowSteps] = useState<string[]>([]);
   const [shouldSubmitEnabledWorkflowSteps, setShouldSubmitEnabledWorkflowSteps] = useState(false);
+  const [hasUserSelectedEnabledWorkflowSteps, setHasUserSelectedEnabledWorkflowSteps] = useState(false);
   const [reviewLevel, setReviewLevel] = useState<number | undefined>(undefined);
   const [autoMerge, setAutoMerge] = useState<boolean | undefined>(undefined);
   const [priority, setPriority] = useState<TaskPriority>(DEFAULT_TASK_PRIORITY);
@@ -603,15 +637,35 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   const [executionMode, setExecutionMode] = useState<"standard" | "fast">("standard");
   const [githubTrackingEnabled, setGithubTrackingEnabled] = useState(false);
   /*
+  FNXC:NewTaskDirtyState 2026-07-24-14:00:
+  Asynchronous model-preset and GitHub-tracking defaults are create-form initialization,
+  not operator edits. Preserve their settled values as the pristine baseline so a blank
+  modal closes directly, while a later operator change still retains discard protection.
+  */
+  const [initialDefaultValues, setInitialDefaultValues] = useState({
+    executorModel: "",
+    validatorModel: "",
+    githubTrackingEnabled: false,
+  });
+  /*
   FNXC:FastOptionalSteps 2026-06-30-09:10:
   New task create payloads must distinguish omitted optional-step intent (no controls/no workflow; allow store defaults) from explicit `[]` (operator chose Fast or deselected all; do not re-seed default-on groups) and non-empty manual selections.
 
   FNXC:FastOptionalSteps 2026-06-30-10:42:
   Fast is itself explicit optional-step intent. Submit the current enabledWorkflowSteps array even before optional-step metadata finishes loading so default-on workflow gates cannot revive through an omitted field.
   */
+  /*
+  FNXC:NewTaskDirtyState 2026-07-24-12:15:
+  TaskForm asynchronously seeds inherited workflow defaults so creation can submit an explicit
+  optional-step selection. That initialization is not operator input and must not trigger the
+  discard dialog; only a user optional-step action is dirty while the seeded payload is preserved.
+  */
   const handleEnabledWorkflowStepsChange = useCallback((ids: string[], meta?: EnabledWorkflowStepsChangeMeta) => {
     setEnabledWorkflowSteps(ids);
     setShouldSubmitEnabledWorkflowSteps(meta?.optionalStepsAvailable === true);
+    if (meta?.source === "user") {
+      setHasUserSelectedEnabledWorkflowSteps(true);
+    }
   }, []);
   const [githubRepoOverride, setGithubRepoOverride] = useState("");
 
@@ -711,6 +765,27 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
   const isBranchNameRequired = branchMode === "existing" || branchMode === "custom-new" || branchMode === "shared-group";
   const hasInvalidBranchSelection = isBranchNameRequired && !branch.trim();
 
+  const handleExecutorModelChange = useCallback((value: string, meta?: TaskFormValueChangeMeta) => {
+    setExecutorModel(value);
+    if (meta?.source === "initialization") {
+      setInitialDefaultValues((defaults) => ({ ...defaults, executorModel: value }));
+    }
+  }, []);
+
+  const handleValidatorModelChange = useCallback((value: string, meta?: TaskFormValueChangeMeta) => {
+    setValidatorModel(value);
+    if (meta?.source === "initialization") {
+      setInitialDefaultValues((defaults) => ({ ...defaults, validatorModel: value }));
+    }
+  }, []);
+
+  const handleGithubTrackingEnabledChange = useCallback((value: boolean, meta?: TaskFormValueChangeMeta) => {
+    setGithubTrackingEnabled(value);
+    if (meta?.source === "initialization") {
+      setInitialDefaultValues((defaults) => ({ ...defaults, githubTrackingEnabled: value }));
+    }
+  }, []);
+
   // Track dirty state
   useEffect(() => {
     const isDirty =
@@ -718,13 +793,11 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
       dependencies.length > 0 ||
       pendingImages.length > 0 ||
       selectedWorkflowId !== undefined ||
-      // Optional workflow steps the user toggled count as unsaved work. (Workflows
-      // whose steps are defaultOn:false — today's only shipped step — seed an empty
-      // set, so this stays false until the user actually opts a step in.)
-      shouldSubmitEnabledWorkflowSteps ||
-      enabledWorkflowSteps.length > 0 ||
-      executorModel !== "" ||
-      validatorModel !== "" ||
+      // The create payload preserves asynchronously seeded defaultOn steps, but only
+      // an operator toggle should require discard confirmation.
+      hasUserSelectedEnabledWorkflowSteps ||
+      executorModel !== initialDefaultValues.executorModel ||
+      validatorModel !== initialDefaultValues.validatorModel ||
       planningModel !== "" ||
       thinkingLevel !== "" ||
       plannerOversightLevel !== "" ||
@@ -737,10 +810,10 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
       branchMode !== "project-default" ||
       branch !== "" ||
       baseBranch !== "" ||
-      githubTrackingEnabled ||
+      githubTrackingEnabled !== initialDefaultValues.githubTrackingEnabled ||
       githubRepoOverrideTrimmed !== "";
     setHasDirtyState(isDirty);
-  }, [description, dependencies, pendingImages, selectedWorkflowId, shouldSubmitEnabledWorkflowSteps, enabledWorkflowSteps, executorModel, validatorModel, planningModel, thinkingLevel, plannerOversightLevel, selectedAgentId, reviewLevel, autoMerge, priority, nodeId, executionMode, branchMode, branch, baseBranch, githubTrackingEnabled, githubRepoOverrideTrimmed]);
+  }, [description, dependencies, pendingImages, selectedWorkflowId, hasUserSelectedEnabledWorkflowSteps, executorModel, validatorModel, planningModel, thinkingLevel, plannerOversightLevel, selectedAgentId, reviewLevel, autoMerge, priority, nodeId, executionMode, branchMode, branch, baseBranch, githubTrackingEnabled, githubRepoOverrideTrimmed, initialDefaultValues]);
 
   const resetForm = useCallback(() => {
     // Clean up object URLs
@@ -759,6 +832,7 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     setSelectedWorkflowId(undefined);
     setEnabledWorkflowSteps([]);
     setShouldSubmitEnabledWorkflowSteps(false);
+    setHasUserSelectedEnabledWorkflowSteps(false);
     setSelectedAgentId(null);
     setShowAgentPicker(false);
     setReviewLevel(undefined);
@@ -771,6 +845,7 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
     setBaseBranch("");
     setHasDirtyState(false);
     setGithubTrackingEnabled(false);
+    setInitialDefaultValues({ executorModel: "", validatorModel: "", githubTrackingEnabled: false });
     setGithubRepoOverride("");
     setDuplicateMatches(null);
     githubGeneratedDescriptionRef.current = "";
@@ -1131,7 +1206,7 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
         style={isFloating ? { zIndex } : undefined}
       >
         <div
-          className={`modal modal-lg new-task-modal${isFloating ? " new-task-modal--floating" : ""}`}
+          className={`modal modal-lg new-task-modal${viewportMode === "tablet" ? " task-modal--tablet" : ""}${isFloating ? " new-task-modal--floating" : ""}`}
           style={panelStyle}
           onPointerDownCapture={isFloating ? bringToFront : undefined}
           onFocusCapture={isFloating ? bringToFront : undefined}
@@ -1142,8 +1217,15 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
               className={`new-task-resize-handle new-task-resize-handle--${direction}`}
               data-testid={`new-task-resize-${direction}`}
               role="separator"
+              aria-orientation={direction === "n" || direction === "s" ? "horizontal" : "vertical"}
+              aria-valuemin={direction === "n" || direction === "s" ? NEW_TASK_MIN_HEIGHT : NEW_TASK_MIN_WIDTH}
+              aria-valuemax={direction === "n" || direction === "s" ? Math.max(NEW_TASK_MIN_HEIGHT, window.innerHeight - NEW_TASK_VIEWPORT_PADDING * 2) : Math.max(NEW_TASK_MIN_WIDTH, window.innerWidth - NEW_TASK_VIEWPORT_PADDING * 2)}
+              aria-valuenow={direction === "n" || direction === "s" ? size.height : size.width}
+              aria-valuetext={`${t("newTaskModal.resize", "Resize new task window")}: ${size.width} by ${size.height}`}
               aria-label={t("newTaskModal.resize", "Resize new task window")}
+              tabIndex={0}
               onPointerDown={(event) => handleFloatingResizePointerDown(event, direction)}
+              onKeyDown={(event) => handleFloatingResizeKeyDown(event, direction)}
             />
           ))}
           <div
@@ -1173,9 +1255,9 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
             dependencies={dependencies}
             onDependenciesChange={setDependencies}
             executorModel={executorModel}
-            onExecutorModelChange={setExecutorModel}
+            onExecutorModelChange={handleExecutorModelChange}
             validatorModel={validatorModel}
-            onValidatorModelChange={setValidatorModel}
+            onValidatorModelChange={handleValidatorModelChange}
             presetMode={presetMode}
             onPresetModeChange={setPresetMode}
             selectedPresetId={selectedPresetId}
@@ -1218,7 +1300,7 @@ export function NewTaskModal({ isOpen, onClose, projectId, tasks, onCreateTask, 
             executionMode={executionMode}
             onExecutionModeChange={setExecutionMode}
             githubTrackingEnabled={githubTrackingEnabled}
-            onGithubTrackingEnabledChange={setGithubTrackingEnabled}
+            onGithubTrackingEnabledChange={handleGithubTrackingEnabledChange}
             githubRepoOverride={githubRepoOverride}
             onGithubRepoOverrideChange={setGithubRepoOverride}
             onCreateSubmit={handleSubmit}

@@ -50,4 +50,21 @@ describe("pre-release Plan Review readiness", () => {
     item.waitReason = "planning";
     await expect(isUnplannedForExecution(store, task, workflow())).resolves.toBe(true);
   });
+
+  it("does not filter active continuations to task kind", async () => {
+    const task = { id: "T-5", column: "todo" } as any;
+    const store = {
+      listWorkflowWorkItemsForTask: async () => [{
+        id: "non-task-continuation",
+        taskId: task.id,
+        kind: "workflow-step",
+        state: "held",
+        waitReason: "capacity",
+        sourceColumn: "todo",
+      }],
+    } as any;
+
+    // A capacity continuation remains graph-owned regardless of its kind.
+    await expect(isUnplannedForExecution(store, task, workflow())).resolves.toBe(false);
+  });
 });

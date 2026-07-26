@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ReportModal } from "../ReportModal";
 import * as api from "../../api";
 import * as capture from "../../utils/report-capture";
+import { readAppFile } from "../../test/cssFixture";
 
 vi.mock("../../api", () => ({
   reportAttachment: vi.fn(),
@@ -89,7 +90,7 @@ describe("ReportModal", () => {
   });
 
   it("retains the canonical mobile rule because modal DOM is breakpoint-independent", () => {
-    const css = readFileSync("app/components/ReportModal.css", "utf8");
+    const css = readAppFile("components/ReportModal.css");
     expect(css).toMatch(/@media \(max-width: 768px\)/);
     expect(css).toMatch(/\.report-modal \{ inline-size: 100%;/);
   });

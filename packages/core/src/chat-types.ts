@@ -36,6 +36,15 @@ export interface ChatInFlightGenerationState {
   updatedAt: string;
 }
 
+export interface ChatTag {
+  id: string;
+  /** Owning project; `null` represents the canonical default project scope. */
+  projectId: string | null;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ChatSession {
   id: string;
   /** Session routing kind; legacy sessions default to direct */
@@ -46,6 +55,8 @@ export interface ChatSession {
   roomName?: string | null;
   /** ID of the agent participating in this session */
   agentId: string;
+  /** Deterministically name-sorted Direct-conversation tags. Always present. */
+  tags: ChatTag[];
   /** Human-readable title for the session (optional, can be auto-generated) */
   title: string | null;
   /** Current status of the session */
@@ -231,6 +242,9 @@ export interface ChatSessionCreateInput {
  * Input for updating a chat session.
  * All fields are optional; only provided fields are updated.
  */
+export interface ChatTagCreateInput { name: string; projectId?: string | null; }
+export interface ChatTagUpdateInput { name: string; }
+
 export interface ChatSessionUpdateInput {
   /** New session title */
   title?: string | null;

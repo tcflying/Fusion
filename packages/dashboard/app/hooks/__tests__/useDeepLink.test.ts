@@ -431,4 +431,90 @@ describe("useDeepLink", () => {
       expect(mockFetchTaskDetail).toHaveBeenCalledTimes(1);
     });
   });
+  /*
+  FNXC:DeepLink 2026-07-25-11:20:
+  Regression coverage for the `#/tasks/<id>` hash deep link, which had NO consumer: every
+  surface writing it (duplicate-warning "Open" in InlineCreateCard / NewTaskModal /
+  QuickEntryBox, and the Column / ListView quick-add fallbacks) silently did nothing.
+  These assert the shared invariant those five surfaces depend on rather than the single
+  reported repro: a written hash always resolves to an open or a toast, never a no-op.
+  */
+  describe("#/tasks/:id hash deep link (shared by all duplicate-warning Open surfaces)", () => {
+    function setHash(hash: string) {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: new URL(`http://localhost:3000/${hash}`),
+      });
+    }
+
+    it("opens the task when the hash is present on mount", async () => {
+      setHash("#/tasks/FN-4242");
+
+      const { openTaskDetail } = renderUseDeepLink();
+
+      await waitFor(() => {
+        expect(mockFetchTaskDetail).toHaveBeenCalledWith("FN-4242", "proj_123");
+        expect(openTaskDetail).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it("opens the task when the hash is written after mount (the Open-button path)", async () => {
+      const { openTaskDetail } = renderUseDeepLink();
+
+      setHash("#/tasks/FN-4242");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+
+      await waitFor(() => {
+        expect(mockFetchTaskDetail).toHaveBeenCalledWith("FN-4242", "proj_123");
+        expect(openTaskDetail).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it("clears the hash so re-Opening the same task fires again", async () => {
+      const { openTaskDetail } = renderUseDeepLink();
+
+      setHash("#/tasks/FN-4242");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      await waitFor(() => expect(openTaskDetail).toHaveBeenCalledTimes(1));
+
+      // The consumer must have stripped the hash; otherwise the second Open is a no-op.
+      expect(window.location.hash).toBe("");
+
+      setHash("#/tasks/FN-4242");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      await waitFor(() => expect(openTaskDetail).toHaveBeenCalledTimes(2));
+    });
+
+    it("toasts instead of failing silently when the task cannot be resolved", async () => {
+      mockFetchTaskDetail.mockRejectedValueOnce(new Error("not found"));
+      setHash("#/tasks/FN-9001");
+
+      const { addToast, openTaskDetail } = renderUseDeepLink();
+
+      await waitFor(() => {
+        expect(addToast).toHaveBeenCalledWith(expect.stringContaining("FN-9001"), "error");
+      });
+      expect(openTaskDetail).not.toHaveBeenCalled();
+    });
+
+    it("scopes the fetch to the active project", async () => {
+      setHash("#/tasks/FN-4242");
+
+      renderUseDeepLink({ projectId: otherProject.id, currentProject: otherProject });
+
+      await waitFor(() => {
+        expect(mockFetchTaskDetail).toHaveBeenCalledWith("FN-4242", "proj_456");
+      });
+    });
+
+    it("ignores hashes that are not task deep links", async () => {
+      setHash("#message-abc");
+
+      renderUseDeepLink();
+
+      await waitFor(() => {
+        expect(mockFetchTaskDetail).not.toHaveBeenCalled();
+      });
+    });
+  });
 });

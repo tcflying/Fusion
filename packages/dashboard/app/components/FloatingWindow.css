@@ -121,6 +121,22 @@ Tablet task-detail popups prioritize symmetric content insets over desktop resiz
 }
 
 /*
+FNXC:FloatingWindow 2026-07-25-00:00:
+The tablet carve-out above is width-gated at 1024px, so a landscape tablet (iPad Air/Pro report 1180-1366 CSS px) fell back to the desktop contract and kept FN-8015's `margin-inline-end: var(--space-lg)` body gutter — content stopped ~17px short of the right edge while the left edge stayed flush, reading as unexplained dead space on the right of the task pop-up.
+Width cannot answer this: the gutter exists to keep a hosted scrollbar out of the east/north-east/south-east resize hot zones, which only matters when a pointer can actually grab them. Gate the carve-out on the input device instead, so every touch-primary tablet gets symmetric insets at any width. `(pointer: coarse)` is primary-input only, so a touchscreen laptop driven by a trackpad still reports `fine` and keeps desktop resize clearance.
+Kept as a separate block rather than folded into the width query so the existing 769-1024px contract stays independently addressable.
+*/
+@media (pointer: coarse) {
+  .floating-window--task-detail .floating-window__body {
+    margin-inline-end: 0;
+  }
+
+  .floating-window--task-detail .floating-window__resize-handle {
+    display: none;
+  }
+}
+
+/*
 FNXC:ChatModal 2026-06-22-14:49:
 On mobile/narrow app viewports, opening Quick Chat should present the full Chat modal as a full-screen sheet instead of a small draggable desktop window. Scope this to the chat FloatingWindow and override the inline desktop geometry only at the mobile breakpoint; desktop pop-out behavior remains movable/resizable.
 */

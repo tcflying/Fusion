@@ -15,6 +15,7 @@ import { readFile, stat } from "node:fs/promises";
 import * as readline from "node:readline";
 import { PluginStore, PluginLoader, validatePluginManifest, resolveGlobalDir, CentralCore } from "@fusion/core";
 import { resolveProject } from "../project-context.js";
+import { promptOutputStream, result } from "../output.js";
 
 export interface BuiltinPluginCatalogEntry {
   id: string;
@@ -440,15 +441,18 @@ export async function runPluginUninstall(
 
   // Confirm unless force
   if (!options?.force) {
-    console.log();
-    console.log(`  Uninstall "${plugin.name}" globally?`);
-    console.log("  This removes it for all projects.");
-    console.log();
+    /*
+     * FNXC:CliQuietMode 2026-07-16-00:00:
+     * This label describes the irreversible scope of the following prompt,
+     * so it remains visible while quiet mode suppresses ordinary status logs.
+     */
+    result(`\n  Uninstall "${plugin.name}" globally?\n  This removes it for all projects.\n\n`);
 
     const response = await new Promise<string>((resolve) => {
       const rl = readline.createInterface({
         input: process.stdin,
-        output: process.stdout,
+        /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream(),
       });
       rl.question("  Continue? [y/N] ", (answer: string) => {
         rl.close();

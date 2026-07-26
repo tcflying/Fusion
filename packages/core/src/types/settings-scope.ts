@@ -11,6 +11,7 @@ import type {
   Locale,
   ReviewArtifactsMode,
   ThemeMode,
+  AnthropicAuthPreference,
 } from "./execution-and-ui.js";
 import type {
   AutoRecoverySettings,
@@ -288,9 +289,35 @@ export interface BackupSettingsMigrationConflict {
   recordedAt: string;
 }
 
+/**
+ * FNXC:VoiceInput 2026-07-21-12:00:
+ * Voice dictation is opt-in and resolved per request with project values overriding global
+ * values. The flag gates dictation only: operators may manage the on-demand model while
+ * disabled, and missing optional runtime support reports unavailable rather than failing boot.
+ * `model` is a registry identifier (default `parakeet-v3`), never a path or URL; `language`
+ * defaults to `en` and unsupported values are rejected when a session is created.
+ */
+export interface VoiceInputSettings {
+  /** Default false; gates dictation/transcription only. */
+  enabled?: boolean;
+  /** Registry model identifier; default `parakeet-v3`. */
+  model?: string;
+  /** Recognition language code; default `en`. */
+  language?: string;
+}
+
 export interface GlobalSettings {
   /** Maximum PostgreSQL server connections for Fusion's embedded database. Applied on the next Fusion restart. */
   embeddedPostgresMaxConnections?: number;
+  /**
+   * FNXC:ProviderAuth 2026-07-24-17:05:
+   * Which Anthropic credential wins when BOTH a raw API key and a Claude subscription OAuth
+   * login are present. Global because credentials are global. "api-key" (default) preserves
+   * the historical precedence; "subscription" makes the OAuth login win so a stale or revoked
+   * saved key can no longer shadow it with `401 invalid x-api-key`. With only one credential
+   * configured this setting changes nothing — resolution falls through to whatever exists.
+   */
+  anthropicAuthPreference?: AnthropicAuthPreference;
   /** Theme mode preference: dark, light, or system (follows OS). Default: "dark". */
   themeMode?: ThemeMode;
   /** Color theme preference for accent colors and styling. Default: "shadcn-ember"; "default" and "ocean" remain valid explicit legacy selections. */
@@ -342,6 +369,7 @@ export interface GlobalSettings {
    *  of per-task or per-lane overrides. No network calls, zero token cost.
    *  Project `testMode` takes precedence over the global value. */
   testMode?: boolean;
+  voiceInput?: VoiceInputSettings;
   /**
    * User-edited or one-click-fetched pricing entries keyed by lowercased `provider:model`.
    *
@@ -572,6 +600,20 @@ export interface GlobalSettings {
    * is the explicit downgrade escape hatch). Default: `stable`.
    */
   updateChannel?: UpdateChannel;
+  /**
+   * FNXC:AutoUpdate 2026-07-25-10:05:
+   * When true, the dashboard host installs available updates on its own
+   * (channel-aware, same install path as the Settings "Update now" button) and
+   * then requests the supervised in-place restart so the new version is actually
+   * running. Default false: unattended self-replacement + process bounce must be
+   * an explicit operator choice.
+   *
+   * Only honored on a supervised host (`fn dashboard` — supervision is the
+   * default). Without a supervising parent the install would leave a running
+   * process whose on-disk code no longer matches, so the watcher skips the
+   * install entirely and logs why instead.
+   */
+  autoUpdateAndRestart?: boolean;
   /** When true (default), the dashboard automatically reloads when a new build
    *  version is detected via /version.json polling or service worker activation.
    *  Set to false to suppress automatic reloads — the user must manually
@@ -1107,6 +1149,7 @@ export interface ProjectSettings {
   /** When true, force every AI lane onto the deterministic mock provider regardless
    *  of per-task or per-lane overrides. No network calls, zero token cost. */
   testMode?: boolean;
+  voiceInput?: VoiceInputSettings;
   /** Phase-1 FN-5741 write-only shadow seam toggle.
    *  Overrides global `mergeRequestContractShadowEnabled` when defined.
    *  Default: false. */

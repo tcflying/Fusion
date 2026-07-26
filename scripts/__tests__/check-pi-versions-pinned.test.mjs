@@ -7,8 +7,8 @@ import {
 
 const pinnedManifest = {
   dependencies: {
-    "@earendil-works/pi-ai": "0.81.1",
-    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@earendil-works/pi-ai": "0.82.0",
+    "@earendil-works/pi-coding-agent": "0.82.0",
   },
 };
 
@@ -22,7 +22,7 @@ describe("check-pi-versions-pinned", () => {
   });
 
   it("rejects caret, tilde, wildcard, x, and comparator ranges", () => {
-    for (const version of ["^0.81.1", "~0.81.1", "*", "0.81.x", ">=0.81.1"]) {
+    for (const version of ["^0.82.0", "~0.82.0", "*", "0.82.x", ">=0.82.0"]) {
       const violations = validate({
         ...pinnedManifest,
         dependencies: { ...pinnedManifest.dependencies, "@earendil-works/pi-ai": version },
@@ -34,7 +34,7 @@ describe("check-pi-versions-pinned", () => {
   it("rejects a matched-set version mismatch", () => {
     const violations = validate({
       ...pinnedManifest,
-      dependencies: { ...pinnedManifest.dependencies, "@earendil-works/pi-coding-agent": "0.81.2" },
+      dependencies: { ...pinnedManifest.dependencies, "@earendil-works/pi-coding-agent": "0.82.1" },
     });
     assert.equal(violations.some((violation) => violation.includes("same exact version")), true);
   });

@@ -1,4 +1,5 @@
 import { writeFile } from "node:fs/promises";
+import { result } from "../output.js";
 import { join, resolve } from "node:path";
 import {
   RESEARCH_EXPORT_FORMATS,
@@ -142,7 +143,7 @@ function printRun(run: ResearchRun): void {
 }
 
 function jsonOut(payload: unknown): void {
-  console.log(JSON.stringify(payload, null, 2));
+  result(JSON.stringify(payload, null, 2) + "\n");
 }
 
 function handleError(error: unknown): never {

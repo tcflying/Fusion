@@ -94,6 +94,40 @@ export const TRANSIENT_ERROR_PATTERNS: RegExp[] = [
   /\bACP session has no live connection\b/i,
 ];
 
+/*
+FNXC:Reliability-ErrorClassification 2026-07-25-21:10 (session/lease contention is NOT a provider failure):
+Fusion serializes work on a shared path with in-process leases: the activeSessionRegistry foreign-task
+guard, the workspace sub-repo acquire lease, and the workspace sub-repo land lease. When a second task
+contends, the holder throws one of these three messages. They are pure CONTENTION — another task is
+mid-flight on the same path — so the only correct response is "wait and try again", never "this model /
+provider / plan is broken".
+Reported failure: a Plan Review collision was classified as a provider failure ("Plan Review provider
+failure — retrying in place (2/2)"), retried twice with no delay against a hold retrying could not clear,
+then parked the task with its budget spent. Matching these shapes as transient makes every generic
+retry/requeue path (executor main session, merge classifier, durable-agent heartbeat recovery) wait it
+out instead. Graph nodes get an explicit backoff hold on top — see SESSION_CONTENTION_HOLD_VALUE.
+*/
+export const SESSION_CONTENTION_PATTERNS: RegExp[] = [
+  // ActiveSessionPathHeldByForeignTaskError (active-session-registry.ts)
+  /active-session path\s+\S+\s+is held by task\s+\S+/i,
+  // WorkspaceRepoAcquireBusyError (worktree-acquisition.ts)
+  /workspace sub-repo\s+\S+\s+acquisition is in progress for task\s+\S+/i,
+  // WorkspaceRepoLandBusyError (merger-ai.ts)
+  /workspace sub-repo\s+\S+\s+land is in progress for task\s+\S+/i,
+];
+
+/**
+ * Detect a path/lease contention failure: another task holds the session path,
+ * sub-repo acquire lease, or sub-repo land lease this task wants. Always
+ * temporary — the holder releases when its own work finishes.
+ */
+export function isSessionContentionError(errorMessage: string): boolean {
+  if (!errorMessage || typeof errorMessage !== "string") {
+    return false;
+  }
+  return SESSION_CONTENTION_PATTERNS.some((pattern) => pattern.test(errorMessage));
+}
+
 /**
  * Check if an error message indicates a transient network/infrastructure error.
  *
@@ -118,6 +152,11 @@ export function isTransientError(errorMessage: string): boolean {
     return false;
   }
   if (isTransientAuthCredentialError(errorMessage)) {
+    return true;
+  }
+  // FNXC:Reliability-ErrorClassification 2026-07-25-21:10: lease/session contention is transient by
+  // construction, so every generic retry path waits for the holder instead of parking the task.
+  if (isSessionContentionError(errorMessage)) {
     return true;
   }
   return TRANSIENT_ERROR_PATTERNS.some((pattern) => pattern.test(errorMessage));

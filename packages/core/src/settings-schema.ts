@@ -88,6 +88,12 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   FNXC:DashboardTheming 2026-07-03-00:00:
   Fresh installs must follow the operating system theme until the user explicitly chooses Light, Dark, or System. Keep this global default aligned with dashboard and desktop pre-hydration fallbacks.
   */
+  /*
+  FNXC:ProviderAuth 2026-07-24-17:05:
+  Default to the historical precedence (raw API key beats subscription OAuth, FN-7391/FN-7396)
+  so upgrading never silently moves an operator's traffic from their key onto their subscription.
+  */
+  anthropicAuthPreference: "api-key",
   themeMode: "system",
   /*
   FNXC:DashboardTheming 2026-06-30-00:00:
@@ -137,6 +143,7 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   defaultProvider: undefined,
   defaultModelId: undefined,
   testMode: undefined,
+  voiceInput: undefined,
   modelPricingOverrides: undefined,
   modelPricingFetchedAt: undefined,
   modelPricingSource: undefined,
@@ -201,6 +208,12 @@ export const DEFAULT_GLOBAL_SETTINGS = {
   // FNXC:UpdateChannels 2026-07-19-12:30: release track for update surfaces;
   // "stable" follows npm dist-tag `latest`, "beta" follows max(latest, beta).
   updateChannel: "stable",
+  /*
+  FNXC:AutoUpdate 2026-07-25-10:05:
+  Unattended update install + supervised restart. Default OFF — an operator must
+  opt in before Fusion replaces its own binary and bounces the process under them.
+  */
+  autoUpdateAndRestart: false,
   autoReloadOnVersionChange: true,
   githubTrackingDefaultRepo: undefined,
   reportRoadmapDedupeEnabled: undefined,
@@ -430,6 +443,7 @@ export const DEFAULT_PROJECT_SETTINGS = {
   // with this on but auto-merge off, review threads are resolved but the PR is not merged.
   autoResolveReviewComments: true,
   testMode: undefined,
+  voiceInput: undefined,
   mergeRequestContractShadowEnabled: false,
   mergeStrategy: "direct",
   directMergeCommitStrategy: "always-squash",

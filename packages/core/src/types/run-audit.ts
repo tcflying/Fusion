@@ -24,8 +24,12 @@ export type RunAuditMutationType =
 
 /** Input for recording a run-audit event. */
 export interface RunAuditEventInput {
+  /** Optional stable event identifier used by idempotent recovery writers. */
+  id?: string;
   /** ISO-8601 timestamp when the event occurred. Defaults to current time if not provided. */
   timestamp?: string;
+  /** Project partition that owns this event. */
+  projectId?: string;
   /** Task ID associated with this event (if applicable). */
   taskId?: string;
   /** Agent ID that performed the mutation. */
@@ -48,6 +52,8 @@ export interface RunAuditEvent {
   id: string;
   /** ISO-8601 timestamp when the event occurred */
   timestamp: string;
+  /** Project partition that owns this event. */
+  projectId?: string;
   /** Task ID associated with this event (if applicable) */
   taskId?: string;
   /** Agent ID that performed the mutation */
@@ -66,6 +72,8 @@ export interface RunAuditEvent {
 
 /** Filter options for querying run-audit events. */
 export interface RunAuditEventFilter {
+  /** Restrict the query to one project partition. */
+  projectId?: string;
   /** Filter by heartbeat run ID. */
   runId?: string;
   /** Filter by task ID. */

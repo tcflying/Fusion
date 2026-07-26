@@ -38,6 +38,7 @@
       "guardRejected": "This move is not allowed by the workflow.",
       "mergeBlocked": "This task is blocked from completing until its merge step finishes.",
       "unknownColumn": "That column doesn't exist in this task's workflow.",
+      "unplannedForExecution": "This task isn't ready for execution yet — planning or plan review is still outstanding.",
       "workflowMismatch": "Drag can't move a card between workflows. Use the workflow switcher instead."
     }
   },

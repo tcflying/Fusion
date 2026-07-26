@@ -991,31 +991,26 @@ FN-7682 — the tokenized-CSS test forbids raw px in the workflow-selector rules
 
 
 /*
-FNXC:QuickAddStart 2026-07-22-16:10:
-The long-press/right-click Start menu is portaled and viewport-clamped by its trigger
-calculation, preserving Save as the primary short-click action on desktop and mobile.
+FNXC:QuickAddStart 2026-07-24-11:20:
+Start replaced the hidden long-press/right-click Save menu (undiscoverable) with a visible chip in the options
+group. It must read as a secondary CTA — clearly actionable, but subordinate to Save's `btn-task-create` fill —
+so it uses a translucent `color-mix` wash of the shared CTA tokens rather than a new color. Box metrics come
+from the row-wide `.quick-entry-actions .btn` height contract above; do not restate them here.
 */
-.quick-entry-start-menu {
-  z-index: var(--z-dropdown);
-  min-width: calc(var(--space-4xl) * 2);
-  padding: var(--space-xs);
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-lg);
+.quick-entry-start-button {
+  background: color-mix(in srgb, var(--cta-bg) 35%, transparent);
+  border-color: color-mix(in srgb, var(--cta-border) 55%, transparent);
+  color: var(--cta-text);
 }
 
-.quick-entry-start-menu button {
-  width: 100%;
-  padding: var(--space-xs) var(--space-sm);
-  background: transparent;
-  border: 0;
-  border-radius: var(--radius-sm);
-  color: var(--text);
-  text-align: left;
+.quick-entry-start-button:hover:not(:disabled),
+.quick-entry-start-button:focus-visible:not(:disabled) {
+  background: color-mix(in srgb, var(--cta-bg-hover) 55%, transparent);
+  border-color: var(--cta-border-hover);
 }
 
-.quick-entry-start-menu button:hover,
-.quick-entry-start-menu button:focus-visible {
-  background: var(--card-hover);
+.quick-entry-start-button:disabled {
+  background: color-mix(in srgb, var(--cta-bg) 12%, transparent);
+  border-color: color-mix(in srgb, var(--cta-border) 25%, transparent);
+  color: var(--text-muted);
 }

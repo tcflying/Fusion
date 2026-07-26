@@ -311,36 +311,9 @@ async function captureToolsWithStore(
   if (settingsOverride) {
     store.getSettings.mockResolvedValue({ ...(await store.getSettings()), ...settingsOverride });
   }
-  // Simulate the real TaskStore: forward transitions persist, but in-progress
-  // regressions on done/skipped steps are rejected so executor.ts can surface
-  // the "already <status>" diagnostic.
-  const stepStates: Array<{ name: string; status: string }> = [
-    { name: "Preflight", status: "done" },
-    { name: "Implement", status: "in-progress" },
-    { name: "Testing", status: "pending" as const },
-    { name: "Docs", status: "pending" as const },
-  ];
-  store.getTask.mockImplementation(async () => ({
-    id: "FN-TEST",
-    title: "Test",
-    description: "Test",
-    column: "in-progress",
-    dependencies: [],
-    steps: stepStates.map((s) => ({ ...s })),
-    currentStep: 1,
-    log: [],
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    ...taskOverride,
-  }));
-  store.updateStep.mockImplementation(async (_taskId: string, stepIndex: number, status: string) => {
-    const current = stepStates[stepIndex];
-    const isRegression = status === "in-progress" && (current.status === "done" || current.status === "skipped");
-    if (!isRegression) {
-      current.status = status;
-    }
-    return { steps: stepStates.map((s) => ({ ...s })) };
-  });
+  if (taskOverride && Object.keys(taskOverride).length > 0) {
+    await store.updateTask("FN-001", taskOverride);
+  }
   mockedExistsSync.mockReturnValue(true);
 
   let capturedTools: any[] = [];
@@ -359,9 +332,15 @@ async function captureToolsWithStore(
     } as any;
   });
 
+  /*
+  FNXC:EngineTests 2026-07-26-20:55:
+  Match the engine-pause harness shape that still reaches implementation sessions under
+  graph ownership (empty steps + harness default getTaskDocument/PROMPT.md). Over-specifying
+  frozen steps/worktree on execute has stranded this surface on plan-only sessions.
+  */
   const executor = new TaskExecutor(store, "/tmp/test");
   await executor.execute({
-    id: "FN-TEST",
+    id: "FN-001",
     title: "Test",
     description: "Test",
     column: "in-progress",
@@ -375,7 +354,9 @@ async function captureToolsWithStore(
 
   const tools: Record<string, any> = {};
   for (const t of capturedTools) {
-    tools[t.name] = t.execute;
+    if (t?.name && typeof t.execute === "function" && tools[t.name] === undefined) {
+      tools[t.name] = t.execute;
+    }
   }
   return { tools, store };
 }
@@ -645,84 +626,22 @@ describe("fn_task_add_dep tool", () => {
   async function captureAddDepTools(opts?: { existingDeps?: string[]; targetExists?: boolean }) {
     const existingDeps = opts?.existingDeps ?? [];
     const targetExists = opts?.targetExists ?? true;
-
-    const store = createMockStore();
-    store.getTask.mockImplementation(async (id: string) => {
-      if (id === "FN-TEST") {
-        return {
-          id: "FN-TEST",
-          title: "Test",
-          description: "Test task",
-          column: "in-progress",
-          dependencies: existingDeps,
-          steps: [],
-          currentStep: 0,
-          log: [],
-          prompt: "# test\n## Steps\n### Step 0: Preflight\n- [ ] check",
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-      }
-      if (id === "FN-OTHER" && targetExists) {
-        return {
-          id: "FN-OTHER",
-          title: "Other task",
-          description: "Another task",
-          column: "todo",
-          dependencies: [],
-          steps: [],
-          currentStep: 0,
-          log: [],
-          prompt: "",
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-      }
-      throw new Error(`Task ${id} not found`);
-    });
-
-    store.updateStep.mockResolvedValue({
-      steps: [
-        { name: "Preflight", status: "done" },
-        { name: "Implement", status: "in-progress" },
-      ],
-    });
-
-    mockedExistsSync.mockReturnValue(true);
-
-    let capturedTools: any[] = [];
-    mockedCreateFnAgent.mockImplementation(async (opts: any) => {
-      capturedTools = [...capturedTools, ...(opts.customTools || [])];
-      return {
-        session: {
-          prompt: vi.fn().mockResolvedValue(undefined),
-          dispose: vi.fn(),
-          sessionManager: {
-            getLeafId: vi.fn().mockReturnValue("leaf-id"),
-            branchWithSummary: vi.fn(),
-          },
-          navigateTree: vi.fn().mockResolvedValue({ cancelled: false }),
-        },
-      } as any;
-    });
-
-    const executor = new TaskExecutor(store, "/tmp/test");
-    await executor.execute({
-      id: "FN-TEST",
-      title: "Test",
-      description: "Test",
-      column: "in-progress",
-      dependencies: existingDeps,
-      steps: [],
-      currentStep: 0,
-      log: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-
-    const tools: Record<string, any> = {};
-    for (const t of capturedTools) {
-      tools[t.name] = t.execute;
+    const { tools, store } = await captureToolsWithStore(undefined, { dependencies: existingDeps });
+    if (targetExists) {
+      await store.updateTask("FN-OTHER", {
+        title: "Other task",
+        description: "Another task",
+        column: "todo",
+        dependencies: [],
+        steps: [],
+        currentStep: 0,
+      });
+    } else {
+      const baseGetTask = store.getTask.bind(store);
+      store.getTask.mockImplementation(async (id: string) => {
+        if (id === "FN-OTHER") throw new Error(`Task ${id} not found`);
+        return baseGetTask(id);
+      });
     }
     return { tools, store };
   }
@@ -739,20 +658,20 @@ describe("fn_task_add_dep tool", () => {
 
     expect(result.content[0].text).toContain("Added dependency");
     expect(result.content[0].text).toContain("triage");
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TEST", {
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
       dependencies: ["FN-OTHER"],
     });
   });
 
   it("returns error for self-dependency", async () => {
     const { tools, store } = await captureAddDepTools();
+    store.updateTask.mockClear();
 
-    const result = await tools.fn_task_add_dep("call1", { task_id: "FN-TEST" });
+    const result = await tools.fn_task_add_dep("call1", { task_id: "FN-001" });
 
     expect(result.content[0].text).toContain("Cannot add self-dependency");
-    expect(result.content[0].text).toContain("FN-TEST cannot depend on itself");
-    // store.updateTask should NOT have been called for dependency update
-    // (it may be called for worktree path updates, so we check specifically for dependencies)
+    expect(result.content[0].text).toContain("FN-001 cannot depend on itself");
+    // After mockClear, only tool-driven dependency writes remain.
     const depUpdateCalls = store.updateTask.mock.calls.filter(
       (call: any[]) => call[1]?.dependencies !== undefined,
     );
@@ -761,6 +680,7 @@ describe("fn_task_add_dep tool", () => {
 
   it("returns error for non-existent target task", async () => {
     const { tools, store } = await captureAddDepTools({ targetExists: false });
+    store.updateTask.mockClear();
 
     const result = await tools.fn_task_add_dep("call1", { task_id: "FN-OTHER" });
 
@@ -774,6 +694,7 @@ describe("fn_task_add_dep tool", () => {
 
   it("returns informational message for duplicate dependency without duplicating", async () => {
     const { tools, store } = await captureAddDepTools({ existingDeps: ["FN-OTHER"] });
+    store.updateTask.mockClear();
 
     const result = await tools.fn_task_add_dep("call1", { task_id: "FN-OTHER" });
 
@@ -790,7 +711,7 @@ describe("fn_task_add_dep tool", () => {
 
     await tools.fn_task_add_dep("call1", { task_id: "FN-OTHER", confirm: true });
 
-    expect(store.logEntry).toHaveBeenCalledWith("FN-TEST", "Added dependency on FN-OTHER — stopping execution for re-planning");
+    expect(store.logEntry).toHaveBeenCalledWith("FN-001", "Added dependency on FN-OTHER — stopping execution for re-planning");
   });
 
   it("appends to existing dependencies without overwriting when confirm=true", async () => {
@@ -799,7 +720,7 @@ describe("fn_task_add_dep tool", () => {
     const result = await tools.fn_task_add_dep("call1", { task_id: "FN-OTHER", confirm: true });
 
     expect(result.content[0].text).toContain("Added dependency");
-    expect(store.updateTask).toHaveBeenCalledWith("FN-TEST", {
+    expect(store.updateTask).toHaveBeenCalledWith("FN-001", {
       dependencies: ["FN-001", "FN-OTHER"],
     });
   });
@@ -813,12 +734,14 @@ describe("fn_task_add_dep tool", () => {
 
   it("returns warning without confirm=true and does NOT add dependency", async () => {
     const { tools, store } = await captureAddDepTools();
+    store.updateTask.mockClear();
+    store.logEntry.mockClear();
 
     const result = await tools.fn_task_add_dep("call1", { task_id: "FN-OTHER" });
 
     expect(result.content[0].text).toContain("stop execution and discard current work");
     expect(result.content[0].text).toContain("confirm=true");
-    // Should NOT have updated dependencies
+    // Should NOT have updated dependencies after the tool call
     const depUpdateCalls = store.updateTask.mock.calls.filter(
       (call: any[]) => call[1]?.dependencies !== undefined,
     );
@@ -833,7 +756,7 @@ describe("fn_task_add_dep tool", () => {
   it("validation errors (self-dep, not-found, dedup) return immediately without requiring confirm", async () => {
     // Self-dep — no confirm needed
     const { tools: tools1 } = await captureAddDepTools();
-    const selfResult = await tools1.fn_task_add_dep("call1", { task_id: "FN-TEST" });
+    const selfResult = await tools1.fn_task_add_dep("call1", { task_id: "FN-001" });
     expect(selfResult.content[0].text).toContain("Cannot add self-dependency");
 
     // Not found — no confirm needed

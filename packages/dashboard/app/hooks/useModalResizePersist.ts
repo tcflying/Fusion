@@ -10,6 +10,14 @@ interface PersistedSize {
 const RESIZE_GRIP_CLASS = "modal-resize-grip";
 const RESIZE_GRIP_LABEL = "Resize modal from bottom-right corner";
 
+/*
+FNXC:TaskModalResize 2026-07-24-19:20:
+The shared Task Detail grip must offer the same keyboard discovery as floating task windows.
+Use the established modal viewport-padding quantum so arrow keys adjust its two dimensions
+without creating a second resize scale or bypassing the existing persistence path.
+*/
+const KEYBOARD_RESIZE_STEP = 16;
+
 function readPersistableSize(node: HTMLElement): PersistedSize {
   const styleWidth = Number.parseFloat(node.style.width);
   const styleHeight = Number.parseFloat(node.style.height);
@@ -95,6 +103,26 @@ export function useModalResizePersist(
       }, 200);
     };
 
+    const grip = document.createElement("div");
+    grip.className = RESIZE_GRIP_CLASS;
+    grip.setAttribute("role", "separator");
+    grip.setAttribute("aria-label", RESIZE_GRIP_LABEL);
+    grip.setAttribute("aria-orientation", "vertical");
+    grip.setAttribute("aria-valuemin", "0");
+    grip.setAttribute("aria-valuemax", String(window.innerWidth));
+    grip.tabIndex = 0;
+    grip.dataset.resizeDirection = "se";
+    existingGrip?.remove();
+    node.appendChild(grip);
+
+    const syncGripAria = () => {
+      const { width, height } = readPersistableSize(node);
+      if (typeof width !== "number" || typeof height !== "number") return;
+      grip.setAttribute("aria-valuenow", String(Math.round(width)));
+      grip.setAttribute("aria-valuetext", `Width ${Math.round(width)} pixels, height ${Math.round(height)} pixels`);
+    };
+    syncGripAria();
+
     let lastSavedW = node.offsetWidth;
     let lastSavedH = node.offsetHeight;
     const observer =
@@ -103,6 +131,7 @@ export function useModalResizePersist(
         : new ResizeObserver(() => {
             const w = node.offsetWidth;
             const h = node.offsetHeight;
+            syncGripAria();
             if (w === lastSavedW && h === lastSavedH) return;
             lastSavedW = w;
             lastSavedH = h;
@@ -110,14 +139,6 @@ export function useModalResizePersist(
           });
 
     observer?.observe(node);
-
-    const grip = document.createElement("div");
-    grip.className = RESIZE_GRIP_CLASS;
-    grip.setAttribute("role", "separator");
-    grip.setAttribute("aria-label", RESIZE_GRIP_LABEL);
-    grip.dataset.resizeDirection = "se";
-    existingGrip?.remove();
-    node.appendChild(grip);
 
     let cleanupActiveDrag: (() => void) | null = null;
 
@@ -149,6 +170,7 @@ export function useModalResizePersist(
         const nextHeight = startHeight + moveEvent.clientY - startY;
         if (nextWidth > 0) node.style.width = `${nextWidth}px`;
         if (nextHeight > 0) node.style.height = `${nextHeight}px`;
+        syncGripAria();
         scheduleSave();
       };
 
@@ -176,11 +198,31 @@ export function useModalResizePersist(
       document.addEventListener("pointercancel", endDrag);
     };
 
+    const onKeyDown = (event: KeyboardEvent) => {
+      let widthDelta = 0;
+      let heightDelta = 0;
+      if (event.key === "ArrowRight") widthDelta = KEYBOARD_RESIZE_STEP;
+      if (event.key === "ArrowLeft") widthDelta = -KEYBOARD_RESIZE_STEP;
+      if (event.key === "ArrowDown") heightDelta = KEYBOARD_RESIZE_STEP;
+      if (event.key === "ArrowUp") heightDelta = -KEYBOARD_RESIZE_STEP;
+      if (widthDelta === 0 && heightDelta === 0) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      const { width = 0, height = 0 } = readPersistableSize(node);
+      if (width + widthDelta > 0) node.style.width = `${width + widthDelta}px`;
+      if (height + heightDelta > 0) node.style.height = `${height + heightDelta}px`;
+      syncGripAria();
+      scheduleSave();
+    };
+
     grip.addEventListener("pointerdown", onPointerDown);
+    grip.addEventListener("keydown", onKeyDown);
 
     return () => {
       cleanupActiveDrag?.();
       grip.removeEventListener("pointerdown", onPointerDown);
+      grip.removeEventListener("keydown", onKeyDown);
       grip.remove();
       observer?.disconnect();
       if (saveTimer) clearTimeout(saveTimer);

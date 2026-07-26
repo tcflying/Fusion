@@ -728,19 +728,36 @@ async function validateAssignableAgentId(
 FNXC:EphemeralAgentTaskCreation 2026-07-01-00:00:
 fn_task_create runs inside whatever agent loaded the pi extension. When the caller is an ephemeral/runtime task-worker (executor-FN-XXXX and friends), the project setting `ephemeralAgentsCanCreateTasks` decides whether it may open new tasks.
 Human/dashboard/CLI callers have no `ctx.agentId`, so they are never gated here — the setting only constrains runtime-managed agents.
-Resolution is fail-open on lookup errors: a missing/unresolvable caller is treated as non-ephemeral so a store hiccup never blocks legitimate task creation.
+
+FNXC:EphemeralAgentTaskCreation 2026-07-26-06:20:
+Lookup resolution is now fail-CLOSED (superseding the original fail-open rule stated here): a
+runtime task-worker session carries a caller id, only a human/dashboard/CLI caller has none, so an
+id that is PRESENT but does not resolve to an agent row (deleted ephemeral row, cross-project
+store, transient read failure) is a runtime caller with unknown identity and is classified
+ephemeral so the project policy still applies. An absent id keeps the human pass-through, and a
+resolved permanent agent is still never gated.
+
+FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+KNOWN LIMITATION — this gate does not currently fire in production, and must not be counted as
+enforcement of the Deny policy. pi's `ExtensionContext` (pi-coding-agent, core/extensions/types)
+carries no `agentId`; the read at the fn_task_create execute site is a speculative cast, and only
+tests ever supply one. Every real call therefore short-circuits at `!callerAgentId` and passes
+through as a human caller. The fail-closed direction above is correct for the day an identity
+signal exists, but making this lane genuinely enforce Deny needs the engine to thread the session's
+agent/task identity into the extension context (env or an augmented context) — a plumbing decision,
+not a local fix. Enforcement today lives in the engine lanes, which withhold the tool outright.
 */
 async function isEphemeralCallerAgent(cwd: string, callerAgentId: string | undefined): Promise<boolean> {
   if (!callerAgentId) return false;
   try {
-    
+
     const agentStore = await getAgentStore(cwd);
     await agentStore.init();
     const agent = await agentStore.resolveAgent(callerAgentId);
-    if (!agent) return false;
+    if (!agent) return true;
     return isEphemeralAgent(agent);
   } catch {
-    return false;
+    return true;
   }
 }
 

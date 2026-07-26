@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline/promises";
 import type { GoalCitationSurface } from "@fusion/core";
 import { getStore } from "../project-resolver.js";
+import { promptOutputStream } from "../output.js";
 
 type GoalStatusFilter = "active" | "archived" | "all";
 
@@ -38,7 +39,8 @@ async function promptForTitleAndDescription(
   let description: string | undefined;
 
   if (!title) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
     title = await rl.question("Goal title: ");
 
     if (!title?.trim()) {

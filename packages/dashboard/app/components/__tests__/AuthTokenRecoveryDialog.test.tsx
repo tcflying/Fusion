@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { AuthTokenRecoveryDialog } from "../AuthTokenRecoveryDialog";
 import { clearAuthToken, setAuthToken } from "../../auth";
+import { readAppFile } from "../../test/cssFixture";
 
 vi.mock("../../auth", () => ({
   setAuthToken: vi.fn(),
@@ -79,7 +80,7 @@ describe("AuthTokenRecoveryDialog", () => {
   });
 
   it("does not define auth-specific modal layering outside the shared modal classes", () => {
-    const css = readFileSync("app/components/AuthTokenRecoveryDialog.css", "utf8");
+    const css = readAppFile("components/AuthTokenRecoveryDialog.css");
 
     expect(css).not.toMatch(/auth-token-recovery-overlay\s*\{[^}]*z-index/s);
   });

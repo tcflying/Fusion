@@ -47,6 +47,7 @@ import {
   TransitionRejectionError,
   resolveWorkflowIrForTask,
   isUnplannedSeedPrompt,
+  resolveEffectiveAutoMerge,
   type TaskStore,
   type Task,
   type WorkflowIr,
@@ -57,6 +58,13 @@ import {
 import { readFile } from "node:fs/promises";
 import { schedulerLog } from "./logger.js";
 import { getPromptPath } from "./spec-staleness.js";
+import { activeSessionRegistry, executingTaskLock } from "./active-session-registry.js";
+import { evaluateStrandedHoldContinuation } from "./plan-review-continuation.js";
+
+// FNXC:StrandedHoldContinuation 2026-07-26-14:15:
+// A genuine stranded-plan fault is warned once per held location; ordinary
+// unplanned cards remain quiet even when the release sweep revisits them.
+const strandedHoldWarningMemo = new Set<string>();
 
 /** A reservation handle returned by {@link HoldReleaseDeps.reserveSlot}. The
  *  sweep calls `release()` if the subsequent move rejects on capacity. */
@@ -86,6 +94,8 @@ export interface HoldReleaseDeps {
   /** Allocate a worktree path for a release into a processing column (passed
    *  through to `moveTask`'s `allocateWorktree`). */
   allocateWorktree?: (task: Task, reservedNames: Set<string>) => string | null;
+  /** Optional third leg of the canonical liveness triple for diagnostics. */
+  isTaskActive?: (taskId: string) => boolean;
 }
 
 /** Outcome of one sweep pass (for tests + observability). */
@@ -177,7 +187,11 @@ export async function isUnplannedForExecution(store: TaskStore, task: Task, ir: 
     );
     if (!legacyPassed) {
       if (typeof store.listWorkflowWorkItemsForTask !== "function") return true;
-      const continuations = await store.listWorkflowWorkItemsForTask(task.id, { kinds: ["task"] });
+      // FNXC:StrandedHoldContinuation 2026-07-26-15:45:
+      // FN-8592 defines graph idleness over every active continuation kind;
+      // filtering to task continuations would allow a live non-task run to be
+      // mistaken for an idle graph and receive a duplicate plan-review seed.
+      const continuations = await store.listWorkflowWorkItemsForTask(task.id);
       const active = continuations.filter((item) => ACTIVE_WORKFLOW_WORK_ITEM_STATES.includes(item.state));
       // Readiness is represented by the graph's durable boundary continuation,
       // not by a special-case review result. Optional groups that are disabled
@@ -402,11 +416,44 @@ function countCapacitySlot(
 /**
  * Run one hold/release sweep pass for the default workflow-column runtime.
  */
+/*
+FNXC:HoldReleaseInstrumentation 2026-07-25-14:35:
+Operator-reported symptom: "tasks that finish planning and are ready don't move immediately — there
+is a long delay." The sweep already logged per-task hold REASONS, but nothing recorded how LONG a
+card waited or how long the sweep itself took, so the delay could not be attributed between (a) the
+poll cadence, (b) sweep execution cost, and (c) a card legitimately waiting on capacity.
+
+`heldSince` records when each task was first observed held with its current reason. On release the
+elapsed time is logged; the entry is dropped when the task releases or stops being held, so the map
+tracks only currently-held cards and cannot grow without bound. Reason changes reset the clock, so
+"waiting 4m on downstream-full" is never conflated with "waiting 4m on deps-unsatisfied".
+*/
+const heldSince = new Map<string, { reason: string; sinceMs: number }>();
+
+/** Sweeps slower than this are the delay rather than a symptom of it — log loudly. */
+const SLOW_SWEEP_WARN_MS = 2_000;
+
+/** Record/refresh the held-since clock for a task and return how long it has been held. */
+function trackHeld(taskId: string, reason: string, nowMs: number): number {
+  const existing = heldSince.get(taskId);
+  if (!existing || existing.reason !== reason) {
+    heldSince.set(taskId, { reason, sinceMs: nowMs });
+    return 0;
+  }
+  return nowMs - existing.sinceMs;
+}
+
+/** Exposed for tests: forget all held-since bookkeeping. */
+export function resetHoldReleaseInstrumentation(): void {
+  heldSince.clear();
+}
+
 export async function runHoldReleaseSweep(
   store: TaskStore,
   deps: HoldReleaseDeps,
 ): Promise<HoldReleaseResult> {
   const result: HoldReleaseResult = { released: [], held: [] };
+  const sweepStartedMs = deps.now();
 
   const settings = await store.getSettings();
   /*
@@ -423,9 +470,17 @@ export async function runHoldReleaseSweep(
   // check is unaffected — this only trims the sweep pre-check cost.
   const irCache = new Map<string, WorkflowIr>();
   const effectiveWorkflowIdByTask = new Map<string, string>();
+  /*
+  FNXC:HoldReleaseInstrumentation 2026-07-25-14:35:
+  This prefetch is a SEQUENTIAL await per non-archived task, so its cost scales with total board
+  size rather than with the number of held cards — the prime suspect for a slow sweep on a large
+  board. Timed separately from the sweep total so the two are distinguishable in one log line.
+  */
+  const prefetchStartedMs = deps.now();
   for (const t of allTasks) {
     effectiveWorkflowIdByTask.set(t.id, await effectiveWorkflowId(store, t.id));
   }
+  const prefetchMs = deps.now() - prefetchStartedMs;
 
   for (const task of allTasks) {
     // Skip paused / recovery-backoff tasks exactly as the legacy scheduler does.
@@ -446,6 +501,7 @@ export async function runHoldReleaseSweep(
 
     // manual / external-event are NEVER auto-released by the sweep.
     if (release === "manual" || release === "external-event") {
+      trackHeld(task.id, `${release}-only`, deps.now());
       result.held.push({ taskId: task.id, reason: `${release}-only` });
       continue;
     }
@@ -455,12 +511,14 @@ export async function runHoldReleaseSweep(
       const deadline = resolveTimerDeadline(holdConfig, task);
       shouldRelease = deadline !== undefined && deps.now() >= deadline;
       if (!shouldRelease) {
+        trackHeld(task.id, "timer-not-elapsed", deps.now());
         result.held.push({ taskId: task.id, reason: "timer-not-elapsed" });
         continue;
       }
     } else if (release === "dependency") {
       shouldRelease = await allDependenciesSatisfied(store, task, allTasks);
       if (!shouldRelease) {
+        trackHeld(task.id, "deps-unsatisfied", deps.now());
         result.held.push({ taskId: task.id, reason: "deps-unsatisfied" });
         continue;
       }
@@ -469,6 +527,7 @@ export async function runHoldReleaseSweep(
       // slot is free (pre-check); the in-txn check is the authority.
       const target = resolveReleaseTarget(ir, task.column, true);
       if (!target) {
+        trackHeld(task.id, "no-downstream-capacity-column", deps.now());
         result.held.push({ taskId: task.id, reason: "no-downstream-capacity-column" });
         continue;
       }
@@ -480,6 +539,7 @@ export async function runHoldReleaseSweep(
         const budgetColumns = new Set(resolveWipBudgetColumns(ir, target));
         const occupants = countCapacitySlot(allTasks, effectiveWorkflowIdByTask, budgetColumns, workflowId, capacity.countPending);
         if (occupants >= capacity.limit) {
+          trackHeld(task.id, "downstream-full", deps.now());
           result.held.push({ taskId: task.id, reason: "downstream-full" });
           continue;
         }
@@ -491,16 +551,58 @@ export async function runHoldReleaseSweep(
 
     const target = resolveReleaseTarget(ir, task.column, release === "capacity");
     if (!target) {
+      trackHeld(task.id, "no-release-target", deps.now());
       result.held.push({ taskId: task.id, reason: "no-release-target" });
       continue;
     }
 
     const released = await issueRelease(store, deps, task, target, ir);
     if (released) {
+      /*
+      FNXC:HoldReleaseInstrumentation 2026-07-25-14:35:
+      Report how long the card actually waited. This is the number that answers "why didn't it move
+      immediately": a few hundred ms means the sweep is prompt and the wait was the poll cadence; a
+      multi-second/minute value with a capacity reason means the card was genuinely queued.
+      */
+      const waitedMs = deps.now() - (heldSince.get(task.id)?.sinceMs ?? deps.now());
+      heldSince.delete(task.id);
+      schedulerLog.log(
+        `Hold release for ${task.id} → ${target} after ${waitedMs}ms held (release=${release})`,
+      );
       result.released.push(task.id);
     } else {
+      trackHeld(task.id, "move-rejected-or-no-slot", deps.now());
       result.held.push({ taskId: task.id, reason: "move-rejected-or-no-slot" });
     }
+  }
+
+  /*
+  FNXC:HoldReleaseInstrumentation 2026-07-25-14:35:
+  One summary line per sweep. Held cards carry their longest current wait so a card stuck for
+  minutes is visible without turning on debug logging. Info-level only when the sweep did something
+  or ran slowly; otherwise debug, so a quiet board does not reprint this every poll.
+  */
+  const sweepMs = deps.now() - sweepStartedMs;
+  const longestHeldMs = result.held.reduce((max, h) => {
+    const entry = heldSince.get(h.taskId);
+    return entry ? Math.max(max, deps.now() - entry.sinceMs) : max;
+  }, 0);
+  const summary =
+    `Hold-release sweep: ${sweepMs}ms (prefetch ${prefetchMs}ms over ${allTasks.length} tasks), `
+    + `released=${result.released.length}, held=${result.held.length}`
+    + (longestHeldMs > 0 ? `, longest held ${longestHeldMs}ms` : "");
+  if (sweepMs >= SLOW_SWEEP_WARN_MS) {
+    schedulerLog.warn(`${summary} — sweep exceeded ${SLOW_SWEEP_WARN_MS}ms and is itself the delay`);
+  } else if (result.released.length > 0) {
+    schedulerLog.log(summary);
+  } else {
+    schedulerLog.debug(summary);
+  }
+
+  // Drop bookkeeping for tasks no longer held so the map tracks only live holds.
+  const stillHeld = new Set(result.held.map((h) => h.taskId));
+  for (const taskId of [...heldSince.keys()]) {
+    if (!stillHeld.has(taskId)) heldSince.delete(taskId);
   }
 
   return result;
@@ -519,6 +621,7 @@ async function issueRelease(
   task: Task,
   target: string,
   ir: WorkflowIr,
+  options: { allowUnplanned?: boolean } = {},
 ): Promise<boolean> {
   const targetColumn = findColumn(ir, target);
   const targetIsProcessing = targetColumn ? resolveColumnFlags(targetColumn).countsTowardWip === true : false;
@@ -533,9 +636,54 @@ async function issueRelease(
   PROMPT.md, `status: "planning"`, or resident in an `intake`-trait column)
   must never be moved into a processing column, no matter which surface
   requested the release (FN-7648).
+
+  FNXC:WorkflowScheduling 2026-07-25-04:55:
+  `allowUnplanned` is the ONLY way past this check, and it is set exclusively by
+  an explicit operator force-promote (`promoteHeldTask({ force: true })`). The
+  automatic surfaces — the sweep and the webhook release — never pass it, so
+  FN-7648's invariant still holds for every non-operator release.
   */
-  if (targetIsProcessing && (await isUnplannedForExecution(store, task, ir))) {
-    schedulerLog.log(`Hold release for ${task.id} blocked — card is unplanned and cannot enter processing column ${target}`);
+  if (targetIsProcessing && !options.allowUnplanned && (await isUnplannedForExecution(store, task, ir))) {
+    /*
+    FNXC:StrandedHoldContinuation 2026-07-26-14:15:
+    Before FN-8592 this was an undeduplicated `schedulerLog.log`, not debug.
+    A real-spec card with no continuation is a repairable fault, so warn only
+    when the exact shared predicate confirms every guard; ordinary unplanned
+    and capacity-held cards remain quiet. Global/Engine pause participates in
+    the predicate and suppresses this warning.
+    */
+    try {
+      const column = findColumn(ir, task.column);
+      const tasksDir = typeof store.getTasksDir === "function" ? store.getTasksDir() : undefined;
+      if (column && tasksDir) {
+        let promptContent: string | null = null;
+        try { promptContent = await readFile(getPromptPath(tasksDir, task.id), "utf8"); } catch { /* missing prompt is a quiet non-candidate */ }
+        const settings = await store.getSettings();
+        const continuations = await store.listWorkflowWorkItemsForTask(task.id);
+        const live = activeSessionRegistry.pathsForTask(task.id).some((path) => activeSessionRegistry.isPathActive(path)) || executingTaskLock.has(task.id) || deps.isTaskActive?.(task.id) === true;
+        const stranded = evaluateStrandedHoldContinuation({
+          task,
+          columnFlags: resolveColumnFlags(column),
+          ir,
+          continuations,
+          stepResults: task.workflowStepResults,
+          effectiveSettings: { autoMerge: resolveEffectiveAutoMerge(task, settings) },
+          enginePaused: settings.globalPause === true || settings.enginePaused === true,
+          promptContent,
+          live,
+          stalenessMs: deps.now() - new Date(task.columnMovedAt ?? task.updatedAt).getTime(),
+          graceMs: 60_000,
+        });
+        const key = `${task.id}:${task.column}`;
+        if (stranded.stranded && !strandedHoldWarningMemo.has(key)) {
+          strandedHoldWarningMemo.add(key);
+          schedulerLog.warn(`Stranded hold continuation for ${task.id} in ${task.column}; self-healing reconciliation will re-seed Plan Review`);
+        }
+      }
+    } catch {
+      // Diagnostics must never widen the release gate or prevent its normal refusal.
+    }
+    schedulerLog.debug(`Hold release for ${task.id} blocked — card is unplanned and cannot enter processing column ${target}`);
     return false;
   }
 
@@ -603,12 +751,27 @@ async function issueRelease(
  * and it is also accepted for other kinds as an operator override. The move
  * still serializes through the in-txn capacity check (KTD-10): a promote into a
  * full column rejects with `capacity-exhausted`, surfaced to the caller.
+ *
+ * FNXC:WorkflowScheduling 2026-07-25-04:55:
+ * `options.force` is the operator's "start it anyway" override for the
+ * `unplanned-for-execution` rejection: an operator who has read the card and
+ * decided the pending replan / Plan Review is not worth waiting for can push it
+ * straight into execution. Force ONLY relaxes the unplanned gate — the hold
+ * membership, release target, capacity check, and slot reservation are all still
+ * enforced, so a forced promote into a full column still rejects on capacity.
+ * Force also CLEARS a durable replan signal (`needs-replan` /
+ * `plan-review-unavailable`) before the move: those statuses are read by triage's
+ * todo rediscovery and by this module's own gate, so leaving one in place would
+ * let the card be pulled back for the very replan the operator just waived.
+ * `status: "planning"` is deliberately NOT cleared — triage is mid-write on
+ * PROMPT.md and clearing it would race the writer; the card still releases.
  */
 export async function promoteHeldTask(
   store: TaskStore,
   taskId: string,
   deps: Pick<HoldReleaseDeps, "reserveSlot" | "allocateWorktree"> = {},
-): Promise<{ released: boolean; toColumn?: string; rejection?: string }> {
+  options: { force?: boolean } = {},
+): Promise<{ released: boolean; toColumn?: string; rejection?: string; forcedUnplanned?: boolean }> {
   const task = await store.getTask(taskId);
   if (!task) return { released: false, rejection: "task-not-found" };
 
@@ -629,18 +792,56 @@ export async function promoteHeldTask(
   const targetIsProcessing = targetColumn
     ? resolveColumnFlags(targetColumn).countsTowardWip === true
     : false;
-  if (targetIsProcessing && (await isUnplannedForExecution(store, task, ir))) {
+  const unplanned = targetIsProcessing && (await isUnplannedForExecution(store, task, ir));
+  if (unplanned && options.force !== true) {
     return { released: false, rejection: "unplanned-for-execution", toColumn: target };
+  }
+
+  let promoted = task;
+  if (unplanned) {
+    // Clear the durable replan signal so triage's todo rediscovery and this
+    // module's own gate do not pull the card back into the waived replan.
+    if (task.status === "needs-replan" || task.status === "plan-review-unavailable") {
+      try {
+        await store.updateTask(task.id, { status: null });
+        promoted = { ...task, status: undefined };
+      } catch (error) {
+        schedulerLog.warn(
+          `Force-promote for ${task.id} could not clear replan status: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    // ids/outcomes-only audit of the override (no prompt or reason prose).
+    if (typeof store.recordRunAuditEvent === "function") {
+      try {
+        await store.recordRunAuditEvent({
+          domain: "database",
+          mutationType: "task:promote-forced-unplanned",
+          target: task.id,
+          taskId: task.id,
+          agentId: "system",
+          runId: `promote-force-${task.id}`,
+          metadata: { fromColumn: task.column, toColumn: target, priorStatus: task.status ?? null },
+        });
+      } catch {
+        // Audit is best-effort — never block the operator's override on it.
+      }
+    }
+    schedulerLog.log(`Force-promote for ${task.id} bypassing unplanned gate into ${target} (operator override)`);
   }
 
   const released = await issueRelease(
     store,
     { now: () => Date.now(), reserveSlot: deps.reserveSlot, allocateWorktree: deps.allocateWorktree },
-    task,
+    promoted,
     target,
     ir,
+    { allowUnplanned: unplanned },
   );
-  return released ? { released: true, toColumn: target } : { released: false, rejection: "capacity-exhausted-or-no-slot" };
+  if (!released) {
+    return { released: false, rejection: "capacity-exhausted-or-no-slot" };
+  }
+  return { released: true, toColumn: target, forcedUnplanned: unplanned || undefined };
 }
 
 /**

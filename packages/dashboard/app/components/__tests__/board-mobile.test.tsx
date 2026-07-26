@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { loadAllAppCss } from "../../test/cssFixture";
+import { loadAllAppCss, readAppFile } from "../../test/cssFixture";
 import path from "node:path";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Task, TaskDetail, Settings } from "@fusion/core";
@@ -91,7 +91,7 @@ function getMainMobileSection(css: string): string {
 
 describe("mobile board magnetic column snap wiring (FN-8235)", () => {
   it("shares the mobile scroll-end hook across legacy, selected, and aggregate live board renders", () => {
-    const boardSource = fs.readFileSync(path.join(process.cwd(), "app/components/Board.tsx"), "utf8");
+    const boardSource = readAppFile("components/Board.tsx");
 
     expect(boardSource).toContain('import { useColumnScrollSnap } from "../hooks/useColumnScrollSnap";');
     expect(boardSource).toContain("useColumnScrollSnap(boardElement, { mobileOnly: true });");

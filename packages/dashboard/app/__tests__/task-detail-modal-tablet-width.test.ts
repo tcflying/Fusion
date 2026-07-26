@@ -33,6 +33,21 @@ describe("task detail modal tablet width (FN-5599, FN-6500)", () => {
     expect(modalRuleMatch![0]).toContain("max-width: 98vw;");
   });
 
+  it("overrides phone-sheet geometry and restores the resize grip for a known 768px tablet", () => {
+    const mobileBlockMatch = detailModalCss.match(/@media\s*\(max-width:\s*768px\)\s*\{[\s\S]*?\.task-modal--tablet \.modal-resize-grip\s*\{[^}]*\}[\s\S]*?\n\}/);
+    expect(mobileBlockMatch).toBeTruthy();
+
+    const mobileBlock = mobileBlockMatch![0];
+    const tabletModalRule = mobileBlock.match(/\.modal\.task-detail-modal\.task-modal--tablet\s*\{[^}]*\}/s)?.[0] ?? "";
+    const tabletOverlayRule = mobileBlock.match(/\.modal-overlay:has\(\.task-detail-modal\.task-modal--tablet\)\s*\{[^}]*\}/s)?.[0] ?? "";
+    const tabletGripRule = mobileBlock.match(/\.task-modal--tablet \.modal-resize-grip\s*\{[^}]*\}/s)?.[0] ?? "";
+
+    expect(tabletModalRule).toContain("width: 98vw;");
+    expect(tabletModalRule).toContain("resize: both;");
+    expect(tabletOverlayRule).toContain("--overlay-padding-top: 6vh;");
+    expect(tabletGripRule).toContain("display: block;");
+  });
+
   it("keeps mobile full-screen sheet width behavior", () => {
     const mobileBlockMatch = detailModalCss.match(
       /@media\s*\(max-width:\s*768px\)\s*\{\s*\.detail-move-btn__arrow[\s\S]*?\.modal\.task-detail-modal\s*\{[^}]*\}[\s\S]*?\n\}/,

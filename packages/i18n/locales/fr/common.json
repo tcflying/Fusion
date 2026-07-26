@@ -38,6 +38,7 @@
       "guardRejected": "",
       "mergeBlocked": "",
       "unknownColumn": "",
+      "unplannedForExecution": "",
       "workflowMismatch": ""
     }
   },

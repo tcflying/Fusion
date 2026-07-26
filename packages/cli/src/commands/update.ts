@@ -1,4 +1,5 @@
 import { exec } from "node:child_process";
+import { result } from "../output.js";
 import { existsSync, readFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { dirname, resolve } from "node:path";
@@ -323,7 +324,7 @@ function printStatus(status: UpdateStatus, checkOnly: boolean): void {
 }
 
 function printJson(status: UpdateStatus): void {
-  console.log(JSON.stringify(status));
+  result(JSON.stringify(status) + "\n");
 }
 
 /*

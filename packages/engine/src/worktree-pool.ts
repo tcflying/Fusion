@@ -259,6 +259,39 @@ export function hasRequiredWorktreeFiles(worktreePath: string): boolean {
   return existsSync(join(worktreePath, ".git"));
 }
 
+/*
+FNXC:WorktreeLiveness 2026-07-26-08:20:
+SYNC, NON-SPAWNING liveness probe for callers that must not run git — specifically failure/recovery
+paths, where spawning git to decide how to recover from a git failure is both slow and fragile.
+`classifyTaskWorktree` stays the canonical classifier and MUST be preferred wherever an await and a
+subprocess are acceptable (see docs/solutions/logic-errors/repo-root-task-worktree-requeue-loop.md
+→ Prevention: new worktree-liveness paths should call the shared classifier).
+
+This probe covers the classifier's filesystem gate (the path exists and carries `.git`) plus its
+`repo-root` gate when `rootDir` is supplied. It does NOT cover `unregistered` or
+`outside-work-tree`, so a directory whose `.git` pointer is stale but present still reads as usable
+here. Callers that treat "usable" as permission to reuse a checkout must tolerate that narrower
+guarantee; callers needing the full verdict must await `classifyTaskWorktree`. Keeping the fast
+probe HERE, beside the classifier, is what makes the difference between the two auditable instead
+of a duplicate check growing in an unrelated module.
+
+Pass `rootDir` whenever the caller has it. The project root is a registered git worktree carrying
+`.git`, so without that gate the main checkout reads as a usable TASK worktree — the FN-6861
+acquisition→gate→requeue loop in
+docs/solutions/logic-errors/repo-root-task-worktree-requeue-loop.md.
+*/
+export function hasUsableWorktreeShape(
+  worktreePath: string | undefined | null,
+  rootDir?: string,
+): boolean {
+  if (!worktreePath) return false;
+  // `.git` under a path that does not exist (or is a file) cannot exist either, so this single
+  // filesystem probe subsumes the directory-existence check.
+  if (!hasRequiredWorktreeFiles(worktreePath)) return false;
+  if (rootDir && isRepoRootPath(rootDir, worktreePath)) return false;
+  return true;
+}
+
 export async function isInsideGitWorkTree(worktreePath: string): Promise<boolean> {
   try {
     const result = await execAsync("git rev-parse --is-inside-work-tree", {

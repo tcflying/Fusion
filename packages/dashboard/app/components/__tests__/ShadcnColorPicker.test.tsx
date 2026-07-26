@@ -3,6 +3,7 @@ import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ShadcnColorPicker } from "../ShadcnColorPicker";
 import { SHADCN_CUSTOM_COLOR_TOKENS } from "../shadcnCustomColors";
+import { readAppFile } from "../../test/cssFixture";
 
 function expandCustomColors() {
   const toggle = screen.getByRole("button", { name: "Show custom colors" });
@@ -79,7 +80,7 @@ describe("ShadcnColorPicker", () => {
   });
 
   it("keeps mobile collapsed and expanded layout rules tokenized", () => {
-    const css = readFileSync("app/components/ShadcnColorPicker.css", "utf8");
+    const css = readAppFile("components/ShadcnColorPicker.css");
 
     expect(css).toMatch(/@media \(max-width: 768px\) \{[\s\S]*?\.shadcn-color-picker-toggle \{[\s\S]*?align-self: flex-start;/);
     expect(css).toMatch(/\.shadcn-color-picker-controls-panel \{[\s\S]*?gap: var\(--space-sm\);/);

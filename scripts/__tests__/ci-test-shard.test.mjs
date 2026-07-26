@@ -686,3 +686,12 @@ test("U6 fix: computePackageDurationWeight excludes slow-tier files from weighti
   assert.equal(weighted.weight, 400);
   assert.equal(weighted.partiallyUntimed, false);
 });
+
+test("U6: buildShardCommands forwards JSON timing flags to plain package test scripts", () => {
+  const timingFlags = ["--reporter=json", "--outputFile.json=.timings/timings-shard3-0.json"];
+  const [command] = buildShardCommands([{ name: "@fusion/desktop", weight: 1 }], {
+    timingFlags: () => timingFlags,
+  });
+
+  assert.deepEqual(command.args, ["--filter", "@fusion/desktop", "test", ...timingFlags]);
+});

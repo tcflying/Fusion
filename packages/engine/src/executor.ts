@@ -1,10 +1,11 @@
 // port-4040-allowlist: this file embeds the "never kill port 4040" rule in the executor prompt.
-import { exec, execSync } from "node:child_process";
+import { exec, execFile, execSync } from "node:child_process";
 import { promisify } from "node:util";
 import { setImmediate as setImmediateCb } from "node:timers";
 
 // Internal git plumbing intentionally bypasses sandbox backends.
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
 
@@ -44,8 +45,16 @@ import {
   type ForeachActiveContext,
   type WorkflowLegacySeams,
 } from "./workflow-node-handlers.js";
-import { MERGE_REGION_KINDS, WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND, WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY } from "./workflow-graph-executor.js";
+import {
+  MERGE_REGION_KINDS,
+  PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE,
+  SESSION_CONTENTION_HOLD_VALUE,
+  WORKFLOW_DRIFT_PARK_CONTEXT_KEY,
+  WORKFLOW_NODE_ENGINE_PAUSE_ABORT_KIND,
+  WORKFLOW_OPTIONAL_GROUP_CONTEXT_KEY,
+} from "./workflow-graph-executor.js";
 import type { WorkflowNodePreparationRequirement, WorkflowNodeResult } from "./workflow-graph-executor.js";
+import { workflowNodeRequiresWorktree } from "./workflow-node-execution-needs.js";
 import type {
   AuditPrimitiveInput,
   PreparedWorktree,
@@ -83,7 +92,9 @@ import { resolveTaskWorktreePath, resolveWorktreesDir } from "./worktree-paths.j
 import { Type, type Static } from "@earendil-works/pi-ai";
 import { describeModel, formatModelMarkerDetails, promptWithFallback, compactSessionContext } from "./pi.js";
 import { buildAgentGatedActionSummary } from "./permanent-agent-gating.js";
-import { accumulateSessionTokenUsage, mergeTokenUsagePerModel } from "./session-token-usage.js";
+import { accumulateSessionTokenUsage, captureSessionTokenBaseline, mergeTokenUsagePerModel, resetSessionTokenBaseline } from "./session-token-usage.js";
+import { finalizePlanningSegment, startPlanningSegment, resolveEphemeralTaskCreationPolicy } from "@fusion/core";
+import { enforceTaskTokenBudgetForPersist } from "./token-budget-enforcer.js";
 import {
   createResolvedAgentSession,
   extractRuntimeHint,
@@ -120,9 +131,12 @@ import { RemovalReason, classifyTaskWorktree, describeRegisteredWorktrees, detec
 import { attemptBranchAutocorrect } from "./branch-autocorrect.js";
 import { ActiveSessionWorktreeRemovalError } from "./worktree-backend.js";
 import {
+  ActiveSessionPathHeldByForeignTaskError,
+  acquireActiveSessionPath,
   activeSessionRegistry,
   executingTaskLock,
   reconcileSelfOwnedActiveSessionForRemoval,
+  type ActiveSessionKind,
 } from "./active-session-registry.js";
 // CLI Agent Executor (U7): task ↔ CLI session orchestration seam.
 import {
@@ -168,8 +182,9 @@ import { AgentLogger } from "./agent-logger.js";
 import { createLogger, executorLog, reviewerLog, formatError } from "./logger.js";
 import { TokenCapDetector } from "./token-cap-detector.js";
 import { isUsageLimitError, checkSessionError, type UsageLimitPauser } from "./usage-limit-detector.js";
-import { isNonContinuableSessionError, isTransientError, isSilentTransientError } from "./transient-error-detector.js";
+import { isNonContinuableSessionError, isNonPlanDefectPlanReviewFailure, isSessionContentionError, isTransientError, isSilentTransientError } from "./transient-error-detector.js";
 import { withRateLimitRetry } from "./rate-limit-retry.js";
+import { isRequiredArtifactReadFailedValue } from "./required-workflow-artifacts.js";
 import {
   detectExternalIntegrationEvidenceGaps,
   formatExternalIntegrationEvidenceDiagnostic,
@@ -209,6 +224,7 @@ import {
   createAgentCreateTool,
   createAgentDeleteTool,
   createDelegateTaskTool,
+  createTaskAssignTool,
   createGetAgentConfigTool,
   createListAgentsTool,
   createMemoryTools,
@@ -223,11 +239,14 @@ import {
   createArtifactRegisterTool as sharedCreateArtifactRegisterTool,
   createArtifactViewTool as sharedCreateArtifactViewTool,
   createTaskCreateTool as sharedCreateTaskCreateTool,
+  isAgentTaskCreateToolAvailable,
+  isAgentDelegateTaskToolAvailable,
   createTaskDocumentReadTool as sharedCreateTaskDocumentReadTool,
   createTaskDocumentWriteTool as sharedCreateTaskDocumentWriteTool,
   createTaskPromptWriteTool as sharedCreateTaskPromptWriteTool,
   createTaskFileScopeAddTool as sharedCreateTaskFileScopeAddTool,
   createTaskLogTool as sharedCreateTaskLogTool,
+  createTaskLogsReadTool as sharedCreateTaskLogsReadTool,
   createWorkflowListTool as sharedCreateWorkflowListTool,
   createWorkflowGetTool as sharedCreateWorkflowGetTool,
   createWorkflowValidateTool as sharedCreateWorkflowValidateTool,
@@ -248,7 +267,7 @@ import {
   isResearchToolSurfaceEnabled,
 } from "./tool-availability.js";
 import { createFusionAuthStorage, createFusionModelRegistry } from "./auth-storage.js";
-import { createRunVerificationTool } from "./run-verification-tool.js";
+import { createRunVerificationTool, runVerificationCommand as runTaskVerificationCommand } from "./run-verification-tool.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { recordRetry } from "./retry-burned-logger.js";
 import type { AgentActionGateContext } from "./agent-action-gate.js";
@@ -259,6 +278,7 @@ export {
   createAgentCreateTool,
   createAgentDeleteTool,
   createDelegateTaskTool,
+  createTaskAssignTool,
   createGetAgentConfigTool,
   createListAgentsTool,
   createReadMessagesTool,
@@ -516,6 +536,16 @@ export const EXECUTE_REQUEUE_LOOP_VISIBLE_THRESHOLD = 3;
  */
 const MAX_TRANSIENT_GRAPH_RESUME_RETRIES = 2;
 const TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS = process.env.VITEST || process.env.NODE_ENV === "test" ? 0 : 1_000;
+/*
+FNXC:SessionContention 2026-07-25-21:30:
+The contention ladder is deliberately long and slow compared with the provider-failure budget (2 fast
+retries): a lease is held for as long as the holder's own work takes — minutes, not milliseconds. Ten
+attempts backing off 5s→60s covers ~8 minutes of waiting, after which the task is left queued for
+ordinary re-dispatch rather than parked.
+*/
+const MAX_SESSION_CONTENTION_HOLD_RETRIES = 10;
+const SESSION_CONTENTION_HOLD_BACKOFF_MS = process.env.VITEST || process.env.NODE_ENV === "test" ? 0 : 5_000;
+const SESSION_CONTENTION_HOLD_MAX_BACKOFF_MS = 60_000;
 /** How long to wait before recovering a completed task still stuck in in-progress. */
 const COMPLETED_TASK_WATCHDOG_MS = 60_000;
 /** How long to wait before retrying a workflow rerun handoff that never reached in-progress. */
@@ -1661,13 +1691,50 @@ The tool prevents your session from being killed by the inactivity watchdog duri
 - Introducing new patterns when existing local patterns should be reused
 - Marking a step done before required review/tooling gates are satisfied`;
 
+/*
+FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+The base prompt teaches fn_task_create/fn_delegate_task in several places ("Out-of-scope work
+found during execution", the Guardrails follow-up rule, the completion checklist). When the
+project policy withholds those tools, an unmodified prompt instructs the agent to call a tool
+that is not in its tool list — the same instruction/capability mismatch that produced the
+original retry storm, just from the other direction.
+
+This override states the absence and names what to do instead, so a withheld tool reads as
+policy rather than malfunction. It is appended last so it wins over the base text, and it
+applies to a custom operator prompt too (an operator who overrode the prompt still gets a
+truthful statement of what this session may do).
+*/
+function getWithheldTaskCreationGuidance(taskCreateWithheld: boolean, delegateWithheld: boolean): string {
+  if (!taskCreateWithheld && !delegateWithheld) return "";
+  const withheld = [
+    ...(taskCreateWithheld ? ["`fn_task_create`"] : []),
+    ...(delegateWithheld ? ["`fn_delegate_task`"] : []),
+  ].join(" and ");
+  return `## Follow-up task creation is disabled for this session
+
+This project's "Ephemeral agent follow-up tasks" policy withholds ${withheld}. ${
+    taskCreateWithheld && delegateWithheld ? "Those tools are" : "That tool is"
+  } deliberately absent from your tool list — this is an operator setting, not a malfunction or a transient error. Do not attempt to call ${
+    taskCreateWithheld && delegateWithheld ? "them" : "it"
+  }, and do not retry.
+
+Ignore any instruction above that tells you to file follow-up work with ${withheld}. When you find out-of-scope work, record it instead with \`fn_task_log(message="follow-up: ...")\` and include it in your \`fn_task_done\` summary so the operator sees it. If the work genuinely blocks this task, use \`fn_task_done(outcome="blocked", reason="...")\` rather than trying to create a task for it.`;
+}
+
 /** Resolve the executor system prompt from settings, falling back to the hardcoded constant. */
-export function getExecutorSystemPrompt(settings: Settings): string {
+export function getExecutorSystemPrompt(
+  settings: Settings,
+  toolAvailability?: { taskCreateWithheld?: boolean; delegateWithheld?: boolean },
+): string {
   const customPrompt = resolveAgentPrompt("executor", settings.agentPrompts);
   const basePrompt = customPrompt || EXECUTOR_SYSTEM_PROMPT;
   const sections = [
     basePrompt,
     isResearchToolSurfaceEnabled(settings) ? getResearchGuidanceForSurface("executor") : "",
+    getWithheldTaskCreationGuidance(
+      toolAvailability?.taskCreateWithheld === true,
+      toolAvailability?.delegateWithheld === true,
+    ),
   ].filter((section) => section.trim());
   return sections.join("\n\n");
 }
@@ -2171,16 +2238,65 @@ export class TaskExecutor {
   getActiveWorktreePaths() consumers that cd into a path are unaffected; only the registry key changes.
   Non-workspace tasks (unique worktree path != rootDir) are returned unchanged.
   */
+  /*
+  FNXC:PlanReviewWorktree 2026-07-25-20:40 (concurrent root-rooted step sessions — single-repo collision):
+  The task-scoped key must apply to the shared repo root in EVERY project mode, not only workspace mode.
+  Read-only graph nodes that need no worktree (Plan Review is the canonical one — it reviews the
+  store-injected PROMPT.md, see FNXC:PlanReviewSpecInjection) run rooted at `this.rootDir`, and a todo
+  task has no worktree of its own. With the bare root as the registry key, two tasks reaching Plan Review
+  at the same time collided: the second failed with "active-session path <root> is held by task <other>;
+  task <self> may not overwrite it", which surfaced as a Plan Review provider failure, burned the
+  in-place retry budget against a hold that retrying can never clear, and left the task parked
+  (reported: FN-1398 holding /home/ubuntu/dev/freemap-svelte while FN-1403 planned).
+  Path-exclusivity on the shared root is not what keeps these sessions correct: write-capable nodes are
+  refused at the root outright (no-worktree-for-write-node above), real per-sub-repo exclusivity is the
+  workspace-repo-acquire lease, and every isPathActive consumer guards removable WORKTREE paths — the
+  root is never one. Liveness still works because the synthetic key stays in the registry under the task.
+  */
   private sessionRegistryPath(taskId: string, worktreePath: string): string {
-    if (this.workspaceConfig && worktreePath === this.rootDir) {
+    if (worktreePath === this.rootDir) {
       return `${worktreePath}#session:${taskId}`;
     }
     return worktreePath;
   }
 
+  /*
+  FNXC:SessionContention 2026-07-25-21:30 (contention prevention at the registration seam):
+  Every executor session registration goes through `acquireActiveSessionPath` instead of the raw
+  `registerPath`, so a LEAKED entry owned by a task with no live session surface in this process is
+  RECLAIMED rather than throwing at the newcomer. That closes the second contention class (a dead
+  holder can never release, so waiting on it is waiting forever). A genuinely live holder still throws
+  the typed error — that case is real serialization, and callers classify it as a retryable contention
+  hold (SESSION_CONTENTION_HOLD_VALUE), never as a provider/model failure.
+  The probe reports LIVE on any uncertainty: an unknown holder with a fresh entry is treated as live by
+  the staleness floor, so the reclaim only ever fires on proven-dead, aged entries.
+  */
+  private acquireSessionRegistryPath(taskId: string, registryPath: string, kind: ActiveSessionKind, ownerKey: string): void {
+    const outcome = acquireActiveSessionPath(activeSessionRegistry, registryPath, { taskId, kind, ownerKey }, {
+      holderLiveProbe: (holderTaskId) => this.hasLiveTaskSessionSurface(holderTaskId) || executingTaskLock.has(holderTaskId),
+    });
+    if (outcome.action === "contended") {
+      throw new ActiveSessionPathHeldByForeignTaskError(registryPath, outcome.holderTaskId, taskId);
+    }
+    if (outcome.action === "reclaimed-stale-foreign") {
+      executorLog.warn(
+        `${taskId}: reclaimed a stale active-session entry on ${registryPath} from dead task ${outcome.holderTaskId} (idle ${outcome.ageMs}ms)`,
+      );
+      void this.store.recordRunAuditEvent?.({
+        taskId,
+        agentId: "executor",
+        runId: generateSyntheticRunId("session-path-reclaim", taskId),
+        domain: "database",
+        mutationType: "session:reclaim-stale-foreign-path",
+        target: taskId,
+        metadata: { taskId, holderTaskId: outcome.holderTaskId, kind, ageMs: outcome.ageMs },
+      })?.catch?.(() => undefined);
+    }
+  }
+
   private setActiveSession(taskId: string, sessionState: ActiveExecutorSessionState, worktreePath: string): void {
     this.activeSessions.set(taskId, sessionState);
-    activeSessionRegistry.registerPath(this.sessionRegistryPath(taskId, worktreePath), { taskId, kind: "executor", ownerKey: taskId });
+    this.acquireSessionRegistryPath(taskId, this.sessionRegistryPath(taskId, worktreePath), "executor", taskId);
   }
 
   private markGraphExecuteSelfRequeued(taskId: string): void {
@@ -2206,7 +2322,7 @@ export class TaskExecutor {
   private setActiveStepExecutor(taskId: string, stepExecutor: StepSessionExecutor, worktreePath: string, seenSteeringIds = new Set<string>()): void {
     this.activeStepExecutors.set(taskId, stepExecutor);
     this.activeStepExecutorSeenSteeringIds.set(taskId, seenSteeringIds);
-    activeSessionRegistry.registerPath(this.sessionRegistryPath(taskId, worktreePath), { taskId, kind: "step-session", ownerKey: `${taskId}#step-session` });
+    this.acquireSessionRegistryPath(taskId, this.sessionRegistryPath(taskId, worktreePath), "step-session", `${taskId}#step-session`);
   }
 
   private deleteActiveStepExecutor(taskId: string, worktreePath?: string): void {
@@ -2227,7 +2343,7 @@ export class TaskExecutor {
   private setActiveWorkflowStepSession(taskId: string, session: AgentSession, worktreePath: string, seenSteeringIds = new Set<string>()): void {
     this.activeWorkflowStepSessions.set(taskId, session);
     this.activeWorkflowStepSessionSeenSteeringIds.set(taskId, seenSteeringIds);
-    activeSessionRegistry.registerPath(this.sessionRegistryPath(taskId, worktreePath), { taskId, kind: "workflow-step", ownerKey: `${taskId}#workflow-step` });
+    this.acquireSessionRegistryPath(taskId, this.sessionRegistryPath(taskId, worktreePath), "workflow-step", `${taskId}#workflow-step`);
   }
 
   private deleteActiveWorkflowStepSession(taskId: string, worktreePath?: string): void {
@@ -3227,6 +3343,22 @@ export class TaskExecutor {
               activeSessionRegistry.unregisterPath(path);
             }
           }),
+        );
+      } else if ((from === "todo" || from === "triage") && to !== "in-progress" && to !== "in-review" && to !== "done") {
+        /*
+        FNXC:PlanningEvacuation 2026-07-25-23:00:
+        A card pulled BACKWARD out of a planner lane (the reported case: todo → Ideas) must stop all
+        engine work on it, not just its planning session. Plan Review and other pre-execution graph
+        nodes run while the card sits in todo/triage, so without this branch the reviewer kept
+        streaming against a card the operator had withdrawn. Forward transitions are excluded — those
+        are the card advancing, and their own lanes own the handoff. Also release the pre-execution
+        worktree acquired at planning time so a withdrawn card leaves nothing behind on disk.
+        */
+        this.trackTaskDisposal(
+          task.id,
+          this.awaitAbortInFlightTaskWork(task.id, `task moved out of planning to ${to}`, {
+            userCanceled: source === "user",
+          }).then(async () => { await this.releasePreExecutionWorktree(task.id, `moved to ${to}`); }),
         );
       } else if (from === "in-progress") {
         this.trackTaskDisposal(
@@ -7687,6 +7819,97 @@ export class TaskExecutor {
     }
   }
 
+  /*
+  FNXC:NodeWorktreeIsolation 2026-07-25-22:10 (planning acquires the task worktree):
+  Public seam for the planning/triage lane. Specification runs a CODING-tool session; pointing it at
+  the shared main checkout meant every planning agent had write tools in the operator's tree and every
+  concurrent planner shared one path. Acquire the task's own worktree up front and let the whole
+  lifecycle — planning, Plan Review, implementation, code review — reuse that single worktree.
+  Returns null (caller falls back to the root, unchanged behavior) when the project is a workspace, or
+  when acquisition fails: planning must never be blocked by a worktree problem.
+  */
+  /*
+  FNXC:PlanningEvacuation 2026-07-25-23:00 (pre-execution worktree release):
+  Planning now acquires a worktree, so a card that never reaches execution — withdrawn to Ideas,
+  archived from a planner lane, or parked pre-execution — would otherwise hold one forever. Release
+  it. Safety conditions, all required:
+   - the task never executed (`firstExecutionAt`/`executionStartedAt` unset): execution evidence means
+     the worktree may hold real work, and only the normal merge/archive lifecycle may remove it;
+   - no live session registered on the path (the same isPathActive guard the other sweeps use);
+   - the branch carries no commits beyond its base — planning writes its spec to the task store, not
+     the worktree, so a clean branch means there is genuinely nothing to lose.
+  Metadata (`worktree`/`branch`) is cleared with it, so a later promotion re-acquires cleanly.
+  Fail-soft throughout: a cleanup problem must never block the lifecycle move that triggered it.
+  */
+  public async releasePreExecutionWorktree(taskId: string, reason: string): Promise<boolean> {
+    try {
+      const live = await this.store.getTask(taskId);
+      if (!live?.worktree) return false;
+      if (live.firstExecutionAt || live.executionStartedAt) return false;
+      if (activeSessionRegistry.isPathActive(live.worktree) || activeSessionRegistry.isPathActive(resolvePath(live.worktree))) return false;
+      if (this.hasLiveTaskSessionSurface(taskId) || executingTaskLock.has(taskId)) return false;
+
+      if (existsSync(live.worktree)) {
+        if (await this.preExecutionWorktreeHasWork(live.worktree)) {
+          executorLog.log(`${taskId}: keeping pre-execution worktree ${live.worktree} — it carries commits or uncommitted changes`);
+          return false;
+        }
+        const settings = await this.store.getSettings();
+        await removeWorktree({
+          rootDir: this.rootDir,
+          worktreePath: live.worktree,
+          settings,
+          taskId,
+          reason: RemovalReason.SelfHealingReclaim,
+        });
+      }
+      this.activeWorktrees.get(taskId)?.delete(live.worktree);
+      await this.store.updateTask(taskId, { worktree: null, branch: null, baseCommitSha: null, sessionFile: null }, this.getRunContextFor(taskId));
+      await this.store.logEntry(taskId, `Released the pre-execution worktree (${reason}) — it will be re-acquired when planning or execution resumes`, undefined, this.getRunContextFor(taskId)).catch(() => undefined);
+      executorLog.log(`${taskId}: released pre-execution worktree ${live.worktree} (${reason})`);
+      return true;
+    } catch (error) {
+      executorLog.warn(`${taskId}: could not release the pre-execution worktree: ${formatError(error).message}`);
+      return false;
+    }
+  }
+
+  /** True when a pre-execution worktree holds commits past its base or any uncommitted change. */
+  private async preExecutionWorktreeHasWork(worktreePath: string): Promise<boolean> {
+    try {
+      const { stdout: dirty } = await execFileAsync("git", ["status", "--porcelain"], { cwd: worktreePath, timeout: 30_000 });
+      if (dirty.trim()) return true;
+      const { stdout: ahead } = await execFileAsync("git", ["log", "--oneline", "@{upstream}..HEAD"], { cwd: worktreePath, timeout: 30_000 })
+        .catch(async () => await execFileAsync("git", ["log", "--oneline", "-1", "HEAD", "--not", "--remotes", "--branches=main", "--branches=master"], { cwd: worktreePath, timeout: 30_000 }));
+      return Boolean(ahead.trim());
+    } catch {
+      // Cannot prove the worktree is clean → treat it as holding work and keep it.
+      return true;
+    }
+  }
+
+  public async ensureTaskWorktreeForPlanning(taskId: string): Promise<string | null> {
+    try {
+      if (this.workspaceConfig === undefined) {
+        this.workspaceConfig = await loadWorkspaceConfig(this.rootDir);
+      }
+      if (this.workspaceConfig && (this.workspaceConfig.repos.length ?? 0) > 0) return null;
+
+      const live = await this.store.getTask(taskId);
+      if (live.worktree && existsSync(live.worktree)) return live.worktree;
+
+      const settings = await this.store.getSettings();
+      const acquisitionTask = live.worktree
+        ? ({ ...live, worktree: undefined, sessionFile: undefined } as TaskDetail)
+        : live;
+      const acquired = await this.ensureGraphCustomNodeWorktree(acquisitionTask, settings, "planning");
+      return acquired.worktree || null;
+    } catch (error) {
+      executorLog.warn(`${taskId}: could not acquire a planning worktree — planning falls back to the repo root: ${formatError(error)}`);
+      return null;
+    }
+  }
+
   private async prepareGraphNodeExecution(
     node: WorkflowIrNode,
     nodeTask: TaskDetail,
@@ -7885,24 +8108,6 @@ export class TaskExecutor {
     const rawCliCommand = executorKind === "cli" && typeof cfg.cliCommand === "string" && cfg.cliCommand.trim()
       ? cfg.cliCommand.trim()
       : undefined;
-    const nodeNameForReviewDetection = typeof cfg.name === "string" && cfg.name.trim() ? cfg.name.trim() : node.id;
-    const isPlanReviewNode =
-      node.id === "plan-review-step"
-      || nodeNameForReviewDetection === "Plan Review"
-      || optionalGroupId === "plan-review";
-    const inlineFixesEnabledForNode = (settings as Settings & { reviewerInlineFixes?: boolean }).reviewerInlineFixes !== false;
-    const reviewTypeNode =
-      isPlanReviewNode
-      || cfg.reviewCanFixInline === true
-      || /(?:^|\b)(?:review|verification)(?:\b|$)/i.test(nodeNameForReviewDetection)
-      || optionalGroupId === "code-review"
-      || optionalGroupId === "browser-verification";
-    const inlineFixesMakeNodeWriteCapable =
-      inlineFixesEnabledForNode
-      && executorKind !== "cli"
-      && reviewTypeNode
-      && !isPlanReviewNode;
-
     // Isolation guard: write-capable nodes must run inside a task worktree, not
     // the shared repo root. Before the execute seam runs, live.worktree is unset
     // — a coding/script/CLI node falling back to this.rootDir would mutate the
@@ -7912,8 +8117,58 @@ export class TaskExecutor {
     FNXC:WorkflowReviewers 2026-07-01-13:28:
     Inline-fix Code Review, Browser Verification, and custom review nodes become write-capable even when the workflow definition says `toolMode: readonly`, so the isolation guard must see that before selecting a worktree. Plan Review is excluded because it uses the narrow PROMPT.md writer instead of source-file write tools.
     */
-    const writeCapable = cfg.toolMode === "coding" || inlineFixesMakeNodeWriteCapable || node.kind === "script" || Boolean(scriptName) || Boolean(rawCliCommand);
-    const executionTarget = writeCapable ? await this.store.getTask(live.id) : live;
+    const writeCapable = workflowNodeRequiresWorktree(node, {
+      optionalGroupId,
+      reviewerInlineFixes: (settings as Settings & { reviewerInlineFixes?: boolean }).reviewerInlineFixes,
+    });
+    let executionTarget = writeCapable ? await this.store.getTask(live.id) : live;
+
+    /*
+    FNXC:NodeWorktreeIsolation 2026-07-25-22:10 (EVERY node runs in the task's own worktree):
+    Operator requirement: Plan Review, Code Review — everything except merge — executes in the
+    task-specific worktree, never in the shared main checkout. Read-only gates used to fall back to
+    `this.rootDir` because a pre-execution task has no worktree yet, which is what made two tasks
+    share a path in the first place (the reported FN-1398/FN-1403 Plan Review collision) and what let
+    a reviewer read a main checkout that other tasks and the operator mutate underneath it.
+    ACQUIRE the worktree at planning time instead: `ensureGraphCustomNodeWorktree` is the same
+    acquisition the write-capable nodes already use, so the worktree/branch/baseCommitSha the
+    implementation session later resumes into is created once, here, and reused.
+    A recorded-but-missing worktree is RE-ACQUIRED (strip the stale metadata first, mirroring
+    prepareGraphNodeExecution) rather than degraded to the root — this replaces FN-7996's
+    run-Plan-Review-from-the-repo-root fallback, which is exactly the shared-path behavior being
+    removed. Workspace projects are unchanged: `ensureGraphCustomNodeWorktree` returns the task
+    untouched there, because workspace sessions are rooted at the browse-root by design and per-repo
+    isolation comes from the sub-repo acquire lease.
+    */
+    const nodeDisplayName = typeof cfg.name === "string" && cfg.name.trim() ? cfg.name.trim() : node.id;
+    const isPlanReviewNode = node.id === "plan-review-step" || nodeDisplayName === "Plan Review" || optionalGroupId === "plan-review";
+    if (!this.workspaceConfig) {
+      const recordedWorktreeMissing = Boolean(executionTarget.worktree) && !existsSync(executionTarget.worktree!);
+      /*
+      A node with NO recorded worktree is pre-execution (planning / Plan Review): acquire one.
+      A node whose RECORDED worktree vanished is a different situation — for gates that review
+      implementation output, the work is gone with it, and handing them a fresh empty worktree would
+      let them review the wrong tree and pass. Those keep failing fast into the unusable-worktree
+      recovery (FN-7996). Plan Review is the exception: it reviews the store-injected PROMPT.md, so it
+      re-acquires rather than parking — this replaces its old "run from the repo root" degrade.
+      */
+      const shouldAcquire = !executionTarget.worktree || (recordedWorktreeMissing && isPlanReviewNode);
+      if (shouldAcquire) {
+        if (recordedWorktreeMissing) {
+          await this.store.logEntry(
+            live.id,
+            `Plan Review worktree ${executionTarget.worktree} is missing on disk — re-acquiring a task worktree instead of running in the shared checkout`,
+            undefined,
+            this.getRunContextFor(live.id),
+          );
+        }
+        const acquisitionTask = recordedWorktreeMissing
+          ? ({ ...executionTarget, worktree: undefined, sessionFile: undefined } as TaskDetail)
+          : executionTarget;
+        executionTarget = await this.ensureGraphCustomNodeWorktree(acquisitionTask, settings, node.id);
+      }
+    }
+
     if (writeCapable && !executionTarget.worktree && !this.workspaceConfig) {
       return { outcome: "failure", value: "no-worktree-for-write-node" };
     }
@@ -8370,6 +8625,93 @@ export class TaskExecutor {
       || latestAction === "Resuming execution after unpause";
   }
 
+  /*
+  FNXC:SessionContention 2026-07-25-21:30:
+  Two ways in, because contention must never slip through to a park:
+   - the typed failure value the graph now publishes (SESSION_CONTENTION_HOLD_VALUE), and
+   - a message-shape fallback over the run's `:error` context patches, so contention arriving from a
+     path that has not been taught the typed value is still recognized.
+  */
+  private graphFailureErrorTexts(result: WorkflowGraphTaskRunResult): string[] {
+    if (!result.context) return [];
+    const texts: string[] = [];
+    for (const [key, value] of Object.entries(result.context)) {
+      if (key.endsWith(":error") && typeof value === "string" && value.trim()) texts.push(value);
+    }
+    return texts;
+  }
+
+  private isSessionContentionGraphFailure(result: WorkflowGraphTaskRunResult): boolean {
+    if (this.graphFailureValue(result) === SESSION_CONTENTION_HOLD_VALUE) return true;
+    return this.graphFailureErrorTexts(result).some((text) => isSessionContentionError(text));
+  }
+
+  /*
+  FNXC:SessionContention 2026-07-25-21:30 (self-recovering wait — the task is never parked):
+  Retry the graph in place on an exponential backoff while the holder finishes. The counter is
+  IN-MEMORY on purpose: it needs no schema change, and an engine restart resetting it is the desired
+  behavior (a restart also drops the in-process registry, so the contention is gone anyway).
+  When the ladder is exhausted the task is left cleanly dispatchable — status/error cleared, progress
+  untouched — so ordinary scheduling picks it up later with a fresh budget. There is no terminal branch
+  here by design: lease contention always ends (the holder finishes, or self-healing sweeps it), so
+  parking the task would only require a human to press Retry on a condition that fixed itself.
+  */
+  private sessionContentionHoldAttempts = new Map<string, number>();
+
+  private clearSessionContentionHold(taskId: string): void {
+    this.sessionContentionHoldAttempts.delete(taskId);
+  }
+
+  private async holdForSessionContention(
+    task: Task,
+    live: TaskDetail,
+    result: WorkflowGraphTaskRunResult,
+  ): Promise<void> {
+    const detail = this.graphFailureErrorTexts(result).find((text) => isSessionContentionError(text));
+    const priorAttempts = this.sessionContentionHoldAttempts.get(task.id) ?? 0;
+    const attempt = priorAttempts + 1;
+
+    if (attempt > MAX_SESSION_CONTENTION_HOLD_RETRIES) {
+      this.clearSessionContentionHold(task.id);
+      const message = `Still waiting on another task to release a shared session path after ${MAX_SESSION_CONTENTION_HOLD_RETRIES} attempts — leaving the task queued for normal re-dispatch (not a failure)${detail ? `: ${detail}` : ""}`;
+      executorLog.warn(`${task.id}: ${message}`);
+      await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+      if (live.status != null || live.error != null) {
+        await this.store.updateTask(task.id, { status: null, error: null }, this.getRunContextFor(task.id));
+      }
+      return;
+    }
+
+    this.sessionContentionHoldAttempts.set(task.id, attempt);
+    const message = `Waiting on another task to release a shared session path — retrying in place (${attempt}/${MAX_SESSION_CONTENTION_HOLD_RETRIES})${detail ? `: ${detail}` : ""}`;
+    executorLog.warn(`${task.id}: ${message}`);
+    await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+    // A contention hold is not a failure state: clear any stale park so the row never shows as failed
+    // while it is simply waiting its turn.
+    if (live.status != null || live.error != null) {
+      await this.store.updateTask(task.id, { status: null, error: null }, this.getRunContextFor(task.id));
+    }
+
+    const delayMs = SESSION_CONTENTION_HOLD_BACKOFF_MS === 0
+      ? 0
+      : Math.min(SESSION_CONTENTION_HOLD_MAX_BACKOFF_MS, SESSION_CONTENTION_HOLD_BACKOFF_MS * 2 ** (attempt - 1));
+    const scheduleRetry = () => {
+      void (async () => {
+        try {
+          const resume = await this.store.getTask(task.id);
+          if (!resume || resume.deletedAt || resume.paused || resume.userPaused) {
+            this.clearSessionContentionHold(task.id);
+            return;
+          }
+          await this.execute(resume);
+        } catch (err) {
+          executorLog.error(`Failed session-contention retry for ${task.id}:`, err);
+        }
+      })();
+    };
+    setTimeout(scheduleRetry, delayMs).unref?.();
+  }
+
   private graphFailureValue(result: WorkflowGraphTaskRunResult): string | undefined {
     const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1];
     if (!failedNode || !result.context) return undefined;
@@ -8388,6 +8730,76 @@ export class TaskExecutor {
 
   private isAwaitingGraphFailureValue(value: string | undefined): value is "awaiting-user-input" | "awaiting-cli-approval" {
     return value === "awaiting-user-input" || value === "awaiting-cli-approval";
+  }
+
+  private extractUnusableWorktreeGraphFailure(result: WorkflowGraphTaskRunResult): string | null {
+    if (!result.context) return null;
+    const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1];
+    if (!failedNode) return null;
+    const candidateKeys: string[] = [`node:${failedNode}:error`];
+    const groupInstanceDelimiter = failedNode.indexOf("::");
+    if (groupInstanceDelimiter !== -1) {
+      candidateKeys.push(`node:${failedNode.slice(groupInstanceDelimiter + 2)}:error`);
+      candidateKeys.push(`node:${failedNode.slice(0, groupInstanceDelimiter)}:error`);
+    }
+    const foreachInstanceDelimiter = failedNode.indexOf("#");
+    if (foreachInstanceDelimiter !== -1) {
+      candidateKeys.push(`node:${failedNode.slice(0, foreachInstanceDelimiter)}:error`);
+      const instanceRest = failedNode.slice(foreachInstanceDelimiter + 1);
+      const templateDelimiter = instanceRest.indexOf(":");
+      if (templateDelimiter !== -1) {
+        candidateKeys.push(`node:${instanceRest.slice(templateDelimiter + 1)}:error`);
+      }
+    }
+    for (const key of candidateKeys) {
+      const value = result.context[key];
+      if (typeof value === "string" && isMissingWorktreeSessionStartFailure(value)) return value;
+    }
+    return null;
+  }
+
+  private async routeUnusableWorktreeGraphFailureToRecovery(
+    task: Task,
+    live: TaskDetail,
+    result: WorkflowGraphTaskRunResult,
+  ): Promise<boolean> {
+    if (
+      live.deletedAt
+      || live.paused
+      || live.userPaused === true
+      || live.column === "done"
+      || live.column === "archived"
+      || this.pausedAborted.has(task.id)
+    ) {
+      return false;
+    }
+    const errorText = this.extractUnusableWorktreeGraphFailure(result);
+    if (!errorText) return false;
+    if (live.column === "in-review") {
+      const settings = await this.store.getSettings();
+      if (!allowsAutoMergeProcessing(live, settings)) return false;
+    }
+    const stalePath = extractMissingWorktreePathFromSessionStartFailure(errorText) ?? live.worktree ?? "";
+    const context = this.getRunContextFor(task.id);
+    const audit = createRunAuditor(this.store, {
+      runId: context?.runId ?? generateSyntheticRunId("graph-worktree-recovery", task.id),
+      agentId: context?.agentId ?? task.assignedAgentId ?? "executor",
+      taskId: task.id,
+      phase: "execute",
+    });
+    return this.recoverMissingWorktreeSessionStartFailure(live, stalePath, new Error(errorText), audit);
+  }
+
+  private isRequiredArtifactRecoveryProtected(task: Task): boolean {
+    return Boolean(
+      task.deletedAt
+      || task.paused
+      || task.userPaused === true
+      || task.column === "done"
+      || task.column === "archived"
+      || task.mergeDetails?.mergeConfirmed === true
+      || (task.column === "in-review" && task.autoMerge === false),
+    );
   }
 
   private isMergeGraphFailure(failedNode: string | undefined): boolean {
@@ -9004,6 +9416,150 @@ export class TaskExecutor {
         return;
       }
       const live = loadedLive;
+      /*
+      FNXC:Lifecycle 2026-07-16-21:22:
+      FN-8141 follow-up 1 — an honest `fn_task_done(outcome="blocked")` park (status="failed",
+      error "BLOCKED: <reason>", executor ~14657) must SURVIVE the same graph-teardown machinery
+      that undid the original incident's failed park. Every downstream classifier in this method
+      can wash the marker out: the genuine-pause-abort todo-rehome branch (~9504) clears
+      status/error on a task the abort bounced back to `todo`; the execution-resume router and the
+      terminal graph-failure sink (~9982) overwrite the distinctive `BLOCKED:` error with a generic
+      "Workflow graph terminated with failure" string; and the engine-internal auto-continue
+      (~9540) re-runs the doomed session. Self-healing (#2257/#2260) and dependency-gated scheduling
+      key off this exact `BLOCKED:` error + the recorded blockedBy dependencies, so any of those
+      would re-open the laundering hole. Detect the live blocked park BEFORE every other classifier
+      and honor it exactly like the non-graph post-loop honor-park (executor ~12163): clear the
+      in-memory pause-abort marker so `recoverPausedAbortFailures` has nothing to chase, RELEASE the
+      worktree/concurrency slot (FN-6782 leaked-`maxWorktrees`-holder precedent; the graph finally
+      does not delete `activeWorktrees`), and return WITHOUT touching status/error/column/
+      dependencies/steps — the park stays intact for the blocker/operator. Unblocking still works:
+      the operator requeue (moveTask in-progress→todo, moves.ts ~628) and `buildManualRetryResetPatch`
+      clear the `BLOCKED:` error, and the scheduler leaves the parked row untouched while blockedBy
+      dependencies are unmet.
+      */
+      if (live.status === "failed" && live.error?.startsWith("BLOCKED:")) {
+        this.clearPausedAborted(task.id);
+        this.activeWorktrees.delete(task.id);
+        const blockedParkHonored = `Workflow graph run ended after an honest blocked park (${live.error}) — honoring park, not requeueing, retrying, or clearing state`;
+        executorLog.log(`${task.id}: ${blockedParkHonored}`);
+        await this.store.logEntry(task.id, blockedParkHonored, undefined, this.getRunContextFor(task.id));
+        await this.persistTokenUsage(task.id);
+        return;
+      }
+      /*
+      FNXC:WorkflowIrPin 2026-07-19-21:10 (KTD-3 drift park, PR #2342):
+      A graph run that exited on the drift guard carries WORKFLOW_DRIFT_PARK_CONTEXT_KEY
+      and visited no nodes. Before this branch existed the result fell through to the
+      generic terminal sink as a misleading `failedNode: 'unknown'` failure — and,
+      combined with the stale pin (now cleared by detectDrift itself), that made a
+      permanent requeue→drift→fail loop. Park it here with an accurate drift reason
+      instead: preserve worktree/branch/step progress untouched, do NOT re-emit the
+      `task:reconcile-workflow-drift` audit (detectDrift already emitted the ids-only
+      event once), and leave the row recoverable by ordinary requeue — which now
+      succeeds because the cleared pin lets the next run re-resolve the CURRENT IR
+      and adopt the changed workflow.
+      */
+      if (result.context?.[WORKFLOW_DRIFT_PARK_CONTEXT_KEY] === true) {
+        const driftMessage = "Workflow drift park: the workflow definition changed under this run (pinned node/column no longer in the current IR). Stale IR pin cleared — requeue the task to re-resolve the current workflow and continue.";
+        executorLog.warn(`${task.id}: ${driftMessage}`);
+        await this.store.logEntry(task.id, driftMessage, undefined, this.getRunContextFor(task.id));
+        if (live.status == null && live.error == null) {
+          await this.store.updateTask(task.id, { error: driftMessage, status: "failed" }, this.getRunContextFor(task.id));
+        }
+        await this.persistTokenUsage(task.id);
+        return;
+      }
+      /*
+      FNXC:SessionContention 2026-07-25-21:30:
+      Classified BEFORE every other graph-failure router. A node that could not start because another
+      task holds its session path or sub-repo lease is not a provider outage, not a plan defect, and not
+      a terminal failure — it is a wait. Route it to the self-recovering backoff hold, which never parks
+      the task and never consumes the provider/artifact retry budgets.
+      */
+      if (this.isSessionContentionGraphFailure(result)) {
+        await this.holdForSessionContention(task, live, result);
+        await this.persistTokenUsage(task.id);
+        return;
+      }
+      /*
+      FNXC:MissingWorktreeRecovery 2026-07-16-18:25:
+      An unusable-worktree session-start refusal inside a graph node must route to the bounded
+      worktree-session recovery BEFORE any other classifier: FN-7977's provider-failure hold
+      would otherwise retry the same stale worktree in place, and the terminal sink would park
+      the task failed with the signature erased (FN-7996 looped dispatch→park all day).
+      */
+      if (await this.routeUnusableWorktreeGraphFailureToRecovery(task, live, result)) {
+        await this.persistTokenUsage(task.id);
+        return;
+      }
+      if (isRequiredArtifactReadFailedValue(this.graphFailureValue(result))) {
+        /*
+        FNXC:WorkflowArtifacts 2026-07-21-17:00:
+        A TaskStore read outage is not proof that an artifact is absent. Keep the
+        task in place and use the bounded graph-resume budget instead of replanning
+        or terminalizing a possibly healthy workflow contract.
+        */
+        const priorRetries = live.graphResumeRetryCount ?? 0;
+        if (priorRetries < MAX_TRANSIENT_GRAPH_RESUME_RETRIES) {
+          const nextRetries = priorRetries + 1;
+          const message = `Required workflow artifact could not be read — retrying in place (${nextRetries}/${MAX_TRANSIENT_GRAPH_RESUME_RETRIES})`;
+          await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+          await this.store.updateTask(task.id, { graphResumeRetryCount: nextRetries }, this.getRunContextFor(task.id));
+          const scheduleRetry = () => {
+            void (async () => {
+              try {
+                const resumeTask = await this.store.getTask(task.id);
+                if (this.isRequiredArtifactRecoveryProtected(resumeTask) || resumeTask.status === "failed") return;
+                await this.execute(resumeTask);
+              } catch (err) {
+                executorLog.error(`Failed required-artifact read retry for ${task.id}:`, err);
+              }
+            })();
+          };
+          const handle = setTimeout(scheduleRetry, TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS);
+          handle.unref?.();
+        } else {
+          await this.store.logEntry(
+            task.id,
+            "Required workflow artifact read retry budget exhausted — task remains held in its current state",
+            undefined,
+            this.getRunContextFor(task.id),
+          );
+        }
+        await this.persistTokenUsage(task.id);
+        return;
+      }
+      if (this.graphFailureValue(result) === PLAN_REVIEW_PROVIDER_FAILURE_HOLD_VALUE) {
+        /*
+         * FNXC:PlanReviewReplan 2026-07-15-16:35:
+         * FN-7977: graph-native Plan Review provider failures are a bounded
+         * in-place retry. They must not follow the built-in failure edge into
+         * plan-replan or overwrite a progressed card's column, worktree, or steps.
+         */
+        const priorRetries = live.graphResumeRetryCount ?? 0;
+        if (priorRetries < MAX_TRANSIENT_GRAPH_RESUME_RETRIES) {
+          const nextRetries = priorRetries + 1;
+          const message = `Plan Review provider failure — retrying in place (${nextRetries}/${MAX_TRANSIENT_GRAPH_RESUME_RETRIES})`;
+          executorLog.warn(`${task.id}: ${message}`);
+          await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+          await this.store.updateTask(task.id, {
+            graphResumeRetryCount: nextRetries,
+          }, this.getRunContextFor(task.id));
+          const scheduleRetry = () => {
+            this.execute(live).catch((err) =>
+              executorLog.error(`Failed Plan Review provider retry for ${task.id}:`, err),
+            );
+          };
+          const handle = setTimeout(scheduleRetry, TRANSIENT_GRAPH_RESUME_RETRY_BACKOFF_MS);
+          handle.unref?.();
+        } else {
+          const message = "Plan Review provider retry budget exhausted — task remains held in its current state";
+          executorLog.warn(`${task.id}: ${message}`);
+          await this.store.logEntry(task.id, message, undefined, this.getRunContextFor(task.id));
+        }
+        await this.persistTokenUsage(task.id);
+        return;
+      }
       if (live.mergeDetails?.mergeConfirmed === true && live.column !== "done") {
         if (await this.finalizeMergeConfirmedWorkflowGraphTask(live.id, "graph-failure")) {
           await this.persistTokenUsage(task.id);
@@ -11136,10 +11692,81 @@ export class TaskExecutor {
         executorLog.log(`${task.id}: fast mode — fn_review_step tool not injected`);
       }
 
+      /*
+      FNXC:TaskVerificationRequest 2026-07-30-00:00:
+      Chat can only enqueue a server-resolved profile. The executor owns the live
+      worktree, so it claims and runs that request here through the existing bounded
+      runner (which acquires withVerificationSlot); no chat-side subprocess exists.
+      */
+      let verificationRequestInFlight = false;
+      const runPendingTaskVerification = async (): Promise<void> => {
+        if (verificationRequestInFlight) return;
+        const pendingVerification = await this.store.getTaskVerificationRequestAsync(task.id);
+        if (pendingVerification?.status !== "requested") return;
+        verificationRequestInFlight = true;
+        try {
+          const claimedVerification = await this.store.claimTaskVerificationRequest(task.id, pendingVerification.requestId);
+          if (!claimedVerification) return;
+          const startedAt = Date.now();
+          try {
+            const verificationResult = await runTaskVerificationCommand({
+              command: claimedVerification.command,
+              cwd: worktreePath,
+              timeoutMs: settings.verificationCommandTimeoutMs ?? 300_000,
+              onHeartbeat: () => stuckDetector?.recordActivity(task.id),
+            });
+            await this.store.finishTaskVerificationRequest(task.id, claimedVerification.requestId, verificationResult.success ? "passed" : "failed", {
+              success: verificationResult.success, exitCode: verificationResult.exitCode,
+              durationMs: Date.now() - startedAt, timedOut: verificationResult.timedOut ?? false,
+              stdoutTail: verificationResult.stdout.slice(-8_000), stderrTail: verificationResult.stderr.slice(-8_000),
+            });
+          } catch (error) {
+            await this.store.finishTaskVerificationRequest(task.id, claimedVerification.requestId, "failed", undefined, error instanceof Error ? error.message.slice(0, 1_000) : "Verification runner failed");
+          }
+        } finally {
+          verificationRequestInFlight = false;
+        }
+      };
+      await runPendingTaskVerification();
+
+      /*
+      FNXC:EphemeralAgentTaskCreation 2026-07-26-06:20:
+      A `deny` project policy removes fn_task_create from the session's tool list instead of
+      registering a tool that only refuses at execute time; see isAgentTaskCreateToolAvailable.
+
+      FNXC:EphemeralAgentTaskCreation 2026-07-26-07:40:
+      fn_delegate_task is withheld by the same policy (it creates a task through the same
+      primitive), and the suppression emits a run-audit event. Without the event an operator
+      cannot distinguish "the policy suppressed the tool" from "the agent had nothing to file" —
+      every other policy decision in this engine leaves that trail.
+      */
+      const executionCallerIsEphemeral = !identityAgent || isEphemeralAgent(identityAgent);
+      const taskCreateWithheld = !isAgentTaskCreateToolAvailable(settings, executionCallerIsEphemeral);
+      const delegateWithheld = !isAgentDelegateTaskToolAvailable(settings, executionCallerIsEphemeral);
+      if (taskCreateWithheld || delegateWithheld) {
+        await this.store.recordRunAuditEvent?.({
+          taskId: task.id,
+          agentId: identityAgent?.id ?? "executor",
+          runId: this.getRunContextFor(task.id)?.runId ?? generateSyntheticRunId("task-create-withheld", task.id),
+          domain: "database",
+          mutationType: "agent:task-create-withheld",
+          target: task.id,
+          metadata: {
+            taskId: task.id,
+            policy: resolveEphemeralTaskCreationPolicy(settings),
+            withheldTaskCreate: taskCreateWithheld,
+            withheldDelegateTask: delegateWithheld,
+            lane: "execution-session",
+          },
+        }).catch(() => undefined);
+      }
       const customTools = [
         this.createTaskUpdateTool(task.id, codeReviewVerdicts, sessionRef, stepCheckpoints, stuckDetector),
         this.createTaskLogTool(task.id),
-        this.createTaskCreateTool(!identityAgent || isEphemeralAgent(identityAgent)),
+        this.createTaskLogsReadTool(task.id),
+        ...(taskCreateWithheld
+          ? []
+          : [this.createTaskCreateTool(executionCallerIsEphemeral, task.id, identityAgent?.id)]),
         this.createTaskAddDepTool(task.id),
         this.createTaskDoneTool(task.id, worktreePath, detail.prompt ?? "", codeReviewVerdicts, () => { taskDone = true; }, audit),
         createRunVerificationTool({
@@ -11215,7 +11842,10 @@ export class TaskExecutor {
         // Agent delegation tools — discover and delegate work to other agents.
         ...(this.options.agentStore ? [
           createListAgentsTool(this.options.agentStore),
-          createDelegateTaskTool(this.options.agentStore, this.store, { rootDir: this.rootDir }),
+          ...(delegateWithheld
+            ? []
+            : [createDelegateTaskTool(this.options.agentStore, this.store, { rootDir: this.rootDir, sourceTaskId: task.id, sourceAgentId: assignedAgentId, callerIsEphemeral: executionCallerIsEphemeral })]),
+          createTaskAssignTool(this.options.agentStore, this.store),
           ...(assignedAgentId ? [
             createGetAgentConfigTool(this.options.agentStore, assignedAgentId),
             createUpdateAgentConfigTool(this.options.agentStore, assignedAgentId),
@@ -11370,7 +12000,7 @@ export class TaskExecutor {
         const executorGoalContext = executorGoalResolution.goalContext;
 
         const executorLayers = buildPromptLayers({
-          basePrompt: getExecutorSystemPrompt(settings),
+          basePrompt: getExecutorSystemPrompt(settings, { taskCreateWithheld, delegateWithheld }),
           goalContext: executorGoalContext,
           agentInstructions: executorInstructions,
           pluginContributions: executorPluginContributions,
@@ -11488,6 +12118,15 @@ export class TaskExecutor {
           lastEffectiveColumnAgentId: columnAgentSeam?.agent.id ?? null,
         }, worktreePath);
 
+        const verificationRequestTimer = setInterval(() => {
+          void runPendingTaskVerification().catch((error) => {
+            executorLog.warn(
+              `${task.id}: verification request pickup failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }, 1_000);
         let leaseRenewalTimer: ReturnType<typeof setInterval> | undefined;
         if (detail.assignedAgentId && detail.checkedOutBy === detail.assignedAgentId) {
           const leaseEpoch = detail.checkoutLeaseEpoch ?? 0;
@@ -12119,6 +12758,7 @@ export class TaskExecutor {
             }
           }
         } finally {
+          clearInterval(verificationRequestTimer);
           if (leaseRenewalTimer) {
             clearInterval(leaseRenewalTimer);
           }
@@ -13320,12 +13960,26 @@ export class TaskExecutor {
     return sharedCreateTaskLogTool(this.store, taskId);
   }
 
+  private createTaskLogsReadTool(taskId: string): ToolDefinition {
+    return sharedCreateTaskLogsReadTool(this.store, taskId);
+  }
+
   /*
   FNXC:EphemeralAgentTaskCreation 2026-07-01-00:00:
   A task-execution session is an ephemeral worker when no permanent identity agent governs it (default executor-FN-XXXX worker) or the governing agent is itself ephemeral. Pass that through so fn_task_create honors the project `ephemeralAgentsCanCreateTasks` toggle; permanent-agent sessions are never gated.
   */
-  private createTaskCreateTool(callerIsEphemeral: boolean): ToolDefinition {
-    return sharedCreateTaskCreateTool(this.store, { sourceType: "api" }, { rootDir: this.rootDir, callerIsEphemeral });
+  private createTaskCreateTool(callerIsEphemeral: boolean, sourceTaskId?: string, sourceAgentId?: string): ToolDefinition {
+    return sharedCreateTaskCreateTool(
+      this.store,
+      { sourceType: "api", sourceAgentId, sourceParentTaskId: sourceTaskId },
+      {
+        rootDir: this.rootDir,
+        callerIsEphemeral,
+        sourceTaskId,
+        sourceAgentId,
+        messageStore: this.options.messageStore,
+      },
+    );
   }
 
   private createTaskDocumentWriteTool(taskId: string): ToolDefinition {
@@ -16983,6 +17637,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
       failure: error,
       source: "executor-session-start",
       auditor: audit,
+      rootDir: this.rootDir,
     });
     if (recovery.outcome !== "escalate-exhausted") {
       this.markGraphExecuteSelfRequeued(task.id);

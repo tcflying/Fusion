@@ -52,6 +52,21 @@ while user-facing tasks can opt in without making every task generate media.
 export const REVIEW_ARTIFACTS_MODES = ["off", "user-facing", "on"] as const;
 export type ReviewArtifactsMode = (typeof REVIEW_ARTIFACTS_MODES)[number];
 
+/*
+FNXC:ProviderAuth 2026-07-24-17:05:
+Anthropic credentials can be present twice at once: a raw API key AND a Claude
+subscription OAuth login. Runtime auth resolution has to pick one, and until now the raw
+key always won silently — an operator who logged in with their subscription but had an old
+(or revoked) key saved kept getting `401 invalid x-api-key` from lanes that call the
+Anthropic endpoint directly, with nothing in the UI explaining which credential was in use.
+This preference makes the choice explicit and operator-owned. It is GLOBAL because
+credentials live in the global `~/.fusion/agent/auth.json`, not per project.
+Default "api-key" preserves the historical precedence (FN-7391/FN-7396), so upgrading
+changes no existing behavior.
+*/
+export const ANTHROPIC_AUTH_PREFERENCES = ["api-key", "subscription"] as const;
+export type AnthropicAuthPreference = (typeof ANTHROPIC_AUTH_PREFERENCES)[number];
+
 /** Theme mode for light/dark/system preference */
 export const THEME_MODES = ["dark", "light", "system"] as const;
 export type ThemeMode = (typeof THEME_MODES)[number];

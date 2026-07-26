@@ -1,4 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+/*
+FNXC:CliQuietMode 2026-07-25-09:05:
+JSON and other result-bearing CLI output uses `result()` (raw stdout), not
+console.log, so quiet mode can suppress chatter without dropping payloads.
+Capture that seam instead of expecting log spies to see JSON.
+*/
+const resultSpy = vi.hoisted(() => vi.fn());
+vi.mock("../../output.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../output.js")>();
+  return {
+    ...actual,
+    result: (text: string) => {
+      resultSpy(text);
+    },
+  };
+});
+
 import { runResearchCancel, runResearchCreate, runResearchExport, runResearchList, runResearchRetry, runResearchShow } from "../research.js";
 
 function makeConstructibleMock<T extends (...args: any[]) => unknown>(impl?: T) {
@@ -116,6 +134,7 @@ describe("research commands", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resultSpy.mockClear();
     process.exit = vi.fn(((code?: number) => {
       throw new Error(`process.exit:${code ?? 0}`);
     }) as typeof process.exit);
@@ -156,7 +175,7 @@ describe("research commands", () => {
 
   it("lists runs as json", async () => {
     await runResearchList({ json: true, status: "completed", limit: 3 });
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"runs"'));
+    expect(resultSpy).toHaveBeenCalledWith(expect.stringContaining('"runs"'));
     expect(researchStoreMock.listRuns).toHaveBeenCalledWith({ status: "completed", limit: 3 });
   });
 
@@ -175,7 +194,7 @@ describe("research commands", () => {
     await runResearchList({ json: true, status: "completed", limit: 3 });
 
     expect(asyncStore.listRuns).toHaveBeenCalledWith({ status: "completed", limit: 3 });
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"runs"'));
+    expect(resultSpy).toHaveBeenCalledWith(expect.stringContaining('"runs"'));
   });
 
   it("rejects invalid list status", async () => {
@@ -212,14 +231,14 @@ describe("research commands", () => {
   it("cancels a run", async () => {
     await runResearchCancel("RR-001", { json: true });
     expect(orchestratorMock.cancelRun).toHaveBeenCalledWith("RR-001");
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"cancelled"'));
+    expect(resultSpy).toHaveBeenCalledWith(expect.stringContaining('"cancelled"'));
   });
 
   it("retries a run", async () => {
     researchStoreMock.getRun.mockImplementation((id: string) => (id === "RR-003" ? { ...mockRun, id: "RR-003", status: "queued" } : { ...mockRun, status: "failed" }));
     await runResearchRetry("RR-001", { json: true });
     expect(orchestratorMock.retryRun).toHaveBeenCalledWith("RR-001");
-    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"retryOf"'));
+    expect(resultSpy).toHaveBeenCalledWith(expect.stringContaining('"retryOf"'));
   });
 
   it("errors when research is disabled", async () => {

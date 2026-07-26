@@ -106,6 +106,7 @@ export { parseTargetInterviewResponseImpl as parseTargetInterviewResponse };
 
 import { buildSessionSkillContextSync, createFnAgent as engineCreateFnAgent, resolveMcpServersForStore } from "@fusion/engine";
 import { createPlanningBoardTools } from "./planning-board-tools.js";
+import { laneModelOptions, resolveLaneSessionModel } from "./lane-session-model.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AgentResult = any;
@@ -316,6 +317,14 @@ interface TargetInterviewSession {
   /** Last terminal error for retry UX */
   error?: string;
   agent?: AgentResult;
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  The provider/model pair this interview runs on, pinned on first resolution so every rebuild
+  (retry, resumed session) stays on the same model instead of falling through to the runtime's
+  built-in Anthropic default. See lane-session-model.ts.
+  */
+  modelProvider?: string;
+  modelId?: string;
   thinkingOutput: string;
   /** Thinking output generated while producing currentQuestion */
   lastGeneratedThinking: string;
@@ -816,11 +825,28 @@ export async function createTargetInterviewAgent(
   */
   const mcpServers = (await resolveMcpServersForStore(store)).servers;
 
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  This lane previously passed NO provider/model pair at all, so every milestone/slice
+  interview turn ran on the runtime's built-in default model regardless of the operator's
+  configured provider — a permanent `401 invalid x-api-key` for anyone without a raw
+  Anthropic key, and a hole in test-mode forcing. Resolve the planning pair here (covering
+  both the first turn and the rebuild call sites) and pin it to the session.
+  */
+  const model = await resolveLaneSessionModel(
+    store,
+    { provider: session.modelProvider, modelId: session.modelId },
+    (reason) => diagnostics.warn("Milestone/slice interview has no resolved provider/model pair; the runtime will use its built-in default model", { sessionId: session.id, operation: "resolve-interview-model", reason }),
+  );
+  session.modelProvider = model.provider;
+  session.modelId = model.modelId;
+
   return createFnAgent({
     cwd: rootDir,
     systemPrompt: getSystemPrompt(session.targetType),
     tools: "readonly",
     mcpServers,
+    ...laneModelOptions(model),
     allowMcpToolsInReadonly: true,
     customTools: [...createPlanningBoardTools(store)],
     /*

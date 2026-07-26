@@ -82,6 +82,7 @@ import type { CliRelaunchRegistry } from "./cli-session-transport.js";
 import { validateRemoteAuthToken } from "./remote-auth.js";
 import { getCliPackageVersion, isUnresolvedCliPackageVersion } from "./cli-package-version.js";
 import { performUpdateCheck } from "./update-check.js";
+import { startAutoUpdateWatcher } from "./auto-update.js";
 import {
   dayHasSamples,
   fileScopeInvariantFailuresPerDay,
@@ -163,6 +164,13 @@ const MIN_AI_SESSION_CLEANUP_INTERVAL_MS = 60 * 1000;
 const MAX_AI_SESSION_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 let aiSessionCleanupIntervalHandle: ReturnType<typeof setInterval> | undefined;
+
+/*
+FNXC:AutoUpdate 2026-07-25-10:05:
+Module-scoped so a second createServer() in the same process (tests, embedded
+desktop server) replaces the previous watcher instead of stacking npm installs.
+*/
+let stopAutoUpdateWatcher: (() => void) | undefined;
 
 function clearAiSessionCleanupInterval(): void {
   if (!aiSessionCleanupIntervalHandle) {
@@ -1027,13 +1035,30 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   // Preserve the raw payload buffer so signed endpoints (for example
   // /api/routines/:id/webhook and settings sync proxying) can verify HMAC
   // signatures and forward exact request bytes.
-  app.use(express.json({
+  /*
+  FNXC:VoiceInput 2026-07-21-12:00:
+  Voice chunks have a route-only 2 MiB parser. The global 100 KiB parser must skip only this
+  endpoint (with or without Express's optional trailing slash) or it rejects before the voice
+  error mapper; rawBody/HMAC behavior remains unchanged elsewhere.
+  */
+  const jsonParser = express.json({
     verify: (req, _res, buf) => {
       if (buf.length > 0) {
         (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
       }
     },
-  }));
+  });
+  app.use((req, res, next) => {
+    // Express treats the trailing-slash spelling as the same route, so its parser boundary must,
+    // too; no broader prefix is exempted from the global rawBody-preserving parser.
+    if (req.path === "/api/voice/transcribe" || req.path === "/api/voice/transcribe/") return next();
+    return jsonParser(req, res, (error) => {
+      // Keep the established global 100 KiB rejection observable as 413 instead of allowing
+      // Express's parser error to fall through to the generic 500 handler.
+      if ((error as { type?: string } | undefined)?.type === "entity.too.large") return res.status(413).json({ error: "payload-too-large" });
+      return next(error);
+    });
+  });
 
   // Daemon mode: bearer token authentication middleware
   // Auth is enabled when daemon option is provided OR FUSION_DAEMON_TOKEN env var is set.
@@ -1757,6 +1782,35 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
         DEFAULT_AI_SESSION_TTL_MS,
       );
     }
+  }
+
+  /*
+  FNXC:AutoUpdate 2026-07-25-10:05:
+  Optional unattended update install + supervised restart (global setting
+  `autoUpdateAndRestart`, default OFF). Started only when the host CLI wired
+  systemControl — that injection is what makes an in-place restart possible at
+  all, and the watcher itself re-reads the setting every cycle, so toggling it in
+  Settings takes effect without a restart. Skipped under NODE_ENV=test for the
+  same reason as the AI-session sweep: unit servers must not schedule timers or
+  reach npm.
+  */
+  if (options?.systemControl && shouldScheduleAiSessionCleanup()) {
+    const systemControl = options.systemControl;
+    stopAutoUpdateWatcher?.();
+    stopAutoUpdateWatcher = startAutoUpdateWatcher({
+      getSettings: async () => {
+        const globalStore = store.getGlobalSettingsStore?.();
+        return globalStore ? await globalStore.getSettings() : {};
+      },
+      currentVersion: cliPackageVersion,
+      supervised: systemControl.supervised,
+      requestRestart: (reason) => systemControl.requestRestart(reason),
+      log: {
+        info: (message, context) => runtimeLogger.info(message, context),
+        warn: (message, context) => runtimeLogger.warn(message, context),
+        error: (message, context) => runtimeLogger.error(message, context),
+      },
+    });
   }
 
   /*

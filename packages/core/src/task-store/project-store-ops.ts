@@ -39,6 +39,7 @@ import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {isWorkflowDefinitionIdPrimaryKeyCollision, nextWorkflowDefinitionIdAsyncImpl} from "../task-store/workflow-definitions.js";
 import {upsertTaskRowInTransaction, buildTaskInsertValues} from "../task-store/async-persistence.js";
 import {readTaskRowInTransaction} from "../task-store/async-persistence.js";
+import {withTaskWorkflowSerialization} from "../task-store/async-workflow-workitems.js";
 import {recordActivityLogEntry as recordActivityLogEntryAsync} from "../task-store/async-audit.js";
 import {applyOriginalDescription} from "../original-description-policy.js";
 import {recordRunAuditEvent as recordRunAuditEventAsync} from "../postgres/data-layer.js";
@@ -163,6 +164,7 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
     if (store.backendMode) {
       const layer = store.asyncLayer!;
       const existingRow = await layer.transactionImmediate(async (tx) => {
+        const persist = async () => {
         const row = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
         if (row && row.deletedAt != null) {
           return { deletedAt: row.deletedAt as string };
@@ -200,6 +202,18 @@ export async function atomicWriteTaskJsonWithAuditImpl(store: TaskStore, dir: st
           await recordRunAuditEventWithinTransaction(tx, auditInput);
         }
         return undefined;
+        };
+        /*
+        FNXC:WorkflowSerialization 2026-07-26-15:30:
+        FN-8592 makes the persisted plan-review passed edge share the exact
+        per-task advisory transaction lock used by conditional continuation
+        seeding. This prevents a pass from committing between that repair's
+        locked predicate reads and its insert.
+        */
+        if (task.workflowStepResults?.some((result) => result.workflowStepId === "plan-review" && result.status === "passed")) {
+          return withTaskWorkflowSerialization(tx, layer.projectId, id, persist);
+        }
+        return persist();
       });
       if (existingRow?.deletedAt) {
         store.throwSoftDeletedWriteBlocked(id, existingRow.deletedAt, auditInput?.mutationType ?? "atomicWriteTaskJsonWithAudit", {

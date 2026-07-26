@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { installQuietGate, resolveQuietMode, setQuietMode, uninstallQuietGate } from "./output.js";
 
 // @ts-expect-error -- Bun-only global; undefined in Node
 const isBunBinary = typeof Bun !== "undefined" && !!Bun.embeddedFiles;
@@ -546,6 +547,7 @@ Options:
   --labels, -L <labels>      Comma-separated label filter for import
   --interactive, -i          Interactive mode for issue selection
   --help, -h                 Show this help
+  --quiet, -q                Suppress informational stdout output
 
 Columns: triage, todo, in-progress, in-review, done, archived
 Supported file types: png, jpg, gif, webp, txt, log, json, yaml, yml, toml, csv, xml
@@ -555,18 +557,29 @@ export function extractGlobalProjectFlag(argv: string[]): {
   cleanedArgs: string[];
   projectName?: string;
   skipOnboarding: boolean;
+  quiet?: boolean;
 } {
-  const command = argv[0];
-  if (command === "serve" || command === "daemon") {
-    return { cleanedArgs: [...argv], skipOnboarding: false };
-  }
-
+  // FNXC:CliQuietMode 2026-07-16-01:00: Serve/daemon keep their legacy
+  // pass-through argv contract even when a global quiet flag precedes them.
+  const command = argv.find((arg) => arg !== "--quiet" && arg !== "-q");
+  const isServeOrDaemon = command === "serve" || command === "daemon";
   const cleanedArgs: string[] = [];
   let projectName: string | undefined;
   let skipOnboarding = false;
+  // FNXC:CliQuietMode 2026-07-16-00:00: `undefined` preserves flag absence so
+  // FUSION_QUIET can participate in resolution; never collapse it to false.
+  let quiet: boolean | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
+    if (arg === "--quiet" || arg === "-q") {
+      quiet = true;
+      continue;
+    }
+    if (isServeOrDaemon) {
+      cleanedArgs.push(arg);
+      continue;
+    }
     if (arg === "--project" || arg === "-P") {
       if (projectName) {
         throw new Error("Duplicate --project flag. Specify a project only once.");
@@ -586,7 +599,7 @@ export function extractGlobalProjectFlag(argv: string[]): {
     cleanedArgs.push(arg);
   }
 
-  return { cleanedArgs, projectName, skipOnboarding };
+  return { cleanedArgs, projectName, skipOnboarding, quiet };
 }
 
 function getFlagValue(args: string[], flag: string): string | undefined {
@@ -690,7 +703,19 @@ function readOwnCliVersion(): string | undefined {
 }
 
 async function main() {
-  const { cleanedArgs: args, projectName, skipOnboarding } = extractGlobalProjectFlag(process.argv.slice(2));
+  const { cleanedArgs: args, projectName, skipOnboarding, quiet } = extractGlobalProjectFlag(process.argv.slice(2));
+  const hasJsonFlag = args.includes("--json");
+  const hasHelpOrVersionFlag = args.some((arg) => ["--help", "-h", "--version", "-v"].includes(arg));
+  const selectedCommand = !args[0] || args[0].startsWith("-") ? "dashboard" : args[0];
+  const isExemptCommand = ["serve", "daemon", "dashboard", "desktop", "chat"].includes(selectedCommand);
+  // FNXC:CliQuietMode 2026-07-16-00:00: Recompute effective state on every
+  // invocation. JSON and help/version are requested results; live commands,
+  // including the bare/dashboard Ink TUI path, must retain their UI output.
+  const effectiveQuiet = resolveQuietMode({ flag: quiet, env: process.env.FUSION_QUIET })
+    && !hasJsonFlag && !hasHelpOrVersionFlag && !isExemptCommand;
+  setQuietMode(effectiveQuiet);
+  if (effectiveQuiet) installQuietGate();
+  else uninstallQuietGate();
 
   // Print version and exit before any application imports. This is what the
   // dashboard's CLI Binary panel probes via `<bin> --version`; without an

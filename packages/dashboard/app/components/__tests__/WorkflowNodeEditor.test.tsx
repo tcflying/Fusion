@@ -35,6 +35,7 @@ import {
   BUILTIN_STEPWISE_CODING_WORKFLOW_IR,
   BUILTIN_WORKFLOWS,
 } from "@fusion/core";
+import { readAppFile } from "../../test/cssFixture";
 
 vi.mock("../../api", () => ({
   fetchWorkflows: vi.fn(),
@@ -861,7 +862,7 @@ describe("WorkflowNodeEditor", () => {
   });
 
   it("keeps simple-editor shell styling outside the mobile media query", () => {
-    const css = readFileSync("app/components/WorkflowNodeEditor.css", "utf8");
+    const css = readAppFile("components/WorkflowNodeEditor.css");
     const mobileMediaIndex = css.indexOf("@media (max-width: 768px)");
 
     expect(css.indexOf("--wf-editor-touch-target")).toBeGreaterThanOrEqual(0);
@@ -871,7 +872,7 @@ describe("WorkflowNodeEditor", () => {
   });
 
   it("routes modal sizing through FloatingWindow without stale overlay or native resize shells", () => {
-    const css = readFileSync("app/components/WorkflowNodeEditor.css", "utf8");
+    const css = readAppFile("components/WorkflowNodeEditor.css");
     const modalBlock = css.match(/\.wf-editor-modal \{[\s\S]*?\n\}/)?.[0] ?? "";
     const mobileBlock = css.slice(css.indexOf("@media (max-width: 768px)"));
 

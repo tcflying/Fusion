@@ -2773,3 +2773,25 @@ Queued-message banners stack above the composer input with a capped scroll area,
   color: var(--accent-text);
   border-color: color-mix(in srgb, var(--color-warning) 55%, transparent);
 }
+
+/* FNXC:ChatTags 2026-08-05-10:55: shared ChatView hosts expose Direct-only tag filters and compact chips without introducing a second sidebar layout. */
+.chat-tag-filter { display: flex; align-items: center; gap: var(--space-xs); color: var(--text-muted); }
+.chat-tag-filter select { flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg); color: var(--text); padding: var(--space-xs); }
+.chat-session-tags { display: flex; flex-wrap: wrap; gap: var(--space-xs); overflow: hidden; }
+.chat-session-tag { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 var(--space-xs); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text-muted); font-size: var(--font-size-xs); }
+/* FNXC:ChatTags 2026-08-05-12:15: direct-conversation tag controls keep assignment, rename, and deletion in the existing context menu so shared Chat hosts do not grow another sidebar action row. */
+.chat-session-tag-menu { display: flex; flex-direction: column; gap: var(--space-xs); padding: var(--space-xs); border-bottom: 1px solid var(--border); }
+.chat-tag-menu-item { display: flex; align-items: center; gap: var(--space-xs); min-width: 0; }
+.chat-session-context-menu .chat-tag-menu-item > [role="menuitemcheckbox"] { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-session-context-menu .chat-tag-menu-item > .btn-icon { flex: 0 0 auto; width: auto; padding: var(--space-xs); }
+.chat-tag-create-row { display: flex; gap: var(--space-xs); }
+.chat-tag-create-row .input { min-width: 0; }
+@media (max-width: 768px) {
+  .chat-session-tags { max-height: calc(var(--space-lg) * 2); }
+  /*
+  FNXC:ChatTags 2026-07-24-23:05:
+  Compact mobile tag-menu gap must use a defined token. --space-2xs is intentionally
+  undefined (space-token-defined hygiene); half of --space-xs matches the prior intent.
+  */
+  .chat-tag-menu-item { gap: calc(var(--space-xs) / 2); }
+}

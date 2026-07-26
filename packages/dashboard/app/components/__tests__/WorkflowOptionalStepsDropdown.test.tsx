@@ -4,6 +4,7 @@ import { render, screen, fireEvent, cleanup, within } from "@testing-library/rea
 import { useState } from "react";
 import type { ResolvedWorkflowOptionalStep } from "@fusion/core";
 import { WorkflowOptionalStepsDropdown } from "../WorkflowOptionalStepsDropdown";
+import { readAppFile } from "../../test/cssFixture";
 
 const STEP: ResolvedWorkflowOptionalStep = {
   templateId: "browser-verification",
@@ -31,7 +32,7 @@ const STEP_WITHOUT_DESCRIPTION: ResolvedWorkflowOptionalStep = {
   defaultOn: false,
 };
 
-const DROPDOWN_CSS = readFileSync("app/components/WorkflowOptionalStepsDropdown.css", "utf8");
+const DROPDOWN_CSS = readAppFile("components/WorkflowOptionalStepsDropdown.css");
 
 // Controlled host: parent owns the enabled set, mirroring the create surfaces.
 function Host({

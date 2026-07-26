@@ -98,6 +98,7 @@ import { trimPromptMd, trimTaskDescription, trimTriggeringComments } from "./hea
 import { detectDeicticReference, extractAntecedentCandidates, renderAmbiguityPromptBlock, scoreReferentConfidence } from "./room-ambiguity.js";
 import { countActiveAgentMembers, decideRoomCoordination, detectTaskFilingIntent, renderRoomCoordinationPromptBlock } from "./room-coordination.js";
 import { evaluateParkedAgentTaskLink, isParkedTaskColumn, type AgentTaskLinkExecutionProof } from "./task-agent-sync.js";
+import { classifyReportHealth } from "./reports-health.js";
 import { accumulateSessionTokenUsage, captureSessionTokenBaseline } from "./session-token-usage.js";
 
 const promptSizeLog = createLogger("prompt-size");
@@ -3665,28 +3666,30 @@ export class HeartbeatMonitor {
         }
       }
 
-      let health = "healthy";
-      if (staleParkedAssignment) {
-        health = "**stale** assignment";
-      } else if (report.state === "paused") {
-        health = report.pauseReason ? `paused (${report.pauseReason})` : "paused";
-      } else if (report.state === "error") {
-        health = "**stuck**";
-      } else if (report.state === "running") {
-        health = heartbeatAgeMs <= heartbeatTimeoutMs * 2 ? "healthy" : "**stuck**";
-      } else if ((report.state === "active" || report.state === "idle") && heartbeatAgeMs > staleThresholdMs) {
-        health = "**stale**";
+      const classification = classifyReportHealth({
+        state: report.state,
+        pauseReason: report.pauseReason,
+        heartbeatAgeMs,
+        heartbeatTimeoutMs,
+        staleThresholdMs,
+        staleParkedAssignment,
+      });
+      if (classification.bucket === "stale") {
         heartbeatLog.log(`[reports-health] stale report ${report.id} intervalSource=${intervalSource} staleThresholdMs=${staleThresholdMs} heartbeatAgeMs=${heartbeatAgeMs}`);
       }
 
       const task = renderedTask;
       const state = renderedState;
       const heartbeat = formatRelativeTime(report.lastHeartbeatAt);
-      return `| ${report.name} | ${state} | ${task} | ${heartbeat} | ${health} |`;
+      return {
+        classification,
+        row: `| ${report.name} | ${state} | ${task} | ${heartbeat} | ${classification.cellText} |`,
+      };
     }));
 
-    const hasStuck = rows.some((row) => row.includes("**stuck**"));
-    const hasStale = rows.some((row) => row.includes("**stale**"));
+    const hasStuck = rows.some(({ classification }) => classification.bucket === "stuck");
+    const hasStale = rows.some(({ classification }) => classification.bucket === "stale" || classification.bucket === "stale-assignment");
+    const hasOperatorActionable = rows.some(({ classification }) => classification.bucket === "operator-actionable");
 
     const actionLines = ["### Actions for Unresponsive Reports"];
     if (hasStuck) {
@@ -3703,6 +3706,9 @@ export class HeartbeatMonitor {
     if (hasStale) {
       actionLines.push("- For **stale** reports: the agent may have lost its heartbeat trigger — create a follow-up task to investigate.");
     }
+    if (hasOperatorActionable) {
+      actionLines.push("- For reports that **need operator repair**: notify the operator and create a follow-up task; do not reassign work until the parked agent's configuration or access issue is repaired.");
+    }
 
     return [
       "## Reports Health Check",
@@ -3711,7 +3717,7 @@ export class HeartbeatMonitor {
       "",
       "| Name | State | Task | Last Heartbeat | Health |",
       "|------|-------|------|----------------|--------|",
-      ...rows,
+      ...rows.map(({ row }) => row),
       "",
       ...actionLines,
     ].join("\n");

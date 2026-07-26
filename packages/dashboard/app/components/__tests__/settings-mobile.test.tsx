@@ -229,6 +229,37 @@ function expectNoMobileRule(css: string, selector: string, declaration: string):
   expect(offendingBlock).toBeUndefined();
 }
 
+/**
+ * Returns the full text of the first `@media` block whose body satisfies `predicate`.
+ *
+ * Note: this brace-matches from the block's OPENING brace outward (unlike `getMobileMediaBlocks`
+ * above, which starts its depth counter before the `@media` prelude and therefore terminates at the
+ * first character), so the returned string is the real block and assertions against it can fail.
+ */
+function findMediaBlock(css: string, predicate: (block: string) => boolean): string | undefined {
+  const mediaPattern = /@media[^{]*\{/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = mediaPattern.exec(css)) !== null) {
+    const open = match.index + match[0].length - 1;
+    let depth = 0;
+    let end = open;
+    for (; end < css.length; end += 1) {
+      if (css[end] === "{") depth += 1;
+      if (css[end] === "}") depth -= 1;
+      if (depth === 0) {
+        end += 1;
+        break;
+      }
+    }
+    const block = css.slice(match.index, end);
+    if (predicate(block)) return block;
+    mediaPattern.lastIndex = end;
+  }
+
+  return undefined;
+}
+
 function expectBaseRule(css: string, selector: string, declaration: string): void {
   const pattern = new RegExp(
     `${escapeRegExp(selector)}\\s*\\{[^}]*${escapeRegExp(declaration)}`,
@@ -397,10 +428,38 @@ describe("SettingsModal mobile adaptations", () => {
 
     await user.click(within(modalActions as HTMLElement).getByRole("button", { name: "Check for updates" }));
     const updateNow = await findByRole("button", { name: "Update now" });
-    expect((modalActions as HTMLElement).contains(updateNow)).toBe(true);
+
+    /*
+    The mobile footer rail is a single nowrap horizontal scroller, so the update banner must live in its own
+    full-width row directly above it — inside the rail it clipped itself and pushed Import/Export/Reset/Close
+    off-screen. Assert both halves of that invariant: banner outside the rail, banner present in the footer row.
+    */
+    const updateRow = container.querySelector(".settings-modal-footer-update-row");
+    expect(updateRow).toBeTruthy();
+    expect((updateRow as HTMLElement).contains(updateNow)).toBe(true);
+    expect((modalActions as HTMLElement).contains(updateNow)).toBe(false);
+    expect(modalActions?.querySelector(".settings-update-result")).toBeNull();
+    expect(updateRow?.nextElementSibling).toBe(modalActions);
 
     await user.click(updateNow);
     expect(await findByText("Updated to v2.0.0 — restart Fusion to apply")).toBeTruthy();
+  });
+
+  it("keeps the update result inline in the footer rail on desktop", async () => {
+    mockSettingsViewport(false);
+    const user = userEvent.setup();
+    const { container, findByRole } = render(<SettingsModal onClose={vi.fn()} addToast={vi.fn()} />);
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+
+    const modalActions = container.querySelector(".modal-actions");
+    expect(modalActions).toBeTruthy();
+
+    await user.click(within(modalActions as HTMLElement).getByRole("button", { name: "Check for updates" }));
+    const updateNow = await findByRole("button", { name: "Update now" });
+
+    expect(container.querySelector(".settings-modal-footer-update-row")).toBeNull();
+    expect((modalActions as HTMLElement).contains(updateNow)).toBe(true);
+    expect(container.querySelector(".settings-update-check .settings-update-result")).toBeTruthy();
   });
 
   it("preserves the mobile section picker accessible name without rendering a visible label", async () => {
@@ -811,6 +870,10 @@ describe("SettingsModal mobile adaptations", () => {
     expectMobileRule(css, ".settings-modal .settings-modal-footer-version", "margin-right: 0;");
     expectMobileRule(css, ".settings-modal .settings-update-check", "align-items: center;");
     expectMobileRule(css, ".settings-modal .settings-update-check", "flex-wrap: wrap;");
+    // The update banner owns a full-width row above the nowrap footer rail, and the rail drops its duplicate divider.
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-update-row", "border-top: 1px solid var(--border);");
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-update-row", "justify-content: center;");
+    expectMobileRule(css, ".settings-modal .settings-modal-footer-update-row + .modal-actions", "border-top: none;");
     expectMobileRule(css, ".settings-modal .settings-version-check-btn", "line-height: 1;");
     expectMobileRule(css, ".settings-modal .settings-version-check-btn", "white-space: nowrap;");
     expectMobileRule(css, ".settings-modal .settings-modal-version", "display: inline-flex;");
@@ -860,6 +923,49 @@ describe("SettingsModal mobile adaptations", () => {
     // Settings header actions keep compact controls on a shared height contract on desktop; mobile inherits this height (FN-4354 reverted prior mobile inflation).
     expectBaseRule(css, ".settings-header-actions", "--settings-header-action-height: calc(var(--space-md) * 2 + var(--space-xs) / 2);");
     expectBaseRule(css, ".settings-header-actions > .settings-header-discord-btn", "height: var(--settings-header-action-height);");
+  });
+
+  it("makes the mobile settings footer rail touch-scrollable at both mobile orientations", () => {
+    const css = loadAllAppCss();
+
+    /*
+    Surface enumeration for "the footer scrolls horizontally on touch, but only when it overflows":
+      1. the media query gating the footer must be the app-wide mobile breakpoint (portrait width AND
+         landscape height), because SettingsModal.tsx picks the mobile footer markup off that same query;
+      2. the rail itself must opt back into horizontal panning past the global `* { touch-action: pan-y }`;
+      3. every touch target INSIDE the rail must opt in too (touch-action is not inherited, and the buttons
+         cover most of the rail's surface);
+      4. scrolling stays conditional — `overflow-x: auto`, never `scroll`, so a fitting cluster has no
+         scroll range and keeps its centered layout;
+      5. the non-shrinking button groups must escape the mobile `* { max-width: 100% }` reset, otherwise the
+         rail has nothing wider than itself to scroll to.
+    Both presentations (standalone modal + embedded SettingsView) share these `.settings-modal` selectors.
+    */
+    const footerBlock = findMediaBlock(css, (block) => /\.settings-modal \.modal-actions\s*\{[^}]*overflow-x:/.test(block));
+    expect(footerBlock).toBeTruthy();
+
+    // 1. Landscape phones (width > 768px, height <= 480px) resolve to viewportMode "mobile" in TSX.
+    const footerQuery = footerBlock!.slice(0, footerBlock!.indexOf("{"));
+    expect(footerQuery).toContain("max-width: 768px");
+    expect(footerQuery).toContain("max-height: 480px");
+
+    const railRule = footerBlock!.match(/\.settings-modal \.modal-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+    // 2 + 4.
+    expect(railRule).toContain("touch-action: pan-x pan-y;");
+    expect(railRule).toContain("overscroll-behavior-x: contain;");
+    expect(railRule).toContain("-webkit-overflow-scrolling: touch;");
+    expect(railRule).toContain("overflow-x: auto;");
+    expect(railRule).not.toContain("overflow-x: scroll;");
+
+    // 3.
+    const targetsRule = footerBlock!.match(/\.settings-modal \.modal-actions \*\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(targetsRule).toContain("touch-action: pan-x pan-y;");
+
+    // 5.
+    for (const selector of [".settings-modal .modal-actions-left", ".settings-modal .modal-actions-right", ".settings-modal .settings-modal-footer-version"]) {
+      const groupRule = footerBlock!.match(new RegExp(`${escapeRegExp(selector)}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
+      expect(groupRule).toContain("max-width: none;");
+    }
   });
 
   it("FN-4354: settings header actions and modal-close have no mobile touch-target inflation", () => {

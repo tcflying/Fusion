@@ -43,7 +43,21 @@ the SQLite cutover ledger. Session Room uses the disjoint 0031–0074 marker
 namespace, so the stale-binary gate advances to the final registered Room
 marker while the baseline SQL remains the dedicated 0000 file.
 */
-export const SCHEMA_BASELINE_VERSION = "0077";
+export const SCHEMA_BASELINE_VERSION = "0084";
+/*
+FNXC:WorkflowTaskContinuations 2026-07-21:
+SCHEMA_BASELINE_VERSION advances to 0031 for durable, single-owner task
+continuations at workflow column boundaries.
+
+FNXC:LegacyAdoption 2026-07-21-17:30:
+SCHEMA_BASELINE_VERSION advances to 0036 for normalized Direct conversation tags; it previously advanced to 0032 for fusion_runtime SELECT +
+SECURITY DEFINER write access to the legacy-adoption drained marker.
+
+FNXC:TaskWedgeNotifications 2026-10-19-00:00:
+Advance the PostgreSQL schema ceiling for the durable wedge episode column. The
+forward migration must run before TaskStore writes the new field on fresh and
+upgraded databases.
+*/
 /** FNXC:SymbolLock 2026-07-31-10:00: upgrades need durable task declarations before admission resolves symbols. */
 export const TASK_DECLARED_SYMBOLS_VERSION = "0028";
 const INITIAL_SCHEMA_VERSION = "0000";
@@ -223,6 +237,19 @@ export const SCHEMA_TASK_BOARD_METADATA_VERSION = "0075";
  */
 export const SCHEMA_SCHEMA_DRIFT_RECOVERY_VERSION = "0076";
 export const SCHEMA_RUN_AUDIT_CONFLICT_RECOVERY_VERSION = "0077";
+export const WORKFLOW_TASK_CONTINUATIONS_VERSION = "0078";
+/** FNXC:LegacyAdoption 2026-07-21-17:30: runtime role needs drained-marker read + restricted write. */
+export const LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION = "0079";
+/** FNXC:TaskWedgeNotifications 2026-10-19-00:00: durable wedge episode migration for PostgreSQL upgrades. */
+export const TASK_WEDGE_NOTIFICATION_VERSION = "0080";
+/** FNXC:MissionValidation 2026-07-23-14:30: provenance-safe milestone criteria require an explicit upgrade. */
+export const MILESTONE_ASSERTION_PROVENANCE_VERSION = "0081";
+/** FNXC:MissionLineageBudget 2026-07-22-12:00: upgraded clusters need durable root stop tombstones. */
+export const MISSION_LINEAGE_STOP_VERSION = "0082";
+/** FNXC:ChatTags 2026-08-05-10:55: existing clusters need normalized project-scoped Direct conversation tags. */
+export const CHAT_SESSION_TAGS_VERSION = "0083";
+/** Existing runtime roles must not retain direct write access to the migration ledger. */
+export const RUNTIME_MIGRATION_LEDGER_PRIVILEGE_HARDENING_VERSION = "0084";
 
 export const SCHEMA_MIGRATIONS = [
   { version: INITIAL_SCHEMA_VERSION, filename: "0000_initial.sql" },
@@ -303,6 +330,13 @@ export const SCHEMA_MIGRATIONS = [
   { version: SCHEMA_TASK_BOARD_METADATA_VERSION, filename: "0043_task_board_metadata.sql" },
   { version: SCHEMA_SCHEMA_DRIFT_RECOVERY_VERSION, filename: "0044_schema_drift_recovery.sql" },
   { version: SCHEMA_RUN_AUDIT_CONFLICT_RECOVERY_VERSION, filename: "0045_run_audit_conflict_recovery.sql" },
+  { version: WORKFLOW_TASK_CONTINUATIONS_VERSION, filename: "0031_workflow_task_continuations.sql" },
+  { version: LEGACY_ADOPTION_DRAINED_MARKER_RUNTIME_GRANTS_VERSION, filename: "0032_legacy_adoption_drained_marker_runtime_grants.sql" },
+  { version: TASK_WEDGE_NOTIFICATION_VERSION, filename: "0033_fn-8505_wedge_notification.sql" },
+  { version: MILESTONE_ASSERTION_PROVENANCE_VERSION, filename: "0034_milestone_assertion_provenance.sql" },
+  { version: MISSION_LINEAGE_STOP_VERSION, filename: "0035_fn_8543_mission_lineage_stop.sql" },
+  { version: CHAT_SESSION_TAGS_VERSION, filename: "0036_chat_session_tags.sql" },
+  { version: RUNTIME_MIGRATION_LEDGER_PRIVILEGE_HARDENING_VERSION, filename: "0046_runtime_migration_ledger_privilege_hardening.sql" },
 ] as const;
 
 export type SchemaMigrationVersion = (typeof SCHEMA_MIGRATIONS)[number]["version"];
@@ -507,22 +541,6 @@ async function ensureBookkeepingTable(db: PostgresJsDatabase<Record<string, neve
       version text PRIMARY KEY,
       applied_at timestamptz NOT NULL DEFAULT now()
     )
-  `));
-  /*
-   * FNXC:PostgresSchema 2026-07-21-22:40:
-   * Runtime task-store startup reads the legacy-adoption marker through the
-   * restricted fusion_runtime role. The bookkeeping table is created in the
-   * public schema after the ownership migration's default-privilege setup, so
-   * explicitly grant its read-only access whenever that role already exists.
-   */
-  await db.execute(sql.raw(`
-    DO $$
-    BEGIN
-      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fusion_runtime') THEN
-        GRANT SELECT, INSERT, UPDATE ON public.${MIGRATION_BOOKKEEPING_TABLE} TO fusion_runtime;
-      END IF;
-    END
-    $$;
   `));
 }
 
@@ -1185,11 +1203,13 @@ export async function applySchemaBaseline(
      * same locked transaction so capability, evolution, capacity, backpressure,
      * RBAC, and recovery tables cannot exist only on disk without being applied.
      */
+    const appliedSet = new Set(applied);
     for (const migration of SCHEMA_MIGRATIONS) {
-      if (Number(migration.version) < 44 || applied.includes(migration.version)) continue;
+      if (Number(migration.version) < 44 || appliedSet.has(migration.version)) continue;
       const migrationSql = await readFile(join(MIGRATIONS_DIR, migration.filename), "utf8");
       await tx.execute(sql.raw(migrationSql));
       await tx.execute(sql`INSERT INTO public.${sql.identifier(MIGRATION_BOOKKEEPING_TABLE)} (version) VALUES (${migration.version}) ON CONFLICT (version) DO NOTHING`);
+      appliedSet.add(migration.version);
       schemaChanged = true;
     }
 

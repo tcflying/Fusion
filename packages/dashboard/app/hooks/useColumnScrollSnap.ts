@@ -20,13 +20,147 @@ between columns. Tap-to-stop and zero-pan lifts hard-jump to the nearest center 
 cancelled swipe's directional page). Directional paging still applies only when the settle
 gesture itself had pan intent.
 */
-/** After lift/cancel/wheel: wait for scroll idle (momentum finished) before paging. */
-const SCROLL_IDLE_SETTLE_MS = 48;
+/*
+FNXC:BoardNavigation 2026-07-24-10:05:
+Board paging must feel fast: the post-momentum quiet window is 2 frames (~32ms), not 3 (~48ms), so
+the settle commits sooner after a swipe. Keep it above one frame — a single-frame window can fire
+mid-fling and page against travel.
+*/
+/**
+ * Fallback quiet window for settles that cannot page at lift (wheel, net-zero direction).
+ * Directional finger swipes no longer wait on it — see `commitDirectionalPage`.
+ */
+const SCROLL_IDLE_SETTLE_MS = 32;
 const CENTER_TOLERANCE_PX = 1;
 /** Minimum finger travel to count as a horizontal pan (short swipe still commits). */
 const MIN_PAN_CLIENT_PX = 12;
 /** Keep a WebKit compositor write from outliving the main-thread hard jump. */
 const PIN_REASSERT_INTERVAL_MS = 16;
+
+/*
+FNXC:BoardNavigation 2026-07-24-11:20:
+Board paging must feel fast, and the slow part was never the settle timer — it was waiting for the
+BROWSER's fling to decelerate before paging (native inertia can coast for most of a second, so a
+flick sat visibly drifting before it committed). The hook now owns the momentum: at finger-up a
+directional swipe kills native inertia and animates to its target column in ~200ms, so the page
+starts moving on lift instead of after the coast. Fling reach is preserved by deriving a page COUNT
+from release velocity rather than from how far inertia happens to travel.
+
+Trade-off accepted: tap-to-stop-during-momentum no longer exists as an interaction (there is no
+long coast left to interrupt). A re-touch during the page animation cancels it and hands control
+back to the finger, which covers the same corrective intent.
+*/
+/** Base duration of the owned page animation (single-column hop). */
+const PAGE_ANIMATION_BASE_MS = 190;
+/** Added per extra column so multi-column flings do not crawl. */
+const PAGE_ANIMATION_PER_EXTRA_PAGE_MS = 45;
+const PAGE_ANIMATION_MAX_MS = 300;
+/** Only release-adjacent scroll samples describe fling speed. */
+const VELOCITY_SAMPLE_WINDOW_MS = 120;
+/** px/ms of release velocity that buys one extra column of paging. */
+const FLING_VELOCITY_PER_EXTRA_PAGE = 1.6;
+/** Ceiling so a hard flick cannot fly across the whole board. */
+const MAX_PAGES_PER_SWIPE = 3;
+/*
+FNXC:BoardNavigation 2026-07-25-09:40:
+A SHORT swipe must never cross more than one column, however fast the flick was. Velocity alone
+over-reached: a quick thumb flick of ~30px reads as multiple px/ms and paged two or three columns,
+so the board jumped past what the user aimed at. Each extra column now also has to be earned with
+travel — the gesture must move at least this fraction of the viewport width per extra page — so
+reach stays proportional to the swipe the user actually made.
+*/
+const TRAVEL_FRACTION_PER_EXTRA_PAGE = 0.6;
+/** Below this the animation is pointless — jump. */
+const MIN_ANIMATED_DISTANCE_PX = 2;
+
+function now(): number {
+  if (typeof performance !== "undefined" && typeof performance.now === "function") {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function prefersReducedMotion(): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+  try {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Ease-out cubic: fast departure, soft arrival — reads as "snappy", not "floaty". */
+function easeOutCubic(progress: number): number {
+  const clamped = progress <= 0 ? 0 : progress >= 1 ? 1 : progress;
+  return 1 - (1 - clamped) ** 3;
+}
+
+/**
+ * Columns to advance for a release velocity, in px/ms (absolute value).
+ *
+ * A deliberate slow swipe pages exactly one column; faster releases buy extra columns so the
+ * hook's owned animation keeps the reach a native fling used to provide.
+ *
+ * FNXC:BoardNavigation 2026-07-25-09:40:
+ * Extra columns must be earned by BOTH speed and distance. `travelPx` (net gesture travel — the
+ * larger of board scroll delta and horizontal finger travel) against `viewportWidth` caps the
+ * count, so a fast but short flick pages exactly one column instead of jumping across the board.
+ * The travel gate is skipped when the caller cannot supply a usable viewport width.
+ */
+export function resolvePageCount(
+  velocityPxPerMs: number,
+  travel?: { travelPx: number; viewportWidth: number },
+): number {
+  const speed = Math.abs(velocityPxPerMs);
+  if (!Number.isFinite(speed) || speed <= 0) return 1;
+  const extraFromVelocity = Math.floor(speed / FLING_VELOCITY_PER_EXTRA_PAGE);
+
+  let extra = extraFromVelocity;
+  if (travel && Number.isFinite(travel.viewportWidth) && travel.viewportWidth > 0) {
+    const travelPx = Math.abs(travel.travelPx);
+    const extraFromTravel = Number.isFinite(travelPx)
+      ? Math.floor(travelPx / (travel.viewportWidth * TRAVEL_FRACTION_PER_EXTRA_PAGE))
+      : 0;
+    extra = Math.min(extraFromVelocity, extraFromTravel);
+  }
+
+  return Math.min(1 + Math.max(0, extra), MAX_PAGES_PER_SWIPE);
+}
+
+/** Duration for a `pageCount`-column hop. */
+export function resolvePageAnimationMs(pageCount: number): number {
+  const extraPages = Math.max(0, pageCount - 1);
+  return Math.min(
+    PAGE_ANIMATION_BASE_MS + extraPages * PAGE_ANIMATION_PER_EXTRA_PAGE_MS,
+    PAGE_ANIMATION_MAX_MS,
+  );
+}
+
+/**
+ * Target column for an owned directional page.
+ *
+ * `originIndex` + `direction * pageCount`, clamped to the column range, then clamped forward to
+ * `floorIndex` (the column the finger already dragged onto) so a long slow drag never animates
+ * backwards to a stale origin-derived target.
+ */
+export function resolveFlingTargetIndex(options: {
+  columnCount: number;
+  originIndex: number;
+  direction: number;
+  pageCount: number;
+  /** Nearest column at release; keeps a long drag's own landing point. */
+  nearestIndex: number;
+}): number {
+  const { columnCount, originIndex, direction, pageCount, nearestIndex } = options;
+  if (columnCount <= 1) return 0;
+  const lastIndex = columnCount - 1;
+  const clamp = (value: number) => Math.min(Math.max(value, 0), lastIndex);
+  const origin = clamp(originIndex);
+  const nearest = clamp(nearestIndex);
+  if (direction === 0) return nearest;
+  const paged = clamp(origin + direction * Math.max(1, pageCount));
+  return direction > 0 ? Math.max(paged, nearest) : Math.min(paged, nearest);
+}
 
 export interface UseColumnScrollSnapOptions {
   /** Restrict magnetic snapping to phone-class viewports. */
@@ -282,6 +416,19 @@ export function useColumnScrollSnap(
     let pinnedScrollLeft: number | null = null;
     /** Continues correcting late WebKit compositor writes until the next user interaction. */
     let pinReassertTimer: ReturnType<typeof setTimeout> | null = null;
+    /*
+    FNXC:BoardNavigation 2026-07-24-11:20:
+    Release velocity comes from board scrollLeft samples taken while the finger is down, not from
+    finger coordinates: on iOS the native pan owns the touch stream, so scroll ticks are the only
+    faithful record of how fast the content was actually moving at lift.
+    */
+    let velocitySampleScrollLeft = scroller.scrollLeft;
+    let velocitySampleAt = now();
+    let releaseVelocityPxPerMs = 0;
+    /** rAF handle for the hook-owned page animation. */
+    let pageAnimationFrame: number | null = null;
+    /** Inline styles frozen for the duration of the page animation. */
+    let animationStyleRestore: (() => void) | null = null;
 
     const clearIdleTimer = () => {
       if (idleTimer !== null) clearTimeout(idleTimer);
@@ -367,6 +514,95 @@ export function useColumnScrollSnap(
       scroller.scrollLeft = target;
       clearPinReassertion();
       reassertPinnedScrollLeft();
+    };
+
+    /**
+     * Stop the hook-owned page animation and give the axis back to the browser.
+     *
+     * FNXC:BoardNavigation 2026-07-24-11:20:
+     * A re-touch during the animation must hand control straight back to the finger — this is the
+     * corrective seam that replaces tap-to-stop-during-momentum.
+     */
+    const cancelPageAnimation = () => {
+      if (pageAnimationFrame !== null && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(pageAnimationFrame);
+      }
+      pageAnimationFrame = null;
+      if (animationStyleRestore) {
+        const restore = animationStyleRestore;
+        animationStyleRestore = null;
+        restore();
+      }
+    };
+
+    /*
+    FNXC:BoardNavigation 2026-07-24-11:20:
+    `overflow-x: hidden` stays on for the WHOLE animation, not just the first frame: it is what
+    makes the compositor drop the native fling, and a fling left alive fights every per-frame
+    scrollLeft write (the board visibly stutters and can land off-center). Programmatic scrollLeft
+    still applies while the axis is hidden, so the animation itself is unaffected.
+    */
+    const freezeScrollerForAnimation = () => {
+      if (animationStyleRestore) return;
+      const priorOverflowX = scroller.style.overflowX;
+      const priorBehavior = scroller.style.scrollBehavior;
+      const priorWebkit = scroller.style.getPropertyValue("-webkit-overflow-scrolling");
+      scroller.style.scrollBehavior = "auto";
+      scroller.style.overflowX = "hidden";
+      scroller.style.setProperty("-webkit-overflow-scrolling", "auto");
+      animationStyleRestore = () => {
+        scroller.style.overflowX = priorOverflowX;
+        scroller.style.scrollBehavior = priorBehavior;
+        if (priorWebkit) {
+          scroller.style.setProperty("-webkit-overflow-scrolling", priorWebkit);
+        } else {
+          scroller.style.removeProperty("-webkit-overflow-scrolling");
+        }
+      };
+    };
+
+    /**
+     * Animate to a column center over `durationMs`, then pin as a normal settle.
+     *
+     * Falls back to the instant hard jump when motion is reduced, `requestAnimationFrame` is
+     * unavailable, or the distance is not worth animating.
+     */
+    const animateSnapTo = (targetLeft: number, durationMs: number) => {
+      const target = Math.round(targetLeft);
+      const from = scroller.scrollLeft;
+      const distance = target - from;
+
+      pointerHeld = false;
+      suspendNativeSnap();
+      cancelPageAnimation();
+
+      if (
+        Math.abs(distance) < MIN_ANIMATED_DISTANCE_PX ||
+        durationMs <= 0 ||
+        prefersReducedMotion() ||
+        typeof window.requestAnimationFrame !== "function"
+      ) {
+        applySnapTo(target);
+        return;
+      }
+
+      freezeScrollerForAnimation();
+      const startedAt = now();
+
+      const step = () => {
+        pageAnimationFrame = null;
+        const elapsed = now() - startedAt;
+        const progress = elapsed / durationMs;
+        if (progress >= 1) {
+          cancelPageAnimation();
+          applySnapTo(target);
+          return;
+        }
+        scroller.scrollLeft = Math.round(from + distance * easeOutCubic(progress));
+        pageAnimationFrame = window.requestAnimationFrame(step);
+      };
+
+      pageAnimationFrame = window.requestAnimationFrame(step);
     };
 
     /**
@@ -483,6 +719,94 @@ export function useColumnScrollSnap(
       idleTimer = setTimeout(snapInScrollDirection, SCROLL_IDLE_SETTLE_MS);
     };
 
+    /**
+     * Page immediately at finger-up, animating the board there ourselves.
+     *
+     * FNXC:BoardNavigation 2026-07-24-11:20:
+     * This is the "faster momentum" path: instead of arming the idle settle and waiting out native
+     * inertia, a directional lift resolves its target from the ORIGIN column plus a velocity-derived
+     * page count and animates there in ~200ms. Reach scales with flick speed, so a hard fling still
+     * crosses multiple columns without the long coast.
+     */
+    const commitDirectionalPage = (direction: number) => {
+      clearIdleTimer();
+
+      const columns = getSnapColumns(scroller);
+      const viewportWidth = scroller.clientWidth || scroller.getBoundingClientRect().width;
+      if (columns.length < 2 || viewportWidth <= 0) {
+        interactionActive = false;
+        restoreNativeSnap();
+        return;
+      }
+
+      const nearestIndex = nearestColumnIndex(scroller, columns);
+      // A gesture begun mid-transit has no trustworthy origin: page from where it actually is.
+      const originIndex = gestureStartCentered ? gestureStartColumnIndex : nearestIndex;
+      /*
+      FNXC:BoardNavigation 2026-07-25-09:40:
+      Net gesture travel gates multi-column reach. Take the larger of the board's own scroll delta
+      and the finger's horizontal travel: on iOS the native pan owns the touch stream (scroll delta
+      is the faithful signal), while a finger that dragged against a rubber-banding edge shows
+      travel only in the client coordinates.
+      */
+      const scrollTravel = Math.abs(scroller.scrollLeft - gestureStartScrollLeft);
+      const fingerTravel =
+        gestureStartClientX !== null && lastClientX !== null
+          ? Math.abs(gestureStartClientX - lastClientX)
+          : 0;
+      const pageCount = resolvePageCount(resolveReleaseVelocity(), {
+        travelPx: Math.max(scrollTravel, fingerTravel),
+        viewportWidth,
+      });
+      const targetIndex = resolveFlingTargetIndex({
+        columnCount: columns.length,
+        originIndex,
+        direction,
+        pageCount,
+        nearestIndex,
+      });
+
+      interactionActive = false;
+      sawHorizontalMovement = false;
+      lockedDirection = 0;
+      gestureStartClientX = null;
+      lastClientX = null;
+      gestureStartClientY = null;
+      lastClientY = null;
+      releaseVelocityPxPerMs = 0;
+
+      animateSnapTo(
+        scrollLeftToCenterColumn(scroller, columns[targetIndex]),
+        resolvePageAnimationMs(pageCount),
+      );
+    };
+
+    /** Reset the release-velocity window at the start of every fresh gesture baseline. */
+    const resetVelocitySampling = () => {
+      velocitySampleScrollLeft = scroller.scrollLeft;
+      velocitySampleAt = now();
+      releaseVelocityPxPerMs = 0;
+    };
+
+    /** Fold one scroll tick into the release-velocity estimate (px/ms, signed). */
+    const sampleVelocity = (currentScrollLeft: number) => {
+      const at = now();
+      const elapsed = at - velocitySampleAt;
+      // Synchronous same-instant ticks (and test batches) carry no speed information.
+      if (elapsed <= 0) return;
+      releaseVelocityPxPerMs = (currentScrollLeft - velocitySampleScrollLeft) / elapsed;
+      velocitySampleScrollLeft = currentScrollLeft;
+      velocitySampleAt = at;
+    };
+
+    /*
+    FNXC:BoardNavigation 2026-07-24-11:20:
+    A finger that moved fast and then held still before lifting must NOT page like a flick: the last
+    sample would still read fast. Velocity older than the sample window counts as a resting finger.
+    */
+    const resolveReleaseVelocity = (): number =>
+      now() - velocitySampleAt > VELOCITY_SAMPLE_WINDOW_MS ? 0 : releaseVelocityPxPerMs;
+
     /*
     FNXC:BoardNavigation 2026-07-22-15:10:
     A second touch during post-lift momentum must cancel the pending directional settle and start a fresh gesture at the current scrollLeft.
@@ -493,6 +817,13 @@ export function useColumnScrollSnap(
 
       if (event.type === "touchstart") touchSequenceActive = true;
       clearPin();
+      /*
+      FNXC:BoardNavigation 2026-07-24-11:20:
+      A touch landing mid-animation takes the axis back immediately (overflow restored, rAF
+      dropped) so the finger drags from wherever the page had reached.
+      */
+      cancelPageAnimation();
+      resetVelocitySampling();
 
       // Mid-momentum re-touch (or duplicate pointerdown+touchstart): cancel pending snap and re-baseline.
       if (interactionActive) {
@@ -593,8 +924,12 @@ export function useColumnScrollSnap(
       lastScrollLeft = current;
       markMoved();
 
-      // While finger is down: free-scroll only. After lift: re-arm idle (momentum).
-      if (pointerHeld) return;
+      // While finger is down: free-scroll only, sampling speed for the release page count.
+      if (pointerHeld) {
+        sampleVelocity(current);
+        return;
+      }
+      // Post-lift ticks (residual inertia before our page takes over): keep the fallback armed.
       armIdleSettle();
     };
 
@@ -612,6 +947,16 @@ export function useColumnScrollSnap(
       if (!sawHorizontalMovement && lockedDirection === 0) {
         clearIdleTimer();
         snapInScrollDirection();
+        return;
+      }
+      /*
+      FNXC:BoardNavigation 2026-07-24-11:20:
+      Directional lift pages NOW instead of arming the idle settle — the whole point of owning the
+      momentum. Net-zero-direction pans (weak or reversed gestures) still fall through to the idle
+      settle, which rests them on the nearest center.
+      */
+      if (lockedDirection !== 0) {
+        commitDirectionalPage(lockedDirection);
         return;
       }
       armIdleSettle();
@@ -634,7 +979,10 @@ export function useColumnScrollSnap(
       pointerHeld = false;
       releasePointerCapture();
       lockDirectionFromGesture();
-      if (sawHorizontalMovement || lockedDirection !== 0) {
+      if (lockedDirection !== 0) {
+        // Genuine cancel with pan intent: page like a lift rather than coasting to an idle settle.
+        commitDirectionalPage(lockedDirection);
+      } else if (sawHorizontalMovement) {
         armIdleSettle();
       } else {
         // FNXC:BoardNavigation 2026-07-22-15:26: Cancelled zero-pan touch must not leave mid-column.
@@ -668,6 +1016,8 @@ export function useColumnScrollSnap(
     return () => {
       clearIdleTimer();
       clearPin();
+      // Unmount mid-animation must not leave the scroller frozen at `overflow-x: hidden`.
+      cancelPageAnimation();
       releasePointerCapture();
       restoreNativeSnap();
       scroller.removeEventListener("pointerdown", beginInteraction);

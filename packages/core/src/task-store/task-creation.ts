@@ -430,8 +430,30 @@ export async function _createTaskInternalBackendImpl(store: TaskStore, input: Ta
       workflow's resolved manual intake (e.g. Coding (Ideas) → "ideas"). Direct
       creates into other columns keep generateSpecifiedPrompt (main parity).
       */
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-25-14:20:
+      Quick-add "Start" collapses create+promote into ONE request: it submits the workflow id AND
+      the post-intake destination column together, so the card lands in `todo` having never sat in
+      the workflow's manual intake column. It is still UNPLANNED — nothing has written a spec — but
+      the intake test above only matched `triage` or the resolved intake column, so the card got
+      `generateSpecifiedPrompt` instead of the bootstrap seed.
+
+      That stranded the card permanently: triage's todo-discovery admits a card only when its
+      PROMPT.md reads as a seed, so a placeholder spec is classified "already planned" and never
+      planned, while `generateSpecifiedPrompt` emits hard-coded boilerplate steps ("Implement the
+      required changes") that no planner ever produced. The card sat in Todo forever with no log
+      line in any lane. Observed on FN-8587.
+
+      Guarded to manual-intake workflows (resolved intake is not the legacy `triage`) landing in the
+      plan-in-place `todo` column, so the pinned contract for a plain direct create into todo on the
+      default workflow — which intentionally keeps generateSpecifiedPrompt — is untouched.
+      */
+      const isUnplannedStartCreate = options?.resolvedEntryColumn !== undefined
+        && options.resolvedEntryColumn !== "triage"
+        && task.column === "todo";
       const isIntakeColumn = task.column === "triage"
-        || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn);
+        || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn)
+        || isUnplannedStartCreate;
       const usedBootstrapPrompt = !options?.promptOverride && isIntakeColumn;
       const prompt = options?.promptOverride
         ?? (isIntakeColumn
@@ -1053,8 +1075,18 @@ export async function _createTaskInternalImpl(store: TaskStore, input: TaskCreat
     workflow's resolved manual intake (e.g. Coding (Ideas) → "ideas"). Direct
     creates into other columns keep generateSpecifiedPrompt (main parity).
     */
+    /*
+    FNXC:CodingIdeasWorkflow 2026-07-25-14:20:
+    Mirror of the backend path above — quick-add "Start" submits workflow id + post-intake column in
+    one request, so the card is unplanned despite not landing in the intake column. See the fuller
+    rationale there; keeping both copies in step is the whole point (this pair has drifted before).
+    */
+    const isUnplannedStartCreate = options?.resolvedEntryColumn !== undefined
+      && options.resolvedEntryColumn !== "triage"
+      && task.column === "todo";
     const isIntakeColumn = task.column === "triage"
-      || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn);
+      || (options?.resolvedEntryColumn !== undefined && task.column === options.resolvedEntryColumn)
+      || isUnplannedStartCreate;
     const usedBootstrapPrompt = !options?.promptOverride && isIntakeColumn;
     const prompt = options?.promptOverride
       ?? (isIntakeColumn

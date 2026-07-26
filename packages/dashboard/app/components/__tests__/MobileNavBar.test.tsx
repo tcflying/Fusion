@@ -5,6 +5,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MobileNavBar } from "../MobileNavBar";
 import { MOBILE_NAV_SELECTABLE_ITEMS } from "../../../../core/src/mobile-nav-primary-items";
 import { MOBILE_MEDIA_QUERY } from "../../hooks/useViewportMode";
+import { readAppFile } from "../../test/cssFixture";
 
 vi.mock("../../api", () => ({
   fetchScripts: vi.fn(),
@@ -29,7 +30,7 @@ function mockViewport(mode: "mobile" | "desktop") {
   });
 }
 
-const mobileNavCss = readFileSync(resolve(process.cwd(), "app/components/MobileNavBar.css"), "utf8");
+const mobileNavCss = readAppFile("components/MobileNavBar.css");
 
 function extractRuleBlock(css: string, selector: string): string {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

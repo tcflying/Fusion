@@ -8,6 +8,7 @@ import {
   runLinkLocalFnBinary,
   runUseGlobalFnBinary,
 } from "../fn-binary-local-install.js";
+import { requireAsyncLayer } from "../require-async-layer.js";
 import { writeSSEEvent } from "../sse-buffer.js";
 import type { ApiRoutesContext } from "./types.js";
 import type { SystemLogEntry } from "../server.js";
@@ -625,7 +626,19 @@ export function registerSystemRoutes(ctx: ApiRoutesContext, deps: SystemRouteDep
     if (rejectCrossOrigin(req, res)) return;
     try {
       const { store: scopedStore } = await getProjectContext(req);
-      const agentStore = new AgentStore({ rootDir: scopedStore.getFusionDir() });
+      /*
+      FNXC:SystemPanel 2026-07-25-11:40:
+      Restart-all reads agents from the same authoritative project PostgreSQL layer as every
+      other agent surface. Constructing AgentStore with only `rootDir` fell through to the
+      deleted sync SQLite Database path (VAL-REMOVAL-005), so the control threw
+      "SQLite Database class body has been removed" instead of bouncing agents. Fail loudly via
+      requireAsyncLayer when project wiring is incomplete rather than reading a SQLite shadow.
+      */
+      const agentStore = new AgentStore({
+        rootDir: scopedStore.getFusionDir(),
+        taskStore: scopedStore,
+        asyncLayer: requireAsyncLayer(scopedStore, "System panel agent restart-all"),
+      });
       await agentStore.init();
 
       const monitor =

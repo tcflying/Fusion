@@ -94,6 +94,7 @@ import { registerRuntimeProviderRoutes } from "./routes/register-runtime-provide
 import { registerHappierDirectSessionRoutes } from "./routes/register-happier-direct-session-routes.js";
 import { registerFnBinaryRoutes } from "./routes/register-fn-binary-routes.js";
 import { registerUpdateCheckRoutes } from "./routes/register-update-check-routes.js";
+import { registerVoiceRoutes } from "./routes/register-voice-routes.js";
 import { registerDiagnosticsRoutes } from "./routes/register-diagnostics-routes.js";
 import { registerSystemRoutes } from "./routes/register-system-routes.js";
 import { registerCliAgentHooksRoute } from "./routes/cli-agent-hooks.js";
@@ -1268,6 +1269,7 @@ export function createApiRoutes(store: TaskStore, options?: ApiRoutesOptions): R
   // by opening storm-guarded fix tasks back in triage.
   registrarMounter.mount("registerMonitorRoutes", () => registerMonitorRoutes(routeContext));
   registrarMounter.mount("registerUpdateCheckRoutes", () => registerUpdateCheckRoutes(routeContext));
+  registrarMounter.mount("registerVoiceRoutes", () => registerVoiceRoutes(routeContext));
   registrarMounter.mount("registerDiagnosticsRoutes", () => registerDiagnosticsRoutes(routeContext));
   // CLI Agent Executor hook ingestion (U17) — per-session token auth, exempt from
   // the daemon bearer-token middleware (hook scripts only hold the session token).

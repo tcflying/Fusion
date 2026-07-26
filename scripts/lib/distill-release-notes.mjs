@@ -5,9 +5,14 @@
  *
  * FNXC:Changelog 2026-07-13-15:45:
  * Highlights + X draft are AI-authored via the local Claude CLI
- * (`claude -p --model sonnet`). Each release gets a fresh engagement-oriented
+ * (`claude -p --model <model>`). Each release gets a fresh engagement-oriented
  * tweet (not a fixed template). Deterministic ranking remains only as a soft
  * fallback so offline/CI releases without Claude never block.
+ *
+ * FNXC:Changelog 2026-07-24-11:05:
+ * Authored by Opus (see DEFAULT_CLAUDE_MODEL), and channel-aware: BOTH channels
+ * get an X draft, with beta drafts written as a call for testers carrying the
+ * `fn update --channel beta` opt-in.
  */
 
 import { spawnSync } from "node:child_process";
@@ -17,11 +22,24 @@ import { CATEGORIES, CATEGORY_HEADINGS } from "./changeset-schema.mjs";
 export const HIGHLIGHTS_MIN = 3;
 export const HIGHLIGHTS_MAX = 5;
 
+/*
+ * FNXC:Changelog 2026-07-24-11:05:
+ * Release copy is authored by OPUS, not sonnet: highlights and the X draft are
+ * the only release artifacts a human reads verbatim, they are written once per
+ * release, and the quality gap shows. Opus is slower, so the CLI budget triples
+ * to 4 minutes; the deterministic fallback still covers a timeout.
+ * `FUSION_RELEASE_CLAUDE_MODEL` still overrides the model.
+ */
+
 /** Wall-clock budget for the Claude CLI call. */
-export const RELEASE_LLM_TIMEOUT_MS = 90_000;
+export const RELEASE_LLM_TIMEOUT_MS = 240_000;
 
 /** Default Claude model alias for release distillation. */
-export const DEFAULT_CLAUDE_MODEL = "sonnet";
+export const DEFAULT_CLAUDE_MODEL = "opus";
+
+/** Tweet budget: X's hard cap, and the length below which a draft reads thin. */
+export const TWEET_MAX_CHARS = 280;
+export const TWEET_TARGET_MIN_CHARS = 200;
 
 /**
  * Lower number = higher highlight priority (deterministic fallback only).
@@ -63,29 +81,75 @@ export const DISTILLATION_SYSTEM_PROMPT = [
   "Return STRICT JSON only — no markdown fences, no preamble:",
   '{ "highlights": string[3..5], "notes": string, "tweet": string }',
   "",
+  /*
+   * FNXC:Changelog 2026-07-24-11:05:
+   * Highlights are the section operators actually read, so they must name the
+   * surface and the outcome. Vague filler ("various improvements", "enhanced
+   * reliability") is what made past Highlights sections skimmable-but-useless.
+   */
   "highlights:",
-  "- Top 3–5 user-facing changes (prefer breaking, security, features, then fixes).",
-  "- Punchy, benefit-led phrasing. Do not invent features not in the input.",
-  "- One short phrase/sentence per item; no markdown inside the strings.",
+  "- The 3–5 changes an operator would most want to know about. Rank by impact:",
+  "  breaking > security > the release's headline feature > widely-hit fixes > performance.",
+  "- Each item names the SURFACE it lands on (board, Command Center, task detail, CLI,",
+  "  dashboard, engine, mobile, desktop, updater…) and the OUTCOME for the operator.",
+  "- Lead with the outcome, not the mechanism: \"Board scrolling stays smooth with 200+ tasks\",",
+  "  not \"Refactored the kanban virtualization layer\".",
+  "- Be concrete. Keep real numbers, versions, limits, and names from the input.",
+  "- Merge duplicates: several entries about one area become ONE highlight.",
+  "- Banned as vague filler: 'various', 'several improvements', 'under the hood',",
+  "  'enhanced', 'better overall', 'general polish', 'misc'.",
+  "- Never invent a change that is not in the input. Never name a file, class, or symbol.",
+  "- ≤ 100 characters each, sentence case, no trailing period, no markdown.",
   "",
   "notes:",
   "- Markdown body only (no version heading).",
   "- Start with ### Highlights using the same 3–5 items as `- ` bullets.",
   "- Then group under (omit empty): ### New, ### Fixed, ### Breaking, ### Security, ### Performance, ### Internal.",
   "- One `- ` bullet per entry; lightly edit for clarity; no file paths or class names.",
+  "- Within a group, most operator-visible first.",
   "",
+  /*
+   * FNXC:Changelog 2026-07-24-11:05:
+   * The X draft must EARN the 280 characters: earlier drafts came back at ~120
+   * chars of generic hype and wasted more than half the budget. Specifics from
+   * the release are the engagement driver, so the prompt demands named changes
+   * and a target length band, and bans the stock launch-announcement voice.
+   */
   "tweet:",
-  "- Ready to post on X. Hard max 280 characters including spaces and the URL.",
-  "- Goal: drive engagement (curiosity, replies, clicks) — not a dry changelog dump.",
-  "- Vary tone per release (excited, wry, bold, founder-voice). Never reuse a fixed template.",
+  `- Ready to post on X. Hard max ${TWEET_MAX_CHARS} characters including spaces and the URL.`,
+  `- USE THE BUDGET: aim for ${TWEET_TARGET_MIN_CHARS}–${TWEET_MAX_CHARS} characters. A short, vague tweet is a failure;`,
+  "  spend the room on specifics instead of adjectives. Count characters before answering.",
   "- Open with Fusion + version + colon, no leading v — e.g. \"Fusion 0.58: …\" (drop .0 patch when patch is 0; keep 0.58.1 as-is). Never \"v0.58.0:\" alone.",
+  "- After that opener, earn the read: a hook line, then 2–4 CONCRETE changes with their",
+  "  real numbers/surfaces, then the link. Line breaks are fine and improve scannability.",
+  "- Structure must vary release to release — pick one and commit: sharp one-liner + detail,",
+  "  before→after contrast, a stat or limit that surprises, a pointed question, a bold claim",
+  "  you then back up, or a tight list. Never reuse the previous release's shape.",
+  "- Voice: a technical founder shipping to peers. Confident, specific, a little opinionated.",
+  "- Banned openers and filler: 'excited to announce', 'we've been busy', 'thrilled',",
+  "  'a lot to unpack', 'game-changer', 'supercharged', 'and much more', 'ships with'.",
+  "- Do not enumerate every change — pick the ones a skeptical developer would stop for.",
   "- Include a link: prefer the static GitHub changelog path when it fits.",
   "- Link form: no https:// scheme — always github.com/Runfusion/Fusion/blob/main/CHANGELOG.md (not a version tag).",
-  "- If that still exceeds 280 chars, use runfusion.ai instead.",
-  "- Weave 2–4 of the highlights into a scroll-stopping hook; questions, contrast, or a bold claim are fine.",
-  "- Plain text only. At most one hashtag. Emoji optional and sparse.",
+  "- If that still exceeds the limit, use runfusion.ai instead.",
+  "- Plain text only. At most one hashtag. At most one emoji, and only if it earns its place.",
   "",
   "JSON only.",
+].join("\n");
+
+/*
+ * FNXC:Changelog 2026-07-24-11:05:
+ * Betas get their own X draft too (previously stable-only). A beta post is a
+ * call for testers, not a launch: it must say it is a beta and give the real
+ * opt-in command (`fn update --channel beta`), so nobody reads a prerelease as
+ * generally available.
+ */
+export const BETA_TWEET_GUIDANCE = [
+  "This is a BETA prerelease, not a stable launch. Adjust the tweet accordingly:",
+  "- Say plainly that it is a beta; never imply general availability.",
+  "- Frame it as a call for testers: what to try, what feedback is useful.",
+  "- Include the opt-in command `fn update --channel beta` (it counts toward the character budget).",
+  "- Still specific and still ≤ the character limit; keep the same anti-hype rules.",
 ].join("\n");
 
 /**
@@ -96,18 +160,25 @@ export const DISTILLATION_SYSTEM_PROMPT = [
  * @param {string} changelogUrl
  * @returns {string}
  */
-export function buildDistillationPrompt(entries, version, changelogUrl) {
+export function buildDistillationPrompt(entries, version, changelogUrl, options = {}) {
+  const channel = options.channel === "beta" ? "beta" : "stable";
   const opener = `${formatTweetVersionLabel(version)}:`;
   const lines = [
     `Version: ${version}`,
+    `Channel: ${channel}`,
     `Tweet opener (required form): ${opener}`,
-    `Changelog URL (prefer in the tweet when it fits ≤280): ${changelogUrl}`,
+    `Changelog URL (prefer in the tweet when it fits ≤${TWEET_MAX_CHARS}): ${changelogUrl}`,
     `Short link (use if the full changelog URL won't fit): ${SHORT_RELEASE_URL}`,
     "",
     "Write fresh, engagement-driving release copy from these changeset entries.",
     `Start the tweet with "${opener}" (no leading v; omit trailing .0 patch when patch is 0).`,
-    "Do not use a stock \"X is out!\" opener every time — earn the click after that prefix.\n",
+    "Do not use a stock \"X is out!\" opener every time — earn the click after that prefix.",
+    `Target ${TWEET_TARGET_MIN_CHARS}–${TWEET_MAX_CHARS} characters for the tweet; count them before answering.`,
   ];
+  if (channel === "beta") {
+    lines.push("", BETA_TWEET_GUIDANCE);
+  }
+  lines.push("");
   entries.forEach((entry, i) => {
     const num = i + 1;
     lines.push(`[${num}]`);
@@ -180,10 +251,18 @@ export function formatTweetVersionLabel(version) {
   const m = bare.match(/^(\d+)\.(\d+)\.(\d+)(.*)$/);
   if (m) {
     const [, major, minor, patch, rest] = m;
-    const display = Number(patch) === 0
-      ? `${major}.${minor}${rest}`
-      : `${major}.${minor}.${patch}${rest}`;
-    return `Fusion ${display}`;
+    const core = Number(patch) === 0 ? `${major}.${minor}` : `${major}.${minor}.${patch}`;
+    /*
+     * FNXC:Changelog 2026-07-24-11:05:
+     * Prereleases now get their own opener. Reusing the stable rule produced
+     * "Fusion 0.74-beta.0" (patch dropped mid-identifier, unreadable); a beta
+     * post reads as "Fusion 0.74 beta:" — the beta counter is noise on X.
+     */
+    if (rest) {
+      const preTag = rest.replace(/^-/, "").split(".")[0];
+      return `Fusion ${core} ${preTag || "pre"}`;
+    }
+    return `Fusion ${core}`;
   }
   return `Fusion ${bare}`;
 }
@@ -568,6 +647,7 @@ export function chatViaClaudeCli(opts) {
  *   env?: Record<string, string | undefined>,
  *   chatComplete?: (args: {system: string, user: string}) => Promise<string | null> | string | null,
  *   allowClaudeCli?: boolean,
+ *   channel?: "beta" | "stable",
  *   timeoutMs?: number,
  *   spawnImpl?: typeof spawnSync,
  * }} [options]
@@ -578,7 +658,9 @@ export async function distillWithAi(entries, version, options = {}) {
 
   const changelogUrl = options.changelogUrl || buildChangelogUrl(version);
   const system = DISTILLATION_SYSTEM_PROMPT;
-  const user = buildDistillationPrompt(entries, version, changelogUrl);
+  const user = buildDistillationPrompt(entries, version, changelogUrl, {
+    channel: options.channel,
+  });
 
   let raw = null;
 

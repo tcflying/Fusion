@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 const execAsync = promisify(exec);
 import { createInterface } from "node:readline/promises";
 import { resolveProjectPathOnly } from "../project-context.js";
+import { promptOutputStream, result } from "../output.js";
 
 /**
  * FNXC:CliBoardMutation 2026-07-09-00:00:
@@ -322,11 +323,15 @@ export async function runGitPull(options: { skipConfirm?: boolean; projectName?:
 
   // Warn about uncommitted changes
   if (status.isDirty && !options.skipConfirm) {
-    console.log();
-    console.log("  ⚠ Warning: You have uncommitted changes.");
-    console.log(`  Branch: ${status.branch}`);
+    /*
+     * FNXC:CliQuietMode 2026-07-16-00:00:
+     * The dirty-worktree warning identifies the consequence the user is being
+     * asked to confirm, so it must bypass quiet-mode chatter suppression.
+     */
+    result(`\n  ⚠ Warning: You have uncommitted changes.\n  Branch: ${status.branch}\n`);
 
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
     const answer = await rl.question("  Continue with pull? [y/N] ");
     rl.close();
 
@@ -394,7 +399,7 @@ export async function runGitPush(options: { skipConfirm?: boolean; projectName?:
   // Confirmation prompt
   if (!options.skipConfirm) {
     console.log();
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     const answer = await rl.question(`  Push branch ${status.branch} to remote? [Y/n] `);
     rl.close();
 

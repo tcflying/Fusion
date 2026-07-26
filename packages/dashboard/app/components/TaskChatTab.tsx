@@ -7,6 +7,8 @@ import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { addSteeringComment, refineTask } from "../api";
 import { useAgentLogs } from "../hooks/useAgentLogs";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import type { ToastType } from "../hooks/useToast";
 import { getErrorMessage } from "@fusion/core";
 import { linkifyFilePaths } from "../utils/filePathLinkify";
@@ -640,6 +642,7 @@ export function TaskChatTab({ task, projectId, active, addToast, onTaskUpdated, 
   const previousActiveRef = useRef(false);
   const anchorFrameRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef, value: draft, onChange: setDraft, projectId });
 
   const userMessages = useMemo(
     () => mergeUserMessages(task.steeringComments, optimisticMessages),
@@ -1077,6 +1080,7 @@ export function TaskChatTab({ task, projectId, active, addToast, onTaskUpdated, 
             aria-label={t("taskChat.messageActiveAgentSession", "Message active agent session")}
             rows={1}
           />
+          <MicButton {...dictation.micProps} disabled={sending} />
           <button
             type="submit"
             className="btn btn-primary btn-icon task-chat-send"

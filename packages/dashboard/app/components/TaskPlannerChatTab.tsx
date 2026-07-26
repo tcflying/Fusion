@@ -4,6 +4,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, Maximize2, Minimize2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { ToastType } from "../hooks/useToast";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import type { ChatMessageInfo, ToolCallInfo } from "../hooks/chatTypes";
 import { attachChatStream, editChatMessage, ensureTaskPlannerChatSession, fetchChatMessages, fetchChatSession, fetchTaskDetail, fetchTaskPlannerChatSession, streamChatResponse, type ChatFailureInfo, type ChatStreamErrorMeta } from "../api";
 import { parseQuestionToolCall, type ParsedQuestionToolCall } from "../utils/parseQuestionToolCall";
@@ -309,6 +311,8 @@ export function TaskPlannerChatTab({ task, projectId, active, expanded = false, 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef: composerTextareaRef, value: draft, onChange: setDraft, projectId });
   const [showCommandMenu, setShowCommandMenu] = useState(false);
   const [commandFilter, setCommandFilter] = useState("");
   const [highlightedCommandIndex, setHighlightedCommandIndex] = useState(0);
@@ -1099,6 +1103,7 @@ export function TaskPlannerChatTab({ task, projectId, active, expanded = false, 
                   activeModelTag={activeModelTag}
                   activeModelProvider={planningModelProvider ?? null}
                   activeSessionId={sessionId}
+                  projectId={projectId}
                   isAwaitingQuestionAnswer={message.role === "assistant"}
                   onQuestionSubmit={(answerText) => void sendMessageContent(answerText)}
                   toolCallRenderer={(toolCall, index) => renderPlannerToolCall(message, toolCall, index)}
@@ -1164,6 +1169,7 @@ export function TaskPlannerChatTab({ task, projectId, active, expanded = false, 
       )}
       <div className="task-planner-chat-composer">
         <textarea
+          ref={composerTextareaRef}
           className="input task-planner-chat-input"
           aria-label={t("taskDetail.plannerChat.inputLabel", "Message planner chat")}
           placeholder={t("taskDetail.plannerChat.placeholder", "Ask the planner about this task… Type / for commands")}
@@ -1173,6 +1179,7 @@ export function TaskPlannerChatTab({ task, projectId, active, expanded = false, 
           disabled={composerState === "sending"}
           rows={1}
         />
+        <MicButton {...dictation.micProps} disabled={composerState === "sending"} />
         <StandardChatActionButton
           isStreaming={composerState === "sending"}
           canSend={canSend}

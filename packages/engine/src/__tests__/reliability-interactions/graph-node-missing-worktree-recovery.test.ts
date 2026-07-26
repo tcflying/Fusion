@@ -296,7 +296,14 @@ describe("Plan Review missing-worktree repo-root fallback (FN-7996)", () => {
     mockedExecSync.mockReturnValue("" as any);
   });
 
-  it("runs the Plan Review reviewer from the repo root when the recorded worktree is gone", async () => {
+  /*
+  FNXC:NodeWorktreeIsolation 2026-07-25-22:10:
+  FN-7996's invariant is unchanged — a missing recorded worktree must never terminal-park Plan Review —
+  but the remedy is no longer "run in the shared repo root". Every lane now runs in the TASK's own
+  worktree, so the reviewer RE-ACQUIRES one. The assertion below is the same symptom (stale path gone,
+  review still runs) with the shared checkout removed as an outcome.
+  */
+  it("re-acquires a task worktree for Plan Review when the recorded worktree is gone (never the repo root)", async () => {
     const store = createMockStore();
     const executor = new TaskExecutor(store, "/tmp/test");
     mockedExistsSync.mockImplementation((path: unknown) => path !== "/tmp/stale-wt");
@@ -317,10 +324,13 @@ describe("Plan Review missing-worktree repo-root fallback (FN-7996)", () => {
     const result = await (executor as any).runGraphCustomNode(node, live, {}, undefined);
 
     expect(result.outcome).toBe("success");
-    expect(captured.worktreePath).toBe("/tmp/test");
+    // Not the stale path, and — the point of the change — not the shared repo root either.
+    expect(captured.worktreePath).not.toBe("/tmp/stale-wt");
+    expect(captured.worktreePath).not.toBe("/tmp/test");
+    expect(captured.worktreePath).toContain("/tmp/test/.worktrees/");
     expect(store.logEntry).toHaveBeenCalledWith(
       live.id,
-      expect.stringContaining("running the reviewer from the repo root"),
+      expect.stringContaining("re-acquiring a task worktree instead of running in the shared checkout"),
       undefined,
       undefined,
     );

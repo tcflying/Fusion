@@ -1195,6 +1195,7 @@
       "mergeBlocked": "",
       "promoteRejected": "",
       "unknownColumn": "",
+      "unplannedForExecution": "",
       "workflowMismatch": ""
     },
     "todo": "待辦",
@@ -1505,6 +1506,10 @@
     "preserveProgressMessage": "此工作已完成步驟。在移動前保留進度？",
     "preserveProgressMoveTodoMessage": "某些工作已完成步驟。在移至待辦前保留進度？",
     "preserveProgressTitle": "保留進度？",
+    "promoteUnplannedCancel": "",
+    "promoteUnplannedConfirm": "",
+    "promoteUnplannedMessage": "",
+    "promoteUnplannedTitle": "",
     "replanAll": "全部重新規劃",
     "replanAllHint_one": "",
     "replanAllHint_other": "",
@@ -5755,7 +5760,13 @@
       "statusActive": "✓ 已啟用",
       "statusNotConnected": "✗ 未連線",
       "title": "驗證",
-      "waitingForLogin": "等待登入…"
+      "waitingForLogin": "等待登入…",
+      "anthropicPreferenceLabel": "Anthropic credential to use",
+      "anthropicPreferenceHint": "You have both an Anthropic API key and a Claude subscription connected. Choose which one Fusion sends when a lane calls Anthropic directly. Default: API key.",
+      "anthropicPreferenceApiKey": "API key",
+      "anthropicPreferenceSubscription": "Claude subscription",
+      "credentialInUse": "In use",
+      "credentialOverridden": "Overridden below"
     },
     "authentication": {
       "enterAPIKey": "",
@@ -6360,7 +6371,8 @@
       },
       "globalMcp": "MCP Servers · Global",
       "mcp": "MCP Servers · Project",
-      "configVersions": "設定版本"
+      "configVersions": "設定版本",
+      "voiceInput": "Voice Input"
     },
     "nodeRouting": {
       "blockExecution": "",
@@ -6880,6 +6892,25 @@
       "confirmTitle": "回滾設定？",
       "confirmMessage": "還原此版本？回滾會記錄為新版本。",
       "confirmRollback": "回滾"
+    },
+    "voiceInput": {
+      "title": "Voice Input",
+      "enable": "Enable voice input",
+      "enableHelp": "Default: off. Voice dictation uses the operator-managed Parakeet v3 model.",
+      "modelStatus": "Parakeet v3 model status",
+      "modelStatusHelp": "The speech model is installed and managed locally on this device.",
+      "modelActions": "Model management",
+      "modelActionsHelp": "Download or remove the Parakeet v3 speech model.",
+      "statusUnavailable": "Voice runtime status could not be determined; voice mode stays disabled.",
+      "runtimeUnavailable": "Voice runtime unavailable",
+      "unknown": "Status unavailable",
+      "downloading": "Downloading model…",
+      "downloadingProgress": "Downloading: {{progress}}%",
+      "installed": "Installed",
+      "notInstalled": "Not installed",
+      "download": "Download",
+      "remove": "Remove",
+      "error": "Model error: {{message}}"
     }
   },
   "setup": {
@@ -8306,6 +8337,10 @@
     "closeIssue": "關閉 Issue",
     "collapse": "收合",
     "createdByAgent": "由代理程式建立",
+    "createdAt": "建立於 {{date}}",
+    "createdAtTitle": "建立於 {{date}}",
+    "completedAt": "完成於 {{date}}",
+    "completedAtTitle": "完成於 {{date}}",
     "createdByAgentNamed": "由代理程式建立：{{name}}",
     "createdPr": "已建立 PR #{{number}}",
     "createFailed": "建立任務失敗",

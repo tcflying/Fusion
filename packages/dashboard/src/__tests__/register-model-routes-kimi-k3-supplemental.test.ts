@@ -4,9 +4,9 @@ import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { registerModelRoutes } from "../routes/register-model-routes.js";
 
 /*
-FNXC:ModelCatalog 2026-07-16-19:05:
-FN-8180 requires Kimi K3 to reach both model-catalog consumers. This route-level
-coverage uses pi 0.81.1's actual built-in ModelRuntime catalog after refresh, so an
+FNXC:ModelCatalog 2026-07-24-12:00:
+FN-8564 requires Kimi K3 to reach both model-catalog consumers. This route-level
+coverage uses Pi 0.82.0's actual built-in ModelRuntime catalog after refresh, so an
 SDK catalog regression cannot leave the Dashboard dropdown missing K3 while the engine
 registry test remains green.
 */

@@ -8,11 +8,13 @@ import type { Task, Settings, TaskPriority, ResolvedWorkflowOptionalStep, Thinki
 import type { ModelInfo, Agent, CreateTaskInput, DuplicateMatch, BoardWorkflowDefinition, NodeInfo } from "../api";
 import { checkDuplicateTasks, fetchModels, fetchSettings, updateGlobalSettings, fetchAgents, uploadAttachment, fetchWorkflowOptionalSteps } from "../api";
 import { DuplicateWarningModal } from "./DuplicateWarningModal";
-import { Link, Paperclip, Brain, Lightbulb, ListTree, Sparkles, Save, ChevronDown, ChevronUp, ChevronRight, Bot, Server, Zap, Eye, EyeOff } from "lucide-react";
+import { Link, Paperclip, Brain, Lightbulb, ListTree, Sparkles, Save, ChevronDown, ChevronUp, ChevronRight, Bot, Server, Zap, Eye, EyeOff, Play } from "lucide-react";
 import { CustomModelDropdown } from "./CustomModelDropdown";
 import { LoadingSpinner } from "./LoadingSpinner";
 import { getScopedItem, removeScopedItem, setScopedItem } from "../utils/projectStorage";
 import { useNodes } from "../hooks/useNodes";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import { NodeHealthDot } from "./NodeHealthDot";
 import { ProviderIcon } from "./ProviderIcon";
 import { WorkflowOptionalStepsDropdown } from "./WorkflowOptionalStepsDropdown";
@@ -20,6 +22,7 @@ import { WorkflowIcon } from "./WorkflowIcon";
 import { PendingAttachmentPreviews } from "./PendingAttachmentPreviews";
 import { getPriorityColorVar, getPriorityIcon, getPriorityLabel } from "../utils/priorityIndicator";
 import { validateQuickAddStartWorkflow, workflowSupportsQuickAddStart, resolveQuickAddStartInitialColumn, resolveQuickAddStartTargetColumn, type ValidatedQuickAddWorkflow } from "../utils/quickAddStart";
+import { computeFixedMenuPosition, getLayoutViewportSize } from "../utils/fixedMenuPosition";
 
 const STORAGE_KEY = "kb-quick-entry-text";
 const ALLOWED_TASK_ATTACHMENT_TYPES = new Set([
@@ -170,15 +173,10 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   // Starts expanded by default — controls visible immediately
   const [isDisclosureExpanded, setIsDisclosureExpanded] = useState(defaultExpanded);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictation = useComposerDictation({ textareaRef, value: description, onChange: setDescription, projectId });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const touchButtonRef = useRef<HTMLButtonElement | null>(null);
-  const saveButtonRef = useRef<HTMLButtonElement | null>(null);
   const startIntentRef = useRef<ValidatedQuickAddWorkflow | null>(null);
-  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const longPressStartRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
-  const suppressSaveClickRef = useRef(false);
-  const [showStartMenu, setShowStartMenu] = useState(false);
-  const [startMenuPosition, setStartMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const justResetRef = useRef(false);
   const previousProjectIdRef = useRef(projectId);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
@@ -373,15 +371,17 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
   const selectedWorkflowForCreate = workflowId === undefined ? undefined : quickEntryWorkflowId;
   const validatedStartWorkflow = useMemo(() => validateQuickAddStartWorkflow(selectedQuickEntryWorkflow), [selectedQuickEntryWorkflow]);
   const startInitialColumn = validatedStartWorkflow ? resolveQuickAddStartInitialColumn(validatedStartWorkflow) : null;
+  /*
+  FNXC:QuickAddStart 2026-07-24-11:20:
+  Start is a VISIBLE button in the quick-add action row for eligible workflows only, replacing the hidden
+  long-press/right-click Save menu that operators could not discover. Eligibility is unchanged
+  (`workflowSupportsQuickAddStart`: Coding (Ideas), or any workflow whose first visible lane is a hold/"waiting"
+  column) and a provable target is still required (`startInitialColumn` for the create-time column override, or
+  `onMoveTask` for the follow-up move). Workflows without a waiting lane render no Start button at all — Save
+  stays the single create affordance there.
+  */
   const canQuickAddStart = Boolean(validatedStartWorkflow && workflowSupportsQuickAddStart(validatedStartWorkflow) && (startInitialColumn || onMoveTask));
-  const canOpenQuickAddStartMenu = canQuickAddStart && Boolean(description.trim()) && !isSubmitting;
-
-  useEffect(() => {
-    if (!canOpenQuickAddStartMenu) {
-      setShowStartMenu(false);
-      setStartMenuPosition(null);
-    }
-  }, [canOpenQuickAddStartMenu]);
+  const canQuickAddStartNow = canQuickAddStart && Boolean(description.trim()) && !isSubmitting;
 
   useEffect(() => {
     const parentChanged = previousWorkflowDefaultRef.current.workflowId !== workflowId
@@ -849,7 +849,13 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
         if (target && onMoveTask) {
           try {
             await onMoveTask(createdTask.id, target as ColumnId);
-            addToast(t("tasks.startedPlanning", "Started planning {{taskId}}", { taskId: createdTask.id }), "success");
+            /*
+            FNXC:CodingIdeasWorkflow 2026-07-25-12:05:
+            Honest copy: this path performs a column move, not a plan dispatch. The old "Started
+            planning" claim was optimistic — planning begins when the engine admits the card, which
+            a busy maxConcurrent pool can defer indefinitely. Same wording as TaskCard's Start.
+            */
+            addToast(t("tasks.queuedForPlanning", "Queued {{taskId}} for planning", { taskId: createdTask.id }), "success");
           } catch (moveError) {
             addToast(getErrorMessage(moveError) || t("tasks.createFailed", "Failed to create task"), "error");
           }
@@ -1097,361 +1103,200 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
     );
   }, []);
 
-  const getEffectiveViewport = useCallback(() => {
-    const vv = window.visualViewport;
-    if (vv && vv.width > 0 && vv.height > 0) {
-      return {
-        width: vv.width,
-        height: vv.height,
-        offsetTop: vv.offsetTop,
-        offsetLeft: vv.offsetLeft,
-      };
-    }
-
-    return {
-      width: window.innerWidth,
-      height: window.innerHeight,
-      offsetTop: 0,
-      offsetLeft: 0,
-    };
-  }, []);
-
+  /*
+  FNXC:QuickAddDepsMenu 2026-07-25-12:00:
+  All Quick Add portaled menus (Deps, Models, workflow, agent, node, priority) share anchor-first
+  layout-viewport positioning. Mixing visualViewport offsets with getBoundingClientRect, or clamping
+  top away from the trigger to preserve a min height floor, made Deps (and siblings) float too high
+  and unattached when free space was tight.
+  */
   const updateModelMenuPosition = useCallback(() => {
     const trigger = modelTriggerRef.current;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 360)
       : Math.min(viewportHeight * 0.5, 360);
-
-    const preferredDesktopWidth = Math.max(rect.width * 1.35, 320);
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 360)
-      : preferredDesktopWidth;
+      : Math.max(rect.width * 1.35, 320);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 240),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setModelMenuPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 240,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setModelMenuPosition({
+      top: position.top,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateWorkflowPickerPosition = useCallback(() => {
     const trigger = workflowTriggerRef.current;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
     const preferredHeight = Math.min(viewportHeight * (isMobile ? 0.6 : 0.5), 360);
     /*
     FNXC:QuickAddWorkflow 2026-06-30-16:16:
-    The workflow menu is wider than its compact trigger, so portal and clamp it against the visual viewport instead of anchoring it to the trigger's inline start. This keeps right-side Board columns and wrapped mobile action rows readable without horizontal overflow.
+    The workflow menu is wider than its compact trigger, so portal and clamp it against the layout viewport instead of anchoring it to the trigger's inline start. This keeps right-side Board columns and wrapped mobile action rows readable without horizontal overflow.
+
+    FNXC:QuickAddDepsMenu 2026-07-25-12:00:
+    Width still expands past the compact trigger; vertical placement uses the shared anchor-first helper so the menu stays attached like Deps/Models.
     */
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 448)
       : Math.min(Math.max(rect.width * 3, 448), 512);
-    const width = Math.min(
+
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 240),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 180);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 180);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      180,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setWorkflowPickerPosition({ top, left, width, maxHeight });
-  }, [getEffectiveViewport]);
+      preferredHeight,
+      minWidth: 240,
+      horizontalPadding,
+    });
+    setWorkflowPickerPosition({
+      top: position.top,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateDepDropdownPosition = useCallback(() => {
     const trigger = depTriggerRef.current;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 320)
       : Math.min(viewportHeight * 0.5, 320);
-
     // Wider dropdown for dependency selection - easier to read task names
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 360)
       : Math.max(rect.width, 280);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 240),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 200);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 200);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      200,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setDepDropdownPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 240,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setDepDropdownPosition({
+      top: position.top,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateAgentPickerPosition = useCallback(() => {
     const trigger = agentPickerRef.current?.querySelector("button") as HTMLButtonElement | null;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 320)
       : Math.min(viewportHeight * 0.5, 320);
-
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 280)
       : Math.max(rect.width, 240);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 200),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setAgentPickerPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 200,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setAgentPickerPosition({
+      top: position.top,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updateNodePickerPosition = useCallback(() => {
     const trigger = nodePickerRef.current?.querySelector("button") as HTMLButtonElement | null;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
     const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
     const isMobile = viewportWidth <= 768;
-
     const preferredHeight = isMobile
       ? Math.min(viewportHeight * 0.6, 320)
       : Math.min(viewportHeight * 0.5, 320);
-
     const preferredWidth = isMobile
       ? Math.min(viewportWidth - horizontalPadding * 2, 280)
       : Math.max(rect.width, 240);
 
-    const width = Math.min(
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
       preferredWidth,
-      Math.max(viewportWidth - horizontalPadding * 2, 200),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setNodePickerPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+      preferredHeight,
+      minWidth: 200,
+      horizontalPadding,
     });
-  }, [getEffectiveViewport]);
+    setNodePickerPosition({
+      top: position.top,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   const updatePriorityPickerPosition = useCallback(() => {
     const trigger = priorityPickerRef.current?.querySelector("button") as HTMLButtonElement | null;
     if (!trigger) return;
 
     const rect = trigger.getBoundingClientRect();
-    const { width: viewportWidth, height: viewportHeight, offsetTop, offsetLeft } = getEffectiveViewport();
-    const horizontalPadding = 16;
-    const verticalPadding = 16;
-    const gap = 4;
-    const preferredHeight = 220;
-    const width = Math.min(
-      Math.max(rect.width, 200),
-      Math.max(viewportWidth - horizontalPadding * 2, 200),
-    );
-
-    const triggerTop = rect.top - offsetTop;
-    const triggerBottom = rect.bottom - offsetTop;
-    const triggerLeft = rect.left - offsetLeft;
-
-    const spaceBelow = viewportHeight - triggerBottom;
-    const spaceAbove = triggerTop;
-    const availableBelow = Math.max(spaceBelow - verticalPadding - gap, 160);
-    const availableAbove = Math.max(spaceAbove - verticalPadding - gap, 160);
-    const openUpward = spaceBelow < preferredHeight && spaceAbove > spaceBelow;
-    const maxHeight = Math.max(
-      Math.min(openUpward ? availableAbove : availableBelow, preferredHeight),
-      160,
-    );
-
-    const left = Math.min(
-      Math.max(triggerLeft, horizontalPadding),
-      viewportWidth - horizontalPadding - width,
-    ) + offsetLeft;
-
-    const top = openUpward
-      ? Math.max(verticalPadding + offsetTop, triggerTop - maxHeight - gap + offsetTop)
-      : Math.min(
-          triggerBottom + gap + offsetTop,
-          viewportHeight + offsetTop - verticalPadding - maxHeight,
-        );
-
-    setPriorityPickerPosition({
-      top,
-      left,
-      width,
-      maxHeight,
+    const { width: viewportWidth, height: viewportHeight } = getLayoutViewportSize();
+    const position = computeFixedMenuPosition({
+      triggerRect: rect,
+      viewportWidth,
+      viewportHeight,
+      preferredWidth: Math.max(rect.width, 200),
+      preferredHeight: 220,
+      minWidth: 200,
     });
-  }, [getEffectiveViewport]);
+    setPriorityPickerPosition({
+      top: position.top,
+      left: position.left,
+      width: position.width,
+      maxHeight: position.maxHeight,
+    });
+  }, []);
 
   // Keep model menu portal anchored during scroll/resize
   useEffect(() => {
@@ -1693,51 +1538,17 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
     resetForm();
   }, [description, onSubtaskBreakdown, selectedWorkflowForCreate, addToast, resetForm]);
 
-  const openStartMenu = useCallback(() => {
-    if (!canOpenQuickAddStartMenu) return;
-    const rect = saveButtonRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    setStartMenuPosition({ top: Math.min(rect.bottom + 4, window.innerHeight - 40), left: Math.max(8, Math.min(rect.right - 120, window.innerWidth - 128)) });
-    setShowStartMenu(true);
-  }, [canOpenQuickAddStartMenu]);
-
-  const clearLongPress = useCallback(() => {
-    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
-    longPressTimerRef.current = null;
-    longPressStartRef.current = null;
-  }, []);
-
-  const handleSavePointerDown = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    if (!canQuickAddStart || (event.pointerType !== "touch" && event.pointerType !== "pen")) return;
-    clearLongPress();
-    longPressStartRef.current = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
-    longPressTimerRef.current = setTimeout(() => {
-      suppressSaveClickRef.current = true;
-      clearLongPress();
-      openStartMenu();
-    }, 550);
-  }, [canQuickAddStart, clearLongPress, openStartMenu]);
-
-  const handleSavePointerMove = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
-    const start = longPressStartRef.current;
-    if (start && start.pointerId === event.pointerId && (Math.abs(start.x - event.clientX) > 10 || Math.abs(start.y - event.clientY) > 10)) clearLongPress();
-  }, [clearLongPress]);
-
-  const handleSaveClick = useCallback(() => {
-    if (suppressSaveClickRef.current) {
-      suppressSaveClickRef.current = false;
-      return;
-    }
-    handleSubmit();
-  }, [handleSubmit]);
-
+  /*
+  FNXC:QuickAddStart 2026-07-24-11:20:
+  Start stashes the workflow snapshot validated at click time in `startIntentRef` and then runs the SAME submit
+  path as Save. The snapshot (not live state) is what `submitCreateTask` reads, so a workflow list refreshed
+  mid-duplicate-confirmation cannot retarget an in-flight Start.
+  */
   const handleStartClick = useCallback(() => {
-    if (!canOpenQuickAddStartMenu || !validatedStartWorkflow) return;
+    if (!canQuickAddStartNow || !validatedStartWorkflow) return;
     startIntentRef.current = validatedStartWorkflow;
-    setShowStartMenu(false);
-    setStartMenuPosition(null);
     handleSubmit();
-  }, [canOpenQuickAddStartMenu, handleSubmit, validatedStartWorkflow]);
+  }, [canQuickAddStartNow, handleSubmit, validatedStartWorkflow]);
 
   const truncate = (s: string, len: number) =>
     s.length > len ? s.slice(0, len) + "…" : s;
@@ -1876,6 +1687,7 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
               aria-expanded={isDisclosureExpanded}
             />
           </div>
+          <MicButton {...dictation.micProps} disabled={isSubmitting || isDisabled} />
           <button
             type="button"
             className="btn btn-sm quick-entry-toggle"
@@ -2340,6 +2152,29 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
               </div>,
               portalRoot,
             )}
+
+            {/*
+            FNXC:QuickAddStart 2026-07-24-11:20:
+            Start renders as the last chip in the options group so it wraps onto the same line as Models/Agent and
+            reads as an alternate create action beside Save (which stays right-aligned in the primary group). It is
+            present ONLY for hold-first/"waiting"-column workflows — most workflows show no Start chip. With an
+            empty description it stays visible but DISABLED (matching Save) so the affordance does not appear and
+            vanish as the operator types; the whole action row still unmounts while a create is in flight.
+            */}
+            {canQuickAddStart && (
+              <button
+                type="button"
+                className="btn btn-sm quick-entry-start-button"
+                onClick={handleStartClick}
+                onMouseDown={(e) => e.preventDefault()}
+                disabled={!canQuickAddStartNow}
+                data-testid="quick-entry-save-start"
+                title={t("tasks.startTaskTitle", "Create and start the task")}
+              >
+                <Play size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
+                {t("tasks.start", "Start")}
+              </button>
+            )}
             </div>
 
             {/*
@@ -2503,30 +2338,17 @@ export function QuickEntryBox({ onCreate, onMoveTask, addToast, tasks = [], avai
               </button>
 
               <button
-                ref={saveButtonRef}
                 type="button"
                 className="btn btn-task-create btn-sm"
-                onClick={handleSaveClick}
-                onContextMenu={(event) => { if (canOpenQuickAddStartMenu) { event.preventDefault(); openStartMenu(); } }}
-                onPointerDown={handleSavePointerDown}
-                onPointerMove={handleSavePointerMove}
-                onPointerLeave={clearLongPress}
-                onPointerUp={clearLongPress}
-                onPointerCancel={clearLongPress}
+                onClick={handleSubmit}
                 onMouseDown={(e) => e.preventDefault()}
                 disabled={!description.trim() || isSubmitting}
-                aria-haspopup={canOpenQuickAddStartMenu ? "menu" : undefined}
                 data-testid="quick-entry-save"
                 title={t("tasks.createTaskTitle", "Create task")}
               >
                 <Save size={12} style={{ verticalAlign: "middle", marginRight: 4 }} />
                 {t("tasks.save", "Save")}
               </button>
-              {showStartMenu && canOpenQuickAddStartMenu && portalRoot && startMenuPosition && createPortal(
-                <div className="quick-entry-start-menu" role="menu" data-testid="quick-entry-save-start" style={{ position: "fixed", top: startMenuPosition.top, left: startMenuPosition.left }}>
-                  <button type="button" role="menuitem" onClick={handleStartClick}>{t("tasks.start", "Start")}</button>
-                </div>, portalRoot,
-              )}
             </div>
           </div>
         )}

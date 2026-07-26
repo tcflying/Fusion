@@ -13,6 +13,7 @@ import { filterTasksByBranchGroup } from "../branch-assignment.js";
 import { BUILTIN_WORKFLOW_SETTINGS } from "../builtin-workflow-settings.js";
 import { isBuiltinWorkflowId } from "../builtin-workflows.js";
 import { fromJson } from "../db.js";
+import { FINGERPRINT_WINDOW_DEFAULT_MS, FINGERPRINT_WINDOW_MAX_MS } from "../duplicate-guard.js";
 import * as schema from "../postgres/schema/index.js";
 import { taskProjectScope } from "../postgres/data-layer.js";
 import { ensureBranchGroupForSource as ensureBranchGroupForSourceAsync, ensurePrEntityForSource as ensurePrEntityForSourceAsync, getActivePrEntityBySource as getActivePrEntityBySourceAsync, getBranchGroup as getBranchGroupAsync, getBranchGroupByBranchName as getBranchGroupByBranchNameAsync, getBranchGroupBySource as getBranchGroupBySourceAsync, getPrEntity as getPrEntityAsync, getPrThreadState as getPrThreadStateAsync, listActivePrEntities as listActivePrEntitiesAsync, listBranchGroups as listBranchGroupsAsync, listPrThreadStates as listPrThreadStatesAsync, recordPrThreadOutcome as recordPrThreadOutcomeAsync } from "./async-branch-groups.js";
@@ -682,8 +683,15 @@ export async function findRecentTasksByContentFingerprintImpl(store: TaskStore,
       return [];
     }
 
-    const requestedWindowMs = options?.windowMs ?? 60_000;
-    const windowMs = Math.max(1, Math.min(300_000, Math.trunc(requestedWindowMs)));
+    /*
+    FNXC:TaskCreationDeduplication 2026-07-26-07:40:
+    Share the duplicate-guard's window constants. This query previously carried its own
+    `?? 60_000` / `Math.min(300_000, …)` pair, so widening the guard alone capped the effective
+    window at five minutes and made its ceiling unreachable — the guard asked for ten minutes
+    and silently got five. One policy, one pair of bounds.
+    */
+    const requestedWindowMs = options?.windowMs ?? FINGERPRINT_WINDOW_DEFAULT_MS;
+    const windowMs = Math.max(1, Math.min(FINGERPRINT_WINDOW_MAX_MS, Math.trunc(requestedWindowMs)));
     const cutoffIso = new Date(Date.now() - windowMs).toISOString();
     const includeArchived = options?.includeArchived ?? false;
 

@@ -20,8 +20,9 @@ import * as useTerminalSessionsModule from "../../hooks/useTerminalSessions";
 import * as useWorkspacesModule from "../../hooks/useWorkspaces";
 import * as apiModule from "../../api";
 import { loadAllAppCss } from "../../test/cssFixture";
+import { readAppFile } from "../../test/cssFixture";
 
-const terminalModalCss = readFileSync("app/components/TerminalModal.css", "utf8");
+const terminalModalCss = readAppFile("components/TerminalModal.css");
 
 function splitFontFamilies(stack: string): string[] {
   return stack

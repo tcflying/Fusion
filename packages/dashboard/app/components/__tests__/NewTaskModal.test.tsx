@@ -10,8 +10,9 @@ import { writeLastSelectedWorkflowId } from "../../utils/lastSelectedWorkflow";
 import { GITHUB_SETUP_WARNING_DELAY_MS, GITHUB_SETUP_WARNING_MISSING_SINCE_KEY } from "../../hooks/useGithubSetupWarningDelay";
 import { __test_clearCache as clearSetupReadinessCache } from "../../hooks/useSetupReadiness";
 import { scopedKey } from "../../utils/projectStorage";
+import { readAppFile } from "../../test/cssFixture";
 
-const newTaskModalCss = readFileSync("app/components/NewTaskModal.css", "utf8");
+const newTaskModalCss = readAppFile("components/NewTaskModal.css");
 
 // Mock lucide-react
 vi.mock("lucide-react", () => ({
@@ -80,7 +81,7 @@ vi.mock("../../hooks/useMobileKeyboard", () => ({
 }));
 
 // FNXC:NewTask 2026-06-22-20:30: viewport mode is switchable so we can exercise both the mobile sheet (default) and the desktop floating window. Defaults to mobile to preserve the existing suite's layout assumptions.
-let mockViewportMode: "mobile" | "desktop" = "mobile";
+let mockViewportMode: "mobile" | "tablet" | "desktop" = "mobile";
 vi.mock("../../hooks/useViewportMode", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 768px), (max-height: 480px)",
   isFullScreenSheetViewport: () => false,
@@ -920,6 +921,140 @@ describe("NewTaskModal", () => {
           expect.objectContaining({ enabledWorkflowSteps: ["browser-verification"] }),
         );
       });
+    });
+
+    /*
+    FNXC:NewTaskDirtyState 2026-07-24-12:00:
+    TaskForm's inherited workflow and optional-step fetches seed create payload metadata,
+    not operator input. A settled blank New Task modal must therefore close directly by
+    Close, Cancel, and Escape, while real field edits retain discard protection.
+    */
+    it.each([
+      ["mobile Close", "mobile", (_overlay: HTMLElement) => fireEvent.click(screen.getByRole("button", { name: "Close" }))],
+      ["mobile Cancel", "mobile", (_overlay: HTMLElement) => fireEvent.click(screen.getByRole("button", { name: "Cancel" }))],
+      ["mobile Escape", "mobile", (overlay: HTMLElement) => fireEvent.keyDown(overlay, { key: "Escape" })],
+      ["desktop Close", "desktop", (_overlay: HTMLElement) => fireEvent.click(screen.getByRole("button", { name: "Close" }))],
+      ["desktop Cancel", "desktop", (_overlay: HTMLElement) => fireEvent.click(screen.getByRole("button", { name: "Cancel" }))],
+      ["desktop Escape", "desktop", (overlay: HTMLElement) => fireEvent.keyDown(overlay, { key: "Escape" })],
+    ] as const)("closes a blank modal with inherited default-on steps through %s without confirmation", async (_closePath, viewport, close) => {
+      const { fetchSettings, fetchWorkflowOptionalSteps } = await import("../../api");
+      mockViewportMode = viewport;
+      vi.mocked(fetchSettings).mockResolvedValue({ modelPresets: [], autoSelectModelPreset: false, defaultPresetBySize: {}, defaultWorkflowId: "wf-x" });
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([{ ...STEP, defaultOn: true }]);
+
+      const { props } = renderNewTaskModal();
+      await waitFor(() => expect(screen.getByTestId("task-form-inline-optional-steps")).toHaveTextContent("Steps: 1 selected"));
+
+      close(screen.getByTestId("new-task-modal-overlay"));
+
+      await waitFor(() => expect(props.onClose).toHaveBeenCalledTimes(1));
+      expect(mockConfirm).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["Close", "mobile", () => fireEvent.click(screen.getByRole("button", { name: "Close" }))],
+      ["Cancel", "desktop", () => fireEvent.click(screen.getByRole("button", { name: "Cancel" }))],
+      ["Escape", "mobile", () => fireEvent.keyDown(screen.getByTestId("new-task-modal-overlay"), { key: "Escape" })],
+    ] as const)("closes directly after enabled automatic defaults through %s", async (_closePath, viewport, close) => {
+      const { fetchSettings } = await import("../../api");
+      mockViewportMode = viewport;
+      vi.mocked(fetchSettings).mockResolvedValue({
+        modelPresets: [{ id: "default-preset", name: "Default preset", executorProvider: "anthropic", executorModelId: "claude-sonnet-4-5", validatorProvider: "openai", validatorModelId: "gpt-4o" }],
+        autoSelectModelPreset: true,
+        defaultPresetBySize: {},
+        githubTrackingEnabledByDefault: true,
+      });
+
+      const { props } = renderNewTaskModal();
+      await waitFor(() => expect(screen.getByTestId("task-form-inline-github")).toHaveAttribute("aria-pressed", "true"));
+
+      close();
+
+      await waitFor(() => expect(props.onClose).toHaveBeenCalledTimes(1));
+      expect(mockConfirm).not.toHaveBeenCalled();
+    });
+
+    it("preserves a custom model selected before settings load and confirms on close", async () => {
+      const { fetchSettings } = await import("../../api");
+      let resolveSettings!: (settings: any) => void;
+      vi.mocked(fetchSettings).mockReturnValueOnce(new Promise<any>((resolve) => {
+        resolveSettings = resolve;
+      }));
+
+      const { props } = renderNewTaskModal();
+      fireEvent.click(await screen.findByTestId("task-form-inline-models"));
+      const executor = await screen.findByRole("button", { name: "Executor Model" });
+      fireEvent.click(executor);
+      fireEvent.click(await screen.findByRole("option", { name: /GPT-4o/ }));
+
+      resolveSettings({
+        modelPresets: [{ id: "recommended", name: "Recommended", executorProvider: "anthropic", executorModelId: "claude-sonnet-4-5", validatorProvider: "openai", validatorModelId: "gpt-4o" }],
+        autoSelectModelPreset: true,
+        defaultPresetBySize: {},
+      });
+      await waitFor(() => expect(executor).toHaveTextContent("GPT-4o"));
+
+      mockConfirm.mockResolvedValueOnce(false);
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      await waitFor(() => expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({ title: "Discard Changes" })));
+      expect(props.onClose).not.toHaveBeenCalled();
+      expect(executor).toHaveTextContent("GPT-4o");
+    });
+
+    it("still confirms when an operator changes an initialized GitHub default", async () => {
+      const { fetchSettings } = await import("../../api");
+      vi.mocked(fetchSettings).mockResolvedValue({
+        modelPresets: [],
+        autoSelectModelPreset: false,
+        defaultPresetBySize: {},
+        githubTrackingEnabledByDefault: true,
+      });
+      const { props } = renderNewTaskModal();
+      const githubToggle = await screen.findByTestId("task-form-inline-github");
+      await waitFor(() => expect(githubToggle).toHaveAttribute("aria-pressed", "true"));
+      fireEvent.click(githubToggle);
+      mockConfirm.mockResolvedValueOnce(false);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      await waitFor(() => expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({ title: "Discard Changes" })));
+      expect(props.onClose).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["undefined inherited workflow", undefined, []],
+      ["default workflow with no optional steps", "wf-x", []],
+    ])("closes directly after $0 initialization metadata", async (_label, defaultWorkflowId, steps) => {
+      const { fetchSettings, fetchWorkflowOptionalSteps } = await import("../../api");
+      vi.mocked(fetchSettings).mockResolvedValue({ modelPresets: [], autoSelectModelPreset: false, defaultPresetBySize: {}, ...(defaultWorkflowId ? { defaultWorkflowId } : {}) });
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue(steps);
+
+      const { props } = renderNewTaskModal();
+      await waitFor(() => expect(fetchWorkflowOptionalSteps).toHaveBeenCalled());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      await waitFor(() => expect(props.onClose).toHaveBeenCalledTimes(1));
+      expect(mockConfirm).not.toHaveBeenCalled();
+    });
+
+    it("still confirms a user-selected optional step and keeps the modal open when discard is declined", async () => {
+      const { fetchSettings, fetchWorkflowOptionalSteps } = await import("../../api");
+      vi.mocked(fetchSettings).mockResolvedValue({ modelPresets: [], autoSelectModelPreset: false, defaultPresetBySize: {}, defaultWorkflowId: "wf-x" });
+      vi.mocked(fetchWorkflowOptionalSteps).mockResolvedValue([STEP]);
+
+      const { props } = renderNewTaskModal();
+      const trigger = await screen.findByTestId("task-form-inline-optional-steps");
+      await waitFor(() => expect(trigger).toHaveTextContent("Steps: none"));
+      fireEvent.click(trigger);
+      fireEvent.click(await screen.findByTestId("wf-optional-steps-dropdown-option-browser-verification"));
+      mockConfirm.mockResolvedValueOnce(false);
+
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      await waitFor(() => expect(mockConfirm).toHaveBeenCalledWith(expect.objectContaining({ title: "Discard Changes" })));
+      expect(props.onClose).not.toHaveBeenCalled();
+      expect(screen.getByTestId("task-form-inline-optional-steps")).toHaveTextContent("Steps: 1 selected");
     });
 
     it("submits explicit empty optional steps when Fast is created before optional-step metadata loads", async () => {
@@ -2047,6 +2182,20 @@ describe("NewTaskModal", () => {
       expect(onClose).not.toHaveBeenCalled();
     });
 
+    it("keeps tablet-class New Task floating and exposes touch resize controls", () => {
+      mockViewportMode = "tablet";
+      renderNewTaskModal();
+
+      expect(screen.getByTestId("new-task-drag-handle")).toHaveClass("new-task-modal__header--draggable");
+      expect(document.querySelector(".new-task-modal")).toHaveClass("task-modal--tablet");
+      expect(document.querySelector(".new-task-modal")).toHaveClass("new-task-modal--floating");
+      for (const dir of ["n", "s", "e", "w", "ne", "nw", "se", "sw"]) {
+        expect(screen.getByTestId(`new-task-resize-${dir}`)).toHaveAttribute("role", "separator");
+        expect(screen.getByTestId(`new-task-resize-${dir}`)).toHaveAttribute("aria-label", "Resize new task window");
+        expect(screen.getByTestId(`new-task-resize-${dir}`)).toHaveAttribute("tabindex", "0");
+      }
+    });
+
     it("exposes a draggable header handle and resize handles", () => {
       renderNewTaskModal();
 
@@ -2058,6 +2207,58 @@ describe("NewTaskModal", () => {
       // The floating panel is the fixed-positioned window.
       const panel = document.querySelector(".new-task-modal--floating");
       expect(panel).not.toBeNull();
+    });
+
+    it("resizes from a focused tablet handle with keyboard controls and exposes updated geometry", () => {
+      mockViewportMode = "tablet";
+      renderNewTaskModal();
+
+      const panel = document.querySelector(".new-task-modal--floating") as HTMLElement;
+      const handle = screen.getByTestId("new-task-resize-se");
+      const initialWidth = Number.parseFloat(panel.style.width);
+      const initialHeight = Number.parseFloat(panel.style.height);
+      handle.focus();
+
+      expect(handle).toHaveFocus();
+      expect(handle).toHaveAttribute("aria-valuenow", String(initialWidth));
+      expect(handle).toHaveAttribute("aria-valuetext", `Resize new task window: ${initialWidth} by ${initialHeight}`);
+
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      fireEvent.keyDown(handle, { key: "ArrowDown" });
+
+      expect(Number.parseFloat(panel.style.width)).toBeGreaterThan(initialWidth);
+      expect(Number.parseFloat(panel.style.height)).toBeGreaterThan(initialHeight);
+      expect(handle).toHaveAttribute("aria-valuenow", panel.style.width.replace("px", ""));
+      expect(handle).toHaveAttribute("aria-valuetext", `Resize new task window: ${panel.style.width.replace("px", "")} by ${panel.style.height.replace("px", "")}`);
+      expect(JSON.parse(window.localStorage.getItem("fusion:new-task-modal-size") ?? "{}")).toMatchObject({
+        width: Number.parseFloat(panel.style.width),
+        height: Number.parseFloat(panel.style.height),
+      });
+    });
+
+    it("resizes from a tablet touch handle without dismissing or leaking selection state", () => {
+      mockViewportMode = "tablet";
+      const onClose = vi.fn();
+      vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+        callback(0);
+        return 1;
+      });
+      vi.stubGlobal("cancelAnimationFrame", vi.fn());
+      renderNewTaskModal({ onClose });
+
+      const panel = document.querySelector(".new-task-modal--floating") as HTMLElement;
+      const handle = screen.getByTestId("new-task-resize-se");
+      const initialWidth = Number.parseFloat(panel.style.width);
+      const initialHeight = Number.parseFloat(panel.style.height);
+
+      fireEvent.pointerDown(handle, { pointerId: 4, clientX: 100, clientY: 100, pointerType: "touch" });
+      fireEvent.pointerMove(handle, { pointerId: 4, clientX: 140, clientY: 130, pointerType: "touch" });
+      fireEvent.pointerUp(handle, { pointerId: 4, clientX: 140, clientY: 130, pointerType: "touch" });
+
+      expect(Number.parseFloat(panel.style.width)).toBeGreaterThan(initialWidth);
+      expect(Number.parseFloat(panel.style.height)).toBeGreaterThan(initialHeight);
+      expect(document.body.style.userSelect).toBe("");
+      expect(onClose).not.toHaveBeenCalled();
     });
 
     it("keeps the floating window touch-draggable with theme-controlled shadow", () => {

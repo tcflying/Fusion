@@ -34,7 +34,7 @@ import {type TaskRow} from "../task-store/persistence.js";
 import {__setTaskActivityLogLimitsForTesting} from "../task-store/comments.js";
 import {withTaskBranchContextInSourceMetadata} from "../task-store/branch-context.js";
 import {upsertTaskRowInTransaction, readTaskRowInTransaction, buildTaskInsertValues} from "../task-store/async-persistence.js";
-import {listDueWorkflowWorkItems as listDueWorkflowWorkItemsAsync} from "../task-store/async-workflow-workitems.js";
+import {listDueWorkflowWorkItems as listDueWorkflowWorkItemsAsync, withTaskWorkflowSerialization} from "../task-store/async-workflow-workitems.js";
 import {getTaskMovedCountsByDay as getTaskMovedCountsByDayAsync} from "../task-store/async-audit.js";
 import {getAllDocuments as getAllDocumentsAsync} from "../task-store/async-comments-attachments.js";
 import {recordGoalCitations as recordGoalCitationsAsync} from "../task-store/async-events.js";
@@ -125,6 +125,7 @@ export async function atomicWriteTaskJsonImpl2(store: TaskStore, dir: string, ta
       always wrote the changed-column subset.
       */
       await layer.transactionImmediate(async (tx) => {
+        const persist = async () => {
         const pgRow = await readTaskRowInTransaction(tx, id, { includeDeleted: true }, layer.projectId);
         if (!pgRow || pgRow.deletedAt != null) {
           // Update-only path: never resurrect a soft-deleted row; a missing row
@@ -157,6 +158,19 @@ export async function atomicWriteTaskJsonImpl2(store: TaskStore, dir: string, ta
           .update(schema.project.tasks)
           .set(setValues as never)
           .where(eq(schema.project.tasks.id, id));
+        };
+        /*
+        FNXC:WorkflowSerialization 2026-07-26-15:30:
+        FN-8592's conditional continuation seed checks for a passed plan-review
+        under its task advisory lock. The generic task persistence path is the
+        sole terminal result writer, so a plan-review pass must take that same
+        lock as the first transaction lock before its row write can commit.
+        */
+        if (task.workflowStepResults?.some((result) => result.workflowStepId === "plan-review" && result.status === "passed")) {
+          await withTaskWorkflowSerialization(tx, layer.projectId, id, persist);
+        } else {
+          await persist();
+        }
       });
       await store.writeTaskJsonFile(dir, task);
       return;

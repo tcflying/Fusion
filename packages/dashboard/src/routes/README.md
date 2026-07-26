@@ -40,6 +40,7 @@ The following is the complete top-level registrar map currently imported by `rou
 - `registerSignalRoutes` — domain registrar mounted by `createApiRoutes`.
 - `registerMonitorRoutes` — domain registrar mounted by `createApiRoutes`.
 - `registerUpdateCheckRoutes` — domain registrar mounted by `createApiRoutes`.
+- `registerVoiceRoutes` — opt-in voice model lifecycle and project-bound PCM transcription endpoints.
 - `registerDiagnosticsRoutes` — domain registrar mounted by `createApiRoutes`.
 - `registerCliAgentHooksRoute` — domain registrar mounted by `createApiRoutes`.
 - `registerCliAgentSettingsRoutes` — domain registrar mounted by `createApiRoutes`.
@@ -105,33 +106,34 @@ Express matches in registration order. `create-api-routes-mount-sequence.ts` is 
 28. `registerSignalRoutes`
 29. `registerMonitorRoutes`
 30. `registerUpdateCheckRoutes`
-31. `registerDiagnosticsRoutes`
-32. `registerCliAgentHooksRoute`
-33. `registerCliAgentSettingsRoutes`
-34. `registerActivityLogRoutes`
-35. `registerAgentCoreListCreateRoutes`
-36. `registerAgentImportExportRoutes`
-37. `registerOrgPortabilityRoutes`
-38. `registerAgentCoreRoutes`
-39. `registerAgentRuntimeRoutes`
-40. `registerSystemRoutes`
-41. `registerAgentReflectionRatingRoutes`
-42. `registerAgentGenerationRoutes`
-43. `registerIntegratedRouters`
-44. `registerProjectRoutes`
-45. `registerNodeRoutes`
-46. `registerDockerNodeRoutes`
-47. `registerDockerProvisioningRoutes`
-48. `registerSettingsSyncRoutes`
-49. `registerSecretsSyncRoutes`
-50. `registerMeshRoutes`
-51. `registerDiscoveryRoutes`
-52. `registerSettingsSyncInboundRoutes`
-53. `registerSecretsSyncInboundRoutes`
-54. `registerSetupActivityRoutes`
-55. `registerIntegratedDevServerRouter`
-56. `registerAgentSkillsRoutes`
-57. `registerProxyRoutes`
+31. `registerVoiceRoutes`
+32. `registerDiagnosticsRoutes`
+33. `registerCliAgentHooksRoute`
+34. `registerCliAgentSettingsRoutes`
+35. `registerActivityLogRoutes`
+36. `registerAgentCoreListCreateRoutes`
+37. `registerAgentImportExportRoutes`
+38. `registerOrgPortabilityRoutes`
+39. `registerAgentCoreRoutes`
+40. `registerAgentRuntimeRoutes`
+41. `registerSystemRoutes`
+42. `registerAgentReflectionRatingRoutes`
+43. `registerAgentGenerationRoutes`
+44. `registerIntegratedRouters`
+45. `registerProjectRoutes`
+46. `registerNodeRoutes`
+47. `registerDockerNodeRoutes`
+48. `registerDockerProvisioningRoutes`
+49. `registerSettingsSyncRoutes`
+50. `registerSecretsSyncRoutes`
+51. `registerMeshRoutes`
+52. `registerDiscoveryRoutes`
+53. `registerSettingsSyncInboundRoutes`
+54. `registerSecretsSyncInboundRoutes`
+55. `registerSetupActivityRoutes`
+56. `registerIntegratedDevServerRouter`
+57. `registerAgentSkillsRoutes`
+58. `registerProxyRoutes`
 <!-- mount-sequence:end -->
 
 ## Ordering rules
@@ -153,3 +155,21 @@ Residual inline handlers in `routes.ts` are grandfathered only. `pnpm check:rout
 pnpm --filter @fusion/dashboard typecheck
 pnpm --filter @fusion/dashboard exec vitest run src/routes/__tests__/create-api-routes-mount-order.test.ts --silent=passed-only --reporter=dot
 ```
+
+## Voice transcription
+
+`registerVoiceRoutes` exposes `GET /voice/status`, `POST`/`DELETE /voice/model`, and dictation
+`POST /voice/session`, `POST /voice/transcribe`, and `DELETE /voice/session/:id`. Settings are
+resolved per request through `getScopedStore(req)` with project-over-global precedence. Voice is
+opt-in: only dictation endpoints require `voiceInput.enabled`; model inspection, download, and
+delete remain available while off because the user-scoped model cache is shared by projects.
+
+Audio chunks are base64 raw 16 kHz mono signed-16-bit little-endian PCM. Chunks are ordered,
+limited to 1 MiB (2 MiB JSON body), and sessions are project-bound. Active sessions become
+60-second closed tombstones on completion, delete, expiry, model removal, or the 16 MiB cap; cap
+tombstones return 413 while other closed sessions return 409, then all evict to 404. Repeated
+DELETE during the tombstone returns `{ closed:true, alreadyClosed:true }`; unknown and foreign IDs
+return 404. Download returns 202 with queued/downloading state; poll status for progress.
+
+`server.ts` excludes only `/api/voice/transcribe` from its global 100 KiB JSON parser so the
+route's 2 MiB parser can return JSON 413/400 errors; other routes retain raw-body HMAC capture.

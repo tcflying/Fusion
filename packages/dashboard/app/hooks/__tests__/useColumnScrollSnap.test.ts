@@ -2,6 +2,9 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   isColumnCentered,
+  resolveFlingTargetIndex,
+  resolvePageAnimationMs,
+  resolvePageCount,
   resolvePanDirection,
   resolveSettleTargetIndex,
   useColumnScrollSnap,
@@ -95,9 +98,17 @@ function dispatchShortSwipe(
   dispatchPointerEvent(scroller, "pointerup", 200 - clientDelta);
 }
 
+/*
+FNXC:BoardNavigation 2026-07-24-11:20:
+The hook now owns the post-lift motion: a directional lift animates to its target column instead of
+waiting out native inertia. Settling therefore means "run the page animation to completion", so this
+helper advances past both the idle fallback and the longest page animation.
+*/
+const SETTLE_ADVANCE_MS = 400;
+
 function settleAfterMomentum(): void {
   act(() => {
-    vi.advanceTimersByTime(48);
+    vi.advanceTimersByTime(SETTLE_ADVANCE_MS);
   });
 }
 
@@ -114,6 +125,106 @@ describe("resolvePanDirection", () => {
 
   it("ignores tiny noise", () => {
     expect(resolvePanDirection({ scrollDelta: 0, clientDelta: 3 })).toBe(0);
+  });
+});
+
+/*
+FNXC:BoardNavigation 2026-07-24-11:20:
+Owning the momentum means reach can no longer come from however far native inertia coasts, so it
+comes from release velocity instead. These guard that mapping: deliberate swipe = one column, hard
+flick = more, with a hard ceiling.
+*/
+describe("resolvePageCount", () => {
+  it("pages exactly one column for a deliberate slow swipe", () => {
+    expect(resolvePageCount(0)).toBe(1);
+    expect(resolvePageCount(0.4)).toBe(1);
+    expect(resolvePageCount(1.5)).toBe(1);
+  });
+
+  it("buys extra columns as release velocity climbs", () => {
+    expect(resolvePageCount(1.7)).toBe(2);
+    expect(resolvePageCount(3.4)).toBe(3);
+  });
+
+  it("caps a hard flick so it cannot fly across the board", () => {
+    expect(resolvePageCount(40)).toBe(3);
+  });
+
+  it("is direction-agnostic (magnitude only) and ignores non-finite input", () => {
+    expect(resolvePageCount(-3.4)).toBe(3);
+    expect(resolvePageCount(Number.NaN)).toBe(1);
+  });
+
+  /*
+  FNXC:BoardNavigation 2026-07-25-09:40:
+  Reported symptom: a small swipe jumped several columns because a quick short flick reads fast.
+  Extra columns now require travel as well as speed.
+  */
+  describe("travel gate", () => {
+    const viewportWidth = 390;
+
+    it("keeps a fast but short flick to a single column", () => {
+      expect(resolvePageCount(3.4, { travelPx: 30, viewportWidth })).toBe(1);
+      expect(resolvePageCount(40, { travelPx: 60, viewportWidth })).toBe(1);
+    });
+
+    it("still allows multi-column reach when the swipe actually travelled", () => {
+      expect(resolvePageCount(1.7, { travelPx: viewportWidth, viewportWidth })).toBe(2);
+      expect(resolvePageCount(3.4, { travelPx: viewportWidth * 2, viewportWidth })).toBe(3);
+    });
+
+    it("never lets travel alone buy columns a slow gesture did not earn", () => {
+      expect(resolvePageCount(0.4, { travelPx: viewportWidth * 3, viewportWidth })).toBe(1);
+    });
+
+    it("ignores the gate when no usable viewport width is available", () => {
+      expect(resolvePageCount(3.4, { travelPx: 10, viewportWidth: 0 })).toBe(3);
+      expect(resolvePageCount(3.4, { travelPx: 10, viewportWidth: Number.NaN })).toBe(3);
+    });
+
+    it("treats travel as a magnitude and tolerates non-finite travel", () => {
+      expect(resolvePageCount(1.7, { travelPx: -viewportWidth, viewportWidth })).toBe(2);
+      expect(resolvePageCount(1.7, { travelPx: Number.NaN, viewportWidth })).toBe(1);
+    });
+  });
+});
+
+describe("resolvePageAnimationMs", () => {
+  it("keeps a single-column hop short and grows sublinearly, capped", () => {
+    const single = resolvePageAnimationMs(1);
+    const triple = resolvePageAnimationMs(3);
+    expect(single).toBeGreaterThan(0);
+    expect(single).toBeLessThanOrEqual(220);
+    expect(triple).toBeGreaterThan(single);
+    expect(triple).toBeLessThanOrEqual(300);
+    // Absurd counts clamp at the ceiling rather than growing without bound.
+    expect(resolvePageAnimationMs(50)).toBe(300);
+  });
+});
+
+describe("resolveFlingTargetIndex", () => {
+  const base = { columnCount: 5, nearestIndex: 0 };
+
+  it("advances pageCount columns from the origin in the locked direction", () => {
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 0, direction: 1, pageCount: 1 })).toBe(1);
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 0, direction: 1, pageCount: 3 })).toBe(3);
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 4, direction: -1, pageCount: 2, nearestIndex: 4 })).toBe(2);
+  });
+
+  it("clamps to the column range at both edges", () => {
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 4, direction: 1, pageCount: 3, nearestIndex: 4 })).toBe(4);
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 0, direction: -1, pageCount: 3 })).toBe(0);
+  });
+
+  it("never animates backwards past a column the finger already dragged onto", () => {
+    // Long slow drag landed on column 2 while the origin was 0: keep the drag's landing.
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 0, direction: 1, pageCount: 1, nearestIndex: 2 })).toBe(2);
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 4, direction: -1, pageCount: 1, nearestIndex: 2 })).toBe(2);
+  });
+
+  it("falls back to the nearest column with no direction, and to 0 below two columns", () => {
+    expect(resolveFlingTargetIndex({ ...base, originIndex: 0, direction: 0, pageCount: 2, nearestIndex: 3 })).toBe(3);
+    expect(resolveFlingTargetIndex({ columnCount: 1, originIndex: 0, direction: 1, pageCount: 2, nearestIndex: 0 })).toBe(0);
   });
 });
 
@@ -261,7 +372,13 @@ describe("useColumnScrollSnap", () => {
     expect(scroller.scrollLeft).toBe(0);
   });
 
-  it("free-scrolls while dragging and coasts after lift before snapping", () => {
+  /*
+  FNXC:BoardNavigation 2026-07-24-11:20:
+  Free-scroll while the finger is DOWN is still untouched. What changed is after lift: the hook
+  animates to the target column itself, so a residual native-inertia write mid-animation cannot
+  redirect the destination.
+  */
+  it("free-scrolls while dragging, then owns the motion after lift", () => {
     const scroller = createScroller();
     renderHook(() => useColumnScrollSnap(scroller, { mobileOnly: true, isUserInteraction: () => true }));
 
@@ -270,15 +387,39 @@ describe("useColumnScrollSnap", () => {
       scroller.scrollLeft = 40;
       scroller.dispatchEvent(new Event("scroll"));
       dispatchPointerEvent(scroller, "pointermove", 160);
-      dispatchPointerEvent(scroller, "pointerup", 160);
     });
+    // Finger still down: the board rests wherever it was dragged.
     expect(scroller.scrollLeft).toBe(40);
 
     act(() => {
+      dispatchPointerEvent(scroller, "pointerup", 160);
+      // Residual compositor inertia tick arriving after lift, mid page animation.
       scroller.scrollLeft = 70;
       scroller.dispatchEvent(new Event("scroll"));
     });
-    expect(scroller.scrollLeft).toBe(70);
+
+    settleAfterMomentum();
+    expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
+  });
+
+  /*
+  FNXC:BoardNavigation 2026-07-24-11:20:
+  Owning the momentum means the page starts moving on lift rather than after the native coast.
+  Guard the observable part of that: partway through the animation the board has already left the
+  release point and is heading toward the target column.
+  */
+  it("starts moving toward the target column during the page animation", () => {
+    const scroller = createScroller(3, 0);
+    renderHook(() => useColumnScrollSnap(scroller, { mobileOnly: true, isUserInteraction: () => true }));
+
+    act(() => dispatchShortSwipe(scroller, { scrollDelta: 8, clientDelta: 20 }));
+
+    act(() => {
+      vi.advanceTimersByTime(64);
+    });
+    const midFlight = scroller.scrollLeft;
+    expect(midFlight).toBeGreaterThan(8);
+    expect(midFlight).toBeLessThan(COLUMN_WIDTH);
 
     settleAfterMomentum();
     expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
@@ -308,36 +449,43 @@ describe("useColumnScrollSnap", () => {
   });
 
   /*
-  FNXC:BoardNavigation 2026-07-22-21:40:
-  Tap-to-stop during momentum, then drag: the new drag's landing point must win. The
-  commit-one-column clamp only applies to gestures that began centered at rest — from a
-  mid-transit origin it forced a page past the corrective drag.
+  FNXC:BoardNavigation 2026-07-22-21:40 (reframed 2026-07-24-11:20):
+  The corrective seam used to be tap-to-stop during native momentum; owning the momentum replaces
+  that long coast with a ~200ms animation, so the equivalent guard is a re-touch DURING the page
+  animation. It must cancel the pending page and let the new drag's direction win.
   */
-  it("takes the new drag's landing point after a tap-to-stop mid-transit", () => {
+  it("lets a drag that interrupts the page animation win over the pending page", () => {
     const scroller = createScroller(3, 0);
     renderHook(() => useColumnScrollSnap(scroller, { mobileOnly: true, isUserInteraction: () => true }));
 
     act(() => {
-      // Swipe right, coast mid-transit past column 1's center.
+      // Swipe right: the hook starts animating toward column 1.
       dispatchPointerEvent(scroller, "pointerdown", 200);
       dispatchPointerEvent(scroller, "pointermove", 160);
       scroller.scrollLeft = 30;
       scroller.dispatchEvent(new Event("scroll"));
       dispatchPointerEvent(scroller, "pointerup", 160);
-      scroller.scrollLeft = 130;
-      scroller.dispatchEvent(new Event("scroll"));
+    });
 
-      // Tap to stop, then drag back left onto column 1's center.
+    // Let the page animation get most of the way to column 1, then grab it.
+    act(() => {
+      vi.advanceTimersByTime(150);
+    });
+    expect(scroller.scrollLeft).toBeGreaterThan(30);
+    expect(scroller.scrollLeft).toBeLessThan(COLUMN_WIDTH);
+
+    act(() => {
+      // Re-touch cancels the animation; drag back left.
       dispatchPointerEvent(scroller, "pointerdown", 150);
-      dispatchPointerEvent(scroller, "pointermove", 180);
-      scroller.scrollLeft = 100;
+      dispatchPointerEvent(scroller, "pointermove", 190);
+      scroller.scrollLeft = 60;
       scroller.dispatchEvent(new Event("scroll"));
-      dispatchPointerEvent(scroller, "pointerup", 180);
+      dispatchPointerEvent(scroller, "pointerup", 190);
     });
     settleAfterMomentum();
 
-    // Regression: the min-progress clamp previously forced column 0 (scrollLeft 0).
-    expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
+    // The leftward corrective drag wins: back to column 0, never onward to column 1.
+    expect(scroller.scrollLeft).toBe(0);
     expect(isColumnCentered(scroller, [...scroller.children] as HTMLElement[])).toBe(true);
   });
 
@@ -384,12 +532,14 @@ describe("useColumnScrollSnap", () => {
 
     act(() => {
       dispatchShortSwipe(scroller, { scrollDelta: 10, clientDelta: 20 });
-      // iOS can report scrollend before its final compositor fling tick.
+      // iOS can report scrollend before its final compositor fling tick — and, now, before the
+      // hook-owned page animation has finished. It must not abort the page.
       scroller.dispatchEvent(new Event("scrollend"));
-      expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
 
-      // Let multiple watchdog passes complete before the callback-less compositor write.
-      vi.advanceTimersByTime(48);
+      // Run the page animation out, then let watchdog passes complete before the
+      // callback-less compositor write.
+      vi.advanceTimersByTime(SETTLE_ADVANCE_MS);
+      expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
       scroller.scrollLeft = COLUMN_WIDTH + 40;
       vi.advanceTimersByTime(16);
     });
@@ -399,7 +549,12 @@ describe("useColumnScrollSnap", () => {
     expect(isColumnCentered(scroller, columns)).toBe(true);
   });
 
-  it("does not snap on touchcancel mid-drag", () => {
+  /*
+  FNXC:BoardNavigation 2026-07-24-11:20:
+  `touchcancel` is a genuine gesture end (unlike a pointercancel with a live touch stream), so a
+  cancelled pan pages on the same owned animation as a lift instead of coasting to an idle settle.
+  */
+  it("pages a cancelled pan gesture on touchcancel", () => {
     const scroller = createScroller();
     renderHook(() => useColumnScrollSnap(scroller, { mobileOnly: true, isUserInteraction: () => true }));
 
@@ -408,11 +563,13 @@ describe("useColumnScrollSnap", () => {
       dispatchPointerEvent(scroller, "pointermove", 170);
       scroller.scrollLeft = 25;
       scroller.dispatchEvent(new Event("scroll"));
-      scroller.dispatchEvent(new Event("touchcancel"));
-      vi.advanceTimersByTime(30);
     });
+    // Finger still down: no snapping mid-drag.
     expect(scroller.scrollLeft).toBe(25);
 
+    act(() => {
+      scroller.dispatchEvent(new Event("touchcancel"));
+    });
     settleAfterMomentum();
     expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
   });
@@ -618,6 +775,107 @@ describe("useColumnScrollSnap", () => {
 
     expect(scroller.scrollLeft).toBe(0);
     expect(isColumnCentered(scroller, [...scroller.children] as HTMLElement[])).toBe(true);
+  });
+
+  /*
+  FNXC:BoardNavigation 2026-07-24-11:20:
+  Killing native inertia must not cost fling REACH. A hard flick still crosses several columns
+  because the page count comes from release velocity sampled off the board's own scroll ticks.
+  */
+  it("crosses multiple columns for a hard flick and one column for a slow swipe", () => {
+    const fastScroller = createScroller(5, 0);
+    renderHook(() => useColumnScrollSnap(fastScroller, { mobileOnly: true, isUserInteraction: () => true }));
+
+    act(() => {
+      fastScroller.dispatchEvent(new Event("touchstart"));
+      dispatchPointerEvent(fastScroller, "pointerdown", 300);
+      // ~4 px/ms of real content travel while the finger is down.
+      for (let tick = 1; tick <= 3; tick++) {
+        vi.advanceTimersByTime(10);
+        dispatchPointerEvent(fastScroller, "pointermove", 300 - tick * 40);
+        fastScroller.scrollLeft = tick * 40;
+        fastScroller.dispatchEvent(new Event("scroll"));
+      }
+      dispatchPointerEvent(fastScroller, "pointerup", 180);
+    });
+    settleAfterMomentum();
+
+    expect(fastScroller.scrollLeft).toBe(COLUMN_WIDTH * 3);
+
+    const slowScroller = createScroller(5, 0);
+    renderHook(() => useColumnScrollSnap(slowScroller, { mobileOnly: true, isUserInteraction: () => true }));
+
+    act(() => {
+      slowScroller.dispatchEvent(new Event("touchstart"));
+      dispatchPointerEvent(slowScroller, "pointerdown", 300);
+      // ~0.3 px/ms: a deliberate drag, not a flick.
+      for (let tick = 1; tick <= 3; tick++) {
+        vi.advanceTimersByTime(50);
+        dispatchPointerEvent(slowScroller, "pointermove", 300 - tick * 15);
+        slowScroller.scrollLeft = tick * 15;
+        slowScroller.dispatchEvent(new Event("scroll"));
+      }
+      dispatchPointerEvent(slowScroller, "pointerup", 255);
+    });
+    settleAfterMomentum();
+
+    expect(slowScroller.scrollLeft).toBe(COLUMN_WIDTH);
+  });
+
+  /*
+  FNXC:BoardNavigation 2026-07-24-11:20:
+  A finger that moved fast and then HELD STILL before lifting is not a flick — stale velocity must
+  not page it three columns.
+  */
+  it("does not treat a fast drag that rests before lift as a flick", () => {
+    const scroller = createScroller(5, 0);
+    renderHook(() => useColumnScrollSnap(scroller, { mobileOnly: true, isUserInteraction: () => true }));
+
+    act(() => {
+      scroller.dispatchEvent(new Event("touchstart"));
+      dispatchPointerEvent(scroller, "pointerdown", 300);
+      for (let tick = 1; tick <= 3; tick++) {
+        vi.advanceTimersByTime(10);
+        dispatchPointerEvent(scroller, "pointermove", 300 - tick * 40);
+        scroller.scrollLeft = tick * 40;
+        scroller.dispatchEvent(new Event("scroll"));
+      }
+      // Finger parks for a beat with no further scroll ticks, then lifts.
+      vi.advanceTimersByTime(300);
+      dispatchPointerEvent(scroller, "pointerup", 180);
+    });
+    settleAfterMomentum();
+
+    // Nearest column at release (120 -> column 1) rather than a 3-column flick.
+    expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
+  });
+
+  /*
+  FNXC:BoardNavigation 2026-07-24-11:20:
+  Reduced-motion users get the destination without the animation — the page still lands on a column
+  center, it just arrives instantly.
+  */
+  it("jumps instead of animating when the user prefers reduced motion", () => {
+    vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
+      matches:
+        query === "(max-width: 768px)" ||
+        query === "(max-height: 480px)" ||
+        query === "(prefers-reduced-motion: reduce)",
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(() => true),
+    })));
+    const scroller = createScroller(3, 0);
+    renderHook(() => useColumnScrollSnap(scroller, { mobileOnly: true, isUserInteraction: () => true }));
+
+    act(() => dispatchShortSwipe(scroller, { scrollDelta: 8, clientDelta: 20 }));
+
+    // No timer advance: the target is already applied at lift.
+    expect(scroller.scrollLeft).toBe(COLUMN_WIDTH);
   });
 
   it("does not attach on non-phone desktop", () => {

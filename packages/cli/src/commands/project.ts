@@ -30,6 +30,7 @@ import {
 import { resolve, isAbsolute, relative, basename, join } from "node:path";
 import { existsSync, statSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { promptOutputStream } from "../output.js";
 import { detectProjectFromCwd, setDefaultProject } from "../project-context.js";
 import { maybeInstallClaudeSkillForNewProject } from "./claude-skills-runner.js";
 import { retryOnLock } from "../lock-retry.js";
@@ -313,7 +314,8 @@ export async function runProjectAdd(
 
     // Interactive mode if name or path not provided
     if (!projectName || !projectPath || options.interactive) {
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
 
       // Get path if not provided
       if (!projectPath) {
@@ -494,7 +496,7 @@ export async function runProjectRemove(name: string, options: ProjectRemoveOptio
     }
 
     if (!options.force) {
-      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
       const answer = await rl.question(`Unregister project '${project.name}'? [y/N] `);
       rl.close();
 

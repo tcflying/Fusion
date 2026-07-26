@@ -2,7 +2,7 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { createFnAgentMock, resolveMcpServersForStoreMock } = vi.hoisted(() => ({
+const { createFnAgentMock, createResolvedAgentSessionMock, resolveMcpServersForStoreMock } = vi.hoisted(() => {
   /*
   FNXC:DashboardTests 2026-07-18-12:20:
   Planning defaults clarificationEnabled=false, so createSession forces a summary after the
@@ -10,7 +10,7 @@ const { createFnAgentMock, resolveMcpServersForStoreMock } = vi.hoisted(() => ({
   complete payload so MCP-forwarding assertions exercise the default product path instead of
   throwing Clarification-disabled follow-up did not produce a summary.
   */
-  createFnAgentMock: vi.fn(async () => ({
+  const makeScriptedAgent = () => ({
     session: {
       state: { messages: [] as Array<{ role: string; content: string }> },
       prompt: vi.fn(async function (this: { state: { messages: Array<{ role: string; content: string }> } }, _message: string) {
@@ -42,12 +42,23 @@ const { createFnAgentMock, resolveMcpServersForStoreMock } = vi.hoisted(() => ({
       }),
       dispose: vi.fn(),
     },
-  })),
-  resolveMcpServersForStoreMock: vi.fn(async () => ({
-    servers: [{ name: "docs", transport: "stdio", command: "node", env: { TOKEN: "materialized-secret" } }],
-    errors: [],
-  })),
-}));
+  });
+  return {
+    createFnAgentMock: vi.fn(makeScriptedAgent),
+    /*
+    FNXC:PlanningRuntimeResolution 2026-07-24-16:20:
+    Planning now builds its session through the shared runtime-resolving seam
+    (`createResolvedAgentSession`), not a bare `createFnAgent` call, so the MCP-forwarding
+    contract for the planning lanes is asserted on that seam. The mission/target interview
+    lanes still construct through `createFnAgent` and keep their own mock.
+    */
+    createResolvedAgentSessionMock: vi.fn(makeScriptedAgent),
+    resolveMcpServersForStoreMock: vi.fn(async () => ({
+      servers: [{ name: "docs", transport: "stdio", command: "node", env: { TOKEN: "materialized-secret" } }],
+      errors: [],
+    })),
+  };
+});
 
 vi.mock("@fusion/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@fusion/core")>();
@@ -68,6 +79,7 @@ vi.mock("@fusion/engine", async (importOriginal) => {
     createChatTaskDocumentTools: vi.fn(() => []),
     createWorkflowAuthoringTools: vi.fn(() => []),
     createFnAgent: createFnAgentMock,
+    createResolvedAgentSession: createResolvedAgentSessionMock,
     resolveMcpServersForStore: resolveMcpServersForStoreMock,
   };
 });
@@ -99,16 +111,17 @@ describe("dashboard MCP lane forwarding", () => {
   beforeEach(() => {
     __resetPlanningState();
     createFnAgentMock.mockClear();
+    createResolvedAgentSessionMock.mockClear();
     resolveMcpServersForStoreMock.mockClear();
   });
 
-  it("forwards the materialized MCP set to chat/planning createFnAgent sessions", async () => {
+  it("forwards the materialized MCP set to chat/planning agent sessions", async () => {
     const store = makePlanningStore();
 
     await createSession("127.0.0.1", "Build a feature", store, "/tmp/fusion-dashboard-test");
 
     expect(resolveMcpServersForStoreMock).toHaveBeenCalledWith(store);
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       cwd: "/tmp/fusion-dashboard-test",
       tools: "readonly",
       allowMcpToolsInReadonly: true,
@@ -121,7 +134,7 @@ describe("dashboard MCP lane forwarding", () => {
 
     await createSession("127.0.0.1", "Build without MCP", makePlanningStore(), "/tmp/fusion-dashboard-test");
 
-    expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       tools: "readonly",
       allowMcpToolsInReadonly: true,
       mcpServers: [],
@@ -142,7 +155,7 @@ describe("dashboard MCP lane forwarding", () => {
     expect(startInitialTurn).toBeTypeOf("function");
     startInitialTurn?.();
 
-    await vi.waitFor(() => expect(createFnAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+    await vi.waitFor(() => expect(createResolvedAgentSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       tools: "readonly",
       allowMcpToolsInReadonly: true,
       mcpServers: [],

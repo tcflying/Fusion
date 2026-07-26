@@ -58,6 +58,10 @@ Terminal acceptance tasks that require real mobile Safari should use [`docs/ios-
 
 Agents running verification through `fn_run_verification` are bounded by default: project `verificationCommandTimeoutMs` when set, otherwise 300s for package scope and 900s for workspace scope, with an 1800s hard cap. Marathon invocations such as root `pnpm test`, `pnpm test:full`, `pnpm verify:workspace`, whole-package tests without file filters, and shell repeat loops are soft-capped unless the agent explicitly passes `allowFullSuite: true`; the escape hatch still emits progress heartbeats and respects the hard cap. **Do not pass `allowFullSuite: true` unless absolutely necessary** — it is the main way verification balloons past its budget. Default to a targeted, file-scoped command such as `pnpm --filter @fusion/<pkg> exec vitest run src/path/to/test.ts --silent=passed-only --reporter=dot`; reserve `allowFullSuite` for a genuinely full run with no targetable test set (state the reason), with the thin merge gate (`pnpm test:gate`) as the cross-cutting safety net.
 
+## Dashboard source-read fixtures
+
+Dashboard app tests that inspect CSS or TypeScript source must use `packages/dashboard/app/test/cssFixture.ts` helpers such as `readAppFile()` and `loadComponentCss()`. Never read a bare relative path or construct a source path from `process.cwd()`; root-anchored Vitest launches otherwise fail at import time. `scripts/check-no-cwd-relative-dashboard-test-reads.mjs` enforces this convention in the full-suite pretest hook and merge gate.
+
 ## Fresh-worktree dist bootstrap
 
 `pnpm test` auto-runs `scripts/ensure-test-artifacts.mjs` to rebuild missing/stale dist artifacts. Dashboard and `dependency-graph` package lanes auto-bootstrap too. If you hit opaque `Failed to resolve import "./cli-spawn.js"` (or similar), treat it as bootstrap regression against FN-4605 — don't work around with a manual `pnpm build`.
@@ -344,7 +348,12 @@ the default branch only**: each CI shard uploads per-shard JSON timing artifacts
 shard artifacts into `.timings/` first (the default lookup directory), or pass
 `--inputs-dir <path>` to point at wherever they were downloaded. A future
 scheduled job can gate on freshness via `node scripts/ci-test-shard.mjs --check-timings-staleness`,
-which exits non-zero when the snapshot is missing or older than the 30-day budget.
+which exits non-zero when the snapshot is missing or older than the 30-day budget. Package test
+wrappers that launch Vitest (including `@fusion/desktop`) must forward caller reporter/output
+arguments unchanged: shard telemetry uses `--reporter=json` plus a package-relative
+`--outputFile.json=.timings/timings-*.json`. Wrappers may default to dot only when callers do
+not select a reporter; a successful artifact set must include parseable, non-empty desktop
+`testResults` under `packages/desktop/.timings/`.
 
 ## Weekly test velocity baseline
 

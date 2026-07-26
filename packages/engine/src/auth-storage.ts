@@ -223,10 +223,15 @@ vendored @earendil-works/pi-coding-agent AuthStorage backend using proper-lockfi
 plus a per-provider read-modify-merge (FileAuthStorageBackend.persistProviderChange /
 refreshOAuthTokenWithLock re-read the file under a lock and spread
 {...currentData, [provider]: credential} rather than flushing a whole-file in-memory
-snapshot). packages/engine/package.json already floors this at
-"@earendil-works/pi-coding-agent": "0.81.1" (exact pin; locked per-provider merge requires
->=0.80.3) — do not downgrade below 0.80.x, and re-verify this comment against
+snapshot). packages/engine/package.json already pins this at
+"@earendil-works/pi-coding-agent": "0.82.0" (exact matched runtime pair; locked per-provider
+merge requires >=0.80.3) — do not downgrade below 0.80.x, and re-verify this comment against
 dist/core/auth-storage.js if the pin is ever lowered. See
+
+FNXC:ProviderAuth 2026-07-24-12:00:
+FN-8564 retains Fusion's credential-store adapter on Pi 0.82.0. The release adds Kimi Code and
+OpenRouter OAuth, so new upstream login providers must still use the same queued, cross-process
+credential persistence contract rather than bypassing Fusion auth storage.
 packages/engine/src/__tests__/auth-storage-concurrency.test.ts for the regression coverage.
 */
 
@@ -416,6 +421,54 @@ function resolveStoredCredentialApiKey(providerId: string, credential: StoredCre
  * can return them as a fallback when neither Fusion auth nor legacy auth.json
  * contains a key for the provider.
  */
+/*
+FNXC:ProviderAuth 2026-07-24-18:20:
+Global settings live in `settings.json` under the resolved GLOBAL dir — not in Postgres
+(Postgres holds project settings, which are merged over the global ones by
+`settings-ops.ts`, and the immutable configuration-revision journal). The global dir is
+`~/.fusion` for current installs but falls back to the pre-rename `~/.pi/fusion` and
+`~/.pi/kb` dirs for operators who never migrated (see core `resolveGlobalDirForHome`).
+Hardcoding `~/.fusion` would silently ignore the operator's preference on those installs and
+fall back to raw-key precedence — the same silent-fallback failure this preference exists to
+remove. Mirror the legacy-aware lookup `getModelRegistryModelsPath` already does for
+models.json rather than importing core's resolver, which throws under VITEST when called
+without an explicit dir.
+*/
+export function getFusionGlobalSettingsPath(home = getHomeDir()): string {
+  const candidates = [
+    join(home, ".fusion", "settings.json"),
+    join(home, ".pi", "fusion", "settings.json"),
+    join(home, ".pi", "kb", "settings.json"),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0];
+}
+
+/*
+FNXC:ProviderAuth 2026-07-24-17:05:
+Read the operator's `anthropicAuthPreference` straight off the global settings file rather
+than threading a Settings object down here. Credential resolution runs deep inside
+createFnAgent (via createFusionAuthStorage, which takes no arguments) and is shared by every
+host — CLI, dashboard, desktop, daemon — so a settings parameter would have to be plumbed
+through all of them. The preference is global by definition (credentials live in the global
+auth.json), and this file is already the sibling of the auth/models files this module reads
+synchronously. Re-read per resolution so toggling the setting takes effect on the next lane
+without a restart; a missing/corrupt file falls back to the historical "api-key" precedence.
+*/
+function readAnthropicAuthPreference(home = getHomeDir()): "api-key" | "subscription" {
+  const settingsPath = getFusionGlobalSettingsPath(home);
+  if (!existsSync(settingsPath)) {
+    return "api-key";
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(settingsPath, "utf-8")) as {
+      anthropicAuthPreference?: unknown;
+    };
+    return parsed?.anthropicAuthPreference === "subscription" ? "subscription" : "api-key";
+  } catch {
+    return "api-key";
+  }
+}
+
 function readModelsJsonApiKeys(home = getHomeDir()): Map<string, string> {
   const apiKeys = new Map<string, string>();
   const modelsPath = getModelRegistryModelsPath(home);
@@ -779,11 +832,27 @@ export function createFusionAuthStorage(): FusionAuthStorage {
     FNXC:ProviderAuth 2026-07-01-14:55:
     Anthropic runtime auth (`getApiKey("anthropic")`) resolves in precedence order: (1) raw API key, (2) legacy `anthropic` OAuth, (3) separated `anthropic-subscription` OAuth, (4) models.json / ModelRegistry fallback raw key. Raw key wins so an explicit `ANTHROPIC_API_KEY` keeps using x-api-key; subscription/OAuth tokens must resolve here so the built-in provider runs them on `/v1` with Claude Code impersonation. Do NOT gate OAuth behind the CLI or reroute it to an `/v1` `anthropic-subscription` provider — that reintroduced the #1857 regression (FN-7391/FN-7396).
     */
-    if (!rawProviderLoggedOut) {
+    /*
+    FNXC:ProviderAuth 2026-07-24-17:05:
+    `anthropicAuthPreference` selects which credential wins when BOTH are configured.
+    "api-key" (default) keeps the order documented above. "subscription" moves the raw-key
+    step BELOW the OAuth steps so a stale or revoked saved key can no longer shadow a working
+    Claude subscription login — the failure mode that surfaced as `401 invalid x-api-key` on
+    lanes that call the Anthropic endpoint directly. Neither setting REMOVES a source: with
+    only one credential present, resolution falls through to it either way.
+    */
+    const preferSubscription = readAnthropicAuthPreference() === "subscription";
+    const resolveRawApiKey = (): string | undefined => {
+      if (rawProviderLoggedOut) return undefined;
       const anthropicApiKeyCredential = selectStoredCredentialByType(ANTHROPIC_PROVIDER_ID, "api_key");
-      if (anthropicApiKeyCredential) {
-        return resolveStoredCredentialApiKey(ANTHROPIC_PROVIDER_ID, anthropicApiKeyCredential);
-      }
+      return anthropicApiKeyCredential
+        ? resolveStoredCredentialApiKey(ANTHROPIC_PROVIDER_ID, anthropicApiKeyCredential)
+        : undefined;
+    };
+
+    if (!preferSubscription) {
+      const rawKey = resolveRawApiKey();
+      if (rawKey) return rawKey;
     }
 
     const subscriptionLoggedOut = loggedOutProviders.has(ANTHROPIC_SUBSCRIPTION_PROVIDER_ID);
@@ -805,6 +874,12 @@ export function createFusionAuthStorage(): FusionAuthStorage {
         const subscriptionKey = await resolveRefreshableCredentialApiKey(ANTHROPIC_SUBSCRIPTION_PROVIDER_ID, subscriptionCredential);
         if (subscriptionKey) return subscriptionKey;
       }
+    }
+
+    // Subscription-preferred: the raw key is the fallback once no OAuth credential resolved.
+    if (preferSubscription) {
+      const rawKey = resolveRawApiKey();
+      if (rawKey) return rawKey;
     }
 
     if (!rawProviderLoggedOut) {

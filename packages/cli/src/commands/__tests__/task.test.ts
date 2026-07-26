@@ -1,5 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
+/*
+FNXC:CliQuietMode 2026-07-25-09:05:
+Task create/link success lines use `result()` so they survive quiet mode.
+Capture that seam for assertions that previously spied console.log.
+*/
+const resultSpy = vi.hoisted(() => vi.fn());
+vi.mock("../../output.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../output.js")>();
+  return {
+    ...actual,
+    result: (text: string) => {
+      resultSpy(text);
+    },
+  };
+});
+
 // Mock node:readline/promises before importing the module under test
 vi.mock("node:readline/promises", () => ({
   createInterface: vi.fn(),
@@ -680,9 +696,9 @@ describe("project-aware task command behavior", () => {
   });
 
   it("runTaskCreate links existing task on deterministic duplicate", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const existing = makeTask({ id: "FN-777", description: "same task", column: "todo" });
     const mockCreateTask = vi.fn();
+    resultSpy.mockClear();
 
     vi.mocked(runDeterministicDuplicateGuard).mockResolvedValue({
       action: "duplicate",
@@ -702,8 +718,7 @@ describe("project-aware task command behavior", () => {
     await runTaskCreate("same task");
 
     expect(mockCreateTask).not.toHaveBeenCalled();
-    expect(logSpy.mock.calls.some((call) => String(call[0]).includes("Linked existing FN-777"))).toBe(true);
-    logSpy.mockRestore();
+    expect(resultSpy.mock.calls.some((call) => String(call[0]).includes("Linked existing FN-777"))).toBe(true);
   });
 
   it("runTaskCreate proceeds when no high-signal tokens are present", async () => {

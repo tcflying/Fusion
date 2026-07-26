@@ -1798,15 +1798,17 @@ Contextual comments remain transient review controls: render the capture/editor 
 selection, and render the tray only after a valid comment exists so an empty plan review keeps
 its established Refine and Proceed action hierarchy.
 */
+/*
+FNXC:PlanningComments 2026-07-25-10:20:
+Single Add-comment trigger, living in the plan action rail at every breakpoint. The former
+--document / --mobile variant pair is gone: both rendered in the DOM and read as duplicate buttons.
+*/
 .planning-add-comment {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: var(--space-sm);
-  margin-top: var(--space-lg);
-}
-
-.planning-add-comment--mobile {
-  display: none;
+  margin-top: 0;
 }
 
 .planning-comment-editor,
@@ -1910,17 +1912,11 @@ reach past Proceed — match the tablet in-flow stack on phone too.
   }
 
   /*
-  FNXC:PlanningComments 2026-07-24-05:35:
-  Tablet and phone hide the document-adjacent trigger (it sits at the end of a long plan and
-  requires scrolling). The action-rail variant becomes the sole control and spans the full
-  footer width above Refine/Proceed so a selection always exposes Add comment without leaving
-  the plan action baseline.
+  FNXC:PlanningComments 2026-07-25-10:20:
+  Tablet and phone give the sole action-rail trigger the full footer width above Refine/Proceed so a
+  selection always exposes Add comment without leaving the plan action baseline.
   */
-  .planning-add-comment--document {
-    display: none;
-  }
-
-  .planning-plan-actions .btn.planning-add-comment--mobile {
+  .planning-plan-actions .btn.planning-add-comment {
     display: flex;
     grid-column: 1 / -1;
     margin-top: 0;
@@ -1934,7 +1930,7 @@ reach past Proceed — match the tablet in-flow stack on phone too.
   tablet and phone share the mobile icon scale (default lucide size can dwarf the label in the
   full-width rail row).
   */
-  .planning-plan-actions .btn.planning-add-comment--mobile svg {
+  .planning-plan-actions .btn.planning-add-comment svg {
     width: var(--space-lg);
     height: var(--space-lg);
     flex-shrink: 0;
@@ -2089,7 +2085,7 @@ plan actions, and a token-sized bottom inset keep all three controls inline with
     gap: var(--space-md);
   }
 
-  .planning-plan-actions .btn.planning-add-comment--mobile {
+  .planning-plan-actions .btn.planning-add-comment {
     display: flex;
     grid-column: 1 / -1;
     width: 100%;
@@ -2098,7 +2094,7 @@ plan actions, and a token-sized bottom inset keep all three controls inline with
     gap: var(--space-sm);
   }
 
-  .planning-plan-actions .btn.planning-add-comment--mobile svg {
+  .planning-plan-actions .btn.planning-add-comment svg {
     width: var(--space-lg);
     height: var(--space-lg);
     flex-shrink: 0;

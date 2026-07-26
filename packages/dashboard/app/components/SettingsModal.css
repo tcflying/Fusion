@@ -339,7 +339,16 @@ Fix the invariant for BOTH presentations (standalone modal + embedded SettingsVi
   min-width: 0;
 }
 
-@media (max-width: 768px) {
+/*
+FNXC:SettingsLayout 2026-07-25-21:05:
+This footer block tracks the app-wide mobile breakpoint (`MOBILE_MEDIA_QUERY` in useViewportMode.ts =
+`(max-width: 768px), (max-height: 480px)`), not width alone. SettingsModal.tsx switches to the mobile footer
+MARKUP off that hook (short version/Reset labels plus the separate `.settings-modal-footer-update-row`),
+so a landscape phone (e.g. 812x375 — width > 768, height <= 480) used to render mobile markup under desktop
+footer CSS: the update row lost its padding/divider and the rail wrapped instead of scrolling. Keep the two in
+sync so both orientations get the same footer.
+*/
+@media (max-width: 768px), (max-height: 480px) {
   /*
   FNXC:Settings 2026-07-09-00:00:
   FN-7752 requires the mobile Settings footer to remain a single horizontal row in both standalone and embedded presentations. Keep Version/Help, Export/Import/Reset, and Cancel/Save on one nowrap rail that can scroll horizontally instead of stacking into multiple rows.
@@ -349,6 +358,17 @@ Fix the invariant for BOTH presentations (standalone modal + embedded SettingsVi
 
   FNXC:Settings 2026-07-22-12:00:
   Mobile Settings bottom buttons must read as one centered control cluster with even token spacing, not the desktop edge-split layout. Override the base `.modal-actions` flex-end + `.modal-actions-left { margin-right: auto }` push so Help/Version, Import/Export/Reset, and Close sit together in the middle of the rail. Use `safe center` so an overflowing update-result/control row still starts at the scroll origin instead of clipping the leading buttons. Gap is `var(--space-sm)` between groups and `var(--space-xs)` inside groups for consistent breathing room on narrow screens. Applies to both standalone modal and embedded SettingsView (shared `.settings-modal .modal-actions`).
+
+  FNXC:SettingsLayout 2026-07-25-21:05:
+  The rail must be TOUCH-scrollable, and only when its content is actually wider than the viewport.
+  `overflow-x: auto` alone gave that on desktop pointers but NOT on a phone: FN-6365's global mobile lock
+  (`* { touch-action: pan-y }` in styles.css) intersects horizontal pans away from every element, so a finger
+  drag across Help/version/Import/Export/Reset/Close did nothing. `touch-action` is not inherited, so the rail
+  AND every touch target inside it (the buttons themselves receive the touchstart) must opt back into `pan-x`
+  — the same container+targets pattern as the board and AgentDetailView tabs. `overscroll-behavior-x: contain`
+  keeps a fling at either end from chaining out to the document/board swipe handlers.
+  "Only if wider than viewport" is `overflow-x: auto` doing its job: when the cluster fits, there is no scroll
+  range, the rail stays centered, and vertical page panning is unaffected.
   */
   .settings-modal .modal-actions {
     flex-wrap: nowrap;
@@ -359,13 +379,36 @@ Fix the invariant for BOTH presentations (standalone modal + embedded SettingsVi
     gap: var(--space-sm);
     overflow-x: auto;
     overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    touch-action: pan-x pan-y;
+    -webkit-overflow-scrolling: touch;
+    min-width: 0;
+    max-width: 100%;
   }
 
+  /*
+  FNXC:SettingsLayout 2026-07-25-21:05:
+  Non-inherited `touch-action` again: the buttons/labels are the actual touch targets, so without this the
+  global `pan-y` lock still swallows a drag that starts on a button (which is most of the rail's surface).
+  Scoped to this footer so nothing else loses the FN-6365 vertical-only default.
+  */
+  .settings-modal .modal-actions * {
+    touch-action: pan-x pan-y;
+  }
+
+  /*
+  FNXC:SettingsLayout 2026-07-25-21:05:
+  `max-width: none` undoes the mobile universal max-width-100% reset in styles.css for the footer's button
+  groups only. A group clamped to the rail's own width cannot contain its non-shrinking buttons — they spill
+  out of their box (overlapping the neighbouring group) instead of making the rail's scrollable content wider,
+  which is the width the scroll range is computed from.
+  */
   .settings-modal .modal-actions-left {
     align-items: center;
     flex-shrink: 0;
     gap: var(--space-xs);
     margin-right: 0;
+    max-width: none;
   }
 
   .settings-modal .modal-actions-right {
@@ -373,6 +416,7 @@ Fix the invariant for BOTH presentations (standalone modal + embedded SettingsVi
     flex-shrink: 0;
     gap: var(--space-xs);
     margin-left: 0;
+    max-width: none;
   }
 
   .settings-modal .settings-modal-footer-version {
@@ -381,6 +425,7 @@ Fix the invariant for BOTH presentations (standalone modal + embedded SettingsVi
     flex: 0 0 auto;
     margin-right: 0;
     min-width: max-content;
+    max-width: none;
   }
 
   /*
@@ -399,6 +444,32 @@ Fix the invariant for BOTH presentations (standalone modal + embedded SettingsVi
     align-self: center;
     flex: 0 1 auto;
     line-height: normal;
+    white-space: normal;
+  }
+
+  /*
+  FNXC:SettingsUpdate 2026-07-25-19:40:
+  Mobile-only row that carries the update-check result above the footer rail (rendered by SettingsModal.tsx when
+  viewportMode === "mobile"). The rail below is a deliberate nowrap scroller; the banner is not, so it wraps and
+  centers here at full width and can no longer clip itself or shove Import/Export/Reset/Close out of view.
+  It owns the footer's top divider and the adjacent rail drops its own so the two rows read as one footer block.
+  */
+  .settings-modal .settings-modal-footer-update-row {
+    display: flex;
+    flex-shrink: 0;
+    justify-content: center;
+    text-align: center;
+    padding: var(--space-sm) var(--modal-padding) 0;
+    border-top: 1px solid var(--border);
+    background: color-mix(in srgb, var(--text) 5%, transparent);
+  }
+
+  .settings-modal .settings-modal-footer-update-row + .modal-actions {
+    border-top: none;
+  }
+
+  .settings-modal .settings-modal-footer-update-row .settings-update-result {
+    justify-content: center;
     white-space: normal;
   }
 

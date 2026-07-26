@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import type { TaskStore } from "@fusion/core";
 import { createSessionDiagnostics, nonfatal } from "./ai-session-diagnostics.js";
 import { registerBeforeExitCleanup } from "./process-lifecycle.js";
+import { laneModelOptions, resolveLaneSessionModel } from "./lane-session-model.js";
 
 // Dynamic import for @fusion/core to get prompt override resolution
 
@@ -505,11 +506,20 @@ async function generateSpecWithAI(
    * FNXC:McpConfig 2026-06-26-16:58:
    * Agent onboarding generation is a tools:none readonly helper, but routes can provide a dashboard-scoped TaskStore. Forward the resolved in-memory MCP server set consistently without changing tool semantics; no-store callers remain empty and secrets are never logged.
    */
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  Resolve an explicit provider/model pair. Without one the runtime silently substitutes its
+  own built-in default model (anthropic/claude-opus-4-8), leaving the operator's configured
+  provider and failing with `401 invalid x-api-key` for anyone with no raw Anthropic key —
+  and bypassing test-mode forcing. See lane-session-model.ts.
+  */
+  const generationModel = await resolveLaneSessionModel(store);
   const agent = await createFnAgent({
     cwd: rootDir,
     systemPrompt: effectiveSystemPrompt,
     tools: "none",
     mcpServers,
+    ...laneModelOptions(generationModel),
   });
 
   try {

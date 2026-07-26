@@ -23,6 +23,11 @@ vi.mock("lucide-react", () => ({
   Cpu: () => null,
 }));
 
+// FNXC:VoiceInput 2026-07-26-05:05: Keep legacy form tests focused on form settings; voice behavior has dedicated hook and composer-invariant suites.
+vi.mock("../../hooks/useComposerDictation", () => ({
+  useComposerDictation: () => ({ micProps: { enabled: false, supported: false, state: "idle", start: vi.fn(), stop: vi.fn() } }),
+}));
+
 // Mock the api module
 vi.mock("../../api", () => ({
   fetchModels: vi.fn().mockResolvedValue({ models: [
@@ -1038,8 +1043,9 @@ describe("TaskForm preset selection (FN-819)", () => {
 
     expect(onPresetModeChange).toHaveBeenCalledWith("preset");
     expect(onSelectedPresetIdChange).toHaveBeenCalledWith("fast");
-    expect(onExecutorModelChange).toHaveBeenCalledWith("anthropic/claude-sonnet-4-5");
-    expect(onValidatorModelChange).toHaveBeenCalledWith("openai/gpt-4o");
+    // FNXC:TaskForm 2026-07-24-23:05: model/preset handlers pass TaskFormValueChangeMeta so NewTaskModal can ignore initialization seeds vs user picks.
+    expect(onExecutorModelChange).toHaveBeenCalledWith("anthropic/claude-sonnet-4-5", { source: "user" });
+    expect(onValidatorModelChange).toHaveBeenCalledWith("openai/gpt-4o", { source: "user" });
   });
 
   it("switching to default clears preset and model overrides", async () => {
@@ -1080,8 +1086,8 @@ describe("TaskForm preset selection (FN-819)", () => {
 
     expect(onPresetModeChange).toHaveBeenCalledWith("default");
     expect(onSelectedPresetIdChange).toHaveBeenCalledWith("");
-    expect(onExecutorModelChange).toHaveBeenCalledWith("");
-    expect(onValidatorModelChange).toHaveBeenCalledWith("");
+    expect(onExecutorModelChange).toHaveBeenCalledWith("", { source: "user" });
+    expect(onValidatorModelChange).toHaveBeenCalledWith("", { source: "user" });
   });
 
   it("switching to custom clears preset ID", async () => {
@@ -1564,7 +1570,8 @@ describe("TaskForm focus behavior (FN-1459)", () => {
       });
 
       await waitFor(() => {
-        expect(onGithubTrackingEnabledChange).toHaveBeenCalledWith(true);
+        // FNXC:TaskForm 2026-07-24-23:05: settings-default seed marks source initialization so create flow can avoid treating it as a user edit.
+        expect(onGithubTrackingEnabledChange).toHaveBeenCalledWith(true, { source: "initialization" });
       });
     });
 

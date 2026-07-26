@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { CentralCore, GlobalSettingsStore, getDefaultCentralDbPath } from "@fusion/core";
 import { createFusionAuthStorage, createFusionModelRegistry } from "@fusion/engine";
 import { resolveProject } from "../project-context.js";
+import { promptOutputStream } from "../output.js";
 import { runInit } from "./init.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
 import { getModelRegistryModelsPath } from "./auth-paths.js";
@@ -37,7 +38,8 @@ interface PromptSession {
 }
 
 function createPromptSession(input: NodeJS.ReadableStream = process.stdin): PromptSession {
-  const rl = createInterface({ input, output: process.stdout });
+  const rl = createInterface({ input, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
   let settled = false;
 
   const cleanup = () => {

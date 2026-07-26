@@ -587,11 +587,17 @@ describe("SettingsModal", () => {
     });
 
     it("shows lifecycle state changes for start and stop actions, including error state", async () => {
+      /*
+      FNXC:SettingsRemote 2026-07-24-23:05:
+      Full Suite flake: a second Stop Tunnel click races loadRemoteData after the first stop.
+      Product UI only shows Stop while state is running/starting; after stop refresh returns
+      error, the control is Start Tunnel. Drive start → running → one stop → error message
+      instead of double-stop, and keep running stable across start-poll ticks.
+      */
       mockFetchRemoteStatus
         .mockResolvedValueOnce({ provider: null, state: "stopped", url: null, lastError: null })
         .mockResolvedValueOnce({ provider: "tailscale", state: "starting", url: null, lastError: null })
-        .mockResolvedValueOnce({ provider: "tailscale", state: "running", url: "https://tail.example", lastError: null })
-        .mockResolvedValueOnce({ provider: "tailscale", state: "error", url: null, lastError: "Tunnel crashed" });
+        .mockResolvedValue({ provider: "tailscale", state: "running", url: "https://tail.example", lastError: null });
 
       await renderModalSection("remote", "Remote Access");
 
@@ -607,15 +613,18 @@ describe("SettingsModal", () => {
 
       expect(await screen.findByRole("button", { name: "Stop Tunnel" })).toBeInTheDocument();
 
+      mockFetchRemoteStatus.mockResolvedValue({
+        provider: "tailscale",
+        state: "error",
+        url: null,
+        lastError: "Tunnel crashed",
+      });
       await settingsModalUser.click(screen.getByRole("button", { name: "Stop Tunnel" }));
       await waitFor(() => {
         expect(mockStopRemoteTunnel).toHaveBeenCalledTimes(1);
       });
-      await settingsModalUser.click(screen.getByRole("button", { name: "Stop Tunnel" }));
-      await waitFor(() => {
-        expect(mockStopRemoteTunnel).toHaveBeenCalledTimes(2);
-      });
       expect(await screen.findByText("Tunnel crashed")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Start Tunnel" })).toBeInTheDocument();
     });
 
     it("shows external tunnel panel with actions when external tunnel is detected", async () => {

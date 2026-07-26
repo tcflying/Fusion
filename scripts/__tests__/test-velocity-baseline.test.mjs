@@ -213,6 +213,44 @@ describe("main", () => {
     }
   });
 
+  it("renders report-only slowest rows from the current timing snapshot", async () => {
+    const rootDir = tempRoot();
+    try {
+      const currentFile = "packages/a/src/__tests__/current.test.ts";
+      mkdirSync(path.join(rootDir, path.dirname(currentFile)), { recursive: true });
+      writeFileSync(path.join(rootDir, currentFile), "");
+      writeJson(rootDir, "scripts/test-timings.json", {
+        capturedAt: "2026-07-24T10:00:00.000Z",
+        packages: { "@pkg/a": { files: { [currentFile]: 1_000 } } },
+      });
+      writeJson(rootDir, "scripts/test-velocity-history.json", {
+        entries: [{
+          capturedAt: "2026-07-22T10:00:00.000Z",
+          gateMs: 1_000,
+          bootSmokeMs: 1_000,
+          testMs: 1_000,
+          quarantineCount: 0,
+          slowestTop20: [{ file: "packages/a/src/__tests__/deleted.test.ts", package: "@pkg/a", ms: 9_000 }],
+          timingSnapshotCapturedAt: "2026-06-01T10:00:00.000Z",
+        }],
+      });
+
+      const exitCode = await main(["--report-only"], {
+        rootDir,
+        stdout: nullStream(),
+        stderr: nullStream(),
+        now: new Date("2026-07-24T12:00:00.000Z"),
+      });
+
+      assert.equal(exitCode, 0);
+      const report = readFileSync(path.join(rootDir, "docs/test-velocity-baseline.md"), "utf8");
+      assert.match(report, /current\.test\.ts/);
+      assert.doesNotMatch(report, /deleted\.test\.ts|days old|no longer exist/);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
   /*
   FNXC:TestVelocityQuarantine 2026-07-02-12:00:
   FN-7420 requires report-only regeneration to render quarantine surfaces from the live ledger even when the committed report and latest timing history still claim a non-zero quarantine count.

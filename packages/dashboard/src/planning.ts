@@ -28,6 +28,7 @@ import {
   TASK_PRIORITIES,
   THINKING_LEVELS,
   formatPlanningPlanMd,
+  resolvePlanningSettingsModel,
   summarizeTitle,
   type PromptOverrideMap,
 } from "@fusion/core";
@@ -47,7 +48,7 @@ import {
   buildSessionSkillContextSync,
   createChatTaskDocumentTools,
   createChatTaskLogsReadTool,
-  createFnAgent as engineCreateFnAgent,
+  createResolvedAgentSession,
   createWorkflowAuthoringTools,
   resolveMcpServersForStore,
 } from "@fusion/engine";
@@ -81,8 +82,31 @@ type PlanningSessionOptions = {
   messageStore?: MessageStore;
   pluginRunner?: SkillPluginRunner;
 };
+/*
+FNXC:PlanningRuntimeResolution 2026-07-24-16:20:
+Planning sessions must be created through the shared `createResolvedAgentSession` seam that chat, executor, reviewer, merger, and heartbeat already use — NOT through a bare `createFnAgent` call. `createFnAgent` pins the session to the default pi runtime, so a planning selection could never route to a CLI/plugin runtime (claude-local/ACP, grok, omp) that owns its own auth; it always issued a direct HTTPS call to the provider endpoint with a Fusion-resolved key. That divergence is why a subscription/CLI-authenticated operator saw planning fail with a raw-key `401 invalid x-api-key` while every other lane worked. Routing here also emits the `session:runtime-resolved` run-audit event, so planning's resolved runtime and post-transform model pair are finally visible.
+
+Planning has no ambient task or bound agent, so it carries no runtimeHint of its own; `resolveRuntime` falls back to the default pi runtime exactly as before when no plugin runtime claims the purpose. `sessionPurpose: "executor"` matches the role planning already requests for skill selection (`buildSessionSkillContextSync(null, "executor", ...)`) and the purpose chat/QuickChat pass for the same reason.
+*/
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let createFnAgent: any = engineCreateFnAgent;
+async function createPlanningRuntimeSession(options: any): Promise<AgentResult> {
+  const { pluginRunner, runtimeHint, settings, ...runtimeOptions } = options ?? {};
+  // Prefer the live engine binding so `ensureEngineReady()`-driven late loading
+  // still resolves, mirroring how this module already reaches engine helpers.
+  const create = (engineModule as unknown as {
+    createResolvedAgentSession?: typeof createResolvedAgentSession;
+  }).createResolvedAgentSession ?? createResolvedAgentSession;
+  return create({
+    sessionPurpose: "executor",
+    ...(runtimeHint ? { runtimeHint } : {}),
+    ...(pluginRunner ? { pluginRunner } : {}),
+    ...(settings ? { settings } : {}),
+    ...runtimeOptions,
+  });
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let createFnAgent: any = createPlanningRuntimeSession;
 
 function isThinkingLevel(value: unknown): value is ThinkingLevel {
   return THINKING_LEVELS.includes(value as ThinkingLevel);
@@ -1325,6 +1349,14 @@ async function runCreateSessionFirstTurn(
   const skillContext = buildSessionSkillContextSync(null, "executor", rootDir, pluginRunner);
 
   /*
+  FNXC:PlanningModelRehydration 2026-07-24-16:20:
+  The non-streaming start is the same surface as the streaming start and the rebuild path:
+  it must resolve an explicit provider/model pair instead of leaving the runtime on its
+  built-in default. See resolveSessionPlanningModel for why an unset pair is a live bug.
+  */
+  const { provider: startProvider, modelId: startModelId } = await resolveSessionPlanningModel(session, store);
+
+  /*
   FNXC:PlanningSkills 2026-06-17-19:33:
   Planning sessions are agent-acting lanes with planning and workflow tools, so they must request the same executor role fallback plus enabled plugin skills (for example ce-debug) as task execution sessions.
   */
@@ -1351,6 +1383,10 @@ async function runCreateSessionFirstTurn(
       ...createChatTaskDocumentTools(store),
       createChatTaskLogsReadTool(store),
     ],
+    ...(startProvider && startModelId
+      ? { defaultProvider: startProvider, defaultModelId: startModelId }
+      : {}),
+    ...(pluginRunner ? { pluginRunner } : {}),
     onThinking: () => {
       // Non-streaming path ignores thinking output
     },
@@ -2103,6 +2139,8 @@ async function createPlanningAgent(
         }
       : {}),
     ...(thinkingLevel ? { defaultThinkingLevel: thinkingLevel } : {}),
+    // Runtime resolution needs the plugin runner to see plugin-provided runtimes.
+    ...(pluginRunner ? { pluginRunner } : {}),
     onThinking: (delta: string) => {
       if (callbacksInvalidated()) return;
       markPlanningGenerationProgress(session.id, delta);
@@ -2144,6 +2182,50 @@ function buildHistoryReplayPrompt(
   ].join("\n\n");
 }
 
+/*
+FNXC:PlanningModelRehydration 2026-07-24-16:20:
+A rebuilt planning agent MUST be given the same provider/model pair the session started on. `ensureSessionAgent` previously passed `undefined, undefined` while still preserving `draftThinkingLevel`, so any rebuild — `/planning/respond`, `/planning/:id/retry`, rewind, or a draft resumed after the in-memory agent was dropped — silently discarded the model selection. `createFnAgent`/`createResolvedAgentSession` forward NO `model` when the pair is incomplete (pi.ts `createSessionWithModel`), so pi-coding-agent then picked its OWN built-in default (`anthropic/claude-opus-4-8`). For an operator on a custom provider or a CLI/subscription runtime that means the resumed turn hit `api.anthropic.com` with a raw key they never configured and died on `401 invalid x-api-key` — mid-interview, after earlier turns on the correct model had already streamed. That is the exact reported symptom: the first turns work, the resumed turn does not.
+
+Resolution order mirrors the start route (`register-planning-subtask-routes.ts` → `resolvePlanningSettingsModel`): the pair persisted on the draft wins, then the lane's settings-resolved pair. Both halves must be present — a half-set pair is treated as unset, matching the runtime's own pair semantics.
+*/
+async function resolveSessionPlanningModel(
+  session: Session,
+  store: TaskStore,
+): Promise<{ provider?: string; modelId?: string }> {
+  if (session.draftModelProvider && session.draftModelId) {
+    return { provider: session.draftModelProvider, modelId: session.draftModelId };
+  }
+
+  try {
+    const settings = await store.getSettings();
+    const resolved = resolvePlanningSettingsModel(settings);
+    if (resolved.provider && resolved.modelId) {
+      // Cache onto the session so later rebuilds in this process stay on the
+      // same pair even if settings change mid-interview.
+      session.draftModelProvider = resolved.provider;
+      session.draftModelId = resolved.modelId;
+      return { provider: resolved.provider, modelId: resolved.modelId };
+    }
+  } catch (err) {
+    diagnostics.warn("Failed to resolve planning model for rebuilt agent", {
+      sessionId: session.id,
+      operation: "resolve-session-planning-model",
+      error: String(err),
+    });
+  }
+
+  /*
+  No complete pair resolved. The runtime falls back to its built-in default model,
+  which is provider-specific and may not match the operator's configured provider —
+  warn loudly rather than let that surface as an opaque provider auth error.
+  */
+  diagnostics.warn(
+    "Rebuilt planning agent has no resolved provider/model pair; the runtime will use its built-in default model",
+    { sessionId: session.id, operation: "resolve-session-planning-model" },
+  );
+  return {};
+}
+
 async function ensureSessionAgent(
   session: Session,
   rootDir: string | undefined,
@@ -2172,7 +2254,21 @@ async function ensureSessionAgent(
     );
   }
 
-  session.agent = await createPlanningAgent(session, effectiveRootDir, effectiveStore, undefined, undefined, session.draftThinkingLevel, promptOverrides, session.pluginRunner);
+  const { provider: resumeProvider, modelId: resumeModelId } = await resolveSessionPlanningModel(
+    session,
+    effectiveStore,
+  );
+
+  session.agent = await createPlanningAgent(
+    session,
+    effectiveRootDir,
+    effectiveStore,
+    resumeProvider,
+    resumeModelId,
+    session.draftThinkingLevel,
+    promptOverrides,
+    session.pluginRunner,
+  );
 
   if (historyForReplay.length === 0) {
     return;

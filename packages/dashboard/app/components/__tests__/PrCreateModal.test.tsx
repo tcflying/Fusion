@@ -5,8 +5,9 @@ import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PrCreateModal } from "../PrCreateModal";
 import type { PrInfo } from "@fusion/core";
+import { readAppFile } from "../../test/cssFixture";
 
-const prCreateModalCss = readFileSync("app/components/PrCreateModal.css", "utf8");
+const prCreateModalCss = readAppFile("components/PrCreateModal.css");
 
 const mocks = vi.hoisted(() => ({
   generatePrMetadata: vi.fn(),

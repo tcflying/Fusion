@@ -13,6 +13,7 @@ import {
   runGhJsonAsync,
 } from "@fusion/core/gh-cli";
 import { resolveProject, createLocalStore, closeProjectStore, type ProjectContext } from "../project-context.js";
+import { promptOutputStream, result as outputResult } from "../output.js";
 import { findNodeByNameOrId } from "./node.js";
 import { retryOnLock, LockRetryExhaustedError } from "../lock-retry.js";
 
@@ -382,7 +383,8 @@ async function runCliNearDuplicateCheck(args: {
     process.exit(1);
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream() });
   try {
     const answer = (await rl.question("Create anyway? [y/N]: ")).trim().toLowerCase();
     if (answer === "y" || answer === "yes") {
@@ -400,7 +402,7 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
   let description = descriptionArg;
 
   if (!description) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     description = await rl.question("Task description: ");
     rl.close();
   }
@@ -506,9 +508,9 @@ export async function runTaskCreate(descriptionArg?: string, attachFiles?: strin
       console.log(`  Project: ${context.projectName}`);
     }
     if (linkedExisting) {
-      console.log(`  ✓ Linked existing ${resolvedTask.id}: ${label}`);
+      outputResult(`  ✓ Linked existing ${resolvedTask.id}: ${label}\n`);
     } else {
-      console.log(`  ✓ Created ${resolvedTask.id}: ${label}`);
+      outputResult(`  ✓ Created ${resolvedTask.id}: ${label}\n`);
     }
     console.log(`    Column: ${resolvedTask.column}`);
     if (resolvedTask.dependencies.length > 0) {
@@ -1204,7 +1206,7 @@ export async function runTaskRefine(id: string, feedbackArg?: string, projectNam
   // store resolution, since this is not a board call.
   let feedback = feedbackArg;
   if (feedback === undefined) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     feedback = await rl.question("What needs to be refined? ");
     rl.close();
   }
@@ -1420,7 +1422,7 @@ export async function runTaskDelete(id: string, force?: boolean, allowResurrecti
 
   // Prompt for confirmation unless force is used
   if (!force) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     const answer = await rl.question(`Are you sure you want to delete ${id}? [y/N] `);
     rl.close();
 
@@ -1495,8 +1497,13 @@ export async function runTaskImportGitHubInteractive(
       return;
     }
 
-    // Display issues with numbers
-    console.log(`  Found ${issues.length} issues:\n`);
+    /*
+     * FNXC:CliQuietMode 2026-07-16-00:00:
+     * Issue choices and validation feedback are required context for this
+     * selection prompt. Preserve them through the output seam when quiet mode
+     * gates informational stdout.
+     */
+    outputResult(`  Found ${issues.length} issues:\n\n`);
     for (let i = 0; i < issues.length; i++) {
       const issue = issues[i];
       const importedTask = existingTasks.find((task) => dashboard.isGitHubIssueAlreadyImported(task, {
@@ -1506,13 +1513,13 @@ export async function runTaskImportGitHubInteractive(
         sourceUrl: issue.html_url,
       }));
       const status = importedTask ? ` [Imported as ${importedTask.id}]` : "";
-      console.log(`  ${i + 1}. #${issue.number} ${issue.title.slice(0, 80)}${issue.title.length > 80 ? "…" : ""}${status}`);
+      outputResult(`  ${i + 1}. #${issue.number} ${issue.title.slice(0, 80)}${issue.title.length > 80 ? "…" : ""}${status}\n`);
     }
 
-    console.log();
+    outputResult("\n");
 
     // Create readline interface for interactive selection
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
 
     let selectedIndices: number[] = [];
     let validInput = false;
@@ -1531,13 +1538,13 @@ export async function runTaskImportGitHubInteractive(
           .filter((n) => !isNaN(n));
 
         if (nums.length === 0) {
-          console.log("  Please enter at least one number or 'all'");
+          outputResult("  Please enter at least one number or 'all'\n");
           continue;
         }
 
         const outOfRange = nums.filter((n) => n < 1 || n > issues.length);
         if (outOfRange.length > 0) {
-          console.log(`  Invalid selection: ${outOfRange.join(", ")} (range: 1-${issues.length})`);
+          outputResult(`  Invalid selection: ${outOfRange.join(", ")} (range: 1-${issues.length})\n`);
           continue;
         }
 
@@ -1595,7 +1602,7 @@ export async function runTaskImportGitHubInteractive(
       }));
 
       const label = task.title || task.description.slice(0, 60) + (task.description.length > 60 ? "…" : "");
-      console.log(`  ✓ Created ${task.id}: ${label}`);
+      outputResult(`  ✓ Created ${task.id}: ${label}\n`);
       existingTasks.push(task);
       created++;
     }
@@ -1768,7 +1775,7 @@ export async function runTaskImportFromGitHub(
       }));
 
       const label = task.title || task.description.slice(0, 60) + (task.description.length > 60 ? "…" : "");
-      console.log(`  ✓ Created ${task.id}: ${label}`);
+      outputResult(`  ✓ Created ${task.id}: ${label}\n`);
       existingTasks.push(task);
       created++;
     }
@@ -1841,7 +1848,7 @@ export async function runTaskImportFromGitLab(
       await retryBoardCall(context, task.id, "log entry", () => store.logEntry(task.id, resource === "merge-requests" ? "Imported merge request from GitLab" : "Imported from GitLab", item.webUrl));
       existingTasks.push(task);
       created += 1;
-      console.log(`  ✓ Created ${task.id}: ${task.title}`);
+      outputResult(`  ✓ Created ${task.id}: ${task.title}\n`);
     }
     console.log(`\n  ✓ Imported ${created} GitLab tasks${skipped > 0 ? ` (${skipped} skipped)` : ""}\n`);
   } finally {
@@ -1853,7 +1860,7 @@ export async function runTaskComment(id: string, message?: string, author = "use
   // Interactive prompt runs BEFORE store resolution (not a board call).
   let text = message;
   if (text === undefined) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     text = await rl.question("Comment: ");
     rl.close();
   }
@@ -1910,7 +1917,7 @@ export async function runTaskSteer(id: string, message?: string, projectName?: s
   // resolution (not a board call).
   let text = message;
   if (text === undefined) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     text = await rl.question("Message: ");
     rl.close();
   }
@@ -1975,14 +1982,20 @@ function clearThinking(): void {
 }
 
 /** Prompt for text (multi-line) question */
-async function promptText(question: PlanningQuestion): Promise<string> {
-  console.log(`\n  ${question.question}`);
-  if (question.description) {
-    console.log(`  ${question.description}`);
-  }
-  console.log("  (Enter your response. Type DONE on its own line when finished):\n");
+// FNXC:CliQuietMode 2026-07-16-01:00: Planning questions, choices, and
+// validation are required prompt UI and must bypass the global stdout gate.
+function writePromptUi(text: string): void {
+  outputResult(text);
+}
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+async function promptText(question: PlanningQuestion): Promise<string> {
+  writePromptUi(`\n  ${question.question}\n`);
+  if (question.description) {
+    writePromptUi(`  ${question.description}\n`);
+  }
+  writePromptUi("  (Enter your response. Type DONE on its own line when finished):\n\n");
+
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
   const lines: string[] = [];
 
   return new Promise((resolve) => {
@@ -2003,11 +2016,11 @@ async function promptText(question: PlanningQuestion): Promise<string> {
 
 /** Prompt for single_select question */
 async function promptSingleSelect(question: PlanningQuestion): Promise<string> {
-  console.log(`\n  ${question.question}`);
+  writePromptUi(`\n  ${question.question}\n`);
   if (question.description) {
-    console.log(`  ${question.description}`);
+    writePromptUi(`  ${question.description}\n`);
   }
-  console.log();
+  writePromptUi("\n");
 
   if (!question.options || question.options.length === 0) {
     throw new Error("Single select question has no options");
@@ -2015,13 +2028,13 @@ async function promptSingleSelect(question: PlanningQuestion): Promise<string> {
 
   for (let i = 0; i < question.options.length; i++) {
     const opt = question.options[i];
-    console.log(`  ${i + 1}. ${opt.label}`);
+    writePromptUi(`  ${i + 1}. ${opt.label}\n`);
     if (opt.description) {
-      console.log(`     ${opt.description}`);
+      writePromptUi(`     ${opt.description}\n`);
     }
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
 
   while (true) {
     const answer = await rl.question("\n  Select (1-" + question.options.length + "): ");
@@ -2032,17 +2045,17 @@ async function promptSingleSelect(question: PlanningQuestion): Promise<string> {
       return question.options[num - 1].id;
     }
 
-    console.log(`  Invalid selection. Please enter a number between 1 and ${question.options.length}`);
+    writePromptUi(`  Invalid selection. Please enter a number between 1 and ${question.options.length}\n`);
   }
 }
 
 /** Prompt for multi_select question */
 async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> {
-  console.log(`\n  ${question.question}`);
+  writePromptUi(`\n  ${question.question}\n`);
   if (question.description) {
-    console.log(`  ${question.description}`);
+    writePromptUi(`  ${question.description}\n`);
   }
-  console.log("  (Enter comma-separated numbers, e.g., 1,3,4):\n");
+  writePromptUi("  (Enter comma-separated numbers, e.g., 1,3,4):\n\n");
 
   if (!question.options || question.options.length === 0) {
     throw new Error("Multi select question has no options");
@@ -2050,13 +2063,13 @@ async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> 
 
   for (let i = 0; i < question.options.length; i++) {
     const opt = question.options[i];
-    console.log(`  ${i + 1}. ${opt.label}`);
+    writePromptUi(`  ${i + 1}. ${opt.label}\n`);
     if (opt.description) {
-      console.log(`     ${opt.description}`);
+      writePromptUi(`     ${opt.description}\n`);
     }
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
 
   while (true) {
     const answer = await rl.question("\n  Select (comma-separated): ");
@@ -2066,13 +2079,13 @@ async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> 
       .filter((n) => !isNaN(n));
 
     if (nums.length === 0) {
-      console.log("  Please select at least one option");
+      writePromptUi("  Please select at least one option\n");
       continue;
     }
 
     const invalid = nums.filter((n) => n < 1 || n > question.options!.length);
     if (invalid.length > 0) {
-      console.log(`  Invalid selection: ${invalid.join(", ")}. Range: 1-${question.options.length}`);
+      writePromptUi(`  Invalid selection: ${invalid.join(", ")}. Range: 1-${question.options.length}\n`);
       continue;
     }
 
@@ -2083,12 +2096,12 @@ async function promptMultiSelect(question: PlanningQuestion): Promise<string[]> 
 
 /** Prompt for confirm question */
 async function promptConfirm(question: PlanningQuestion): Promise<boolean> {
-  console.log(`\n  ${question.question}`);
+  writePromptUi(`\n  ${question.question}\n`);
   if (question.description) {
-    console.log(`  ${question.description}`);
+    writePromptUi(`  ${question.description}\n`);
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
   const answer = await rl.question("\n  [Y/n]: ");
   rl.close();
 
@@ -2180,7 +2193,7 @@ export async function runTaskPlan(
 
   // If no initial plan, prompt interactively
   if (!initialPlan && !resumeSessionId) {
-    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
     console.log("\n  Let's plan your task. What would you like to accomplish?\n");
     initialPlan = await rl.question("  Describe your idea: ");
     rl.close();
@@ -2392,7 +2405,7 @@ export async function runTaskPlan(
         // Ask for confirmation (unless --yes flag)
         let confirmed = yesFlag;
         if (!yesFlag) {
-          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          const rl = createInterface({ input: process.stdin, output: promptOutputStream() });
           const answer = await rl.question("  Create this task? [Y/n]: ");
           rl.close();
           const trimmed = answer.trim().toLowerCase();
@@ -2413,7 +2426,7 @@ export async function runTaskPlan(
             createTaskFromPlanSession(sessionId, store, { baseBranch: baseBranch?.trim() || undefined }));
 
           console.log();
-          console.log(`  ${alreadyCreated ? "✓ Task already created from this plan:" : "✓ Created"} ${task.id}: ${task.title || task.description.slice(0, 60)}${task.description.length > 60 ? "…" : ""}`);
+          outputResult(`  ${alreadyCreated ? "✓ Task already created from this plan:" : "✓ Created"} ${task.id}: ${task.title || task.description.slice(0, 60)}${task.description.length > 60 ? "…" : ""}\n`);
           console.log(`    Column: ${task.column ?? "triage"}`);
           if (task.dependencies.length > 0) {
             console.log(`    Dependencies: ${task.dependencies.join(", ")}`);
@@ -2430,7 +2443,7 @@ export async function runTaskPlan(
           */
           if (!yesFlag) {
             // FNXC:PlanningMultiTask 2026-07-24-03:20: close the interface on every path, including thrown prompts (review finding — a leaked readline keeps the process alive).
-            const rlContinue = createInterface({ input: process.stdin, output: process.stdout });
+            const rlContinue = createInterface({ input: process.stdin, output: promptOutputStream() });
             let wantsMore = false;
             let focus = "";
             try {

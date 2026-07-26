@@ -500,7 +500,8 @@ describe("SettingsModal", () => {
 
       await settingsModalUser.click(screen.getByLabelText("Plan/Triage Model"));
       await settingsModalUser.click(await screen.findByText("GPT-4o"));
-      await settingsModalUser.click(screen.getAllByRole("button", { name: "Close" }).at(-1)!);
+      // FNXC:SettingsModalTests 2026-07-27-17:20: scoped footer-close selector avoids the whole-tree accessible-name walk of getAllByRole({ name: "Close" }).
+      await settingsModalUser.click(document.querySelector(".modal-actions-right button") as HTMLButtonElement);
 
       await waitFor(() => expect(mockUpdateWorkflowSettingValues).toHaveBeenCalledWith("workflow-custom", expectedPatch, "proj-1"));
       expect(onClose).toHaveBeenCalledTimes(1);

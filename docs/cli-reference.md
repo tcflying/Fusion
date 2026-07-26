@@ -99,7 +99,15 @@ fn <command> <subcommand> [options]
 | Option | Description |
 |---|---|
 | `--project <name>`, `-P <name>` | Target a specific registered project. |
+| `--quiet`, `-q` | Suppress informational stdout chatter for non-interactive commands. |
+| `FUSION_QUIET=1` | Enable quiet mode from the environment (`1`, `true`, `yes`, or `on`). |
 | `--help`, `-h` | Show help output. |
+
+### Quiet mode
+
+`fn --quiet <command>` (or `FUSION_QUIET=1 fn <command>`) suppresses console chatter and raw stdout progress writers without changing exit codes. Stderr, every interactive prompt, and command output whose stdout is the machine-consumable result (such as IDs, paths, and exported payloads) always remain visible. An explicit `--quiet` flag wins over the environment.
+
+Quiet suppression is disabled for `--json`, help/version requests (including delegated subcommand help), and the live `serve`, `daemon`, `dashboard`, `desktop`, `chat`, and Ink dashboard-TUI surfaces. These commands still accept either quiet flag and strip it before command routing.
 
 ### Project resolution order
 

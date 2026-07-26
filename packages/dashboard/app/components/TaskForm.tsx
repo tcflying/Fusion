@@ -1,5 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { useComposerDictation } from "../hooks/useComposerDictation";
+import { MicButton } from "./MicButton";
 import { DEFAULT_TASK_PRIORITY, TASK_PRIORITIES, type GlobalSettings, type Task, type TaskPriority, type Settings, type WorkflowDefinition, type ResolvedWorkflowOptionalStep } from "@fusion/core";
 import type { ToastType } from "../hooks/useToast";
 import { fetchModels, fetchSettings, fetchWorkflows, fetchWorkflowOptionalSteps, refineText, getRefineErrorMessage, updateGlobalSettings, fetchGlobalSettings, fetchGitBranches, type RefinementType, type ModelInfo, type NodeInfo } from "../api";
@@ -55,6 +57,13 @@ type TaskExecutionModeSelection = "standard" | "fast";
 export type BranchSelectionMode = "project-default" | "auto-new" | "existing" | "custom-new" | "shared-group";
 export interface EnabledWorkflowStepsChangeMeta {
   optionalStepsAvailable: boolean;
+  /** Distinguishes automatic create-form seeding from an operator optional-step choice. */
+  source?: "initialization" | "user";
+}
+
+/** Identifies form writes made by asynchronous create-form defaults rather than an operator. */
+export interface TaskFormValueChangeMeta {
+  source?: "initialization" | "user";
 }
 
 const PRESET_OPTION_SEPARATOR = "──────────";
@@ -87,9 +96,9 @@ export interface TaskFormProps {
   priority?: TaskPriority;
   onPriorityChange?: (value: TaskPriority) => void;
   executorModel: string;
-  onExecutorModelChange: (value: string) => void;
+  onExecutorModelChange: (value: string, meta?: TaskFormValueChangeMeta) => void;
   validatorModel: string;
-  onValidatorModelChange: (value: string) => void;
+  onValidatorModelChange: (value: string, meta?: TaskFormValueChangeMeta) => void;
   planningModel?: string;
   onPlanningModelChange?: (value: string) => void;
   thinkingLevel?: string;
@@ -151,7 +160,7 @@ export interface TaskFormProps {
   executionMode?: TaskExecutionModeSelection;
   onExecutionModeChange?: (value: TaskExecutionModeSelection) => void;
   githubTrackingEnabled?: boolean;
-  onGithubTrackingEnabledChange?: (value: boolean) => void;
+  onGithubTrackingEnabledChange?: (value: boolean, meta?: TaskFormValueChangeMeta) => void;
   githubRepoOverride?: string;
   onGithubRepoOverrideChange?: (value: string) => void;
 
@@ -311,6 +320,15 @@ export function TaskForm({
   const depDropdownRef = useRef<HTMLDivElement>(null);
   const workflowDropdownRef = useRef<HTMLDivElement>(null);
   const descTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // FNXC:VoiceInput 2026-07-24-05:00: Controlled dictated updates must use the same
+  // description autosize routine as keyboard events after their React render commits.
+  const resizeDescription = useCallback(() => {
+    const element = descTextareaRef.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${element.scrollHeight}px`;
+  }, []);
+  const dictation = useComposerDictation({ textareaRef: descTextareaRef, value: description, onChange: onDescriptionChange, onResize: resizeDescription, projectId });
   const titleInputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -375,7 +393,7 @@ export function TaskForm({
       // mid-flight when switching to "No workflow"), so the loading row never sticks.
       setOptionalStepsLoading(false);
       if (isCreateOptionalStepPicker) {
-        onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: false });
+        onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: false, source: "initialization" });
       }
       return;
     }
@@ -392,14 +410,14 @@ export function TaskForm({
           const seededSteps = executionModeRef.current === "fast"
             ? []
             : steps.filter((s) => s.defaultOn).map((s) => s.templateId);
-          onEnabledWorkflowStepsChange?.(seededSteps, { optionalStepsAvailable: steps.length > 0 });
+          onEnabledWorkflowStepsChange?.(seededSteps, { optionalStepsAvailable: steps.length > 0, source: "initialization" });
         }
       })
       .catch(() => {
         if (cancelled) return;
         setOptionalSteps([]);
         if (isCreateOptionalStepPicker) {
-          onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: false });
+          onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: false, source: "initialization" });
         }
       })
       .finally(() => {
@@ -421,7 +439,7 @@ export function TaskForm({
   const handleExecutionModeChange = useCallback((nextMode: TaskExecutionModeSelection) => {
     onExecutionModeChange?.(nextMode);
     if (nextMode === "fast" && onWorkflowIdChange) {
-      onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: optionalSteps.length > 0 });
+      onEnabledWorkflowStepsChange?.([], { optionalStepsAvailable: optionalSteps.length > 0, source: "user" });
     }
   }, [onEnabledWorkflowStepsChange, onExecutionModeChange, onWorkflowIdChange, optionalSteps.length]);
 
@@ -431,13 +449,19 @@ export function TaskForm({
       const next = current.includes(templateId)
         ? current.filter((id) => id !== templateId)
         : [...current, templateId];
-      onEnabledWorkflowStepsChange?.(next, { optionalStepsAvailable: optionalSteps.length > 0 });
+      onEnabledWorkflowStepsChange?.(next, { optionalStepsAvailable: optionalSteps.length > 0, source: "user" });
     },
     [enabledWorkflowSteps, onEnabledWorkflowStepsChange, optionalSteps.length],
   );
 
   const availablePresets = settings?.modelPresets || [];
   const selectedPreset = availablePresets.find((preset) => preset.id === selectedPresetId);
+  /*
+  FNXC:NewTaskDirtyState 2026-07-24-18:30:
+  Settings arrive asynchronously, but a model selected before they resolve is operator input.
+  Do not let the delayed auto-preset replace that selection or reclassify it as pristine.
+  */
+  const hasUserSelectedModelRef = useRef(false);
   const effectiveGithubRepoDefault = resolveEffectiveGithubRepoDefault(settings, globalSettings);
   const githubRepoOverrideTrimmed = (githubRepoOverride || "").trim();
   const githubRepoOverrideInvalid = githubRepoOverrideTrimmed.length > 0 && !REPO_OVERRIDE_RE.test(githubRepoOverrideTrimmed);
@@ -463,14 +487,14 @@ export function TaskForm({
 
   // Auto-select preset by size (create mode only)
   useEffect(() => {
-    if (mode !== "create" || !isActive || !settings?.autoSelectModelPreset) return;
+    if (mode !== "create" || !isActive || !settings?.autoSelectModelPreset || hasUserSelectedModelRef.current) return;
     const recommended = getRecommendedPresetForSize(undefined, settings.defaultPresetBySize || {}, availablePresets);
     if (recommended) {
       const selection = applyPresetToSelection(recommended);
       onSelectedPresetIdChange(recommended.id);
       onPresetModeChange("preset");
-      onExecutorModelChange(selection.executorValue);
-      onValidatorModelChange(selection.validatorValue);
+      onExecutorModelChange(selection.executorValue, { source: "initialization" });
+      onValidatorModelChange(selection.validatorValue, { source: "initialization" });
     }
   }, [isActive, settings, availablePresets, mode]);
 
@@ -483,7 +507,7 @@ export function TaskForm({
     if (githubTrackingDefaultAppliedRef.current) return;
     if (!settings) return;
 
-    onGithubTrackingEnabledChange(settings.githubTrackingEnabledByDefault ?? false);
+    onGithubTrackingEnabledChange(settings.githubTrackingEnabledByDefault ?? false, { source: "initialization" });
     githubTrackingDefaultAppliedRef.current = true;
   }, [mode, isActive, settings, onGithubTrackingEnabledChange]);
 
@@ -502,6 +526,7 @@ export function TaskForm({
   useEffect(() => {
     if (!isActive) {
       githubTrackingDefaultAppliedRef.current = false;
+      hasUserSelectedModelRef.current = false;
     }
   }, [isActive]);
 
@@ -710,10 +735,8 @@ export function TaskForm({
   // Auto-resize textarea
   const handleDescriptionInput = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     onDescriptionChange(e.target.value);
-    const el = e.target;
-    el.style.height = "auto";
-    el.style.height = el.scrollHeight + "px";
-  }, [onDescriptionChange]);
+    resizeDescription();
+  }, [onDescriptionChange, resizeDescription]);
 
   const handleToggleDescriptionExpand = useCallback(() => {
     setIsDescriptionExpanded((prev) => !prev);
@@ -908,6 +931,7 @@ export function TaskForm({
             rows={mode === "edit" ? 8 : 5}
             disabled={disabled || isRefining}
           />
+          <MicButton {...dictation.micProps} disabled={disabled || isRefining} />
           {/* Determine if refine button will be shown — controls expand button placement */}
           {(() => {
             const showRefineButton = Boolean(description.trim()) && !disabled;
@@ -1480,11 +1504,12 @@ export function TaskForm({
                 value={presetMode === "preset" ? selectedPresetId : presetMode}
                 onChange={(e) => {
                   const value = e.target.value;
+                  hasUserSelectedModelRef.current = true;
                   if (value === "default") {
                     onPresetModeChange("default");
                     onSelectedPresetIdChange("");
-                    onExecutorModelChange("");
-                    onValidatorModelChange("");
+                    onExecutorModelChange("", { source: "user" });
+                    onValidatorModelChange("", { source: "user" });
                     return;
                   }
                   if (value === "custom") {
@@ -1496,8 +1521,8 @@ export function TaskForm({
                   const selection = applyPresetToSelection(preset);
                   onPresetModeChange("preset");
                   onSelectedPresetIdChange(value);
-                  onExecutorModelChange(selection.executorValue);
-                  onValidatorModelChange(selection.validatorValue);
+                  onExecutorModelChange(selection.executorValue, { source: "user" });
+                  onValidatorModelChange(selection.validatorValue, { source: "user" });
                 }}
                 disabled={disabled}
               >
@@ -1516,7 +1541,10 @@ export function TaskForm({
               <button
                 type="button"
                 className="btn btn-sm"
-                onClick={() => onPresetModeChange("custom")}
+                onClick={() => {
+                  hasUserSelectedModelRef.current = true;
+                  onPresetModeChange("custom");
+                }}
                 disabled={disabled}
               >
                 {t("taskForm.overridePreset", "Override")}
@@ -1529,9 +1557,10 @@ export function TaskForm({
                 label={t("taskForm.executorModelLabel", "Executor Model")}
                 value={executorModel}
                 onChange={(value) => {
+                  hasUserSelectedModelRef.current = true;
                   onPresetModeChange("custom");
                   onSelectedPresetIdChange("");
-                  onExecutorModelChange(value);
+                  onExecutorModelChange(value, { source: "user" });
                 }}
                 models={availableModels}
                 disabled={disabled || presetMode === "preset"}
@@ -1551,9 +1580,10 @@ export function TaskForm({
                 label={t("taskForm.reviewerModelLabel", "Reviewer Model")}
                 value={validatorModel}
                 onChange={(value) => {
+                  hasUserSelectedModelRef.current = true;
                   onPresetModeChange("custom");
                   onSelectedPresetIdChange("");
-                  onValidatorModelChange(value);
+                  onValidatorModelChange(value, { source: "user" });
                 }}
                 models={availableModels}
                 disabled={disabled || presetMode === "preset"}

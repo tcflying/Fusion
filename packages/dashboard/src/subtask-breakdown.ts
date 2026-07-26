@@ -10,6 +10,7 @@ import {
   resetDiagnosticsSink,
 } from "./ai-session-diagnostics.js";
 import { GenerationGuard, createAbortError, isAbortError } from "./ai-session-timeout.js";
+import { laneModelOptions, resolveLaneSessionModel } from "./lane-session-model.js";
 
 import { createFnAgent as engineCreateFnAgent, resolveMcpServersForStore } from "@fusion/engine";
 
@@ -411,7 +412,15 @@ export async function decomposeForTriage(
    * FNXC:McpConfig 2026-06-26-16:45:
    * Triage subtask decomposition is a readonly planning helper; when the dashboard triage hook provides a scoped store, resolve MCP at session creation and forward only the in-memory server set. Keep no-store callers on an empty MCP set and never log materialized secrets.
    */
-  const agent: SubtaskAgent = await createFnAgent({ cwd, systemPrompt, tools: "readonly", mcpServers });
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  Resolve an explicit provider/model pair. Without one the runtime silently substitutes its
+  own built-in default model (anthropic/claude-opus-4-8), leaving the operator's configured
+  provider and failing with `401 invalid x-api-key` for anyone with no raw Anthropic key —
+  and bypassing test-mode forcing. See lane-session-model.ts.
+  */
+  const subtaskModel = await resolveLaneSessionModel(store);
+  const agent: SubtaskAgent = await createFnAgent({ cwd, systemPrompt, tools: "readonly", mcpServers, ...laneModelOptions(subtaskModel) });
   try {
     await agent.session.prompt(description);
     const messages = agent.session.state.messages as Array<{
@@ -538,11 +547,20 @@ async function generateSubtasks(
         FNXC:McpConfig 2026-06-26-16:45:
         Streaming subtask generation is a readonly planning helper that now carries the dashboard-scoped TaskStore into the timeout-bounded worker. Resolve MCP inside the GenerationGuard window and forward only counts/errors if diagnostics are added; never expose plaintext env/header secrets.
         */
+  /*
+  FNXC:LaneModelResolution 2026-07-24-17:40:
+  Resolve an explicit provider/model pair. Without one the runtime silently substitutes its
+  own built-in default model (anthropic/claude-opus-4-8), leaving the operator's configured
+  provider and failing with `401 invalid x-api-key` for anyone with no raw Anthropic key —
+  and bypassing test-mode forcing. See lane-session-model.ts.
+  */
+        const streamingModel = await resolveLaneSessionModel(store);
         const agentPromise = createFnAgent({
           cwd,
           systemPrompt,
           tools: "readonly",
           mcpServers,
+          ...laneModelOptions(streamingModel),
           onThinking: (delta: string) => {
             const current = sessions.get(sessionId);
             if (!current) return;

@@ -1509,9 +1509,21 @@ export class AgentStore extends EventEmitter {
         );
       }
 
+      /*
+       * FNXC:AgentStore 2026-07-24-12:00:
+       * FN-8569 observed CEO Reports Health rows with a live state and stale
+       * `error-unrecoverable` marker. Resuming from paused/error performs
+       * best-effort pauseReason cleanup only; it is not an atomicity guarantee
+       * because independent updateAgent marker writes can recreate desync. The
+       * engine-side reports-health classifier remains the authoritative defense.
+       * Preserve lastError as diagnostic history for operator triage.
+       */
+      const clearsPauseReasonOnResume = (currentState === "paused" || currentState === "error")
+        && (newState === "active" || newState === "idle" || newState === "running");
       const updated: Agent = {
         ...agent,
         state: newState,
+        ...(clearsPauseReasonOnResume && { pauseReason: undefined }),
         updatedAt: new Date().toISOString(),
       };
 

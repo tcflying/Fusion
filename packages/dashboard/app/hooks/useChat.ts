@@ -10,6 +10,10 @@ import {
   attachChatStream,
   streamChatResponse,
   cancelChatResponse,
+  fetchChatTags,
+  createChatTag as apiCreateChatTag,
+  renameChatTag as apiRenameChatTag,
+  deleteChatTag as apiDeleteChatTag,
   type ChatFailureInfo,
   type ChatSessionListResponse,
   type ChatStreamErrorMeta,
@@ -17,7 +21,7 @@ import {
 import { subscribeSse } from "../sse-bus";
 import { getScopedItem, setScopedItem, removeScopedItem } from "../utils/projectStorage";
 import { recordResumeEvent } from "../utils/resumeInstrumentation";
-import type { Agent, ChatInFlightGenerationState, ChatMessage } from "@fusion/core";
+import type { Agent, ChatInFlightGenerationState, ChatMessage, ChatTag } from "@fusion/core";
 
 const ACTIVE_SESSION_STORAGE_KEY = "kb-chat-active-session";
 /**
@@ -74,6 +78,8 @@ export interface ChatSessionInfo {
   lastMessageAt?: string;
   isGenerating?: boolean;
   inFlightGeneration?: ChatInFlightGenerationState | null;
+  /** Legacy mock payloads may omit this; UI treats omission as no assignments. */
+  tags?: ChatTag[];
   /**
    * When set, this chat session is driven by a cli-agent executor (U12). The
    * message-pane + composer region is delegated to <CliChatSurface> instead of
@@ -110,6 +116,9 @@ export interface UseChatReturn {
   sessions: ChatSessionInfo[];
   activeSession: ChatSessionInfo | null;
   sessionsLoading: boolean;
+  tags: ChatTag[];
+  selectedTagId: string | null;
+  setSelectedTagId: (id: string | null) => void;
 
   // Message state
   messages: ChatMessageInfo[];
@@ -142,6 +151,10 @@ export interface UseChatReturn {
    */
   setSessionThinkingLevel: (id: string, level: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
+  createTag: (name: string) => Promise<ChatTag>;
+  renameTag: (id: string, name: string) => Promise<void>;
+  deleteTag: (id: string) => Promise<void>;
+  setSessionTags: (sessionId: string, tagIds: string[]) => Promise<void>;
 
   // Message operations
   /**
@@ -405,6 +418,8 @@ export function useChat(
   const [sessions, setSessions] = useState<ChatSessionInfo[]>(() => readCachedSessions(projectId));
   const [activeSession, setActiveSession] = useState<ChatSessionInfo | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(() => readCachedSessions(projectId).length === 0);
+  const [tags, setTags] = useState<ChatTag[]>([]);
+  const [selectedTagId, setSelectedTagId] = useState<string | null>(null);
 
   // Message state
   const [messages, setMessages] = useState<ChatMessageInfo[]>([]);
@@ -521,6 +536,14 @@ export function useChat(
     setSessions(cachedSessions);
     setSessionsLoading(cachedSessions.length === 0);
   }, [projectId, readCachedSessions]);
+
+  useEffect(() => {
+    let live = true;
+    setSelectedTagId(null);
+    setTags([]);
+    void fetchChatTags(projectId).then((data) => { if (live) setTags(data.tags); }).catch(() => { if (live) setTags([]); });
+    return () => { live = false; };
+  }, [projectId]);
 
   // Initial load
   useEffect(() => {
@@ -1681,10 +1704,25 @@ export function useChat(
     return () => clearTimeout(timeoutId);
   }, [trimmedSearchQuery, projectId]);
 
+  /* FNXC:ChatTags 2026-08-05-10:55: optimistic assignment keeps shared Chat hosts in sync while a failed API mutation rolls back exactly the prior session snapshot. */
+  const createTag = useCallback(async (name: string): Promise<ChatTag> => { const response = await apiCreateChatTag(name, projectId); setTags((previous) => [...previous, response.tag].sort((a, b) => a.name.localeCompare(b.name))); return response.tag; }, [projectId]);
+  const renameTag = useCallback(async (id: string, name: string) => { const response = await apiRenameChatTag(id, name, projectId); setTags((previous) => previous.map((tag) => tag.id === id ? response.tag : tag).sort((a, b) => a.name.localeCompare(b.name))); setSessions((previous) => previous.map((session) => ({ ...session, tags: (session.tags ?? []).map((tag) => tag.id === id ? response.tag : tag) }))); }, [projectId]);
+  const deleteTag = useCallback(async (id: string) => { await apiDeleteChatTag(id, projectId); setTags((previous) => previous.filter((tag) => tag.id !== id)); setSessions((previous) => previous.map((session) => ({ ...session, tags: (session.tags ?? []).filter((tag) => tag.id !== id) }))); setSelectedTagId((selected) => selected === id ? null : selected); }, [projectId]);
+  const setSessionTags = useCallback(async (sessionId: string, tagIds: string[]) => {
+    const previous = sessionsRef.current;
+    const assigned = tags.filter((tag) => tagIds.includes(tag.id));
+    setSessions((current) => current.map((session) => session.id === sessionId ? { ...session, tags: assigned } : session));
+    try {
+      const response = await updateChatSession(sessionId, { tagIds }, projectId);
+      setSessions((current) => current.map((session) => session.id === sessionId ? response.session : session));
+      if (activeSessionRef.current?.id === sessionId) setActiveSession(response.session);
+    } catch (error) { setSessions(previous); throw error; }
+  }, [projectId, tags]);
+
   // Filter sessions based on search query: title/agentId match always applies; content
   // matches (from contentMatchedPreviews) are always unioned in.
   const filteredSessions = (() => {
-    if (!trimmedSearchQuery) return sessions;
+    if (!trimmedSearchQuery) return selectedTagId ? sessions.filter((session) => (session.tags ?? []).some((tag) => tag.id === selectedTagId)) : sessions;
 
     const lowerQuery = trimmedSearchQuery.toLowerCase();
     const titleMatched = sessions.filter(
@@ -1705,7 +1743,8 @@ export function useChat(
       const existing = merged.get(session.id);
       merged.set(session.id, { ...(existing ?? session), matchedMessagePreview: preview });
     }
-    return sortChatSessions(Array.from(merged.values()));
+    const searchMatches = sortChatSessions(Array.from(merged.values()));
+    return selectedTagId ? searchMatches.filter((session) => (session.tags ?? []).some((tag) => tag.id === selectedTagId)) : searchMatches;
   })();
 
   useEffect(() => {
@@ -1983,6 +2022,9 @@ export function useChat(
     sessions,
     activeSession,
     sessionsLoading,
+    tags,
+    selectedTagId,
+    setSelectedTagId,
     messages,
     messagesLoading,
     isStreaming,
@@ -1999,6 +2041,10 @@ export function useChat(
     setSessionModel,
     setSessionThinkingLevel,
     deleteSession,
+    createTag,
+    renameTag,
+    deleteTag,
+    setSessionTags,
     sendMessage,
     editMessageAndResend,
     stopStreaming,

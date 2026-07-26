@@ -8,6 +8,7 @@ import {
 } from "@fusion/core";
 import { createInterface } from "node:readline/promises";
 import { resolveProjectStore } from "../project-resolver.js";
+import { promptOutputStream } from "../output.js";
 
 // ── Status Labels for Display ───────────────────────────────────────────────
 
@@ -105,7 +106,8 @@ async function promptForTitleAndDescription(
   if (!title) {
     const rl = createInterface({
       input: process.stdin,
-      output: process.stdout,
+      /* FNXC:CliQuietMode 2026-07-16-00:00: Readline prompts bypass the quiet stdout gate so interactive questions remain visible. */
+    output: promptOutputStream(),
     });
     title = await rl.question(titlePrompt);
 
@@ -431,7 +433,7 @@ export async function runMissionDelete(
     if (!force) {
       const rl = createInterface({
         input: process.stdin,
-        output: process.stdout,
+        output: promptOutputStream(),
       });
       const answer = await rl.question(
         `Are you sure you want to delete ${id}: "${mission.title}"? [y/N] `,
@@ -614,7 +616,7 @@ export async function runFeatureAdd(
     if (!title) {
       const rl = createInterface({
         input: process.stdin,
-        output: process.stdout,
+        output: promptOutputStream(),
       });
       title = await rl.question("Feature title: ");
 

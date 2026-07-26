@@ -35,6 +35,7 @@ import {
   detectImageMimeFromBytes,
   applyFrontendUxCriteria,
   extractEffectiveWriteScopeFromPrompt,
+  ApprovalRequestStore,
   MAX_TASK_LIST_TEXT_CHARS,
   upsertWorkflowStepResult,
   type NearDuplicateCandidate,
@@ -84,6 +85,7 @@ import type {
   AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { ModelFallbackExhaustedError, describeModel, formatModelMarkerDetails, promptWithFallback } from "./pi.js";
+import { isTaskStillInPlanningStage } from "./replan-target.js";
 import {
   createResolvedAgentSession,
   extractRuntimeHint,
@@ -115,6 +117,9 @@ import {
 import { buildPromptLayers, collapsePromptLayers } from "./prompt-layers.js";
 import { createFallbackModelObserver } from "./fallback-model-observer.js";
 import { planLog, formatError } from "./logger.js";
+// FNXC:PlanArtifactPersistence 2026-07-26-03:55: worktree-stranded plans are copied back into the project
+// .fusion folder and mirrored into the project DB before finalization reads the spec.
+import { mirrorPlanToProjectDb, persistPlanArtifact, relativePromptPath } from "./plan-artifact-writeback.js";
 import { resolveMcpServersForStore } from "./mcp-resolution.js";
 import {
   isUsageLimitError,
@@ -177,6 +182,15 @@ export interface TriageProcessorOptions {
   globalCapacityLegacyRecoveryGate?: GlobalCapacityLegacyRecoveryGateV1;
   /** Runtime-owned durable admission control for the planner/reviewer session boundary. */
   globalCapacityLegacyDispatchControl?: GlobalCapacityLegacyDispatchControlV1;
+  /*
+  FNXC:NodeWorktreeIsolation 2026-07-25-22:10:
+  Acquires (or reuses) the task-specific worktree so the planning session runs there instead of in the
+  shared main checkout. Planning uses the CODING tool surface, so running it at the repo root gave every
+  planner write tools in the operator's tree and made concurrent planners share one path. Optional: when
+  unwired (older callers, tests) or when it resolves null (workspace projects, acquisition failure),
+  planning falls back to the repo root exactly as before.
+  */
+  acquirePlanningWorktree?: (taskId: string) => Promise<string | null>;
 }
 
 type GlobalCapacityTriageExecutionGrant = Extract<
@@ -204,7 +218,20 @@ export class TriageProcessor {
   private pollInterval: ReturnType<typeof setInterval> | null = null;
   /** The interval (ms) of the currently active `setInterval` timer. */
   private activePollMs: number | null = null;
+  /*
+  FNXC:CodingIdeasWorkflow 2026-07-25-11:20:
+  Event-wake state for requestImmediatePoll(). Planning discovery is timer-driven, so pressing
+  Start on an Ideas card (which only writes a column change) used to wait out the remainder of the
+  poll interval — up to pollIntervalMs, 15s by default — before anything even looked at the card.
+  `nudgeTimer` debounces a burst of moves into one poll; `nudgeDuringPoll` remembers a nudge that
+  arrived while a poll was already in flight, since that poll may have snapshotted the task list
+  before the move landed and would otherwise drop the wake entirely.
+  */
+  private nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+  private nudgeDuringPoll = false;
   private processing = new Set<string>();
+  /** Synchronous ownership fence shared with advanced planning recovery. */
+  private advancedRecoveryReservations = new Set<string>();
   /** Timestamps when tasks entered the `processing` set, for staleness detection. */
   private processingSince = new Map<string, number>();
   private wasGlobalPaused = false;
@@ -232,6 +259,11 @@ export class TriageProcessor {
   private stuckAborted = new Set<string>();
   private taskDeletedHandler?: (task: Task) => void;
   private taskPausedHandler?: (task: Task) => void;
+  /** FNXC:CodingIdeasWorkflow 2026-07-25-11:20: store-event wake for planning-eligible columns. */
+  private taskColumnWakeHandler?: (task: Task) => void;
+  /** FNXC:PlanningEvacuation 2026-07-25-23:00: stops planning when a card leaves the planner lanes. */
+  private taskEvacuatedFromPlanningHandler?: (task: Task) => void;
+  private _approvalRequestStore?: ApprovalRequestStore;
 
   /**
    * @param store — Task store instance (also used to listen for `settings:updated` events)
@@ -345,6 +377,93 @@ export class TriageProcessor {
         this.recordTriageSessionTokenUsageSoon(task.id, session as AgentSession, { agentId: task.assignedAgentId ?? "triage" });
         session.dispose();
         this.activeSessions.delete(task.id);
+      }
+    };
+
+    /*
+    FNXC:CodingIdeasWorkflow 2026-07-25-11:20:
+    Wake planning discovery the moment a task lands in a planning-eligible column, instead of
+    waiting out the poll timer. Symptom: pressing Start on a Coding (Ideas) card appeared to do
+    nothing for up to pollIntervalMs (15s default) — the Start affordance performs a bare column
+    move (TaskCard.handleStartClick -> onMoveTask) with no dispatch call, so the engine did not
+    learn about the card until its next tick.
+
+    Surface enumeration — the wake is bound to the STORE EVENT, not to the Start button, so every
+    move surface is covered by construction: board drag, card context menu, task detail, List view,
+    the CLI, agent tools, and POST /tasks/:id/move all funnel through store.moveTask, which emits
+    task:updated. Both move sources (user and engine) and both intake shapes (Ideas -> Todo
+    promotion and a plain triage-column create) go through the same emit.
+
+    The handler is deliberately dumb: it filters on column only and delegates every real decision
+    to the poll, so it cannot bypass a pause, dependency, seed-prompt, or concurrency gate.
+    */
+    this.taskColumnWakeHandler = (task: Task) => {
+      if (!task?.id) return;
+      if (task.column !== "todo" && task.column !== "triage") return;
+      if (task.paused === true || task.userPaused === true) return;
+      // Already being planned (or mid-plan) — the running poll/session owns it.
+      if (this.processing.has(task.id) || this.hasLivePlanningWork(task.id)) return;
+      this.requestImmediatePoll();
+    };
+
+    /*
+    FNXC:PlanningEvacuation 2026-07-25-23:00:
+    Moving a card OUT of the planner lanes while it is being planned (the reported case: dragging a
+    todo card back to Ideas) must stop the planning session immediately — the operator has withdrawn
+    the card, and an agent that keeps streaming tokens and writing a spec for it is doing work nobody
+    asked for. It must also stop LOOKING planned: the "planning" status badge is what the card shows,
+    so the abort path clears it (`pauseAborted` + the existing restore-status unwind) and the card
+    reads as a plain idea again.
+
+    This reuses the pause/delete abort machinery verbatim — same abort(), same token-usage snapshot,
+    same `pauseAborted` unwind that clears status without reporting an error — so evacuation cannot
+    drift from the two paths that already work.
+
+    Moving the card BACK to todo/triage needs no new code: `taskColumnWakeHandler` above wakes the
+    poll on that move, and with the planning status cleared the card is an ordinary planning
+    candidate again, so planning restarts.
+
+    Columns are matched positively (todo/triage) rather than naming "ideas", so evacuation to ANY
+    non-planner column stops the session. `in-progress` is excluded from the abort because a card
+    that legitimately advances into execution is not an evacuation — its session is already
+    unwinding on its own.
+    */
+    this.taskEvacuatedFromPlanningHandler = (task: Task) => {
+      if (!task?.id) return;
+      /*
+      Only an explicit, known destination column is evidence of evacuation. `task:updated` also
+      carries PARTIAL payloads (a pause flag flip, a steering comment) with no `column` field at all,
+      and treating an absent column as "not a planner lane" would abort a healthy planning session on
+      an unrelated update.
+      */
+      if (typeof task.column !== "string") return;
+      if (task.column === "todo" || task.column === "triage" || task.column === "in-progress") return;
+      if (this.activeSubagentSessions.has(task.id)) {
+        this.disposeSubagentsForTask(task.id, `task moved to ${task.column}`);
+      }
+      const session = this.activeSessions.get(task.id);
+      if (!session) return;
+      planLog.log(`task moved out of planning to '${task.column}' — terminating triage session for ${task.id}`);
+      this.pauseAborted.add(task.id);
+      this.options.stuckTaskDetector?.untrackTask(task.id);
+      const sessionWithAbort = session as { abort?: () => Promise<void>; dispose: () => void };
+      if (typeof sessionWithAbort.abort === "function") {
+        void sessionWithAbort.abort().catch((err) => {
+          planLog.warn(`Failed to abort triage session for ${task.id}: ${err}`);
+        });
+      }
+      this.recordTriageSessionTokenUsageSoon(task.id, session as AgentSession, { agentId: task.assignedAgentId ?? "triage" });
+      session.dispose();
+      this.activeSessions.delete(task.id);
+      /*
+      The `pauseAborted` unwind restores status only while the row is still in the planning stage; an
+      evacuated card is not, so clear the badge directly here. Fail-soft: a status write must never
+      break the abort.
+      */
+      if (task.status === "planning") {
+        void Promise.resolve(this.store.updateTask(task.id, { status: null })).catch((err: unknown) => {
+          planLog.warn(`${task.id}: failed to clear planning status after evacuation: ${err instanceof Error ? err.message : String(err)}`);
+        });
       }
     };
   }
@@ -548,6 +667,15 @@ export class TriageProcessor {
     if (this.taskPausedHandler && typeof this.store.on === "function") {
       this.store.on("task:updated", this.taskPausedHandler);
     }
+    if (this.taskColumnWakeHandler && typeof this.store.on === "function") {
+      this.store.on("task:updated", this.taskColumnWakeHandler);
+      this.store.on("task:created", this.taskColumnWakeHandler);
+    }
+    if (this.taskEvacuatedFromPlanningHandler && typeof this.store.on === "function") {
+      // `task:updated` is the single event every move surface emits (see the wake handler's
+      // surface enumeration); `task:moved` carries a different payload shape and is not needed.
+      this.store.on("task:updated", this.taskEvacuatedFromPlanningHandler);
+    }
 
     // Clear stale "planning" statuses left by a prior crash/restart.
     // No triage agent is actually running at startup, so any task still
@@ -591,11 +719,24 @@ export class TriageProcessor {
       this.pollInterval = null;
       this.activePollMs = null;
     }
+    // FNXC:CodingIdeasWorkflow 2026-07-25-11:20: a debounced wake must not fire past shutdown.
+    if (this.nudgeTimer) {
+      clearTimeout(this.nudgeTimer);
+      this.nudgeTimer = null;
+    }
+    this.nudgeDuringPoll = false;
     if (this.taskDeletedHandler && typeof this.store.off === "function") {
       this.store.off("task:deleted", this.taskDeletedHandler);
     }
     if (this.taskPausedHandler && typeof this.store.off === "function") {
       this.store.off("task:updated", this.taskPausedHandler);
+    }
+    if (this.taskColumnWakeHandler && typeof this.store.off === "function") {
+      this.store.off("task:updated", this.taskColumnWakeHandler);
+      this.store.off("task:created", this.taskColumnWakeHandler);
+    }
+    if (this.taskEvacuatedFromPlanningHandler && typeof this.store.off === "function") {
+      this.store.off("task:updated", this.taskEvacuatedFromPlanningHandler);
     }
     // Tear down any in-flight specify sessions and reviewer subagents so they
     // don't keep streaming LLM tokens / tool calls past engine shutdown.
@@ -726,7 +867,15 @@ export class TriageProcessor {
    * Used by self-healing maintenance to avoid recovering live sessions.
    */
   getProcessingTaskIds(): Set<string> {
-    return new Set(this.processing);
+    const ids = new Set(this.processing);
+    for (const taskId of this.advancedRecoveryReservations) ids.add(taskId);
+    return ids;
+  }
+
+  private hasLivePlanningWork(taskId: string): boolean {
+    const subagents = this.activeSubagentSessions.get(taskId);
+    if (subagents && subagents.size > 0) return true;
+    return this.activeSessions.has(taskId) && !this.stuckAborted.has(taskId);
   }
 
   /**
@@ -962,10 +1111,112 @@ export class TriageProcessor {
    * well before the dispatched tasks finish — so subsequent polls can discover
    * newly arrived triage tasks promptly.
    */
+  /**
+   * Discover planner-ready work for both direct triage polling and coordinator
+   * refresh. Keeping the seed-prompt checks here makes the cross-lane admission
+   * union include cards before their planner writes status:"planning".
+   */
+  private async discoverReadyPlanningTasks(allTasks: Task[], now: number): Promise<Task[]> {
+    const eligibleTriageTasks = allTasks.filter(
+      (t) => t.column === "triage" && isTaskStillInPlanningStage(t)
+        && !this.advancedRecoveryReservations.has(t.id)
+        && !this.processing.has(t.id) && !this.hasLivePlanningWork(t.id) && !t.paused
+        && t.status !== "awaiting-approval" && t.status !== "failed" && t.status !== "stuck-killed"
+        && !(t.nextRecoveryAt && new Date(t.nextRecoveryAt).getTime() > now),
+    );
+    const eligibleTodoTasksRaw = allTasks.filter(
+      (t) => t.column === "todo" && !this.processing.has(t.id) && !this.hasLivePlanningWork(t.id) && !t.paused
+        && t.status !== "awaiting-approval" && t.status !== "failed" && t.status !== "stuck-killed"
+        && t.status !== "planning"
+        && !(t.nextRecoveryAt && new Date(t.nextRecoveryAt).getTime() > now),
+    );
+    const eligibleTodoTasks: Task[] = [];
+    for (const todoTask of eligibleTodoTasksRaw) {
+      if (todoTask.status === "needs-replan") {
+        eligibleTodoTasks.push(todoTask);
+        continue;
+      }
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-25-11:20:
+      A MISSING PROMPT.md means unplanned, so the card is admitted for planning rather than
+      dropped. Previously any read failure hit a silent `catch {}` that deferred to "scheduler
+      filesystem validation" — but the scheduler's filter KEEPS a candidate whose prompt it cannot
+      read, so a card with no PROMPT.md was invisible to planning while still visible to dispatch,
+      and produced no log line in either lane. Planning regenerates the spec, which is the correct
+      recovery for both plan-in-place (Ideas) cards and a normal-workflow card whose spec vanished.
+      Only ENOENT is treated as unplanned; a genuine read fault (permissions, a directory in the
+      file's place) still skips the card, but now says so in the log instead of vanishing.
+      */
+      try {
+        const promptPath = join(this.rootDir, ".fusion", "tasks", todoTask.id, "PROMPT.md");
+        const content = await readFile(promptPath, "utf-8");
+        if (isUnplannedSeedPrompt(content, todoTask.id, todoTask.title, todoTask.description)) {
+          eligibleTodoTasks.push(todoTask);
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+          planLog.warn(
+            `${todoTask.id}: PROMPT.md is missing — treating as unplanned and admitting it for planning`,
+          );
+          eligibleTodoTasks.push(todoTask);
+        } else {
+          planLog.warn(
+            `${todoTask.id}: PROMPT.md unreadable (${(err as NodeJS.ErrnoException)?.code ?? "unknown"}) — ` +
+            "skipping planning discovery for this poll",
+          );
+        }
+      }
+    }
+    return [...eligibleTriageTasks, ...eligibleTodoTasks].sort((a, b) => {
+      const aTime = Date.parse(a.createdAt);
+      const bTime = Date.parse(b.createdAt);
+      const aValid = Number.isFinite(aTime);
+      const bValid = Number.isFinite(bTime);
+      if (aValid !== bValid) return aValid ? -1 : 1;
+      if (aValid && aTime !== bTime) return aTime - bTime;
+      const numeric = compareTaskIdNumeric(a.id, b.id);
+      return numeric !== 0 ? numeric : a.id.localeCompare(b.id);
+    });
+  }
+
+  /**
+   * Run a planning-discovery poll now instead of waiting for the next timer tick.
+   *
+   * FNXC:CodingIdeasWorkflow 2026-07-25-11:20:
+   * Requirement: starting a task must begin planning immediately, not "within 15 seconds".
+   * The Start affordance on an intake (Ideas) card performs a bare column move — there is no
+   * dispatch call in that path — so planning only began when the next `setInterval` tick happened
+   * to fire. The store-event wake (taskColumnWakeHandler) is the primary caller.
+   *
+   * Contract: advisory and idempotent. It never plans a task by itself, it only advances WHEN the
+   * existing poll runs — every pause, seed-prompt, dependency, and concurrency gate still applies,
+   * so a nudge on a capacity-blocked card is a no-op rather than an admission bypass. Returns false
+   * when the processor is not running.
+   */
+  requestImmediatePoll(): boolean {
+    if (!this.running) return false;
+    // A poll is mid-flight: it may already have read the task list, so remember to re-poll after.
+    if (this.polling) {
+      this.nudgeDuringPoll = true;
+      return true;
+    }
+    if (this.nudgeTimer) return true; // Already coalescing a burst of moves.
+    this.nudgeTimer = setTimeout(() => {
+      this.nudgeTimer = null;
+      void this.poll();
+    }, TriageProcessor.NUDGE_DEBOUNCE_MS);
+    this.nudgeTimer.unref?.();
+    return true;
+  }
+
+  /** Coalescing window for requestImmediatePoll, so a multi-card drag causes one poll, not N. */
+  private static readonly NUDGE_DEBOUNCE_MS = 150;
+
   private async poll(): Promise<void> {
     if (!this.running) return;
     if (this.polling) return;
     this.polling = true;
+    this.nudgeDuringPoll = false;
 
     try {
       const settings = await this.store.getSettings();
@@ -1014,6 +1265,7 @@ export class TriageProcessor {
         this.idleSemaphoreLeakCandidateSince = result.candidateSinceMs;
       }
 
+      const discoveredTriageTasks = await this.discoverReadyPlanningTasks(allTasks, now);
       const eligibleTriageTasks = allTasks.filter(
         (t) => t.column === "triage" && !this.processing.has(t.id) && !t.paused
           // Skip tasks awaiting manual plan approval — they should not be auto-discovered
@@ -1056,7 +1308,7 @@ export class TriageProcessor {
           // Missing/unreadable prompt — skip; the scheduler's filesystem validation handles it.
         }
       }
-      const triageTasks = sortTasksByPriorityThenAgeAndId([...eligibleTriageTasks, ...eligibleTodoTasks]).sort((a, b) => {
+      const triageTasks = sortTasksByPriorityThenAgeAndId(discoveredTriageTasks).sort((a, b) => {
         const priorityCmp = compareTaskPriority(a.priority, b.priority);
         if (priorityCmp !== 0) {
           return priorityCmp;
@@ -1113,6 +1365,18 @@ export class TriageProcessor {
       planLog.error("Poll error:", err);
     } finally {
       this.polling = false;
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-25-11:20:
+      Replay a nudge that arrived mid-poll. Without this, a move that lands microseconds after the
+      poll's listTasks() snapshot is swallowed by the `if (this.polling) return` re-entry guard and
+      the operator waits a full interval anyway — exactly the symptom the wake exists to remove.
+      Re-entry is bounded: the flag is cleared when the replay poll starts, so a nudge storm during
+      a slow poll produces at most one extra poll.
+      */
+      if (this.nudgeDuringPoll && this.running) {
+        this.nudgeDuringPoll = false;
+        this.requestImmediatePoll();
+      }
     }
   }
 
@@ -1156,7 +1420,9 @@ export class TriageProcessor {
       // planning-phase reads (requirePlanApproval, planning/validator model lanes)
       // pick up workflow values. Behavior-inert when nothing is customized.
       const settings = await mergeEffectiveSettings(this.store, currentTask, await this.store.getSettings());
-      const promptPath = `.fusion/tasks/${task.id}/PROMPT.md`;
+      // FNXC:PlanArtifactPersistence 2026-07-26-03:55: one definition of the cwd-relative spec path, shared
+      // with the worktree write-back so the rescue reads exactly the path the planner was handed.
+      const promptPath = relativePromptPath(task.id);
 
       /*
       FNXC:PlanReview 2026-06-29-12:58:
@@ -1396,11 +1662,30 @@ export class TriageProcessor {
           )
           : { provider: undefined, modelId: undefined };
 
+        /*
+        FNXC:TriagePromptPersistence 2026-07-21-17:50:
+        Planning must use the coding tool surface. The shared readonly policy filters
+        mutation tools, including fn_task_prompt_write, before the model sees them;
+        advertising that writer in the prompt while running readonly stranded triage
+        on the original PROMPT.md stub and sent the stub into Plan Review.
+        */
+        /*
+        FNXC:NodeWorktreeIsolation 2026-07-25-22:10:
+        Planning runs in the TASK's own worktree, not the shared main checkout. This session carries the
+        coding tool surface (see FNXC:TriagePromptPersistence above), so rooting it at `this.rootDir`
+        put write tools in the operator's tree and made every concurrent planner share one path — the
+        same shared-path shape behind the reported Plan Review session collision. The worktree acquired
+        here is the one Plan Review and the implementation session then reuse.
+        */
+        const planningCwd = (await this.options.acquirePlanningWorktree?.(task.id).catch(() => null)) || this.rootDir;
+        if (planningCwd !== this.rootDir) {
+          await this.store.logEntry(task.id, `Planning session running in task worktree ${planningCwd}`).catch(() => undefined);
+        }
         const { session } = await createResolvedAgentSession({
           sessionPurpose: "triage",
           runtimeHint: triageRuntimeHint,
           pluginRunner: this.options.pluginRunner,
-          cwd: this.rootDir,
+          cwd: planningCwd,
           systemPrompt: triageSystemPromptFinal,
           systemPromptLayers: triageLayers,
           tools: "coding",
@@ -1581,6 +1866,31 @@ export class TriageProcessor {
           FNXC:PlanReview 2026-06-29-01:52:
           Workflow Plan Review is the single operator-controlled AI plan gate. Triage must not remind agents to call fn_review_spec or retry planning only because that legacy tool was not approved; after PROMPT.md is written, triage itself runs optional Plan Review before releasing the task to execution.
           */
+
+          /*
+          FNXC:PlanArtifactPersistence 2026-07-26-03:55:
+          Planning ran with the coding tool surface inside the task worktree, so a planner that ignored
+          `fn_task_prompt_write` and used the generic write tool resolved the relative spec path against
+          the WORKTREE. Finalization reads `<rootDir>/<promptPath>`, so that spec would read as missing,
+          fail deterministic validation, and then be destroyed with the worktree. Copy any worktree-local
+          spec back into the project `.fusion/` folder BEFORE the finalize read, and mirror whatever is
+          authoritative into the project database (PROMPT.md has no `tasks` column and is otherwise
+          filesystem-only). Both halves are best-effort — validation below still owns the verdict.
+          */
+          const planPersistence = await persistPlanArtifact({
+            store: this.store,
+            taskId: task.id,
+            rootDir: this.rootDir,
+            planningCwd,
+            author: "triage",
+            logger: { log: (m: string) => planLog.log(m), warn: (m: string) => planLog.warn(m) },
+          });
+          if (planPersistence.outcome === "recovered") {
+            await this.store.logEntry(
+              task.id,
+              "Recovered the plan written inside the task worktree into the project .fusion folder",
+            ).catch(() => undefined);
+          }
 
           const written = await readFile(
             join(this.rootDir, promptPath),
@@ -2586,6 +2896,18 @@ export class TriageProcessor {
         }
       }
     }
+
+    /*
+    FNXC:PlanArtifactPersistence 2026-07-26-03:55:
+    Finalization is where the ACCEPTED spec content is known (post hygiene rewrite), and it is the last
+    writer that touches the root PROMPT.md on a planning pass. Mirror it into the project database here so
+    the DB copy is the finalized plan, not the pre-hygiene draft. Identical content is skipped, so a pass
+    whose hygiene rewrite was a no-op produces exactly one document revision.
+    */
+    await mirrorPlanToProjectDb(this.store, task.id, written, {
+      author: "triage",
+      logger: { warn: (m: string) => planLog.warn(m) },
+    });
 
     let taskIntentSignature: ReturnType<typeof extractIntentSignature> = {
       routePaths: [],

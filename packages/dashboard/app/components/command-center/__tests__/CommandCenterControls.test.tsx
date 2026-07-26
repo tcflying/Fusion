@@ -4,11 +4,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { CommandCenterControls } from "../CommandCenterControls";
 import { ConfirmDialogProvider } from "../../../hooks/useConfirm";
+import { readAppFile } from "../../../test/cssFixture";
 
-const commandCenterControlsCss = readFileSync(
-  join(process.cwd(), "app/components/command-center/CommandCenterControls.css"),
-  "utf8",
-);
+const commandCenterControlsCss = readAppFile("components/command-center/CommandCenterControls.css");
 
 const legacyMocks = vi.hoisted(() => ({
   fetchConfig: vi.fn(),

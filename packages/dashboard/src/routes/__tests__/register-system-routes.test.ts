@@ -49,14 +49,19 @@ pause+resume each running project engine, and agent restart-all must bounce
 only ACTIVE agents (operator-paused agents stay paused).
 */
 
-const agentStoreState: { agents: Array<{ id: string; state: string }> } = { agents: [] };
+const agentStoreState: {
+  agents: Array<{ id: string; state: string }>;
+  lastOptions?: Record<string, unknown>;
+} = { agents: [] };
 
 vi.mock("@fusion/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@fusion/core")>();
   return {
     ...actual,
     AgentStore: class {
-      constructor(_opts: unknown) {}
+      constructor(opts: unknown) {
+        agentStoreState.lastOptions = opts as Record<string, unknown>;
+      }
       async init(): Promise<void> {}
       async listAgents(): Promise<Array<{ id: string; state: string }>> {
         return agentStoreState.agents;
@@ -80,7 +85,12 @@ interface HarnessOptions {
   options?: Record<string, unknown>;
   deps?: Partial<Parameters<typeof registerSystemRoutes>[1]>;
   store?: Record<string, unknown>;
+  /** Scoped project store returned by getProjectContext; omit for the default PG-backed stub. */
+  scopedStore?: Record<string, unknown>;
 }
+
+/* FNXC:SystemPanel 2026-07-25-11:40: Scoped project stores are PostgreSQL-backed after VAL-REMOVAL-005; the fixture must expose an AsyncDataLayer so routes never construct a store on the deleted sync SQLite path. */
+const PROJECT_ASYNC_LAYER = { __layer: "pg" } as never;
 
 function createApp(harness: HarnessOptions = {}) {
   const router = express.Router();
@@ -101,7 +111,10 @@ function createApp(harness: HarnessOptions = {}) {
       getProjectContext: vi.fn(async () => ({
         projectId: "proj-1",
         engine: undefined,
-        store: { getFusionDir: () => "/tmp/fusion-test" } as never,
+        store: (harness.scopedStore ?? {
+          getFusionDir: () => "/tmp/fusion-test",
+          getAsyncLayer: () => PROJECT_ASYNC_LAYER,
+        }) as never,
       })),
       prioritizeProjectsForCurrentDirectory: (projects) => projects,
       emitRemoteRouteDiagnostic: vi.fn(),
@@ -572,6 +585,49 @@ describe("POST /system/agents/restart-all", () => {
     expect(pauseAgent).toHaveBeenCalledTimes(1);
     expect(pauseAgent).toHaveBeenCalledWith("agent-active", expect.objectContaining({ stopActiveRun: true }));
     expect(resumeAgent).toHaveBeenCalledWith("agent-active", expect.objectContaining({ clearPauseReason: true }));
+  });
+
+  /*
+  FNXC:SystemPanel 2026-07-25-11:40:
+  Original symptom: "Restart agents" returned "SQLite Database class body has been removed
+  (VAL-REMOVAL-005)" because the route built its AgentStore from `rootDir` alone, with no
+  AsyncDataLayer, and the store fell back to the deleted sync SQLite path. The invariant —
+  not just the repro — is that the route always constructs its AgentStore against the scoped
+  project's AsyncDataLayer, and fails loudly when the project has none.
+  */
+  it("constructs the AgentStore against the scoped project's PostgreSQL async layer", async () => {
+    agentStoreState.agents = [{ id: "agent-active", state: "active" }];
+    const monitor = { pauseAgent: vi.fn(async () => ({})), resumeAgent: vi.fn(async () => ({})) };
+    const { app } = createApp({
+      deps: {
+        hasHeartbeatExecutor: true,
+        heartbeatMonitor: monitor as never,
+        isHeartbeatMonitorForProject: vi.fn(() => true),
+        resolveHeartbeatMonitor: vi.fn(() => monitor as never),
+      },
+    });
+
+    const res = await postJson(app, "/api/system/agents/restart-all");
+    expect(res.status).toBe(200);
+    expect(agentStoreState.lastOptions?.asyncLayer).toBe(PROJECT_ASYNC_LAYER);
+  });
+
+  it("fails loudly when the scoped project store has no async layer", async () => {
+    agentStoreState.agents = [{ id: "agent-active", state: "active" }];
+    const monitor = { pauseAgent: vi.fn(async () => ({})), resumeAgent: vi.fn(async () => ({})) };
+    const { app } = createApp({
+      scopedStore: { getFusionDir: () => "/tmp/fusion-test", getAsyncLayer: () => null },
+      deps: {
+        hasHeartbeatExecutor: true,
+        heartbeatMonitor: monitor as never,
+        isHeartbeatMonitorForProject: vi.fn(() => true),
+        resolveHeartbeatMonitor: vi.fn(() => monitor as never),
+      },
+    });
+
+    const res = await postJson(app, "/api/system/agents/restart-all");
+    expect(res.status).toBe(500);
+    expect(monitor.pauseAgent).not.toHaveBeenCalled();
   });
 
   it("409s when no lifecycle monitor is available", async () => {

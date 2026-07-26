@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { CommandCenter } from "../CommandCenter";
+import { readAppFile } from "../../../test/cssFixture";
 
 /*
 FNXC:CommandCenterSystemTests 2026-07-23-22:35:
@@ -297,14 +298,14 @@ describe("SystemControlsArea layout integration", () => {
   });
 
   it("keeps the System controls header row override active on mobile", () => {
-    const css = readFileSync(join(process.cwd(), "app/components/command-center/areas/SystemControlsArea.css"), "utf8");
+    const css = readAppFile("components/command-center/areas/SystemControlsArea.css");
 
     expect(css).toMatch(/\.cc-area-section-header\.cc-system-controls-header\s*{[^}]*flex-direction:\s*row;[^}]*justify-content:\s*space-between;/s);
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)\s*{[\s\S]*\.cc-area-section-header\.cc-system-controls-header\s*{[^}]*flex-direction:\s*row;[^}]*justify-content:\s*space-between;/);
   });
 
   it("keeps the System tab gap and mobile scroll-owner CSS contracts tokenized", () => {
-    const css = readFileSync(join(process.cwd(), "app/components/command-center/CommandCenter.css"), "utf8");
+    const css = readAppFile("components/command-center/CommandCenter.css");
 
     expect(css).toMatch(/\.cc-system-tab\s*{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*gap:\s*var\(--space-lg\);/s);
     expect(css).toMatch(/@media\s*\(max-width:\s*768px\)\s*{[\s\S]*\.cc-tabpanel\s*{[^}]*padding-bottom:\s*calc\(var\(--space-lg\) \+ env\(safe-area-inset-bottom, 0\) \+ var\(--standalone-bottom-gap\)\);/);

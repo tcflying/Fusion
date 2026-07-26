@@ -925,6 +925,7 @@ function AppInner() {
   /* FNXC:Navigation 2026-06-22-18:00: The right dock panel is no longer experimental or user-toggleable; tablet/desktop project screens always support it regardless of any stale persisted `rightDock` setting. */
   const rightDockEnabled = true;
   const executorFooterVisible = viewMode === "project" && !!currentProject;
+  const mobileNavVisible = viewMode === "project" && !!currentProject;
   const rightDockActive = rightDockEnabled && !isMobile && executorFooterVisible;
   const sidebarActive = leftSidebarNavEnabled && !isMobile && executorFooterVisible;
   const agentOnboardingEnabled = experimentalFeatures.agentOnboarding === true;
@@ -1943,7 +1944,7 @@ function AppInner() {
           />
         )}
         <div
-          className={`project-content${executorFooterVisible && (!isMobile || !mobileKeyboardOpen) ? " project-content--with-footer" : ""}${isMobile && !mobileKeyboardOpen ? " project-content--with-mobile-nav" : ""}`}
+          className={`project-content${executorFooterVisible && (!isMobile || !mobileKeyboardOpen) ? " project-content--with-footer" : ""}${isMobile && mobileNavVisible && !mobileKeyboardOpen ? " project-content--with-mobile-nav" : ""}`}
         >
           {roomCockpitOpen ? (
             <Suspense fallback={null}>
@@ -1986,8 +1987,9 @@ function AppInner() {
       )}
       <MobileNavBar
         view={taskView}
-        onChangeView={viewMode === "project" && currentProject ? handleTaskViewChange : () => {}}
-        footerVisible={viewMode === "project" && !!currentProject}
+        onChangeView={mobileNavVisible ? handleTaskViewChange : () => {}}
+        footerVisible={mobileNavVisible}
+        hidden={!mobileNavVisible}
         modalOpen={modalManager.anyModalOpen}
         keyboardOpen={mobileNavKeyboardOpen}
         mobileNavPrimaryItems={mobileNavPrimaryItems}

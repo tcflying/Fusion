@@ -312,7 +312,12 @@ describe("useExecutorStats", () => {
       expect(result.current.stats.executorState).toBe("stopped");
     });
 
-    it("returns 'idle' when enginePaused is true and runningTaskCount is 0", async () => {
+    it("returns 'paused' when enginePaused is true and runningTaskCount is 0", async () => {
+      /*
+      FNXC:EngineControls 2026-07-24-23:15:
+      Pause dominates run-state: a drained paused engine must still read "paused",
+      not "idle", so the footer badge matches the operator-set condition (749167cbe).
+      */
       mockFetchExecutorStats.mockResolvedValue({
         globalPause: false,
         enginePaused: true,
@@ -325,7 +330,7 @@ describe("useExecutorStats", () => {
         await vi.advanceTimersByTimeAsync(100);
       });
 
-      expect(result.current.stats.executorState).toBe("idle");
+      expect(result.current.stats.executorState).toBe("paused");
     });
 
     it("returns 'paused' when enginePaused is true and runningTaskCount > 0", async () => {

@@ -67,6 +67,19 @@ export function translateRejection(t: TFn, rejection: TransitionRejectionDetail)
       return t("board.rejection.workflowMismatch", "Drag can't move a card between workflows. Use the workflow switcher instead.");
     case "merge-blocked":
       return t("board.rejection.mergeBlocked", "This task is blocked from completing until its merge step finishes.");
+    /*
+    FNXC:BoardRejections 2026-07-25-04:55:
+    FN-8471 added this server-side code without a client case or catalog entry, so
+    the default branch fell through to `t(messageKey, messageKey)` and the board
+    printed the raw `board.rejection.unplannedForExecution` key at operators. The
+    static literal here is also what the i18next extractor sees, so the key must
+    be spelled out in the switch rather than resolved via the carried messageKey.
+    */
+    case "unplanned-for-execution":
+      return t(
+        "board.rejection.unplannedForExecution",
+        "This task isn't ready for execution yet — planning or plan review is still outstanding.",
+      );
     default:
       return t(rejection.messageKey, rejection.messageKey);
   }
@@ -86,6 +99,11 @@ export function translateRejectionKey(t: TFn, messageKey: string): string {
       return t("board.rejection.workflowMismatch", "Drag can't move a card between workflows. Use the workflow switcher instead.");
     case "board.rejection.mergeBlocked":
       return t("board.rejection.mergeBlocked", "This task is blocked from completing until its merge step finishes.");
+    case "board.rejection.unplannedForExecution":
+      return t(
+        "board.rejection.unplannedForExecution",
+        "This task isn't ready for execution yet — planning or plan review is still outstanding.",
+      );
     default:
       return t(messageKey, messageKey);
   }
@@ -196,7 +214,8 @@ interface ColumnProps {
   /** Per-task workflow columns for aggregate Board cards whose tasks come from different workflows. */
   taskContextMenuColumnsByTaskId?: ReadonlyMap<string, readonly TaskContextMenuColumnMetadata[]>;
   /** Manually promote a held card out of this hold column (workflow mode). */
-  onPromote?: (taskId: string) => Promise<void>;
+  /** `force` waives the unplanned-for-execution gate after operator confirmation. */
+  onPromote?: (taskId: string, options?: { force?: boolean }) => Promise<void>;
   /**
    * Pre-check whether a drop into THIS column is allowed for the dragged task.
    * Returns null for "allowed", or an i18n messageKey for a deterministic
@@ -416,6 +435,16 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
     }
   }, [addToast, allTasks, column, confirm, onMoveTask, tasks, t]);
 
+  /*
+  FNXC:BoardPromote 2026-07-25-04:55:
+  Promote is a two-attempt flow for the `unplanned-for-execution` rejection only.
+  The first attempt never forces; if the server refuses because a replan / plan
+  review is still outstanding, the operator is asked whether to start execution
+  anyway and the retry carries `{ force: true }`. Every other rejection (capacity,
+  guard) stays a plain inline message with no override — those are not the
+  operator's call to waive. Inline feedback rather than a toast, so several holds
+  can promote concurrently without toast spam.
+  */
   const handlePromote = useCallback(async (taskId: string) => {
     if (!onPromote) return;
     setInlineFeedback(null);
@@ -425,12 +454,32 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
       return next;
     });
     try {
-      await onPromote(taskId);
+      try {
+        await onPromote(taskId);
+      } catch (err) {
+        const rejection = extractTransitionRejection(err);
+        if (rejection?.code !== "unplanned-for-execution") throw err;
+
+        const forceConfirmed = await confirm({
+          title: t("column.promoteUnplannedTitle", "Start execution anyway?"),
+          message: t(
+            "column.promoteUnplannedMessage",
+            "{{taskId}} is still waiting on planning or plan review. Promoting now starts execution with the current plan and cancels the pending replan.",
+            { taskId },
+          ),
+          confirmLabel: t("column.promoteUnplannedConfirm", "Start Anyway"),
+          cancelLabel: t("column.promoteUnplannedCancel", "Keep Waiting"),
+          danger: true,
+        });
+        if (!forceConfirmed) {
+          setInlineFeedback(translateRejection(t, rejection));
+          return;
+        }
+        await onPromote(taskId, { force: true });
+      }
     } catch (err) {
       const rejection = extractTransitionRejection(err);
       if (rejection) {
-        // Capacity-exhausted (and any rejection) shows INLINE column feedback,
-        // not a toast — so multiple holds can promote concurrently without spam.
         setInlineFeedback(translateRejection(t, rejection));
       } else {
         setInlineFeedback(getErrorMessage(err));
@@ -442,7 +491,7 @@ function ColumnComponent({ column, tasks, projectId, maxConcurrent, showWorktree
         return next;
       });
     }
-  }, [onPromote, t]);
+  }, [confirm, onPromote, t]);
 
   const worktreeGroups = useMemo(() => {
     if (!showWorktreeGroups) return [];

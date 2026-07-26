@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { SystemStatsArea } from "../areas/SystemStatsArea";
+import { readAppFile } from "../../../test/cssFixture";
 
 const mockFetchSystemStats = vi.fn();
 const mockFetchNodeSystemStats = vi.fn();
@@ -375,7 +376,7 @@ describe("SystemStatsArea", () => {
   });
 
   it("keeps the node selector inside the mobile System-area layout contract", () => {
-    const css = readFileSync(join(process.cwd(), "app/components/command-center/areas/SystemStatsArea.css"), "utf8");
+    const css = readAppFile("components/command-center/areas/SystemStatsArea.css");
     expect(css).toContain("@media (max-width: 768px)");
     expect(css).toContain(".cc-system-node-selector");
     expect(css).toContain("inline-size: 100%");

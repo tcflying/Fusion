@@ -1800,9 +1800,20 @@ Planner rewrote mission without the raw request.
       expect(specifySpy).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-200" }));
     });
 
+    /*
+    FNXC:NodeWorktreeIsolation 2026-07-25-22:40:
+    Advancement evidence is an EXECUTION TIMESTAMP, not a worktree. Planning acquires the task's own
+    worktree now (so no lane runs in the shared checkout), which makes `worktree` the normal state of a
+    card being planned; reading it as advancement would skip every planning write. The invariant this
+    test guards — a genuinely advanced row is not re-dispatched — is unchanged.
+    */
     it("does not repeatedly dispatch a triage row that already has executor advancement evidence", async () => {
       const tasks: Task[] = [
-        createTriageTask({ id: "FN-ADVANCED", worktree: "/tmp/fusion-fn-advanced" }),
+        createTriageTask({
+          id: "FN-ADVANCED",
+          worktree: "/tmp/fusion-fn-advanced",
+          firstExecutionAt: new Date().toISOString(),
+        }),
         createTriageTask({ id: "FN-UNPLANNED" }),
       ];
       const triageStore = createMockStore({

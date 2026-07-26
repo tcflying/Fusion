@@ -407,8 +407,9 @@ export function Board({ tasks, projectId, maxConcurrent, showWorktreeGrouping, o
   } = useBoardWorkflows({ projectId, shouldHydrateCache: shouldHydrateBoardWorkflowsCache });
   const draggingTaskIdRef = useRef<string | null>(null);
 
-  const handlePromote = useCallback(async (taskId: string) => {
-    await promoteTask(taskId, projectId);
+  const handlePromote = useCallback(async (taskId: string, options?: { force?: boolean }) => {
+    // `force` only ever arrives from Column's confirmed unplanned-for-execution override.
+    await promoteTask(taskId, projectId, options);
   }, [projectId]);
 
   const handleToggleAutoMerge = useCallback(() => {
