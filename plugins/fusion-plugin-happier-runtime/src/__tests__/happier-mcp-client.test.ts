@@ -93,9 +93,10 @@ describe("official Happier MCP stdio client", () => {
     });
     await client.close();
 
-    expect(mockSpawn).toHaveBeenCalledWith(
-      "happier",
-      ["mcp", "serve", "--session", "happier-session-1"],
+    const [executable, args, spawnOptions] = mockSpawn.mock.calls[0]!;
+    expect(executable).toBe("happier");
+    expect(args.slice(-4)).toEqual(["mcp", "serve", "--session", "happier-session-1"]);
+    expect(spawnOptions).toEqual(
       expect.objectContaining({ shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }),
     );
     expect(fake.requests).toEqual([

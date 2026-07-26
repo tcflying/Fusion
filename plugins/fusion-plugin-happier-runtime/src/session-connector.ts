@@ -1221,19 +1221,43 @@ export class HappierSessionConnector implements SessionConnectorV1, SessionConne
 
   async getCapabilities(identity?: SessionConnectorIdentityV1): Promise<SessionConnectorCapabilitiesV1> {
     const verifiedAt = this.now();
-    const binding = identity ? this.bindingForIdentity(identity) : null;
-    if (!binding) return this.capabilitiesFromTools(new Set<string>(), identity, verifiedAt);
-    let client: HappierMcpClient | undefined;
-    let available = new Set<string>();
+    const resolvedBinding = identity ? this.bindingForIdentity(identity) : null;
+    const bindings = identity
+      ? (resolvedBinding === null ? [] : [resolvedBinding])
+      : this.persistedBindings();
+    if (bindings.length === 0) return this.capabilitiesFromTools(new Set<string>(), identity, verifiedAt);
+    let available: Set<string> | null = null;
     try {
-      client = await this.dependencies.openMcpClient({ settings: this.settings, sessionId: binding.happierSessionId });
-      available = validatedToolNames(await client.listTools());
+      for (const binding of bindings) {
+        const client = await this.dependencies.openMcpClient({ settings: this.settings, sessionId: binding.happierSessionId });
+        try {
+          const discovered = validatedToolNames(await client.listTools());
+          if (available === null) {
+            available = discovered;
+          } else {
+            const intersection = new Set<string>();
+            for (const tool of available) {
+              if (discovered.has(tool)) intersection.add(tool);
+            }
+            available = intersection;
+          }
+        } finally {
+          await client.close().catch(() => undefined);
+        }
+      }
     } catch {
       // The capability result below remains fail-closed with no claimed MCP tools.
-    } finally {
-      await client?.close().catch(() => undefined);
+      available = new Set<string>();
     }
-    return this.capabilitiesFromTools(available, identity, verifiedAt);
+    /*
+     * FNXC:HappierGlobalCapabilityIntersection 2026-07-25-18:58:
+     * Existing-Session Room creation has no native identity before ensureExisting,
+     * but must still verify the connector can safely attach every configured
+     * binding. Probe every binding and certify only the intersection; one failed
+     * discovery therefore disables the global capability rather than borrowing
+     * a different Session's tool surface.
+     */
+    return this.capabilitiesFromTools(available ?? new Set<string>(), identity, verifiedAt);
   }
 
   async ensureExisting(
@@ -1599,10 +1623,10 @@ export class HappierSessionConnector implements SessionConnectorV1, SessionConne
     const capabilities = Object.fromEntries(
       SESSION_CONNECTOR_CAPABILITIES.map((name) => [name, capabilityMatrix.capabilities[name].state]),
     ) as SessionConnectorHealthV1["capabilities"];
-    const checkedAt = this.now();
     const host = nonEmptyString(hostId) ? "reachable" as const : "unavailable" as const;
     try {
       const health = await this.dependencies.probeRuntime(this.settings);
+      const checkedAt = this.now();
       const reasonCodes = typedHealthReasonCodes(health.details);
       const authentication = health.authenticated
         ? "authenticated" as const
@@ -1643,6 +1667,7 @@ export class HappierSessionConnector implements SessionConnectorV1, SessionConne
         retryAfterMs: null,
       };
     } catch {
+      const checkedAt = this.now();
       return {
         connectorId: this.id,
         hostId,

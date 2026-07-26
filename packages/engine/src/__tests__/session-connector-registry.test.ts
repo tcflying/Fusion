@@ -304,6 +304,24 @@ describe("provider-neutral Session Connector registry contract", () => {
     }
   });
 
+  it("allows unknown quota only for explicitly read-only existing-session attachment", async () => {
+    const connector = makeConnector({ health: () => healthyHealth({ rateLimit: "unknown" }) });
+    const registry = makeRegistry();
+    registry.register(connector);
+
+    await expect(registry.requireVerified({
+      connectorId: "happier",
+      capability: "ensureExisting",
+      identity: IDENTITY,
+      requiredHostId: IDENTITY.hostId,
+      allowUnknownRateLimitForReadOnlyAttachment: true,
+    })).resolves.toBe(connector);
+    await expect(requireVerified(registry, "send")).rejects.toMatchObject({
+      code: "SESSION_CONNECTOR_HEALTH_NOT_READY",
+      capability: "send",
+    });
+  });
+
   it("uses identity-bound capability certification instead of an identityless health capability matrix", async () => {
     const connector = makeConnector({
       health: () => healthyHealth({

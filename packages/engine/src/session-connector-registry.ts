@@ -145,6 +145,12 @@ export interface RequireVerifiedSessionConnectorInput {
   readonly capability: SessionConnectorCapabilityName;
   readonly identity?: SessionConnectorIdentityV1;
   readonly requiredHostId?: string;
+  /**
+   * Existing-session attachment is a provider-read-only operation when the
+   * caller separately proves no provider turn started. It may proceed when a
+   * connector cannot observe quota but all other runtime health is ready.
+   */
+  readonly allowUnknownRateLimitForReadOnlyAttachment?: boolean;
 }
 
 const CAPABILITY_STATES = new Set<SessionConnectorCapabilityState>([
@@ -382,7 +388,10 @@ export class SessionConnectorRegistry {
         this.healthMaxAgeMs,
         this.healthMaxFutureSkewMs,
       );
-      if (!isMutationHealthReady(health)) {
+      const permitsReadOnlyAttachment = input.capability === "ensureExisting"
+        && input.allowUnknownRateLimitForReadOnlyAttachment === true
+        && isReadOnlyAttachmentHealthReady(health);
+      if (!isMutationHealthReady(health) && !permitsReadOnlyAttachment) {
         throw new SessionConnectorHealthNotReadyError(
           connector.id,
           input.capability,
@@ -647,6 +656,25 @@ function isMutationHealthReady(health: SessionConnectorHealthV1): boolean {
     && (health.server === "reachable" || health.server === "not_applicable")
     && (health.backend === "ready" || health.backend === "not_applicable")
     && health.rateLimit === "clear"
+    && health.host === "reachable"
+    && health.reasonCodes.length === 0;
+}
+
+/*
+ * FNXC:ExistingSessionUnknownQuota 2026-07-25-19:02:
+ * The Room spine invokes this only before ensureExisting and still rejects an
+ * explicit rate limit. Some official MCPs cannot report quota for a read-only
+ * identity attachment; treating unknown as a clear quota would be false, while
+ * refusing attachment makes a no-provider-turn path impossible. Never reuse
+ * this predicate for send/control/create operations.
+ */
+function isReadOnlyAttachmentHealthReady(health: SessionConnectorHealthV1): boolean {
+  return health.state === "healthy"
+    && health.authentication === "authenticated"
+    && (health.daemon === "running" || health.daemon === "not_applicable")
+    && (health.server === "reachable" || health.server === "not_applicable")
+    && (health.backend === "ready" || health.backend === "not_applicable")
+    && (health.rateLimit === "clear" || health.rateLimit === "unknown")
     && health.host === "reachable"
     && health.reasonCodes.length === 0;
 }

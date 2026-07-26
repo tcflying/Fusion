@@ -1334,6 +1334,7 @@ describe("Room existing-Session vertical spine (deterministic connector double)"
         connectorId: CONNECTOR_ID,
         capability: "ensureExisting" satisfies SessionConnectorCapabilityName,
         requiredHostId: session.identity.hostId,
+        allowUnknownRateLimitForReadOnlyAttachment: true,
       });
       expect(harness.connector.ensureExisting).toHaveBeenCalledWith({
         contractVersion: 1,

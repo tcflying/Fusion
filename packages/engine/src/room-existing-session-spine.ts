@@ -200,6 +200,7 @@ export class RoomExistingSessionSpine {
         connectorId: request.connectorId,
         capability: "ensureExisting",
         requiredHostId: request.requiredHostId,
+        allowUnknownRateLimitForReadOnlyAttachment: true,
       });
       let ensured: Awaited<ReturnType<typeof connector.ensureExisting>>;
       try {
