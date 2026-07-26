@@ -92,7 +92,7 @@ import { resolveTaskWorktreePath, resolveWorktreesDir } from "./worktree-paths.j
 import { Type, type Static } from "@earendil-works/pi-ai";
 import { describeModel, formatModelMarkerDetails, promptWithFallback, compactSessionContext } from "./pi.js";
 import { buildAgentGatedActionSummary } from "./permanent-agent-gating.js";
-import { accumulateSessionTokenUsage, captureSessionTokenBaseline, mergeTokenUsagePerModel, resetSessionTokenBaseline } from "./session-token-usage.js";
+import { accumulateSessionTokenUsage, mergeTokenUsagePerModel } from "./session-token-usage.js";
 import { finalizePlanningSegment, startPlanningSegment, resolveEphemeralTaskCreationPolicy } from "@fusion/core";
 import { enforceTaskTokenBudgetForPersist } from "./token-budget-enforcer.js";
 import {
@@ -184,7 +184,10 @@ import { TokenCapDetector } from "./token-cap-detector.js";
 import { isUsageLimitError, checkSessionError, type UsageLimitPauser } from "./usage-limit-detector.js";
 import { isNonContinuableSessionError, isNonPlanDefectPlanReviewFailure, isSessionContentionError, isTransientError, isSilentTransientError } from "./transient-error-detector.js";
 import { withRateLimitRetry } from "./rate-limit-retry.js";
-import { isRequiredArtifactReadFailedValue } from "./required-workflow-artifacts.js";
+import {
+  isRequiredArtifactReadFailedValue,
+  parseRequiredArtifactMissingValue,
+} from "./required-workflow-artifacts.js";
 import {
   detectExternalIntegrationEvidenceGaps,
   formatExternalIntegrationEvidenceDiagnostic,
@@ -1883,6 +1886,11 @@ export class TaskExecutor {
    *  Prevents the task:moved handler from dispatching execute() before the
    *  bounce finishes its own dispatch. */
   private workflowRerunPending = new Set<string>();
+  /**
+   * Graph-owned column transitions must not be mistaken for external moves
+   * that cancel the graph currently performing the transition.
+   */
+  private workflowLifecycleMovesInFlight = new Set<string>();
   /** FN-5256: in-flight session-disposal promises keyed by taskId. The
    *  task:moved (away from in-progress) and task:deleted listeners populate
    *  this so a fast re-dispatch (task:moved → in-progress) awaits the prior
@@ -1906,6 +1914,11 @@ export class TaskExecutor {
   private effectiveColumnAgentByTask = new Map<string, string>();
   /** Active pre-merge workflow step sessions per task. */
   private activeWorkflowStepSessions = new Map<string, AgentSession>();
+  /**
+   * Only graph-owned Plan Review sessions appear here. Self-healing uses this
+   * narrow liveness proof so it never finalizes an in-flight planning segment.
+   */
+  private activePlanningWorkflowSessions = new Set<string>();
   /** Steering comments already observed for active workflow step sessions. */
   private activeWorkflowStepSessionSeenSteeringIds = new Map<string, Set<string>>();
   /** Active configured-command abort controllers keyed by task. */
@@ -3361,6 +3374,12 @@ export class TaskExecutor {
           }).then(async () => { await this.releasePreExecutionWorktree(task.id, `moved to ${to}`); }),
         );
       } else if (from === "in-progress") {
+        if (this.workflowLifecycleMovesInFlight.has(task.id) && this.graphRouting.has(task.id)) {
+          executorLog.log(
+            `[event:task:moved] Preserving graph run for ${task.id} across its own ${from} → ${to} boundary`,
+          );
+          return;
+        }
         this.trackTaskDisposal(
           task.id,
           this.awaitAbortInFlightTaskWork(task.id, `parent moved from in-progress to ${to}`, {
@@ -4610,6 +4629,7 @@ export class TaskExecutor {
     }));
 
     await this.store.updateTask(taskId, { tokenUsage });
+    await enforceTaskTokenBudgetForPersist(this.store, taskId, this.getRunContextFor(taskId));
   }
 
   /**
@@ -4844,6 +4864,8 @@ export class TaskExecutor {
       phase: CoreWorkflowStepResult["phase"];
       status: CoreWorkflowStepResult["status"];
       verdict?: string;
+      /** Raw graph node result when no reviewer verdict was produced. */
+      failureValue?: string;
       nodeId?: string;
       maxRevisions?: unknown;
     },
@@ -4852,6 +4874,14 @@ export class TaskExecutor {
     if (info.status !== "advisory_failure" && info.status !== "failed") return false;
 
     const liveTask = await this.store.getTask(taskId).catch(() => fallbackTask);
+    const missingArtifactKeys = parseRequiredArtifactMissingValue(info.failureValue);
+    if (missingArtifactKeys) {
+      await this.recoverMissingRequiredArtifacts(liveTask, missingArtifactKeys, {
+        source: "workflow-step",
+        nodeId: info.nodeId,
+      });
+      return true;
+    }
     const isPlanReview = info.nodeId === "plan-review" || info.stepName === "Plan Review";
     if (isPlanReview) {
       /*
@@ -4860,6 +4890,19 @@ export class TaskExecutor {
        */
       if (info.status === "advisory_failure" && info.verdict !== "REVISE") return false;
       if (info.verdict !== undefined && info.verdict !== "REVISE") return false;
+      if (isNonPlanDefectPlanReviewFailure({
+        verdict: info.verdict,
+        errorMessage: info.feedback,
+        failureValue: info.failureValue,
+      })) {
+        await this.store.logEntry(
+          taskId,
+          "Plan Review provider failure — task kept in place",
+          `Plan Review failed without a REVISE verdict due to a provider, model, transport, or abort condition. The task remains in ${liveTask.column}; no automatic replan was scheduled.\n\nDiagnostic:\n${info.feedback}`,
+          this.getRunContextFor(taskId),
+        );
+        return false;
+      }
       /*
        * FNXC:PlanReviewReplan 2026-06-29-00:41:
        * Plan Review is pre-execution spec validation, so a failed/revision result
@@ -4920,7 +4963,12 @@ export class TaskExecutor {
         optionalStepRevisionLogOutcome(feedback, revisionKey),
         this.getRunContextFor(taskId),
       );
-      await moveTaskToReplanColumn(this.store, { id: taskId, column: liveTask.column }, replanColumn);
+      this.workflowLifecycleMovesInFlight.add(taskId);
+      try {
+        await moveTaskToReplanColumn(this.store, { id: taskId, column: liveTask.column }, replanColumn);
+      } finally {
+        this.workflowLifecycleMovesInFlight.delete(taskId);
+      }
       await this.store.updateTask(taskId, {
         status: "needs-replan",
         error: null,
@@ -8717,6 +8765,15 @@ export class TaskExecutor {
     if (!failedNode || !result.context) return undefined;
     const value = result.context[`node:${failedNode}:value`];
     if (typeof value === "string") return value;
+    const groupInstanceDelimiter = failedNode.indexOf("::");
+    if (groupInstanceDelimiter !== -1) {
+      const groupNode = failedNode.slice(0, groupInstanceDelimiter);
+      const groupValue = result.context[`node:${groupNode}:value`];
+      if (typeof groupValue === "string") return groupValue;
+      const templateNode = failedNode.slice(groupInstanceDelimiter + 2);
+      const templateValue = result.context[`node:${templateNode}:value`];
+      return typeof templateValue === "string" ? templateValue : undefined;
+    }
     const foreachInstanceDelimiter = failedNode.indexOf("#");
     if (foreachInstanceDelimiter === -1) return undefined;
     /*
@@ -8730,6 +8787,10 @@ export class TaskExecutor {
 
   private isAwaitingGraphFailureValue(value: string | undefined): value is "awaiting-user-input" | "awaiting-cli-approval" {
     return value === "awaiting-user-input" || value === "awaiting-cli-approval";
+  }
+
+  hasActivePlanningWorkflowSession(taskId: string): boolean {
+    return this.activePlanningWorkflowSessions.has(taskId) && this.activeWorkflowStepSessions.has(taskId);
   }
 
   private extractUnusableWorktreeGraphFailure(result: WorkflowGraphTaskRunResult): string | null {
@@ -8788,6 +8849,79 @@ export class TaskExecutor {
       phase: "execute",
     });
     return this.recoverMissingWorktreeSessionStartFailure(live, stalePath, new Error(errorText), audit);
+  }
+
+  private async recoverMissingRequiredArtifacts(
+    task: Task,
+    artifactKeys: string[],
+    source: { source: "graph-entry" | "workflow-step"; nodeId?: string },
+  ): Promise<void> {
+    const currentTask = await this.store.getTask(task.id).catch(() => null);
+    if (!currentTask || this.isRequiredArtifactRecoveryProtected(currentTask)) return;
+    task = currentTask;
+    const decision = computeRecoveryDecision({
+      recoveryRetryCount: task.recoveryRetryCount,
+      nextRecoveryAt: task.nextRecoveryAt,
+    });
+    const attempt = decision.nextState.recoveryRetryCount ?? MAX_RECOVERY_RETRIES;
+    const context = this.getRunContextFor(task.id);
+    const action = decision.shouldRetry ? "replan" : "park-failed";
+
+    await this.store.recordRunAuditEvent?.({
+      taskId: task.id,
+      agentId: "executor",
+      runId: context?.runId ?? generateSyntheticRunId("required-artifact-missing", task.id),
+      domain: "database",
+      mutationType: "task:required-artifact-missing",
+      target: task.id,
+      metadata: {
+        taskId: task.id,
+        artifactKeys,
+        owner: "planning",
+        source: source.source,
+        action,
+        attempt,
+        maxAttempts: MAX_RECOVERY_RETRIES,
+        ...(source.nodeId ? { nodeId: source.nodeId } : {}),
+      },
+    });
+
+    if (!decision.shouldRetry) {
+      const liveTask = await this.store.getTask(task.id).catch(() => null);
+      if (!liveTask || this.isRequiredArtifactRecoveryProtected(liveTask)) return;
+      const error = `REQUIRED_ARTIFACT_RECOVERY_EXHAUSTED: ${artifactKeys.join(", ")} remained missing after ${MAX_RECOVERY_RETRIES} automatic planning retries.`;
+      await this.store.logEntry(task.id, error, undefined, context);
+      await this.store.updateTask(task.id, {
+        status: "failed",
+        error,
+        recoveryRetryCount: null,
+        nextRecoveryAt: null,
+      }, context);
+      return;
+    }
+
+    const replanColumn = await resolveReplanTargetColumn(this.store, task.id);
+    await this.store.logEntry(
+      task.id,
+      `Required workflow artifact missing — moved to ${replanColumn} for automatic planning recovery (attempt ${attempt}/${MAX_RECOVERY_RETRIES} in ${formatDelay(decision.delayMs)})`,
+      `Missing artifact keys: ${artifactKeys.join(", ")}`,
+      context,
+    );
+    this.workflowLifecycleMovesInFlight.add(task.id);
+    try {
+      const liveTask = await this.store.getTask(task.id).catch(() => null);
+      if (!liveTask || this.isRequiredArtifactRecoveryProtected(liveTask)) return;
+      await moveTaskToReplanColumn(this.store, { id: task.id, column: liveTask.column }, replanColumn);
+    } finally {
+      this.workflowLifecycleMovesInFlight.delete(task.id);
+    }
+    await this.store.updateTask(task.id, {
+      status: "needs-replan",
+      error: null,
+      recoveryRetryCount: decision.nextState.recoveryRetryCount,
+      nextRecoveryAt: decision.nextState.nextRecoveryAt,
+      graphResumeRetryCount: 0,
+    }, context);
   }
 
   private isRequiredArtifactRecoveryProtected(task: Task): boolean {
@@ -16732,6 +16866,17 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         `Workflow step '${workflowStep.name}' using model: ${workflowModelDetails}`,
       );
       this.setActiveWorkflowStepSession(task.id, session, worktreePath, this.createSeenSteeringIds(task));
+      const ownsPlanningSegment = workflowStep.id === "graph:plan-review-step" || workflowStep.name === "Plan Review";
+      if (ownsPlanningSegment) {
+        this.activePlanningWorkflowSessions.add(task.id);
+        const planningStart = startPlanningSegment(task);
+        try {
+          if (planningStart.planningStartedAt) await this.store.updateTask(task.id, planningStart);
+        } catch (error) {
+          this.activePlanningWorkflowSessions.delete(task.id);
+          throw error;
+        }
+      }
 
       let output = "";
       const deltaNormalizer = createStreamingDeltaNormalizer();
@@ -16864,6 +17009,17 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         return { success: false, error: errorMessage };
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
+        if (ownsPlanningSegment) {
+          try {
+            const livePlanningTask = await this.store.getTask(task.id);
+            if (livePlanningTask) {
+              const planningEnd = finalizePlanningSegment(livePlanningTask);
+              if (planningEnd.planningStartedAt === null) await this.store.updateTask(task.id, planningEnd);
+            }
+          } finally {
+            this.activePlanningWorkflowSessions.delete(task.id);
+          }
+        }
         const activeWorkflowStepSession = this.activeWorkflowStepSessions.get(task.id);
         if (activeWorkflowStepSession === session) {
           this.deleteActiveWorkflowStepSession(task.id);
@@ -17671,7 +17827,7 @@ You have access to the file system to review changes.${inlineFixBlock}${verdictB
         this.getRunContextFor(task.id),
       );
     }
-    return true;
+    return recovery.outcome !== "escalate-exhausted";
   }
 
   private async emitWorktreeReanchoredAudit(

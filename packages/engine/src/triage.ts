@@ -230,6 +230,11 @@ export class TriageProcessor {
   private nudgeTimer: ReturnType<typeof setTimeout> | null = null;
   private nudgeDuringPoll = false;
   private processing = new Set<string>();
+  /**
+   * Tasks inside the Plan Review-to-column handoff remain planning-owned even
+   * after their main planning session has ended.
+   */
+  private finalizing = new Set<string>();
   /** Synchronous ownership fence shared with advanced planning recovery. */
   private advancedRecoveryReservations = new Set<string>();
   /** Timestamps when tasks entered the `processing` set, for staleness detection. */
@@ -867,12 +872,22 @@ export class TriageProcessor {
    * Used by self-healing maintenance to avoid recovering live sessions.
    */
   getProcessingTaskIds(): Set<string> {
-    const ids = new Set(this.processing);
+    const ids = this.getPlanningTaskIds();
     for (const taskId of this.advancedRecoveryReservations) ids.add(taskId);
     return ids;
   }
 
+  getPlanningTaskIds(): Set<string> {
+    const ids = new Set(this.processing);
+    for (const taskId of this.finalizing) ids.add(taskId);
+    for (const [taskId, sessions] of this.activeSubagentSessions) {
+      if (sessions.size > 0) ids.add(taskId);
+    }
+    return ids;
+  }
+
   private hasLivePlanningWork(taskId: string): boolean {
+    if (this.finalizing.has(taskId)) return true;
     const subagents = this.activeSubagentSessions.get(taskId);
     if (subagents && subagents.size > 0) return true;
     return this.activeSessions.has(taskId) && !this.stuckAborted.has(taskId);
@@ -912,6 +927,7 @@ export class TriageProcessor {
         this.processingSince.delete(taskId);
         this.activeSessions.delete(taskId);
         this.stuckAborted.delete(taskId);
+        this.finalizing.delete(taskId);
         evicted.add(taskId);
       }
     }
@@ -2769,6 +2785,25 @@ export class TriageProcessor {
   }
 
   private async finalizeApprovedTask(
+    task: Task,
+    writtenInput: string,
+    settings: Settings,
+    options: {
+      isReplan?: boolean;
+      feedback?: string;
+      recoveryLogAction?: string;
+      preservePromptContent?: boolean;
+    } = {},
+  ): Promise<void> {
+    this.finalizing.add(task.id);
+    try {
+      await this.finalizeApprovedTaskBody(task, writtenInput, settings, options);
+    } finally {
+      this.finalizing.delete(task.id);
+    }
+  }
+
+  private async finalizeApprovedTaskBody(
     task: Task,
     writtenInput: string,
     settings: Settings,
