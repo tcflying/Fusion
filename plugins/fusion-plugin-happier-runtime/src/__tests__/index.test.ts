@@ -251,7 +251,7 @@ describe("Happier runtime plugin registration", () => {
     expect(manifestJson.version).toBe(packageJson.version);
     expect(manifestJson.runtime?.version).toBe(packageJson.version);
     expect(manifestJson.sessionConnector?.version).toBe(packageJson.version);
-    expect(packageJson.version).toBe("0.3.0");
+    expect(packageJson.version).toBe("0.3.1");
     expect(plugin.manifest.fusionVersion).toBe(HAPPIER_RUNTIME_COMPATIBILITY.fusionSemver);
     expect(plugin.manifest.settingsSchema).toBe(HAPPIER_RUNTIME_SETTINGS_SCHEMA);
     expect(Object.keys(manifestJson.settingsSchema ?? {}).sort()).toEqual(

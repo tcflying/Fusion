@@ -47,6 +47,20 @@ async function fixture() {
   return { dependencies, entrypoint, pin, root };
 }
 
+async function worktreeFixture() {
+  const value = await fixture();
+  const commonGitDirectory = join(value.root, "git-common");
+  const worktreeGitDirectory = join(commonGitDirectory, "worktrees", "attested");
+  const ref = "refs/heads/codex/attested";
+  await mkdir(join(commonGitDirectory, "refs", "heads", "codex"), { recursive: true });
+  await mkdir(worktreeGitDirectory, { recursive: true });
+  await writeFile(join(value.root, ".git"), `gitdir: ${worktreeGitDirectory}\n`);
+  await writeFile(join(worktreeGitDirectory, "HEAD"), `ref: ${ref}\n`);
+  await writeFile(join(worktreeGitDirectory, "commondir"), "../..\n");
+  await writeFile(join(commonGitDirectory, ref), `${value.pin.sourceCommit}\n`);
+  return value;
+}
+
 describe("verifyHappierCliAttestation", () => {
   const liveConformance = liveEntrypoint && liveSourceRoot ? it : it.skip;
 
@@ -87,6 +101,22 @@ describe("verifyHappierCliAttestation", () => {
         source: "git_head",
         artifact: "sha256_file_bytes",
       },
+    });
+  });
+
+  it("attests a Git worktree whose branch ref remains loose in the common Git directory", async () => {
+    const value = await worktreeFixture();
+
+    await expect(verifyHappierCliAttestation({
+      executable: process.execPath,
+      entrypoint: value.entrypoint,
+      allowedCliRoots: [value.root],
+    }, {
+      pin: value.pin,
+      probeVersion: async () => "0.2.10",
+    })).resolves.toMatchObject({
+      ok: true,
+      sourceCommit: value.pin.sourceCommit,
     });
   });
 

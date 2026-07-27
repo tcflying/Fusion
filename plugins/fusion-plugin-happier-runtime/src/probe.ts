@@ -37,6 +37,8 @@ export interface HappierRuntimeHealth {
   backendId: HappierBackend;
   modelId: string | null;
   modelState: "not_reported";
+  requestedModelId?: string | null;
+  requestedModelUpdatedAt?: number | null;
   attestation: HappierCliAttestation;
   details: string[];
 }
@@ -191,6 +193,18 @@ function isExactBoundSessionStatus(
   return session?.id === happierSessionId && session.active === true;
 }
 
+function requestedModelFromExactBoundSessionStatus(
+  envelope: HappierJsonEnvelope<unknown>,
+  happierSessionId: string,
+): Readonly<{ modelId: string; updatedAt: number }> | null {
+  if (!envelope.ok || !isExactBoundSessionStatus(envelope, happierSessionId) || !isRecord(envelope.data)) return null;
+  const modelOverride = isRecord(envelope.data.modelOverride) ? envelope.data.modelOverride : null;
+  const modelId = typeof modelOverride?.modelId === "string" ? modelOverride.modelId.trim() : "";
+  const updatedAt = modelOverride?.updatedAt;
+  if (!modelId || typeof updatedAt !== "number" || !Number.isFinite(updatedAt)) return null;
+  return { modelId, updatedAt };
+}
+
 function isExactBoundBackendModelInventory(
   envelope: HappierJsonEnvelope<unknown>,
   happierSessionId: string,
@@ -220,6 +234,8 @@ export async function probeHappierRuntime(
   let authenticated = false;
   let daemon = false;
   let backend = false;
+  let requestedModelId: string | null = null;
+  let requestedModelUpdatedAt: number | null = null;
   try {
     backendId = resolveHappierBackend(settings);
   } catch {
@@ -236,6 +252,8 @@ export async function probeHappierRuntime(
       backendId,
       modelId: null,
       modelState: "not_reported",
+      requestedModelId,
+      requestedModelUpdatedAt,
       attestation,
       details: ["backend-config-invalid"],
     };
@@ -255,6 +273,8 @@ export async function probeHappierRuntime(
       backendId,
       modelId: null,
       modelState: "not_reported",
+      requestedModelId,
+      requestedModelUpdatedAt,
       attestation,
       details: ["cli-attestation-failed"],
     };
@@ -384,13 +404,23 @@ export async function probeHappierRuntime(
           serverState = "reachable";
         }
         if (backend) {
+          const requestedModel = requestedModelFromExactBoundSessionStatus(
+            sessionStatus,
+            binding.happierSessionId,
+          );
           /*
            * FNXC:HappierRuntimeHealthTruth 2026-07-27-16:15:
-           * Happier 0.2.10 proves the bound backend and its model inventory,
-           * but neither official action reports the selected model. Keep the
-           * model null and withhold ready instead of assuming "default".
+           * The bound status may expose a persisted next-resume model request,
+           * but it is not proof that the Provider has switched. Keep modelId
+           * null and readiness withheld until a current Provider model exists.
            */
-          details.push("model-not-reported");
+          if (requestedModel) {
+            requestedModelId = requestedModel.modelId;
+            requestedModelUpdatedAt = requestedModel.updatedAt;
+            details.push("model-requested-not-confirmed");
+          } else {
+            details.push("model-not-reported");
+          }
         } else {
           details.push("backend-machine-availability-unverified");
         }
@@ -413,7 +443,8 @@ export async function probeHappierRuntime(
     && authenticated
     && daemon
     && backend
-    && !details.includes("model-not-reported");
+    && !details.includes("model-not-reported")
+    && !details.includes("model-requested-not-confirmed");
   return {
     discovered,
     executable,
@@ -426,6 +457,8 @@ export async function probeHappierRuntime(
     backendId,
     modelId: null,
     modelState: "not_reported",
+    requestedModelId,
+    requestedModelUpdatedAt,
     attestation,
     details: [...new Set(details)].slice(0, 12),
   };

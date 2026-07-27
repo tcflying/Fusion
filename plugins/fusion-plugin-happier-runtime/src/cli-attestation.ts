@@ -24,10 +24,10 @@ export const HAPPIER_RUNTIME_COMPATIBILITY = Object.freeze({
   pluginVersion: HAPPIER_SESSION_CONNECTOR_VERSION,
   fusionSemver: ">=0.74.0-beta.3 <0.75.0",
   happierCliSemver: "0.2.10",
-  happierSourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+  happierSourceCommit: "f7a07c6f31694e0d435448b560f3386e1743c7e9",
   officialProtocolContract: "sessionControl/v1@6e059c41d865343c1efc9c98676e5af3882d85ff",
   entrypointRelativePath: "apps/cli/package-dist/index.mjs",
-  entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786",
+  entrypointSha256: "sha256:10fa0e53fe3f1c712b71bf75882ea80fe5801d6a31ac11449f4ab7b49d3752c0",
 } as const);
 
 export const HAPPIER_CLI_COMPATIBILITY_PIN: HappierCliCompatibilityPin = Object.freeze({
@@ -153,7 +153,7 @@ async function resolveGitDirectory(sourceRoot: string): Promise<string> {
   return resolve(sourceRoot, pointer);
 }
 
-async function readPackedRef(gitDirectory: string, ref: string): Promise<string | null> {
+async function resolveGitMetadataDirectories(gitDirectory: string): Promise<string[]> {
   const candidates = [gitDirectory];
   try {
     const common = (await readFile(join(gitDirectory, "commondir"), "utf8")).trim();
@@ -161,7 +161,23 @@ async function readPackedRef(gitDirectory: string, ref: string): Promise<string 
   } catch {
     // A normal repository has no commondir file.
   }
-  for (const directory of candidates) {
+  return candidates;
+}
+
+async function readLooseRef(gitDirectory: string, ref: string): Promise<string | null> {
+  for (const directory of await resolveGitMetadataDirectories(gitDirectory)) {
+    try {
+      const value = (await readFile(join(directory, ref), "utf8")).trim();
+      if (/^[a-f0-9]{40}$/u.test(value)) return value;
+    } catch {
+      // The ref may instead be packed or absent from this metadata directory.
+    }
+  }
+  return null;
+}
+
+async function readPackedRef(gitDirectory: string, ref: string): Promise<string | null> {
+  for (const directory of await resolveGitMetadataDirectories(gitDirectory)) {
     try {
       const lines = (await readFile(join(directory, "packed-refs"), "utf8")).split(/\r?\n/u);
       const match = lines.find((line) => line.endsWith(` ${ref}`));
@@ -179,13 +195,10 @@ async function defaultReadSourceCommit(sourceRoot: string): Promise<string> {
   if (/^[a-f0-9]{40}$/u.test(head)) return head;
   const ref = head.match(/^ref:\s*(refs\/.+)$/u)?.[1];
   if (!ref) throw new Error("invalid Git HEAD");
-  try {
-    const value = (await readFile(join(gitDirectory, ref), "utf8")).trim();
-    if (/^[a-f0-9]{40}$/u.test(value)) return value;
-  } catch {
-    const packed = await readPackedRef(gitDirectory, ref);
-    if (packed) return packed;
-  }
+  const loose = await readLooseRef(gitDirectory, ref);
+  if (loose) return loose;
+  const packed = await readPackedRef(gitDirectory, ref);
+  if (packed) return packed;
   throw new Error("Git HEAD ref is unavailable");
 }
 

@@ -59,6 +59,7 @@ const boundSessionStatus = {
     data: {
       session: { id: boundSessionId, active: true },
       agentState: { controlledByUser: false, pendingRequestsCount: 0 },
+      modelOverride: { modelId: "gpt-5.6-sol", updatedAt: 1_753_396_000_000 },
     },
   }),
 };
@@ -290,6 +291,8 @@ describe("probeHappierRuntime", () => {
       backendId: "codex",
       modelId: null,
       modelState: "not_reported",
+      requestedModelId: null,
+      requestedModelUpdatedAt: null,
       attestation: attestationOk,
       details: ["backend-machine-availability-unverified"],
     });
@@ -412,9 +415,11 @@ describe("probeHappierRuntime", () => {
       backend: true,
       modelId: null,
       modelState: "not_reported",
+      requestedModelId: "gpt-5.6-sol",
+      requestedModelUpdatedAt: 1_753_396_000_000,
       ready: false,
     });
-    expect(health.details).toContain("model-not-reported");
+    expect(health.details).toContain("model-requested-not-confirmed");
   });
 
   it("uses lightweight daemon status and a live bound session instead of the doctor report", async () => {

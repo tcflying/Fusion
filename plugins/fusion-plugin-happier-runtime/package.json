@@ -1,6 +1,6 @@
 {
   "name": "@fusion-plugin-examples/happier-runtime",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",

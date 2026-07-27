@@ -1,7 +1,7 @@
 {
   "id": "fusion-plugin-happier-runtime",
   "name": "Happier Runtime Plugin",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local/custom Fusion adapter for a pinned Happier CLI and MCP contract",
   "author": "tcflying",
   "homepage": "https://github.com/tcflying/Fusion",
@@ -16,13 +16,13 @@
     "upstreamProtocolContract": "sessionControl/v1@6e059c41d865343c1efc9c98676e5af3882d85ff"
   },
   "compatibility": {
-    "pluginVersion": "0.3.0",
+    "pluginVersion": "0.3.1",
     "fusionSemver": ">=0.74.0-beta.3 <0.75.0",
     "happierCliSemver": "0.2.10",
-    "happierSourceCommit": "6e059c41d865343c1efc9c98676e5af3882d85ff",
+    "happierSourceCommit": "f7a07c6f31694e0d435448b560f3386e1743c7e9",
     "officialProtocolContract": "sessionControl/v1@6e059c41d865343c1efc9c98676e5af3882d85ff",
     "entrypointRelativePath": "apps/cli/package-dist/index.mjs",
-    "entrypointSha256": "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786"
+    "entrypointSha256": "sha256:10fa0e53fe3f1c712b71bf75882ea80fe5801d6a31ac11449f4ab7b49d3752c0"
   },
   "settingsSchema": {
     "executable": {
@@ -189,12 +189,12 @@
     "runtimeId": "happier",
     "name": "Happier Runtime",
     "description": "Local/custom adapter for pinned Happier JSON CLI sessions with durable native ids",
-    "version": "0.3.0"
+    "version": "0.3.1"
   },
   "sessionConnector": {
     "connectorId": "happier",
     "name": "Happier Session Connector",
     "description": "Local/custom connector for manually bound Sessions using the pinned official Happier MCP contract",
-    "version": "0.3.0"
+    "version": "0.3.1"
   }
 }
