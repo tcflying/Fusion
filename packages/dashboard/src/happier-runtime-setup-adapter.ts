@@ -57,6 +57,61 @@ function stringSetting(settings: Record<string, unknown>, key: string, maximum =
   return safeHappierSettingString(settings[key], maximum);
 }
 
+export const HAPPIER_SETUP_READ_TIMEOUT_MS = 12_000;
+const HAPPIER_SETUP_OPERATION_TIMEOUT_MS = 5_000;
+
+function boundedHappierSetupSettings(settings: Record<string, unknown>): HappierCliSettings {
+  const cap = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) && value > 0
+      ? Math.min(value, HAPPIER_SETUP_OPERATION_TIMEOUT_MS)
+      : HAPPIER_SETUP_OPERATION_TIMEOUT_MS;
+  return {
+    ...settings,
+    timeoutMs: cap(settings.timeoutMs),
+    connectTimeoutMs: cap(settings.connectTimeoutMs),
+    toolTimeoutMs: cap(settings.toolTimeoutMs),
+  } as HappierCliSettings;
+}
+
+/** A setup screen is observational only and must never hold an HTTP request indefinitely. */
+export async function withinHappierSetupDeadline<T>(
+  operation: Promise<T>,
+  timeoutMs = HAPPIER_SETUP_READ_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("Happier setup read timed out")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function unavailableRuntimeHealth(settings: HappierCliSettings) {
+  const backendId = settings.backend === "claude" || settings.backend === "opencode"
+    ? settings.backend
+    : "codex" as const;
+  return {
+    discovered: false,
+    executable: false,
+    server: false,
+    serverState: "not-probed" as const,
+    authenticated: false,
+    daemon: false,
+    backend: false,
+    ready: false,
+    backendId,
+    modelId: null,
+    modelState: "not_reported" as const,
+    attestation: { ok: false as const, reasonCode: "cli_version_probe_failed" as const },
+    details: ["setup-read-timeout"],
+  };
+}
+
 export function computeHappierBindingRevision(
   bindings: readonly HappierRuntimeSessionBinding[],
 ): string {
@@ -294,12 +349,14 @@ export function discoverNativeHappierSessions(
 export async function readHappierRuntimeSetupStatus(
   input: ReadHappierRuntimeSetupStatusInput,
 ): Promise<HappierRuntimeSetupStatus> {
-  const runtimeHealth = await probeHappierProvider(input.settings);
+  const settings = boundedHappierSetupSettings(input.settings);
+  const runtimeHealth = await withinHappierSetupDeadline(
+    probeHappierProvider(settings),
+  ).catch(() => unavailableRuntimeHealth(settings));
   let connectorHealth: SessionConnectorHealthV1 | null = null;
   let capabilityEvidence: readonly HappierCapabilityProbeSample[] = [];
   let connectorReadError: string | undefined;
   try {
-    const settings = input.settings as HappierCliSettings;
     const connector = new HappierSessionConnector({
       settings,
       dependencies: {
@@ -307,7 +364,9 @@ export async function readHappierRuntimeSetupStatus(
         attestCli: async () => runtimeHealth.attestation,
       },
     });
-    connectorHealth = await connector.getHealth(input.hostId ?? "fusion-dashboard");
+    connectorHealth = await withinHappierSetupDeadline(
+      connector.getHealth(input.hostId ?? "fusion-dashboard"),
+    );
     capabilityEvidence = await connector.getCapabilityProbeEvidence();
   } catch {
     connectorReadError = "Happier connector health is unavailable";
@@ -328,7 +387,7 @@ export async function readHappierRuntimeSetupStatus(
     };
   } else {
     try {
-      const listed = await listHappierSessions(input.settings as HappierCliSettings);
+      const listed = await withinHappierSetupDeadline(listHappierSessions(settings));
       happierDiscovery = {
         state: "available",
         candidates: listed.sessions.map((session) => ({

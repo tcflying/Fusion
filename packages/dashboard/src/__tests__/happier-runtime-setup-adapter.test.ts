@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
 
-import { buildHappierRuntimeSetupStatus } from "../happier-runtime-setup-adapter.js";
+import {
+  buildHappierRuntimeSetupStatus,
+  withinHappierSetupDeadline,
+} from "../happier-runtime-setup-adapter.js";
 
 describe("buildHappierRuntimeSetupStatus", () => {
+  it("bounds a stalled observational setup read", async () => {
+    await expect(withinHappierSetupDeadline(new Promise<never>(() => undefined), 5))
+      .rejects.toThrow("Happier setup read timed out");
+  });
+
   it("projects typed health into verified bindings while keeping discoveries as explicit unbound candidates", () => {
     const status = buildHappierRuntimeSetupStatus({
       settings: {
