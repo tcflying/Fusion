@@ -187,6 +187,69 @@ describe("createSkillsAdapter - fetchCatalog fallback behavior", () => {
     }
   });
 
+  it("falls back from unavailable semantic search to observable SQLite FTS/brute-force results", async () => {
+    delete process.env.SKILLS_SH_TOKEN;
+
+    globalThis.fetch = vi.fn().mockImplementation((url: string | URL | Request) => {
+      const parsed = new URL(typeof url === "string" ? url : url.toString());
+      const query = parsed.searchParams.get("q");
+      if (query === "database optimization") {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: "Semantic index unavailable",
+        });
+      }
+      if (query === "database") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            query,
+            searchType: "fts",
+            skills: [
+              { id: "owner/repo/database-tuning", skillId: "database-tuning", name: "Database Tuning", installs: 20, source: "owner/repo" },
+            ],
+          }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({
+          query,
+          searchType: "fuzzy",
+          skills: [
+            { id: "owner/repo/database-tuning", skillId: "database-tuning", name: "Database Tuning", installs: 20, source: "owner/repo" },
+            { id: "owner/tools/query-optimizer", skillId: "query-optimizer", name: "Query Optimizer", installs: 10, source: "owner/tools" },
+          ],
+        }),
+      });
+    }) as unknown as typeof fetch;
+
+    const adapter = createSkillsAdapter({
+      packageManager: { resolve: vi.fn().mockResolvedValue({ skills: [] }) },
+      getSettingsPath: vi.fn().mockReturnValue("/tmp/settings.json"),
+    });
+
+    const result = await adapter.fetchCatalog({ limit: 20, query: "database optimization" });
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    expect("entries" in result).toBe(true);
+    if ("entries" in result) {
+      expect(result.entries.map((entry) => entry.id)).toEqual([
+        "owner/repo/database-tuning",
+        "owner/tools/query-optimizer",
+      ]);
+      expect(result.search).toEqual({
+        source: "brute-force",
+        fallbackUsed: true,
+        fallbackSource: "sqlite-fts",
+        warning: "Semantic skill search was unavailable; showing keyword fallback results.",
+      });
+    }
+  });
+
   it("uses public search endpoint when no token is present", async () => {
     // Ensure no token
     delete process.env.SKILLS_SH_TOKEN;

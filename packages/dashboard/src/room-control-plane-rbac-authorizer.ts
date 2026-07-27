@@ -182,8 +182,22 @@ function resolveRbacRequest(input: RoomControlPlaneAuthorizationInput): Resolved
   }
   if (access !== "write") return null;
   if (operation === "operator_action") {
-    if (resource !== "room" || action !== "send_to_seat") return null;
-    return { scope: "room", action: "operate_room" };
+    if (resource !== "room") return null;
+    if (action === "send_to_seat") return { scope: "room", action: "operate_room" };
+    /*
+     * FNXC:SessionRoomMembershipControl 2026-07-27-06:31:
+     * Restore and membership changes alter durable Room topology, so they
+     * require manage_room rather than the narrower message operator grant.
+     * The finite allow-list keeps unknown actions fail-closed.
+     */
+    if (
+      action === "restore_existing_sessions"
+      || action === "request_add_existing_session"
+      || action === "request_remove_existing_session"
+    ) {
+      return { scope: "room", action: "manage_room" };
+    }
+    return null;
   }
   if (operation === "update" || operation === "delete" || operation === "command") {
     return { scope: "room", action: "manage_room" };

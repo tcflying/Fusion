@@ -66,11 +66,60 @@ export interface RoomTaskDispatchCapacityAdmissionSource {
      * controller telemetry sent to the governor must never claim a lower p95.
      */
     readonly capabilityMinimumP95LatencyMs: number;
-  }): Promise<RoomCapacityGovernorInputV1 | null>;
+  }): Promise<
+    RoomCapacityGovernorInputV1
+    | RoomTaskDispatchCapacitySourceFailureV1
+    | null
+  >;
+}
+
+/*
+FNXC:WindowsHostLocalCapacityPolicy 2026-07-27-06:30:
+A signed Windows host ceiling is not a provider-global quota. Production may
+therefore resolve a routing policy only after reading the exact durable
+capability-registry revision and task graph used by this dispatch decision.
+The source may publish conservative host-local limits for those concrete
+provider/account lineages; absence, ambiguity, or failure remains withheld.
+*/
+export interface RoomTaskDispatchCapabilityRoutingPolicySource {
+  getCapabilityRoutingPolicy(input: {
+    readonly room: RoomAggregateV1;
+    readonly graph: RoomTaskGraphProjectionV1;
+    readonly capabilityRegistry: RoomCapabilityRegistryProjectionV1;
+    readonly asOf: string;
+  }): Promise<RoomCapabilityRegistry.RoomCapabilityRoutingPolicyV1 | null>;
+}
+
+export type RoomTaskDispatchCapacitySourceFailureCode =
+  | "capacity_binding_selection_unavailable"
+  | "capacity_governor_input_invalid"
+  | "capacity_policy_unverified"
+  | "capacity_request_invalid"
+  | "capacity_snapshot_invalid"
+  | "capacity_source_internal_error"
+  | "capacity_telemetry_invalid"
+  | "capacity_telemetry_missing"
+  | "capacity_telemetry_observer_failed";
+
+export type RoomTaskDispatchCapacitySourceFailureStage =
+  | "binding_selection"
+  | "governor_validation"
+  | "policy_validation"
+  | "request_validation"
+  | "snapshot_validation"
+  | "source_internal"
+  | "telemetry_observation"
+  | "telemetry_validation";
+
+export interface RoomTaskDispatchCapacitySourceFailureV1 {
+  readonly state: "withheld";
+  readonly reasonCode: RoomTaskDispatchCapacitySourceFailureCode;
+  readonly stage: RoomTaskDispatchCapacitySourceFailureStage;
 }
 
 export type RoomTaskDispatchCapacityReasonCode =
   | RoomCapacityGovernorReasonCode
+  | RoomTaskDispatchCapacitySourceFailureCode
   | "capacity_admission_unconfigured"
   | "capacity_binding_ineligible"
   | "capacity_capability_policy_unconfigured"
@@ -92,6 +141,45 @@ export interface RoomTaskDispatchCapacityAdmissionV1 {
    */
   readonly reasonCodes: readonly RoomTaskDispatchCapacityReasonCode[];
   readonly decision: RoomCapacityGovernorDecisionV1 | null;
+  /** Typed and message-free source detail suitable for audit/metric projection. */
+  readonly diagnostic?: RoomTaskDispatchCapacitySourceFailureV1;
+}
+
+const CAPACITY_SOURCE_FAILURE_CODES =
+  new Set<RoomTaskDispatchCapacitySourceFailureCode>([
+    "capacity_binding_selection_unavailable",
+    "capacity_governor_input_invalid",
+    "capacity_policy_unverified",
+    "capacity_request_invalid",
+    "capacity_snapshot_invalid",
+    "capacity_source_internal_error",
+    "capacity_telemetry_invalid",
+    "capacity_telemetry_missing",
+    "capacity_telemetry_observer_failed",
+  ]);
+
+const CAPACITY_SOURCE_FAILURE_STAGES =
+  new Set<RoomTaskDispatchCapacitySourceFailureStage>([
+    "binding_selection",
+    "governor_validation",
+    "policy_validation",
+    "request_validation",
+    "snapshot_validation",
+    "source_internal",
+    "telemetry_observation",
+    "telemetry_validation",
+  ]);
+
+function isCapacitySourceFailure(
+  value: unknown
+): value is RoomTaskDispatchCapacitySourceFailureV1 {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<RoomTaskDispatchCapacitySourceFailureV1>;
+  return candidate.state === "withheld"
+    && typeof candidate.reasonCode === "string"
+    && CAPACITY_SOURCE_FAILURE_CODES.has(candidate.reasonCode as RoomTaskDispatchCapacitySourceFailureCode)
+    && typeof candidate.stage === "string"
+    && CAPACITY_SOURCE_FAILURE_STAGES.has(candidate.stage as RoomTaskDispatchCapacitySourceFailureStage);
 }
 
 export interface RoomDependencyDispatchCoordinatorOptions {
@@ -112,6 +200,11 @@ export interface RoomDependencyDispatchCoordinatorOptions {
    * reports before their scores can enter Core's quality-first scheduler.
    */
   readonly capabilityRoutingPolicy?: RoomCapabilityRegistry.RoomCapabilityRoutingPolicyV1;
+  /**
+   * Durable-snapshot-aware alternative to a static routing policy. Supplying
+   * both authorities is ambiguous and fails closed.
+   */
+  readonly capabilityRoutingPolicySource?: RoomTaskDispatchCapabilityRoutingPolicySource;
   readonly now?: () => string;
 }
 
@@ -387,7 +480,10 @@ export class RoomDependencyDispatchCoordinator {
       };
     }
 
-    let capacityInput: RoomCapacityGovernorInputV1 | null;
+    let capacityInput:
+      | RoomCapacityGovernorInputV1
+      | RoomTaskDispatchCapacitySourceFailureV1
+      | null;
     try {
       capacityInput = await source.getCapacityGovernorInput({
         room: input.room,
@@ -416,6 +512,23 @@ export class RoomDependencyDispatchCoordinator {
         admittedNodeIds: Object.freeze([]),
         reasonCodes: Object.freeze(["capacity_telemetry_unavailable"]),
         decision: null,
+      };
+    }
+    if (isCapacitySourceFailure(capacityInput)) {
+      /*
+      FNXC:CapacityTelemetryDiagnostics 2026-07-27-03:03:
+      Preserve one allowlisted, message-free source failure through the
+      coordinator result. This keeps admission fail-closed while allowing the
+      durable audit/metric projection to distinguish observer failure, stale
+      telemetry, bad policy, and malformed snapshots.
+      */
+      return {
+        state: "withheld",
+        requestedNodeIds,
+        admittedNodeIds: Object.freeze([]),
+        reasonCodes: Object.freeze([capacityInput.reasonCode]),
+        decision: null,
+        diagnostic: Object.freeze({ ...capacityInput }),
       };
     }
 
@@ -512,14 +625,6 @@ export class RoomDependencyDispatchCoordinator {
         reasonCode: "capacity_capability_registry_unavailable",
       };
     }
-    const routingPolicy = this.options.capabilityRoutingPolicy;
-    if (!routingPolicy) {
-      return {
-        ok: false,
-        reasonCode: "capacity_capability_policy_unconfigured",
-      };
-    }
-
     let registry: RoomCapabilityRegistryProjectionV1 | null;
     try {
       registry = await readRegistry(input.room.room.id);
@@ -533,6 +638,38 @@ export class RoomDependencyDispatchCoordinator {
       return {
         ok: false,
         reasonCode: "capacity_capability_registry_unavailable",
+      };
+    }
+
+    const staticRoutingPolicy = this.options.capabilityRoutingPolicy;
+    const routingPolicySource = this.options.capabilityRoutingPolicySource;
+    if (
+      (staticRoutingPolicy === undefined && routingPolicySource === undefined)
+      || (staticRoutingPolicy !== undefined && routingPolicySource !== undefined)
+    ) {
+      return {
+        ok: false,
+        reasonCode: "capacity_capability_policy_unconfigured",
+      };
+    }
+    let routingPolicy: RoomCapabilityRegistry.RoomCapabilityRoutingPolicyV1 | null =
+      staticRoutingPolicy ?? null;
+    if (routingPolicySource !== undefined) {
+      try {
+        routingPolicy = await routingPolicySource.getCapabilityRoutingPolicy({
+          room: input.room,
+          graph: input.graph,
+          capabilityRegistry: registry,
+          asOf: input.asOf,
+        });
+      } catch {
+        routingPolicy = null;
+      }
+    }
+    if (routingPolicy === null) {
+      return {
+        ok: false,
+        reasonCode: "capacity_capability_policy_unconfigured",
       };
     }
 

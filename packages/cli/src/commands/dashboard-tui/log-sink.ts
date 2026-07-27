@@ -3,11 +3,26 @@ import { LogRingBuffer, type LogEntry } from "./log-ring-buffer.js";
 
 // ── formatConsoleArgs ─────────────────────────────────────────────────────────
 
-// The engine's createLogger() prefixes messages with a null-byte-delimited
-// severity marker so we can recover the original intent when routed via
-// console.error (which is the transport it uses).
-// eslint-disable-next-line no-control-regex -- marker is NUL-delimited by design
-const LOG_LEVEL_MARKER_REGEX = /^\u0000fnlvl=(info|warn|error)\u0000\s*/;
+/*
+FNXC:PrintableLogFraming 2026-07-27-02:23:
+The engine's createLogger() uses a printable severity prefix. Recover the
+original intent when info is transported via console.error, while keeping
+redirected output valid searchable text for Windows logs and collectors.
+*/
+const LOG_LEVEL_MARKER_REGEX = /^\[fnlvl=(info|warn|error)\]\s*/;
+
+/*
+FNXC:PrintableLogFraming 2026-07-27-18:07:
+Non-TTY output must keep severity in the searchable text itself. Pipes and log
+collectors can merge stdout/stderr, so stream choice alone cannot distinguish
+warn from error after the original logger marker has been decoded.
+*/
+function frameRedirectedLine(
+  level: LogEntry["level"],
+  line: string,
+): string {
+  return `[fnlvl=${level}] ${line}`;
+}
 
 /**
  * Format heterogeneous console args into a single string, extracting a
@@ -156,9 +171,12 @@ export class DashboardLogSink {
     if (this.tui && this.isTTY) {
       this.tui.log(message, prefix);
     } else if (this.originalConsole) {
-      this.originalConsole.log.call(console, line);
+      this.originalConsole.log.call(
+        console,
+        frameRedirectedLine("info", line),
+      );
     } else {
-      console.log(line);
+      console.log(frameRedirectedLine("info", line));
     }
   }
 
@@ -170,9 +188,12 @@ export class DashboardLogSink {
     if (this.tui && this.isTTY) {
       this.tui.warn(message, prefix);
     } else if (this.originalConsole) {
-      this.originalConsole.warn.call(console, line);
+      this.originalConsole.warn.call(
+        console,
+        frameRedirectedLine("warn", line),
+      );
     } else {
-      console.warn(line);
+      console.warn(frameRedirectedLine("warn", line));
     }
   }
 
@@ -184,9 +205,12 @@ export class DashboardLogSink {
     if (this.tui && this.isTTY) {
       this.tui.error(message, prefix);
     } else if (this.originalConsole) {
-      this.originalConsole.error.call(console, line);
+      this.originalConsole.error.call(
+        console,
+        frameRedirectedLine("error", line),
+      );
     } else {
-      console.error(line);
+      console.error(frameRedirectedLine("error", line));
     }
   }
 

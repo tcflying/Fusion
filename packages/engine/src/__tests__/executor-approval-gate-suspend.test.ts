@@ -128,4 +128,31 @@ describe("TaskExecutor.buildActionGateContext pauseForApproval", () => {
     resolveAbort();
     await abortPromise;
   });
+
+  it("uses the AsyncDataLayer for approval requests without opening the legacy database", () => {
+    const layer = { projectId: "project-1", db: {} } as any;
+    const store = createEventedStore();
+    store.getAsyncLayer = vi.fn(() => layer);
+    store.getDatabase = vi.fn(() => {
+      throw new Error("legacy database must not be opened");
+    });
+    const executor = new TaskExecutor(store, "/tmp/test");
+
+    const approvalStore = (executor as any).approvalRequestStore;
+
+    expect((approvalStore as any).asyncLayer).toBe(layer);
+    expect(store.getDatabase).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when approval requests have no AsyncDataLayer", () => {
+    const store = createEventedStore();
+    store.getAsyncLayer = vi.fn(() => null);
+    store.getDatabase = vi.fn(() => {
+      throw new Error("legacy database must not be opened");
+    });
+    const executor = new TaskExecutor(store, "/tmp/test");
+
+    expect(() => (executor as any).approvalRequestStore).toThrow("TaskExecutor approval requests require an AsyncDataLayer");
+    expect(store.getDatabase).not.toHaveBeenCalled();
+  });
 });

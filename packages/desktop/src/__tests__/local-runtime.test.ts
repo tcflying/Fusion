@@ -52,9 +52,13 @@ const engineMocks = vi.hoisted(() => {
   // subsystem into createServer (fixes desktop's "Plugin install mode is not supported" and Browse
   // registry "Plugin \"registry\" not found" symptoms).
   const pluginStoreInstance = { init: vi.fn(async () => undefined) };
+  const pluginSchemaContracts = [{
+    pluginId: "fusion-plugin-postgres-schema",
+    postgresSchema: { version: 1, tables: [] },
+  }];
   const pluginLoaderInstance = {
     loadAllPlugins: vi.fn(async () => ({ loaded: 2, errors: 0 })),
-    getPluginSchemaInitHooks: vi.fn(() => []),
+    getPluginSchemaInitHooks: vi.fn(() => pluginSchemaContracts),
   };
   const runPluginSchemaInits = vi.fn(async () => undefined);
   const PluginLoader = vi.fn(function () {
@@ -66,11 +70,20 @@ const engineMocks = vi.hoisted(() => {
     close: vi.fn(async () => undefined),
     listProjects: vi.fn(async () => [] as Array<{ id: string; name: string; path: string; status: string }>),
   };
+  const roomRbacAsyncLayer = { projectId: "project-1" };
+  const roomRbacRegistry = { source: "durable-room-rbac-registry" };
+  const projectEngine = {
+    id: "engine-1",
+    getTaskStore: vi.fn(() => ({
+      getAsyncLayer: vi.fn(() => roomRbacAsyncLayer),
+    })),
+  };
   const engineManager = {
     startAll: vi.fn(async () => undefined),
     startReconciliation: vi.fn(),
     stopAll: vi.fn(async () => undefined),
-    ensureEngine: vi.fn(async () => ({ id: "engine-1" })),
+    ensureEngine: vi.fn(async () => projectEngine),
+    getEngine: vi.fn(() => projectEngine),
     onProjectAccessed: vi.fn(),
   };
   const CentralCore = vi.fn(function () {
@@ -83,10 +96,17 @@ const engineMocks = vi.hoisted(() => {
     kind: "windows-native-room-host-composition-registry",
     input,
   }));
+  const modelRegistry = { listModels: vi.fn(() => []), refresh: vi.fn() };
+  const createFusionModelRegistry = vi.fn(async () => modelRegistry);
   const seedDashboardProvidersDispose = vi.fn();
   const seedDashboardProviders = vi.fn(async ({ authStorage }: { authStorage: unknown }) => ({
     authStorage: { ...(authStorage as object), __wrapped: true },
     dispose: seedDashboardProvidersDispose,
+  }));
+  const createPostgresRoomRbacRegistry = vi.fn(() => roomRbacRegistry);
+  const createDashboardAuthContext = vi.fn((input: { host: string; noAuth?: boolean }) => ({
+    mode: "loopback-no-auth" as const,
+    host: input.host,
   }));
   const createServer = vi.fn(() => ({ listen: vi.fn() }));
 
@@ -105,6 +125,10 @@ const engineMocks = vi.hoisted(() => {
     PluginLoader,
     ProjectEngineManager,
     createWindowsNativeRoomHostCompositionAdapterRegistry,
+    createFusionModelRegistry,
+    modelRegistry,
+    createPostgresRoomRbacRegistry,
+    createDashboardAuthContext,
     seedDashboardProviders,
     seedDashboardProvidersDispose,
     createServer,
@@ -114,22 +138,29 @@ const engineMocks = vi.hoisted(() => {
     ensureBundledPluginInstalled,
     isBundledPluginId,
     resolveDesktopBundlePluginDirs,
+    roomRbacAsyncLayer,
+    roomRbacRegistry,
+    projectEngine,
   };
 });
 
 vi.mock("@fusion/core", () => ({
   CentralCore: engineMocks.CentralCore,
   PluginLoader: engineMocks.PluginLoader,
+  createPostgresRoomRbacRegistry: engineMocks.createPostgresRoomRbacRegistry,
   ensureBundledPluginInstalled: engineMocks.ensureBundledPluginInstalled,
   isBundledPluginId: engineMocks.isBundledPluginId,
 }));
 vi.mock("../bundled-plugin-dirs.js", () => ({ resolveDesktopBundlePluginDirs: engineMocks.resolveDesktopBundlePluginDirs }));
-vi.mock("@fusion/dashboard", () => ({ createServer: engineMocks.createServer }));
+vi.mock("@fusion/dashboard", () => ({
+  createDashboardAuthContext: engineMocks.createDashboardAuthContext,
+  createServer: engineMocks.createServer,
+}));
 vi.mock("@fusion/engine", () => ({
   ProjectEngineManager: engineMocks.ProjectEngineManager,
   createWindowsNativeRoomHostCompositionAdapterRegistry: engineMocks.createWindowsNativeRoomHostCompositionAdapterRegistry,
   createFusionAuthStorage: () => ({ reload: () => undefined, getOAuthProviders: () => [], hasAuth: () => false }),
-  createFusionModelRegistry: () => ({ listModels: () => [], refresh: () => undefined }),
+  createFusionModelRegistry: engineMocks.createFusionModelRegistry,
   seedDashboardProviders: engineMocks.seedDashboardProviders,
 }));
 
@@ -481,6 +512,38 @@ describe("LocalRuntimeManager", () => {
     expect(cleanup).toHaveBeenCalledTimes(1);
   });
 
+  /*
+   * FNXC:DesktopClosePolicy 2026-07-27-15:49:
+   * The Windows "leave PostgreSQL running" choice must detach the desktop backend owner without
+   * invoking the full shutdown path that stops the shared embedded postmaster.
+   */
+  it("detaches backend resources without stopping embedded PostgreSQL when requested", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    const server = new FakeServer(4545);
+    const backendShutdown = vi.fn(async () => undefined);
+    const backendDetachKeepingEmbedded = vi.fn(async () => undefined);
+    const backendStore = {
+      ...store,
+      __backendShutdown: backendShutdown,
+      __backendDetachKeepingEmbedded: backendDetachKeepingEmbedded,
+    };
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => backendStore,
+      createDashboardServer: async () => {
+        setTimeout(() => server.emit("listening"), 0);
+        return server as unknown as Server;
+      },
+    });
+
+    await manager.startLocal();
+    await manager.stopLocal({ keepEmbeddedPostgres: true });
+
+    expect(backendDetachKeepingEmbedded).toHaveBeenCalledTimes(1);
+    expect(backendShutdown).not.toHaveBeenCalled();
+    expect(manager.getStatus()).toEqual({ source: "none", state: "stopped" });
+  });
+
   it("startLocal while already running returns current status", async () => {
     const { LocalRuntimeManager } = await import("../local-runtime.ts");
     const server = new FakeServer(4545);
@@ -511,6 +574,10 @@ describe("LocalRuntimeManager", () => {
    * auth storage, matching the CLI-equivalent catalog seedDashboardProviders produces (see
    * packages/engine/src/__tests__/provider-registration.test.ts for the underlying catalog
    * assertions across customProviders undefined/[]/one/multiple).
+   *
+   * FNXC:DesktopModelRegistry 2026-07-27-15:49:
+   * The shared model-registry factory is asynchronous; both desktop consumers must receive the
+   * resolved registry rather than the factory Promise.
    */
   it("createDashboardServerDefault seeds providers and passes the WRAPPED auth storage to createServer (FN-7622)", async () => {
     const { LocalRuntimeManager } = await import("../local-runtime.ts");
@@ -531,11 +598,14 @@ describe("LocalRuntimeManager", () => {
     await manager.startLocal();
 
     expect(engineMocks.seedDashboardProviders).toHaveBeenCalledWith(
-      expect.objectContaining({ authStorage: expect.anything(), modelRegistry: expect.anything() }),
+      expect.objectContaining({ authStorage: expect.anything(), modelRegistry: engineMocks.modelRegistry }),
     );
     expect(engineMocks.createServer).toHaveBeenCalledWith(
       expect.anything(),
-      expect.objectContaining({ authStorage: expect.objectContaining({ __wrapped: true }) }),
+      expect.objectContaining({
+        authStorage: expect.objectContaining({ __wrapped: true }),
+        modelRegistry: engineMocks.modelRegistry,
+      }),
     );
 
     await manager.stopLocal();
@@ -580,12 +650,74 @@ describe("LocalRuntimeManager", () => {
     await manager.stopLocal();
   });
 
+  it("composes packaged local Room RBAC from the durable project registry on loopback", async () => {
+    const { LocalRuntimeManager } = await import("../local-runtime.ts");
+    engineMocks.centralCore.listProjects.mockResolvedValueOnce([
+      { id: "project-1", name: "Repo", path: "/repo", status: "active" },
+    ]);
+    const server = new FakeServer(4545);
+    const listen = vi.fn(() => {
+      setTimeout(() => server.emit("listening"), 0);
+      return server as unknown as Server;
+    });
+    engineMocks.createServer.mockReturnValueOnce({ listen });
+
+    const manager = new LocalRuntimeManager({
+      rootDir: "/repo",
+      createStore: async () => store,
+    });
+
+    await manager.startLocal();
+
+    const serverOptions = engineMocks.createServer.mock.calls[0]?.[1] as {
+      dashboardAuthContext?: unknown;
+      roomControlPlaneRbac?: {
+        resolveRegistry(input: { projectId: string }): Promise<unknown> | unknown;
+        resolvePublicOrigin(request: { socket: { localAddress?: string; localPort?: number } }): string;
+        authorizeDaemonTransport(request: {
+          headers: Record<string, string | undefined>;
+          socket: { localAddress?: string; localPort?: number };
+        }): Promise<boolean> | boolean;
+      };
+    };
+    expect(engineMocks.createDashboardAuthContext).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      noAuth: true,
+    });
+    expect(serverOptions.dashboardAuthContext).toEqual({
+      mode: "loopback-no-auth",
+      host: "127.0.0.1",
+    });
+    expect(serverOptions.roomControlPlaneRbac).toBeDefined();
+    expect(await serverOptions.roomControlPlaneRbac?.resolveRegistry({ projectId: "project-1" }))
+      .toBe(engineMocks.roomRbacRegistry);
+    expect(engineMocks.createPostgresRoomRbacRegistry).toHaveBeenCalledWith(engineMocks.roomRbacAsyncLayer);
+    expect(serverOptions.roomControlPlaneRbac?.resolvePublicOrigin({
+      socket: { localAddress: "127.0.0.1", localPort: 4545 },
+    })).toBe("http://127.0.0.1:4545");
+    expect(await serverOptions.roomControlPlaneRbac?.authorizeDaemonTransport({
+      headers: {
+        host: "127.0.0.1:4545",
+        origin: "http://127.0.0.1:4545",
+        "sec-fetch-site": "same-origin",
+      },
+      socket: { localAddress: "127.0.0.1", localPort: 4545 },
+    })).toBe(true);
+    expect(listen).toHaveBeenCalledWith(0, "127.0.0.1");
+
+    await manager.stopLocal();
+  });
+
   /*
    * FN-7623 symptom verification: before this fix, createDashboardServerDefault called createServer
    * WITHOUT pluginStore/pluginLoader, so desktop's Browse-registry sub-router never mounted ("Plugin
    * \"registry\" not found") and plugin install threw "Plugin install mode is not supported: plugin
    * loader not available". Assert the fix in the engine-less (zero-projects) startup state — the
    * plugin subsystem must wire in regardless of whether a primary engine resolved.
+   *
+   * FNXC:DesktopPluginSchema 2026-07-27-15:49:
+   * PluginLoader owns schema execution before publishing a loaded plugin; the desktop host must
+   * not replay its collected PostgreSQL contracts after loadAllPlugins.
    */
   it("wires PluginStore + PluginLoader into createServer when engine-less (zero projects) (FN-7623)", async () => {
     const { LocalRuntimeManager } = await import("../local-runtime.ts");
@@ -610,6 +742,7 @@ describe("LocalRuntimeManager", () => {
       expect.objectContaining({ pluginStore: engineMocks.pluginStoreInstance, taskStore: expect.anything() }),
     );
     expect(engineMocks.pluginLoaderInstance.loadAllPlugins).toHaveBeenCalledTimes(1);
+    expect(engineMocks.runPluginSchemaInits).not.toHaveBeenCalled();
     expect(engineMocks.createServer).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({

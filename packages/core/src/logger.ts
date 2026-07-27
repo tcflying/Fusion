@@ -20,8 +20,15 @@ export interface Logger {
   error(message: string, ...args: unknown[]): void;
 }
 
-const LOG_LEVEL_MARKER_PREFIX = "\u0000fnlvl=";
-const LOG_LEVEL_MARKER_SUFFIX = "\u0000";
+/*
+FNXC:PrintableLogFraming 2026-07-27-02:23:
+Redirected dashboard, serve, and daemon logs must stay searchable text while
+preserving the severity hint consumed by the dashboard TUI. Use a printable
+prefix instead of NUL framing so ordinary log collectors never classify the
+stream as binary.
+*/
+const LOG_LEVEL_MARKER_PREFIX = "[fnlvl=";
+const LOG_LEVEL_MARKER_SUFFIX = "] ";
 
 function withSeverityMarker(level: "info" | "warn" | "error", payload: string): string {
   return `${LOG_LEVEL_MARKER_PREFIX}${level}${LOG_LEVEL_MARKER_SUFFIX}${payload}`;
@@ -35,9 +42,9 @@ function withSeverityMarker(level: "info" | "warn" | "error", payload: string): 
  *          logs and errors. Keeping logs off stdout prevents command/test
  *          output consumers from receiving Fusion execution chatter.
  *
- *          The logger prepends an internal control-character severity marker
- *          so dashboard TUI console-capture can preserve info/warn/error
- *          semantics even when `log()` is transported via `console.error`.
+ *          The logger prepends a printable severity marker so dashboard TUI
+ *          console-capture can preserve info/warn/error semantics even when
+ *          `log()` is transported via `console.error`.
  */
 export function createLogger(prefix: string): Logger {
   const tag = `[${prefix}]`;

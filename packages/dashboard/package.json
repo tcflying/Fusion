@@ -23,6 +23,11 @@
       "types": "./src/planning.ts",
       "import": "./src/planning.ts"
     },
+    "./skills-search": {
+      "types": "./src/skills-search.ts",
+      "source": "./src/skills-search.ts",
+      "import": "./src/skills-search.ts"
+    },
     "./app/components/TaskCard": {
       "types": "./app/components/TaskCard.tsx",
       "import": "./app/components/TaskCard.tsx"

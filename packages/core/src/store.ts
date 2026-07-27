@@ -1614,8 +1614,8 @@ export class TaskStore extends EventEmitter<TaskStoreEvents> {
   }
   /** PostgreSQL-authoritative audit reader; sync fallback remains for test doubles. */
   async getRunAuditEventsAsync(options: RunAuditEventFilter = {}): Promise<RunAuditEvent[]> {
-    if (this.asyncLayer) {
-      const events = await queryRunAuditEvents(this.asyncLayer.db, options);
+    if (this.asyncLayer) { // FNXC:RunAuditProjectScope 2026-07-27-02:38: The project-bound layer authorizes every runtime-fallback and merge-advance audit read; row projectId is provenance only, and queryRunAuditEvents rejects scope overrides.
+      const events = await queryRunAuditEvents(this.asyncLayer, options);
       return events.map((event) => ({
         ...event,
         projectId: event.projectId ?? undefined,

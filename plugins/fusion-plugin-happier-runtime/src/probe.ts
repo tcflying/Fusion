@@ -1,6 +1,15 @@
 import { spawn } from "node:child_process";
 
 import {
+  HAPPIER_DEFAULT_BACKEND,
+  resolveHappierBackend,
+  resolveHappierBackendFromCanonicalSessionUri,
+} from "./backend-resolver.js";
+import {
+  verifyHappierCliAttestation,
+  type HappierCliAttestation,
+} from "./cli-attestation.js";
+import {
   buildHappierInvocation,
   buildHappierProcessEnv,
   parseHappierJson,
@@ -14,6 +23,7 @@ import {
   type HappierJsonEnvelope,
   type HappierJsonRecord,
 } from "./types.js";
+import { terminateHappierProcessTree } from "./process-lifecycle.js";
 
 export interface HappierRuntimeHealth {
   discovered: boolean;
@@ -25,6 +35,9 @@ export interface HappierRuntimeHealth {
   backend: boolean;
   ready: boolean;
   backendId: HappierBackend;
+  modelId: string | null;
+  modelState: "not_reported";
+  attestation: HappierCliAttestation;
   details: string[];
 }
 
@@ -35,14 +48,16 @@ interface ProbeCommandResult {
 
 export interface HappierProbeDependencies {
   run(commandArgs: readonly string[], settings: HappierCliSettings): Promise<ProbeCommandResult>;
+  attestCli(settings: HappierCliSettings): Promise<HappierCliAttestation>;
 }
+
+const defaultProbeDependencies: HappierProbeDependencies = {
+  run: runHappierProbeCommand,
+  attestCli: verifyHappierCliAttestation,
+};
 
 function isRecord(value: unknown): value is HappierJsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function selectedBackend(settings: HappierCliSettings): HappierBackend {
-  return settings.backend === "codex" || settings.backend === "opencode" ? settings.backend : "claude";
 }
 
 function backendHelpArgs(backend: HappierBackend): string[] {
@@ -65,7 +80,7 @@ export function runHappierProbeCommand(
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      child?.kill("SIGTERM");
+      void terminateHappierProcessTree(child);
       reject(new HappierCliError("timeout", `Happier probe timed out after ${resolved.timeoutMs}ms`));
     }, resolved.timeoutMs);
 
@@ -79,6 +94,7 @@ export function runHappierProbeCommand(
     try {
       child = spawn(invocation.command, invocation.args, {
         shell: false,
+        windowsHide: true,
         stdio: ["ignore", "pipe", "ignore"],
         env: buildHappierProcessEnv(resolved),
       });
@@ -90,7 +106,7 @@ export function runHappierProbeCommand(
     child.stdout?.on("data", (chunk: Buffer) => {
       bytes += chunk.byteLength;
       if (bytes > resolved.maxOutputBytes) {
-        child?.kill("SIGTERM");
+        void terminateHappierProcessTree(child);
         fail(new HappierCliError("output-limit", "Happier probe output exceeded the configured limit"));
         return;
       }
@@ -137,12 +153,56 @@ function activeReachability(status: HappierJsonRecord): string | undefined {
   return isRecord(active) && typeof active.reachability === "string" ? active.reachability : undefined;
 }
 
+function resolveHealthBinding(
+  settings: HappierCliSettings,
+  backend: HappierBackend,
+): NonNullable<HappierCliSettings["happierSessionBindings"]>[number] | null {
+  const candidates = (settings.happierSessionBindings ?? [])
+    .filter((binding) => resolveHappierBackendFromCanonicalSessionUri(binding.canonicalSessionUri) === backend)
+    .toSorted((left, right) => [
+      left.serverProfileId,
+      left.machineId,
+      left.happierSessionId,
+      left.canonicalSessionUri,
+    ].join("\u0000").localeCompare([
+      right.serverProfileId,
+      right.machineId,
+      right.happierSessionId,
+      right.canonicalSessionUri,
+    ].join("\u0000")));
+  return candidates[0] ?? null;
+}
+
+function isExactBoundSessionStatus(
+  envelope: HappierJsonEnvelope<unknown>,
+  happierSessionId: string,
+): boolean {
+  if (!envelope.ok || envelope.kind !== "session_status" || !isRecord(envelope.data)) return false;
+  const session = isRecord(envelope.data.session) ? envelope.data.session : null;
+  return session?.id === happierSessionId && session.active === true;
+}
+
+function isExactBoundBackendModelInventory(
+  envelope: HappierJsonEnvelope<unknown>,
+  happierSessionId: string,
+  backend: HappierBackend,
+): boolean {
+  if (!envelope.ok || envelope.kind !== "session_actions_execute" || !isRecord(envelope.data)) return false;
+  const result = isRecord(envelope.data.result) ? envelope.data.result : null;
+  const items = result && Array.isArray(result.items) ? result.items : [];
+  return envelope.data.sessionId === happierSessionId
+    && envelope.data.actionId === "agents.models.list"
+    && result?.agentId === backend
+    && result.source === "session_metadata"
+    && items.some((item) => isRecord(item) && typeof item.id === "string" && item.id.trim().length > 0);
+}
+
 /** Probe every required Happier layer without creating or mutating a session. */
 export async function probeHappierRuntime(
   settings: HappierCliSettings = {},
-  dependencies: HappierProbeDependencies = { run: runHappierProbeCommand },
+  dependencies: HappierProbeDependencies = defaultProbeDependencies,
 ): Promise<HappierRuntimeHealth> {
-  const backendId = selectedBackend(settings);
+  let backendId = HAPPIER_DEFAULT_BACKEND;
   const details: string[] = [];
   let discovered = false;
   let executable = false;
@@ -151,6 +211,45 @@ export async function probeHappierRuntime(
   let authenticated = false;
   let daemon = false;
   let backend = false;
+  try {
+    backendId = resolveHappierBackend(settings);
+  } catch {
+    const attestation = await dependencies.attestCli(settings);
+    return {
+      discovered,
+      executable,
+      server,
+      serverState,
+      authenticated,
+      daemon,
+      backend,
+      ready: false,
+      backendId,
+      modelId: null,
+      modelState: "not_reported",
+      attestation,
+      details: ["backend-config-invalid"],
+    };
+  }
+
+  const attestation = await dependencies.attestCli(settings);
+  if (!attestation.ok) {
+    return {
+      discovered,
+      executable,
+      server,
+      serverState,
+      authenticated,
+      daemon,
+      backend,
+      ready: false,
+      backendId,
+      modelId: null,
+      modelState: "not_reported",
+      attestation,
+      details: ["cli-attestation-failed"],
+    };
+  }
 
   try {
     const help = await dependencies.run(backendHelpArgs(backendId), settings);
@@ -203,15 +302,63 @@ export async function probeHappierRuntime(
     try {
       const profilesRaw = await dependencies.run(["profiles", "list", "--json"], settings);
       const profiles = await parseHappierJson(profilesRaw.stdout, 64 * 1024);
-      const profileAvailable = backendId === "opencode" || profileSupportsBackend(profiles, backendId);
-      backend = profilesRaw.exitCode === 0 && profileAvailable;
-      if (!backend) details.push("backend-unavailable");
+      const profileAvailable = profileSupportsBackend(profiles, backendId);
+      const binding = resolveHealthBinding(settings, backendId);
+      if (profilesRaw.exitCode !== 0 || !profileAvailable) {
+        details.push("backend-unavailable");
+      } else if (!binding) {
+        /*
+         * FNXC:HappierRuntimeHealthTruth 2026-07-27-16:15:
+         * A profile is only a compatibility catalog. Backend health requires
+         * an exact bound Session plus the official live status and
+         * session-scoped model inventory actions; absent identity stays
+         * fail-closed for every backend.
+         */
+        details.push("backend-machine-availability-unverified");
+      } else {
+        const sessionStatusRaw = await dependencies.run(
+          ["session", "status", binding.happierSessionId, "--live", "--json"],
+          settings,
+        );
+        const sessionStatus = await parseHappierJson(sessionStatusRaw.stdout, 64 * 1024);
+        const modelInventoryRaw = await dependencies.run([
+          "session",
+          "actions",
+          "execute",
+          binding.happierSessionId,
+          "agents.models.list",
+          "--input-json",
+          JSON.stringify({ agentId: backendId, limit: 200 }),
+          "--json",
+        ], settings);
+        const modelInventory = await parseHappierJson(modelInventoryRaw.stdout, 64 * 1024);
+        backend = sessionStatusRaw.exitCode === 0
+          && modelInventoryRaw.exitCode === 0
+          && isExactBoundSessionStatus(sessionStatus, binding.happierSessionId)
+          && isExactBoundBackendModelInventory(modelInventory, binding.happierSessionId, backendId);
+        if (backend) {
+          /*
+           * FNXC:HappierRuntimeHealthTruth 2026-07-27-16:15:
+           * Happier 0.2.10 proves the bound backend and its model inventory,
+           * but neither official action reports the selected model. Keep the
+           * model null and withhold ready instead of assuming "default".
+           */
+          details.push("model-not-reported");
+        } else {
+          details.push("backend-machine-availability-unverified");
+        }
+      }
     } catch (error) {
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "backend-timeout" : "backend-invalid");
     }
   }
 
-  const ready = executable && server && authenticated && daemon && backend;
+  const ready = executable
+    && server
+    && authenticated
+    && daemon
+    && backend
+    && !details.includes("model-not-reported");
   return {
     discovered,
     executable,
@@ -222,6 +369,9 @@ export async function probeHappierRuntime(
     backend,
     ready,
     backendId,
+    modelId: null,
+    modelState: "not_reported",
+    attestation,
     details: [...new Set(details)].slice(0, 12),
   };
 }

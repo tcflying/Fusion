@@ -117,6 +117,7 @@ vi.mock("node:child_process", () => ({
 
 const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 // ─── Import after mocks and spies ────────────────────────────────────────────
 
@@ -234,12 +235,14 @@ describe("runSkillsSearch", () => {
   beforeEach(() => {
     consoleLogSpy.mockClear();
     consoleErrorSpy.mockClear();
+    consoleWarnSpy.mockClear();
     mocks.mockFetch.mockReset();
   });
 
   afterEach(() => {
     consoleLogSpy.mockClear();
     consoleErrorSpy.mockClear();
+    consoleWarnSpy.mockClear();
   });
 
   it("prints usage when no query provided", async () => {
@@ -301,6 +304,45 @@ describe("runSkillsSearch", () => {
 
     expect(consoleLogSpy).toHaveBeenCalledWith(
       expect.stringContaining("No skills found for 'nonexistent'"),
+    );
+  });
+
+  it("prints the warning and fallback source when semantic search uses SQLite FTS/brute-force", async () => {
+    mocks.mockFetch.mockImplementation((url: string) => {
+      const query = new URL(url).searchParams.get("q");
+      if (query === "database optimization") {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: "Semantic index unavailable",
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          query,
+          searchType: query === "database" ? "fts" : "fuzzy",
+          skills: [
+            {
+              id: "owner/repo/database-tuning",
+              skillId: "database-tuning",
+              name: "Database Tuning",
+              installs: 20,
+              source: "owner/repo",
+            },
+          ],
+        }),
+      } as Response);
+    });
+
+    await runSkillsSearch(["database", "optimization"]);
+
+    expect(mocks.mockFetch).toHaveBeenCalledTimes(3);
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("source: sqlite-fts"),
+    );
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Database Tuning"),
     );
   });
 

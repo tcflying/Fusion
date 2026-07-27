@@ -23,11 +23,9 @@ import {
   createRoomControlPlaneEngineRouteDependencies,
   type RoomControlPlaneEngineRouteDependenciesOptions,
 } from "./room-control-plane-engine-route-dependencies.js";
-import {
-  createRoomControlPlaneRbacAuthorizer,
-  type RoomControlPlaneRbacAuthorizerOptions,
-} from "./room-control-plane-rbac-authorizer.js";
 import type { RoomControlPlaneRouteDependencies } from "./routes/register-room-control-plane-routes.js";
+import { createServerRoomControlPlaneRbacAuthorizer, type RoomControlPlaneServerRbacOptions } from "./server-room-rbac.js";
+export type { RoomControlPlaneServerRbacOptions } from "./server-room-rbac.js";
 import { createSSE, disconnectSSEClient, markSSEClientAlive } from "./sse.js";
 import { rateLimit, RATE_LIMITS } from "./rate-limit.js";
 import { ApiError, sendErrorResponse } from "./api-error.js";
@@ -75,6 +73,7 @@ import { CliChatSessionRunner } from "./cli-chat.js";
 import { stopAllDevServers } from "./dev-server-routes.js";
 import type { SkillsAdapter } from "./skills-adapter.js";
 import { createAuthMiddleware, authenticateUpgradeRequest, getDaemonToken } from "./auth-middleware.js";
+import type { DashboardAuthContext } from "./dashboard-auth-context.js";
 import { setupCliSessionWebSocket } from "./cli-session-ws.js";
 import { createCliSessionsRouter } from "./routes/cli-sessions.js";
 import { getProjectIdFromRequest, resolveStoreForProjectId } from "./routes/context.js";
@@ -246,6 +245,8 @@ export function createDaemonRoomControlPlaneAuthorizer(
 }
 
 export interface ServerOptions {
+  /** Resolved host package version used by every request-scoped PluginLoader. */
+  fusionVersion?: string;
   /** Optional ProjectEngine — when provided, subsystems (onMerge, automationStore,
    *  missionAutopilot, missionExecutionLoop, heartbeatMonitor) are derived from it.
    *  Explicit options still override engine-derived values.
@@ -265,7 +266,7 @@ export interface ServerOptions {
    * precedence over the legacy callback and derives the Room actor from the
    * registry-backed Cookie session for every request.
    */
-  roomControlPlaneRbac?: RoomControlPlaneRbacAuthorizerOptions;
+  roomControlPlaneRbac?: RoomControlPlaneServerRbacOptions;
   /** Optional HybridExecutor orchestration context for multi-project runtime plumbing. */
   hybridExecutor?: import("@fusion/engine").HybridExecutor;
   /**
@@ -523,9 +524,14 @@ export interface ServerOptions {
     | null;
   /** Optional SkillsAdapter for skills discovery, execution toggling, and catalog fetching */
   skillsAdapter?: SkillsAdapter;
-  /** Daemon mode configuration with bearer token authentication.
-   *  When provided, all API requests (except /api/health) require valid bearer token. */
+  /** Legacy daemon-mode bearer configuration. New CLI hosts also pass the
+   *  explicit dashboardAuthContext below. */
   daemon?: { token: string };
+  /**
+   * Host-resolved Dashboard authentication contract. Unlike `noAuth`, the
+   * loopback-no-auth variant proves the bind host was validated before listen.
+   */
+  dashboardAuthContext?: DashboardAuthContext;
   /** Explicitly disable bearer-token auth, ignoring FUSION_DAEMON_TOKEN /
    *  FUSION_DASHBOARD_TOKEN env vars. Used by `fn dashboard --no-auth` so a
    *  stale token in a project .env doesn't silently override the flag. */
@@ -577,12 +583,7 @@ function createServerRoomControlPlaneRouteDependencies(
 ): RoomControlPlaneRouteDependencies | undefined {
   const daemonToken = resolveDaemonTransportToken(options);
   const authorizeProject = options?.roomControlPlaneRbac
-    ? daemonToken
-      ? createRoomControlPlaneRbacAuthorizer({
-        ...options.roomControlPlaneRbac,
-        authorizeDaemonTransport: async (request) => authenticateUpgradeRequest(daemonToken, request),
-      })
-      : undefined
+    ? createServerRoomControlPlaneRbacAuthorizer(options.roomControlPlaneRbac, daemonToken)
     : options?.roomControlPlaneAuthorizeProject;
   if (typeof authorizeProject !== "function") {
     return undefined;
@@ -595,9 +596,7 @@ function createServerRoomControlPlaneRouteDependencies(
 }
 
 function resolveDaemonTransportToken(options?: ServerOptions): string | undefined {
-  return options?.noAuth
-    ? undefined
-    : options?.daemon?.token ?? process.env.FUSION_DAEMON_TOKEN;
+  return getDaemonToken(options);
 }
 
 /** System panel log entry shape (mirrors the CLI log sink's ring buffer). */
@@ -1060,8 +1059,9 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     });
   });
 
-  // Daemon mode: bearer token authentication middleware
-  // Auth is enabled when daemon option is provided OR FUSION_DAEMON_TOKEN env var is set.
+  // Dashboard host bearer-token authentication middleware.
+  // Auth mode comes from the explicit host context, with daemon/env fallback
+  // retained for older embedders.
   // The middleware exempts /api/health and everything outside /api/ — the SPA shell
   // (index.html + built assets) is public so the browser can load the frontend JS
   // that then captures ?token= from the URL and injects a Bearer header on every
@@ -1172,8 +1172,8 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
 
   // Create ChatStore for chat session management (available for SSE event forwarding)
   // FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Dashboard chat persistence is PostgreSQL-only and shares the scoped project layer.
-  const chatLayer = requireAsyncLayer(store, "Dashboard ChatStore");
-  const chatStore = options?.chatStore ?? new ChatStore(chatLayer);
+  const chatStore = options?.chatStore
+    ?? new ChatStore(requireAsyncLayer(store, "Dashboard ChatStore"));
   store.on("task:moved", (data: { task: Task; from: string; to: string }) => {
     if (data.to !== "archived") return;
     /*
@@ -1523,8 +1523,8 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
 
   // Create AiSessionStore for background task persistence
   // FNXC:PostgresSatelliteCutover 2026-07-14-17:30: Background AI sessions must use the authoritative project PostgreSQL layer.
-  const aiSessionLayer = requireAsyncLayer(store, "Dashboard AiSessionStore");
-  const aiSessionStore: AiSessionStore | undefined = options?.aiSessionStore ?? new AiSessionStore(aiSessionLayer);
+  const aiSessionStore: AiSessionStore | undefined = options?.aiSessionStore
+    ?? new AiSessionStore(requireAsyncLayer(store, "Dashboard AiSessionStore"));
   if (aiSessionStore) {
     // FNXC:RuntimeSatelliteCompletion 2026-06-25-00:20:
     // recoverStaleSessions + rehydrateFromStore are now async. Fire-and-forget
@@ -1568,12 +1568,6 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
 
   // Create AgentStore for chat prompt enrichment (initialized lazily by ChatManager)
   // FNXC:PostgresSseAgentStore 2026-07-14-19:35: Chat enrichment shares the mandatory default-project PostgreSQL layer.
-  const chatAgentLayer = requireAsyncLayer(store, "Chat AgentStore");
-  const chatAgentStore = new AgentStore({
-    rootDir: store.getFusionDir(),
-    asyncLayer: chatAgentLayer,
-  });
-
   // Create ChatManager for AI chat message handling.
   /*
   FNXC:GrokCliRouting 2026-07-10-00:00:
@@ -1587,15 +1581,21 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
   project-scoped chat path already uses via engine.getPluginRunner()), falling
   back to the loader only in UI-only mode where no engine exists.
   */
-  const chatManager = options?.chatManager ?? new ChatManager(
-    chatStore!,
-    store.getRootDir(),
-    chatAgentStore,
-    resolveChatManagerPluginRunner(options),
-    () => store.getSettings(),
-    options?.engine?.getMessageStore(),
-    store,
-  );
+  const chatManager = options?.chatManager ?? (() => {
+    const chatAgentStore = new AgentStore({
+      rootDir: store.getFusionDir(),
+      asyncLayer: requireAsyncLayer(store, "Chat AgentStore"),
+    });
+    return new ChatManager(
+      chatStore!,
+      store.getRootDir(),
+      chatAgentStore,
+      resolveChatManagerPluginRunner(options),
+      () => store.getSettings(),
+      options?.engine?.getMessageStore(),
+      store,
+    );
+  })();
 
   // CLI Agent Executor — chat surface wiring. When the cli-session transport is
   // supplied (the runtime is live), broker cli-backed chat sends to the PTY and

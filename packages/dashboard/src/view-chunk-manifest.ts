@@ -33,7 +33,10 @@ export const VIEW_SOURCE_MAP: Record<TaskViewId, string> = {
   skills: "components/SkillsView.tsx",
   memory: "components/MemoryView.tsx",
   insights: "components/InsightsView.tsx",
-  reliability: "components/ReliabilityView.tsx",
+  // FNXC:ReliabilityCommandCenterChunk 2026-07-27-02:57:
+  // ReliabilityView is imported by CommandCenter and no longer owns a
+  // top-level lazy route. Publishing a second manifest entry makes production
+  // warn about a chunk Vite correctly does not emit.
   "command-center": "components/command-center/CommandCenter.tsx",
   "dev-server": "components/DevServerView.tsx",
   goalsView: "components/GoalsView.tsx",

@@ -14,6 +14,7 @@ import { dirname, extname, join, resolve } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import * as readline from "node:readline";
 import { PluginStore, PluginLoader, validatePluginManifest, resolveGlobalDir, CentralCore } from "@fusion/core";
+import { getCliPackageVersion, isUnresolvedCliPackageVersion } from "@fusion/dashboard";
 import { resolveProject } from "../project-context.js";
 import { promptOutputStream, result } from "../output.js";
 
@@ -177,9 +178,17 @@ export async function createPluginLoader(
   pluginStore: PluginStore,
   projectName?: string,
 ): Promise<{ store: PluginStore; loader: PluginLoader }> {
-  const projectPath = await getProjectPath(projectName);
-  // Create a mock TaskStore for the loader (plugins don't need full task store access)
-  const mockTaskStore = {
+  const context = await resolveProject(projectName).catch(() => undefined);
+  const projectPath = context?.projectPath ?? await getProjectPath(projectName);
+  /*
+  FNXC:PluginDevPostgresSchema 2026-07-27:
+  PluginLoader runs schema preflight before onLoad. The CLI must therefore use
+  the PostgreSQL-backed TaskStore resolved for the project, which owns the
+  schema executor. The narrow fallback preserves path-only compatibility for
+  callers without a resolvable project; its lack of schema capabilities is
+  handled fail-closed by PluginLoader.
+  */
+  const taskStore = context?.store ?? {
     getRootDir: () => projectPath,
     getFusionDir: () => projectPath + "/.fusion",
     on: () => {},
@@ -188,7 +197,11 @@ export async function createPluginLoader(
 
   const loader = new PluginLoader({
     pluginStore,
-    taskStore: mockTaskStore,
+    taskStore,
+    fusionVersion: (() => {
+      const version = getCliPackageVersion(import.meta.url);
+      return isUnresolvedCliPackageVersion(version) ? undefined : version;
+    })(),
   });
 
   return { store: pluginStore, loader };

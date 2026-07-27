@@ -12,7 +12,13 @@ import {
   fetchSkillContent,
   fetchSkillFileContent,
 } from "../api";
-import type { DiscoveredSkill, CatalogEntry, SkillContent, SkillFileContent } from "@fusion/dashboard";
+import type {
+  DiscoveredSkill,
+  CatalogEntry,
+  CatalogFetchResult,
+  SkillContent,
+  SkillFileContent,
+} from "@fusion/dashboard";
 
 /*
 FNXC:Skills 2026-06-23-04:15:
@@ -47,6 +53,7 @@ export function SkillsView({ projectId, addToast, onClose }: SkillsViewProps) {
   const [isLoadingCatalog, setIsLoadingCatalog] = useState(false);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogEntries, setCatalogEntries] = useState<CatalogEntry[]>([]);
+  const [catalogSearch, setCatalogSearch] = useState<CatalogFetchResult["search"]>(undefined);
   const [searchQuery, setSearchQuery] = useState("");
   const [installingCatalogEntryId, setInstallingCatalogEntryId] = useState<string | null>(null);
 
@@ -117,9 +124,11 @@ export function SkillsView({ projectId, addToast, onClose }: SkillsViewProps) {
 
     setIsLoadingCatalog(true);
     setCatalogError(null);
+    setCatalogSearch(undefined);
     try {
       const result = await fetchSkillsCatalog(query, 20, projectId);
       setCatalogEntries(result.entries);
+      setCatalogSearch(result.search);
     } catch (err) {
       if (isCatalogUnavailableError(err)) {
         setCatalogError(t("skills.catalogUnavailable", "Catalog is temporarily unavailable. Please try again later."));
@@ -594,6 +603,34 @@ export function SkillsView({ projectId, addToast, onClose }: SkillsViewProps) {
           <h3 id="catalog-title" className="skills-view-section-title">
             {t("skills.catalogSection", "Skills Catalog")}
           </h3>
+
+          {catalogSearch?.fallbackUsed ? (
+            /*
+             * FNXC:SkillsSearchFallbackUI 2026-07-27-02:58:
+             * Fallback catalog results remain useful, but the UI must identify degraded semantic search and its concrete source. Never render a fallback result set as an indistinguishable successful semantic search.
+             */
+            <div
+              className="skills-view-search-warning"
+              role="status"
+              aria-live="polite"
+              data-testid="skills-search-fallback-warning"
+            >
+              <AlertCircle size={16} aria-hidden="true" />
+              <span>
+                {catalogSearch.warning
+                  ?? t(
+                    "skills.searchFallbackWarning",
+                    "Semantic skill search was unavailable; showing keyword fallback results.",
+                  )}
+                {" "}
+                <strong>
+                  {t("skills.searchFallbackSource", "Source: {{source}}", {
+                    source: catalogSearch.fallbackSource ?? catalogSearch.source,
+                  })}
+                </strong>
+              </span>
+            </div>
+          ) : null}
 
           {/* Catalog Content */}
           {catalogError ? (

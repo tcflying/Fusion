@@ -19,6 +19,19 @@ import {
 export { computeSkillId, getSkillSettingState, parseSkillId } from "@fusion/core";
 import type { TaskStore } from "@fusion/core";
 import type { ChildProcess } from "node:child_process";
+import {
+  searchPublicSkillsWithFallback,
+  type SkillsSearchMetadata,
+  type UpstreamError,
+} from "./skills-search.js";
+export {
+  searchPublicSkillsWithFallback,
+  type PublicSkillsSearchEntry,
+  type PublicSkillsSearchResult,
+  type SkillsSearchMetadata,
+  type UpstreamError,
+  type UpstreamErrorCode,
+} from "./skills-search.js";
 
 /**
  * Check if a path exists asynchronously using access().
@@ -102,6 +115,8 @@ export interface CatalogFetchResult {
     tokenPresent: boolean;
     fallbackUsed: boolean;
   };
+  /** Search diagnostics are present for query-backed results. */
+  search?: SkillsSearchMetadata;
 }
 
 /**
@@ -129,19 +144,6 @@ export interface SkillContent {
   name: string;
   skillMd: string;
   files: SkillFileEntry[];
-}
-
-/**
- * Upstream error codes for catalog fetch failures.
- */
-export type UpstreamErrorCode = "upstream_timeout" | "upstream_http_error" | "upstream_invalid_payload";
-
-/**
- * Upstream error with code.
- */
-export interface UpstreamError {
-  error: string;
-  code: UpstreamErrorCode;
 }
 
 /**
@@ -819,22 +821,6 @@ function buildCatalogUrl(limit: number, query?: string): string {
   return `https://skills.sh/api/v1/skills?${params.toString()}`;
 }
 
-/**
- * Build the public search URL.
- *
- * The search API requires a non-empty query that meets minimum length.
- */
-function buildSearchUrl(limit: number, query: string): string {
-  const params = new URLSearchParams();
-  params.set("q", query);
-  params.set("limit", String(limit));
-
-  return `https://skills.sh/api/search?${params.toString()}`;
-}
-
-/**
- * Fetch and normalize catalog data from the public /api/search endpoint.
- */
 const MIN_PUBLIC_SEARCH_QUERY_LENGTH = 2;
 
 function getPublicSearchQuery(query?: string): string | null {
@@ -854,67 +840,12 @@ async function fetchPublicCatalog(
   query: string,
   auth: CatalogFetchResult["auth"],
 ): Promise<CatalogFetchResult | UpstreamError> {
-  const url = buildSearchUrl(limit, query);
-
-  try {
-    const response = await fetch(url, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    if (!response.ok) {
-      return {
-        error: `Upstream returned ${response.status}: ${response.statusText}`,
-        code: "upstream_http_error",
-      };
-    }
-
-    const data = await response.json().catch(() => null);
-    if (!data) {
-      return {
-        error: "Invalid upstream response format",
-        code: "upstream_invalid_payload",
-      };
-    }
-
-    return normalizeSearchResponse(data, auth);
-  } catch (err) {
-    const error = err as Error;
-    if (isTimeoutError(error)) {
-      return { error: "Upstream request timed out", code: "upstream_timeout" };
-    }
-    return {
-      error: error.message || "Upstream request failed",
-      code: "upstream_http_error",
-    };
-  }
-}
-
-/**
- * Normalize public search endpoint response shape to CatalogFetchResult.
- */
-function normalizeSearchResponse(
-  data: unknown,
-  auth: CatalogFetchResult["auth"],
-): CatalogFetchResult | UpstreamError {
-  if (!data || typeof data !== "object") {
-    return {
-      error: "Invalid upstream response format",
-      code: "upstream_invalid_payload",
-    };
-  }
-
-  const record = data as Record<string, unknown>;
-  if (!Array.isArray(record.skills)) {
-    return {
-      error: "Invalid upstream response format: expected { skills: [...] }",
-      code: "upstream_invalid_payload",
-    };
-  }
-
+  const result = await searchPublicSkillsWithFallback({ limit, query });
+  if ("error" in result) return result;
   return {
-    entries: record.skills.map(normalizeSearchEntry),
+    entries: result.skills.map(normalizeSearchEntry),
     auth,
+    search: result.search,
   };
 }
 

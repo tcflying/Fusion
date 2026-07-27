@@ -5,6 +5,10 @@ import type { Server } from "node:http";
 import { resolveDesktopRuntimePrimaryProject } from "./engine-runtime.js";
 import { resolveDesktopBundlePluginDirs } from "./bundled-plugin-dirs.js";
 import { resolveDesktopSystemControl } from "./local-runtime.js";
+import {
+  createDesktopRoomRbacOptions,
+  DESKTOP_LOCAL_BIND_HOST,
+} from "./room-rbac-composition.js";
 
 /*
  * FNXC:DesktopRuntime 2026-07-07-12:00:
@@ -15,14 +19,12 @@ import { resolveDesktopSystemControl } from "./local-runtime.js";
  * paths consistent (see local-runtime.ts's matching comment).
  */
 type PluginStoreLike = { init(): Promise<void> };
-type PluginDatabaseLike = { runPluginSchemaInits(hooks: Array<{ pluginId: string; hook: unknown }>): Promise<void> };
 
 type TaskStoreLike = {
   init(): Promise<void>;
   watch(): Promise<void>;
   close(): void;
   getPluginStore(): PluginStoreLike;
-  getDatabase(): PluginDatabaseLike;
 };
 
 type RuntimeCleanup = () => Promise<void> | void;
@@ -68,8 +70,14 @@ export class DesktopLocalServerManager {
 
     try {
       const { TaskStore, createTaskStoreForBackend } = await import("@fusion/core");
-      const { CentralCore, PluginLoader, ensureBundledPluginInstalled, isBundledPluginId } = await import("@fusion/core");
-      const { createServer } = await import("@fusion/dashboard");
+      const {
+        CentralCore,
+        PluginLoader,
+        createPostgresRoomRbacRegistry,
+        ensureBundledPluginInstalled,
+        isBundledPluginId,
+      } = await import("@fusion/core");
+      const { createDashboardAuthContext, createServer, getCliPackageVersion, isUnresolvedCliPackageVersion } = await import("@fusion/dashboard");
       const { ProjectEngineManager, createFusionAuthStorage, createFusionModelRegistry, seedDashboardProviders } = await import("@fusion/engine");
       // FNXC:BackendFlip 2026-06-26-14:40:
       // Consult the startup factory to boot a PostgreSQL-backed TaskStore.
@@ -101,7 +109,17 @@ export class DesktopLocalServerManager {
         undefined,
         backendBoot ? { asyncLayer: backendBoot.hostAsyncLayer } : undefined,
       );
-      const engineManager = new ProjectEngineManager(centralCore);
+      const resolvedFusionVersion = getCliPackageVersion(import.meta.url);
+      const fusionVersion = isUnresolvedCliPackageVersion(resolvedFusionVersion) ? undefined : resolvedFusionVersion;
+      const engineManager = new ProjectEngineManager(centralCore, { cliPackageVersion: fusionVersion });
+      const roomControlPlaneRbac = createDesktopRoomRbacOptions({
+        engineManager,
+        createRegistry: createPostgresRoomRbacRegistry,
+      });
+      const dashboardAuthContext = createDashboardAuthContext({
+        host: DESKTOP_LOCAL_BIND_HOST,
+        noAuth: true,
+      });
       const providerSeeding: { dispose?: () => void } = {};
       cleanup = async () => {
         providerSeeding.dispose?.();
@@ -121,9 +139,14 @@ export class DesktopLocalServerManager {
        * API-key seeding, wrapAuthStorageWithApiKeyProviders, registerCustomProviders) so this path
        * surfaces the same provider catalog as the CLI and the embedded runtime path. Pass the WRAPPED
        * authStorage to createServer, not the raw one.
-       */
+      */
       const authStorage = createFusionAuthStorage();
-      const modelRegistry = createFusionModelRegistry(authStorage);
+      /*
+       * FNXC:DesktopModelRegistry 2026-07-27-15:49:
+       * Keep this legacy desktop startup path aligned with LocalRuntimeManager by resolving the
+       * asynchronous model registry before provider seeding or dashboard server construction.
+       */
+      const modelRegistry = await createFusionModelRegistry(authStorage);
       const { authStorage: wrappedAuthStorage, dispose } = await seedDashboardProviders({
         store: store as never,
         authStorage,
@@ -151,7 +174,7 @@ export class DesktopLocalServerManager {
       try {
         pluginStore = store.getPluginStore();
         await pluginStore.init();
-        pluginLoader = new PluginLoader({ pluginStore: pluginStore as never, taskStore: store as never });
+        pluginLoader = new PluginLoader({ pluginStore: pluginStore as never, taskStore: store as never, fusionVersion });
 
         const boundPluginStore = pluginStore;
         const boundPluginLoader = pluginLoader;
@@ -168,10 +191,11 @@ export class DesktopLocalServerManager {
         }
 
         await pluginLoader.loadAllPlugins();
-        const schemaHooks = pluginLoader.getPluginSchemaInitHooks();
-        if (schemaHooks.length > 0) {
-          await store.getDatabase().runPluginSchemaInits(schemaHooks);
-        }
+        /*
+         * FNXC:DesktopPluginSchema 2026-07-27-15:49:
+         * PluginLoader already executes PostgreSQL schema contracts during load. Keep this legacy
+         * desktop host from replaying the collected contracts through the removed SQLite-era seam.
+         */
 
         ensureBundledPluginInstalledCallback = async (pluginId: string): Promise<boolean> => {
           if (!isBundledPluginId(pluginId)) {
@@ -187,10 +211,19 @@ export class DesktopLocalServerManager {
         ensureBundledPluginInstalledCallback = undefined;
       }
 
+      /*
+       * FNXC:DesktopRoomRbacComposition 2026-07-27-15:23:
+       * Keep the legacy packaged server path aligned with LocalRuntimeManager: use the durable
+       * trusted-device registry/issuer composition, a verified loopback Dashboard auth context,
+       * and a listener bound only to the controlled loopback host.
+       */
       const app = createServer(store as never, {
+        fusionVersion,
         ...(primaryEngine ? { engine: primaryEngine } : {}),
         engineManager,
         centralCore,
+        dashboardAuthContext,
+        roomControlPlaneRbac,
         authStorage: wrappedAuthStorage,
         modelRegistry,
         ...(pluginStore && pluginLoader ? { pluginStore: pluginStore as never, pluginLoader, pluginRunner: pluginLoader } : {}),
@@ -200,7 +233,7 @@ export class DesktopLocalServerManager {
         // app.relaunch(); see resolveDesktopSystemControl in local-runtime.ts.
         ...(await resolveDesktopSystemControl()),
       });
-      server = app.listen(0);
+      server = app.listen(0, DESKTOP_LOCAL_BIND_HOST);
 
       await Promise.race([
         once(server, "listening"),

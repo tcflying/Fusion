@@ -8,8 +8,19 @@ import { getAuthToken } from "./auth";
 
 export * from "./api/legacy";
 export * from "./api/chat";
+export * from "./api/happier-runtime";
 export * from "./api-node";
 export * from "./api/report";
+
+/*
+FNXC:DashboardApi 2026-07-27-15:50:
+The compatibility barrel must expose focused-module contracts still consumed by AgentDetailView, AgentsView, and PlanningModeModal so package typechecking covers the same stable import surface as runtime loading.
+*/
+export {
+  isAgentHeartbeatEnabled,
+  withAgentHeartbeatEnabled,
+} from "./api/agents";
+export type { PlanningContextualComment } from "./api/planning";
 
 export type HappierDirectSessionProviderId = "codex" | "claude" | "opencode";
 

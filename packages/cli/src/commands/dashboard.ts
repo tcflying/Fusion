@@ -1,6 +1,6 @@
 import type { AddressInfo } from "node:net";
 import { join, resolve as pathResolve } from "node:path";
-import { execFile as execFileCb, spawn, type ChildProcess } from "node:child_process";
+import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { stat, readdir, readFile as fsReadFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
@@ -11,7 +11,6 @@ import {
   CentralCore,
   AgentStore,
   PluginLoader,
-  PluginStore,
   getTaskMergeBlocker,
   getEnabledPiExtensionPaths,
   isEphemeralAgent,
@@ -32,9 +31,12 @@ import {
   type WorkflowIrColumn,
   type TraitFlags,
   createTaskStoreForBackend,
+  FUSION_NON_RETRYABLE_EXIT_CODE,
   FUSION_RESTART_EXIT_CODE,
+  isPostgresUniqueError,
 } from "@fusion/core";
 import {
+  createDashboardAuthContext,
   createServer,
   refreshAllCustomProviderModels,
   AttachTicketStore,
@@ -110,7 +112,19 @@ import { ensureBundledDependencyGraphPluginInstalled, ensureBundledGrokRuntimePl
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-sync.js";
 import { DashboardTUI, DashboardLogSink, isTTYAvailable, type SystemInfo, type GitStatus, type GitCommit, type GitCommitDetail, type GitBranch, type GitWorktree, type FileEntry, type FileReadResult, type TaskStep as TUITaskStep, type TaskLogEntry as TUITaskLogEntry, type TaskDetailData, type TaskEvent } from "./dashboard-tui/index.js";
+import {
+  formatDashboardAuthBannerLines,
+  formatDashboardEngineBannerLines,
+  maskDashboardAuthToken,
+  resolveDashboardEngineMode,
+} from "./dashboard-startup-banner.js";
 import { DASHBOARD_STARTUP_STATUS, runTuiStartupPrelude } from "./dashboard-startup-chain.js";
+import {
+  hasLiveSupervisingParent as hasCanonicalLiveSupervisingParent,
+  resolveSupervisorRespawnCommand as resolveCanonicalSupervisorRespawnCommand,
+  runServerCommandSupervised,
+  shouldSuperviseServerCommand,
+} from "./server-supervisor.js";
 
 // Re-export for backward compatibility with tests
 export { promptForPort };
@@ -734,10 +748,15 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   //   3. `FUSION_DAEMON_TOKEN`    — back-compat with daemon mode
   //   4. stored token in ~/.fusion/settings.json
   //   5. newly generated persisted token (first authenticated run only)
-  // `--no-auth` skips the middleware entirely. The token is embedded in the
-  // launch URL (as `?token=...`) so the user can click once and the browser
-  // stores it to localStorage for subsequent loads.
+  // `--no-auth` skips the middleware entirely. The bearer is never embedded in
+  // a URL; authenticated browser sessions obtain it through the explicit
+  // owner-only settings/clipboard flow.
   const dashboardAuthToken = await resolveDashboardAuthToken(opts);
+  const dashboardAuthContext = createDashboardAuthContext({
+    host: selectedHost,
+    noAuth: opts.noAuth,
+    token: dashboardAuthToken,
+  });
   const roomControlPlaneAuthorizeProject: NonNullable<Parameters<typeof createServer>[1]>["roomControlPlaneAuthorizeProject"] =
     dashboardAuthToken && !opts.noAuth && !opts.noEngine
       ? createDaemonRoomControlPlaneAuthorizer(dashboardAuthToken)
@@ -784,9 +803,12 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   let store: TaskStore | undefined;
   // eslint-disable-next-line prefer-const
   let agentStore: AgentStore | undefined;
+  let dashboardEngineManager: ProjectEngineManager | undefined;
+  let dashboardEngineStartupFailed = false;
 
   if (isTTY) {
     tui = new DashboardTUI();
+    tui.setDashboardAuthTokenProvider(() => dashboardAuthToken);
     tui.lang = opts.lang;
     void startupUpdateStatusPromise.then((updateStatus) => {
       tui?.setUpdateStatus(updateStatus);
@@ -1362,9 +1384,11 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
   // PluginRunner for the REST routes (provides getPluginRoutes and
   // reloadPlugin methods).
   //
+  const pluginHostVersion = getCliPackageVersion(import.meta.url);
   const pluginLoader = new PluginLoader({
     pluginStore,
     taskStore: store,
+    fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
   });
 
   // Lazy-install hook for bundled runtime plugins (Hermes/OpenClaw/Paperclip).
@@ -1837,60 +1861,62 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     string,
     { enabledKey: string; skills: ReturnType<PluginLoader["getPluginSkills"]> }
   >();
-  const getProjectScopedPluginSkills = async (rootDir: string): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
+  const getProjectScopedPluginSkills = async (rootDir: string, resolvedProjectStore?: TaskStore): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
     const normalizedRootDir = pathResolve(rootDir);
-    const stateStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
+    const targetStore = resolvedProjectStore ?? (store && normalizedRootDir === pathResolve(store.getRootDir()) ? store : undefined);
+    if (!targetStore) {
+      return [];
+    }
+    /*
+     * FNXC:PluginSkillsPostgres 2026-07-27-02:38:
+     * Dashboard skill discovery must reuse the route-resolved project TaskStore and its PluginStore. A root-only compatibility store re-enters the deleted SQLite path; metadata-only plugin loading also stays read-only so discovery cannot synthesize runtime start/stop state.
+     */
+    const stateStore = targetStore.getPluginStore();
     await stateStore.init();
+    const enabledPlugins = await stateStore.listPlugins({ enabled: true });
+    const enabledKey = enabledPlugins
+      .map((plugin) => `${plugin.id}:${plugin.updatedAt}`)
+      .sort()
+      .join("\0");
+    const cached = pluginSkillCache.get(normalizedRootDir);
+    if (cached?.enabledKey === enabledKey) {
+      return cached.skills;
+    }
+    if (enabledPlugins.length === 0) {
+      const skills: ReturnType<PluginLoader["getPluginSkills"]> = [];
+      pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
+      return skills;
+    }
+
+    /*
+     * FNXC:PluginSkills 2026-07-10-00:00:
+     * Same-root skill discovery must reuse the dashboard daemon's active PluginLoader; request-scoped loaders are only for other project roots and are stopped after metadata collection to avoid leaking plugin side effects or SQLite handles.
+     */
+    if (store && normalizedRootDir === pathResolve(store.getRootDir())) {
+      const enabledIds = new Set(enabledPlugins.map((plugin) => plugin.id));
+      const skills = pluginLoader.getPluginSkills().filter((entry) => enabledIds.has(entry.pluginId));
+      pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
+      return skills;
+    }
+
+    const scopedPluginStore = targetStore.getPluginStore();
+    const scopedPluginLoader = new PluginLoader({
+      pluginStore: scopedPluginStore,
+      taskStore: targetStore,
+      persistRuntimeState: false,
+      fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
+    });
     try {
-      const enabledPlugins = await stateStore.listPlugins({ enabled: true });
-      const enabledKey = enabledPlugins
-        .map((plugin) => `${plugin.id}:${plugin.updatedAt}`)
-        .sort()
-        .join("\0");
-      const cached = pluginSkillCache.get(normalizedRootDir);
-      if (cached?.enabledKey === enabledKey) {
-        return cached.skills;
+      await scopedPluginStore.init();
+      const { errors } = await scopedPluginLoader.loadAllPlugins();
+      if (errors > 0) {
+        logSink.warn(`Project-scoped plugin skill loading for ${normalizedRootDir} had ${errors} error(s)`, "plugins");
       }
-      if (enabledPlugins.length === 0) {
-        const skills: ReturnType<PluginLoader["getPluginSkills"]> = [];
-        pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
-        return skills;
-      }
-
-      if (!store) {
-        return [];
-      }
-      /*
-       * FNXC:PluginSkills 2026-07-10-00:00:
-       * Same-root skill discovery must reuse the dashboard daemon's active PluginLoader; request-scoped loaders are only for other project roots and are stopped after metadata collection to avoid leaking plugin side effects or SQLite handles.
-       */
-      if (normalizedRootDir === pathResolve(store.getRootDir())) {
-        const enabledIds = new Set(enabledPlugins.map((plugin) => plugin.id));
-        const skills = pluginLoader.getPluginSkills().filter((entry) => enabledIds.has(entry.pluginId));
-        pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
-        return skills;
-      }
-
-      const scopedPluginStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
-      const scopedTaskStore = new TaskStore(normalizedRootDir);
-      const scopedPluginLoader = new PluginLoader({ pluginStore: scopedPluginStore, taskStore: scopedTaskStore });
-      try {
-        await scopedPluginStore.init();
-        await scopedTaskStore.init();
-        const { errors } = await scopedPluginLoader.loadAllPlugins();
-        if (errors > 0) {
-          logSink.warn(`Project-scoped plugin skill loading for ${normalizedRootDir} had ${errors} error(s)`, "plugins");
-        }
-        const skills = scopedPluginLoader.getPluginSkills();
-        pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
-        return skills;
-      } finally {
-        await scopedPluginLoader.stopAllPlugins();
-        scopedPluginStore.close();
-        scopedTaskStore.close();
-      }
+      const skills = scopedPluginLoader.getPluginSkills();
+      pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
+      return skills;
     } finally {
-      stateStore.close();
+      await scopedPluginLoader.stopAllPlugins();
     }
   };
 
@@ -2012,12 +2038,14 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       getTaskMergeBlocker,
       roomHostCompositionOperatorAdapterRegistry,
     });
+    dashboardEngineManager = engineManager;
 
     // Start engines for all registered projects in the background. The
     // on-access fast path (server's onProjectFirstAccessed) and the
     // reconciliation loop below both cover correctness, so awaiting here
     // just blocks the TUI on the slowest project's git/state init.
     void engineManager.startAll().catch((err) => {
+      dashboardEngineStartupFailed = true;
       const message = err instanceof Error ? err.message : String(err);
       logSink.warn(`Background engine startup failed: ${message}`, "dashboard");
     });
@@ -2170,6 +2198,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       : undefined;
 
     app = createServer(store, {
+      fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
       engine: cwdEngine,
       engineManager,
       cliAgentHubResolver,
@@ -2259,6 +2288,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         ? { roomControlPlaneAuthorizeProject }
         : {}),
       daemon: dashboardAuthToken ? { token: dashboardAuthToken } : undefined,
+      dashboardAuthContext,
       noAuth: opts.noAuth,
       runtimeLogger,
       systemControl: systemControlForServer,
@@ -2492,6 +2522,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     // FNXC:DashboardStartup 2026-06-20-23:39:
     // Dashboard development mode still needs a running engine by default; only the explicit `--no-engine` flag should produce a UI-only process so local and dev startup paths match user expectations.
     app = createServer(store, {
+      fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
       onMerge,
       centralCore: centralCoreForMesh ?? undefined,
       authStorage: dashboardAuthStorage,
@@ -2593,6 +2624,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       skillsAdapter,
       https: loadTlsCredentialsFromEnv(),
       daemon: dashboardAuthToken ? { token: dashboardAuthToken } : undefined,
+      dashboardAuthContext,
       noAuth: opts.noAuth,
       runtimeLogger,
       systemControl: systemControlForServer,
@@ -2779,11 +2811,26 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     const displayHost =
       selectedHost === "0.0.0.0" || selectedHost === "::" ? selectedHost : "localhost";
     const baseUrl = `http://${displayHost}:${actualPort}`;
-    const tokenizedUrl = dashboardAuthToken
-      ? `${baseUrl}/?token=${encodeURIComponent(dashboardAuthToken)}`
-      : baseUrl;
-
     const updateMessage = formatUpdateMessage(await startupUpdateStatusPromise);
+    /*
+     * FNXC:DashboardRuntimeStateBanner 2026-07-27-06:43:
+     * Resolve engine state once before the TTY/non-TTY split. Both surfaces
+     * must report paused, disabled, or active from the same persisted setting;
+     * a branch-local value previously made the non-TTY banner uncompilable.
+     */
+    const dashboardSettings = await store.getSettings();
+    const roomExecutionStates = dashboardEngineManager
+      ? Array.from(dashboardEngineManager.getAllEngines().values()).map(
+          (engine) => engine.getRoomControlPlaneExecutionStatus().state,
+        )
+      : [];
+    const engineMode = resolveDashboardEngineMode({
+      noEngine,
+      paused: Boolean(dashboardSettings.enginePaused),
+      engineRunning: dashboardEngineManager?.hasRunningEngine() ?? false,
+      startupFailed: dashboardEngineStartupFailed,
+      roomExecutionStates,
+    });
 
     // ── TTY Mode: Set system info on TUI ───────────────────────────────
     //
@@ -2792,9 +2839,7 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
     // log streaming.
     //
     if (isTTY && tui) {
-      // Determine engine mode
-      const settings = await store.getSettings();
-      const engineMode = noEngine ? "no-engine" : settings.enginePaused ? "paused" : "active";
+      const settings = dashboardSettings;
       const startupDurationMs = Date.now() - dashboardStartedAt;
 
       const systemInfo: SystemInfo = {
@@ -2802,8 +2847,9 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         port: actualPort,
         baseUrl,
         authEnabled: Boolean(dashboardAuthToken),
-        authToken: dashboardAuthToken,
-        tokenizedUrl: dashboardAuthToken ? tokenizedUrl : undefined,
+        maskedAuthToken: dashboardAuthToken
+          ? maskDashboardAuthToken(dashboardAuthToken)
+          : undefined,
         engineMode,
         fileWatcher: true,
         startTimeMs: dashboardStartedAt,
@@ -3321,6 +3367,10 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
         tui.log("AI engine active");
       } else if (engineMode === "no-engine") {
         tui.log("AI engine disabled (--no-engine)");
+      } else if (engineMode === "withheld") {
+        tui.warn("AI engine withheld by runtime authority/readiness gate", "engine");
+      } else if (engineMode === "degraded") {
+        tui.warn("AI engine degraded because runtime is not fully ready", "engine");
       } else {
         tui.log("AI engine paused");
       }
@@ -3337,25 +3387,17 @@ export async function runDashboard(port: number, opts: { paused?: boolean; dev?:
       console.log();
       console.log(`  fn board`);
       console.log(`  ────────────────────────`);
-      console.log(`  → ${baseUrl}`);
-      if (dashboardAuthToken) {
-        console.log(`  Auth:    bearer token required`);
-        console.log(`  Token:   ${dashboardAuthToken}`);
-        console.log(`  Open:    ${tokenizedUrl}`);
-        console.log(`           (the browser stores the token so you only need to click once)`);
-      } else {
-        console.log(`  Auth:    disabled (--no-auth)`);
+      for (const line of formatDashboardAuthBannerLines({
+        baseUrl,
+        dashboardAuthToken,
+      })) {
+        console.log(line);
       }
       console.log();
       console.log(`  Tasks stored in .fusion/tasks/`);
       console.log(`  Merge:      AI-assisted (conflict resolution + commit messages)`);
-      if (noEngine) {
-        console.log(`  AI engine:  ✗ disabled (--no-engine)`);
-      } else {
-        console.log(`  AI engine:  ✓ active`);
-        console.log(`    • planning: auto-planning tasks`);
-        console.log(`    • scheduler: dependency-aware execution`);
-        console.log(`    • cron: scheduled task execution`);
+      for (const line of formatDashboardEngineBannerLines(engineMode)) {
+        console.log(line);
       }
       console.log(`  File watcher: ✓ active`);
       if (updateMessage) {
@@ -3406,296 +3448,40 @@ export function resolveFusionSourceWorkspaceRoot(): string | undefined {
 
 // ── Supervised Dashboard Mode ────────────────────────────────────────────────
 
-const SUPERVISE_MAX_RESTARTS = 3;
-const SUPERVISE_BASE_DELAY_MS = 2_000;
-const SUPERVISE_MAX_DELAY_MS = 16_000;
-const SUPERVISE_STALE_RESET_MS = 60_000;
-
-/** True when running inside a bun-compiled single-file `fn` binary. */
-function isCompiledBinary(): boolean {
-  const bun = (globalThis as { Bun?: { embeddedFiles?: unknown } }).Bun;
-  return typeof bun !== "undefined" && Boolean(bun.embeddedFiles);
-}
-
 /*
-FNXC:SystemPanel 2026-07-12-14:05:
-How the supervisor respawns "itself", per install shape:
-  - node script (npx / global npm install / `pnpm dev` source run): re-exec
-    process.execPath with execArgv preserved (tsx loader flags under source
-    runs) plus the argv[1] entry script.
-  - bun-compiled packaged binary (`fn`/`fn.exe` from build:exe): the binary IS
-    the program; argv[1] is Bun's virtual embedded path, so re-exec
-    process.execPath alone.
-Returns null when no respawn command can be determined (then supervision is
-skipped and the dashboard runs unsupervised).
+FNXC:DashboardSupervisor 2026-07-27-16:43:
+Dashboard, serve, and daemon now share one parent-identity, restart-budget,
+signal-forwarding, and respawn implementation. Compatibility exports stay here
+for existing callers, but the legacy flag-only supervisor is no longer an
+independent authority.
 */
-export function resolveSupervisorRespawnCommand(): { command: string; args: string[] } | null {
-  if (isCompiledBinary()) {
-    return { command: process.execPath, args: [] };
-  }
-  const entryPoint = process.argv[1];
-  if (!entryPoint) return null;
-  return { command: process.execPath, args: [...process.execArgv, entryPoint] };
-}
+export const hasLiveSupervisingParent = hasCanonicalLiveSupervisingParent;
+export const resolveSupervisorRespawnCommand =
+  resolveCanonicalSupervisorRespawnCommand;
 
-/*
-FNXC:SystemPanel 2026-07-25-10:05:
-Is a supervising parent ACTUALLY there, right now?
-
-FUSION_RESTART_SUPERVISED=1 alone is not proof. It is a plain environment
-variable, so it is inherited by every process the dashboard spawns — agent
-terminals, dev servers, shells. Running `fn dashboard` from inside one of those
-made the new dashboard believe it was supervised: it advertised
-restartSupported=true, and a restart request then exited the process with
-FUSION_RESTART_EXIT_CODE with nobody listening for it. The dashboard just
-disappeared — which is what "the restart button does nothing" looks like from a
-browser tab that never comes back.
-
-The supervisor now also stamps its own pid (FUSION_SUPERVISOR_PID). Supervision
-counts only when that pid is our real parent: a leaked copy of the variable
-names a process that is not our parent (or a dead one — we get reparented, so
-ppid stops matching), and we correctly report unsupervised. A parent that
-predates the stamp (older scripts/dev-with-memory.mjs) sets no pid, so the flag
-alone still counts — no behavior change for it.
-*/
-export function hasLiveSupervisingParent(
-  env: NodeJS.ProcessEnv = process.env,
-  ppid: number = process.ppid,
-): boolean {
-  if (env.FUSION_RESTART_SUPERVISED !== "1") return false;
-  const declaredPid = env.FUSION_SUPERVISOR_PID;
-  if (!declaredPid) return true;
-  const parsed = Number.parseInt(declaredPid, 10);
-  return Number.isFinite(parsed) && parsed === ppid;
-}
-
-/*
-FNXC:SystemPanel 2026-07-12-14:05:
-Supervision decision for `fn dashboard` (and bare `fn`, which defaults to the
-dashboard). Supervision is now the DEFAULT so every install shape — bare `fn`,
-`fusion`, npx, packaged binary — supports the System panel's in-place restart
-and gets crash recovery. Skipped when:
-  - --no-supervise is passed (explicit opt-out; also the escape hatch for
-    debugging the child directly),
-  - a supervising parent is genuinely present (the supervisor's own child, or
-    scripts/dev-with-memory.mjs under `pnpm dev` — never nest supervisors). A
-    merely INHERITED FUSION_RESTART_SUPERVISED no longer counts; see
-    hasLiveSupervisingParent above. This is what makes `fn dashboard` launched
-    from a Fusion-spawned terminal supervise itself instead of silently losing
-    restart support.
-  - an inspector flag is active (the debugger must attach to the real app
-    process, and a respawned child would fight over the inspector port),
-  - no respawn command can be resolved.
-*/
 export function shouldSuperviseDashboard(
   args: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
   execArgv: readonly string[] = process.execArgv,
   ppid: number = process.ppid,
 ): boolean {
-  if (args.includes("--no-supervise")) return false;
-  if (hasLiveSupervisingParent(env, ppid)) return false;
-  if (execArgv.some((arg) => arg.startsWith("--inspect"))) return false;
-  return resolveSupervisorRespawnCommand() !== null;
+  return shouldSuperviseServerCommand("dashboard", args, env, execArgv, ppid);
 }
 
-/**
- * Run the dashboard under foreground process supervision with bounded restart
- * attempts and exponential backoff.
- *
- * FNXC:DashboardAvailability 2026-06-30-23:20:
- * Long-lived remote dashboard sessions need bounded crash recovery without
- * detaching from the operator terminal or terminating unrelated port listeners.
- *
- * Spawns the current CLI entry point as a child process (minus the --supervise
- * flag) and monitors for unexpected exits. If the child exits non-zero, the
- * supervisor restarts up to SUPERVISE_MAX_RESTARTS times with exponential
- * backoff. Clean exits (SIGINT/SIGTERM/exit 0) propagate without restart.
- *
- * FNXC:SystemPanel 2026-07-12-14:05:
- * The child is spawned ATTACHED (same foreground process group, stdio
- * inherited) — NOT via superviseSpawn's detached process group — because the
- * interactive TUI must own the terminal: a background-process-group child
- * reading a TTY gets SIGTTIN/SIGTTOU-stopped, which is why detached
- * supervision was headless-only. Attached means terminal Ctrl+C reaches the
- * child directly; when a child is alive the parent waits for its graceful exit
- * (and exits immediately on SIGINT during crash-backoff, when no child is alive
- * to receive Ctrl+C), and forwards direct SIGTERM kills to the child. A parent
- * signal latches `stopping` so an intentional shutdown never respawns. Exit code
- * FUSION_RESTART_EXIT_CODE is an operator-requested restart (System panel):
- * immediate respawn, no crash budget consumed.
- *
- * This does NOT use shell detachment wrappers, shell kill loops, or unbounded retries.
- * Port 4040 processes are never killed — the child binds its own port.
- */
 export async function runDashboardSupervised(
   port: number,
   _opts: Parameters<typeof runDashboard>[1] = {},
 ): Promise<void> {
-  // Reconstruct child args: same flags, minus the supervision flags.
-  const childArgs = process.argv.slice(2).filter((a) => a !== "--supervise" && a !== "--no-supervise");
-  // Ensure "dashboard" is present without duplicating it after global flags.
-  if (!childArgs.includes("dashboard")) {
-    const firstOptionIndex = childArgs.findIndex((arg) => arg.startsWith("-"));
-    childArgs.splice(firstOptionIndex === -1 ? 0 : firstOptionIndex, 0, "dashboard");
-  }
-
-  const respawn = resolveSupervisorRespawnCommand();
-  if (!respawn) {
-    console.error("[dashboard:supervisor] cannot determine entry point for child process");
-    process.exit(1);
-  }
-
-  let restartCount = 0;
-  let lastExitTime = 0;
-  const restartCommand = formatSupervisorRestartCommand(respawn.command, respawn.args, childArgs);
-
-  let activeChild: ReturnType<typeof spawnAttached> | null = null;
-  // `stopping` latches once the operator asks to quit so the restart loop never
-  // respawns after an intentional shutdown, even if the child's post-signal
-  // exit code is non-zero.
-  let stopping = false;
-  // Parent lifecycle: terminal Ctrl+C (SIGINT) already reaches the attached
-  // child via the shared foreground process group, so when a child is alive the
-  // parent just waits for its graceful exit. But during crash-backoff (or
-  // between spawns) there is NO child to receive the terminal SIGINT, so Ctrl+C
-  // would hang for up to the backoff window — exit immediately in that case.
-  process.on("SIGINT", () => {
-    stopping = true;
-    if (!activeChild) process.exit(130);
-  });
-  // A direct SIGTERM to the parent (process managers, `kill`) is forwarded so
-  // the child shuts down too, then the loop stops. During crash-backoff there
-  // is no child to forward to and the loop is parked in a sleep, so exit
-  // immediately rather than waiting out the backoff. If the parent dies
-  // unexpectedly, best-effort kill the child on exit.
-  process.on("SIGTERM", () => {
-    stopping = true;
-    if (!activeChild) process.exit(143);
-    try {
-      activeChild.child.kill("SIGTERM");
-    } catch {
-      // Child may already be gone.
-    }
-  });
-  process.on("exit", () => {
-    try {
-      activeChild?.child.kill("SIGTERM");
-    } catch {
-      // Child may already be gone.
-    }
-  });
-
-  while (true) {
-    const attemptLabel = `${restartCount + 1}/${SUPERVISE_MAX_RESTARTS + 1}`;
-    console.log(`[dashboard:supervisor] starting dashboard (attempt ${attemptLabel})`);
-
-    try {
-      activeChild = spawnAttached(respawn.command, [...respawn.args, ...childArgs]);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[dashboard:supervisor] failed to spawn child: ${message}`);
-      process.exit(1);
-    }
-
-    const exitResult = await activeChild.waitExit;
-    activeChild = null;
-    const exitCode = exitResult.code ?? 1;
-    const exitSignal = exitResult.signal;
-
-    // Operator asked to stop (SIGINT/SIGTERM to the parent) — never respawn,
-    // regardless of the child's post-signal exit code.
-    if (stopping) {
-      return;
-    }
-
-    // Clean exit — propagate without restart
-    if (exitSignal === "SIGINT" || exitSignal === "SIGTERM" || exitCode === 0) {
-      return;
-    }
-
-    /*
-    FNXC:SystemPanel 2026-07-12-10:50:
-    Operator-requested restart (dashboard System panel). Respawn immediately
-    and reset the crash budget — an intentional restart must never consume
-    SUPERVISE_MAX_RESTARTS or incur crash backoff.
-    */
-    if (exitCode === FUSION_RESTART_EXIT_CODE) {
-      console.log("[dashboard:supervisor] restart requested — restarting now");
-      restartCount = 0;
-      lastExitTime = 0;
-      continue;
-    }
-
-    // Reset restart counter if the child ran for a long time
-    const now = Date.now();
-    if (now - lastExitTime > SUPERVISE_STALE_RESET_MS) {
-      restartCount = 0;
-    }
-    lastExitTime = now;
-
-    restartCount++;
-    if (restartCount > SUPERVISE_MAX_RESTARTS) {
-      console.error(
-        `\n[dashboard:supervisor] dashboard exited unexpectedly ${SUPERVISE_MAX_RESTARTS + 1} times.\n` +
-        `Giving up. If using Tailscale Serve, the remote URL will return 502\n` +
-        `until the dashboard is restarted manually:\n\n` +
-        `  ${restartCommand}\n\n` +
-        `To check if a listener is still active:\n` +
-        `  curl http://127.0.0.1:${port}/api/health\n`,
-      );
-      process.exit(1);
-    }
-
-    const delay = Math.min(
-      SUPERVISE_BASE_DELAY_MS * Math.pow(2, restartCount - 1),
-      SUPERVISE_MAX_DELAY_MS,
-    );
-    console.log(
-      `[dashboard:supervisor] restarting in ${Math.round(delay / 1000)}s (attempt ${restartCount}/${SUPERVISE_MAX_RESTARTS})`,
-    );
-    await new Promise((resolve) => setTimeout(resolve, delay));
-  }
+  await runServerCommandSupervised("dashboard", port);
 }
 
-interface AttachedChildExit {
-  code: number | null;
-  signal: NodeJS.Signals | null;
-}
-
-/*
-FNXC:SystemPanel 2026-07-12-14:05:
-Attached (non-detached) supervised spawn: the child shares the parent's
-foreground process group so the interactive TUI keeps terminal ownership.
-Deliberately NOT superviseSpawn (its detached process group is what made the
-supervised TUI unusable on a TTY); parent-death cleanup is handled by the
-supervisor's own exit/SIGTERM handlers.
-*/
-function spawnAttached(command: string, args: string[]): { child: ChildProcess; waitExit: Promise<AttachedChildExit> } {
-  const child = spawn(command, args, {
-    stdio: "inherit",
-    /*
-    FNXC:SystemPanel 2026-07-25-10:05:
-    FUSION_SUPERVISOR_PID lets the child verify this supervisor is its actual
-    parent. Without it, any grandchild that inherits FUSION_RESTART_SUPERVISED
-    (agent terminals, dev servers) would claim restart support it does not have.
-    */
-    env: { ...process.env, FUSION_RESTART_SUPERVISED: "1", FUSION_SUPERVISOR_PID: String(process.pid) },
-  });
-  const waitExit = new Promise<AttachedChildExit>((resolve) => {
-    child.on("close", (code, signal) => resolve({ code, signal }));
-    child.on("error", () => resolve({ code: 1, signal: null }));
-  });
-  return { child, waitExit };
-}
-
-function formatSupervisorRestartCommand(command: string, respawnArgs: readonly string[], childArgs: readonly string[]): string {
-  return [command, ...respawnArgs, ...childArgs].map(quoteShellArg).join(" ");
-}
-
-function quoteShellArg(value: string): string {
-  if (/^[A-Za-z0-9_/:=.,+-]+$/.test(value)) {
-    return value;
-  }
-  return `'${value.replace(/'/g, "'\\''")}'`;
+export function classifyDashboardFatalExit(error: unknown): {
+  readonly exitCode: number;
+  readonly nonRetryable: boolean;
+} {
+  const nonRetryable = isPostgresUniqueError(error);
+  return {
+    exitCode: nonRetryable ? FUSION_NON_RETRYABLE_EXIT_CODE : 1,
+    nonRetryable,
+  };
 }

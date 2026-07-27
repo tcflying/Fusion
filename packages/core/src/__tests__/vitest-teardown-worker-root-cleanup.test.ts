@@ -6,6 +6,8 @@ import { __fusionWorkerRootCleanupTestHooks } from "../__test-utils__/vitest-set
 import setup, {
   __setWorkerRootRmSyncForTests,
   finalizeWorkerRootCleanup,
+  finalizeWorkerRootCleanupAfterLifecycle,
+  finalizeWorkerRootCleanupAfterLifecycleSync,
   removeWorkerRootWithRetry,
   removeLegacyTopLevelHomeRoots,
 } from "../__test-utils__/vitest-teardown";
@@ -121,6 +123,50 @@ describe("vitest global teardown worker-root cleanup", () => {
     rmSync(childLifecycleRecord, { force: true });
     finalizeWorkerRootCleanup(workerRoot);
 
+    expect(existsSync(workerRoot)).toBe(false);
+  });
+
+  it("waits boundedly for a just-exiting worker lifecycle before deleting the shared root", async () => {
+    const workerRoot = remember(mkdtempSync(join(tmpdir(), "fusion-test-workers-lifecycle-wait-")));
+    makeWorkerChild(workerRoot, "late-exit");
+    const lifecycleDir = join(workerRoot, ".fusion-test-worker-lifecycle");
+    const lifecycleRecord = join(lifecycleDir, `worker-${process.pid}.json`);
+    mkdirSync(lifecycleDir, { recursive: true });
+    writeFileSync(lifecycleRecord, JSON.stringify({ pid: process.pid, kind: "worker" }));
+    let waits = 0;
+
+    await finalizeWorkerRootCleanupAfterLifecycle(workerRoot, {
+      maxWaitMs: 100,
+      pollIntervalMs: 1,
+      sleep: async () => {
+        waits++;
+        rmSync(lifecycleRecord, { force: true });
+      },
+    });
+
+    expect(waits).toBe(1);
+    expect(existsSync(workerRoot)).toBe(false);
+  });
+
+  it("supports the same bounded lifecycle drain in a forced synchronous exit path", () => {
+    const workerRoot = remember(mkdtempSync(join(tmpdir(), "fusion-test-workers-lifecycle-exit-")));
+    makeWorkerChild(workerRoot, "forced-exit");
+    const lifecycleDir = join(workerRoot, ".fusion-test-worker-lifecycle");
+    const lifecycleRecord = join(lifecycleDir, `worker-${process.pid}.json`);
+    mkdirSync(lifecycleDir, { recursive: true });
+    writeFileSync(lifecycleRecord, JSON.stringify({ pid: process.pid, kind: "worker" }));
+    let waits = 0;
+
+    finalizeWorkerRootCleanupAfterLifecycleSync(workerRoot, {
+      maxWaitMs: 100,
+      pollIntervalMs: 1,
+      sleep: () => {
+        waits++;
+        rmSync(lifecycleRecord, { force: true });
+      },
+    });
+
+    expect(waits).toBe(1);
     expect(existsSync(workerRoot)).toBe(false);
   });
 

@@ -1,10 +1,10 @@
 {
   "name": "@fusion-plugin-examples/happier-runtime",
-  "version": "0.2.73",
+  "version": "0.3.0",
   "type": "module",
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
-  "description": "Happier JSON CLI runtime contract plugin for Fusion",
+  "description": "Local/custom Fusion adapter for a pinned Happier CLI and MCP contract",
   "keywords": [
     "fusion-plugin",
     "happier",

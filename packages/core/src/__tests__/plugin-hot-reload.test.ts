@@ -228,6 +228,26 @@ describe("PluginLoader Hot-Reload", () => {
       delete (globalThis as typeof globalThis & { __legacyPluginOnLoad?: () => void }).__legacyPluginOnLoad;
     });
 
+    it("fails closed before onLoad when its TaskStore cannot apply a declared schema", async () => {
+      const onLoad = vi.fn();
+      (globalThis as typeof globalThis & { __missingSchemaAdapterOnLoad?: () => void }).__missingSchemaAdapterOnLoad = onLoad;
+      await writePluginModule(tmpDir, "plugin.js", baseManifest, {
+        onPostgresSchemaInit: `() => ({ version: 1, tablePrefix: "fixture_", statements: [] })`,
+        onLoad: `() => globalThis.__missingSchemaAdapterOnLoad()`,
+      });
+      pluginLoader = new PluginLoader({
+        pluginStore: mockPluginStore,
+        taskStore: { on: vi.fn(), off: vi.fn() } as any,
+      });
+
+      await expect(pluginLoader.loadPlugin("hot-reload-test")).rejects.toThrow(
+        'Plugin "hot-reload-test" declares schema initialization but the current TaskStore cannot safely apply plugin schemas',
+      );
+      expect(onLoad).not.toHaveBeenCalled();
+      expect(pluginLoader.isPluginLoaded("hot-reload-test")).toBe(false);
+      delete (globalThis as typeof globalThis & { __missingSchemaAdapterOnLoad?: () => void }).__missingSchemaAdapterOnLoad;
+    });
+
     it("should load a plugin after initial startup", async () => {
       // Initially no plugins loaded
       expect(pluginLoader.getPluginTools()).toEqual([]);

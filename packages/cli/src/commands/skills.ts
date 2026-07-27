@@ -7,6 +7,11 @@
  */
 
 import { spawn } from "node:child_process";
+import {
+  searchPublicSkillsWithFallback,
+  type SkillsSearchMetadata,
+  type UpstreamErrorCode,
+} from "@fusion/dashboard/skills-search";
 
 /**
  * Skill entry from the skills.sh /api/search endpoint.
@@ -30,19 +35,38 @@ export interface SkillsShSearchResult {
  */
 export const SKILLS_API_BASE = process.env.SKILLS_API_URL ?? "https://skills.sh";
 
-/**
- * Response from the skills.sh /api/search endpoint.
+export type SkillsSearchOutcome =
+  | {
+      skills: SkillsShSearchResult[];
+      search: SkillsSearchMetadata;
+    }
+  | {
+      skills: [];
+      error: string;
+      code: UpstreamErrorCode;
+    };
+
+/*
+ * FNXC:CliSkillsSearchFallback 2026-07-27-02:38:
+ * CLI skills search must share the Dashboard's semantic-to-fuzzy/FTS fallback and expose its warning/source. A transport or index failure is an explicit error outcome, never an empty successful result that looks like "no matching skills."
  */
-interface SkillsSearchResponse {
-  query: string;
-  searchType: string;
-  skills: Array<{
-    id: string;
-    skillId: string;
-    name: string;
-    installs: number;
-    source: string;
-  }>;
+export async function searchSkillsDetailed(query: string, limit = 10): Promise<SkillsSearchOutcome> {
+  const result = await searchPublicSkillsWithFallback({
+    baseUrl: SKILLS_API_BASE,
+    query,
+    limit,
+  });
+  if ("error" in result) {
+    return {
+      skills: [],
+      error: result.error,
+      code: result.code,
+    };
+  }
+  return {
+    skills: result.skills.sort((a, b) => b.installs - a.installs),
+    search: result.search,
+  };
 }
 
 /**
@@ -55,35 +79,12 @@ interface SkillsSearchResponse {
  * @returns Array of matching skills sorted by install count descending
  */
 export async function searchSkills(query: string, limit = 10): Promise<SkillsShSearchResult[]> {
-  const url = `${SKILLS_API_BASE}/api/search?q=${encodeURIComponent(query)}&limit=${limit}`;
-
-  try {
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(10_000),
-      headers: {
-        Accept: "application/json",
-      },
-    });
-
-    if (!response.ok) {
-      console.error(`[skills] Search failed: HTTP ${response.status} ${response.statusText}`);
-      return [];
-    }
-
-    const data = (await response.json()) as SkillsSearchResponse;
-
-    if (!data.skills || !Array.isArray(data.skills)) {
-      console.error("[skills] Invalid response format from skills.sh API");
-      return [];
-    }
-
-    // Return skills sorted by installs descending
-    return data.skills.sort((a, b) => b.installs - a.installs);
-  } catch (err) {
-    const error = err as Error;
-    console.error(`[skills] Search failed: ${error.message}`);
+  const result = await searchSkillsDetailed(query, limit);
+  if ("error" in result) {
+    console.error(`[skills] Search failed: ${result.error}`);
     return [];
   }
+  return result.skills;
 }
 
 /**
@@ -123,7 +124,17 @@ export async function runSkillsSearch(
     return;
   }
 
-  const skills = await searchSkills(query, options?.limit ?? 10);
+  const result = await searchSkillsDetailed(query, options?.limit ?? 10);
+  if ("error" in result) {
+    console.error(`[skills] Search failed: ${result.error}`);
+    return;
+  }
+  const { skills, search } = result;
+  if (search.warning) {
+    console.warn(
+      `[skills] Warning: ${search.warning} (source: ${search.fallbackSource ?? search.source})`,
+    );
+  }
 
   if (skills.length === 0) {
     console.log(`No skills found for '${query}'`);

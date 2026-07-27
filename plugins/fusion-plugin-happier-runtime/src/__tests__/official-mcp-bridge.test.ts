@@ -41,6 +41,25 @@ function legacyExtensionDependencies(): LegacyExtensionSpies {
   };
 }
 
+function attestPinnedCli() {
+  return vi.fn(async () => ({
+    ok: true as const,
+    trustLevel: "local_custom_pinned_source_build" as const,
+    sourceRoot: "G:\\codex-project\\happier",
+    entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+    cliVersion: "0.2.10",
+    sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+    entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786" as const,
+    verifiedAt: "2026-07-27T05:20:00.000Z",
+    evidence: {
+      version: "cli_--version" as const,
+      package: "package_json" as const,
+      source: "git_head" as const,
+      artifact: "sha256_file_bytes" as const,
+    },
+  }));
+}
+
 function officialMcpClient() {
   const callTool = vi.fn(async (input: { name: string; arguments?: Record<string, unknown> }) => {
     if (input.name === "session_list") {
@@ -93,6 +112,7 @@ describe("Happier official MCP bridge", () => {
       dependencies: {
         ...legacy,
         openMcpClient,
+        attestCli: attestPinnedCli(),
       } as unknown as Partial<HappierSessionConnectorDependencies>,
     });
 
@@ -138,6 +158,7 @@ describe("Happier official MCP bridge", () => {
       dependencies: {
         ...legacy,
         openMcpClient,
+        attestCli: attestPinnedCli(),
       } as unknown as Partial<HappierSessionConnectorDependencies>,
       now: () => "2026-07-19T19:29:00.000Z",
     });
@@ -192,6 +213,7 @@ describe("Happier official MCP bridge", () => {
       dependencies: {
         ...legacy,
         openMcpClient: vi.fn(async () => client),
+        attestCli: attestPinnedCli(),
       } as unknown as Partial<HappierSessionConnectorDependencies>,
       now: () => "2026-07-20T14:02:00.000Z",
     });

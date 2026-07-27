@@ -27,8 +27,14 @@ export interface Logger {
   error(message: string, ...args: unknown[]): void;
 }
 
-const LOG_LEVEL_MARKER_PREFIX = "\u0000fnlvl=";
-const LOG_LEVEL_MARKER_SUFFIX = "\u0000";
+/*
+FNXC:PrintableLogFraming 2026-07-27-02:50:
+Engine logs share the dashboard TUI severity contract with core logs. Keep the
+marker printable so redirected dashboard, serve, and daemon output remains
+plain searchable text instead of being classified as binary.
+*/
+const LOG_LEVEL_MARKER_PREFIX = "[fnlvl=";
+const LOG_LEVEL_MARKER_SUFFIX = "] ";
 
 function withSeverityMarker(level: "info" | "warn" | "error", payload: string): string {
   return `${LOG_LEVEL_MARKER_PREFIX}${level}${LOG_LEVEL_MARKER_SUFFIX}${payload}`;
@@ -58,9 +64,9 @@ function isDebugEnabled(prefix: string): boolean {
  *          engine logs off stdout prevents command/test output consumers from
  *          receiving Fusion execution chatter.
  *
- *          The logger prepends an internal control-character severity marker
- *          so dashboard TUI console-capture can preserve info/warn/error
- *          semantics even when `log()` is transported via `console.error`.
+ *          The logger prepends a printable severity marker so dashboard TUI
+ *          console-capture can preserve info/warn/error semantics even when
+ *          `log()` is transported via `console.error`.
  *
  *          `debug()` is gated on `FUSION_DEBUG` and re-reads the env var per
  *          call so tests and long-lived processes can toggle it without

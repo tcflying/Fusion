@@ -203,6 +203,8 @@ vi.mock("../ensure-project-registered.js", () => ({
 
 vi.mock("@fusion/dashboard", () => ({
   createServer: mocks.createServer,
+  getCliPackageVersion: vi.fn(() => "0.74.0-beta.3"),
+  isUnresolvedCliPackageVersion: vi.fn(() => false),
   loadTlsCredentialsFromEnv: vi.fn().mockReturnValue(undefined),
 }));
 

@@ -20,7 +20,10 @@ import {
 import { RoomControlPlaneReadService } from "@fusion/engine";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as serverModule from "../server.js";
-import { createServer, type RoomControlPlaneProjectAuthorizer } from "../server.js";
+import {
+  createServer as createDashboardServer,
+  type RoomControlPlaneProjectAuthorizer,
+} from "../server.js";
 import { DEFAULT_ROOM_CONTROL_PLANE_TRUSTED_DEVICE_COOKIE_NAME } from "../room-control-plane-rbac-authorizer.js";
 import { request } from "../test-request.js";
 
@@ -226,6 +229,34 @@ class MemoryStore extends EventEmitter {
 
   getSettings = vi.fn(async () => ({}));
   getSettingsFast = vi.fn(async () => ({}));
+  getProjectScopedPluginMcpServers = vi.fn(async () => []);
+}
+
+function createTestAiSessionStore() {
+  return Object.assign(new EventEmitter(), {
+    recoverStaleSessions: vi.fn(async () => 0),
+    listRecoverable: vi.fn(async () => []),
+    cleanupStaleSessions: vi.fn(async () => 0),
+    stopScheduledCleanup: vi.fn(),
+  });
+}
+
+function createTestChatStore() {
+  return Object.assign(new EventEmitter(), {
+    deleteSessionsForAgentId: vi.fn(async () => 0),
+  });
+}
+
+function createServer(
+  store: TaskStore,
+  options?: Parameters<typeof createDashboardServer>[1],
+): ReturnType<typeof createDashboardServer> {
+  return createDashboardServer(store, {
+    aiSessionStore: createTestAiSessionStore() as never,
+    chatStore: createTestChatStore() as never,
+    chatManager: {} as never,
+    ...options,
+  });
 }
 
 function roomSummary(): RoomSummaryV1 {
@@ -451,9 +482,9 @@ describe("Room control-plane server wiring", () => {
     const list = await request(app, "GET", `/api/rooms?projectId=${PROJECT_ID}`);
     const projection = await request(app, "GET", `/api/rooms/${ROOM_ID}?projectId=${PROJECT_ID}`);
 
-    expect(list.status).toBe(200);
+    expect(list.status, JSON.stringify(list.body)).toBe(200);
     expect(list.body).toEqual({ rooms: [roomSummary()], nextCursor: null });
-    expect(projection.status).toBe(200);
+    expect(projection.status, JSON.stringify(projection.body)).toBe(200);
     expect(projection.body).toMatchObject({
       room: {
         roomId: ROOM_ID,
@@ -670,6 +701,93 @@ describe("Room control-plane server wiring", () => {
     expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
   });
 
+  it("keeps loopback no-auth Room writes behind an explicit durable trusted-device transport", async () => {
+    const { service } = createReadService();
+    const { engine, calls: engineCalls } = createProjectEngine(store, service);
+    const { manager } = createEngineManager(engine);
+    const resolvePublicOrigin = vi.fn(() => ROOM_RBAC_PUBLIC_ORIGIN);
+    const registry = createInMemoryRoomRbacRegistry();
+    const ownerCredential = createTrustedRoomDeviceCredential();
+    const now = new Date();
+    await registry.issueTrustedDeviceSession({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: PROJECT_ID,
+      sessionId: "desktop-owner-session",
+      principalId: "desktop-owner",
+      deviceId: "desktop-owner-device",
+      credential: ownerCredential,
+      issuedAt: new Date(now.getTime() - 60_000).toISOString(),
+      expiresAt: new Date(now.getTime() + 60 * 60_000).toISOString(),
+      idempotencyKey: "desktop-owner-session",
+    });
+    await registry.grantRole({
+      contractVersion: ROOM_RBAC_REGISTRY_CONTRACT_VERSION,
+      projectId: PROJECT_ID,
+      grantId: "desktop-owner-grant",
+      principalId: "desktop-owner",
+      role: "owner",
+      roomId: null,
+      grantedAt: now.toISOString(),
+      expectedAuthorizationVersion: 0,
+      idempotencyKey: "desktop-owner-grant",
+    });
+    (store as unknown as { getAsyncLayer(): object }).getAsyncLayer = () => ({});
+    const chatStore = Object.assign(new EventEmitter(), {
+      deleteSessionsForAgentId: vi.fn(async () => undefined),
+    });
+    const aiSessionStore = Object.assign(new EventEmitter(), {
+      recoverStaleSessions: vi.fn(async () => 0),
+      listRecoverable: vi.fn(async () => []),
+      stopScheduledCleanup: vi.fn(),
+    });
+    const app = createServer(store, {
+      engineManager: manager,
+      noAuth: true,
+      chatStore: chatStore as never,
+      aiSessionStore: aiSessionStore as never,
+      roomControlPlaneRbac: {
+        resolveRegistry: async () => registry,
+        resolvePublicOrigin,
+        allowLoopbackHttp: true,
+        authorizeDaemonTransport: async () => true,
+      },
+    });
+
+    const response = await request(
+      app,
+      "POST",
+      `/api/rooms?projectId=${PROJECT_ID}`,
+      JSON.stringify({ expectedAggregateVersion: 0, payload: { objective: "must remain denied" } }),
+      {
+        "content-type": "application/json",
+        origin: ROOM_RBAC_PUBLIC_ORIGIN,
+        "sec-fetch-site": "same-origin",
+      },
+    );
+    const paired = await request(
+      app,
+      "POST",
+      `/api/rooms/device-sessions?projectId=${PROJECT_ID}`,
+      JSON.stringify({}),
+      {
+        ...trustedDeviceHeaders(ownerCredential),
+        "content-type": "application/json",
+      },
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.body).toMatchObject({ details: { code: "ROOM_PROJECT_ACCESS_DENIED" } });
+    expect(paired.status).toBe(201);
+    expect(paired.body).toMatchObject({
+      session: {
+        deviceId: expect.any(String),
+        expiresAt: expect.any(String),
+      },
+    });
+    expect(resolvePublicOrigin).toHaveBeenCalled();
+    expect(engineCalls.getRoomControlPlaneReadService).not.toHaveBeenCalled();
+  });
+
   it("requires daemon transport and an existing durable owner before pairing a device", async () => {
     const { service } = createReadService();
     const { engine } = createProjectEngine(store, service);
@@ -861,8 +979,12 @@ describe("Room control-plane server wiring", () => {
     const mutation = await request(
       app,
       "POST",
-      `/api/rooms?projectId=${PROJECT_ID}`,
-      JSON.stringify({ expectedAggregateVersion: 0, payload: { objective: "must not create" } }),
+      `/api/rooms/${ROOM_ID}/messages/actions?projectId=${PROJECT_ID}`,
+      JSON.stringify({
+        expectedAggregateVersion: 3,
+        action: "send",
+        payload: { content: "must not dispatch" },
+      }),
       { "content-type": "application/json" },
     );
 

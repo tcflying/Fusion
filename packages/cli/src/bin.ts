@@ -147,8 +147,6 @@ function lazyCommandModule<TModule extends object>(
 // without importing the full command graph.
 function loadCommandHandlers() {
   const { runDashboard } = lazyCommandModule(() => import("./commands/dashboard.js"));
-  const { runServe } = lazyCommandModule(() => import("./commands/serve.js"));
-  const { runDaemon } = lazyCommandModule(() => import("./commands/daemon.js"));
   const { runDesktop } = lazyCommandModule(() => import("./commands/desktop.js"));
   const { runTaskCreate, runTaskList, runTaskMove, runTaskMerge, runTaskUpdate, runTaskDeps, runTaskLog, runTaskLogs, runTaskShow, runTaskAttach, runTaskPause, runTaskUnpause, runTaskImportFromGitHub, runTaskImportFromGitLab, runTaskDuplicate, runTaskArchive, runTaskUnarchive, runTaskRefine, runTaskPlan, runTaskDelete, runTaskRetry, runTaskComment, runTaskComments, runTaskSteer, runTaskSetNode, runTaskClearNode } = lazyCommandModule(() => import("./commands/task.js"));
   const { runPrCreate, runPrShow, runPrList, runPrRespond, runPrApprove, runPrRetry, runPrMerge, runPrClose, runPrAutomerge, runPrAutomergeCleanup } = lazyCommandModule(() => import("./commands/pr.js"));
@@ -187,8 +185,6 @@ function loadCommandHandlers() {
 
   return {
     runDashboard,
-    runServe,
-    runDaemon,
     runDesktop,
     runTaskCreate,
     runTaskList,
@@ -340,8 +336,8 @@ Usage:
   fn dashboard --dev                  Start dashboard in development mode
   fn dashboard --no-engine            Start web UI only (no AI engine)
   fn dashboard --interactive          Start with interactive port selection
-  fn serve [--port <port>] [--host <host>] [--paused] [--daemon] [--project <id|name>] [--no-auto-register]
-                                      Start Fusion as a headless node (API + engine, no UI)
+  fn serve [--port <port>] [--host <host>] [--token <token>] [--no-auth] [--paused] [--daemon] [--project <id|name>] [--no-auto-register]
+                                      Start Fusion as an authenticated, supervised headless node (API + engine, no UI)
                                       Auto-registers cwd project on first run (use --no-auto-register to disable)
   fn daemon [--port <port>] [--host <host>] [--token <token>] [--paused] [--token-only] [--project <id|name>] [--no-auto-register]
                                       Start Fusion daemon (API + engine, auth required)
@@ -530,13 +526,12 @@ Options:
   --port, -p <port>          Dashboard/serve port (default: 4040)
   --host <host>              Serve host (default: 127.0.0.1 — localhost only; pass 0.0.0.0 to expose)
   --token <token>            Dashboard/daemon bearer token. Default: $FUSION_DASHBOARD_TOKEN, $FUSION_DAEMON_TOKEN, or auto-generated.
-  --no-auth                  Disable dashboard bearer-token auth for dashboard/desktop (local-only; not recommended on 0.0.0.0)
+  --no-auth                  Disable dashboard/serve bearer auth on verified loopback only; non-loopback hosts fail closed
   --interactive              Interactive mode (port selection for dashboard, issue selection for import)
   --paused                   Start with engine paused (automation disabled)
   --dev                      Start dashboard in development mode
   --no-engine                Start dashboard only (no AI engine)
   --supervise                (default) Run with auto-restart on crash and System-panel restart support
-  --no-supervise             Run the dashboard without the supervising parent process
   --lang <locale>            Terminal-UI locale for this run (en, zh-CN, zh-TW, fr, es, ko); the browser dashboard resolves its own language
   --attach <file>            Attach file(s) on task create (repeatable)
   --depends <id>             Declare dependency on task create (repeatable)
@@ -744,8 +739,6 @@ async function main() {
 
   const {
     runDashboard,
-    runServe,
-    runDaemon,
     runDesktop,
     runTaskCreate,
     runTaskList,
@@ -928,10 +921,18 @@ async function main() {
         Supervision is the default for the dashboard (bare `fn`, `fusion`,
         npx, packaged binary alike): a foreground parent respawns the child on
         crash and on the System panel's intentional-restart exit code.
-        `--no-supervise` opts out; a child under an existing supervisor
-        (FUSION_RESTART_SUPERVISED=1, incl. `pnpm dev`) and inspector runs
-        never self-supervise. `--supervise` is kept as a no-op-compat flag.
+        A child under an existing supervisor (validated by the stamped parent
+        pid) and inspector runs never self-supervise. The retired
+        `--no-supervise` flag is ignored; `--supervise` remains a no-op-compat
+        flag.
         */
+        if (noAuth) {
+          const { createDashboardAuthContext } = await import("@fusion/dashboard");
+          createDashboardAuthContext({
+            host: host ?? "127.0.0.1",
+            noAuth: true,
+          });
+        }
         const { shouldSuperviseDashboard } = await import("./commands/dashboard.js");
         const supervise = shouldSuperviseDashboard(args);
         const dashLangIdx = args.indexOf("--lang");
@@ -955,36 +956,14 @@ async function main() {
       }
 
       case "serve": {
-        const portIdx = args.indexOf("--port");
-        const portIdxShort = args.indexOf("-p");
-        const pi = portIdx !== -1 ? portIdx : portIdxShort;
-        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 4040;
-        const paused = args.includes("--paused");
-        const interactive = args.includes("--interactive");
-        const hostIdx = args.indexOf("--host");
-        const host = hostIdx !== -1 && hostIdx + 1 < args.length ? args[hostIdx + 1] : undefined;
-        const daemon = args.includes("--daemon");
-        const project = getFlagValue(args, "--project");
-        const noAutoRegister = args.includes("--no-auto-register");
-        await runServe(port, { paused, interactive, host, daemon, project, noAutoRegister });
+        const { runServeCommand } = await import("./commands/server-command-dispatch.js");
+        await runServeCommand(args);
         break;
       }
 
       case "daemon": {
-        const portIdx = args.indexOf("--port");
-        const portIdxShort = args.indexOf("-p");
-        const pi = portIdx !== -1 ? portIdx : portIdxShort;
-        const port = pi !== -1 ? parseInt(args[pi + 1], 10) : 0;
-        const paused = args.includes("--paused");
-        const interactive = args.includes("--interactive");
-        const hostIdx = args.indexOf("--host");
-        const host = hostIdx !== -1 && hostIdx + 1 < args.length ? args[hostIdx + 1] : undefined;
-        const tokenIdx = args.indexOf("--token");
-        const token = tokenIdx !== -1 && tokenIdx + 1 < args.length ? args[tokenIdx + 1] : undefined;
-        const tokenOnly = args.includes("--token-only");
-        const project = getFlagValue(args, "--project");
-        const noAutoRegister = args.includes("--no-auto-register");
-        await runDaemon({ port, paused, interactive, host, token, tokenOnly, project, noAutoRegister });
+        const { runDaemonCommand } = await import("./commands/server-command-dispatch.js");
+        await runDaemonCommand(args);
         break;
       }
 

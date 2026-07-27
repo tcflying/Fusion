@@ -18,6 +18,7 @@ import type {
   RoomPhaseGateEvidenceRecordV1,
   RoomRoleAssignmentConstraintsV1,
   RoomRoleAssignmentProjectionV1,
+  RunAuditEventInput,
   RouteRoomProtocolMessageInputV1,
   RouteRoomProtocolMessageResultV1,
   RouteOperatorMessageResultV1,
@@ -66,7 +67,12 @@ export type RoomExistingSessionStore = Pick<
   | "transitionRoomRoleAssignment"
   | "routeRoomProtocolMessage"
   | "routeOperatorMessage"
+  | "requestMembershipChange"
 > & RoomConnectorIngestionStore;
+
+export type RoomExistingSessionAuditStore = Pick<{
+  recordRunAuditEvent(input: RunAuditEventInput): unknown | Promise<unknown>;
+}, "recordRunAuditEvent">;
 
 /**
  * The caller must attest concrete binding capabilities rather than inferring
@@ -94,6 +100,32 @@ export interface CreateRoomWithExistingSessionsInput {
   readonly room: CreateRoomWithExistingBindingsInput["room"];
   readonly sessions: readonly ExactExistingSessionSeatRequest[];
   readonly roleAssignment: RoomRoleAssignmentConfigurationV1;
+}
+
+export interface RestoreRoomExistingSessionsInput {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly idempotencyKey: string;
+}
+
+export interface RequestAddExistingSessionAtTurnBoundaryInput {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedMembershipVersion: number;
+  readonly changeId: string;
+  readonly idempotencyKey: string;
+  readonly reason: string;
+  readonly session: ExactExistingSessionSeatRequest;
+}
+
+export interface RequestRemoveExistingSessionAtTurnBoundaryInput {
+  readonly roomId: string;
+  readonly expectedAggregateVersion: number;
+  readonly expectedMembershipVersion: number;
+  readonly changeId: string;
+  readonly idempotencyKey: string;
+  readonly reason: string;
+  readonly seatId: string;
 }
 
 export interface TransitionRoomRoleAssignmentAtCompletedTurnBoundaryInput {
@@ -147,6 +179,7 @@ export interface RoomExistingSessionSpineOptions {
   readonly projectId: string;
   readonly roomStore: RoomExistingSessionStore;
   readonly connectorRegistry: SessionConnectorRegistry;
+  readonly auditStore?: RoomExistingSessionAuditStore;
   readonly now?: () => string;
   readonly ingestionLimits: SessionConnectorIngestionLimits;
 }
@@ -177,6 +210,13 @@ before connector ensure or Room persistence, then activates the durable entry
 assignment with a causal system command. Later phases use an explicit completed
 turn boundary and retain core's atomic CAS/gate enforcement; this is a runtime
 seam, not a live-provider certification.
+
+FNXC:SessionRoomMembershipControl 2026-07-27-06:25:
+Dashboard attach/remove requests are staged through Core's durable membership
+CAS and become active only at a completed turn boundary. Restore re-verifies
+every attached native Session through ensureExisting without starting a
+provider turn or creating a replacement. A post-ensure CAS prevents a stale
+operator view from being reported as restored.
 */
 export class RoomExistingSessionSpine {
   private readonly now: () => string;
@@ -277,6 +317,189 @@ export class RoomExistingSessionSpine {
       occurredAt,
     });
     return this.requireRoom(created.room.id);
+  }
+
+  async restoreRoomExistingSessions(
+    input: RestoreRoomExistingSessionsInput,
+  ): Promise<RoomAggregateV1> {
+    requireNonEmpty(input.roomId, "roomId");
+    requireNonEmpty(input.idempotencyKey, "idempotencyKey");
+    requireVersion(input.expectedAggregateVersion, "expectedAggregateVersion");
+    const room = await this.requireRoom(input.roomId);
+    if (room.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+        "Existing-Session Room restore requires the current aggregate version",
+      );
+    }
+
+    const attachedBindings = room.bindings.filter((binding) => binding.state === "attached");
+    if (attachedBindings.length < 2) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_BINDING_NOT_FOUND",
+        "Existing-Session Room restore requires at least two attached bindings",
+      );
+    }
+    for (const binding of attachedBindings) {
+      if (!binding.machineId) {
+        throw new RoomExistingSessionSpineError(
+          "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+          "Existing Session restore requires a durable machine identity for every binding",
+        );
+      }
+      const connector = await this.options.connectorRegistry.requireVerified({
+        connectorId: binding.connectorId,
+        capability: "ensureExisting",
+        requiredHostId: binding.hostId,
+        allowUnknownRateLimitForReadOnlyAttachment: true,
+      });
+      let ensured: Awaited<ReturnType<typeof connector.ensureExisting>>;
+      try {
+        ensured = await connector.ensureExisting({
+          contractVersion: 1,
+          canonicalSessionUri: canonicalSessionUriForBinding(binding),
+          requiredHostId: binding.hostId,
+          requiredMachineId: binding.machineId,
+          idempotencyKey: `${input.idempotencyKey}:${binding.id}`,
+        });
+      } catch {
+        throw new RoomExistingSessionSpineError(
+          "ROOM_EXISTING_SESSION_ENSURE_FAILED",
+          "Existing Session restore threw before identity could be re-verified",
+        );
+      }
+      if (!ensured.ok) {
+        throw new RoomExistingSessionSpineError(
+          "ROOM_EXISTING_SESSION_ENSURE_FAILED",
+          `Existing Session restore failed with connector code ${ensured.error.code}`,
+        );
+      }
+      if (ensured.value.providerTurnStarted !== false) {
+        throw new RoomExistingSessionSpineError(
+          "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+          "Existing Session restore must not start a provider turn",
+        );
+      }
+      assertRestoredBindingIdentity(binding, ensured.value.identity);
+    }
+
+    const restored = await this.requireRoom(input.roomId);
+    if (restored.room.aggregateVersion !== input.expectedAggregateVersion) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+        "Existing-Session Room changed while restore identities were being verified",
+      );
+    }
+    await this.recordOperatorAudit("room:restore-existing-sessions", input.roomId, {
+      idempotencyKey: input.idempotencyKey,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      bindingIds: attachedBindings.map((binding) => binding.id),
+    });
+    return restored;
+  }
+
+  async requestAddExistingSessionAtTurnBoundary(
+    input: RequestAddExistingSessionAtTurnBoundaryInput,
+  ): Promise<RoomAggregateV1> {
+    validateMembershipRequestBase(input);
+    validateSingleExistingSessionRequest(input.session);
+    const current = await this.requireRoom(input.roomId);
+    requireMembershipVersions(current, input.expectedAggregateVersion, input.expectedMembershipVersion);
+    const connector = await this.options.connectorRegistry.requireVerified({
+      connectorId: input.session.connectorId,
+      capability: "ensureExisting",
+      requiredHostId: input.session.requiredHostId,
+      allowUnknownRateLimitForReadOnlyAttachment: true,
+    });
+    let ensured: Awaited<ReturnType<typeof connector.ensureExisting>>;
+    try {
+      ensured = await connector.ensureExisting({
+        contractVersion: 1,
+        canonicalSessionUri: input.session.canonicalSessionUri,
+        requiredHostId: input.session.requiredHostId,
+        requiredMachineId: input.session.requiredMachineId,
+        idempotencyKey: input.session.idempotencyKey,
+      });
+    } catch {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_ENSURE_FAILED",
+        "Existing Session attach threw before the membership request was persisted",
+      );
+    }
+    if (!ensured.ok) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_ENSURE_FAILED",
+        `Existing Session attach failed with connector code ${ensured.error.code}`,
+      );
+    }
+    if (ensured.value.providerTurnStarted !== false) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+        "Existing Session attach must not start a provider turn",
+      );
+    }
+    assertEnsuredIdentity(input.session, ensured.value.identity);
+    const occurredAt = this.now();
+    return this.options.roomStore.requestMembershipChange({
+      roomId: input.roomId,
+      changeId: input.changeId,
+      idempotencyKey: input.idempotencyKey,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedMembershipVersion: input.expectedMembershipVersion,
+      activateAt: "next_turn_boundary",
+      mutation: {
+        action: "add",
+        seat: {
+          id: input.session.seatId,
+          role: input.session.role,
+          permissionScope: [...input.session.permissionScope],
+        },
+        binding: bindingFromIdentity(input.session.bindingId, ensured.value.identity),
+      },
+      reason: input.reason,
+      requestedAt: occurredAt,
+    }, {
+      eventId: `room-existing-session:${input.roomId}:membership:${hashRoomValue(input.idempotencyKey)}`,
+      actorType: "system",
+      actorId: "room-existing-session-spine",
+      correlationId: `room-existing-session:${input.roomId}:membership`,
+      causationId: null,
+      occurredAt,
+    });
+  }
+
+  async requestRemoveExistingSessionAtTurnBoundary(
+    input: RequestRemoveExistingSessionAtTurnBoundaryInput,
+  ): Promise<RoomAggregateV1> {
+    validateMembershipRequestBase(input);
+    requireNonEmpty(input.seatId, "seatId");
+    const current = await this.requireRoom(input.roomId);
+    requireMembershipVersions(current, input.expectedAggregateVersion, input.expectedMembershipVersion);
+    if (!current.seats.some((seat) => seat.id === input.seatId && seat.state === "active")) {
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_SEAT_NOT_FOUND",
+        "Only an active Room seat can be removed",
+      );
+    }
+    const occurredAt = this.now();
+    return this.options.roomStore.requestMembershipChange({
+      roomId: input.roomId,
+      changeId: input.changeId,
+      idempotencyKey: input.idempotencyKey,
+      expectedAggregateVersion: input.expectedAggregateVersion,
+      expectedMembershipVersion: input.expectedMembershipVersion,
+      activateAt: "next_turn_boundary",
+      mutation: { action: "remove", seatId: input.seatId },
+      reason: input.reason,
+      requestedAt: occurredAt,
+    }, {
+      eventId: `room-existing-session:${input.roomId}:membership:${hashRoomValue(input.idempotencyKey)}`,
+      actorType: "system",
+      actorId: "room-existing-session-spine",
+      correlationId: `room-existing-session:${input.roomId}:membership`,
+      causationId: null,
+      occurredAt,
+    });
   }
 
   async transitionRoleAssignmentAtCompletedTurnBoundary(
@@ -440,6 +663,23 @@ export class RoomExistingSessionSpine {
     return this.requireRoom(roomId);
   }
 
+  private async recordOperatorAudit(
+    mutationType: string,
+    roomId: string,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.options.auditStore) return;
+    await this.options.auditStore.recordRunAuditEvent({
+      projectId: this.options.projectId,
+      agentId: "room-existing-session-spine",
+      runId: roomId,
+      domain: "database",
+      mutationType,
+      target: roomId,
+      metadata,
+    });
+  }
+
   private async requireRoom(roomId: string): Promise<RoomAggregateV1> {
     requireNonEmpty(roomId, "roomId");
     const room = await this.options.roomStore.getRoom(roomId);
@@ -467,22 +707,73 @@ function validateExistingSessionRequests(
   const canonicalUris = new Set<string>();
   const idempotencyKeys = new Set<string>();
   for (const session of sessions) {
-    for (const [field, value] of Object.entries({
-      seatId: session.seatId,
-      bindingId: session.bindingId,
-      role: session.role,
-      connectorId: session.connectorId,
-      canonicalSessionUri: session.canonicalSessionUri,
-      requiredHostId: session.requiredHostId,
-      requiredMachineId: session.requiredMachineId,
-      idempotencyKey: session.idempotencyKey,
-    })) {
-      requireNonEmpty(value, field);
-    }
+    validateSingleExistingSessionRequest(session);
     rejectDuplicate(seatIds, session.seatId, "seat ID");
     rejectDuplicate(bindingIds, session.bindingId, "binding ID");
     rejectDuplicate(canonicalUris, session.canonicalSessionUri, "canonical Session URI");
     rejectDuplicate(idempotencyKeys, session.idempotencyKey, "ensure idempotency key");
+  }
+}
+
+function validateSingleExistingSessionRequest(
+  session: ExactExistingSessionSeatRequest,
+): void {
+  for (const [field, value] of Object.entries({
+    seatId: session.seatId,
+    bindingId: session.bindingId,
+    role: session.role,
+    connectorId: session.connectorId,
+    canonicalSessionUri: session.canonicalSessionUri,
+    requiredHostId: session.requiredHostId,
+    requiredMachineId: session.requiredMachineId,
+    idempotencyKey: session.idempotencyKey,
+  })) {
+    requireNonEmpty(value, field);
+  }
+  if (!Array.isArray(session.permissionScope) || session.permissionScope.some((scope) => typeof scope !== "string" || !scope.trim())) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_INVALID_REQUEST",
+      "permissionScope must contain only non-empty strings",
+    );
+  }
+}
+
+function validateMembershipRequestBase(
+  input: Pick<
+    RequestAddExistingSessionAtTurnBoundaryInput,
+    "roomId" | "expectedAggregateVersion" | "expectedMembershipVersion" | "changeId" | "idempotencyKey" | "reason"
+  >,
+): void {
+  requireNonEmpty(input.roomId, "roomId");
+  requireNonEmpty(input.changeId, "changeId");
+  requireNonEmpty(input.idempotencyKey, "idempotencyKey");
+  requireNonEmpty(input.reason, "reason");
+  requireVersion(input.expectedAggregateVersion, "expectedAggregateVersion");
+  requireVersion(input.expectedMembershipVersion, "expectedMembershipVersion");
+}
+
+function requireVersion(value: number, field: string): void {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_INVALID_REQUEST",
+      `${field} must be a non-negative safe integer`,
+    );
+  }
+}
+
+function requireMembershipVersions(
+  room: RoomAggregateV1,
+  expectedAggregateVersion: number,
+  expectedMembershipVersion: number,
+): void {
+  if (
+    room.room.aggregateVersion !== expectedAggregateVersion
+    || room.membershipVersion !== expectedMembershipVersion
+  ) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+      "Room membership request is stale and must be refreshed before retrying",
+    );
   }
 }
 
@@ -654,6 +945,43 @@ function assertEnsuredIdentity(
       "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
       "Connector ensure returned an identity outside the requested connector, host, or machine",
     );
+  }
+}
+
+function assertRestoredBindingIdentity(
+  binding: RoomBindingRecordV1,
+  identity: SessionConnectorIdentityV1,
+): void {
+  if (
+    identity.connectorId !== binding.connectorId
+    || identity.providerId !== binding.providerId
+    || identity.nativeSessionId !== binding.nativeSessionId
+    || identity.happierSessionId !== binding.happierSessionId
+    || identity.serverProfileId !== binding.serverProfileId
+    || identity.machineId !== binding.machineId
+    || identity.hostId !== binding.hostId
+  ) {
+    throw new RoomExistingSessionSpineError(
+      "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+      "Existing Session restore returned a different canonical identity",
+    );
+  }
+}
+
+function canonicalSessionUriForBinding(binding: RoomBindingRecordV1): string {
+  if (binding.nativeSessionId.includes("://")) return binding.nativeSessionId;
+  switch (binding.providerId) {
+    case "codex":
+      return `codex://threads/${binding.nativeSessionId}`;
+    case "claude":
+      return `claude://sessions/${binding.nativeSessionId}`;
+    case "opencode":
+      return `opencode://sessions/${binding.nativeSessionId}`;
+    default:
+      throw new RoomExistingSessionSpineError(
+        "ROOM_EXISTING_SESSION_IDENTITY_CONFLICT",
+        `Provider ${binding.providerId} has no verified canonical Session URI mapping`,
+      );
   }
 }
 

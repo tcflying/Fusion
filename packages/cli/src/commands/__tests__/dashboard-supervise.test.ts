@@ -8,7 +8,8 @@ Supervision must be the DEFAULT for the dashboard across install shapes (bare
 `fn`/`fusion`, npx, packaged binary) so the System panel restart works out of
 the box, while never nesting supervisors (FUSION_RESTART_SUPERVISED=1 set by
 the supervisor itself and by scripts/dev-with-memory.mjs), never fighting an
-attached debugger, and honoring the --no-supervise opt-out.
+attached debugger, while the retired --no-supervise flag cannot disable
+recovery.
 */
 describe("shouldSuperviseDashboard", () => {
   it("defaults to supervised for a plain dashboard invocation", () => {
@@ -19,12 +20,12 @@ describe("shouldSuperviseDashboard", () => {
     expect(shouldSuperviseDashboard([], {}, [])).toBe(true);
   });
 
-  it("is disabled by --no-supervise", () => {
-    expect(shouldSuperviseDashboard(["dashboard", "--no-supervise"], {}, [])).toBe(false);
+  it("does not allow the retired --no-supervise flag to disable recovery", () => {
+    expect(shouldSuperviseDashboard(["dashboard", "--no-supervise"], {}, [])).toBe(true);
   });
 
-  it("never nests: disabled when a supervising parent already exists", () => {
-    expect(shouldSuperviseDashboard(["dashboard"], { FUSION_RESTART_SUPERVISED: "1" }, [])).toBe(false);
+  it("does not trust a legacy flag without an actual parent pid", () => {
+    expect(shouldSuperviseDashboard(["dashboard"], { FUSION_RESTART_SUPERVISED: "1" }, [])).toBe(true);
   });
 
   /*
@@ -53,8 +54,8 @@ describe("hasLiveSupervisingParent", () => {
     expect(hasLiveSupervisingParent({}, 1)).toBe(false);
   });
 
-  it("accepts a parent that predates the pid stamp (legacy dev wrapper)", () => {
-    expect(hasLiveSupervisingParent({ FUSION_RESTART_SUPERVISED: "1" }, 1)).toBe(true);
+  it("rejects a legacy flag without a parent pid stamp", () => {
+    expect(hasLiveSupervisingParent({ FUSION_RESTART_SUPERVISED: "1" }, 1)).toBe(false);
   });
 
   it("accepts the stamped supervisor when it is our actual parent", () => {

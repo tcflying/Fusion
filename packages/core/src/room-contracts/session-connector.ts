@@ -442,6 +442,8 @@ export const SESSION_CONNECTOR_HEALTH_REASON_CODES = [
   "backend_unavailable",
   "backend_timeout",
   "backend_invalid",
+  "backend_machine_availability_unverified",
+  "cli_attestation_failed",
   "rate_limited",
   "host_unavailable",
   "capability_not_verified",

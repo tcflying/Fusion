@@ -125,6 +125,19 @@ export class DashboardTUI {
   // True while a full-screen terminal attach owns the TTY; suppresses Ink
   // re-render/resize work that would corrupt the passthrough surface.
   private terminalAttachActive = false;
+  /*
+  FNXC:DashboardAuthTui 2026-07-27-16:43:
+  Keep the bearer out of serializable/renderable DashboardState. The provider
+  is an in-process capability used only by explicit clipboard and terminal
+  attach actions; snapshots, logs, React frames, and browser URLs receive only
+  the masked display value.
+  */
+  private dashboardAuthTokenProvider: (() => string | undefined) | null = null;
+  private lastNonPausedEngineMode:
+    | "no-engine"
+    | "active"
+    | "withheld"
+    | "degraded" = "active";
 
   // Resize listener attached at start(), detached at stop().
   private resizeListener: (() => void) | null = null;
@@ -242,8 +255,24 @@ export class DashboardTUI {
   }
 
   setSystemInfo(info: SystemInfo): void {
+    if (info.engineMode !== "paused") {
+      this.lastNonPausedEngineMode = info.engineMode;
+    }
     this.systemInfo = info;
     this.notify();
+  }
+
+  setDashboardAuthTokenProvider(
+    provider: (() => string | undefined) | null,
+  ): void {
+    this.dashboardAuthTokenProvider = provider;
+  }
+
+  async copyDashboardAuthToken(): Promise<boolean> {
+    const token = this.dashboardAuthTokenProvider?.();
+    if (!token) return false;
+    const { copyToClipboard } = await import("./utils.js");
+    return copyToClipboard(token);
   }
 
   setTaskStats(stats: TaskStats): void {
@@ -643,7 +672,9 @@ export class DashboardTUI {
             break;
           }
           const newSettings = await this.callbacks.onTogglePause(newPaused);
-          const newEngineMode = newSettings.enginePaused ? "paused" : "active";
+          const newEngineMode = newSettings.enginePaused
+            ? "paused"
+            : this.lastNonPausedEngineMode;
           this.setSystemInfo({ ...this.systemInfo, engineMode: newEngineMode });
           this.setSettings(newSettings);
         }
@@ -935,7 +966,7 @@ export class DashboardTUI {
     if (!this.renderApp || !this.inkRender) return;
     const baseUrl = this.systemInfo?.baseUrl;
     if (!baseUrl) return;
-    const token = this.systemInfo?.authToken;
+    const token = this.dashboardAuthTokenProvider?.();
 
     const { attachTerminalSession } = await import("./terminal-attach.js");
 

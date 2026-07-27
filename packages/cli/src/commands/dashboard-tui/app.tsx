@@ -229,8 +229,8 @@ function estimateSystemContentRows(
     1,
     Math.ceil((3 + 1 + (info.baseUrl?.length ?? 0)) / inner),
   );
-  const tokenRows = info.authToken
-    ? Math.max(1, Math.ceil((5 + 1 + info.authToken.length) / inner))
+  const tokenRows = info.maskedAuthToken
+    ? Math.max(1, Math.ceil((5 + 1 + info.maskedAuthToken.length) / inner))
     : 0;
 
   // +1 for the always-on hint row.
@@ -360,6 +360,8 @@ function SystemPanel({ state, isFocused }: { state: DashboardState; isFocused: b
               <Text dimColor>Engine</Text>
               {info.engineMode === "no-engine" && <Text color="yellow">no-engine</Text>}
               {info.engineMode === "paused" && <Text color="yellow">paused</Text>}
+              {info.engineMode === "withheld" && <Text color="red">withheld</Text>}
+              {info.engineMode === "degraded" && <Text color="yellow">degraded</Text>}
               {info.engineMode === "active" && <Text color="green">active</Text>}
             </Box>
             <Box flexDirection="row" gap={1} flexShrink={0}>
@@ -379,10 +381,9 @@ function SystemPanel({ state, isFocused }: { state: DashboardState; isFocused: b
               <Text>{formatUptime(Date.now() - info.startTimeMs)}</Text>
             </Box>
           </Box>
-          {/* URL and Token each get their own full-width row so long values
-              wrap onto multiple lines instead of being truncated or pushed
-              off-panel. The token in particular MUST always render in
-              full so users can copy it (via [c]) or click-drag select it. */}
+          {/* URL and masked Token each get their own full-width row. The bearer
+              never enters render state; [c] requests it through the controller's
+              owner-only in-process provider and copies it directly. */}
           {state.isReady && Number.isFinite(info.startupDurationMs) && (
             <Text dimColor>{t("tui.readyIn", "Ready in {{secs}}s", { secs: ((info.startupDurationMs ?? 0) / 1000).toFixed(1) })}</Text>
           )}
@@ -390,10 +391,10 @@ function SystemPanel({ state, isFocused }: { state: DashboardState; isFocused: b
             <Text dimColor>URL</Text>
             <Text color="cyanBright">{info.baseUrl}</Text>
           </Box>
-          {info.authToken && (
+          {info.maskedAuthToken && (
             <Box flexDirection="row" gap={1} flexShrink={0}>
               <Text dimColor>Token</Text>
-              <Text color="yellow">{info.authToken}</Text>
+              <Text color="yellow">{info.maskedAuthToken}</Text>
             </Box>
           )}
           {/* Inline hint row — always shown so the [Enter] / [c] shortcuts
@@ -405,8 +406,8 @@ function SystemPanel({ state, isFocused }: { state: DashboardState; isFocused: b
           <Box flexShrink={0}>
             <Text dimColor wrap="truncate-end">
               <Text color="cyanBright">[Enter]</Text> {t("tui.systemOpenUrl", "open URL")}
-              {info.authToken ? (
-                <Text> · <Text color="cyanBright">[c]</Text> {t("tui.systemCopyTokenHint", "copy token · select token text to copy manually")}</Text>
+              {info.maskedAuthToken ? (
+                <Text> · <Text color="cyanBright">[c]</Text> {t("tui.systemCopyTokenHint", "copy token securely")}</Text>
               ) : (
                 <Text> · {t("tui.systemDragToSelect", "drag to select")}</Text>
               )}
@@ -4420,8 +4421,7 @@ export function DashboardApp({ controller }: DashboardAppProps) {
     // the user's browser. Logs panel handles Enter itself (expand log entry)
     // so we gate by activeSection.
     if (key.return && state.activeSection === "system" && state.systemInfo) {
-      const url = state.systemInfo.tokenizedUrl ?? state.systemInfo.baseUrl;
-      openInBrowser(url);
+      openInBrowser(state.systemInfo.baseUrl);
       return;
     }
 
@@ -4431,10 +4431,9 @@ export function DashboardApp({ controller }: DashboardAppProps) {
     if (
       (input === "c" || input === "C") &&
       state.activeSection === "system" &&
-      state.systemInfo?.authToken
+      state.systemInfo?.maskedAuthToken
     ) {
-      const token = state.systemInfo.authToken;
-      void copyToClipboard(token).then((ok) => {
+      void controller.copyDashboardAuthToken().then((ok) => {
         controller.flashClipboard(ok);
         if (ok) {
           controller.log("Auth token copied to clipboard.", "clipboard");

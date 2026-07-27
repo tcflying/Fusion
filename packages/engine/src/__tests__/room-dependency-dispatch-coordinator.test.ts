@@ -15,6 +15,7 @@ import {
 
 import {
   RoomDependencyDispatchCoordinator,
+  type RoomTaskDispatchCapabilityRoutingPolicySource,
   type RoomTaskDispatchStore,
 } from "../room-dependency-dispatch-coordinator.js";
 import type {
@@ -541,6 +542,7 @@ function capacityDispatchFixture(
   capacityAdmissionSource?: CapacityAdmissionSourceFixture,
   options: {
     readonly capabilityRegistry?: RoomCapabilityRegistryProjectionV1;
+    readonly capabilityRoutingPolicySource?: RoomTaskDispatchCapabilityRoutingPolicySource;
     readonly nodeRequirements?: Pick<
       RoomTaskNodeProjectionV1,
       "roleRequirements" | "capabilityRequirements"
@@ -595,7 +597,9 @@ function capacityDispatchFixture(
     hostId: WORKER_LEASE.hostId,
     store,
     now: () => NOW,
-    capabilityRoutingPolicy: CAPABILITY_ROUTING_POLICY,
+    ...(options.capabilityRoutingPolicySource
+      ? { capabilityRoutingPolicySource: options.capabilityRoutingPolicySource }
+      : { capabilityRoutingPolicy: CAPABILITY_ROUTING_POLICY }),
     ...(capacityAdmissionSource ? { capacityAdmissionSource } : {}),
   });
   return { claims, coordinator, room: currentRoom };
@@ -1117,6 +1121,82 @@ describe("RoomDependencyDispatchCoordinator", () => {
         reasonCodes: ["capacity_telemetry_unavailable"],
         decision: null,
       },
+    ]);
+  });
+
+  it("derives routing admission from the exact durable registry before asking the capacity governor", async () => {
+    const routingInputs: Parameters<
+      RoomTaskDispatchCapabilityRoutingPolicySource["getCapabilityRoutingPolicy"]
+    >[0][] = [];
+    const fixture = capacityDispatchFixture(
+      {
+        getCapacityGovernorInput: async (input) =>
+          capacityGovernorInput(input.readyNodeIds, {
+            capabilityRegistry: input.capabilityRegistryProof,
+            qualityScores: new Map(
+              Object.entries(input.capabilityQualityByReadyNodeId ?? {})
+            ),
+            p95LatencyMs: input.capabilityMinimumP95LatencyMs,
+          }),
+      },
+      {
+        capabilityRoutingPolicySource: {
+          getCapabilityRoutingPolicy: async (input) => {
+            routingInputs.push(input);
+            return CAPABILITY_ROUTING_POLICY;
+          },
+        },
+      }
+    );
+
+    const result = await fixture.coordinator.dispatchReadyTasks({
+      room: fixture.room,
+      lease: WORKER_LEASE,
+      renewLease: async (lease) => lease,
+    });
+
+    expect(fixture.claims.map((claim) => claim.nodeId)).toEqual([
+      "node-capacity",
+    ]);
+    expect(result.claimedNodeIds).toEqual(["node-capacity"]);
+    expect(routingInputs).toHaveLength(1);
+    expect(routingInputs[0]).toMatchObject({
+      room: { room: { id: ROOM_ID } },
+      graph: { roomId: ROOM_ID },
+      capabilityRegistry: {
+        roomId: ROOM_ID,
+        registry: { revision: 1 },
+      },
+      asOf: NOW,
+    });
+  });
+
+  it("preserves a typed capacity-source diagnostic for structured audit consumers", async () => {
+    const fixture = capacityDispatchFixture({
+      getCapacityGovernorInput: async () => ({
+        state: "withheld",
+        reasonCode: "capacity_telemetry_observer_failed",
+        stage: "telemetry_observation",
+      } as never),
+    });
+
+    const result = await fixture.coordinator.dispatchReadyTasks({
+      room: fixture.room,
+      lease: WORKER_LEASE,
+      renewLease: async (lease) => lease,
+    });
+
+    expect(fixture.claims).toEqual([]);
+    expect(result.capacityAdmissions).toEqual([
+      expect.objectContaining({
+        state: "withheld",
+        reasonCodes: ["capacity_telemetry_observer_failed"],
+        diagnostic: {
+          state: "withheld",
+          reasonCode: "capacity_telemetry_observer_failed",
+          stage: "telemetry_observation",
+        },
+      }),
     ]);
   });
 

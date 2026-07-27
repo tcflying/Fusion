@@ -353,7 +353,11 @@ describe("RoomTaskDispatchCapacityAdmissionSource", () => {
         "node-capacity-a": capability.recommendation.qualityScore,
       },
       capabilityMinimumP95LatencyMs: capability.recommendation.latencyP95Ms,
-    })).resolves.toBeNull();
+    })).resolves.toMatchObject({
+      state: "withheld",
+      reasonCode: "capacity_telemetry_invalid",
+      stage: "telemetry_validation",
+    });
   });
 
   it("fails closed when the signed telemetry sample is older than the verified TTL", async () => {
@@ -383,7 +387,11 @@ describe("RoomTaskDispatchCapacityAdmissionSource", () => {
         "node-capacity-a": capability.recommendation.qualityScore,
       },
       capabilityMinimumP95LatencyMs: capability.recommendation.latencyP95Ms,
-    })).resolves.toBeNull();
+    })).resolves.toMatchObject({
+      state: "withheld",
+      reasonCode: "capacity_telemetry_invalid",
+      stage: "telemetry_validation",
+    });
   });
 
   it("fails closed for a mixed binding/provider recommendation group", async () => {
@@ -417,7 +425,11 @@ describe("RoomTaskDispatchCapacityAdmissionSource", () => {
         "node-capacity-a": capability.recommendation.qualityScore,
       },
       capabilityMinimumP95LatencyMs: capability.recommendation.latencyP95Ms,
-    })).resolves.toBeNull();
+    })).resolves.toMatchObject({
+      state: "withheld",
+      reasonCode: "capacity_binding_selection_unavailable",
+      stage: "binding_selection",
+    });
   });
 
   it("fails closed when the dispatcher proof does not match the durable registry", async () => {
@@ -446,6 +458,44 @@ describe("RoomTaskDispatchCapacityAdmissionSource", () => {
         "node-capacity-a": capability.recommendation.qualityScore,
       },
       capabilityMinimumP95LatencyMs: capability.recommendation.latencyP95Ms,
-    })).resolves.toBeNull();
+    })).resolves.toMatchObject({
+      state: "withheld",
+      reasonCode: "capacity_binding_selection_unavailable",
+      stage: "binding_selection",
+    });
+  });
+
+  it("returns a typed, message-free diagnostic when the telemetry observer throws", async () => {
+    const activePolicy = policy();
+    const capability = capabilityContext();
+    const source = createRoomTaskDispatchCapacityAdmissionSource({
+      policy: activePolicy,
+      telemetryObservation: {
+        observeVerifiedCapacityTelemetry: async () => {
+          throw new Error("provider account secret should never escape");
+        },
+      },
+    });
+
+    const result = await source.getCapacityGovernorInput({
+      room: room(),
+      graph: graph(),
+      readyNodeIds: ["node-capacity-a"],
+      asOf: AS_OF,
+      capabilityRegistry: capability.projection,
+      capabilityRegistryProof: capability.proof,
+      capabilityRecommendations: [capability.recommendation],
+      capabilityQualityByReadyNodeId: {
+        "node-capacity-a": capability.recommendation.qualityScore,
+      },
+      capabilityMinimumP95LatencyMs: capability.recommendation.latencyP95Ms,
+    });
+
+    expect(result).toEqual({
+      state: "withheld",
+      reasonCode: "capacity_telemetry_observer_failed",
+      stage: "telemetry_observation",
+    });
+    expect(JSON.stringify(result)).not.toContain("provider account secret");
   });
 });

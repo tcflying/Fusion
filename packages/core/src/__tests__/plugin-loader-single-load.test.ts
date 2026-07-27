@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PluginLoader } from "../plugin-loader.js";
+import { isFusionVersionCompatible, PluginLoader } from "../plugin-loader.js";
 import type { PluginInstallation } from "../plugin-types.js";
 
 async function createFixture(onLoadSource: string, onUnloadSource?: string) {
@@ -145,5 +145,19 @@ describe("PluginLoader process single-load lifecycle", () => {
     await expect(loader.loadPlugin("single-load")).resolves.toMatchObject({ manifest: { id: "single-load" } });
 
     expect((globalThis as Record<string, unknown>).__fusionPluginOnLoadCount).toBe(1);
+  });
+});
+
+describe("PluginLoader Fusion-version compatibility", () => {
+  it("accepts the Happier runtime's bounded prerelease range for the running Fusion version", () => {
+    expect(
+      isFusionVersionCompatible("0.74.0-beta.3", ">=0.74.0-beta.3 <0.75.0"),
+    ).toBe(true);
+  });
+
+  it("rejects a Fusion version outside the plugin's declared range", () => {
+    expect(
+      isFusionVersionCompatible("0.75.0", ">=0.74.0-beta.3 <0.75.0"),
+    ).toBe(false);
   });
 });

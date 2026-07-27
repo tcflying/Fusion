@@ -13,7 +13,7 @@ describe("DashboardLogSink", () => {
 
     sink.log("test message");
 
-    expect(consoleLogSpy).toHaveBeenCalledWith("test message");
+    expect(consoleLogSpy).toHaveBeenCalledWith("[fnlvl=info] test message");
     consoleLogSpy.mockRestore();
   });
 
@@ -23,7 +23,9 @@ describe("DashboardLogSink", () => {
 
     sink.log("test message", "dashboard");
 
-    expect(consoleLogSpy).toHaveBeenCalledWith("[dashboard] test message");
+    expect(consoleLogSpy).toHaveBeenCalledWith(
+      "[fnlvl=info] [dashboard] test message",
+    );
     consoleLogSpy.mockRestore();
   });
 
@@ -33,7 +35,9 @@ describe("DashboardLogSink", () => {
 
     sink.warn("warning message");
 
-    expect(consoleWarnSpy).toHaveBeenCalledWith("warning message");
+    expect(consoleWarnSpy).toHaveBeenCalledWith(
+      "[fnlvl=warn] warning message",
+    );
     consoleWarnSpy.mockRestore();
   });
 
@@ -43,7 +47,9 @@ describe("DashboardLogSink", () => {
 
     sink.error("error message");
 
-    expect(consoleErrorSpy).toHaveBeenCalledWith("error message");
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "[fnlvl=error] error message",
+    );
     consoleErrorSpy.mockRestore();
   });
 
@@ -53,7 +59,7 @@ describe("DashboardLogSink", () => {
 
     sink.log("");
 
-    expect(consoleLogSpy).toHaveBeenCalledWith("");
+    expect(consoleLogSpy).toHaveBeenCalledWith("[fnlvl=info] ");
     consoleLogSpy.mockRestore();
   });
 });
@@ -290,8 +296,8 @@ describe("formatConsoleArgs", () => {
     expect(message).toBe("starting task FN-123");
   });
 
-  it("strips the internal severity marker and returns explicit level", () => {
-    const { message, prefix, level } = formatConsoleArgs([" fnlvl=error [executor] task failed"], "info");
+  it("strips the printable severity marker and returns explicit level", () => {
+    const { message, prefix, level } = formatConsoleArgs(["[fnlvl=error] [executor] task failed"], "info");
     expect(prefix).toBe("executor");
     expect(level).toBe("error");
     expect(message).toBe("task failed");

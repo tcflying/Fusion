@@ -31,11 +31,14 @@
   "files": [
     "agent-browser.mjs",
     "bin.mjs",
+    "build-info.mjs",
     "dist/**/*.js",
     "dist/**/*.d.ts",
     "dist/**/*.d.ts.map",
     "dist/**/*.js.map",
     "dist/migrations/**",
+    "dist/build-info.json",
+    "dist/compatibility-matrix.json",
     "dist/registry-manifest.json",
     "dist/client/**",
     "dist/desktop/**",
@@ -49,7 +52,7 @@
   "scripts": {
     "dev": "tsx src/bin.ts",
     "prebuild": "node ../../scripts/sync-fusion-skill-tools.mjs",
-    "prepack": "node ./scripts/prepare-publish-manifest.mjs prepack",
+    "prepack": "cross-env FUSION_CLI_FULL_PACKAGE=1 pnpm build && node ./scripts/prepare-publish-manifest.mjs prepack",
     "postpack": "node ./scripts/prepare-publish-manifest.mjs postpack",
     "build": "tsup",
     "build:package": "cross-env FUSION_CLI_FULL_PACKAGE=1 tsup",

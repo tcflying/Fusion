@@ -11,6 +11,9 @@ import {
   type RoomProviderBackpressureCleanupActions,
   type SessionConnectorHistoryItemV1,
   type SessionConnectorIdentityV1,
+  type SessionConnectorResultV1,
+  type SessionConnectorSendReceiptV1,
+  type SessionConnectorSendRequestV1,
   type SessionConnectorV1,
 } from "@fusion/core";
 import {
@@ -123,6 +126,15 @@ export interface ReconcileAmbiguousRoomDeliveryInput {
   readonly currentTime?: () => string;
   readonly signal?: AbortSignal;
   readonly assertAuthority?: () => Promise<void>;
+  readonly audit: RoomDeliveryAuditIdentity;
+}
+
+export interface ReconcileApprovedRoomDeliveryInput {
+  readonly store: RoomDeliveryCoordinatorStore; readonly registry: SessionConnectorRegistry;
+  readonly identity: SessionConnectorIdentityV1; readonly outboxId: string;
+  readonly senderFence: NonNullable<BeginRoomDeliveryAttemptInput["senderFence"]>;
+  readonly content: string; readonly now: string; readonly currentTime?: () => string;
+  readonly signal?: AbortSignal; readonly assertAuthority?: () => Promise<void>;
   readonly audit: RoomDeliveryAuditIdentity;
 }
 
@@ -543,15 +555,25 @@ export async function dispatchRoomDelivery(
   }
 
   if (!result.ok) {
+    /*
+    FNXC:RoomDeliveryApproval 2026-07-27-16:10:
+    A connector approval artifact acknowledges only a durable waiting state,
+    never provider acceptance. Preserve the validated artifact reference on the
+    uncertain outbox so restart recovery can invoke an explicit reconciliation;
+    malformed or cross-Session safeDetails retain the generic connector error.
+    */
+    const approval = providerCleanupFailureReason === null
+      ? connectorApprovalEvidence(result.error.safeDetails, input.identity)
+      : null;
     return input.store.completeDeliveryAttempt({
       outboxId: input.outboxId,
       attemptId: deliveryAttemptId,
       senderFence: input.senderFence,
       outcome: "delivery_uncertain",
-      connectorAcknowledgementId: null,
+      connectorAcknowledgementId: approval?.artifactId ?? null,
       nativeMessageId: null,
       nativeCursor: null,
-      errorCode: `connector_${result.error.code}`,
+      errorCode: approval ? "connector_approval_waiting" : `connector_${result.error.code}`,
       nextAttemptAt: null,
       now: operationTime(input),
       audit: input.audit,
@@ -590,6 +612,138 @@ export async function dispatchRoomDelivery(
     nativeCursor: receipt.cursor,
     errorCode: confirmed ? providerCleanupFailureReason : "connector_delivery_uncertain",
     nextAttemptAt: null,
+    now: operationTime(input),
+    audit: input.audit,
+  });
+}
+
+type ApprovalReconciliationConnector = SessionConnectorV1 & {
+  reconcileApproval(input: Readonly<{
+    contractVersion: 1; artifactId: string; request: SessionConnectorSendRequestV1;
+  }>): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>>;
+};
+
+/**
+ * Reconcile a user-approved Happier action against provider history. This is a
+ * separate recovery command from dispatch and cannot invoke send().
+ */
+export async function reconcileApprovedRoomDelivery(
+  input: ReconcileApprovedRoomDeliveryInput,
+): Promise<RoomOutboxRecordV1> {
+  assertAuditIdentity(input.audit);
+  await assertOperationAuthority(input);
+  const delivery = await requireDelivery(input.store, input.outboxId);
+  const binding = await requireBinding(input.store, delivery.bindingId);
+  assertDispatchIdentity(delivery, binding, input.identity);
+  if (
+    delivery.state !== "delivery_uncertain"
+    || delivery.lastErrorCode !== "connector_approval_waiting"
+  ) {
+    throw new RoomDeliveryCoordinatorError("delivery_state_conflict",
+      `Room delivery ${input.outboxId} is not waiting for connector approval reconciliation`);
+  }
+  const artifactId = safeText(delivery.connectorAcknowledgementId, 512);
+  if (!artifactId) {
+    throw new RoomDeliveryCoordinatorError("delivery_state_conflict",
+      `Room delivery ${input.outboxId} has no durable connector approval artifact`);
+  }
+  if (hashRoomValue(input.content) !== delivery.payloadHash) {
+    throw new RoomDeliveryCoordinatorError("delivery_payload_conflict",
+      `Room delivery ${input.outboxId} content does not match its durable payload hash`);
+  }
+  if (
+    input.senderFence.roomId !== delivery.roomId
+    || input.senderFence.resourceId !== delivery.bindingId
+    || input.senderFence.hostId !== input.identity.hostId
+  ) {
+    throw new RoomDeliveryCoordinatorError("delivery_identity_conflict",
+      `Room delivery ${input.outboxId} approval reconciliation has a mismatched sender fence`);
+  }
+
+  const connector = await input.registry.requireVerified({
+    connectorId: binding.connectorId,
+    capability: "send",
+    identity: input.identity,
+    requiredHostId: binding.hostId,
+  });
+  if (!isApprovalReconciliationConnector(connector)) {
+    throw new RoomDeliveryCoordinatorError("connector_capability_unverified",
+      `Session connector ${binding.connectorId} does not expose explicit approval reconciliation`);
+  }
+  const request = {
+    contractVersion: 1,
+    bindingId: delivery.bindingId,
+    identity: input.identity,
+    logicalMessageId: delivery.logicalMessageId,
+    localMessageId: delivery.localMessageId,
+    idempotencyKey: delivery.idempotencyKey,
+    content: input.content,
+    contentHash: delivery.payloadHash,
+    deliveryAuthorization: {
+      outboxId: delivery.id,
+      senderFence: input.senderFence,
+    },
+  } as const satisfies SessionConnectorSendRequestV1;
+
+  let result: SessionConnectorResultV1<SessionConnectorSendReceiptV1>;
+  try {
+    await assertOperationAuthority(input);
+    result = await connector.reconcileApproval({ contractVersion: 1, artifactId, request });
+    await assertOperationAuthority(input);
+  } catch {
+    return input.store.reconcileDelivery({
+      outboxId: input.outboxId,
+      expectedAttemptCount: delivery.attemptCount,
+      outcome: "delivery_uncertain",
+      connectorAcknowledgementId: artifactId,
+      nativeMessageId: delivery.nativeMessageId,
+      nativeCursor: delivery.nativeCursor,
+      errorCode: "approval_reconciliation_failed",
+      evidenceRef: buildReconciliationEvidenceRef(delivery, "approval_reconciliation_failed", {
+        artifactId,
+      }),
+      now: operationTime(input),
+      audit: input.audit,
+    });
+  }
+  if (!result.ok) {
+    const remainsWaiting = connectorApprovalEvidence(result.error.safeDetails, input.identity) !== null;
+    const errorCode = remainsWaiting
+      ? "connector_approval_waiting"
+      : "approval_reconciliation_failed";
+    return input.store.reconcileDelivery({
+      outboxId: input.outboxId,
+      expectedAttemptCount: delivery.attemptCount,
+      outcome: "delivery_uncertain",
+      connectorAcknowledgementId: artifactId,
+      nativeMessageId: delivery.nativeMessageId,
+      nativeCursor: delivery.nativeCursor,
+      errorCode,
+      evidenceRef: buildReconciliationEvidenceRef(delivery, errorCode,
+        { artifactId, connectorErrorCode: result.error.code }),
+      now: operationTime(input),
+      audit: input.audit,
+    });
+  }
+
+  const receipt = result.value;
+  const hasExactReceipt = receipt.outcome === "confirmed"
+    && Boolean(receipt.connectorAcknowledgementId)
+    && Boolean(receipt.nativeMessageId);
+  const errorCode = hasExactReceipt ? null : "approval_reconciliation_unconfirmed";
+  const reconciliationOutcome = hasExactReceipt ? "approval_reconciled" : "approval_reconciliation_unconfirmed";
+  return input.store.reconcileDelivery({
+    outboxId: input.outboxId,
+    expectedAttemptCount: delivery.attemptCount,
+    outcome: hasExactReceipt ? "confirmed" : "delivery_uncertain",
+    connectorAcknowledgementId: hasExactReceipt ? receipt.connectorAcknowledgementId : artifactId,
+    nativeMessageId: hasExactReceipt ? receipt.nativeMessageId : delivery.nativeMessageId,
+    nativeCursor: hasExactReceipt ? receipt.cursor : delivery.nativeCursor,
+    errorCode,
+    evidenceRef: buildReconciliationEvidenceRef(delivery, reconciliationOutcome, {
+      artifactId, connectorAcknowledgementId: receipt.connectorAcknowledgementId,
+      nativeMessageId: receipt.nativeMessageId, cursor: receipt.cursor,
+    }),
     now: operationTime(input),
     audit: input.audit,
   });
@@ -1772,6 +1926,50 @@ function assertOptionalCursor(cursor: string | null): void {
       "Room delivery reconciliation cursor cannot be blank",
     );
   }
+}
+
+function connectorApprovalEvidence(
+  safeDetails: Readonly<Record<string, unknown>> | undefined,
+  expectedIdentity: SessionConnectorIdentityV1,
+): Readonly<{ artifactId: string; operation: "session_message_send"; approvalStateRef: string }> | null {
+  if (!safeDetails || safeDetails.actionState !== "approval_request_created") return null;
+  const artifactId = safeText(safeDetails.artifactId, 512);
+  const approvalStateRef = safeText(safeDetails.approvalStateRef, 64);
+  const sessionIdentity = safeDetails.sessionIdentity;
+  if (
+    !artifactId
+    || safeDetails.operation !== "session_message_send"
+    || safeDetails.runtimeState !== "waitingOnInput"
+    || safeDetails.reconciliationRequired !== true
+    || !approvalStateRef || !/^[a-f0-9]{64}$/u.test(approvalStateRef)
+    || !sessionIdentity || typeof sessionIdentity !== "object" || Array.isArray(sessionIdentity)
+  ) {
+    return null;
+  }
+  const identity = sessionIdentity as Readonly<Record<string, unknown>>;
+  if (
+    identity.connectorId !== expectedIdentity.connectorId
+    || identity.providerId !== expectedIdentity.providerId
+    || identity.nativeSessionId !== expectedIdentity.nativeSessionId
+    || identity.happierSessionId !== expectedIdentity.happierSessionId
+    || identity.serverProfileId !== expectedIdentity.serverProfileId
+    || identity.machineId !== expectedIdentity.machineId || identity.hostId !== expectedIdentity.hostId
+  ) {
+    return null;
+  }
+  return Object.freeze({ artifactId, operation: "session_message_send", approvalStateRef });
+}
+
+function isApprovalReconciliationConnector(connector: SessionConnectorV1):
+  connector is ApprovalReconciliationConnector {
+  return typeof (connector as Partial<ApprovalReconciliationConnector>).reconcileApproval === "function";
+}
+
+function safeText(value: unknown, maximum: number): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed && trimmed.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(trimmed)
+    ? trimmed : null;
 }
 
 function buildReconciliationEvidenceRef(

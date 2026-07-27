@@ -15,7 +15,6 @@ import {
   CentralCore,
   TaskStore,
   PluginLoader,
-  PluginStore,
   getTaskMergeBlocker,
   INSIGHT_EXTRACTION_SCHEDULE_NAME,
   processAndAuditInsightExtraction,
@@ -29,7 +28,7 @@ import {
   registerBuiltInZaiProvider,
 } from "@fusion/core";
 import type { AutomationRunResult, ScheduledTask } from "@fusion/core";
-import { createDaemonRoomControlPlaneAuthorizer, createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
+import { createDashboardAuthContext, createDaemonRoomControlPlaneAuthorizer, createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
   createWindowsNativeRoomHostCompositionAdapterRegistry,
@@ -57,6 +56,11 @@ import {
 import { promptForPort } from "./port-prompt.js";
 import { createReadOnlyProviderSettingsView } from "./provider-settings.js";
 import { wrapAuthStorageWithApiKeyProviders } from "./provider-auth.js";
+import { resolveHostBearerToken } from "./server-auth.js";
+import {
+  createHostSystemRestartControl,
+  hasLiveSupervisingParent,
+} from "./server-supervisor.js";
 import { getPackageManagerAgentDir } from "./auth-paths.js";
 import { resolveProject } from "../project-context.js";
 import {
@@ -241,7 +245,7 @@ function ensureProcessDiagnostics(): void {
 
 export async function runServe(
   port: number,
-  opts: { interactive?: boolean; paused?: boolean; host?: string; daemon?: boolean; noAutoRegister?: boolean; project?: string } = {},
+  opts: { interactive?: boolean; paused?: boolean; host?: string; daemon?: boolean; noAuth?: boolean; token?: string; noAutoRegister?: boolean; project?: string } = {},
 ) {
   serveStartTime = Date.now();
   ensureProcessDiagnostics();
@@ -586,9 +590,11 @@ export async function runServe(
   // PluginRunner for the REST routes (provides getPluginRoutes and
   // reloadPlugin methods).
   //
+  const pluginHostVersion = getCliPackageVersion(import.meta.url);
   const pluginLoader = new PluginLoader({
     pluginStore,
     taskStore: store,
+    fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
   });
 
   try {
@@ -841,32 +847,45 @@ export async function runServe(
     );
   });
 
-  // ── Daemon token resolution ─────────────────────────────────────────────
-  //
-  // When --daemon flag is set, resolve the daemon token using the same
-  // priority as fn daemon: env var > stored token > generate new token.
-  //
-  let daemonToken: string | undefined;
-  if (opts.daemon) {
-    // 1. Check environment variable first
-    daemonToken = process.env.FUSION_DAEMON_TOKEN;
-
-    // 2. Check stored token in global settings
-    if (!daemonToken) {
+  /*
+  FNXC:ServeAuth 2026-07-27-03:54:
+  Headless serve is authenticated by default, matching daemon and Dashboard.
+  `--daemon` remains a compatibility flag but no longer decides whether auth
+  exists. Only an explicit, host-validated loopback `--no-auth` may disable it.
+  */
+  const daemonToken = await resolveHostBearerToken({
+    noAuth: opts.noAuth,
+    explicitToken: opts.token,
+    environmentToken:
+      process.env.FUSION_DASHBOARD_TOKEN ?? process.env.FUSION_DAEMON_TOKEN,
+    getOrCreateToken: async () => {
       const globalDir = resolveGlobalDir();
       const settingsStore = new GlobalSettingsStore(globalDir);
       const tokenManager = new DaemonTokenManager(settingsStore);
-      daemonToken = await tokenManager.getToken();
-    }
-
-    // 3. Generate and store a new token if none exists
-    if (!daemonToken) {
-      const globalDir = resolveGlobalDir();
-      const settingsStore = new GlobalSettingsStore(globalDir);
-      const tokenManager = new DaemonTokenManager(settingsStore);
-      daemonToken = await tokenManager.generateToken();
-    }
-  }
+      if (typeof tokenManager.getOrCreateToken === "function") {
+        return tokenManager.getOrCreateToken();
+      }
+      const existing = await tokenManager.getToken();
+      return existing ?? tokenManager.generateToken();
+    },
+  });
+  const dashboardAuthContext = createDashboardAuthContext({
+    host: selectedHost,
+    noAuth: opts.noAuth,
+    token: daemonToken,
+  });
+  /*
+  FNXC:ServerSupervisor 2026-07-27-03:54:
+  Expose System restart only when this child has the pid-stamped command
+  supervisor as its real parent. The helper late-binds graceful shutdown.
+  */
+  let shuttingDown = false;
+  const systemRestartControl = createHostSystemRestartControl({
+    supervised: hasLiveSupervisingParent(),
+    canRestart: () => !shuttingDown,
+    log: (message) => console.log(`[serve] ${message}`),
+    error: (message) => console.error(`[serve] ${message}`),
+  });
 
   const roomControlPlaneAuthorizeProject: NonNullable<Parameters<typeof createServer>[1]>["roomControlPlaneAuthorizeProject"] =
     daemonToken ? createDaemonRoomControlPlaneAuthorizer(daemonToken) : undefined;
@@ -879,55 +898,60 @@ export async function runServe(
     string,
     { enabledKey: string; skills: ReturnType<PluginLoader["getPluginSkills"]> }
   >();
-  const getProjectScopedPluginSkills = async (rootDir: string): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
+  const getProjectScopedPluginSkills = async (rootDir: string, resolvedProjectStore?: TaskStore): Promise<ReturnType<PluginLoader["getPluginSkills"]>> => {
     const normalizedRootDir = pathResolve(rootDir);
-    const stateStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
+    const targetStore = resolvedProjectStore ?? (normalizedRootDir === pathResolve(store.getRootDir()) ? store : undefined);
+    if (!targetStore) {
+      return [];
+    }
+    /*
+     * FNXC:PluginSkillsPostgres 2026-07-27-02:38:
+     * Serve skill discovery must reuse the route-resolved project TaskStore and its PluginStore. A root-only compatibility store re-enters the deleted SQLite path; metadata-only plugin loading also stays read-only so discovery cannot synthesize runtime start/stop state.
+     */
+    const stateStore = targetStore.getPluginStore();
     await stateStore.init();
+    const enabledPlugins = await stateStore.listPlugins({ enabled: true });
+    const enabledKey = enabledPlugins
+      .map((plugin) => `${plugin.id}:${plugin.updatedAt}`)
+      .sort()
+      .join("\0");
+    const cached = pluginSkillCache.get(normalizedRootDir);
+    if (cached?.enabledKey === enabledKey) return cached.skills;
+    if (enabledPlugins.length === 0) {
+      const skills: ReturnType<PluginLoader["getPluginSkills"]> = [];
+      pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
+      return skills;
+    }
+
+    /*
+     * FNXC:PluginSkills 2026-07-10-00:00:
+     * Same-root skill discovery must reuse the daemon's active PluginLoader; request-scoped loaders are only for other project roots and are stopped after metadata collection to avoid leaking plugin side effects or SQLite handles.
+     */
+    if (normalizedRootDir === pathResolve(store.getRootDir())) {
+      const enabledIds = new Set(enabledPlugins.map((plugin) => plugin.id));
+      const skills = pluginLoader.getPluginSkills().filter((entry) => enabledIds.has(entry.pluginId));
+      pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
+      return skills;
+    }
+
+    const scopedPluginStore = targetStore.getPluginStore();
+    const scopedPluginLoader = new PluginLoader({
+      pluginStore: scopedPluginStore,
+      taskStore: targetStore,
+      persistRuntimeState: false,
+      fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
+    });
     try {
-      const enabledPlugins = await stateStore.listPlugins({ enabled: true });
-      const enabledKey = enabledPlugins
-        .map((plugin) => `${plugin.id}:${plugin.updatedAt}`)
-        .sort()
-        .join("\0");
-      const cached = pluginSkillCache.get(normalizedRootDir);
-      if (cached?.enabledKey === enabledKey) return cached.skills;
-      if (enabledPlugins.length === 0) {
-        const skills: ReturnType<PluginLoader["getPluginSkills"]> = [];
-        pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
-        return skills;
+      await scopedPluginStore.init();
+      const { errors } = await scopedPluginLoader.loadAllPlugins();
+      if (errors > 0) {
+        console.warn(`[plugins] Project-scoped plugin skill loading for ${normalizedRootDir} had ${errors} error(s)`);
       }
-
-      /*
-       * FNXC:PluginSkills 2026-07-10-00:00:
-       * Same-root skill discovery must reuse the daemon's active PluginLoader; request-scoped loaders are only for other project roots and are stopped after metadata collection to avoid leaking plugin side effects or SQLite handles.
-       */
-      if (normalizedRootDir === pathResolve(store.getRootDir())) {
-        const enabledIds = new Set(enabledPlugins.map((plugin) => plugin.id));
-        const skills = pluginLoader.getPluginSkills().filter((entry) => enabledIds.has(entry.pluginId));
-        pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
-        return skills;
-      }
-
-      const scopedPluginStore = new PluginStore(normalizedRootDir, { centralGlobalDir: resolveGlobalDir() });
-      const scopedTaskStore = new TaskStore(normalizedRootDir);
-      const scopedPluginLoader = new PluginLoader({ pluginStore: scopedPluginStore, taskStore: scopedTaskStore });
-      try {
-        await scopedPluginStore.init();
-        await scopedTaskStore.init();
-        const { errors } = await scopedPluginLoader.loadAllPlugins();
-        if (errors > 0) {
-          console.warn(`[plugins] Project-scoped plugin skill loading for ${normalizedRootDir} had ${errors} error(s)`);
-        }
-        const skills = scopedPluginLoader.getPluginSkills();
-        pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
-        return skills;
-      } finally {
-        await scopedPluginLoader.stopAllPlugins();
-        scopedPluginStore.close();
-        scopedTaskStore.close();
-      }
+      const skills = scopedPluginLoader.getPluginSkills();
+      pluginSkillCache.set(normalizedRootDir, { enabledKey, skills });
+      return skills;
     } finally {
-      stateStore.close();
+      await scopedPluginLoader.stopAllPlugins();
     }
   };
 
@@ -945,6 +969,7 @@ export async function runServe(
     : undefined;
 
   const app = createServer(store, {
+    fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
     engine: primaryEngine,
     engineManager,
     centralCore: sharedCentralCore ?? undefined,
@@ -1040,7 +1065,10 @@ export async function runServe(
     headless: true,
     skillsAdapter,
     roomControlPlaneAuthorizeProject,
-    daemon: daemonToken ? { token: daemonToken } : undefined,
+    daemon: opts.daemon && daemonToken ? { token: daemonToken } : undefined,
+    dashboardAuthContext,
+    noAuth: opts.noAuth,
+    systemControl: systemRestartControl.systemControl,
     https: loadTlsCredentialsFromEnv(),
   });
 
@@ -1118,15 +1146,20 @@ export async function runServe(
   const { maskApiKey } = await import("./node.js");
 
   console.log();
-  if (daemonToken) {
-    console.log(`  Fusion Node (daemon mode)`);
+  if (dashboardAuthContext.mode === "bearer") {
+    console.log(`  Fusion Node${opts.daemon ? " (daemon mode)" : ""}`);
     console.log(`  ────────────────────────`);
     console.log(`  → http://${selectedHost}:${actualPort}`);
     console.log();
-    console.log(`  Token: fn_${maskApiKey(daemonToken)}`);
+    /*
+    FNXC:ServeAuth 2026-07-27-03:54:
+    Auth is now the normal serve mode. Never print the complete bearer token
+    into terminal/CI scrollback; clients receive it explicitly via configuration.
+    */
+    console.log(`  Token:      ${maskApiKey(dashboardAuthContext.token)}`);
     console.log();
     console.log(`  Connect from another machine:`);
-    console.log(`    fn node connect <name> --url http://<host>:<port> --api-key ${daemonToken}`);
+    console.log(`    fn node connect <name> --url http://<host>:<port> --api-key <token>`);
     console.log();
     console.log(`  Health:     GET /api/health`);
     console.log(`  API:        /api/* (bearer token required)`);
@@ -1144,8 +1177,6 @@ export async function runServe(
   }
   console.log();
 
-  let shuttingDown = false;
-
   /*
   FNXC:DaemonSignalExit 2026-07-10-14:00:
   Same invariant as `fn daemon`: a memory-pressure SIGTERM must exit non-zero so a
@@ -1156,7 +1187,10 @@ export async function runServe(
   */
   const SIGNAL_EXIT_CODES: Record<string, number> = { SIGINT: 130, SIGTERM: 143 };
 
-  const shutdown = async (signal?: NodeJS.Signals) => {
+  const shutdown = async (
+    signal?: NodeJS.Signals,
+    requestedExitCode = 0,
+  ) => {
     if (shuttingDown) return;
     shuttingDown = true;
 
@@ -1232,8 +1266,14 @@ export async function runServe(
 
     stopDiagnosticInterval();
     store.close();
-    process.exit(signal ? (SIGNAL_EXIT_CODES[signal] ?? 128) : 0);
+    process.exit(
+      requestedExitCode ||
+        (signal ? (SIGNAL_EXIT_CODES[signal] ?? 128) : 0),
+    );
   };
+  systemRestartControl.bindShutdown((exitCode) =>
+    shutdown(undefined, exitCode),
+  );
 
   process.on("SIGINT", () => {
     void shutdown("SIGINT");

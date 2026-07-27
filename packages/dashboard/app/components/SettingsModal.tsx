@@ -4648,7 +4648,7 @@ export function SettingsModal({
       case "hermes-runtime":
         return <HermesRuntimeSection />;
       case "happier-runtime":
-        return <HappierRuntimeSection />;
+        return <HappierRuntimeSection projectId={projectId} />;
       case "openclaw-runtime":
         return <OpenClawRuntimeSection />;
       case "paperclip-runtime":

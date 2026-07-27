@@ -272,6 +272,62 @@ describe("RoomController global capacity admission", () => {
     expect(taskDispatcher.dispatchReadyTasks).toHaveBeenCalledTimes(1);
   });
 
+  it("persists typed task-capacity diagnostics for audit and metric projection", async () => {
+    const workerStarted = deferred<void>();
+    const audit = vi.fn(async () => undefined);
+    const global = acquiredGlobal();
+    const taskDispatcher = {
+      dispatchReadyTasks: vi.fn(async ({ room, lease }) => ({
+        room,
+        lease,
+        claimedNodeIds: [],
+        skippedNodeIds: ["task-a"],
+        capacityAdmissions: [{
+          state: "withheld" as const,
+          requestedNodeIds: ["task-a"],
+          admittedNodeIds: [],
+          reasonCodes: ["capacity_telemetry_observer_failed" as const],
+          decision: null,
+          diagnostic: {
+            state: "withheld" as const,
+            reasonCode: "capacity_telemetry_observer_failed" as const,
+            stage: "telemetry_observation" as const,
+          },
+        }],
+      })),
+    } satisfies RoomTaskDispatcher;
+    const controller = createController({
+      worker: {
+        runRoom: vi.fn(async ({ signal }: RoomWorkerRunInput) => {
+          workerStarted.resolve();
+          await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+        }),
+      },
+      capacityAdmission: capacityAdmission(global),
+      taskDispatcher,
+      audit,
+    });
+
+    await controller.start();
+    await workerStarted.promise;
+
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({
+      mutationType: "room:task-capacity-admission",
+      metadata: expect.objectContaining({
+        admissionState: "withheld",
+        requestedCount: 1,
+        admittedCount: 0,
+        reasonCodes: ["capacity_telemetry_observer_failed"],
+        diagnostic: {
+          state: "withheld",
+          reasonCode: "capacity_telemetry_observer_failed",
+          stage: "telemetry_observation",
+        },
+      }),
+    }));
+    expect(JSON.stringify(audit.mock.calls)).not.toContain("provider secret");
+  });
+
   it("starts a Room worker after global capacity admits without consulting a controller-level provider gate", async () => {
     const workerStarted = deferred<void>();
     const global = acquiredGlobal();

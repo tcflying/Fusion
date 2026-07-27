@@ -34,6 +34,15 @@ FN-7046 repaired the deferred `store.ts`/`types.ts` line-count drift by re-ratch
 
 FNXC:CI 2026-06-25-23:10:
 FN-7050 repaired the `routes.ts`/`executor.ts` line-count drift by re-ratcheting only those two baseline ceilings after organic execution-lane model growth. Wholesale god-file shrink remains long-term deferred work for dedicated refactors, and this repair intentionally excludes FN-7046's `store.ts`/`types.ts` entries and FN-7044's `areas.test.tsx` split.
+
+FNXC:CI 2026-07-27-06:49:
+FUS-P1-009 freezes every new source file at the 2,000-line cap, including untracked worktree files, while reporting grandfathered growth separately. Baseline maintenance is ratchet-only so a newly oversized file or fresh growth cannot be silently adopted by `--update`.
+
+FNXC:CI 2026-07-27-07:36:
+The FUS-P1-009 migration explicitly seeds paths that were already oversized in the task-start committed snapshot, then re-pins only pre-existing grandfathered paths after focused high-heat splits. A path that first crosses 2,000 lines in the working tree remains absent from the baseline and fails as new growth.
+
+FNXC:CI 2026-07-27-17:02:
+FUS-P1-009 makes baseline maintenance fail closed when the working tree contains grandfathered growth or a newly oversized source file. `--update` may calculate lower ceilings, but it must not write them or report success until every fresh violation is removed.
 */
 // Repo-wide guard: hand-written source files may not exceed a hard line-count
 // cap (MAX_LINES). This stops the next god-file from being born while leaving
@@ -50,8 +59,8 @@ FN-7050 repaired the `routes.ts`/`executor.ts` line-count drift by re-ratcheting
 // under SCAN_ROOTS are scanned, and *.d.ts is excluded. Lockfiles, CHANGELOG,
 // locale JSON, and snapshots never match because of the extension filter.
 //
-// Run `node scripts/check-file-line-count.mjs --update` to rewrite the baseline
-// after an intentional, reviewed change to the set of oversized files.
+// Run `node scripts/check-file-line-count.mjs --update` to ratchet existing
+// ceilings down. The command never adds paths or raises ceilings.
 //
 // FNXC:TestInfrastructure 2026-06-21-10:00:
 // Line-count drift remains visible through the explicit check:line-count audit,
@@ -78,18 +87,31 @@ export function loadBaseline(path = BASELINE_PATH) {
   }
 }
 
-export function listTrackedSources() {
-  const result = spawnSync("git", ["ls-files", "--", ...SCAN_ROOTS], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+export function listSourceFiles(runGit = spawnSync) {
+  const result = runGit(
+    "git",
+    [
+      "ls-files",
+      "--cached",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      ...SCAN_ROOTS,
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
   if (result.status !== 0) {
     throw new Error(result.stderr?.trim() || "git ls-files failed");
   }
   return result.stdout
-    .split("\n")
+    .split("\0")
     .map((line) => line.trim())
     .filter(Boolean)
+    .filter((path) => SCAN_ROOTS.some((root) => path.startsWith(`${root}/`)))
     .filter((path) => SOURCE_EXT.test(path) && !DECLARATION_EXT.test(path));
 }
 
@@ -130,7 +152,7 @@ export function evaluate(counts, baseline = loadBaseline()) {
   return { violations, staleBaseline };
 }
 
-export function collectCounts(files = listTrackedSources()) {
+export function collectCounts(files = listSourceFiles()) {
   const counts = {};
   for (const filePath of files) {
     // A tracked file that can't be read must fail the guard, not be skipped:
@@ -147,45 +169,79 @@ export function collectCounts(files = listTrackedSources()) {
 }
 
 export function formatFailureMessage(violations) {
-  const lines = violations.map(({ filePath, lines: n, ceiling, grandfathered }) =>
-    grandfathered
-      ? `${filePath}: ${n} lines (grandfathered ceiling ${ceiling} — this file grew and must shrink, not expand)`
-      : `${filePath}: ${n} lines (cap ${ceiling})`,
-  );
+  const grandfatheredGrowth = violations.filter((violation) => violation.grandfathered);
+  const newOverCap = violations.filter((violation) => !violation.grandfathered);
+  const sections = [];
+  if (grandfatheredGrowth.length > 0) {
+    sections.push(
+      `Grandfathered files that grew (${grandfatheredGrowth.length}):`,
+      ...grandfatheredGrowth.map(
+        ({ filePath, lines, ceiling }) =>
+          `${filePath}: ${lines} lines (grandfathered ceiling ${ceiling} — this file grew and must shrink, not expand)`,
+      ),
+    );
+  }
+  if (newOverCap.length > 0) {
+    if (sections.length > 0) sections.push("");
+    sections.push(
+      `New or untracked files over the hard cap (${newOverCap.length}):`,
+      ...newOverCap.map(
+        ({ filePath, lines, ceiling }) => `${filePath}: ${lines} lines (cap ${ceiling})`,
+      ),
+    );
+  }
   return [
     `[check-file-line-count] ${violations.length} file(s) exceed the line-count guardrail:`,
     "",
-    ...lines,
+    ...sections,
     "",
     `New source files must stay at or under ${MAX_LINES} lines. Split the file into`,
     "focused modules. Grandfathered files (in scripts/line-count-baseline.json) may",
     "shrink but never grow; refactor them down rather than raising their ceiling.",
-    "If a larger file is genuinely justified, update the baseline with",
-    "`node scripts/check-file-line-count.mjs --update` in a reviewed change.",
+    "`node scripts/check-file-line-count.mjs --update` only tightens existing",
+    "ceilings; it will not adopt a new oversized file or grandfather fresh growth.",
   ].join("\n");
 }
 
-function buildBaseline(counts) {
+export function buildRatchetedBaseline(counts, currentBaseline = loadBaseline()) {
   const baseline = {};
-  for (const filePath of Object.keys(counts).sort()) {
-    if (counts[filePath] > MAX_LINES) baseline[filePath] = counts[filePath];
+  for (const filePath of Object.keys(currentBaseline).sort()) {
+    const lines = counts[filePath];
+    if (lines > MAX_LINES) {
+      baseline[filePath] = Math.min(lines, currentBaseline[filePath]);
+    }
   }
   return baseline;
 }
 
+export function planBaselineUpdate(counts, currentBaseline = loadBaseline()) {
+  const { violations } = evaluate(counts, currentBaseline);
+  return {
+    accepted: violations.length === 0,
+    baseline: buildRatchetedBaseline(counts, currentBaseline),
+    violations,
+  };
+}
+
 export function main(argv = process.argv.slice(2)) {
   const counts = collectCounts();
+  const currentBaseline = loadBaseline();
 
   if (argv.includes("--update")) {
-    const baseline = buildBaseline(counts);
+    const update = planBaselineUpdate(counts, currentBaseline);
+    if (!update.accepted) {
+      console.error(formatFailureMessage(update.violations));
+      return 1;
+    }
+    const baseline = update.baseline;
     writeFileSync(BASELINE_PATH, `${JSON.stringify(baseline, null, 2)}\n`);
     console.error(
-      `[check-file-line-count] baseline rewritten: ${Object.keys(baseline).length} file(s) over ${MAX_LINES} lines.`,
+      `[check-file-line-count] baseline ratcheted: ${Object.keys(baseline).length} existing file(s) remain over ${MAX_LINES} lines; no new paths or raised ceilings were adopted.`,
     );
     return 0;
   }
 
-  const { violations, staleBaseline } = evaluate(counts);
+  const { violations, staleBaseline } = evaluate(counts, currentBaseline);
 
   // Any stale entry — shrunk, dropped under the cap, or deleted — means the
   // baseline can ratchet down. Deleted-only entries must trigger this note too,

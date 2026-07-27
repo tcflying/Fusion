@@ -9,6 +9,7 @@
  * Cross-platform: Works on Windows, macOS, and Linux.
  */
 import {
+  buildDevChildEnv,
   buildForwardedDevArgs,
   buildDevNodeArgs,
   getPrebuildCommand,
@@ -61,16 +62,15 @@ const ENTRY = path.resolve(process.cwd(), "packages/cli/src/bin.ts");
 // don't propagate to grandchildren via NODE_OPTIONS.
 /*
 FNXC:SystemPanel 2026-07-12-10:45:
-This wrapper is the supervising parent for `pnpm dev` / `pnpm start`, so it is
-where the dashboard System panel's "Restart"/"Rebuild & restart" actions land:
-the child exits with FUSION_RESTART_EXIT_CODE (86 — keep in sync with
-packages/core/src/process-supervisor.ts) and we respawn the same command
-immediately, keeping the same terminal/TTY so the TUI comes back seamlessly.
-FUSION_RESTART_SUPERVISED=1 tells the child a respawning parent exists, which
-is what makes the dashboard advertise restart support. Any other exit code
-propagates unchanged (no crash-restart loop here — `--supervise` owns that).
+Historical note: this wrapper originally advertised itself as the dashboard
+supervisor and handled only exit 86. The command-level supervisor now owns
+restart and crash-budget semantics for dashboard, serve, and daemon.
+
+FNXC:ServerSupervisor 2026-07-27-03:54:
+Do not stamp this prebuild/memory wrapper as a supervisor. The CLI child must
+see no inherited supervisor marker so it can create a real pid-stamped parent
+that handles System restart and ordinary crashes with one shared policy.
 */
-const RESTART_EXIT_CODE = 86;
 
 function runApp(extraArgs) {
   const tsx = spawn(process.execPath, buildDevNodeArgs({
@@ -81,17 +81,9 @@ function runApp(extraArgs) {
     args: extraArgs,
   }), {
     stdio: "inherit",
-    // FNXC:SystemPanel 2026-07-25-10:05: stamp the supervisor pid alongside the
-    // flag so the child can tell a real supervising parent from an inherited
-    // copy of the variable (see hasLiveSupervisingParent in commands/dashboard.ts).
-    env: { ...process.env, FUSION_RESTART_SUPERVISED: "1", FUSION_SUPERVISOR_PID: String(process.pid) },
+    env: buildDevChildEnv(process.env),
   });
   tsx.on("close", (c) => {
-    if (c === RESTART_EXIT_CODE) {
-      console.log("[fusion:dev] restart requested — restarting…");
-      runApp(extraArgs);
-      return;
-    }
     process.exit(c ?? 1);
   });
 }

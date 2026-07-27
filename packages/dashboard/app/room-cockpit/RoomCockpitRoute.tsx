@@ -28,6 +28,7 @@ import {
   type RoomCockpitExistingSessionPreflightResultV1,
   type RoomCockpitExistingSessionPreflightSubmissionV1,
 } from "./RoomCockpitExistingSessionPreflightPanel";
+import { RoomCockpitCommandPanel } from "./RoomCockpitCommandPanel";
 import {
   connectRoomCockpitLiveEvents,
   getRoomCockpitBrowserEventSourceFactory,
@@ -1202,6 +1203,16 @@ export function RoomCockpitRoute({
       <RoomCockpitExistingSessionPreflightPanel
         disabled={!projectId}
         onPreflight={preflightExistingSessions}
+      />
+      {/*
+      FNXC:RoomCockpitCommandRoute 2026-07-27-15:04:
+      Mount the compact explicit command launcher beside preflight without passing preflight results into it, so discovery cannot silently become import or attachment. Every create, membership, restore, and operator action expands only after an operator choice and continues through the console's commandId, operator-entered CAS, review, confirmation, and visible receipt boundary.
+      */}
+      <RoomCockpitCommandPanel
+        projectId={projectId}
+        activeRoomId={selectedRoomId}
+        initiallyExpanded={false}
+        fetchCommand={fetchProjection}
       />
       <RoomCockpitView
         state={snapshot.state}

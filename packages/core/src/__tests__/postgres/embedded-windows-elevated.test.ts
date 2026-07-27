@@ -4,12 +4,27 @@ import { DEFAULT_EMBEDDED_POSTGRES_FLAGS } from "../../postgres/embedded-lifecyc
 import {
   buildPgCtlOptionsString,
   buildPgCtlStartArgs,
+  buildWindowsElevationProbe,
   containsElevatedStartupFatal,
   resolvePgRunnerDir,
   sanitizePostgresFlags,
   withWindowsNativeBinPath,
   WindowsPostgresFatalDetector,
 } from "../../postgres/embedded-windows-elevated.js";
+
+describe("Windows elevation probe composition", () => {
+  it("uses a static native executable and argv without a command shell", () => {
+    expect(buildWindowsElevationProbe()).toEqual({
+      command: "net.exe",
+      args: ["session"],
+      options: {
+        encoding: "utf8",
+        shell: false,
+        windowsHide: true,
+      },
+    });
+  });
+});
 
 /*
  * FNXC:PostgresEmbedded 2026-07-16-12:45 (retained):

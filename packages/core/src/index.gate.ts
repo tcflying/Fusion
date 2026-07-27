@@ -2277,7 +2277,7 @@ export { LEGACY_STATUS_ADOPTION, resolveLegacyStatusAdoption, resolveReviewLevel
 export { hashWorkflowIr, computeWorkflowIrPin, detectWorkflowDrift, type WorkflowIrPin } from "./workflow-ir-resolver.js";
 export { evaluateTransitionInvariants, evaluateMergeBlockerPostcondition, evaluateTerminalReentryPostcondition, evaluateCapacityRejection, isWipColumn, isTerminalColumn, isCompleteColumn, isHoldColumn, isHoldToWipBoundary, type CapacityFacts } from "./workflow-transition-policy.js";
 // FNXC:GateBarrelSync 2026-07-19-12:20: stale-binary guard exports mirrored per the sync rule above (PR #2341 review).
-export { StaleBinarySchemaError, assertBinaryNotOlderThanDatabase } from "./postgres/schema-applier.js";
+export { StaleBinarySchemaError, DistBuildInfoSchemaError, assertBinaryNotOlderThanDatabase } from "./postgres/schema-applier.js";
 export { promoteResearchFinding } from "./research-feature-promotion.js";
 export type { ResearchFeaturePromotionInput } from "./research-feature-promotion.js";
 export { ACTIVE_WORKFLOW_WORK_ITEM_STATES } from "./types.js";

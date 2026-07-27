@@ -16,9 +16,8 @@ export interface SystemInfo {
   port: number;
   baseUrl: string;
   authEnabled: boolean;
-  authToken?: string;
-  tokenizedUrl?: string;
-  engineMode: "no-engine" | "active" | "paused";
+  maskedAuthToken?: string;
+  engineMode: "no-engine" | "active" | "paused" | "withheld" | "degraded";
   fileWatcher: boolean;
   startTimeMs: number;
   startupDurationMs?: number;

@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build as esbuildBuild } from "esbuild";
 import { ALL_STAGED_BUNDLED_IDS, RUNTIME_PLUGIN_IDS } from "./src/plugins/staged-bundled-plugin-ids";
+// @ts-expect-error Committed ESM helper ships beside bin.mjs and is exercised by Vitest.
+import { writeBuildGenerationArtifacts } from "./build-info.mjs";
 
 export { ALL_STAGED_BUNDLED_IDS };
 
@@ -46,6 +48,7 @@ const dashboardClientDest = join(__dirname, "dist", "client");
 // the migration SQL must be staged into dist/migrations to remain resolvable.
 const pgMigrationsSrc = join(__dirname, "..", "core", "src", "postgres", "migrations");
 const pgMigrationsDest = join(__dirname, "dist", "migrations");
+const pgSchemaApplierSrc = join(__dirname, "..", "core", "src", "postgres", "schema-applier.ts");
 const piClaudeCliSrc = join(__dirname, "..", "pi-claude-cli");
 const piClaudeCliDest = join(__dirname, "dist", "pi-claude-cli");
 const droidCliSrc = join(__dirname, "..", "droid-cli");
@@ -86,6 +89,87 @@ const dashboardClientStub = `<!doctype html>
   </body>
 </html>
 `;
+
+/*
+FNXC:CliBuildGeneration 2026-07-27-04:56:
+Fast builds and publish-grade full builds both emit source-HEAD/schema-attested
+build-info. Full artifacts additionally hash every staged plugin, while fast
+artifacts truthfully mark plugins as excluded instead of blessing stale output
+left by an earlier full build.
+*/
+function resolveBuildSourceHead(): Promise<string> {
+  const explicit =
+    process.env.FUSION_SOURCE_HEAD?.trim()
+    || process.env.GITHUB_SHA?.trim();
+  if (explicit) return Promise.resolve(explicit);
+
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      "git",
+      ["-C", workspaceRoot, "rev-parse", "HEAD"],
+      { shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error("git rev-parse HEAD timed out after 5000ms"));
+    }, 5_000);
+    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(
+          new Error(
+            `git rev-parse HEAD exited ${code ?? "unknown"}: ${Buffer.concat(stderr).toString("utf8").trim()}`,
+          ),
+        );
+        return;
+      }
+      const head = Buffer.concat(stdout).toString("utf8").trim();
+      if (!head) {
+        reject(new Error("git rev-parse HEAD returned an empty source identity"));
+        return;
+      }
+      resolvePromise(head);
+    });
+  });
+}
+
+function readSourceSchemaVersion(): string {
+  const source = readFileSync(pgSchemaApplierSrc, "utf8");
+  const match = source.match(
+    /export\s+const\s+SCHEMA_BASELINE_VERSION\s*=\s*["']([^"']+)["']/,
+  );
+  if (!match) {
+    throw new Error(
+      `[tsup] Cannot read SCHEMA_BASELINE_VERSION from ${pgSchemaApplierSrc}`,
+    );
+  }
+  return match[1];
+}
+
+async function writeCliBuildGenerationArtifacts(
+  packagingMode: "fast" | "full",
+): Promise<void> {
+  const artifacts = await writeBuildGenerationArtifacts({
+    cliRoot: __dirname,
+    workspaceRoot,
+    sourceHead: await resolveBuildSourceHead(),
+    schemaVersion: readSourceSchemaVersion(),
+    packagingMode,
+    pluginIds: ALL_STAGED_BUNDLED_IDS,
+  });
+  console.log(
+    `Wrote Fusion ${packagingMode} build generation ${artifacts.buildInfo.generationId} `
+    + `for schema ${artifacts.buildInfo.schemaVersion}.`,
+  );
+}
 
 type BundlePluginEntryOptions = {
   pluginId: string;
@@ -505,6 +589,7 @@ const cliBuildConfig = {
       console.log(
         "CLI fast package mode: skipped desktop ensure-build, bundled-plugin staging, and full plugin-sdk DTS. Set FUSION_CLI_FULL_PACKAGE=1 or use `pnpm build:full` for release packaging.",
       );
+      await writeCliBuildGenerationArtifacts("fast");
       return;
     }
 
@@ -658,14 +743,15 @@ const cliBuildConfig = {
     if (existsSync(dashboardClientSrc)) {
       cpSync(dashboardClientSrc, dashboardClientDest, { recursive: true });
       console.log("Copied dashboard client assets to dist/client/");
-      return;
+    } else {
+      mkdirSync(dashboardClientDest, { recursive: true });
+      writeFileSync(join(dashboardClientDest, "index.html"), dashboardClientStub, "utf-8");
+      console.warn(
+        `WARNING: Dashboard client assets not found at ${dashboardClientSrc}. Generated minimal stub at ${join(dashboardClientDest, "index.html")}.`,
+      );
     }
 
-    mkdirSync(dashboardClientDest, { recursive: true });
-    writeFileSync(join(dashboardClientDest, "index.html"), dashboardClientStub, "utf-8");
-    console.warn(
-      `WARNING: Dashboard client assets not found at ${dashboardClientSrc}. Generated minimal stub at ${join(dashboardClientDest, "index.html")}.`,
-    );
+    await writeCliBuildGenerationArtifacts("full");
   },
 };
 

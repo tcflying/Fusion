@@ -49,6 +49,22 @@ type RoomControlPlaneOperatorMessageCommand = Extract<
   Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
   { readonly type: "room.send-to-seat.v1" }
 >;
+type RoomControlPlaneCreateExistingSessionsCommand = Extract<
+  Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
+  { readonly type: "room.create-existing-session.v1" }
+>;
+type RoomControlPlaneRestoreExistingSessionsCommand = Extract<
+  Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
+  { readonly type: "room.restore-existing-sessions.v1" }
+>;
+type RoomControlPlaneAddExistingSessionCommand = Extract<
+  Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
+  { readonly type: "room.request-add-existing-session.v1" }
+>;
+type RoomControlPlaneRemoveExistingSessionCommand = Extract<
+  Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
+  { readonly type: "room.request-remove-existing-session.v1" }
+>;
 type RoomControlPlaneEvolutionShadowCommand = Extract<
   Parameters<RoomControlPlaneProjectEngine["executeProjectRoomCommand"]>[0],
   { readonly type: "room.record-evolution-shadow.v1" }
@@ -96,6 +112,30 @@ const ROOM_MESSAGE_INTENTS = [
   "help_request",
 ] as const satisfies readonly RoomMessageIntent[];
 const OPERATOR_MESSAGE_PAYLOAD_KEYS = ["seatId", "intent", "content", "authorityEnvelope"] as const;
+const CREATE_EXISTING_SESSIONS_PAYLOAD_KEYS = ["room", "sessions", "roleAssignment"] as const;
+const ADD_EXISTING_SESSION_PAYLOAD_KEYS = [
+  "expectedMembershipVersion",
+  "changeId",
+  "reason",
+  "session",
+] as const;
+const REMOVE_EXISTING_SESSION_PAYLOAD_KEYS = [
+  "expectedMembershipVersion",
+  "changeId",
+  "reason",
+  "seatId",
+] as const;
+const EXISTING_SESSION_SEAT_KEYS = [
+  "seatId",
+  "bindingId",
+  "role",
+  "permissionScope",
+  "connectorId",
+  "canonicalSessionUri",
+  "requiredHostId",
+  "requiredMachineId",
+  "idempotencyKey",
+] as const;
 const EVOLUTION_SHADOW_PAYLOAD_KEYS = ["contractVersion", "hypothesisId", "candidateVersionId"] as const;
 const EVOLUTION_SHADOW_WITHHELD_REASONS = new Set<Extract<
   RoomControlPlaneEvolutionShadowResultV1,
@@ -756,6 +796,242 @@ async function mutateOperatorMessage(
   return { accepted: true, aggregateVersion: canonicalAggregateVersion(result, input) };
 }
 
+type RoomLifecycleCommand =
+  | RoomControlPlaneCreateExistingSessionsCommand
+  | RoomControlPlaneRestoreExistingSessionsCommand
+  | RoomControlPlaneAddExistingSessionCommand
+  | RoomControlPlaneRemoveExistingSessionCommand;
+
+function invalidRoomLifecycleMutation(input: RoomControlPlaneMutationInputV1, message: string): never {
+  throw new ApiError(400, message, {
+    code: "ROOM_CONTROL_PLANE_LIFECYCLE_ACTION_INVALID",
+    projectId: input.projectId,
+    roomId: input.roomId,
+    action: input.action,
+  });
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function requireLifecycleCommandIdentity(input: RoomControlPlaneMutationInputV1): string {
+  if (!isNonEmptyIdentifier(input.commandId)) {
+    return invalidRoomLifecycleMutation(input, "Room lifecycle actions require a non-empty routed commandId.");
+  }
+  if (!isNonEmptyIdentifier(input.actorId)) {
+    return invalidRoomLifecycleMutation(input, "Room lifecycle actions require an authenticated operator identity.");
+  }
+  if (!isNonNegativeInteger(input.expectedAggregateVersion)) {
+    return invalidRoomLifecycleMutation(input, "Room lifecycle actions require a non-negative aggregate version.");
+  }
+  return input.commandId;
+}
+
+function isExactExistingSessionSeat(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactPayloadKeys(value, EXISTING_SESSION_SEAT_KEYS)) return false;
+  return isNonEmptyIdentifier(value.seatId)
+    && isNonEmptyIdentifier(value.bindingId)
+    && isNonEmptyIdentifier(value.role)
+    && Array.isArray(value.permissionScope)
+    && value.permissionScope.every((scope) => isNonEmptyIdentifier(scope))
+    && isNonEmptyIdentifier(value.connectorId)
+    && isCanonicalSessionUri(value.canonicalSessionUri)
+    && isNonEmptyIdentifier(value.requiredHostId)
+    && isNonEmptyIdentifier(value.requiredMachineId)
+    && isNonEmptyIdentifier(value.idempotencyKey);
+}
+
+/*
+FNXC:RoomControlPlaneLifecycleCommands 2026-07-27-06:31:
+Create, restore, and dynamic membership use exact payload allow-lists and the
+route-owned project/room/command/operator identity. The HTTP layer may request
+membership changes, but Core's durable CAS and completed-turn boundary remain
+the only activation authority. No Dashboard payload can self-assert an actor or
+silently import an unrelated Session.
+*/
+function createRoomLifecycleCommand(input: RoomControlPlaneMutationInputV1): RoomLifecycleCommand {
+  const commandId = requireLifecycleCommandIdentity(input);
+  if (input.resource !== "room") {
+    return invalidRoomLifecycleMutation(input, "Room lifecycle commands require the Room resource.");
+  }
+
+  if (input.operation === "create" && input.action === "create") {
+    if (input.roomId !== null || input.expectedAggregateVersion !== 0) {
+      return invalidRoomLifecycleMutation(input, "Room creation requires a null route roomId and aggregate version zero.");
+    }
+    if (
+      !isRecord(input.payload)
+      || !hasExactPayloadKeys(input.payload, CREATE_EXISTING_SESSIONS_PAYLOAD_KEYS)
+      || !isRecord(input.payload.room)
+      || !isNonEmptyIdentifier(input.payload.room.id)
+      || !Array.isArray(input.payload.sessions)
+      || input.payload.sessions.length < 2
+      || !input.payload.sessions.every(isExactExistingSessionSeat)
+      || !isRecord(input.payload.roleAssignment)
+    ) {
+      return invalidRoomLifecycleMutation(
+        input,
+        "Room creation requires an explicit Room, at least two exact existing Sessions, and role-assignment certification.",
+      );
+    }
+    return {
+      type: "room.create-existing-session.v1",
+      projectId: input.projectId,
+      commandId,
+      input: input.payload as unknown as RoomControlPlaneCreateExistingSessionsCommand["input"],
+    };
+  }
+
+  if (!isNonEmptyIdentifier(input.roomId) || input.operation !== "operator_action") {
+    return invalidRoomLifecycleMutation(input, "Room lifecycle actions require a routed Room operator action.");
+  }
+  if (input.action === "restore_existing_sessions") {
+    if (!isRecord(input.payload) || Object.keys(input.payload).length !== 0) {
+      return invalidRoomLifecycleMutation(input, "Room restore does not accept caller-provided identity overrides.");
+    }
+    return {
+      type: "room.restore-existing-sessions.v1",
+      projectId: input.projectId,
+      commandId,
+      input: {
+        roomId: input.roomId,
+        expectedAggregateVersion: input.expectedAggregateVersion,
+        idempotencyKey: commandId,
+      },
+    };
+  }
+  if (input.action === "request_add_existing_session") {
+    if (
+      !isRecord(input.payload)
+      || !hasExactPayloadKeys(input.payload, ADD_EXISTING_SESSION_PAYLOAD_KEYS)
+      || !isNonNegativeInteger(input.payload.expectedMembershipVersion)
+      || !isNonEmptyIdentifier(input.payload.changeId)
+      || !isNonEmptyIdentifier(input.payload.reason)
+      || !isExactExistingSessionSeat(input.payload.session)
+    ) {
+      return invalidRoomLifecycleMutation(input, "Room attach requires exact membership CAS and existing-Session identity.");
+    }
+    return {
+      type: "room.request-add-existing-session.v1",
+      projectId: input.projectId,
+      commandId,
+      input: {
+        roomId: input.roomId,
+        expectedAggregateVersion: input.expectedAggregateVersion,
+        expectedMembershipVersion: input.payload.expectedMembershipVersion,
+        changeId: input.payload.changeId,
+        idempotencyKey: commandId,
+        reason: input.payload.reason,
+        session: input.payload.session as unknown as RoomControlPlaneAddExistingSessionCommand["input"]["session"],
+      },
+    };
+  }
+  if (input.action === "request_remove_existing_session") {
+    if (
+      !isRecord(input.payload)
+      || !hasExactPayloadKeys(input.payload, REMOVE_EXISTING_SESSION_PAYLOAD_KEYS)
+      || !isNonNegativeInteger(input.payload.expectedMembershipVersion)
+      || !isNonEmptyIdentifier(input.payload.changeId)
+      || !isNonEmptyIdentifier(input.payload.reason)
+      || !isNonEmptyIdentifier(input.payload.seatId)
+    ) {
+      return invalidRoomLifecycleMutation(input, "Room removal requires exact membership CAS and one active seat.");
+    }
+    return {
+      type: "room.request-remove-existing-session.v1",
+      projectId: input.projectId,
+      commandId,
+      input: {
+        roomId: input.roomId,
+        seatId: input.payload.seatId,
+        expectedAggregateVersion: input.expectedAggregateVersion,
+        expectedMembershipVersion: input.payload.expectedMembershipVersion,
+        changeId: input.payload.changeId,
+        idempotencyKey: commandId,
+        reason: input.payload.reason,
+      },
+    };
+  }
+  return invalidRoomLifecycleMutation(input, `Unsupported Room lifecycle action ${input.action}.`);
+}
+
+function canonicalRoomLifecycleMutationResult(
+  raw: unknown,
+  input: RoomControlPlaneMutationInputV1,
+  command: RoomLifecycleCommand,
+): RoomControlPlaneMutationResultV1 {
+  const result = isRecord(raw) ? raw : null;
+  const actor = result && isRecord(result.actor) ? result.actor : null;
+  const value = result && isRecord(result.value) ? result.value : null;
+  const room = value && isRecord(value.room) ? value.room : null;
+  const aggregateVersion = room?.aggregateVersion;
+  const expectedRoomId = input.roomId ?? (
+    isRecord(input.payload.room) && isNonEmptyIdentifier(input.payload.room.id)
+      ? input.payload.room.id
+      : null
+  );
+  if (
+    !result
+    || result.type !== command.type
+    || result.projectId !== input.projectId
+    || result.commandId !== command.commandId
+    || !actor
+    || actor.kind !== "dashboard_operator"
+    || actor.principalId !== input.actorId
+    || !room
+    || room.id !== expectedRoomId
+    || room.projectId !== input.projectId
+    || !isNonNegativeInteger(aggregateVersion)
+  ) {
+    throw unavailable(
+      "ROOM_CONTROL_PLANE_MUTATION_RESPONSE_INVALID",
+      "The project Engine returned an invalid Room lifecycle result.",
+      input.projectId,
+    );
+  }
+  const membershipVersion = isNonNegativeInteger(value?.membershipVersion)
+    ? value.membershipVersion
+    : null;
+  const pendingMembershipChangeCount = Array.isArray(value?.pendingMembershipChanges)
+    ? value.pendingMembershipChanges.length
+    : null;
+  return {
+    accepted: true,
+    aggregateVersion,
+    result: Object.freeze({
+      commandId: command.commandId,
+      type: command.type,
+      roomId: expectedRoomId,
+      membershipVersion,
+      pendingMembershipChangeCount,
+    }),
+  };
+}
+
+async function mutateRoomLifecycle(
+  engine: RoomControlPlaneProjectEngine,
+  input: RoomControlPlaneMutationInputV1,
+): Promise<RoomControlPlaneMutationResultV1> {
+  const command = createRoomLifecycleCommand(input);
+  const trustedPrincipal: RoomControlPlaneTrustedPrincipal = {
+    kind: "dashboard_operator",
+    principalId: input.actorId,
+    authenticated: true,
+  };
+  let result: unknown;
+  try {
+    result = await engine.executeProjectRoomCommand(command, trustedPrincipal);
+  } catch (_error) {
+    throw unavailable(
+      "ROOM_PROJECT_ENGINE_UNAVAILABLE",
+      "The project Engine is unavailable for Room lifecycle mutations.",
+      input.projectId,
+    );
+  }
+  return canonicalRoomLifecycleMutationResult(result, input, command);
+}
+
 function invalidExistingSessionPreflightInput(
   input: RoomControlPlaneExistingSessionPreflightInputV1,
   message: string,
@@ -950,6 +1226,22 @@ function createEngineBackedPort(
       assertPortProject(input.projectId, projectId);
       if (input.resource === "room" && input.operation === "operator_action" && input.action === "send_to_seat") {
         return await mutateOperatorMessage(engine, input);
+      }
+      if (
+        input.resource === "room"
+        && (
+          (input.operation === "create" && input.action === "create")
+          || (
+            input.operation === "operator_action"
+            && (
+              input.action === "restore_existing_sessions"
+              || input.action === "request_add_existing_session"
+              || input.action === "request_remove_existing_session"
+            )
+          )
+        )
+      ) {
+        return await mutateRoomLifecycle(engine, input);
       }
       return unsupportedMutation(input);
     },

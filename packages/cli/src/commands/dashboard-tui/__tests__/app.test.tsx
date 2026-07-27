@@ -981,36 +981,74 @@ describe("LogsPanel indicator", () => {
 });
 
 describe("SystemPanel token visibility", () => {
-  it("keeps full auth token visible in narrow terminals", async () => {
+  it("shows only the masked auth token in narrow terminals", async () => {
     const controller = newController();
     const authToken = "fn_abcdef0123456789abcdef0123456789";
-    controller.setSystemInfo({ ...makeSystemInfo(), authEnabled: true, authToken });
+    controller.setDashboardAuthTokenProvider(() => authToken);
+    controller.setSystemInfo({
+      ...makeSystemInfo(),
+      authEnabled: true,
+      maskedAuthToken: "****6789",
+    });
 
     const rendered = render(renderDashboardAppNode(controller));
     setTerminalSize(rendered, 60, 24);
     rendered.rerender(renderDashboardAppNode(controller));
 
-    await waitForFrameContains(rendered.lastFrame, authToken);
+    await waitForFrameContains(rendered.lastFrame, "****6789");
+    expect(rendered.lastFrame()).not.toContain(authToken);
     rendered.unmount();
   });
 
-  it("shows URL and full token in wide terminals", async () => {
+  it("shows URL and masked token in wide terminals", async () => {
     const controller = newController();
     const authToken = "fn_abcdef0123456789abcdef0123456789";
-    controller.setSystemInfo({ ...makeSystemInfo(), authEnabled: true, authToken });
+    controller.setDashboardAuthTokenProvider(() => authToken);
+    controller.setSystemInfo({
+      ...makeSystemInfo(),
+      authEnabled: true,
+      maskedAuthToken: "****6789",
+    });
 
     const rendered = render(renderDashboardAppNode(controller));
     setTerminalSize(rendered, 160, 28);
     rendered.rerender(renderDashboardAppNode(controller));
 
     await waitForFrameContains(rendered.lastFrame, "http://localhost:4040");
-    await waitForFrameContains(rendered.lastFrame, authToken);
+    await waitForFrameContains(rendered.lastFrame, "****6789");
+    expect(rendered.lastFrame()).not.toContain(authToken);
+    rendered.unmount();
+  });
+
+  it("keeps the bearer out of render state while the explicit copy action still works", async () => {
+    copyToClipboardMock.mockResolvedValue(true);
+    const controller = newController();
+    const authToken = "fn_abcdef0123456789abcdef0123456789";
+    controller.setDashboardAuthTokenProvider(() => authToken);
+    controller.setSystemInfo({
+      ...makeSystemInfo(),
+      authEnabled: true,
+      maskedAuthToken: "****6789",
+    });
+
+    expect(JSON.stringify(controller.getSnapshot())).not.toContain(authToken);
+    const rendered = render(renderDashboardAppNode(controller));
+    rendered.stdin.write("c");
+
+    await vi.waitFor(() => {
+      expect(copyToClipboardMock).toHaveBeenCalledWith(authToken);
+    });
+    expect(rendered.lastFrame()).not.toContain(authToken);
     rendered.unmount();
   });
 
   it("hides token row and keeps no-token hint when auth token is absent", async () => {
     const controller = newController();
-    controller.setSystemInfo({ ...makeSystemInfo(), authEnabled: false, authToken: undefined });
+    controller.setSystemInfo({
+      ...makeSystemInfo(),
+      authEnabled: false,
+      maskedAuthToken: undefined,
+    });
 
     const rendered = render(renderDashboardAppNode(controller));
     setTerminalSize(rendered, 120, 24);

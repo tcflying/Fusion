@@ -89,14 +89,18 @@ export interface RoomCapacityGovernorLatencySnapshotV1 {
 }
 
 export interface RoomCapacityGovernorQuotaSnapshotV1 {
-  readonly source: "session_connector_observation";
+  /**
+   * `host_capacity_policy` is an explicit host-local ceiling. It must never be
+   * presented as, or used to infer, a provider-global account quota.
+   */
+  readonly source: "session_connector_observation" | "host_capacity_policy";
   readonly state: RoomCapacityGovernorQuotaStateV1;
   readonly hardConcurrencyLimit: number;
   readonly retryAfterMs: number | null;
 }
 
 export interface RoomCapacityGovernorConnectorSnapshotV1 {
-  readonly source: "session_connector_observation";
+  readonly source: "session_connector_observation" | "durable_capability_registry";
   readonly state: RoomCapacityGovernorConnectorStateV1;
 }
 
@@ -582,6 +586,23 @@ function requireSource(
   }
 }
 
+function requireOneOfSources(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+  path: string,
+  issues: RoomCapacityGovernorIssueV1[]
+): void {
+  if (!expected.includes(value.source as string)) {
+    issues.push(
+      issue(
+        "invalid_input",
+        path + ".source",
+        "Snapshot source is not certified for this field"
+      )
+    );
+  }
+}
+
 function normalizeTelemetry(
   value: unknown,
   issues: RoomCapacityGovernorIssueV1[]
@@ -659,15 +680,21 @@ function normalizeTelemetry(
     "$.telemetry.latency",
     issues
   );
-  requireSource(
+  /*
+   * FNXC:WindowsHostLocalCapacityTelemetry 2026-07-27-06:30:
+   * A signed host-local concurrency ceiling and a replay-checked capability
+   * registry are independent certified sources. Accept them explicitly
+   * without relabeling either one as provider-global quota telemetry.
+   */
+  requireOneOfSources(
     quota,
-    "session_connector_observation",
+    ["session_connector_observation", "host_capacity_policy"],
     "$.telemetry.quota",
     issues
   );
-  requireSource(
+  requireOneOfSources(
     connector,
-    "session_connector_observation",
+    ["session_connector_observation", "durable_capability_registry"],
     "$.telemetry.connector",
     issues
   );

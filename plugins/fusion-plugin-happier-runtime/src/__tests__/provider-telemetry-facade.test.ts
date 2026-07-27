@@ -61,7 +61,25 @@ describe("Happier provider telemetry facade", () => {
         }],
       },
       now: () => NOW,
-      dependencies: { openMcpClient },
+      dependencies: {
+        openMcpClient,
+        attestCli: vi.fn(async () => ({
+          ok: true as const,
+          trustLevel: "local_custom_pinned_source_build" as const,
+          sourceRoot: "G:\\codex-project\\happier",
+          entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+          cliVersion: "0.2.10",
+          sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+          entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786" as const,
+          verifiedAt: NOW,
+          evidence: {
+            version: "cli_--version" as const,
+            package: "package_json" as const,
+            source: "git_head" as const,
+            artifact: "sha256_file_bytes" as const,
+          },
+        })),
+      },
     });
     const source: SessionConnectorProviderTelemetrySourceV1 = connector;
 

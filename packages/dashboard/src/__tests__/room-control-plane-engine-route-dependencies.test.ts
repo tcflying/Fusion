@@ -420,6 +420,194 @@ describe("Room control-plane Engine route dependencies", () => {
     });
   });
 
+  it("maps create, restore, attach, and remove to exact Engine Room commands with CAS", async () => {
+    const service = createReadService();
+    const executeProjectRoomCommand = vi.fn(async (command: { type: string; commandId: string }) => ({
+      type: command.type,
+      projectId: PROJECT_ID,
+      commandId: command.commandId,
+      actor: { kind: "dashboard_operator", principalId: "operator-1" },
+      value: {
+        room: { id: ROOM_ID, projectId: PROJECT_ID, aggregateVersion: 8 },
+        membershipVersion: 4,
+        pendingMembershipChanges: [],
+      },
+    }));
+    const { app } = createApp({
+      resolveProjectEngine: () => ({
+        ...createEngine(PROJECT_ID, service),
+        executeProjectRoomCommand: executeProjectRoomCommand as RoomControlPlaneProjectEngine["executeProjectRoomCommand"],
+      }),
+    });
+    const createPayload = {
+      room: {
+        id: ROOM_ID,
+        objective: "Coordinate exact existing Sessions",
+        protocolId: "analysis-decision",
+        protocolVersion: 1,
+        createdBy: "operator-1",
+      },
+      sessions: [
+        {
+          seatId: "seat-codex",
+          bindingId: "binding-codex-1",
+          role: "implementer",
+          permissionScope: ["room:message"],
+          connectorId: "happier",
+          canonicalSessionUri: "codex://threads/thread-1",
+          requiredHostId: "windows-host-1",
+          requiredMachineId: "machine-1",
+          idempotencyKey: "ensure-codex-1",
+        },
+        {
+          seatId: "seat-claude",
+          bindingId: "binding-claude-1",
+          role: "reviewer",
+          permissionScope: ["room:message", "candidate:review"],
+          connectorId: "happier",
+          canonicalSessionUri: "claude://sessions/session-2",
+          requiredHostId: "windows-host-1",
+          requiredMachineId: "machine-1",
+          idempotencyKey: "ensure-claude-1",
+        },
+      ],
+      roleAssignment: {
+        capabilitySnapshot: {
+          contractVersion: 1,
+          snapshotId: "operator-certified-snapshot-1",
+          revision: 1,
+          capturedAt: "2026-07-27T06:00:00.000Z",
+          bindings: [],
+        },
+        constraints: { locks: [], forbids: [] },
+      },
+    };
+    const addSession = {
+      seatId: "seat-opencode",
+      bindingId: "binding-opencode-1",
+      role: "reviewer",
+      permissionScope: ["room:message"],
+      connectorId: "happier",
+      canonicalSessionUri: "opencode://sessions/session-3",
+      requiredHostId: "windows-host-1",
+      requiredMachineId: "machine-1",
+      idempotencyKey: "ensure-opencode-1",
+    };
+
+    const created = await request(
+      app,
+      "POST",
+      `/api/rooms?projectId=${PROJECT_ID}`,
+      JSON.stringify({
+        expectedAggregateVersion: 0,
+        commandId: "create-room-command-1",
+        payload: createPayload,
+      }),
+      { "content-type": "application/json" },
+    );
+    const restored = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      JSON.stringify({
+        expectedAggregateVersion: 8,
+        commandId: "restore-room-command-1",
+        action: "restore_existing_sessions",
+        payload: {},
+      }),
+      { "content-type": "application/json" },
+    );
+    const attached = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      JSON.stringify({
+        expectedAggregateVersion: 8,
+        commandId: "add-session-command-1",
+        action: "request_add_existing_session",
+        payload: {
+          expectedMembershipVersion: 4,
+          changeId: "change-add-opencode",
+          reason: "Add an independent reviewer",
+          session: addSession,
+        },
+      }),
+      { "content-type": "application/json" },
+    );
+    const removed = await request(
+      app,
+      "POST",
+      `/api/rooms/${ROOM_ID}/actions?projectId=${PROJECT_ID}`,
+      JSON.stringify({
+        expectedAggregateVersion: 8,
+        commandId: "remove-session-command-1",
+        action: "request_remove_existing_session",
+        payload: {
+          expectedMembershipVersion: 4,
+          changeId: "change-remove-opencode",
+          reason: "Reviewer completed the assignment",
+          seatId: "seat-opencode",
+        },
+      }),
+      { "content-type": "application/json" },
+    );
+
+    expect([created.status, restored.status, attached.status, removed.status]).toEqual([201, 200, 200, 200]);
+    expect([created.body.aggregateVersion, restored.body.aggregateVersion, attached.body.aggregateVersion, removed.body.aggregateVersion])
+      .toEqual([8, 8, 8, 8]);
+    expect(executeProjectRoomCommand.mock.calls.map(([command]) => command)).toEqual([
+      {
+        type: "room.create-existing-session.v1",
+        projectId: PROJECT_ID,
+        commandId: "create-room-command-1",
+        input: createPayload,
+      },
+      {
+        type: "room.restore-existing-sessions.v1",
+        projectId: PROJECT_ID,
+        commandId: "restore-room-command-1",
+        input: {
+          roomId: ROOM_ID,
+          expectedAggregateVersion: 8,
+          idempotencyKey: "restore-room-command-1",
+        },
+      },
+      {
+        type: "room.request-add-existing-session.v1",
+        projectId: PROJECT_ID,
+        commandId: "add-session-command-1",
+        input: {
+          roomId: ROOM_ID,
+          expectedAggregateVersion: 8,
+          expectedMembershipVersion: 4,
+          changeId: "change-add-opencode",
+          idempotencyKey: "add-session-command-1",
+          reason: "Add an independent reviewer",
+          session: addSession,
+        },
+      },
+      {
+        type: "room.request-remove-existing-session.v1",
+        projectId: PROJECT_ID,
+        commandId: "remove-session-command-1",
+        input: {
+          roomId: ROOM_ID,
+          seatId: "seat-opencode",
+          expectedAggregateVersion: 8,
+          expectedMembershipVersion: 4,
+          changeId: "change-remove-opencode",
+          idempotencyKey: "remove-session-command-1",
+          reason: "Reviewer completed the assignment",
+        },
+      },
+    ]);
+    expect(executeProjectRoomCommand.mock.calls.every(([, principal]) => (
+      principal.kind === "dashboard_operator"
+      && principal.principalId === "operator-1"
+      && principal.authenticated === true
+    ))).toBe(true);
+  });
+
   it("preflights multiple existing Sessions through the route-owned read-only command without creating a Room or provider turn, including canonical legacy telemetry withholding", async () => {
     const service = createReadService();
     const executeProjectRoomCommand = vi.fn(async (command: {

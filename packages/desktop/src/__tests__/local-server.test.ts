@@ -36,9 +36,13 @@ const mocks = vi.hoisted(() => {
   const pluginStoreInstance = {
     init: vi.fn(async () => undefined),
   };
+  const pluginSchemaContracts = [{
+    pluginId: "fusion-plugin-postgres-schema",
+    postgresSchema: { version: 1, tables: [] },
+  }];
   const pluginLoaderInstance = {
     loadAllPlugins: vi.fn(async () => ({ loaded: 2, errors: 0 })),
-    getPluginSchemaInitHooks: vi.fn(() => []),
+    getPluginSchemaInitHooks: vi.fn(() => pluginSchemaContracts),
   };
   const runPluginSchemaInits = vi.fn(async () => undefined);
   const PluginLoader = vi.fn(function () {
@@ -72,13 +76,21 @@ const mocks = vi.hoisted(() => {
     registerProject: vi.fn(async ({ path, name }: { path: string; name: string }) => ({ id: "project-1", name, path, status: "initializing" })),
     updateProject: vi.fn(async (id: string, patch: Record<string, unknown>) => ({ id, name: "Repo", path: "/repo", status: patch.status ?? "active" })),
   };
-  const engine = { id: "engine-1" };
+  const roomRbacAsyncLayer = { projectId: "project-1" };
+  const roomRbacRegistry = { source: "durable-room-rbac-registry" };
+  const engine = {
+    id: "engine-1",
+    getTaskStore: vi.fn(() => ({
+      getAsyncLayer: vi.fn(() => roomRbacAsyncLayer),
+    })),
+  };
   const engineMap = new Map([["project-1", engine]]);
   const engineManager = {
     startAll: vi.fn(async () => undefined),
     startReconciliation: vi.fn(),
     stopAll: vi.fn(async () => undefined),
     getAllEngines: vi.fn(() => engineMap),
+    getEngine: vi.fn((projectId: string) => engineMap.get(projectId)),
     ensureEngine: vi.fn(async () => engine),
     onProjectAccessed: vi.fn(),
   };
@@ -90,6 +102,7 @@ const mocks = vi.hoisted(() => {
     close = store.close;
     getPluginStore = store.getPluginStore;
     getAsyncLayer = store.getAsyncLayer;
+    getDatabase = vi.fn(() => ({ runPluginSchemaInits }));
   }
 
   const server = Object.assign(new SimpleEmitter(), {
@@ -114,16 +127,22 @@ const mocks = vi.hoisted(() => {
   // FN-7622: mirrors @fusion/engine's real seedDashboardProviders() shape — wraps the raw
   // authStorage into a distinguishable WRAPPED object so tests can assert local-server.ts passes
   // the wrapped storage (not the raw one) into createServer, and returns a disposer.
+  const modelRegistry = { listModels: vi.fn(() => []), refresh: vi.fn() };
+  const createFusionModelRegistry = vi.fn(async () => modelRegistry);
   const seedDashboardProvidersDispose = vi.fn();
   const seedDashboardProviders = vi.fn(async ({ authStorage }: { authStorage: unknown }) => ({
     authStorage: { ...(authStorage as object), __wrapped: true },
     dispose: seedDashboardProvidersDispose,
   }));
+  const createPostgresRoomRbacRegistry = vi.fn(() => roomRbacRegistry);
+  const createDashboardAuthContext = vi.fn((input: { host: string; noAuth?: boolean }) => ({
+    mode: "loopback-no-auth" as const,
+    host: input.host,
+  }));
   const createTaskStoreForBackend = vi.fn(async () => null);
 
   return {
     TaskStore,
-    createTaskStoreForBackend: vi.fn(async () => ({ taskStore: store, shutdown: backendShutdown })),
     backendShutdown,
     CentralCore,
     PluginLoader,
@@ -137,32 +156,41 @@ const mocks = vi.hoisted(() => {
     pluginStoreInstance,
     pluginLoaderInstance,
     runPluginSchemaInits,
+    createFusionModelRegistry,
+    modelRegistry,
     seedDashboardProviders,
     seedDashboardProvidersDispose,
+    createPostgresRoomRbacRegistry,
+    createDashboardAuthContext,
     createTaskStoreForBackend,
     ensureBundledPluginInstalled,
     isBundledPluginId,
     resolveDesktopBundlePluginDirs,
+    roomRbacAsyncLayer,
+    roomRbacRegistry,
   };
 });
 
 vi.mock("@fusion/core", () => ({
   TaskStore: mocks.TaskStore,
-  createTaskStoreForBackend: mocks.createTaskStoreForBackend,
   /* FNXC:MigrationHoldingPage 2026-07-17-13:50: local-server.ts formats migration progress for the launch gate. */
   formatMigrationProgress: (event: { phase: string }) => `migration ${event.phase}`,
   CentralCore: mocks.CentralCore,
+  createPostgresRoomRbacRegistry: mocks.createPostgresRoomRbacRegistry,
   createTaskStoreForBackend: mocks.createTaskStoreForBackend,
   PluginLoader: mocks.PluginLoader,
   ensureBundledPluginInstalled: mocks.ensureBundledPluginInstalled,
   isBundledPluginId: mocks.isBundledPluginId,
 }));
 vi.mock("../bundled-plugin-dirs.js", () => ({ resolveDesktopBundlePluginDirs: mocks.resolveDesktopBundlePluginDirs }));
-vi.mock("@fusion/dashboard", () => ({ createServer: mocks.createServer }));
+vi.mock("@fusion/dashboard", () => ({
+  createDashboardAuthContext: mocks.createDashboardAuthContext,
+  createServer: mocks.createServer,
+}));
 vi.mock("@fusion/engine", () => ({
   ProjectEngineManager: mocks.ProjectEngineManager,
   createFusionAuthStorage: () => ({ reload: () => undefined, getOAuthProviders: () => [], hasAuth: () => false }),
-  createFusionModelRegistry: () => ({ listModels: () => [], refresh: () => undefined }),
+  createFusionModelRegistry: mocks.createFusionModelRegistry,
   // FN-7622: seedDashboardProviders is asserted directly in provider-registration.test.ts; this
   // desktop-side mock just proves local-server.ts calls it and wires its returned WRAPPED auth
   // storage (not the raw one) into createServer.
@@ -185,7 +213,7 @@ describe("DesktopLocalServerManager", () => {
     expect(manager.getPort()).toBe(4545);
     expect(manager.getState().status).toBe("ready");
     expect(mocks.engineManager.startAll).toHaveBeenCalledTimes(1);
-    expect(mocks.CentralCore).toHaveBeenCalledWith(undefined, { asyncLayer: mocks.store.getAsyncLayer() });
+    expect(mocks.CentralCore).toHaveBeenCalledWith(undefined, undefined);
     // No auto-registration of the runtime root; the primary engine is the first existing project.
     expect(mocks.centralCore.registerProject).not.toHaveBeenCalled();
     expect(mocks.engineManager.ensureEngine).toHaveBeenCalledWith("project-1");
@@ -212,6 +240,51 @@ describe("DesktopLocalServerManager", () => {
     await manager.start();
 
     expect(mocks.CentralCore).toHaveBeenCalledWith(undefined, { asyncLayer: hostAsyncLayer });
+
+    await manager.stop();
+  });
+
+  it("composes the legacy packaged server with durable Room RBAC on loopback", async () => {
+    const { DesktopLocalServerManager } = await import("../local-server.ts");
+    const manager = new DesktopLocalServerManager("/repo");
+
+    await manager.start();
+
+    const serverOptions = mocks.createServer.mock.calls[0]?.[1] as {
+      dashboardAuthContext?: unknown;
+      roomControlPlaneRbac?: {
+        resolveRegistry(input: { projectId: string }): Promise<unknown> | unknown;
+        resolvePublicOrigin(request: { socket: { localAddress?: string; localPort?: number } }): string;
+        authorizeDaemonTransport(request: {
+          headers: Record<string, string | undefined>;
+          socket: { localAddress?: string; localPort?: number };
+        }): Promise<boolean> | boolean;
+      };
+    };
+    expect(mocks.createDashboardAuthContext).toHaveBeenCalledWith({
+      host: "127.0.0.1",
+      noAuth: true,
+    });
+    expect(serverOptions.dashboardAuthContext).toEqual({
+      mode: "loopback-no-auth",
+      host: "127.0.0.1",
+    });
+    expect(serverOptions.roomControlPlaneRbac).toBeDefined();
+    expect(await serverOptions.roomControlPlaneRbac?.resolveRegistry({ projectId: "project-1" }))
+      .toBe(mocks.roomRbacRegistry);
+    expect(mocks.createPostgresRoomRbacRegistry).toHaveBeenCalledWith(mocks.roomRbacAsyncLayer);
+    expect(serverOptions.roomControlPlaneRbac?.resolvePublicOrigin({
+      socket: { localAddress: "127.0.0.1", localPort: 4545 },
+    })).toBe("http://127.0.0.1:4545");
+    expect(await serverOptions.roomControlPlaneRbac?.authorizeDaemonTransport({
+      headers: {
+        host: "127.0.0.1:4545",
+        origin: "http://127.0.0.1:4545",
+        "sec-fetch-site": "same-origin",
+      },
+      socket: { localAddress: "127.0.0.1", localPort: 4545 },
+    })).toBe(true);
+    expect(mocks.listen).toHaveBeenCalledWith(0, "127.0.0.1");
 
     await manager.stop();
   });
@@ -291,6 +364,9 @@ describe("DesktopLocalServerManager", () => {
    * CLI/web build. Assert the fix: seedDashboardProviders is invoked with the store (so it can
    * read globalSettings.customProviders) and createServer receives its returned WRAPPED auth
    * storage, not the raw one, and the seeding disposer is invoked on stop().
+   *
+   * FNXC:DesktopModelRegistry 2026-07-27-15:49:
+   * This second desktop startup surface must also await the shared asynchronous registry factory.
    */
   it("seeds providers via seedDashboardProviders and passes the WRAPPED auth storage to createServer (FN-7622)", async () => {
     const { DesktopLocalServerManager } = await import("../local-server.ts");
@@ -302,13 +378,14 @@ describe("DesktopLocalServerManager", () => {
       expect.objectContaining({
         store: expect.objectContaining({ init: mocks.store.init, watch: mocks.store.watch }),
         authStorage: expect.anything(),
-        modelRegistry: expect.anything(),
+        modelRegistry: mocks.modelRegistry,
       }),
     );
     expect(mocks.createServer).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
         authStorage: expect.objectContaining({ __wrapped: true }),
+        modelRegistry: mocks.modelRegistry,
       }),
     );
 
@@ -322,6 +399,9 @@ describe("DesktopLocalServerManager", () => {
    * ("Plugin \"registry\" not found" on Browse registry) and install threw "Plugin install mode
    * is not supported: plugin loader not available". Assert the fix: createServer now receives
    * pluginStore, pluginLoader, and pluginRunner (aliased to the same PluginLoader instance).
+   *
+   * FNXC:DesktopPluginSchema 2026-07-27-15:49:
+   * The legacy packaged server must share PluginLoader's single schema-execution ownership.
    */
   it("wires PluginStore + PluginLoader into createServer (FN-7623)", async () => {
     const { DesktopLocalServerManager } = await import("../local-server.ts");

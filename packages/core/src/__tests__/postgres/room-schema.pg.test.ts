@@ -1,11 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sql } from "drizzle-orm";
 
 import { AsyncRoomStore } from "../../async-room-store.js";
-import { createConnectionSetFromUrl, type PostgresConnections } from "../../postgres/connection.js";
+import type { PgTestHarness } from "../../__test-utils__/pg-test-harness.js";
+import { type PostgresConnections } from "../../postgres/connection.js";
 import { createAsyncDataLayer } from "../../postgres/data-layer.js";
 import { EmbeddedPostgresLifecycle } from "../../postgres/embedded-lifecycle.js";
 import {
@@ -30,15 +31,16 @@ import {
 } from "../../postgres/schema-applier.js";
 import { ROOM_PROJECT_TABLE_NAMES } from "../../postgres/schema/room.js";
 
-vi.setConfig({ testTimeout: 60_000 });
-
-interface EmbeddedTestContext {
-  readonly dataDir: string;
-  readonly lifecycle: EmbeddedPostgresLifecycle;
-  connections: PostgresConnections | null;
+interface IsolatedTestContext {
+  readonly harness: PgTestHarness;
+  readonly connections: PostgresConnections;
 }
 
-const contexts: EmbeddedTestContext[] = [];
+const contexts: IsolatedTestContext[] = [];
+let createTaskStoreForTest: typeof import("../../__test-utils__/pg-test-harness.js").createTaskStoreForTest;
+let fixtureDataDir: string | null = null;
+let fixtureLifecycle: EmbeddedPostgresLifecycle | null = null;
+let previousPgTestUrlBase: string | undefined;
 
 const MIGRATION_OWNED_ROOM_TABLE_NAMES = [
   "room_evolution_effect_outbox",
@@ -57,25 +59,62 @@ const MIGRATION_OWNED_ROOM_TABLE_NAMES = [
   "room_provider_backpressure_cleanup_actions",
 ] as const;
 
-async function startEmbeddedDatabase(): Promise<EmbeddedTestContext> {
-  const dataDir = mkdtempSync(join(tmpdir(), "fusion-room-schema-"));
-  const lifecycle = new EmbeddedPostgresLifecycle({
-    dataDir,
+/*
+FNXC:RoomSchemaPgTests 2026-07-27-20:29:
+Migration coverage still needs a database with no application schema, but booting
+a fresh embedded PostgreSQL server for every case exceeded Vitest's normal budget.
+Start one embedded cluster for this file, then clone the shared golden-template
+fixture and remove only application schemas and migration bookkeeping so every
+assertion keeps the same fresh/historical state.
+*/
+beforeAll(async () => {
+  fixtureDataDir = mkdtempSync(join(tmpdir(), "fusion-room-schema-template-"));
+  fixtureLifecycle = new EmbeddedPostgresLifecycle({
+    dataDir: fixtureDataDir,
     database: "fusion",
     user: "postgres",
     password: "password",
   });
-  const backend = await lifecycle.start();
-  const context = {
-    dataDir,
-    lifecycle,
-    connections: await createConnectionSetFromUrl(backend, { poolMax: 2 }),
-  } satisfies EmbeddedTestContext;
+  previousPgTestUrlBase = process.env.FUSION_PG_TEST_URL_BASE;
+  const backend = await fixtureLifecycle.start();
+  const fixtureUrlBase = new URL(backend.runtimeUrl);
+  fixtureUrlBase.pathname = "";
+  process.env.FUSION_PG_TEST_URL_BASE = fixtureUrlBase.toString().replace(/\/$/, "");
+  ({ createTaskStoreForTest } = await import("../../__test-utils__/pg-test-harness.js"));
+});
+
+afterAll(async () => {
+  if (previousPgTestUrlBase === undefined) {
+    delete process.env.FUSION_PG_TEST_URL_BASE;
+  } else {
+    process.env.FUSION_PG_TEST_URL_BASE = previousPgTestUrlBase;
+  }
+  if (fixtureLifecycle) await fixtureLifecycle.stop();
+  if (fixtureDataDir) rmSync(fixtureDataDir, { recursive: true, force: true });
+});
+
+async function startIsolatedDatabase(): Promise<IsolatedTestContext> {
+  const harness = await createTaskStoreForTest({
+    prefix: "fusion_room_schema",
+    copyFromGolden: true,
+  });
+  try {
+    await harness.connections.migration.execute(sql.raw(`
+      DROP SCHEMA IF EXISTS archive CASCADE;
+      DROP SCHEMA IF EXISTS central CASCADE;
+      DROP SCHEMA IF EXISTS project CASCADE;
+      DROP TABLE IF EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} CASCADE;
+    `));
+  } catch (error) {
+    await harness.teardown();
+    throw error;
+  }
+  const context = { harness, connections: harness.connections } satisfies IsolatedTestContext;
   contexts.push(context);
   return context;
 }
 
-async function materializeHistoricalBaseline(context: EmbeddedTestContext): Promise<void> {
+async function materializeHistoricalBaseline(context: IsolatedTestContext): Promise<void> {
   await context.connections!.migration.execute(
     sql.raw(await readBaselineMigrationSql()),
   );
@@ -96,7 +135,7 @@ function expectedRegisteredMigrationsAfter(version: string, includeOfficialForwa
 }
 
 async function materializeHistoricalSchemaThrough(
-  context: EmbeddedTestContext,
+  context: IsolatedTestContext,
   targetVersion: string,
 ): Promise<void> {
   const targetIndex = SCHEMA_MIGRATIONS.findIndex((migration) => migration.version === targetVersion);
@@ -120,7 +159,7 @@ async function materializeHistoricalSchemaThrough(
 }
 
 async function restorePreMembershipProductionInvariantState(
-  context: EmbeddedTestContext,
+  context: IsolatedTestContext,
 ): Promise<void> {
   await context.connections!.migration.execute(sql.raw(`
     DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
@@ -145,7 +184,7 @@ async function restorePreMembershipProductionInvariantState(
 }
 
 async function restorePreNativeSenderTakeoverState(
-  context: EmbeddedTestContext,
+  context: IsolatedTestContext,
 ): Promise<void> {
   await context.connections!.migration.execute(sql.raw(`
     DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
@@ -163,7 +202,7 @@ async function restorePreNativeSenderTakeoverState(
 }
 
 async function insertBindingIngestionFixture(
-  context: EmbeddedTestContext,
+  context: IsolatedTestContext,
   suffix: string,
 ): Promise<{ roomId: string; seatId: string; bindingId: string }> {
   const roomId = `room-schema-${suffix}`;
@@ -212,18 +251,13 @@ afterEach(async () => {
   while (contexts.length > 0) {
     const context = contexts.pop();
     if (!context) continue;
-    if (context.connections) {
-      await context.connections.close();
-      context.connections = null;
-    }
-    await context.lifecycle.stop();
-    rmSync(context.dataDir, { recursive: true, force: true });
+    await context.harness.teardown();
   }
 });
 
 describe("Session Room PostgreSQL migration", () => {
   it("applies baseline then Room migration to a fresh embedded database", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
 
     expect(result.appliedVersions).toEqual(SCHEMA_MIGRATIONS.map((migration) => migration.version));
@@ -372,7 +406,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("materializes durable native IDE sender takeover columns and enforces projection constraints", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     const fixture = await insertBindingIngestionFixture(context, "fresh-takeover");
 
@@ -569,7 +603,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades existing ingestion rows to 0010 without fabricating takeover state", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await restorePreNativeSenderTakeoverState(context);
     const fixture = await insertBindingIngestionFixture(context, "upgrade-0010");
@@ -605,7 +639,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades existing 0010 messages with durable routing targets and nullable provenance", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalSchemaThrough(
       context,
       SCHEMA_ROOM_NATIVE_SENDER_TAKEOVER_VERSION,
@@ -697,7 +731,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades existing 0011 task rows into scoped typed DAG projections", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalSchemaThrough(
       context,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
@@ -933,7 +967,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades 0012 topology rows and enforces one active edge shape while retaining tombstones", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await context.connections!.migration.execute(sql.raw(`
       DELETE FROM public.${MIGRATION_BOOKKEEPING_TABLE}
@@ -1187,7 +1221,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades a legacy accepted node with deterministic hash-only acceptance evidence", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalSchemaThrough(
       context,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
@@ -1250,7 +1284,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("fails 0012 before registration when a legacy accepted node lacks accepted_at", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalSchemaThrough(
       context,
       SCHEMA_ROOM_MESSAGE_ROUTING_VERSION,
@@ -1284,7 +1318,7 @@ describe("Session Room PostgreSQL migration", () => {
   }, 30_000);
 
   it("upgrades an existing 0000 database without replaying the baseline", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalBaseline(context);
     await context.connections!.migration.execute(sql.raw(`
       CREATE TABLE IF NOT EXISTS public.${MIGRATION_BOOKKEEPING_TABLE} (
@@ -1325,7 +1359,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades an existing 0001 Room schema through connector ingestion", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     await context.connections!.migration.execute(sql.raw(roomSql));
@@ -1367,7 +1401,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades an existing 0002 schema through connector ingestion", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
@@ -1398,7 +1432,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades an existing 0003 schema and deterministically backfills inbox identities", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
@@ -1580,7 +1614,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades an existing 0004 schema with durable delivery reconciliation evidence", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await materializeHistoricalBaseline(context);
     const roomSql = await readSchemaMigrationSql(SCHEMA_ROOM_VERSION);
     const ownershipSql = await readSchemaMigrationSql(SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION);
@@ -1631,7 +1665,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("idempotently backfills legacy Room run-audit rows from metadata during 0007", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await context.connections!.migration.execute(sql`
       INSERT INTO project.tasks (
@@ -1676,7 +1710,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("upgrades 0008 pending membership rows into global Session identity reservations", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await restorePreMembershipProductionInvariantState(context);
     const binding = {
@@ -1755,7 +1789,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("fails the 0009 upgrade closed when two projects already own one active Session identity", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await restorePreMembershipProductionInvariantState(context);
     await context.connections!.migration.execute(sql`
@@ -1830,7 +1864,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("fails the 0009 upgrade closed for a malformed pending binding reservation", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await restorePreMembershipProductionInvariantState(context);
     await context.connections!.migration.execute(sql`
@@ -1869,7 +1903,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("fails the 0009 upgrade closed when active and pending rows share one Session identity", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     await restorePreMembershipProductionInvariantState(context);
     await context.connections!.migration.execute(sql`
@@ -1944,7 +1978,7 @@ describe("Session Room PostgreSQL migration", () => {
   });
 
   it("materializes append-only controlled-evolution lineage with scoped evidence and rollback proof", async () => {
-    const context = await startEmbeddedDatabase();
+    const context = await startIsolatedDatabase();
     const result = await applySchemaBaseline(context.connections!.migration, { pluginHooks: [] });
     expect(result.appliedVersions).toContain(SCHEMA_ROOM_EVOLUTION_CONTROLLER_VERSION);
 

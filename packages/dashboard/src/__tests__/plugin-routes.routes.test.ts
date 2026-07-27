@@ -708,12 +708,18 @@ describe("POST /plugins/:id/enable", () => {
     const loadAll = vi.spyOn(PluginLoader.prototype, "loadAllPlugins");
     const app = express();
     app.use(express.json());
-    app.use("/api", createApiRoutes(store, { pluginStore, pluginLoader }));
+    app.use("/api", createApiRoutes(store, {
+      pluginStore,
+      pluginLoader,
+      // The dashboard host resolves this from its CLI/desktop package manifest.
+      fusionVersion: "0.74.0-beta.3",
+    } as any));
 
     try {
       expect((await GET(app, "/api/plugins/ui-slots?projectId=project-p")).status).toBe(200);
       expect((await GET(app, "/api/plugins/ui-contributions?projectId=project-p")).status).toBe(200);
       expect(loadAll).toHaveBeenCalledTimes(1);
+      expect((loadAll.mock.instances[0] as any).options.fusionVersion).toBe("0.74.0-beta.3");
     } finally {
       loadAll.mockRestore();
     }

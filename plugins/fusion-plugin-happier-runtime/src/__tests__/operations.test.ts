@@ -98,6 +98,7 @@ describe("Happier multi-agent operations", () => {
     expect(invokeHappierJsonForKind.mock.calls[0]?.[0]).toEqual(["session", "run", "get", "sess-1", "run-1", "--include-structured", "--json"]);
     expect(invokeHappierJsonForKind.mock.calls[1]?.[0]).toEqual(["session", "run", "list", "sess-1", "--backend", "agent:claude", "--status", "running", "--limit", "5", "--json"]);
     expect(invokeHappierJsonForKind.mock.calls[2]?.[0]).toEqual(["session", "run", "wait", "sess-1", "run-1", "--timeout", "42", "--json"]);
+    expect(invokeHappierJsonForKind.mock.calls[2]?.[4]).toBe(47_000);
   });
 
   it("rejects malformed participant ids before spawning the CLI", async () => {

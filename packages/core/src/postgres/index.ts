@@ -86,6 +86,7 @@ export {
   SCHEMA_BASELINE_VERSION,
   // FNXC:StaleBinaryGuard 2026-07-19-03:10 (U9b / R10): old-binary write refusal.
   StaleBinarySchemaError,
+  DistBuildInfoSchemaError,
   assertBinaryNotOlderThanDatabase,
   WORKFLOW_IR_PIN_AND_LEGACY_ADOPTION_VERSION,
   PROJECT_OWNERSHIP_SCHEMA_VERSION,

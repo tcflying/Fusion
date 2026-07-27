@@ -4,13 +4,150 @@ import {
   type SessionConnectorIdentityV1,
   type SessionConnectorSendRequestV1,
 } from "@fusion/core";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const deliveryFences = vi.hoisted(() => {
+  const persistentStores = new Map<string, ReturnType<typeof createStore>>();
+  function createStore() {
+    const records = new Map<string, Record<string, unknown>>();
+    const keyFor = (input: Record<string, unknown>) => JSON.stringify({
+      canonicalSessionUri: input.canonicalSessionUri,
+      providerId: input.providerId,
+      nativeSessionId: input.nativeSessionId,
+      happierSessionId: input.happierSessionId,
+      serverProfileId: input.serverProfileId,
+      machineId: input.machineId,
+      localMessageId: input.localMessageId,
+    });
+    return {
+      reserve: async (input: Record<string, unknown>) => {
+        const key = keyFor(input);
+        const existing = records.get(key);
+        if (existing) {
+          return existing.contentHash === input.contentHash
+            ? { state: existing.state, record: existing }
+            : { state: "conflict", record: existing };
+        }
+        const record = {
+          contractVersion: 1,
+          keyHash: "a".repeat(64),
+          state: "pending",
+          ...input,
+          receipt: null,
+          createdAt: NOW,
+          updatedAt: NOW,
+        };
+        records.set(key, record);
+        return { state: "created", record };
+      },
+      confirm: async (input: Record<string, unknown>, receipt: Record<string, unknown>) => {
+        const key = keyFor(input);
+        const prior = records.get(key);
+        const record = { ...prior, state: "confirmed", receipt, updatedAt: NOW };
+        records.set(key, record);
+        return { state: "confirmed", record };
+      },
+    };
+  }
+  return {
+    clear: () => persistentStores.clear(),
+    create: (options?: { directory?: string }) => {
+      if (!options?.directory) return createStore();
+      const existing = persistentStores.get(options.directory);
+      if (existing) return existing;
+      const created = createStore();
+      persistentStores.set(options.directory, created);
+      return created;
+    },
+  };
+});
+
+const approvalStates = vi.hoisted(() => {
+  const stores = new Map<string, Map<string, Record<string, unknown>>>();
+  const keyFor = (input: Record<string, unknown>) => JSON.stringify({
+    operation: input.operation,
+    identity: input.identity,
+    bindingId: input.bindingId,
+    logicalMessageId: input.logicalMessageId,
+    localMessageId: input.localMessageId,
+    idempotencyKey: input.idempotencyKey,
+    contentHash: input.contentHash,
+  });
+  return {
+    clear: () => stores.clear(),
+    create: (options?: { directory?: string }) => {
+      const directory = options?.directory ?? Symbol("ephemeral").toString();
+      let records = stores.get(directory);
+      if (!records) {
+        records = new Map();
+        stores.set(directory, records);
+      }
+      return {
+        recordWaiting: async (input: Record<string, unknown>) => {
+          const key = keyFor(input);
+          const existing = records.get(key);
+          if (existing) return existing;
+          const record = {
+            contractVersion: 1,
+            keyHash: "b".repeat(64),
+            state: "waiting_approval",
+            ...input,
+            receipt: null,
+            createdAt: NOW,
+            updatedAt: NOW,
+          };
+          records.set(key, record);
+          return record;
+        },
+        find: async (input: Record<string, unknown>) => records.get(keyFor(input)) ?? null,
+        read: async (input: Record<string, unknown>) => records.get(keyFor(input)) ?? null,
+        markReconciled: async (input: Record<string, unknown>, receipt: Record<string, unknown>) => {
+          const key = keyFor(input);
+          const existing = records.get(key);
+          if (!existing) throw new Error("approval state missing");
+          const record = {
+            ...existing,
+            state: "reconciled",
+            receipt,
+            updatedAt: NOW,
+          };
+          records.set(key, record);
+          return record;
+        },
+      };
+    },
+  };
+});
+
+vi.mock("../delivery-fence-store.js", () => ({
+  createHappierDeliveryFenceStore: deliveryFences.create,
+}));
+
+vi.mock("../cli-attestation.js", () => ({
+  verifyHappierCliAttestation: vi.fn(async () => ({
+    ok: true,
+    trustLevel: "local_custom_pinned_source_build",
+    sourceRoot: "G:\\codex-project\\happier",
+    entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+    cliVersion: "0.2.10",
+    sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+    entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786",
+    verifiedAt: "2026-07-27T04:40:00.000Z",
+    evidence: {
+      version: "cli_--version",
+      package: "package_json",
+      source: "git_head",
+      artifact: "sha256_file_bytes",
+    },
+  })),
+}));
 
 import {
   correlateRawHappierHistoryLocalId,
   createHappierSessionConnectorWithHostWriteAuthorization,
   HappierSessionConnector,
 } from "../session-connector.js";
+import type { HappierCliAttestation } from "../cli-attestation.js";
 
 const NOW = "2026-07-19T19:29:00.000Z";
 const URI = "codex://threads/codex-thread-1";
@@ -23,11 +160,28 @@ const IDENTITY: SessionConnectorIdentityV1 = {
   machineId: "machine-1",
   hostId: "fusion-host-1",
 };
+const PROBE_ATTESTATION: HappierCliAttestation = {
+  ok: true,
+  trustLevel: "local_custom_pinned_source_build",
+  sourceRoot: "G:\\codex-project\\happier",
+  entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+  cliVersion: "0.2.10",
+  sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+  entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786",
+  verifiedAt: NOW,
+  evidence: {
+    version: "cli_--version",
+    package: "package_json",
+    source: "git_head",
+    artifact: "sha256_file_bytes",
+  },
+};
 
 function clientWithTools(
-  tools = ["session_list", "session_status_get", "session_message_send", "session_wait_idle", "session_stop"],
+  tools = ["session_list", "session_status_get", "session_message_send", "session_wait_idle", "session_history_get", "session_stop"],
   toolResults: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {},
 ) {
+  let lastSend: Readonly<{ sessionId: string; localId: string; message: string }> | null = null;
   const callTool = vi.fn(async (input: { name: string; arguments?: Record<string, unknown> }) => {
     const overridden = toolResults[input.name];
     if (overridden) return overridden;
@@ -41,8 +195,44 @@ function clientWithTools(
             agentState: { status: "waitingOnInput" },
           },
         };
-      case "session_message_send":
+      case "session_message_send": {
+        lastSend = {
+          sessionId: String(input.arguments?.sessionId),
+          localId: String(input.arguments?.localId),
+          message: String(input.arguments?.message),
+        };
+        return {
+          structuredContent: {
+            sessionId: lastSend.sessionId,
+            localId: lastSend.localId,
+            waited: false,
+          },
+        };
+      }
       case "session_wait_idle":
+        return {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            idle: true,
+            observedAt: Date.parse(NOW),
+          },
+        };
+      case "session_history_get":
+        return {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            format: "raw",
+            messages: lastSend
+              ? [{
+                  id: "native-message-1",
+                  localId: lastSend.localId,
+                  createdAt: Date.parse(NOW),
+                  role: "user",
+                  raw: { content: { type: "text", text: lastSend.message } },
+                }]
+              : [],
+          },
+        };
       case "session_stop":
         return { structuredContent: { sessionId: IDENTITY.happierSessionId, ok: true } };
       default:
@@ -62,6 +252,9 @@ function setup(options: {
   tools?: string[];
   toolResults?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
   bindingFields?: Readonly<Record<string, unknown>>;
+  deliveryFenceDirectory?: string;
+  approvalStateDirectory?: string;
+  attestCli?: () => Promise<HappierCliAttestation>;
 } = {}) {
   const client = clientWithTools(options.tools, options.toolResults);
   const openMcpClient = vi.fn(async () => client);
@@ -77,6 +270,7 @@ function setup(options: {
       executable: "happier",
       activeServerId: "server-1",
       webappUrl: "https://app.happier.dev",
+      ...(options.deliveryFenceDirectory ? { deliveryFenceDirectory: options.deliveryFenceDirectory } : {}),
       happierSessionBindings: [{
         canonicalSessionUri: URI,
         happierSessionId: IDENTITY.happierSessionId!,
@@ -87,8 +281,13 @@ function setup(options: {
       }],
     },
     now: () => NOW,
+    ...(options.approvalStateDirectory
+      ? { approvalStateDirectory: options.approvalStateDirectory }
+      : {}),
     dependencies: {
       openMcpClient,
+      createApprovalStateStore: approvalStates.create as never,
+      ...(options.attestCli ? { attestCli: options.attestCli } : {}),
       probeRuntime: vi.fn(async () => ({
         discovered: true,
         executable: true,
@@ -99,6 +298,9 @@ function setup(options: {
         backend: true,
         ready: true,
         backendId: "codex" as const,
+        modelId: null,
+        modelState: "not_reported" as const,
+        attestation: PROBE_ATTESTATION,
         details: [],
       })),
     },
@@ -108,6 +310,11 @@ function setup(options: {
     : new HappierSessionConnector(connectorOptions);
   return { connector, client, openMcpClient, verifyHostWriteAuthorization };
 }
+
+beforeEach(() => {
+  deliveryFences.clear();
+  approvalStates.clear();
+});
 
 function sendRequest(): SessionConnectorSendRequestV1 {
   const content = "Continue the explicit Happier Session";
@@ -142,6 +349,17 @@ function sendRequest(): SessionConnectorSendRequestV1 {
 }
 
 describe("HappierSessionConnector official MCP operations", () => {
+  it("rejects an inverted MCP wait hierarchy before any connector send can start", () => {
+    expect(() => new HappierSessionConnector({
+      settings: {
+        executable: "happier",
+        waitTimeoutMs: 304_999,
+        waitTimeoutGraceMs: 5_000,
+      },
+      sendTimeoutSeconds: 300,
+    })).toThrow("Happier wait timeout hierarchy is invalid");
+  });
+
   it("maps an explicit bound session status without asserting a native writer", async () => {
     const { connector, client } = setup();
 
@@ -257,7 +475,7 @@ describe("HappierSessionConnector official MCP operations", () => {
     expect(client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "fusion_runtime_snapshot_get" }));
   });
 
-  it("sends and waits only after host/runtime write authorization while interrupt remains unavailable", async () => {
+  it("sends and waits only after host/runtime write authorization", async () => {
     const { connector, client, openMcpClient, verifyHostWriteAuthorization } = setup({ takeover: true, hostAuthorization: true });
     const request = sendRequest();
 
@@ -265,20 +483,11 @@ describe("HappierSessionConnector official MCP operations", () => {
       ok: true,
       value: {
         outcome: "confirmed",
-        connectorAcknowledgementId: request.localMessageId,
+        connectorAcknowledgementId: expect.stringMatching(/^happier-receipt:/u),
+        nativeMessageId: "native-message-1",
         acceptedAt: NOW,
       },
     });
-    await expect(connector.interrupt({
-      contractVersion: 1,
-      identity: IDENTITY,
-      idempotencyKey: "stop-1",
-      reason: "operator requested stop",
-    })).resolves.toMatchObject({
-      ok: false,
-      error: { code: "unavailable", retryable: false },
-    });
-
     expect(openMcpClient).toHaveBeenCalledWith(expect.objectContaining({ sessionId: IDENTITY.happierSessionId }));
     expect(verifyHostWriteAuthorization).toHaveBeenCalledWith(expect.objectContaining({
       operation: "send",
@@ -300,7 +509,166 @@ describe("HappierSessionConnector official MCP operations", () => {
       name: "session_wait_idle",
       arguments: { sessionId: IDENTITY.happierSessionId, timeoutSeconds: 300 },
     });
-    expect(client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "session_stop" }));
+    expect(client.callTool).toHaveBeenCalledWith({
+      name: "session_history_get",
+      arguments: {
+        sessionId: IDENTITY.happierSessionId,
+        limit: 1000,
+        format: "raw",
+        includeMeta: false,
+        includeStructuredPayload: false,
+      },
+    });
+  });
+
+  it("fails closed before transport when CLI attestation drifts", async () => {
+    const { connector, client, openMcpClient } = setup({
+      hostAuthorization: true,
+      attestCli: async () => ({ ok: false, reasonCode: "cli_artifact_hash_mismatch" }),
+    });
+
+    await expect(connector.send(sendRequest())).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: "degraded",
+        retryable: false,
+        safeDetails: {
+          category: "cli_attestation",
+          reasonCode: "cli_artifact_hash_mismatch",
+        },
+      },
+    });
+    expect(openMcpClient).not.toHaveBeenCalled();
+    expect(client.callTool).not.toHaveBeenCalled();
+  });
+
+  it("never confirms or waits when the send receipt localId is for another message", async () => {
+    const { connector, client } = setup({
+      hostAuthorization: true,
+      toolResults: {
+        session_message_send: {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            localId: "different-local-id",
+            waited: false,
+          },
+        },
+      },
+    });
+
+    await expect(connector.send(sendRequest())).resolves.toEqual({
+      ok: false,
+      error: {
+        code: "delivery_uncertain",
+        message: "Happier send evidence could not be bound to the exact Session and localId",
+        retryable: false,
+        safeDetails: {
+          state: "happier_receipt_reconciliation_required",
+          reason: "send_local_id_mismatch",
+        },
+      },
+    });
+    expect(client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "session_wait_idle" }));
+    expect(client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "session_history_get" }));
+  });
+
+  it("never confirms a send when wait does not prove exact-session idle with a valid observation", async () => {
+    const { connector, client } = setup({
+      hostAuthorization: true,
+      toolResults: {
+        session_wait_idle: {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            idle: false,
+            observedAt: Date.parse(NOW),
+          },
+        },
+      },
+    });
+
+    await expect(connector.send(sendRequest())).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: "delivery_uncertain",
+        retryable: false,
+        safeDetails: {
+          state: "happier_receipt_reconciliation_required",
+          reason: "wait_not_idle",
+        },
+      },
+    });
+    expect(client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "session_history_get" }));
+  });
+
+  it("completes interrupt only after the official remote stop proves the exact session stopped", async () => {
+    const { connector, client, verifyHostWriteAuthorization } = setup({
+      hostAuthorization: true,
+      toolResults: {
+        session_stop: {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            stopped: true,
+          },
+        },
+      },
+    });
+
+    await expect(connector.interrupt({
+      contractVersion: 1,
+      identity: IDENTITY,
+      idempotencyKey: "stop-1",
+      reason: "operator requested stop",
+    })).resolves.toMatchObject({
+      ok: true,
+      value: {
+        state: "completed",
+        connectorAcknowledgementId: expect.stringMatching(/^happier-stop:/u),
+      },
+    });
+    expect(verifyHostWriteAuthorization).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "interrupt",
+      canonicalSessionUri: URI,
+      happierSessionId: IDENTITY.happierSessionId,
+      bindingId: null,
+      deliveryAuthorization: null,
+      idempotencyKey: "stop-1",
+      reason: "operator requested stop",
+    }));
+    expect(client.callTool).toHaveBeenCalledWith({
+      name: "session_stop",
+      arguments: { sessionId: IDENTITY.happierSessionId },
+    });
+  });
+
+  it("fails closed when the official remote stop cannot confirm stopped true", async () => {
+    const { connector } = setup({
+      hostAuthorization: true,
+      toolResults: {
+        session_stop: {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            stopped: false,
+          },
+        },
+      },
+    });
+
+    await expect(connector.interrupt({
+      contractVersion: 1,
+      identity: IDENTITY,
+      idempotencyKey: "stop-unconfirmed-1",
+      reason: "operator requested stop",
+    })).resolves.toEqual({
+      ok: false,
+      error: {
+        code: "delivery_uncertain",
+        message: "Happier did not confirm that the exact remote session stopped",
+        retryable: true,
+        safeDetails: {
+          state: "happier_stop_unconfirmed",
+        },
+      },
+    });
   });
 
   it("rejects a write decision replayed across immutable Happier bindings", async () => {
@@ -496,12 +864,126 @@ describe("HappierSessionConnector official MCP operations", () => {
       error: {
         code: "unavailable",
         retryable: false,
-        safeDetails: { actionState: "approval_request_created" },
+        safeDetails: {
+          bridge: "official_mcp_stdio",
+          actionState: "approval_request_created",
+          artifactId: "approval-artifact-1",
+          operation: "session_message_send",
+          happierSessionId: IDENTITY.happierSessionId,
+          runtimeState: "waitingOnInput",
+          reconciliationRequired: true,
+        },
       },
     });
     expect(client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({
       name: "session_wait_idle",
     }));
+  });
+
+  it("restores a pending approval and confirms it only through explicit reconciliation", async () => {
+    const request = sendRequest();
+    const deliveryFenceDirectory = "G:\\fusion-test\\approval-restart-fence";
+    const approvalStateDirectory = "G:\\fusion-test\\approval-restart-state";
+    const first = setup({
+      takeover: true,
+      hostAuthorization: true,
+      deliveryFenceDirectory,
+      approvalStateDirectory,
+      toolResults: {
+        session_message_send: {
+          structuredContent: {
+            kind: "approval_request_created",
+            artifactId: "approval-restart-send-1",
+          },
+        },
+      },
+    });
+
+    await expect(first.connector.send(request)).resolves.toMatchObject({
+      ok: false,
+      error: {
+        safeDetails: {
+          actionState: "approval_request_created",
+          artifactId: "approval-restart-send-1",
+          operation: "session_message_send",
+          approvalStateRef: "b".repeat(64),
+        },
+      },
+    });
+
+    const restarted = setup({
+      takeover: true,
+      hostAuthorization: true,
+      deliveryFenceDirectory,
+      approvalStateDirectory,
+      toolResults: {
+        session_history_get: {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            format: "raw",
+            messages: [{
+              id: "native-approved-message-1",
+              localId: request.localMessageId,
+              createdAt: Date.parse(NOW),
+              role: "user",
+              raw: { content: { type: "text", text: request.content } },
+            }],
+          },
+        },
+      },
+    });
+
+    await expect(restarted.connector.send(request)).resolves.toMatchObject({
+      ok: false,
+      error: {
+        safeDetails: {
+          actionState: "approval_request_created",
+          artifactId: "approval-restart-send-1",
+        },
+      },
+    });
+    expect(restarted.client.callTool).not.toHaveBeenCalled();
+
+    await expect(restarted.connector.reconcileApproval({
+      contractVersion: 1,
+      artifactId: "approval-restart-send-1",
+      request,
+    })).resolves.toMatchObject({
+      ok: true,
+      value: {
+        outcome: "confirmed",
+        nativeMessageId: "native-approved-message-1",
+      },
+    });
+    expect(restarted.client.callTool).toHaveBeenCalledWith({
+      name: "session_history_get",
+      arguments: expect.objectContaining({ sessionId: IDENTITY.happierSessionId }),
+    });
+    expect(restarted.client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: "session_message_send",
+    }));
+    expect(restarted.client.callTool).not.toHaveBeenCalledWith(expect.objectContaining({
+      name: "session_wait_idle",
+    }));
+
+    const twiceRestarted = setup({
+      takeover: true,
+      hostAuthorization: true,
+      deliveryFenceDirectory,
+      approvalStateDirectory,
+    });
+    await expect(twiceRestarted.connector.reconcileApproval({
+      contractVersion: 1,
+      artifactId: "approval-restart-send-1",
+      request,
+    })).resolves.toMatchObject({
+      ok: true,
+      value: {
+        outcome: "confirmed",
+        nativeMessageId: "native-approved-message-1",
+      },
+    });
+    expect(twiceRestarted.client.callTool).not.toHaveBeenCalled();
   });
 
   it("does not confirm a send when a conflicting official MCP content envelope requires approval", async () => {
@@ -645,7 +1127,52 @@ describe("HappierSessionConnector official MCP operations", () => {
     expect(client.callTool.mock.calls.filter(([call]) => call.name === "session_message_send")).toHaveLength(1);
   });
 
-  it("never sends session_stop even if a direct result would require approval", async () => {
+  it("never resends an unresolved localId after a connector restart", async () => {
+    const deliveryFenceDirectory = "G:\\fusion-test\\happier-restart-fence";
+    const first = setup({
+      hostAuthorization: true,
+      deliveryFenceDirectory,
+      toolResults: {
+        session_wait_idle: {
+          structuredContent: {
+            sessionId: IDENTITY.happierSessionId,
+            idle: false,
+            observedAt: Date.parse(NOW),
+          },
+        },
+      },
+    });
+    const request = sendRequest();
+
+    await expect(first.connector.send(request)).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: "delivery_uncertain",
+        safeDetails: { reason: "wait_not_idle" },
+      },
+    });
+    expect(first.client.callTool.mock.calls.filter(([call]) =>
+      call.name === "session_message_send")).toHaveLength(1);
+
+    const restarted = setup({ hostAuthorization: true, deliveryFenceDirectory });
+    await expect(restarted.connector.send(request)).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: "delivery_uncertain",
+        safeDetails: { reason: "local_id_not_found" },
+      },
+    });
+    expect(restarted.client.callTool).toHaveBeenCalledWith({
+      name: "session_history_get",
+      arguments: expect.objectContaining({ sessionId: IDENTITY.happierSessionId }),
+    });
+    expect(restarted.client.callTool.mock.calls.some(([call]) =>
+      call.name === "session_message_send")).toBe(false);
+    expect(restarted.client.callTool.mock.calls.some(([call]) =>
+      call.name === "session_wait_idle")).toBe(false);
+  });
+
+  it("never completes session_stop when the direct result requires approval", async () => {
     const { connector, client } = setup({
       takeover: true,
       hostAuthorization: true,
@@ -673,13 +1200,21 @@ describe("HappierSessionConnector official MCP operations", () => {
       error: {
         code: "unavailable",
         retryable: false,
-        safeDetails: { localExtensionState: "local_extension_unattested" },
+        safeDetails: {
+          actionState: "approval_request_created",
+          artifactId: "approval-artifact-2",
+          operation: "session_stop",
+          happierSessionId: IDENTITY.happierSessionId,
+        },
       },
     });
-    expect(client.callTool).not.toHaveBeenCalled();
+    expect(client.callTool).toHaveBeenCalledWith({
+      name: "session_stop",
+      arguments: { sessionId: IDENTITY.happierSessionId },
+    });
   });
 
-  it("never sends session_stop even if a conflicting result would require approval", async () => {
+  it("never completes session_stop when a conflicting result requires approval", async () => {
     const { connector, client } = setup({
       takeover: true,
       hostAuthorization: true,
@@ -707,13 +1242,21 @@ describe("HappierSessionConnector official MCP operations", () => {
       error: {
         code: "unavailable",
         retryable: false,
-        safeDetails: { localExtensionState: "local_extension_unattested" },
+        safeDetails: {
+          actionState: "approval_request_created",
+          artifactId: "approval-conflict-stop-1",
+          operation: "session_stop",
+          happierSessionId: IDENTITY.happierSessionId,
+        },
       },
     });
-    expect(client.callTool).not.toHaveBeenCalled();
+    expect(client.callTool).toHaveBeenCalledWith({
+      name: "session_stop",
+      arguments: { sessionId: IDENTITY.happierSessionId },
+    });
   });
 
-  it("never sends session_stop even if a deeply wrapped result would require approval", async () => {
+  it("never completes session_stop when a deeply wrapped result requires approval", async () => {
     const { connector, client } = setup({
       takeover: true,
       hostAuthorization: true,
@@ -746,10 +1289,18 @@ describe("HappierSessionConnector official MCP operations", () => {
       error: {
         code: "unavailable",
         retryable: false,
-        safeDetails: { localExtensionState: "local_extension_unattested" },
+        safeDetails: {
+          actionState: "approval_request_created",
+          artifactId: "approval-deep-stop-1",
+          operation: "session_stop",
+          happierSessionId: IDENTITY.happierSessionId,
+        },
       },
     });
-    expect(client.callTool).not.toHaveBeenCalled();
+    expect(client.callTool).toHaveBeenCalledWith({
+      name: "session_stop",
+      arguments: { sessionId: IDENTITY.happierSessionId },
+    });
   });
 
   it("fails closed before a write when a settings-controlled takeover timestamp is forged", async () => {

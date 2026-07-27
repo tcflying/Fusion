@@ -1464,6 +1464,8 @@ export {
   validatePluginSettingsPolicy,
 } from "./plugin-store.js";
 export type { PluginStoreEvents, PluginRegistrationInput, PluginUpdateInput } from "./plugin-store.js";
+export { HAPPIER_RUNTIME_SETTING_KEYS, canonicalHappierSessionUri, normalizeHappierSessionBindings, safeHappierSettingString, validateHappierRuntimeSettings } from "./happier-runtime-settings.js";
+export type { HappierRuntimeBackend, HappierRuntimeSessionBinding, NormalizedHappierSessionBindings } from "./happier-runtime-settings.js";
 export { PluginLoader, resolvePluginEntryPath } from "./plugin-loader.js";
 export {
   BUNDLED_PLUGIN_IDS,
@@ -2091,10 +2093,7 @@ export {
   type MobileNavSelectableItem,
   type ResolvedMobileNavPrimaryItems,
 } from "./mobile-nav-primary-items.js";
-export {
-  isSessionRoomControlPlaneEnabled,
-  SESSION_ROOM_CONTROL_PLANE_FLAG,
-} from "./room-feature-gate.js";
+export { evaluateSessionRoomControlPlaneProductionGate, isSessionRoomControlPlaneEnabled, isSessionRoomControlPlaneRequested, SESSION_ROOM_CONTROL_PLANE_FLAG, SESSION_ROOM_PRODUCTION_READINESS_PROOF_CONTRACT_VERSION, SESSION_ROOM_REQUIRED_PRODUCTION_CONTROLS, type SessionRoomControlPlaneProductionGateContextV1, type SessionRoomControlPlaneProductionGateEvaluationV1, type SessionRoomControlPlaneProductionReadinessProofV1, type SessionRoomProductionControlProofV1, type SessionRoomProductionControlV1 } from "./room-feature-gate.js";
 export * from "./room-contracts/index.js";
 export * from "./room-protocol-schema.js";
 export * from "./room-protocol-definitions.js";
@@ -2489,6 +2488,7 @@ export {
   SCHEMA_BASELINE_VERSION,
   // FNXC:StaleBinaryGuard 2026-07-19-03:10 (U9b / R10): old-binary write refusal.
   StaleBinarySchemaError,
+  DistBuildInfoSchemaError,
   assertBinaryNotOlderThanDatabase,
   SCHEMA_ROOM_BINDING_OWNERSHIP_VERSION,
   SCHEMA_ROOM_OUTBOX_IDENTITY_VERSION,

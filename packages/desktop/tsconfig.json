@@ -6,7 +6,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "lib": ["ES2024", "DOM", "DOM.Iterable"],
+    "lib": ["ES2024", "DOM", "DOM.Iterable", "DOM.AsyncIterable"],
     "types": ["node", "vite/client"]
   },
   "include": ["src/**/*"],

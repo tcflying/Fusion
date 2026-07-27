@@ -288,7 +288,11 @@ describe("Room existing-Session spine with real PostgreSQL", () => {
 
       const restoredStore = new AsyncRoomStore(layer);
       const restoredSpine = new RoomExistingSessionSpine({ ...options, roomStore: restoredStore });
-      const restored = await restoredSpine.restoreRoom(ROOM_ID);
+      const restored = await restoredSpine.restoreRoomExistingSessions({
+        roomId: ROOM_ID,
+        expectedAggregateVersion: created.room.aggregateVersion,
+        idempotencyKey: "restore-existing-spine-pg-1",
+      });
       expect({
         ...restored,
         seats: restored.seats.toSorted((left, right) => left.id.localeCompare(right.id)),
@@ -514,7 +518,7 @@ describe("Room existing-Session spine with real PostgreSQL", () => {
         },
       });
       await expect(writerStore.getActiveRoomRoleAssignment(ROOM_ID)).resolves.toEqual(transitioned);
-      expect(connector.ensureExisting).toHaveBeenCalledTimes(2);
+      expect(connector.ensureExisting).toHaveBeenCalledTimes(4);
       expect(connector.create).not.toHaveBeenCalled();
       expect(connector.send).not.toHaveBeenCalled();
       expect(connector.interrupt).not.toHaveBeenCalled();

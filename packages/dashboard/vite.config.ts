@@ -248,6 +248,15 @@ export default defineConfig({
         target: `http://localhost:${process.env.FUSION_API_PORT ?? "4040"}`,
         changeOrigin: true,
         ws: true,
+        /*
+        FNXC:DevHmrAuth 2026-07-27-03:54:
+        `scripts/dev-hmr.mjs` supplies this server-only token to Vite and the
+        dashboard API. Inject it at the proxy boundary so HMR never needs
+        `--no-auth` or a secret exposed through a VITE_* client variable.
+        */
+        headers: process.env.FUSION_DASHBOARD_TOKEN
+          ? { Authorization: `Bearer ${process.env.FUSION_DASHBOARD_TOKEN}` }
+          : undefined,
       },
     },
   },

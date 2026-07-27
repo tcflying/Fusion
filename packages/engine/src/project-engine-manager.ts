@@ -69,6 +69,12 @@ export interface EngineManagerOptions {
   roomProviderBackpressureVerifiedFactory?: ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"];
   roomCapabilityRegistryRefreshVerifiedFactory?: ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"];
   roomTaskDispatchCapacityAdmissionVerifiedFactory?: ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"];
+  /**
+   * FNXC:SessionRoomProductionProof 2026-07-27-16:42:
+   * Forward the host-owned evidence provider unchanged. ProjectEngine rechecks
+   * its current, project-bound proof before composing or continuing Room work.
+   */
+  roomProductionReadinessProofProvider?: ProjectEngineOptions["roomProductionReadinessProofProvider"];
   // FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
   // backend boot so all engines reuse one connection pool (no second embedded PG).
   externalTaskStore?: ProjectEngineOptions["externalTaskStore"];
@@ -76,6 +82,36 @@ export interface EngineManagerOptions {
 
 /** Default interval for background reconciliation (30 seconds). */
 export const DEFAULT_RECONCILIATION_INTERVAL_MS = 30_000;
+
+async function settleWithBoundedConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  run: (item: T) => Promise<R>,
+): Promise<Array<PromiseSettledResult<R>>> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(items.length, concurrency));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      try {
+        results[index] = {
+          status: "fulfilled",
+          value: await run(items[index]),
+        };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function normalizeOwnedRootForComparison(root: string): string {
+  const normalized = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
 
 export class ProjectEngineManager {
   private engines = new Map<string, ProjectEngine>();
@@ -101,12 +137,15 @@ export class ProjectEngineManager {
    * each engine creates its own semaphore and the global limit is not shared.
    */
   private globalSemaphore: AgentSemaphore;
-  private currentGlobalLimit = 4;
+  private currentGlobalLimit = 1;
+  private readonly initialGlobalLimitReady: Promise<void>;
+  private initialGlobalLimitError?: Error;
   private concurrencyListener?: (...args: unknown[]) => void;
 
   /** Reconciliation state for background project startup. */
   private reconciliationInterval: ReturnType<typeof setInterval> | null = null;
   private reconciliationStopped = false;
+  private reconciliationInFlight: Promise<void> | undefined;
   private readonly resolvedRoomHostCompositionProvider?: RoomHostCompositionProviderV1;
 
   constructor(
@@ -155,7 +194,11 @@ export class ProjectEngineManager {
     if (typeof centralCore.on === "function") {
       this.concurrencyListener = (state: unknown) => {
         const s = state as { globalMaxConcurrent?: number };
-        if (typeof s.globalMaxConcurrent === "number") {
+        if (
+          typeof s.globalMaxConcurrent === "number"
+          && Number.isInteger(s.globalMaxConcurrent)
+          && s.globalMaxConcurrent > 0
+        ) {
           this.currentGlobalLimit = s.globalMaxConcurrent;
           runtimeLog.log(`Global concurrency limit updated to ${this.currentGlobalLimit}`);
         }
@@ -163,16 +206,40 @@ export class ProjectEngineManager {
       centralCore.on("concurrency:changed", this.concurrencyListener);
     }
 
-    // Read initial limit from CentralCore (async — updates the mutable limit)
-    this.refreshGlobalLimit();
+    /*
+    FNXC:GlobalConcurrencyHydration 2026-07-27-02:37:
+    No project engine may start against a guessed semaphore limit. Capture the
+    one authoritative CentralCore hydration and make every startup path await
+    it. Retain a normalized error instead of leaving a rejected constructor
+    promise unhandled; startup then fails closed with the original cause.
+    */
+    this.initialGlobalLimitReady = this.refreshGlobalLimit().catch((error) => {
+      this.initialGlobalLimitError = error instanceof Error
+        ? error
+        : new Error(String(error));
+      runtimeLog.error(
+        `Global concurrency limit hydration failed: ${this.initialGlobalLimitError.message}`,
+      );
+    });
   }
 
   private async refreshGlobalLimit(): Promise<void> {
-    try {
-      const state = await this.centralCore.getGlobalConcurrencyState();
-      this.currentGlobalLimit = state.globalMaxConcurrent;
-    } catch {
-      // Keep default of 4
+    const state = await this.centralCore.getGlobalConcurrencyState();
+    if (
+      !Number.isInteger(state.globalMaxConcurrent)
+      || state.globalMaxConcurrent <= 0
+    ) {
+      throw new Error(
+        `Invalid global concurrency limit: ${String(state.globalMaxConcurrent)}`,
+      );
+    }
+    this.currentGlobalLimit = state.globalMaxConcurrent;
+  }
+
+  private async awaitInitialGlobalLimit(): Promise<void> {
+    await this.initialGlobalLimitReady;
+    if (this.initialGlobalLimitError) {
+      throw this.initialGlobalLimitError;
     }
   }
 
@@ -270,6 +337,7 @@ export class ProjectEngineManager {
     overrides?: Partial<ProjectEngineOptions>,
   ): Promise<ProjectEngine> {
     if (this.stopped) throw new Error("ProjectEngineManager is stopped");
+    await this.awaitInitialGlobalLimit();
 
     // Check if the project is paused before starting
     const project = await this.centralCore.getProject(projectId);
@@ -302,13 +370,23 @@ export class ProjectEngineManager {
    * Failures for individual projects are logged but don't stop others.
    */
   async startAll(): Promise<void> {
+    await this.awaitInitialGlobalLimit();
     const projects = await this.centralCore.listProjects();
     if (projects.length === 0) return;
 
     runtimeLog.log(`Starting engines for ${projects.length} registered project(s)`);
 
-    const results = await Promise.allSettled(
-      projects.map((p) => this.ensureEngine(p.id)),
+    /*
+    FNXC:BoundedEngineStartup 2026-07-27-02:37:
+    Multi-project boot must not fan every engine out at once. Reuse the hydrated
+    host concurrency limit as the startup bound so limit=1 remains serial from
+    initialization through dispatch instead of oversubscribing before per-task
+    semaphore admission exists.
+    */
+    const results = await settleWithBoundedConcurrency(
+      projects,
+      this.currentGlobalLimit,
+      (project) => this.ensureEngine(project.id),
     );
 
     let started = 0;
@@ -343,6 +421,19 @@ export class ProjectEngineManager {
     if (this.concurrencyListener && typeof this.centralCore.off === "function") {
       this.centralCore.off("concurrency:changed", this.concurrencyListener);
       this.concurrencyListener = undefined;
+    }
+
+    /*
+    FNXC:LocalNodeOfflineOrder 2026-07-27-02:53:
+    Persist the local node's offline state before any project backend stops.
+    Otherwise a shutdown can leave a still-online node record pointing at
+    engines whose provider and task runtimes have already disappeared.
+    */
+    try {
+      await this.centralCore.markLocalNodeOffline();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      runtimeLog.warn(`Local node offline persistence failed: ${message}`);
     }
 
     const stops = Array.from(this.engines.entries()).map(
@@ -460,7 +551,27 @@ export class ProjectEngineManager {
    * This is the core reconciliation logic used by both `startReconciliation`
    * and `startAll()`.
    */
-  private async reconcile(): Promise<void> {
+  private reconcile(): Promise<void> {
+    if (this.reconciliationInFlight) return this.reconciliationInFlight;
+
+    const run = this.reconcileOnce();
+    this.reconciliationInFlight = run;
+    void run.then(
+      () => {
+        if (this.reconciliationInFlight === run) {
+          this.reconciliationInFlight = undefined;
+        }
+      },
+      () => {
+        if (this.reconciliationInFlight === run) {
+          this.reconciliationInFlight = undefined;
+        }
+      },
+    );
+    return run;
+  }
+
+  private async reconcileOnce(): Promise<void> {
     if (this.stopped || this.reconciliationStopped) return;
 
     try {
@@ -478,20 +589,28 @@ export class ProjectEngineManager {
         `Reconciliation: found ${missing.length} project(s) without engines`,
       );
 
-      // Start engines for missing projects (fire-and-forget)
-      for (const project of missing) {
-        if (this.stopped || this.reconciliationStopped) break;
-        this.ensureEngine(project.id).catch((err) => {
-          // An engine owned by another process is expected, not a failure —
-          // createAndStart already logged it once and recorded it in
-          // externalEngines. Swallow it here so reconciliation doesn't warn
-          // every interval for the same externally-owned engine.
-          if (err instanceof EngineAlreadyRunningError) return;
-          const message = err instanceof Error ? err.message : String(err);
-          runtimeLog.warn(
-            `Failed to start engine for project ${project.id}: ${message}`,
-          );
-        });
+      /*
+      FNXC:GlobalConcurrencyHydration 2026-07-28-02:05:
+      Reconciliation is a second multi-project startup entry point. It must
+      share startAll's hydrated limit and one in-flight pass; otherwise a later
+      interval can launch projects skipped by an earlier limit=1 pass.
+      */
+      const results = await settleWithBoundedConcurrency(
+        missing,
+        this.currentGlobalLimit,
+        async (project) => {
+          if (this.stopped || this.reconciliationStopped) return;
+          await this.ensureEngine(project.id);
+        },
+      );
+      for (const [index, result] of results.entries()) {
+        if (result.status !== "rejected" || result.reason instanceof EngineAlreadyRunningError) {
+          continue;
+        }
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        runtimeLog.warn(
+          `Failed to start engine for project ${missing[index].id}: ${message}`,
+        );
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -516,7 +635,11 @@ export class ProjectEngineManager {
     }
 
     const runtimeConfig = await this.buildRuntimeConfig(project);
-    const engineOptions = this.buildEngineOptions(project, overrides);
+    const engineOptions = this.buildEngineOptions(
+      project,
+      runtimeConfig.workingDirectory,
+      overrides,
+    );
 
     // Acquire the per-machine singleton guard before spinning up any engine
     // subsystems. This prevents two fusion processes from running engines for
@@ -581,6 +704,7 @@ export class ProjectEngineManager {
       | undefined;
 
     return {
+      fusionVersion: this.options.cliPackageVersion,
       projectId: project.id,
       workingDirectory: await this.centralCore.resolveLocalProjectWorkingDirectory(project.id),
       isolationMode:
@@ -595,8 +719,15 @@ export class ProjectEngineManager {
 
   private buildEngineOptions(
     project: RegisteredProject,
+    workingDirectory: string,
     overrides?: Partial<ProjectEngineOptions>,
   ): ProjectEngineOptions {
+    const sharedTaskStore = this.options.externalTaskStore;
+    const sharesTaskStoreRoot =
+      sharedTaskStore !== undefined
+      && normalizeOwnedRootForComparison(sharedTaskStore.getRootDir())
+        === normalizeOwnedRootForComparison(workingDirectory);
+
     return {
       projectId: project.id,
       cliPackageVersion: this.options.cliPackageVersion,
@@ -613,10 +744,14 @@ export class ProjectEngineManager {
       roomProviderBackpressureVerifiedFactory: this.options.roomProviderBackpressureVerifiedFactory,
       roomCapabilityRegistryRefreshVerifiedFactory: this.options.roomCapabilityRegistryRefreshVerifiedFactory,
       roomTaskDispatchCapacityAdmissionVerifiedFactory: this.options.roomTaskDispatchCapacityAdmissionVerifiedFactory,
-      // FNXC:SqliteFinalRemoval 2026-06-26-11:20: forward the shared external
-      // TaskStore so engines reuse the central boot's connection pool instead
-      // of starting a second embedded PostgreSQL on the same data dir.
-      ...(this.options.externalTaskStore ? { externalTaskStore: this.options.externalTaskStore } : {}),
+      roomProductionReadinessProofProvider: this.options.roomProductionReadinessProofProvider,
+      /*
+      FNXC:ExternalTaskStoreRootOwnership 2026-07-27-02:53:
+      A central TaskStore is project-root scoped. Reuse it only for the engine
+      whose resolved working directory owns that root; injecting it into every
+      project would cross-contaminate task persistence.
+      */
+      ...(sharesTaskStoreRoot ? { externalTaskStore: sharedTaskStore } : {}),
       ...overrides,
     };
   }

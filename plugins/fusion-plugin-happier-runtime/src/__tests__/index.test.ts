@@ -8,7 +8,10 @@ import {
 } from "@fusion/core";
 import { describe, expect, it, vi } from "vitest";
 import plugin, {
+  HAPPIER_RUNTIME_COMPATIBILITY,
   HAPPIER_RUNTIME_ID,
+  HAPPIER_RUNTIME_PROVENANCE,
+  HAPPIER_RUNTIME_SETTINGS_SCHEMA,
   createHappierHostWriteAuthorizationDependency,
   happierSessionConnectorFactory,
   happierSessionConnectorMetadata,
@@ -90,14 +93,54 @@ function adapterConnector(
   identity = IDENTITY,
   canonicalSessionUri = URI,
 ) {
+  const fenceRecords = new Map<string, Record<string, unknown>>();
+  let lastSend: Readonly<{ localId: string; message: string }> | null = null;
   const client = {
     listTools: vi.fn(async () => [
       { name: "session_message_send" },
       { name: "session_wait_idle" },
+      { name: "session_history_get" },
     ]),
-    callTool: vi.fn(async () => ({
-      structuredContent: { sessionId: identity.happierSessionId, ok: true },
-    })),
+    callTool: vi.fn(async (input: { name: string; arguments?: Record<string, unknown> }) => {
+      if (input.name === "session_message_send") {
+        lastSend = {
+          localId: String(input.arguments?.localId),
+          message: String(input.arguments?.message),
+        };
+        return {
+          structuredContent: {
+            sessionId: identity.happierSessionId,
+            localId: lastSend.localId,
+            waited: false,
+          },
+        };
+      }
+      if (input.name === "session_wait_idle") {
+        return {
+          structuredContent: {
+            sessionId: identity.happierSessionId,
+            idle: true,
+            observedAt: Date.parse(NOW),
+          },
+        };
+      }
+      if (input.name === "session_history_get") {
+        return {
+          structuredContent: {
+            sessionId: identity.happierSessionId,
+            format: "raw",
+            messages: lastSend
+              ? [{
+                  id: "native-message-1",
+                  localId: lastSend.localId,
+                  raw: { content: { type: "text", text: lastSend.message } },
+                }]
+              : [],
+          },
+        };
+      }
+      throw new Error(`unexpected tool ${input.name}`);
+    }),
     close: vi.fn(async () => undefined),
   };
   const openMcpClient = vi.fn(async () => client);
@@ -120,7 +163,67 @@ function adapterConnector(
       }],
     },
     now: () => NOW,
-    dependencies: { openMcpClient, probeRuntime: vi.fn() },
+    dependencies: {
+      openMcpClient,
+      probeRuntime: vi.fn(),
+      attestCli: vi.fn(async () => ({
+        ok: true as const,
+        trustLevel: "local_custom_pinned_source_build" as const,
+        sourceRoot: "G:\\codex-project\\happier",
+        entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+        cliVersion: "0.2.10",
+        sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+        entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786" as const,
+        verifiedAt: NOW,
+        evidence: {
+          version: "cli_--version" as const,
+          package: "package_json" as const,
+          source: "git_head" as const,
+          artifact: "sha256_file_bytes" as const,
+        },
+      })),
+      createDeliveryFenceStore: () => ({
+        reserve: async (input) => {
+          const key = JSON.stringify({
+            canonicalSessionUri: input.canonicalSessionUri,
+            happierSessionId: input.happierSessionId,
+            localMessageId: input.localMessageId,
+          });
+          const existing = fenceRecords.get(key);
+          if (existing) {
+            return existing.contentHash === input.contentHash
+              ? { state: existing.state as "pending" | "confirmed", record: existing as never }
+              : { state: "conflict" as const, record: existing as never };
+          }
+          const record = {
+            contractVersion: 1,
+            keyHash: "a".repeat(64),
+            state: "pending",
+            ...input,
+            receipt: null,
+            createdAt: NOW,
+            updatedAt: NOW,
+          };
+          fenceRecords.set(key, record);
+          return { state: "created" as const, record: record as never };
+        },
+        confirm: async (input, receipt) => {
+          const key = JSON.stringify({
+            canonicalSessionUri: input.canonicalSessionUri,
+            happierSessionId: input.happierSessionId,
+            localMessageId: input.localMessageId,
+          });
+          const record = {
+            ...fenceRecords.get(key),
+            state: "confirmed",
+            receipt,
+            updatedAt: NOW,
+          };
+          fenceRecords.set(key, record);
+          return { state: "confirmed" as const, record: record as never };
+        },
+      }),
+    },
   }, verifier);
   return { connector, client, openMcpClient };
 }
@@ -131,6 +234,13 @@ describe("Happier runtime plugin registration", () => {
     const packageJson = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string };
     const manifestJson = JSON.parse(readFileSync(new URL("../../manifest.json", import.meta.url), "utf8")) as {
       version: string;
+      author?: string;
+      homepage?: string;
+      description?: string;
+      fusionVersion?: string;
+      provenance?: Record<string, unknown>;
+      compatibility?: Record<string, unknown>;
+      settingsSchema?: Record<string, unknown>;
       runtime?: { version?: string };
       sessionConnector?: { version?: string };
     };
@@ -141,6 +251,18 @@ describe("Happier runtime plugin registration", () => {
     expect(manifestJson.version).toBe(packageJson.version);
     expect(manifestJson.runtime?.version).toBe(packageJson.version);
     expect(manifestJson.sessionConnector?.version).toBe(packageJson.version);
+    expect(packageJson.version).toBe("0.3.0");
+    expect(plugin.manifest.fusionVersion).toBe(HAPPIER_RUNTIME_COMPATIBILITY.fusionSemver);
+    expect(plugin.manifest.settingsSchema).toBe(HAPPIER_RUNTIME_SETTINGS_SCHEMA);
+    expect(Object.keys(manifestJson.settingsSchema ?? {}).sort()).toEqual(
+      Object.keys(HAPPIER_RUNTIME_SETTINGS_SCHEMA).sort(),
+    );
+    expect(manifestJson.compatibility).toEqual(HAPPIER_RUNTIME_COMPATIBILITY);
+    expect(manifestJson.provenance).toMatchObject(HAPPIER_RUNTIME_PROVENANCE);
+    expect(manifestJson.author).toBe(HAPPIER_RUNTIME_PROVENANCE.maintainer);
+    expect(manifestJson.homepage).toBe(HAPPIER_RUNTIME_PROVENANCE.repository);
+    expect(manifestJson.description).toContain("Local/custom");
+    expect(manifestJson.description).not.toContain("Official Happier");
   });
 
   it("registers metadata and creates the runtime without provider credentials", async () => {

@@ -1,4 +1,7 @@
-import { invokeHappierJsonForKind } from "./cli-spawn.js";
+import {
+  invokeHappierJsonForKind,
+  resolveHappierWaitTimeoutMs,
+} from "./cli-spawn.js";
 import {
   HappierCliError,
   type HappierCliSettings,
@@ -404,7 +407,16 @@ export async function waitForHappierRun(
     args.push("--timeout", String(options.timeoutSeconds));
   }
   args.push("--json");
-  const raw = await invokeHappierJsonForKind(args, "session_run_wait", settings, signal);
+  const outerTimeoutMs = options.timeoutSeconds === undefined
+    ? undefined
+    : resolveHappierWaitTimeoutMs(options.timeoutSeconds, settings);
+  const raw = await invokeHappierJsonForKind(
+    args,
+    "session_run_wait",
+    settings,
+    signal,
+    outerTimeoutMs,
+  );
   if (!isRecord(raw)) throw new HappierCliError("protocol", "Happier run wait returned invalid data");
   return {
     sessionId: expectedSessionId(raw.sessionId, sessionId, "run wait"),

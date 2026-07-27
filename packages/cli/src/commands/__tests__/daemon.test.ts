@@ -631,6 +631,11 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
   getCliPackageVersion: vi.fn(() => "0.0.0"),
   // FNXC:CliTests 2026-07-13-08:00: getCliPackageVersion added to @fusion/dashboard barrel export; mock must surface it for daemon/serve startup model sync.
   createServer: mocks.createServerMock,
+  createDashboardAuthContext: vi.fn((input: { host: string; token: string }) => ({
+    mode: "bearer",
+    host: input.host,
+    token: input.token,
+  })),
   GitHubClient: vi.fn().mockImplementation(function () {
     return {};
   }),

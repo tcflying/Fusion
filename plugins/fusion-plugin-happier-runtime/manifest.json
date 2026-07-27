@@ -1,20 +1,200 @@
 {
   "id": "fusion-plugin-happier-runtime",
   "name": "Happier Runtime Plugin",
-  "version": "0.2.73",
-  "description": "Happier JSON CLI contract layer for Fusion runtime sessions",
-  "author": "Fusion Team",
-  "homepage": "https://github.com/Runfusion/Fusion",
+  "version": "0.3.0",
+  "description": "Local/custom Fusion adapter for a pinned Happier CLI and MCP contract",
+  "author": "tcflying",
+  "homepage": "https://github.com/tcflying/Fusion",
+  "fusionVersion": ">=0.74.0-beta.3 <0.75.0",
+  "provenance": {
+    "distribution": "local_custom_integration",
+    "officialHappierPlugin": false,
+    "maintainer": "tcflying",
+    "repository": "https://github.com/tcflying/Fusion",
+    "upstreamRepository": "https://github.com/happier-dev/happier",
+    "upstreamSourceCommit": "6e059c41d865343c1efc9c98676e5af3882d85ff",
+    "upstreamProtocolContract": "sessionControl/v1@6e059c41d865343c1efc9c98676e5af3882d85ff"
+  },
+  "compatibility": {
+    "pluginVersion": "0.3.0",
+    "fusionSemver": ">=0.74.0-beta.3 <0.75.0",
+    "happierCliSemver": "0.2.10",
+    "happierSourceCommit": "6e059c41d865343c1efc9c98676e5af3882d85ff",
+    "officialProtocolContract": "sessionControl/v1@6e059c41d865343c1efc9c98676e5af3882d85ff",
+    "entrypointRelativePath": "apps/cli/package-dist/index.mjs",
+    "entrypointSha256": "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786"
+  },
+  "settingsSchema": {
+    "executable": {
+      "type": "string",
+      "label": "Node Executable",
+      "description": "Absolute path to the current Fusion Node executable. Runtime attestation rejects every other executable.",
+      "group": "Pinned CLI",
+      "required": true
+    },
+    "entrypoint": {
+      "type": "string",
+      "label": "Happier CLI Entrypoint",
+      "description": "Absolute package-dist entrypoint. It must resolve beneath an allowed source root and match the published hash.",
+      "group": "Pinned CLI",
+      "required": true
+    },
+    "allowedCliRoots": {
+      "type": "array",
+      "itemType": "string",
+      "label": "Allowed Happier Source Roots",
+      "description": "One or more absolute realpath roots allowed to contain the pinned Happier CLI entrypoint.",
+      "group": "Pinned CLI",
+      "required": true
+    },
+    "backend": {
+      "type": "enum",
+      "label": "Backend",
+      "description": "Single backend used consistently by health probes, the runtime, and the Session Connector.",
+      "enumValues": [
+        "codex",
+        "claude",
+        "opencode"
+      ],
+      "defaultValue": "codex",
+      "required": true,
+      "group": "Runtime"
+    },
+    "homeDir": {
+      "type": "string",
+      "label": "Happier Home Directory",
+      "description": "Optional absolute Happier state directory.",
+      "group": "Runtime"
+    },
+    "activeServerId": {
+      "type": "string",
+      "label": "Active Server Profile ID",
+      "description": "Server profile expected by every persisted binding in this plugin configuration.",
+      "group": "Runtime"
+    },
+    "serverUrl": {
+      "type": "string",
+      "label": "Server URL",
+      "description": "Optional credential-free HTTP(S) server URL.",
+      "group": "Runtime"
+    },
+    "publicServerUrl": {
+      "type": "string",
+      "label": "Public Server URL",
+      "description": "Optional credential-free HTTP(S) public server URL.",
+      "group": "Runtime"
+    },
+    "webappUrl": {
+      "type": "string",
+      "label": "Web App URL",
+      "description": "Optional credential-free HTTP(S) Happier web app URL.",
+      "group": "Runtime"
+    },
+    "profile": {
+      "type": "string",
+      "label": "Happier Profile",
+      "description": "Optional Happier CLI profile name.",
+      "group": "Runtime"
+    },
+    "timeoutMs": {
+      "type": "number",
+      "label": "Legacy CLI Timeout (ms)",
+      "description": "Fallback deadline for one-shot CLI operations.",
+      "defaultValue": 30000,
+      "group": "Timeouts"
+    },
+    "spawnTimeoutMs": {
+      "type": "number",
+      "label": "Process Spawn Timeout (ms)",
+      "description": "Deadline for proving that a child process started.",
+      "defaultValue": 30000,
+      "group": "Timeouts"
+    },
+    "connectTimeoutMs": {
+      "type": "number",
+      "label": "MCP Connect Timeout (ms)",
+      "description": "Deadline for MCP initialization and capability negotiation.",
+      "defaultValue": 30000,
+      "group": "Timeouts"
+    },
+    "toolTimeoutMs": {
+      "type": "number",
+      "label": "MCP Tool Timeout (ms)",
+      "description": "Deadline for non-provider-waiting CLI and MCP calls.",
+      "defaultValue": 30000,
+      "group": "Timeouts"
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "label": "Provider Wait Timeout (seconds)",
+      "description": "Inner provider deadline shared by Runtime and Session Connector sends.",
+      "defaultValue": 300,
+      "group": "Timeouts"
+    },
+    "waitTimeoutMs": {
+      "type": "number",
+      "label": "Outer Wait Timeout (ms)",
+      "description": "Optional outer deadline; persistence rejects values shorter than provider wait plus grace.",
+      "group": "Timeouts"
+    },
+    "waitTimeoutGraceMs": {
+      "type": "number",
+      "label": "Wait Cleanup Grace (ms)",
+      "description": "Cleanup and transport grace added after the inner provider deadline.",
+      "defaultValue": 5000,
+      "group": "Timeouts"
+    },
+    "maxOutputBytes": {
+      "type": "number",
+      "label": "Maximum Output Bytes",
+      "description": "Maximum buffered bytes accepted from a CLI or MCP child process.",
+      "defaultValue": 1048576,
+      "group": "Timeouts"
+    },
+    "enableLocalRuntimeSnapshot": {
+      "type": "boolean",
+      "label": "Enable Local Runtime Snapshot Extension",
+      "description": "Opt in to the non-upstream Fusion local runtime snapshot extension.",
+      "defaultValue": false,
+      "group": "Local Extensions"
+    },
+    "enableLocalReconciliationHistory": {
+      "type": "boolean",
+      "label": "Enable Local Reconciliation History Extension",
+      "description": "Opt in to the non-upstream local history extension used for fail-closed reconciliation.",
+      "defaultValue": false,
+      "group": "Local Extensions"
+    },
+    "enableLocalProviderTelemetry": {
+      "type": "boolean",
+      "label": "Enable Local Provider Telemetry Extension",
+      "description": "Opt in to non-upstream local provider telemetry. It never grants dispatch readiness.",
+      "defaultValue": false,
+      "group": "Local Extensions"
+    },
+    "createIntentDirectory": {
+      "type": "string",
+      "label": "Create Intent Directory",
+      "description": "Optional absolute directory for restart-durable create intents.",
+      "group": "Durability"
+    },
+    "deliveryFenceDirectory": {
+      "type": "string",
+      "label": "Delivery Fence Directory",
+      "description": "Optional absolute directory for restart-durable localId/contentHash fences.",
+      "group": "Durability"
+    }
+  },
   "runtime": {
     "runtimeId": "happier",
     "name": "Happier Runtime",
-    "description": "Official Happier CLI-backed runtime session contract",
-    "version": "0.2.73"
+    "description": "Local/custom adapter for pinned Happier JSON CLI sessions with durable native ids",
+    "version": "0.3.0"
   },
   "sessionConnector": {
     "connectorId": "happier",
     "name": "Happier Session Connector",
-    "description": "Official Happier MCP-backed connector for manually bound Sessions",
-    "version": "0.2.73"
+    "description": "Local/custom connector for manually bound Sessions using the pinned official Happier MCP contract",
+    "version": "0.3.0"
   }
 }

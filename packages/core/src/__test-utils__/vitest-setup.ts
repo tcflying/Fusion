@@ -28,6 +28,11 @@ import {
   finalizeWorkerRootCleanup,
   registerWorkerRootLifecycle,
   releaseWorkerRootLifecycle,
+  terminateTestProcessTree,
+  terminateTestProcessTreeSync,
+  writeTestTimeoutArtifacts,
+  type TestProcessTreeCleanupResult,
+  type TestTimeoutArtifactPaths,
   type WorkerRootLifecycle,
 } from "./vitest-teardown.js";
 
@@ -174,6 +179,10 @@ function findRepoRoot(start: string): string {
 
 const repoRoot = findRepoRoot(realProjectRoot);
 process.env.FUSION_TEST_REAL_ROOT = repoRoot;
+const TEST_TIMEOUT_ARTIFACT_DIR = resolve(
+  process.env.FUSION_TEST_TIMEOUT_ARTIFACT_DIR?.trim()
+    || join(repoRoot, ".timings", "test-timeouts", ensureTestRunToken()),
+);
 
 // Prevent MasterKeyManager from hitting the real macOS/Linux keychain during
 // tests — keytar can block for 15s+ on CI-like environments. Tests that need
@@ -226,7 +235,15 @@ const { root: WORKER_ROOT, selfMinted: SELF_MINTED_WORKER_ROOT } = (() => {
   }
   return { root, selfMinted };
 })();
-const WORKER_ROOT_LIFECYCLE = registerWorkerRootLifecycle(WORKER_ROOT, "worker");
+/*
+FNXC:TestWorkerLifecycleCleanup 2026-07-27-02:49:
+Vitest's thread pool shares the owner process PID and cwd; registering that PID
+as a separate worker makes final cleanup wait on the process that is performing
+the cleanup itself. Only fork/process workers need a process-lifecycle lease.
+*/
+const WORKER_ROOT_LIFECYCLE = isMainThread
+  ? registerWorkerRootLifecycle(WORKER_ROOT, "worker")
+  : null;
 
 const REAL_TMPDIR = (() => {
   try {
@@ -261,7 +278,9 @@ function ensureWorkerRoot(): void {
   */
   mkdirSync(WORKER_ROOT, { recursive: true });
   writeWorkerRootOwnerMarker(WORKER_ROOT);
-  registerWorkerRootLifecycle(WORKER_ROOT, "worker", WORKER_ROOT_LIFECYCLE.pid);
+  if (WORKER_ROOT_LIFECYCLE) {
+    registerWorkerRootLifecycle(WORKER_ROOT, "worker", WORKER_ROOT_LIFECYCLE.pid);
+  }
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -757,9 +776,14 @@ process.chdir = (target: string) => {
 type TrackedSubprocess = {
   commandLine: string;
   startedAt: number;
+  timeoutMs: number;
   timeoutTimer: NodeJS.Timeout | null;
   timedOut: boolean;
   testName: string | null;
+  treeCleanupPromise: Promise<TestProcessTreeCleanupResult | null> | null;
+  cleanupEvidencePromise: Promise<TestTimeoutEvidence> | null;
+  abortSignal: AbortSignal | null;
+  abortListener: (() => void) | null;
 };
 
 const originalChildProcess = {
@@ -775,10 +799,20 @@ const originalChildProcess = {
 const trackedSubprocesses = new Map<ChildProcess, TrackedSubprocess>();
 const managedChildLifecycles = new Map<ChildProcess, WorkerRootLifecycle>();
 
+type TestTimeoutEvidence = Readonly<{
+  cleanup: TestProcessTreeCleanupResult | null;
+  artifacts: TestTimeoutArtifactPaths | null;
+  error: string | null;
+}>;
+
 // Typed failure record so afterEach can attribute each timed-out subprocess
 // back to the test that spawned it rather than blindly throwing in whichever
 // test happens to run next (cascade false-positives).
-type CompletedSubprocessFailure = { ownerTestName: string | null; message: string };
+type CompletedSubprocessFailure = {
+  ownerTestName: string | null;
+  message: string;
+  evidencePromise: Promise<TestTimeoutEvidence>;
+};
 const completedSubprocessFailures: CompletedSubprocessFailure[] = [];
 
 function describeTestSubprocessCommand(command: string, args?: readonly string[]): string {
@@ -787,6 +821,20 @@ function describeTestSubprocessCommand(command: string, args?: readonly string[]
 
 function currentTestName(): string | null {
   return expect.getState().currentTestName ?? null;
+}
+
+function failedTestProcessTreeCleanup(
+  rootPid: number,
+  error: unknown,
+): TestProcessTreeCleanupResult {
+  return {
+    rootPid,
+    method: process.platform === "win32" ? "windows-process-tree" : "direct-process",
+    cleanupTimedOut: true,
+    observedProcesses: [],
+    residualProcesses: [],
+    error: error instanceof Error ? error.message : String(error),
+  };
 }
 
 // Cheap, no-network introspection invocations are safe to run in tests — they
@@ -919,6 +967,8 @@ export const __fusionSubprocessTimeoutTestHooks = {
   defaultTimeoutMs: DEFAULT_TEST_SUBPROCESS_TIMEOUT_MS,
   embeddedPostgresTimeoutMs: EMBEDDED_POSTGRES_TEST_SUBPROCESS_TIMEOUT_MS,
   testSubprocessTimeoutMs,
+  isSynchronousSubprocessTimeout,
+  failedTestProcessTreeCleanup,
 };
 
 function withDefaultTimeout<T extends { timeout?: number | undefined }>(
@@ -934,12 +984,69 @@ function withDefaultTimeout<T extends { timeout?: number | undefined }>(
   } as T;
 }
 
+function isSynchronousSubprocessTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as NodeJS.ErrnoException;
+  return candidate.code === "ETIMEDOUT"
+    || /\bETIMEDOUT\b|timed out/i.test(candidate.message ?? "");
+}
+
+function synchronousSubprocessPid(value: unknown): number | null {
+  if (!value || typeof value !== "object") return null;
+  const pid = (value as { pid?: unknown }).pid;
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function recordSynchronousSubprocessTimeout(input: {
+  commandLine: string;
+  timeoutMs: number;
+  startedAt: number;
+  rootPid: number | null;
+}): void {
+  let cleanup: TestProcessTreeCleanupResult | null = null;
+  let cleanupError: string | null = null;
+  if (input.rootPid !== null) {
+    try {
+      cleanup = terminateTestProcessTreeSync(input.rootPid, {
+        startedAt: input.startedAt,
+        protectedPids: [process.pid, process.ppid],
+      });
+    } catch (error) {
+      cleanup = failedTestProcessTreeCleanup(input.rootPid, error);
+      cleanupError = cleanup.error ?? "unknown process-tree cleanup error";
+    }
+  }
+  try {
+    const artifacts = writeTestTimeoutArtifacts({
+      artifactDir: TEST_TIMEOUT_ARTIFACT_DIR,
+      reason: "subprocess-timeout",
+      testName: currentTestName(),
+      commandLine: input.commandLine,
+      timeoutMs: input.timeoutMs,
+      workerPid: process.pid,
+      rootPid: input.rootPid,
+      cleanup,
+    });
+    process.stderr.write(
+      `[vitest-setup] synchronous subprocess timeout artifacts: JUnit=${artifacts.junitPath}; processes=${artifacts.residualProcessListPath}${cleanupError ? `; cleanupError=${cleanupError}` : ""}\n`,
+    );
+  } catch (error) {
+    process.stderr.write(
+      `[vitest-setup] synchronous subprocess timeout cleanup/evidence failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+}
+
 function cleanupTrackedSubprocess(proc: ChildProcess): void {
   const tracked = trackedSubprocesses.get(proc);
   if (!tracked) return;
   if (tracked.timeoutTimer) {
     clearTimeout(tracked.timeoutTimer);
     tracked.timeoutTimer = null;
+  }
+  if (tracked.abortSignal && tracked.abortListener) {
+    tracked.abortSignal.removeEventListener("abort", tracked.abortListener);
+    tracked.abortListener = null;
   }
   trackedSubprocesses.delete(proc);
 }
@@ -951,36 +1058,179 @@ function releaseManagedChildLifecycle(proc: ChildProcess): void {
   releaseWorkerRootLifecycle(lifecycle);
 }
 
-function registerTrackedSubprocess(proc: ChildProcess, commandLine: string): void {
-  const timeoutMs = testSubprocessTimeoutMs(commandLine);
+type TestProcessFailureReason = "subprocess-timeout" | "test-timeout" | "left-running";
+
+/*
+FNXC:PostgresTestProcessCleanup 2026-07-27-06:12:
+The Vitest guard owns every test-launched process, including psql/initdb/pg_ctl
+and ad-hoc runners. On timeout or leaked completion, terminate the owned Windows
+tree before releasing its worker-root lease, then persist JUnit plus a residual
+PID inventory outside the worker root. Never select processes by port or name;
+the cleanup authority is only the exact child PID this worker spawned.
+*/
+function startTrackedProcessTreeCleanup(
+  proc: ChildProcess,
+  tracked: TrackedSubprocess,
+): Promise<TestProcessTreeCleanupResult | null> {
+  if (tracked.treeCleanupPromise) return tracked.treeCleanupPromise;
+  tracked.treeCleanupPromise = (async () => {
+    const rootPid = typeof proc.pid === "number" && proc.pid > 0 ? proc.pid : null;
+    if (rootPid === null) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // A child with no published PID cannot have a targeted tree authority.
+      }
+      return null;
+    }
+    return terminateTestProcessTree(rootPid, {
+      startedAt: tracked.startedAt,
+      protectedPids: [process.pid, process.ppid],
+      killRoot: () => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // The root may have exited while the Windows orphan sweep ran.
+        }
+      },
+    });
+  })();
+  return tracked.treeCleanupPromise;
+}
+
+function startTrackedSubprocessCleanup(
+  proc: ChildProcess,
+  tracked: TrackedSubprocess,
+  reason: TestProcessFailureReason,
+): Promise<TestTimeoutEvidence> {
+  if (tracked.cleanupEvidencePromise) return tracked.cleanupEvidencePromise;
+  tracked.cleanupEvidencePromise = (async (): Promise<TestTimeoutEvidence> => {
+    const rootPid = typeof proc.pid === "number" && proc.pid > 0 ? proc.pid : null;
+    let cleanup: TestProcessTreeCleanupResult | null = null;
+    let cleanupError: string | null = null;
+    try {
+      cleanup = await startTrackedProcessTreeCleanup(proc, tracked);
+    } catch (error) {
+      cleanupError = error instanceof Error ? error.message : String(error);
+      cleanup = rootPid === null ? null : failedTestProcessTreeCleanup(rootPid, error);
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Preserve the cleanup failure in the mandatory evidence below.
+      }
+    }
+    try {
+      const artifacts = writeTestTimeoutArtifacts({
+        artifactDir: TEST_TIMEOUT_ARTIFACT_DIR,
+        reason,
+        testName: tracked.testName,
+        commandLine: tracked.commandLine,
+        timeoutMs: tracked.timeoutMs,
+        workerPid: process.pid,
+        rootPid,
+        cleanup,
+      });
+      return { cleanup, artifacts, error: cleanupError };
+    } catch (error) {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Preserve the cleanup/evidence failure below.
+      }
+      return {
+        cleanup,
+        artifacts: null,
+        error: [
+          cleanupError,
+          `artifact write failed: ${error instanceof Error ? error.message : String(error)}`,
+        ].filter(Boolean).join("; "),
+      };
+    }
+  })();
+  return tracked.cleanupEvidencePromise;
+}
+
+function formatTimeoutEvidence(evidence: TestTimeoutEvidence): string {
+  const artifactText = evidence.artifacts
+    ? `JUnit=${evidence.artifacts.junitPath}; processes=${evidence.artifacts.residualProcessListPath}`
+    : "timeout artifacts unavailable";
+  const residualCount = evidence.cleanup?.residualProcesses.length ?? 0;
+  return [
+    artifactText,
+    `residualProcesses=${residualCount}`,
+    ...(evidence.error ? [`cleanup/evidence error: ${evidence.error}`] : []),
+  ].join("; ");
+}
+
+function registerTrackedSubprocess(
+  proc: ChildProcess,
+  commandLine: string,
+  options: { timeoutMs?: number; abortSignal?: AbortSignal } = {},
+): void {
+  const timeoutMs = typeof options.timeoutMs === "number"
+    && Number.isFinite(options.timeoutMs)
+    && options.timeoutMs > 0
+    ? Math.max(1, Math.trunc(options.timeoutMs))
+    : testSubprocessTimeoutMs(commandLine);
   const tracked: TrackedSubprocess = {
     commandLine,
     startedAt: Date.now(),
+    timeoutMs,
     timeoutTimer: null,
     timedOut: false,
     testName: currentTestName(),
+    treeCleanupPromise: null,
+    cleanupEvidencePromise: null,
+    abortSignal: options.abortSignal ?? null,
+    abortListener: null,
   };
   trackedSubprocesses.set(proc, tracked);
   if (typeof proc.pid === "number" && proc.pid > 0) {
     managedChildLifecycles.set(proc, registerWorkerRootLifecycle(WORKER_ROOT, "child", proc.pid));
   }
 
+  if (tracked.abortSignal) {
+    tracked.abortListener = () => {
+      void startTrackedProcessTreeCleanup(proc, tracked).catch(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // The abort raced normal process completion.
+        }
+      });
+    };
+    if (tracked.abortSignal.aborted) {
+      tracked.abortListener();
+    } else {
+      tracked.abortSignal.addEventListener("abort", tracked.abortListener, { once: true });
+    }
+  }
+
   tracked.timeoutTimer = setTimeout(() => {
     tracked.timedOut = true;
+    const evidencePromise = startTrackedSubprocessCleanup(
+      proc,
+      tracked,
+      "subprocess-timeout",
+    );
     completedSubprocessFailures.push({
       ownerTestName: tracked.testName,
       message: `Timed out after ${timeoutMs}ms: ${tracked.commandLine}${tracked.testName ? ` (${tracked.testName})` : ""}`,
+      evidencePromise,
     });
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Ignore — the process may have already exited.
-    }
   }, timeoutMs);
 
   const finish = () => {
     cleanupTrackedSubprocess(proc);
-    releaseManagedChildLifecycle(proc);
+    const cleanupPromise = tracked.cleanupEvidencePromise ?? tracked.treeCleanupPromise;
+    if (cleanupPromise) {
+      void cleanupPromise.then(
+        () => releaseManagedChildLifecycle(proc),
+        () => releaseManagedChildLifecycle(proc),
+      );
+    } else {
+      releaseManagedChildLifecycle(proc);
+    }
   };
   proc.once("close", finish);
   proc.once("error", finish);
@@ -1004,8 +1254,11 @@ function installChildProcessGuards(): void {
       throw blockedCliError(commandLine);
     }
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.spawn(command, args, options);
-    registerTrackedSubprocess(proc, commandLine);
+    const proc = originalChildProcess.spawn(command, args, { ...options, timeout: 0 });
+    registerTrackedSubprocess(proc, commandLine, {
+      timeoutMs: options.timeout,
+      abortSignal: options.signal,
+    });
     return proc;
   }) as ChildProcessModule["spawn"];
 
@@ -1022,7 +1275,17 @@ function installChildProcessGuards(): void {
       throw blockedCliError(commandLine);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.spawnSync(command, args, options);
+    const startedAt = Date.now();
+    const result = originalChildProcess.spawnSync(command, args, options);
+    if (isSynchronousSubprocessTimeout(result.error)) {
+      recordSynchronousSubprocessTimeout({
+        commandLine,
+        timeoutMs: options.timeout ?? testSubprocessTimeoutMs(commandLine),
+        startedAt,
+        rootPid: synchronousSubprocessPid(result),
+      });
+    }
+    return result;
   }) as ChildProcessModule["spawnSync"];
 
   mutableChildProcess.execSync = ((command: string, options?: ExecSyncOptions) => {
@@ -1033,7 +1296,21 @@ function installChildProcessGuards(): void {
       throw blockedCliError(command);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.execSync(command, withDefaultTimeout(options, command));
+    const boundedOptions = withDefaultTimeout(options, command);
+    const startedAt = Date.now();
+    try {
+      return originalChildProcess.execSync(command, boundedOptions);
+    } catch (error) {
+      if (isSynchronousSubprocessTimeout(error)) {
+        recordSynchronousSubprocessTimeout({
+          commandLine: command,
+          timeoutMs: boundedOptions.timeout ?? testSubprocessTimeoutMs(command),
+          startedAt,
+          rootPid: synchronousSubprocessPid(error),
+        });
+      }
+      throw error;
+    }
   }) as ChildProcessModule["execSync"];
 
   mutableChildProcess.execFileSync = ((file: string, argsOrOptions?: readonly string[] | ExecFileSyncOptions, maybeOptions?: ExecFileSyncOptions) => {
@@ -1049,7 +1326,20 @@ function installChildProcessGuards(): void {
       throw blockedCliError(commandLine);
     }
     ensureRuntimeIsolationForSubprocess();
-    return originalChildProcess.execFileSync(file, args, options);
+    const startedAt = Date.now();
+    try {
+      return originalChildProcess.execFileSync(file, args, options);
+    } catch (error) {
+      if (isSynchronousSubprocessTimeout(error)) {
+        recordSynchronousSubprocessTimeout({
+          commandLine,
+          timeoutMs: options.timeout ?? testSubprocessTimeoutMs(commandLine),
+          startedAt,
+          rootPid: synchronousSubprocessPid(error),
+        });
+      }
+      throw error;
+    }
   }) as ChildProcessModule["execFileSync"];
 
   // Preserve util.promisify(exec) → { stdout, stderr } semantics. Function.prototype.bind
@@ -1065,8 +1355,16 @@ function installChildProcessGuards(): void {
     const options = typeof optionsOrCallback === "function" ? undefined : optionsOrCallback;
     const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.exec(command, withDefaultTimeout(options, command), callback);
-    registerTrackedSubprocess(proc, command);
+    const boundedOptions = withDefaultTimeout(options, command);
+    const proc = originalChildProcess.exec(
+      command,
+      { ...boundedOptions, timeout: 0 },
+      callback,
+    );
+    registerTrackedSubprocess(proc, command, {
+      timeoutMs: boundedOptions.timeout,
+      abortSignal: boundedOptions.signal,
+    });
     return proc;
   }) as unknown as ChildProcessModule["exec"];
   (execWrapper as unknown as Record<symbol, unknown>)[promisify.custom] = (command: string, options?: ExecOptions) =>
@@ -1099,8 +1397,17 @@ function installChildProcessGuards(): void {
       ? (typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback)
       : (typeof argsOrOptions === "function" ? argsOrOptions : typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback);
     ensureRuntimeIsolationForSubprocess();
-    const proc = originalChildProcess.execFile(file, args, withDefaultTimeout(options, commandLine), callback);
-    registerTrackedSubprocess(proc, commandLine);
+    const boundedOptions = withDefaultTimeout(options, commandLine);
+    const proc = originalChildProcess.execFile(
+      file,
+      args,
+      { ...boundedOptions, timeout: 0 },
+      callback,
+    );
+    registerTrackedSubprocess(proc, commandLine, {
+      timeoutMs: boundedOptions.timeout,
+      abortSignal: boundedOptions.signal,
+    });
     return proc;
   }) as unknown as ChildProcessModule["execFile"];
   (execFileWrapper as unknown as Record<symbol, unknown>)[promisify.custom] = (file: string, args?: readonly string[], options?: ExecFileOptions) =>
@@ -1129,7 +1436,9 @@ function installChildProcessGuards(): void {
     }
     ensureRuntimeIsolationForSubprocess();
     const proc = originalChildProcess.fork(modulePath, args, options);
-    registerTrackedSubprocess(proc, commandLine);
+    registerTrackedSubprocess(proc, commandLine, {
+      abortSignal: options?.signal,
+    });
     return proc;
   }) as ChildProcessModule["fork"];
 
@@ -1138,7 +1447,7 @@ function installChildProcessGuards(): void {
 
 installChildProcessGuards();
 
-afterEach(async () => {
+afterEach(async (testContext) => {
   // Drain the completed-subprocess failure queue. Only surface failures that
   // belong to the currently-finishing test; failures from a *previous* test
   // whose 30 s timer fired while this test was already running are left in
@@ -1146,11 +1455,11 @@ afterEach(async () => {
   // has already finished, they are simply discarded here to avoid false-positive
   // cascade failures on innocent successor tests.
   const currentTest = currentTestName();
-  const owned: string[] = [];
+  const owned: CompletedSubprocessFailure[] = [];
   const remaining: CompletedSubprocessFailure[] = [];
   for (const failure of completedSubprocessFailures) {
     if (failure.ownerTestName === currentTest) {
-      owned.push(failure.message);
+      owned.push(failure);
     } else {
       // Keep failures that belong to other tests so they can be surfaced when
       // that test's afterEach runs (concurrent-worker scenario). Failures whose
@@ -1162,7 +1471,13 @@ afterEach(async () => {
   }
   completedSubprocessFailures.length = 0;
   completedSubprocessFailures.push(...remaining);
-  const failures = owned;
+  const failures: string[] = [];
+  let timeoutEvidenceWritten = false;
+  for (const failure of owned) {
+    const evidence = await failure.evidencePromise;
+    timeoutEvidenceWritten ||= evidence.artifacts !== null;
+    failures.push(`${failure.message}; ${formatTimeoutEvidence(evidence)}`);
+  }
 
   // Give SIGTERM'd processes a brief grace period to exit before declaring
   // them "left running" — tests like dev-server-process.cleanup() send SIGTERM
@@ -1213,20 +1528,43 @@ afterEach(async () => {
       // current test to avoid false-positive "left running" errors from
       // sibling tests that are still wrapping up their subprocesses.
       if (tracked.testName === currentTest) {
+        const reason = testContext.signal.aborted ? "test-timeout" : "left-running";
+        const evidence = await startTrackedSubprocessCleanup(proc, tracked, reason);
+        timeoutEvidenceWritten ||= evidence.artifacts !== null;
         failures.push(
-          `Left running at end of test: ${tracked.commandLine}${tracked.testName ? ` (${tracked.testName})` : ""}`,
+          `Left running at end of test: ${tracked.commandLine}${tracked.testName ? ` (${tracked.testName})` : ""}; ${formatTimeoutEvidence(evidence)}`,
         );
-        try {
-          proc.kill("SIGKILL");
-        } catch {
-          // Ignore — the process may have already exited.
-        }
       }
     }
     // Always clean up (cancel the tracking timer and remove from map) so the
     // 60s timeout timer cannot fire after this afterEach, regardless of which
     // test originally spawned the process.
     cleanupTrackedSubprocess(proc);
+  }
+
+  if (testContext.signal.aborted && !timeoutEvidenceWritten) {
+    try {
+      const timeoutMs = typeof testContext.task.timeout === "number"
+        ? testContext.task.timeout
+        : 0;
+      const artifacts = writeTestTimeoutArtifacts({
+        artifactDir: TEST_TIMEOUT_ARTIFACT_DIR,
+        reason: "test-timeout",
+        testName: currentTest ?? testContext.task.name,
+        commandLine: null,
+        timeoutMs,
+        workerPid: process.pid,
+        rootPid: null,
+        cleanup: null,
+      });
+      process.stderr.write(
+        `[vitest-setup] timeout artifacts: JUnit=${artifacts.junitPath}; processes=${artifacts.residualProcessListPath}\n`,
+      );
+    } catch (error) {
+      failures.push(
+        `Test timeout evidence write failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   if (failures.length > 0) {
@@ -1250,27 +1588,54 @@ export const __fusionWorkerRootCleanupTestHooks = {
   writeWorkerRootOwnerMarker,
 };
 
-process.on("exit", () => {
-  for (const [proc] of trackedSubprocesses) {
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Ignore — the process may have already exited.
+let workerShutdownResourcesReleased = false;
+
+/*
+FNXC:TestWorkerLifecycleCleanup 2026-07-27-02:47:
+Vitest fork workers are commonly terminated by IPC disconnect, and Windows can
+keep the fork alive until the parent exits. Release the worker-root lease and
+cwd on disconnect/beforeExit, while the event loop can still drain child close
+events, instead of waiting for the worker's final exit event after the parent's
+cleanup decision has already run.
+*/
+function releaseWorkerShutdownResources(): void {
+  if (workerShutdownResourcesReleased) return;
+  workerShutdownResourcesReleased = true;
+  const shutdownDeadline = Date.now() + 5_000;
+  const ownedProcesses = new Set<ChildProcess>([
+    ...trackedSubprocesses.keys(),
+    ...managedChildLifecycles.keys(),
+  ]);
+  for (const proc of ownedProcesses) {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      const remainingMs = Math.max(1, shutdownDeadline - Date.now());
+      try {
+        if (typeof proc.pid === "number" && proc.pid > 0) {
+          terminateTestProcessTreeSync(proc.pid, {
+            startedAt: trackedSubprocesses.get(proc)?.startedAt ?? Date.now(),
+            timeoutMs: remainingMs,
+            protectedPids: [process.pid, process.ppid],
+            killRoot: () => {
+              try {
+                proc.kill("SIGKILL");
+              } catch {
+                // The exact root may already be gone.
+              }
+            },
+          });
+        } else {
+          proc.kill("SIGKILL");
+        }
+      } catch {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // Final worker-root cleanup retains lifecycle proof on failure.
+        }
+      }
     }
     cleanupTrackedSubprocess(proc);
-  }
-  for (const [proc] of managedChildLifecycles) {
-    if (proc.exitCode !== null || proc.signalCode !== null) {
-      releaseManagedChildLifecycle(proc);
-      continue;
-    }
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Ignore — final worker-root cleanup retains this lifecycle record until
-      // the child is provably gone instead of deleting a possibly-held root.
-    }
-    cleanupTrackedSubprocess(proc);
+    releaseManagedChildLifecycle(proc);
   }
   if (workerTempDir) {
     try {
@@ -1283,4 +1648,8 @@ process.on("exit", () => {
   }
   releaseWorkerRootLifecycle(WORKER_ROOT_LIFECYCLE);
   removeSelfMintedWorkerRootWithRetry();
-});
+}
+
+process.once("disconnect", releaseWorkerShutdownResources);
+process.once("beforeExit", releaseWorkerShutdownResources);
+process.on("exit", releaseWorkerShutdownResources);

@@ -14,11 +14,11 @@ export function HermesRuntimeSection() {
       <HermesRuntimeCard />
     </>);
 }
-export function HappierRuntimeSection() {
+export function HappierRuntimeSection({ projectId }: { projectId?: string }) {
     const { t } = useTranslation("app");
     return (<>
       <h4 className="settings-section-heading">{t("settings.runtimesRuntimes.happierRuntime", "Happier Runtime")}</h4>
-      <HappierRuntimeCard />
+      <HappierRuntimeCard projectId={projectId} />
     </>);
 }
 export function OpenClawRuntimeSection() {

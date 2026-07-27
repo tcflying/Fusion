@@ -22,6 +22,7 @@ export type {
 export type AgentSession = Parameters<AgentRuntime["promptWithFallback"]>[0];
 
 export const HAPPIER_BACKENDS = ["codex", "claude", "opencode"] as const;
+export const HAPPIER_DEFAULT_PROVIDER_WAIT_TIMEOUT_SECONDS = 300;
 
 export type HappierBackend = (typeof HAPPIER_BACKENDS)[number];
 
@@ -43,6 +44,12 @@ export interface HappierSessionBinding {
 export interface HappierCliSettings {
   executable?: string;
   entrypoint?: string;
+  /** Real source roots permitted to contain the pinned package-dist entrypoint. */
+  allowedCliRoots?: readonly string[];
+  /** Optional absolute directory for restart-durable delivery fences. */
+  deliveryFenceDirectory?: string;
+  /** Optional absolute directory for restart-durable create intents. */
+  createIntentDirectory?: string;
   homeDir?: string;
   activeServerId?: string;
   serverUrl?: string;
@@ -70,7 +77,20 @@ export interface HappierCliSettings {
    * dispatch, or capacity readiness.
    */
   enableLocalProviderTelemetry?: boolean;
+  /** Legacy/default timeout for one-shot CLI operations. */
   timeoutMs?: number;
+  /** Deadline for process startup before an operation-specific budget applies. */
+  spawnTimeoutMs?: number;
+  /** Deadline for MCP initialization and capability negotiation. */
+  connectTimeoutMs?: number;
+  /** Deadline for non-waiting CLI or MCP tools. */
+  toolTimeoutMs?: number;
+  /** Optional explicit outer deadline for provider-waiting operations. */
+  waitTimeoutMs?: number;
+  /** Cleanup/transport grace added after an advertised inner provider wait. */
+  waitTimeoutGraceMs?: number;
+  /** Inner provider wait shared by Runtime and Session Connector sends. */
+  timeoutSeconds?: number;
   maxOutputBytes?: number;
 }
 
@@ -135,6 +155,7 @@ export interface HappierSessionCreateInput {
   cwd: string;
   backend: HappierBackend;
   title: string;
+  tag?: string;
 }
 
 export interface HappierMessageInput {
@@ -145,7 +166,23 @@ export interface HappierMessageInput {
 }
 
 export type HappierSessionCreateResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord; created: boolean };
+export interface HappierSessionListItem {
+  readonly id: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly active?: boolean;
+  readonly archivedAt?: number | null;
+  readonly tag?: string;
+  readonly path?: string;
+  readonly agentId?: string;
+}
+export interface HappierSessionListResult {
+  readonly sessions: readonly HappierSessionListItem[];
+  readonly nextCursor: null;
+  readonly hasNext: false;
+}
 export type HappierSessionMessageResult = HappierJsonRecord & { sessionId: string; localId?: string | null; waited?: boolean };
+export type HappierSessionStopResult = HappierJsonRecord & { sessionId: string; stopped: true };
 export type HappierSessionStatusResult = HappierJsonRecord & { sessionId: string; session: HappierJsonRecord };
 export interface HappierRawHistoryRow {
   id: string;
@@ -255,6 +292,9 @@ export type HappierRecoveryErrorCode =
   | "status-check-failed"
   | "native-session-binding-missing"
   | "native-session-persistence-failed"
+  | "create-intent-recovery-failed"
+  | "orphan-cleanup-failed"
+  | "stop-unconfirmed"
   | "history-reconciliation-failed"
   | "provider-process-failed"
   | "ambiguous-send-unresolved";

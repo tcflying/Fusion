@@ -79,14 +79,20 @@ test("engine-core remains an explicit allow-listed merge gate", () => {
 test("root and package gate scripts still propagate real Vitest failures", () => {
   const root = readJson("package.json");
   const engine = readJson("packages/engine/package.json");
+  const gate = read("scripts/test-gate.mjs");
 
   assert.equal(
     engine.scripts?.["test:core"],
     "vitest run --silent=passed-only --reporter=dot --project=engine-core",
   );
-  assert.match(root.scripts?.["test:gate"] ?? "", /pnpm --filter @fusion\/engine test:core/);
-  assert.match(root.scripts?.["test:gate"] ?? "", /wait \$engine_pid \|\| status=1/);
-  assert.match(root.scripts?.["test:gate"] ?? "", /wait \$pg_pid \|\| status=1/);
+  assert.match(root.scripts?.["test:gate"] ?? "", /node scripts\/test-gate\.mjs/);
+  assert.match(gate, /runGate\(\["--filter", "@fusion\/engine", "test:core"\]\)/);
+  assert.match(gate, /runGate\(\["--filter", "@fusion\/core", "test:pg-gate"\]\)/);
+  assert.match(gate, /const pnpm = process\.platform === "win32" \? "pnpm\.cmd" : "pnpm"/);
+  assert.match(gate, /shell: process\.platform === "win32"/);
+  assert.match(gate, /Promise\.all\(\[/);
+  assert.match(gate, /codes\.some\(\(code\) => code !== 0\)/);
+  assert.doesNotMatch(root.scripts?.["test:gate"] ?? "", /sh -c/);
   assert.doesNotMatch(root.scripts?.["test:gate"] ?? "", /NODE_NO_WARNINGS/);
   assert.doesNotMatch(root.scripts?.["test"] ?? "", /NODE_NO_WARNINGS/);
 });

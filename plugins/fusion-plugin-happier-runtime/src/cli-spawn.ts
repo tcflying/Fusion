@@ -1,8 +1,13 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
 import {
+  terminateHappierProcessTree,
+  waitForHappierProcessClose,
+} from "./process-lifecycle.js";
+import {
   HAPPIER_BACKENDS,
+  HAPPIER_DEFAULT_PROVIDER_WAIT_TIMEOUT_SECONDS,
   HappierCliError,
   type HappierBackend,
   type HappierCliInvocation,
@@ -23,14 +28,56 @@ import {
   type HappierSessionCreateInput,
   type HappierSessionCreateResult,
   type HappierSessionHistoryResult,
+  type HappierSessionListItem,
+  type HappierSessionListResult,
   type HappierSessionMessageResult,
+  type HappierSessionStopResult,
   type HappierSessionStatusResult,
   type HappierSuccessEnvelope,
 } from "./types.js";
+import {
+  buildHappierTransportMessage,
+  type HappierRuntimePermissionMode,
+} from "./runtime-options.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_WAIT_TIMEOUT_GRACE_MS = 5_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 const REDACTED = "[REDACTED]";
+const HAPPIER_PROCESS_ENV_ALLOWLIST = new Set([
+  "ALL_PROXY",
+  "APPDATA",
+  "COLORTERM",
+  "COMSPEC",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "LANG",
+  "LC_ALL",
+  "LOCALAPPDATA",
+  "NO_PROXY",
+  "PATH",
+  "PATHEXT",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "PROGRAMW6432",
+  "SYSTEMDRIVE",
+  "SYSTEMROOT",
+  "TEMP",
+  "TERM",
+  "TMP",
+  "TMPDIR",
+  "TZ",
+  "USERPROFILE",
+  "WINDIR",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_STATE_HOME",
+]);
 const SENSITIVE_KEYS = new Set([
   "accesstoken",
   "apikey",
@@ -41,12 +88,15 @@ const SENSITIVE_KEYS = new Set([
   "key",
   "password",
   "privatekey",
+  "refreshtoken",
   "secret",
+  "sessionsecret",
   "token",
+  "cookie",
 ]);
 
 const BEARER_RE = /\bBearer\s+[^\s"'`,;\]}]+/gi;
-const SENSITIVE_ASSIGNMENT_RE = /(["']?)(access(?:[_-]?token|[_-]?key)|client[_-]?secret|private[_-]?key|authorization|bearer[_-]?token|token|secret|password|key)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;\]}]+)/gi;
+const SENSITIVE_ASSIGNMENT_RE = /(["']?)(access(?:[_-]?token|[_-]?key)|client[_-]?secret|private[_-]?key|refresh[_-]?token|session[_-]?secret|authorization|bearer[_-]?token|cookie|token|secret|password|key)\1(\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;\]}]+)/gi;
 
 function normalizeKey(key: string): string {
   return key.replace(/[^a-z0-9]/gi, "").toLowerCase();
@@ -107,6 +157,12 @@ function positiveNumber(value: unknown, fallback: number): number {
   return fallback;
 }
 
+function optionalPositiveNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parsed = positiveNumber(value, Number.NaN);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 /** Resolve explicit settings first, then non-secret environment fallbacks. */
 export function resolveHappierCliSettings(
   settings?: HappierCliSettings | Record<string, unknown>,
@@ -123,6 +179,12 @@ export function resolveHappierCliSettings(
   const happierSessionBindings = Array.isArray(settings?.happierSessionBindings)
     ? settings.happierSessionBindings as readonly HappierSessionBinding[]
     : undefined;
+  const allowedCliRoots = Array.isArray(settings?.allowedCliRoots)
+    ? settings.allowedCliRoots.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    : nonEmptyString(process.env.FUSION_HAPPIER_ALLOWED_CLI_ROOTS)
+      ?.split(";")
+      .map((value) => value.trim())
+      .filter(Boolean);
   const enableLocalRuntimeSnapshot = typeof settings?.enableLocalRuntimeSnapshot === "boolean"
     ? settings.enableLocalRuntimeSnapshot
     : process.env.FUSION_HAPPIER_ENABLE_LOCAL_RUNTIME_SNAPSHOT_V1 === "1";
@@ -132,10 +194,14 @@ export function resolveHappierCliSettings(
   const enableLocalProviderTelemetry = typeof settings?.enableLocalProviderTelemetry === "boolean"
     ? settings.enableLocalProviderTelemetry
     : process.env.FUSION_HAPPIER_ENABLE_LOCAL_PROVIDER_TELEMETRY_V1 === "1";
+  const timeoutMs = positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
 
   return {
     executable,
     entrypoint,
+    ...(allowedCliRoots?.length ? { allowedCliRoots } : {}),
+    deliveryFenceDirectory: nonEmptyString(settings?.deliveryFenceDirectory),
+    createIntentDirectory: nonEmptyString(settings?.createIntentDirectory),
     homeDir: nonEmptyString(settings?.homeDir) ?? nonEmptyString(process.env.HAPPIER_HOME_DIR),
     activeServerId:
       nonEmptyString(settings?.activeServerId) ?? nonEmptyString(process.env.HAPPIER_ACTIVE_SERVER_ID),
@@ -149,7 +215,28 @@ export function resolveHappierCliSettings(
     enableLocalRuntimeSnapshot,
     enableLocalReconciliationHistory,
     enableLocalProviderTelemetry,
-    timeoutMs: positiveNumber(settings?.timeoutMs ?? process.env.HAPPIER_CLI_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
+    timeoutMs,
+    spawnTimeoutMs: positiveNumber(
+      settings?.spawnTimeoutMs ?? process.env.HAPPIER_CLI_SPAWN_TIMEOUT_MS,
+      timeoutMs,
+    ),
+    connectTimeoutMs: positiveNumber(
+      settings?.connectTimeoutMs ?? process.env.HAPPIER_CLI_CONNECT_TIMEOUT_MS,
+      timeoutMs,
+    ),
+    toolTimeoutMs: positiveNumber(
+      settings?.toolTimeoutMs ?? process.env.HAPPIER_CLI_TOOL_TIMEOUT_MS,
+      timeoutMs,
+    ),
+    waitTimeoutMs: optionalPositiveNumber(
+      settings?.waitTimeoutMs ?? process.env.HAPPIER_CLI_WAIT_TIMEOUT_MS,
+    ),
+    waitTimeoutGraceMs: positiveNumber(
+      settings?.waitTimeoutGraceMs ?? process.env.HAPPIER_CLI_WAIT_TIMEOUT_GRACE_MS,
+      DEFAULT_WAIT_TIMEOUT_GRACE_MS,
+    ),
+    timeoutSeconds: optionalPositiveNumber(settings?.timeoutSeconds)
+      ?? HAPPIER_DEFAULT_PROVIDER_WAIT_TIMEOUT_SECONDS,
     maxOutputBytes: Math.max(
       1,
       Math.floor(positiveNumber(settings?.maxOutputBytes ?? process.env.HAPPIER_CLI_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES)),
@@ -158,17 +245,51 @@ export function resolveHappierCliSettings(
 }
 
 /**
- * FNXC:HappierRuntime 2026-07-14-09:54:
- * Preserve the parent environment while pinning every non-secret Happier stack
- * selector. Credentials remain owned by the official Happier home directory.
+ * Resolve the outer deadline for an operation that advertises an inner wait.
+ *
+ * FNXC:HappierTimeoutHierarchy 2026-07-27-02:53:
+ * Explicit wait budgets are configuration assertions, not best-effort hints.
+ * Reject an inverted hierarchy before process/provider I/O; when no explicit
+ * outer wait is configured, derive the smallest valid deadline.
+ */
+export function resolveHappierWaitTimeoutMs(
+  innerTimeoutSeconds: number,
+  settings?: HappierCliSettings,
+): number {
+  if (!Number.isInteger(innerTimeoutSeconds) || innerTimeoutSeconds < 1 || innerTimeoutSeconds > 3_600) {
+    throw new HappierCliError("protocol", "Happier inner wait timeout must be an integer from 1 through 3600");
+  }
+  const resolved = resolveHappierCliSettings(settings);
+  const minimumOuterTimeoutMs = innerTimeoutSeconds * 1_000 + resolved.waitTimeoutGraceMs!;
+  if (resolved.waitTimeoutMs !== undefined && resolved.waitTimeoutMs < minimumOuterTimeoutMs) {
+    throw new HappierCliError(
+      "protocol",
+      "Happier wait timeout hierarchy is invalid",
+      undefined,
+      "timeout_hierarchy_invalid",
+    );
+  }
+  return resolved.waitTimeoutMs
+    ?? Math.max(resolved.toolTimeoutMs!, minimumOuterTimeoutMs);
+}
+
+/**
+ * FNXC:HappierProcessEnvironment 2026-07-27-04:13:
+ * Forward only OS launch/search, locale, temp, home, and proxy variables.
+ * Provider keys, NODE_OPTIONS, arbitrary Fusion state, and inherited Happier
+ * selectors are excluded; the selected stack is rebuilt from typed settings.
  */
 export function buildHappierProcessEnv(
   settings: HappierCliSettings,
   baseEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const resolved = resolveHappierCliSettings(settings);
+  const allowedBase = Object.fromEntries(
+    Object.entries(baseEnv).filter(([key, value]) =>
+      value !== undefined && HAPPIER_PROCESS_ENV_ALLOWLIST.has(key.toLocaleUpperCase("en-US"))),
+  );
   return {
-    ...baseEnv,
+    ...allowedBase,
     ...(resolved.homeDir ? { HAPPIER_HOME_DIR: resolved.homeDir } : {}),
     ...(resolved.activeServerId ? { HAPPIER_ACTIVE_SERVER_ID: resolved.activeServerId } : {}),
     ...(resolved.serverUrl ? { HAPPIER_SERVER_URL: resolved.serverUrl } : {}),
@@ -232,69 +353,6 @@ function parseHappierJsonEnvelope<T = unknown>(
     throw invalidEnvelope("failure envelope is missing error.code");
   }
   return parsed as unknown as HappierJsonEnvelope<T>;
-}
-
-const CHILD_TERMINATION_TIMEOUT_MS = 2_000;
-
-function signalHappierChild(child: ReturnType<typeof spawn>): boolean {
-  try {
-    return child.kill("SIGTERM");
-  } catch {
-    return false;
-  }
-}
-
-function terminateHappierChild(child: ReturnType<typeof spawn> | undefined): Promise<boolean> {
-  if (
-    !child
-    || typeof child.exitCode === "number"
-    || typeof child.signalCode === "string"
-  ) return Promise.resolve(true);
-  if (process.platform === "win32" && typeof child.pid === "number") {
-    return new Promise((resolve) => {
-      execFile(
-        "taskkill.exe",
-        ["/PID", String(child.pid), "/T", "/F"],
-        {
-          shell: false,
-          timeout: CHILD_TERMINATION_TIMEOUT_MS,
-          windowsHide: true,
-          maxBuffer: 64 * 1024,
-        },
-        (error) => {
-          if (!error) {
-            resolve(true);
-            return;
-          }
-          // Direct-child fallback is best effort only. A failed or timed-out
-          // tree kill remains observable to iterator cancellation callers.
-          signalHappierChild(child);
-          resolve(false);
-        },
-      );
-    });
-  }
-  return Promise.resolve(signalHappierChild(child));
-}
-
-function waitForHappierChildClose(child: ReturnType<typeof spawn> | undefined): Promise<boolean> {
-  if (
-    !child
-    || typeof child.exitCode === "number"
-    || typeof child.signalCode === "string"
-  ) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    let timer: NodeJS.Timeout | undefined;
-    const finish = (closed: boolean): void => {
-      child.removeListener("close", onClose);
-      if (timer) clearTimeout(timer);
-      resolve(closed);
-    };
-    const onClose = (): void => finish(true);
-    child.once("close", onClose);
-    timer = setTimeout(() => finish(false), CHILD_TERMINATION_TIMEOUT_MS);
-    timer.unref();
-  });
 }
 
 /** Parse and validate Happier's exact `{v,ok,kind,data|error}` envelope. */
@@ -384,10 +442,14 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
   settings?: HappierCliSettings,
   signal?: AbortSignal,
   expectedKind?: string,
+  outerTimeoutMs?: number,
 ): Promise<T> {
   const resolved = resolveHappierCliSettings(settings);
   const invocation = buildHappierInvocation(commandArgs, resolved);
   const maxOutputBytes = resolved.maxOutputBytes;
+  const operationTimeoutMs = outerTimeoutMs === undefined
+    ? resolved.toolTimeoutMs!
+    : positiveNumber(outerTimeoutMs, resolved.toolTimeoutMs!);
 
   return new Promise<T>((resolve, reject) => {
     const stdout = new BoundedOutputAccumulator(maxOutputBytes);
@@ -395,42 +457,87 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
     let child: ReturnType<typeof spawn> | undefined;
     let timer: NodeJS.Timeout | undefined;
     let settled = false;
+    let settlingAfterTermination = false;
 
     const finishReject = (error: HappierCliError): void => {
-      if (settled) return;
+      if (settled || settlingAfterTermination) return;
       settled = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
+      child?.off("spawn", onSpawn);
       reject(error);
     };
 
     const finishResolve = (value: T): void => {
-      if (settled) return;
+      if (settled || settlingAfterTermination) return;
       settled = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
+      child?.off("spawn", onSpawn);
       resolve(value);
     };
 
-    function terminate(): void {
-      void terminateHappierChild(child);
+    async function terminateAndReject(error: HappierCliError): Promise<void> {
+      if (settled || settlingAfterTermination) return;
+      settlingAfterTermination = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      child?.off("spawn", onSpawn);
+      const closeConfirmed = waitForHappierProcessClose(child);
+      const terminationConfirmed = await terminateHappierProcessTree(child);
+      const processClosed = await closeConfirmed;
+      settled = true;
+      settlingAfterTermination = false;
+      reject(
+        terminationConfirmed && processClosed
+          ? error
+          : new HappierCliError(
+            "process",
+            "Happier CLI process tree exit was not confirmed",
+            undefined,
+            "process_tree_exit_unconfirmed",
+          ),
+      );
     }
 
     function onAbort(): void {
-      terminate();
-      finishReject(new HappierCliError("timeout", "Happier CLI invocation aborted"));
+      void terminateAndReject(new HappierCliError("timeout", "Happier CLI invocation aborted"));
+    }
+
+    function armTimeout(timeoutMs: number, stage: "spawn" | "operation"): void {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        void terminateAndReject(new HappierCliError(
+          "timeout",
+          stage === "spawn"
+            ? "Happier CLI process spawn timed out"
+            : `Happier CLI timed out after ${timeoutMs}ms`,
+          undefined,
+          stage === "spawn" ? "cli_spawn_timeout" : undefined,
+        ));
+      }, timeoutMs);
+    }
+
+    function onSpawn(): void {
+      if (settled) return;
+      armTimeout(operationTimeoutMs, "operation");
     }
 
     function onOutput(stream: "stdout" | "stderr", chunk: Buffer): void {
       const accumulator = stream === "stdout" ? stdout : stderr;
       if (accumulator.append(chunk)) return;
-      terminate();
-      finishReject(new HappierCliError("output-limit", `Happier CLI ${stream} exceeded the ${maxOutputBytes}-byte output limit`));
+      void terminateAndReject(
+        new HappierCliError(
+          "output-limit",
+          `Happier CLI ${stream} exceeded the ${maxOutputBytes}-byte output limit`,
+        ),
+      );
     }
 
     try {
       child = spawn(invocation.command, invocation.args, {
         shell: false,
+        windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: buildHappierProcessEnv(resolved),
       });
@@ -440,10 +547,12 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
       return;
     }
 
-    timer = setTimeout(() => {
-      terminate();
-      finishReject(new HappierCliError("timeout", `Happier CLI timed out after ${resolved.timeoutMs}ms`));
-    }, resolved.timeoutMs);
+    child.once("spawn", onSpawn);
+    if (typeof child.pid === "number" && child.pid > 0) {
+      onSpawn();
+    } else {
+      armTimeout(resolved.spawnTimeoutMs!, "spawn");
+    }
 
     if (signal) {
       if (signal.aborted) {
@@ -466,7 +575,7 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
     });
 
     child.once("close", (exitCode: number | null) => {
-      if (settled) return;
+      if (settled || settlingAfterTermination) return;
       const rawStdout = stdout.toString();
       const rawStderr = stderr.toString();
 
@@ -511,6 +620,148 @@ export function invokeHappierJson<T extends HappierJsonRecord = HappierJsonRecor
   });
 }
 
+export type HappierResumeProcessLease = Readonly<{
+  sessionId: string;
+  pid: number | null;
+  stop: () => Promise<boolean>;
+}>;
+
+/**
+ * FNXC:HappierStrictResume 2026-07-27-16:25:
+ * Official `happier resume` is a long-running provider owner, not a one-shot
+ * JSON command. Return a controlled lease only after spawn and keep stop
+ * pending until both tree termination and the direct-child close are known.
+ */
+export function startHappierResumeProcess(
+  sessionId: string,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<HappierResumeProcessLease> {
+  const requestedSessionId = nonEmptyString(sessionId);
+  if (!requestedSessionId) {
+    return Promise.reject(new HappierCliError("session", "Happier resume requires a non-empty session id"));
+  }
+  const resolved = resolveHappierCliSettings(settings);
+  const invocation = buildHappierInvocation(["resume", requestedSessionId], resolved);
+
+  return new Promise<HappierResumeProcessLease>((resolve, reject) => {
+    let child: ReturnType<typeof spawn> | undefined;
+    let spawnTimer: NodeJS.Timeout | undefined;
+    let promiseSettled = false;
+    let spawned = false;
+    let closed = false;
+    let stopPromise: Promise<boolean> | undefined;
+
+    const clearLifecycleListeners = (): void => {
+      if (spawnTimer) clearTimeout(spawnTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const stop = (): Promise<boolean> => {
+      if (closed) return Promise.resolve(true);
+      stopPromise ??= (async () => {
+        const closeConfirmed = waitForHappierProcessClose(child);
+        const terminationConfirmed = await terminateHappierProcessTree(child);
+        const processClosed = await closeConfirmed;
+        return terminationConfirmed && processClosed;
+      })();
+      return stopPromise;
+    };
+
+    const rejectAfterStop = (error: HappierCliError): void => {
+      if (promiseSettled) return;
+      promiseSettled = true;
+      clearLifecycleListeners();
+      void stop().then((confirmed) => {
+        reject(
+          confirmed
+            ? error
+            : new HappierCliError(
+              "process",
+              "Happier resume process tree exit was not confirmed",
+              undefined,
+              "process_tree_exit_unconfirmed",
+            ),
+        );
+      });
+    };
+
+    function onAbort(): void {
+      if (promiseSettled) {
+        void stop();
+        return;
+      }
+      rejectAfterStop(new HappierCliError("timeout", "Happier resume aborted"));
+    }
+
+    const onSpawn = (): void => {
+      if (promiseSettled) return;
+      spawned = true;
+      promiseSettled = true;
+      clearLifecycleListeners();
+      resolve({
+        sessionId: requestedSessionId,
+        pid: typeof child?.pid === "number" ? child.pid : null,
+        stop,
+      });
+    };
+
+    try {
+      child = spawn(invocation.command, invocation.args, {
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "ignore", "ignore"],
+        env: buildHappierProcessEnv(resolved),
+      });
+    } catch (error) {
+      promiseSettled = true;
+      const message = error instanceof Error ? error.message : String(error);
+      reject(new HappierCliError("process", `Happier resume spawn failed: ${redactHappierOutput(message)}`));
+      return;
+    }
+
+    child.once("spawn", onSpawn);
+    child.once("close", () => {
+      closed = true;
+      if (!spawned && !promiseSettled) {
+        promiseSettled = true;
+        clearLifecycleListeners();
+        reject(new HappierCliError("process", "Happier resume exited before confirming spawn"));
+      }
+    });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      if (promiseSettled) return;
+      promiseSettled = true;
+      clearLifecycleListeners();
+      reject(new HappierCliError("process", `Happier resume process error: ${redactHappierOutput(error.message)}`));
+    });
+
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    if (typeof child.pid === "number" && child.pid > 0) {
+      onSpawn();
+    } else {
+      spawnTimer = setTimeout(() => {
+        rejectAfterStop(
+          new HappierCliError(
+            "timeout",
+            "Happier resume process spawn timed out",
+            undefined,
+            "cli_spawn_timeout",
+          ),
+        );
+      }, resolved.spawnTimeoutMs!);
+      spawnTimer.unref();
+    }
+  });
+}
+
 type NdjsonWaiter<T> = Readonly<{
   resolve: (result: IteratorResult<T>) => void;
   reject: (error: unknown) => void;
@@ -549,7 +800,7 @@ function createHappierNdjsonStream<T>(
   const waiters: Array<NdjsonWaiter<T>> = [];
 
   const terminate = (): Promise<boolean> => {
-    terminationPromise ??= terminateHappierChild(child);
+    terminationPromise ??= terminateHappierProcessTree(child);
     return terminationPromise;
   };
 
@@ -663,6 +914,7 @@ function createHappierNdjsonStream<T>(
     try {
       child = spawn(invocation.command, invocation.args, {
         shell: false,
+        windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: buildHappierProcessEnv(resolved),
       });
@@ -714,7 +966,7 @@ function createHappierNdjsonStream<T>(
       return new Promise<IteratorResult<T>>((resolve, reject) => waiters.push({ resolve, reject }));
     },
     async return(): Promise<IteratorResult<T>> {
-      const closed = childClosed ? Promise.resolve(true) : waitForHappierChildClose(child);
+      const closed = childClosed ? Promise.resolve(true) : waitForHappierProcessClose(child);
       if (!consumerClosed) {
         consumerClosed = true;
         void terminate();
@@ -787,10 +1039,11 @@ export async function invokeHappierJsonForKind<T extends HappierJsonRecord>(
   kind: string,
   settings?: HappierCliSettings,
   signal?: AbortSignal,
+  outerTimeoutMs?: number,
 ): Promise<T> {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await invokeHappierJson<T>(commandArgs, settings, signal, kind);
+      return await invokeHappierJson<T>(commandArgs, settings, signal, kind, outerTimeoutMs);
     } catch (error) {
       if (attempt === 2 || signal?.aborted || !isTransientWindowsStartupFailure(error)) throw error;
       await new Promise<void>((resolve) => setTimeout(resolve, attempt === 0 ? 75 : 250));
@@ -1086,9 +1339,24 @@ export async function createHappierSession(
   signal?: AbortSignal,
 ): Promise<HappierSessionCreateResult> {
   if (!input.cwd.trim() || !input.title.trim()) throw new HappierCliError("session", "Happier session cwd and title are required");
+  const tag = input.tag?.trim();
+  if (input.tag !== undefined && (!tag || tag.length > 128 || !/^[A-Za-z0-9._:-]+$/u.test(tag))) {
+    throw new HappierCliError("session", "Happier session create tag is invalid");
+  }
   const data = ensureRecord(
     await invokeHappierJsonForKind(
-      ["session", "create", "--path", input.cwd, "--backend", validateBackend(input.backend), "--title", input.title, "--json"],
+      [
+        "session",
+        "create",
+        "--path",
+        input.cwd,
+        "--backend",
+        validateBackend(input.backend),
+        "--title",
+        input.title,
+        ...(tag ? ["--tag", tag] : []),
+        "--json",
+      ],
       "session_create",
       settings,
       signal,
@@ -1100,24 +1368,177 @@ export async function createHappierSession(
   return { ...data, sessionId, session: data.session, created: data.created } as HappierSessionCreateResult;
 }
 
+function normalizeListedSession(value: unknown): HappierSessionListItem {
+  if (!isRecord(value)) throw new HappierCliError("protocol", "Happier session list returned an invalid session");
+  const id = trimSessionId(value.id);
+  const createdAt = value.createdAt;
+  const updatedAt = value.updatedAt;
+  if (
+    typeof createdAt !== "number"
+    || !Number.isFinite(createdAt)
+    || typeof updatedAt !== "number"
+    || !Number.isFinite(updatedAt)
+  ) {
+    throw new HappierCliError("protocol", "Happier session list returned invalid timestamps");
+  }
+  const optionalString = (field: "tag" | "path" | "agentId"): string | undefined => {
+    const raw = value[field];
+    if (raw === undefined) return undefined;
+    if (typeof raw !== "string" || !raw.trim() || /[\u0000-\u001f\u007f]/u.test(raw)) {
+      throw new HappierCliError("protocol", `Happier session list returned an invalid ${field}`);
+    }
+    return raw;
+  };
+  if (value.active !== undefined && typeof value.active !== "boolean") {
+    throw new HappierCliError("protocol", "Happier session list returned an invalid active flag");
+  }
+  if (
+    value.archivedAt !== undefined
+    && value.archivedAt !== null
+    && (typeof value.archivedAt !== "number" || !Number.isFinite(value.archivedAt))
+  ) {
+    throw new HappierCliError("protocol", "Happier session list returned an invalid archivedAt value");
+  }
+  return Object.freeze({
+    id,
+    createdAt,
+    updatedAt,
+    ...(value.active === undefined ? {} : { active: value.active }),
+    ...(value.archivedAt === undefined ? {} : { archivedAt: value.archivedAt as number | null }),
+    ...(optionalString("tag") ? { tag: optionalString("tag") } : {}),
+    ...(optionalString("path") ? { path: optionalString("path") } : {}),
+    ...(optionalString("agentId") ? { agentId: optionalString("agentId") } : {}),
+  });
+}
+
+/**
+ * FNXC:HappierCreateIntentPagination 2026-07-27-03:29:
+ * Recovery must inspect every official list page. A missing/repeated cursor,
+ * duplicate session identity, or malformed metadata blocks create rather than
+ * making a second remote Session from an incomplete view.
+ */
+export async function listHappierSessions(
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<HappierSessionListResult> {
+  const sessions: HappierSessionListItem[] = [];
+  const sessionIds = new Set<string>();
+  const cursors = new Set<string>();
+  let cursor: string | null = null;
+  for (let page = 0; page < 10_000; page += 1) {
+    const data = ensureRecord(
+      await invokeHappierJsonForKind(
+        [
+          "session",
+          "list",
+          "--limit",
+          "200",
+          ...(cursor ? ["--cursor", cursor] : []),
+          "--json",
+        ],
+        "session_list",
+        settings,
+        signal,
+      ),
+      "session list",
+    );
+    if (!Array.isArray(data.sessions)) {
+      throw new HappierCliError("protocol", "Happier session list returned invalid sessions");
+    }
+    for (const value of data.sessions) {
+      const session = normalizeListedSession(value);
+      if (sessionIds.has(session.id)) {
+        throw new HappierCliError("protocol", "Happier session list repeated a session identity");
+      }
+      sessionIds.add(session.id);
+      sessions.push(session);
+    }
+    const nextCursor = data.nextCursor;
+    const hasNext = data.hasNext;
+    if (nextCursor !== null && typeof nextCursor !== "string") {
+      throw new HappierCliError("protocol", "Happier session list returned an invalid next cursor");
+    }
+    if (typeof hasNext !== "boolean") {
+      throw new HappierCliError("protocol", "Happier session list returned an invalid hasNext flag");
+    }
+    if (!hasNext) {
+      if (nextCursor !== null) {
+        throw new HappierCliError("protocol", "Happier session list returned a cursor after the final page");
+      }
+      return Object.freeze({
+        sessions: Object.freeze(sessions),
+        nextCursor: null,
+        hasNext: false,
+      });
+    }
+    if (!nextCursor || cursors.has(nextCursor)) {
+      throw new HappierCliError("protocol", "Happier session list pagination did not advance");
+    }
+    cursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  throw new HappierCliError("protocol", "Happier session list exceeded the recovery page bound");
+}
+
 export async function sendHappierMessage(
-  input: HappierMessageInput,
+  input: HappierMessageInput & Readonly<{
+    systemPrompt?: string;
+    modelId?: string;
+    permissionMode?: HappierRuntimePermissionMode;
+  }>,
   settings?: HappierCliSettings,
   signal?: AbortSignal,
 ): Promise<HappierSessionMessageResult> {
   const sessionId = trimSessionId(input.sessionId);
-  if (!input.message.trim()) throw new HappierCliError("session", "Happier message is required");
+  const message = buildHappierTransportMessage(input.systemPrompt, input.message);
   const localId = input.localId.trim();
   if (!localId || localId.length > 128 || !/^[A-Za-z0-9._:-]+$/u.test(localId)) {
     throw new HappierCliError("session", "Happier message localId is invalid");
   }
+  const modelId = input.modelId?.trim();
+  if (input.modelId !== undefined && (
+    !modelId
+    || modelId.length > 512
+    || hasForbiddenControlCharacter(modelId)
+  )) {
+    throw new HappierCliError("session", "Happier message modelId is invalid");
+  }
+  const permissionMode = input.permissionMode;
+  if (
+    permissionMode !== undefined
+    && permissionMode !== "read-only"
+    && permissionMode !== "safe-yolo"
+  ) {
+    throw new HappierCliError("session", "Happier message permission mode is invalid");
+  }
   const timeoutSeconds = validatePositiveInteger(input.timeoutSeconds, "timeoutSeconds");
+  /*
+   * FNXC:HappierTimeoutHierarchy 2026-07-27-02:51:
+   * `session send --wait` owns an inner provider deadline. Keep the controlling
+   * process alive through that deadline plus cleanup grace; a generic 30-second
+   * tool timeout must not terminate a valid 120/300-second provider wait.
+   */
+  const outerTimeoutMs = resolveHappierWaitTimeoutMs(timeoutSeconds, settings);
   const data = ensureRecord(
     await invokeHappierJsonForKind(
-      ["session", "send", sessionId, input.message, "--local-id", localId, "--wait", "--timeout", String(timeoutSeconds), "--json"],
+      [
+        "session",
+        "send",
+        sessionId,
+        message,
+        "--local-id",
+        localId,
+        ...(permissionMode ? ["--permission-mode", permissionMode] : []),
+        ...(modelId ? ["--model", modelId] : []),
+        "--wait",
+        "--timeout",
+        String(timeoutSeconds),
+        "--json",
+      ],
       "session_send",
       settings,
       signal,
+      outerTimeoutMs,
     ),
     "session send",
   );
@@ -1138,6 +1559,128 @@ export async function archiveHappierSession(
     "session archive",
   );
   expectedSessionId(data, requested, "session archive");
+}
+
+/**
+ * FNXC:HappierRemoteStopProof 2026-07-27-03:17:
+ * Process termination is only local cleanup. Cancellation is complete only
+ * when Happier's official stop command echoes the exact session identity and
+ * `stopped:true`; every other response remains an unconfirmed remote stop.
+ */
+export async function stopHappierSession(
+  sessionId: string,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<HappierSessionStopResult> {
+  const requested = trimSessionId(sessionId);
+  const data = ensureRecord(
+    await invokeHappierJsonForKind(
+      ["session", "stop", requested, "--json"],
+      "session_stop",
+      settings,
+      signal,
+    ),
+    "session stop",
+  );
+  const returned = expectedSessionId(data, requested, "session stop");
+  if (data.stopped !== true) {
+    throw new HappierCliError(
+      "protocol",
+      "Happier session stop did not confirm stopped true",
+      undefined,
+      "stop_unconfirmed",
+    );
+  }
+  return { ...data, sessionId: returned, stopped: true } as HappierSessionStopResult;
+}
+
+function sessionControlValue(value: string, field: string): string {
+  const normalized = value.trim();
+  if (
+    !normalized
+    || normalized.length > 512
+    || hasForbiddenControlCharacter(normalized)
+  ) {
+    throw new HappierCliError("session", `Happier Session ${field} is invalid`);
+  }
+  return normalized;
+}
+
+/**
+ * FNXC:HappierRuntimeVisibleOptions 2026-07-27-16:16:
+ * Persist the operator-visible title/model/permission through Happier's
+ * official Session controls. Exact echo validation prevents a prefix-resolved
+ * or stale control response from silently targeting another Session.
+ */
+export async function setHappierSessionTitle(
+  sessionId: string,
+  title: string,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<void> {
+  const requested = trimSessionId(sessionId);
+  const normalizedTitle = sessionControlValue(title, "title");
+  const data = ensureRecord(
+    await invokeHappierJsonForKind(
+      ["session", "set-title", requested, normalizedTitle, "--json"],
+      "session_set_title",
+      settings,
+      signal,
+    ),
+    "session set-title",
+  );
+  expectedSessionId(data, requested, "session set-title");
+  if (data.title !== normalizedTitle) {
+    throw new HappierCliError("protocol", "Happier session set-title returned a mismatched title");
+  }
+}
+
+export async function setHappierSessionModel(
+  sessionId: string,
+  modelId: string,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<void> {
+  const requested = trimSessionId(sessionId);
+  const normalizedModelId = sessionControlValue(modelId, "modelId");
+  const data = ensureRecord(
+    await invokeHappierJsonForKind(
+      ["session", "set-model", requested, normalizedModelId, "--json"],
+      "session_set_model",
+      settings,
+      signal,
+    ),
+    "session set-model",
+  );
+  expectedSessionId(data, requested, "session set-model");
+  if (data.modelId !== normalizedModelId) {
+    throw new HappierCliError("protocol", "Happier session set-model returned a mismatched modelId");
+  }
+}
+
+export async function setHappierSessionPermissionMode(
+  sessionId: string,
+  permissionMode: HappierRuntimePermissionMode,
+  settings?: HappierCliSettings,
+  signal?: AbortSignal,
+): Promise<void> {
+  const requested = trimSessionId(sessionId);
+  const data = ensureRecord(
+    await invokeHappierJsonForKind(
+      ["session", "set-permission-mode", requested, permissionMode, "--json"],
+      "session_set_permission_mode",
+      settings,
+      signal,
+    ),
+    "session set-permission-mode",
+  );
+  expectedSessionId(data, requested, "session set-permission-mode");
+  if (data.permissionMode !== permissionMode) {
+    throw new HappierCliError(
+      "protocol",
+      "Happier session set-permission-mode returned a mismatched permission mode",
+    );
+  }
 }
 
 export async function getHappierSessionStatus(

@@ -9,9 +9,39 @@ import { describe, it, expect, afterEach } from "vitest";
 import {
   createTaskStoreForTest,
   PG_AVAILABLE,
+  resolvePgTestUrlBase,
   type PgTestHarness,
 } from "../../__test-utils__/pg-test-harness.js";
 import { insertTaskRow } from "../../task-store/async-persistence.js";
+
+describe("resolvePgTestUrlBase", () => {
+  it("preserves an explicit test authority", () => {
+    expect(resolvePgTestUrlBase({
+      configuredUrl: " postgresql://ci-user:ci-pass@db.internal:5544 ",
+      readPostmasterPid: () => {
+        throw new Error("must not read embedded state");
+      },
+    })).toBe("postgresql://ci-user:ci-pass@db.internal:5544");
+  });
+
+  it("resolves Fusion's running embedded test cluster with explicit credentials", () => {
+    expect(resolvePgTestUrlBase({
+      globalDir: "C:\\fusion-home",
+      readPostmasterPid: () => "4321\nC:/fusion-home/embedded-postgres/test\n0\n26965\n",
+    })).toBe("postgresql://postgres:password@127.0.0.1:26965");
+  });
+
+  it("fails closed when embedded ownership metadata is absent or malformed", () => {
+    expect(resolvePgTestUrlBase({
+      readPostmasterPid: () => "not-a-pid\n\n\n5432\n",
+    })).toBe("");
+    expect(resolvePgTestUrlBase({
+      readPostmasterPid: () => {
+        throw new Error("ENOENT");
+      },
+    })).toBe("");
+  });
+});
 
 const testDescribe = PG_AVAILABLE ? describe : describe.skip;
 

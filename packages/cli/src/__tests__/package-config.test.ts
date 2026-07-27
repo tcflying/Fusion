@@ -109,6 +109,40 @@ describe("CLI package.json publishing config", () => {
     expect(pkg.files).toContain("README.md");
   });
 
+  /*
+  FNXC:CliBuildGeneration 2026-07-27-04:56:
+  Published and upgrade artifacts must carry the launcher validator plus the
+  exact CLI/Dashboard/plugin/schema generation records it verifies.
+  */
+  it("ships build-info and the release compatibility matrix", () => {
+    expect(pkg.files).toContain("build-info.mjs");
+    expect(pkg.files).toContain("dist/build-info.json");
+    expect(pkg.files).toContain("dist/compatibility-matrix.json");
+  });
+
+  it("writes and validates generation artifacts after both fast and full CLI builds", () => {
+    const tsupRaw = readFileSync(
+      join(workspaceRoot, "packages", "cli", "tsup.config.ts"),
+      "utf-8",
+    );
+    expect(tsupRaw).toContain("writeBuildGenerationArtifacts");
+    expect(tsupRaw).toContain('await writeCliBuildGenerationArtifacts("fast")');
+    expect(tsupRaw).toContain('await writeCliBuildGenerationArtifacts("full")');
+  });
+
+  /*
+  FNXC:CliBuildGeneration 2026-07-27-06:09:
+  Pack/publish must not reuse a fast or pre-commit dist. Force a fresh full
+  generation before the temporary publish-manifest transform runs.
+  */
+  it("forces prepack through a full CLI generation build", () => {
+    expect(pkg.scripts.prepack).toContain("FUSION_CLI_FULL_PACKAGE=1");
+    expect(pkg.scripts.prepack).toContain("pnpm build");
+    expect(pkg.scripts.prepack.indexOf("pnpm build")).toBeLessThan(
+      pkg.scripts.prepack.indexOf("prepare-publish-manifest.mjs prepack"),
+    );
+  });
+
   it("does not include bare 'dist' entry or globs that would match Bun binaries", () => {
     const bunBinaryNames = [
       "fn",

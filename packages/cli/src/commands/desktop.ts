@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as os from "node:os";
 import { CentralCore, PluginLoader, createTaskStoreForBackend, type TaskStore } from "@fusion/core";
-import { createServer } from "@fusion/dashboard";
+import { createServer, getCliPackageVersion, isUnresolvedCliPackageVersion } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
   createWindowsNativeRoomHostCompositionAdapterRegistry,
@@ -35,6 +35,8 @@ interface DashboardRuntime {
 }
 
 async function startDashboardRuntime(rootDir: string, paused: boolean, noAuth: boolean): Promise<DashboardRuntime> {
+  const resolvedFusionVersion = getCliPackageVersion(import.meta.url);
+  const fusionVersion = isUnresolvedCliPackageVersion(resolvedFusionVersion) ? undefined : resolvedFusionVersion;
   // FNXC:PostgresCutover 2026-07-04-00:00: boot the PostgreSQL backend via the startup
   // factory (embedded by default, external via DATABASE_URL), mirroring dashboard.ts.
   // FNXC:PostgresFinalCutover 2026-07-14-17:20: Desktop startup has no SQLite
@@ -87,6 +89,7 @@ async function startDashboardRuntime(rootDir: string, paused: boolean, noAuth: b
         hostAsyncLayer: boot?.hostAsyncLayer,
       });
     engineManager = new ProjectEngineManager(centralCore, {
+      cliPackageVersion: fusionVersion,
       roomHostCompositionOperatorAdapterRegistry,
     });
     await engineManager.startAll();
@@ -108,9 +111,10 @@ async function startDashboardRuntime(rootDir: string, paused: boolean, noAuth: b
      */
     const pluginStore = store.getPluginStore();
     await pluginStore.init();
-    const pluginLoader = new PluginLoader({ pluginStore, taskStore: store });
+    const pluginLoader = new PluginLoader({ pluginStore, taskStore: store, fusionVersion });
 
     const app = createServer(store, {
+      fusionVersion,
       engine: cwdEngine,
       engineManager,
       centralCore,

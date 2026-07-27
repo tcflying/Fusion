@@ -13,10 +13,9 @@ import type {
   ResearchSynthesisRequest,
   ResearchSynthesisResult,
   PlannerOverseerRuntimeSnapshot,
-  PlannerInterventionSourceLink,
-  PlannerOversightStage,
   AsyncDataLayer,
   GlobalCapacityPolicyAuthorityV1,
+  SessionRoomControlPlaneProductionReadinessProofV1,
 } from "@fusion/core";
 import {
   AsyncRoomCheckpointStore,
@@ -26,14 +25,9 @@ import {
   AsyncRoomStore,
   allowsAutoMergeProcessing,
   compareTasksByPriorityThenAgeAndId,
-  emitOverseerConfirmation,
-  emitOverseerEscalation,
-  emitOverseerObservation,
-  emitOverseerRecoveryAttempt,
-  emitOverseerRetry,
-  emitOverseerSteering,
+  evaluateSessionRoomControlPlaneProductionGate,
   getTaskHardMergeBlocker,
-  isSessionRoomControlPlaneEnabled,
+  isSessionRoomControlPlaneRequested,
   isLiveSharedBranchGroupMemberIntegration,
   isSharedBranchGroupMemberIntegration,
   isWorkspaceTask,
@@ -53,7 +47,8 @@ import type { WorktreePool } from "./worktree-pool.js";
 import type { ProjectRuntimeConfig } from "./project-runtime.js";
 import { PrMonitor } from "./pr-monitor.js";
 import { PlannerOverseerMonitor, resolveExecutorStuckAfterMs } from "./planner-overseer.js";
-import { PlannerRecoveryController, type PlannerRecoveryHandlers } from "./planner-recovery-controller.js";
+import { PlannerRecoveryController } from "./planner-recovery-controller.js";
+import { ProjectEnginePlannerRecoveryWiring } from "./project-engine-planner-recovery-wiring.js";
 import { evaluateOverseerHumanControl } from "./overseer-human-control-policy.js";
 import type { PrNodeGithubOps } from "./pr-nodes.js";
 import { PrReconciler, type PrReconcileGithubOps } from "./pr-reconcile.js";
@@ -67,6 +62,11 @@ import { CronRunner, createAiPromptExecutor } from "./cron-runner.js";
 import type { RoutineRunner } from "./routine-runner.js";
 import { sweepStaleAutostashes, VerificationError } from "./merger.js";
 import { runAiMerge, landWorkspaceTask, WorkspacePartialLandError, WorkspaceRepoLandBusyError } from "./merger-ai.js";
+import {
+  buildVerificationFailureSignature,
+  shouldRetryAutoMergeConflict,
+  verifyMergeConfirmedReachability,
+} from "./project-engine-merge-guardrails.js";
 import { promoteBranchGroup, type BranchGroupPromotionResult, type CreateGroupPrFn, type SyncGroupPrFn } from "./group-merge-coordinator.js";
 import { PRIORITY_MERGE } from "./concurrency.js";
 import { runtimeLog } from "./logger.js";
@@ -79,7 +79,6 @@ import { createRunAuditor, generateSyntheticRunId } from "./run-audit.js";
 import {
   computeVerificationFailureSignature,
   createAutomatedFollowup,
-  extractFailingTestFiles,
 } from "./verification-followup-dedup.js";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { isTransientError } from "./transient-error-detector.js";
@@ -96,6 +95,7 @@ import { DurableRoomRecoveryWorker } from "./room-durable-recovery-worker.js";
 import {
   RoomDependencyDispatchCoordinator,
   type RoomDependencyDispatchCoordinatorOptions,
+  type RoomTaskDispatchCapabilityRoutingPolicySource,
   type RoomTaskDispatchCapacityAdmissionSource,
 } from "./room-dependency-dispatch-coordinator.js";
 import { RoomSemanticControllerInboxProcessor } from "./room-semantic-controller-inbox-processor.js";
@@ -136,14 +136,21 @@ import {
 import { ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION } from "./room-global-concurrency-accounting.js";
 import type { SessionConnectorIngestionLimits } from "./session-connector-ingestion.js";
 import { RoomRunAuditDispatcher } from "./room-run-audit-dispatcher.js";
+import {
+  RoomParticipantRunTaskProjector,
+  type RecordRoomParticipantRunTaskStateInputV1,
+  type RoomParticipantRunTaskProjectionV1,
+} from "./room-participant-run-task-projection.js";
 import type {
   ExternalTunnelInfo,
   TunnelProvider,
-  TunnelProviderConfig,
   TunnelRestoreDiagnostics,
   TunnelRestoreReasonCode,
   TunnelStatusSnapshot,
 } from "./remote-access/types.js";
+import { formatErrorDetails, isRemoteActive, type RemoteLifecycleEvaluation } from "./project-engine-remote-lifecycle-helpers.js";
+
+export { shouldRetryAutoMergeConflict };
 
 /**
  * Callback for processing pull-request merge strategy.
@@ -178,6 +185,19 @@ export interface RoomControllerFactoryContext {
 export type RoomControllerFactory = (
   context: RoomControllerFactoryContext,
 ) => RoomControllerLifecycle;
+
+export interface RoomProductionReadinessProofContextV1 {
+  readonly projectId: string;
+  readonly taskStore: TaskStore;
+  readonly connectorRegistry: SessionConnectorRegistry;
+  readonly connectorIds: readonly string[];
+}
+
+export type RoomProductionReadinessProofProviderV1 = (
+  context: RoomProductionReadinessProofContextV1,
+) =>
+  | SessionRoomControlPlaneProductionReadinessProofV1
+  | Promise<SessionRoomControlPlaneProductionReadinessProofV1>;
 
 export interface RoomEvidenceWorkflowsFactoryContext extends RoomControllerFactoryContext {
   readonly workerId: string;
@@ -246,9 +266,10 @@ export type RoomCapabilityRegistryRefreshVerifiedFactory = (
 
 export interface RoomTaskDispatchCapacityAdmissionVerifiedPortsV1 {
   readonly capacityAdmissionSource: RoomTaskDispatchCapacityAdmissionSource;
-  readonly capabilityRoutingPolicy: NonNullable<
+  readonly capabilityRoutingPolicy?: NonNullable<
     RoomDependencyDispatchCoordinatorOptions["capabilityRoutingPolicy"]
   >;
+  readonly capabilityRoutingPolicySource?: RoomTaskDispatchCapabilityRoutingPolicySource;
 }
 
 export interface RoomTaskDispatchCapacityAdmissionVerifiedFactoryContext {
@@ -296,131 +317,6 @@ const deterministicMergerModeDeprecationWarnedProjects = new Set<string>();
  */
 export function __resetDeterministicMergerModeDeprecationWarned(): void {
   deterministicMergerModeDeprecationWarnedProjects.clear();
-}
-
-interface RemoteLifecycleEvaluation {
-  provider: TunnelProvider;
-  config?: TunnelProviderConfig;
-  reason?: TunnelRestoreReasonCode;
-  message?: string;
-}
-
-const isRemoteActive = (ra: Settings["remoteAccess"] | undefined): boolean =>
-  ra?.activeProvider != null && (ra.providers[ra.activeProvider]?.enabled ?? false);
-
-function formatErrorDetails(error: unknown): { message: string; detail: string } {
-  if (error instanceof Error) {
-    return {
-      message: error.message || error.name,
-      detail: error.stack ?? `${error.name}: ${error.message}`,
-    };
-  }
-  const detail = String(error);
-  return { message: detail, detail };
-}
-
-/*
-FNXC:Workspace 2026-06-22-05:10 (Phase C review B6 — unify partial-land retry seam):
-The workspace PARTIAL-land retry decision (some sub-repos landed, one failed) is the SAME
-arithmetic as the conflict-retry decision MINUS the `autoResolveConflicts` gate (a partial
-land is retryable regardless of conflict-resolution settings, because the landed repos'
-`landedSha` is persisted and a re-run skips them — U2 idempotency). To keep the
-`resolveMaxAutoMergeRetries(settings)` arithmetic in ONE place we collapse the former
-`shouldRetryWorkspacePartialLand` into this function via `skipAutoResolveCheck`. When set,
-the `autoResolveConflicts` gate is bypassed; otherwise behavior is byte-identical to before.
-`currentRetries + 1 < MAX` keeps the LAST attempt's failure parking in the same tick rather
-than scheduling an Nth timer that a restart could strand.
-*/
-export function shouldRetryAutoMergeConflict(
-  currentRetries: number,
-  settings: { autoResolveConflicts?: boolean; maxAutoMergeRetries?: unknown } | null | undefined,
-  opts?: { skipAutoResolveCheck?: boolean },
-): { shouldRetry: boolean; maxAutoMergeRetries: number; nextRetryCount: number } {
-  const maxAutoMergeRetries = resolveMaxAutoMergeRetries(settings);
-  const autoResolveOk = opts?.skipAutoResolveCheck === true || settings?.autoResolveConflicts !== false;
-  return {
-    shouldRetry: autoResolveOk && currentRetries + 1 < maxAutoMergeRetries,
-    maxAutoMergeRetries,
-    nextRetryCount: currentRetries + 1,
-  };
-}
-
-/**
- * FN-5627: Defense-in-depth gate for the auto-merge "merge already confirmed"
- * fast-path. Verifies the task's recorded `mergeDetails.commitSha` is actually
- * reachable from the integration branch tip before promoting in-review → done.
- *
- * Returns:
- *  - { reachable: true } when commitSha is an ancestor of integrationBranch.
- *  - { reachable: false, reason } when it is NOT reachable (the merger poisoned
- *    the row with mergeConfirmed=true before ref-advance succeeded, OR a self-
- *    healing path set the flag prematurely). Caller must refuse the fast-path.
- *  - { reachable: true, skipped: "no-commit-sha" } when commitSha is unset —
- *    legacy/no-op finalize paths and verified-no-op merges legitimately have
- *    no commitSha; the fast-path must remain functional for those.
- */
-async function verifyMergeConfirmedReachability(args: {
-  commitSha: string | undefined;
-  integrationBranch: string | undefined;
-  cwd: string;
-}): Promise<
-  | { reachable: true; skipped?: "no-commit-sha" | "no-integration-branch" }
-  | { reachable: false; reason: "not-ancestor" | "commit-missing" | "git-error"; diagnostic: string }
-> {
-  const { commitSha, integrationBranch, cwd } = args;
-  // No commit sha = legitimate no-op/verified-short-circuit/early-recovery case.
-  if (!commitSha || !commitSha.trim()) {
-    return { reachable: true, skipped: "no-commit-sha" };
-  }
-  // No integration branch resolvable = degrade safely (caller continues fast-path);
-  // this keeps the gate from breaking ancient tasks missing mergeTargetBranch.
-  if (!integrationBranch || !integrationBranch.trim()) {
-    return { reachable: true, skipped: "no-integration-branch" };
-  }
-  // Verify the commit exists locally before testing ancestry — git
-  // merge-base --is-ancestor returns exit 128 for missing commits, which we
-  // want to surface as "commit-missing" rather than "not-ancestor".
-  try {
-    await execFileAsync("git", ["cat-file", "-e", `${commitSha}^{commit}`], {
-      cwd,
-      timeout: 10_000,
-    });
-  } catch (error: unknown) {
-    const diagnostic = error instanceof Error ? error.message : String(error);
-    return { reachable: false, reason: "commit-missing", diagnostic };
-  }
-  try {
-    await execFileAsync(
-      "git",
-      ["merge-base", "--is-ancestor", commitSha, `refs/heads/${integrationBranch}`],
-      { cwd, timeout: 10_000 },
-    );
-    return { reachable: true };
-  } catch (error: unknown) {
-    // Exit code 1 = not an ancestor. Other non-zero = git error.
-    const err = error as { code?: number; message?: string };
-    const code = typeof err.code === "number" ? err.code : undefined;
-    const diagnostic = err.message ?? String(error);
-    if (code === 1) {
-      return { reachable: false, reason: "not-ancestor", diagnostic };
-    }
-    return { reachable: false, reason: "git-error", diagnostic };
-  }
-}
-
-function buildVerificationFailureSignature(error: VerificationError): string {
-  const commandResult = error.verificationResult.testResult ?? error.verificationResult.buildResult;
-  const lane = commandResult?.command?.trim()
-    || error.verificationResult.failedCommand?.trim()
-    || "verification-failure";
-  const failingTestFiles = commandResult
-    ? extractFailingTestFiles(commandResult.stdout, commandResult.stderr)
-    : [];
-  return computeVerificationFailureSignature({
-    lane,
-    failingTestFiles,
-    failedCommand: commandResult?.command ?? error.verificationResult.failedCommand ?? null,
-  }).signature;
 }
 
 export interface AutomationSubsystemHealth {
@@ -525,6 +421,14 @@ export interface ProjectEngineOptions {
    * services available but never starts a partial worker.
    */
   roomHostCompositionProvider?: RoomHostCompositionProviderV1;
+  /**
+   * FNXC:SessionRoomProductionGate 2026-07-27-16:10:
+   * A trusted host must issue current, project/connector-bound evidence for
+   * every high-risk Session control. The provider is re-run by the live
+   * controller guard so expired or withdrawn proof fences later work instead
+   * of authorizing the process for its entire lifetime from one startup read.
+   */
+  roomProductionReadinessProofProvider?: RoomProductionReadinessProofProviderV1;
   roomEvidenceWorkflowsFactory?: RoomEvidenceWorkflowsFactory;
   /** Test/host seam for durable Room lifecycle audit delivery. */
   roomRunAuditDispatcherFactory?: RoomRunAuditDispatcherFactory;
@@ -668,26 +572,14 @@ export class ProjectEngine {
    */
   private plannerRecoveryController?: PlannerRecoveryController;
   /**
-   * FNXC:PlannerOversight 2026-07-04-19:45:
-   * FN-7551 requirement: real overseer decision points (observation,
-   * steering/retry/targeted-fix, confirmation request+resolution, and
-   * bounded-recovery escalation) must emit exactly one `overseer:intervention`
-   * run-audit entry through the FN-7520 `emitOverseer*` façade with the real
-   * `TaskStore`, so the dashboard intervention timeline reflects live engine
-   * activity instead of only synthetic unit-test entries. Emission must be
-   * deduped so the 45s poll does not flood the timeline: this map tracks the
-   * last emitted `"stage:signal"` per taskId for observations, mirroring
-   * FN-7514's `lastWithheldReason` dedup pattern. Cleared alongside the
-   * monitor/controller ring buffers whenever a task leaves the in-flight set.
+   * FNXC:PlannerOversight 2026-07-27-17:02:
+   * FUS-P1-009 keeps ProjectEngine as lifecycle owner while a focused
+   * collaborator owns planner handler wiring and audit deduplication. The
+   * collaborator uses the same TaskStore instance and is cleared at the same
+   * task lifecycle boundaries as the former inline maps.
    */
-  private readonly plannerObservationEmitDedup = new Map<string, string>();
-  /**
-   * FNXC:PlannerOversight 2026-07-04-19:45:
-   * FN-7551: tracks `(taskId, stage)` pairs that have already had a bounded-
-   * recovery escalation emitted so a stage that stays exhausted across many
-   * subsequent polls emits exactly one `escalate` entry, not one per poll.
-   */
-  private readonly plannerEscalationEmitDedup = new Set<string>();
+  private plannerRecoveryWiring: ProjectEnginePlannerRecoveryWiring | undefined =
+    new ProjectEnginePlannerRecoveryWiring();
   private prReconciler?: PrReconciler;
   private prCommentHandler?: PrCommentHandler;
   private notifier?: NtfyNotifier;
@@ -1100,6 +992,37 @@ export class ProjectEngine {
     return { composition: resolution.composition };
   }
 
+  private async evaluateRoomProductionReadiness(
+    settings: Pick<Settings, "experimentalFeatures"> | undefined,
+    taskStore: TaskStore,
+    connectorRegistry: SessionConnectorRegistry,
+  ): Promise<ReturnType<typeof evaluateSessionRoomControlPlaneProductionGate>> {
+    const connectorIds = Object.freeze([...connectorRegistry.ids()].sort());
+    const context = {
+      projectId: this.config.projectId,
+      connectorIds,
+      now: new Date().toISOString(),
+    } as const;
+    const provider = this.options.roomProductionReadinessProofProvider;
+    if (!provider) {
+      return evaluateSessionRoomControlPlaneProductionGate(settings, undefined, context);
+    }
+    try {
+      const proof = await provider({
+        projectId: this.config.projectId,
+        taskStore,
+        connectorRegistry,
+        connectorIds,
+      });
+      return evaluateSessionRoomControlPlaneProductionGate(settings, proof, context);
+    } catch {
+      return {
+        enabled: false,
+        reasonCodes: ["production_readiness_proof_provider_failed"],
+      };
+    }
+  }
+
   private async startOnce(startGeneration: number): Promise<void> {
     this.starting = true;
     try {
@@ -1129,7 +1052,7 @@ export class ProjectEngine {
     // The existing ProjectEngine is the sole process lifecycle owner. Room
     // workers reuse its initialized TaskStore/AsyncDataLayer and never create a
     // second scheduler, backend connection, or browser-owned execution loop.
-    if (isSessionRoomControlPlaneEnabled(settings)) {
+    if (isSessionRoomControlPlaneRequested(settings)) {
       const asyncLayer = store.getAsyncLayer();
       if (!asyncLayer) {
         this.setRoomControlPlaneExecutionStatus("read_only_withheld", ["durable_async_layer_missing"]);
@@ -1188,10 +1111,17 @@ export class ProjectEngine {
         this.roomExistingSessionPreflight = new RoomExistingSessionPreflightService({
           connectorRegistry: roomSessionConnectorRegistry,
         });
+        /*
+         * FNXC:SessionRoomMembershipControl 2026-07-27-06:25:
+         * Restore is a provider-free identity verification command but still
+         * needs a durable operator audit. Reuse the owning project TaskStore;
+         * never construct a second audit store or lose project partitioning.
+         */
         this.roomExistingSessionSpine = new RoomExistingSessionSpine({
           projectId: this.config.projectId,
           roomStore,
           connectorRegistry: roomSessionConnectorRegistry,
+          auditStore: store,
           ingestionLimits,
         });
         const roomHostId = hostname();
@@ -1206,6 +1136,12 @@ export class ProjectEngine {
         };
         const roomCompositionResolution = await this.resolveVerifiedRoomComposition(
           roomCompositionContext,
+        );
+        if (!this.isStartGenerationCurrent(startGeneration)) return;
+        const roomProductionReadiness = await this.evaluateRoomProductionReadiness(
+          settings,
+          store,
+          roomSessionConnectorRegistry,
         );
         if (!this.isStartGenerationCurrent(startGeneration)) return;
         /*
@@ -1228,6 +1164,9 @@ export class ProjectEngine {
         const missingVerifiedRoomComposition = roomCompositionResolution.composition === null
           ? [`host_composition_${roomCompositionResolution.withheldReason}`]
           : [...this.getMissingVerifiedRoomComposition(roomCompositionResolution.composition)];
+        if (!roomProductionReadiness.enabled) {
+          missingVerifiedRoomComposition.push(...roomProductionReadiness.reasonCodes);
+        }
         let centralGlobalCapacityAuthority: GlobalCapacityPolicyAuthorityV1 | null = null;
         let roomGlobalConcurrencyRuntime: RoomGlobalConcurrencyRuntimeV1 | null = null;
         if (missingVerifiedRoomComposition.length === 0) {
@@ -1281,6 +1220,33 @@ export class ProjectEngine {
           projectId: this.config.projectId,
           roomStore,
         });
+        const roomProductionReadinessAuthorityGuard = {
+          assertCurrent: async () => {
+            let currentSettings: Pick<Settings, "experimentalFeatures"> | undefined;
+            try {
+              currentSettings = await store.getSettings();
+            } catch {
+              return {
+                state: "withheld" as const,
+                reason: "production_readiness_settings_unavailable",
+              };
+            }
+            const currentReadiness = await this.evaluateRoomProductionReadiness(
+              currentSettings,
+              store,
+              roomSessionConnectorRegistry,
+            );
+            if (!currentReadiness.enabled) {
+              return {
+                state: "withheld" as const,
+                reason: currentReadiness.reasonCodes[0]
+                  ?? "production_readiness_proof_withheld",
+              };
+            }
+            return verifiedRoomComposition.authority?.guard?.assertCurrent()
+              ?? { state: "current" as const };
+          },
+        };
         const roomControllerFactory = this.options.roomControllerFactory ?? ((context: RoomControllerFactoryContext) => {
           const roomStore = context.roomStore;
           const leaseStore = new AsyncRoomLeaseStore(context.asyncLayer, { projectId: context.projectId });
@@ -1329,13 +1295,17 @@ export class ProjectEngine {
             workerId,
             hostId,
           });
+          const hasStaticCapabilityPolicy =
+            verifiedTaskDispatchCapacity?.capabilityRoutingPolicy !== undefined;
+          const hasDurableCapabilityPolicySource =
+            verifiedTaskDispatchCapacity?.capabilityRoutingPolicySource !== undefined;
           if (
             !verifiedTaskDispatchCapacity
             || typeof verifiedTaskDispatchCapacity.capacityAdmissionSource?.getCapacityGovernorInput !== "function"
-            || !verifiedTaskDispatchCapacity.capabilityRoutingPolicy
+            || hasStaticCapabilityPolicy === hasDurableCapabilityPolicySource
           ) {
             throw new Error(
-              "ProjectEngine roomTaskDispatchCapacityAdmissionVerifiedFactory must return a capacity admission source and routing policy",
+              "ProjectEngine roomTaskDispatchCapacityAdmissionVerifiedFactory must return a capacity admission source and exactly one routing-policy authority",
             );
           }
           const providerBackpressureSendGate = createRoomProviderBackpressureDeliveryGate(
@@ -1367,12 +1337,20 @@ export class ProjectEngine {
               workerId,
               hostId,
               store: roomStore,
-              ...(verifiedTaskDispatchCapacity
-                ? {
-                  capacityAdmissionSource: verifiedTaskDispatchCapacity.capacityAdmissionSource,
-                  capabilityRoutingPolicy: verifiedTaskDispatchCapacity.capabilityRoutingPolicy,
-                }
-                : {}),
+              /*
+               * FNXC:WindowsHostLocalCapacityPolicy 2026-07-27-06:30:
+               * Preserve the host's single routing-policy authority by
+               * identity. A durable snapshot-aware source is not collapsed
+               * into a startup-time provider quota, and dual sources were
+               * rejected above before the controller can claim work.
+               */
+              capacityAdmissionSource: verifiedTaskDispatchCapacity.capacityAdmissionSource,
+              ...(verifiedTaskDispatchCapacity.capabilityRoutingPolicy === undefined
+                ? {}
+                : { capabilityRoutingPolicy: verifiedTaskDispatchCapacity.capabilityRoutingPolicy }),
+              ...(verifiedTaskDispatchCapacity.capabilityRoutingPolicySource === undefined
+                ? {}
+                : { capabilityRoutingPolicySource: verifiedTaskDispatchCapacity.capabilityRoutingPolicySource }),
             })
             : undefined;
           const evidenceWorkflows = this.options.roomEvidenceWorkflowsFactory?.({
@@ -1429,9 +1407,7 @@ export class ProjectEngine {
              * compatible, while forwarding the guard whenever the all-or-
              * nothing host composition supplied one.
              */
-            ...(verifiedRoomComposition.authority?.guard
-              ? { hostCompositionAuthorityGuard: verifiedRoomComposition.authority.guard }
-              : {}),
+            hostCompositionAuthorityGuard: roomProductionReadinessAuthorityGuard,
             recordRunAuditEvent: async (event) => {
               await auditDispatcher.enqueue(event);
             },
@@ -2102,6 +2078,21 @@ export class ProjectEngine {
     return this.runtime.getTaskStore();
   }
 
+  /**
+   * Persist a provider-native participant observation into both the owning
+   * Fusion task activity and its run audit. This is intentionally an explicit
+   * ProjectEngine boundary: connector output does not become Fusion state
+   * merely because a provider process reported it.
+   */
+  recordRoomParticipantRunTaskState(
+    input: RecordRoomParticipantRunTaskStateInputV1,
+  ): Promise<RoomParticipantRunTaskProjectionV1> {
+    return new RoomParticipantRunTaskProjector({
+      projectId: this.config.projectId,
+      store: this.getTaskStore(),
+    }).record(input);
+  }
+
   getRoomControlPlaneReadService(): RoomControlPlaneReadService | undefined {
     return this.roomControlPlaneReadService;
   }
@@ -2309,8 +2300,7 @@ export class ProjectEngine {
       // so if oversight is later re-enabled for this task, the first new
       // observation/escalation emits rather than staying suppressed by stale
       // dedup keys from before the stop.
-      this.plannerObservationEmitDedup.delete(taskId);
-      this.clearPlannerEscalationDedup(taskId);
+      this.getPlannerRecoveryWiring().clearTask(taskId);
 
       return { applied: true, reason: "stopped", task: updatedTask };
     } catch (err) {
@@ -2334,294 +2324,34 @@ export class ProjectEngine {
   }
 
   /**
-   * FNXC:PlannerOversight 2026-07-04-19:45:
-   * FN-7551 mapping helper: converts the `{kind, ref, url?}` source-link shape
-   * shared by `OverseerSourceLink` (FN-7511 observations) and
-   * `PlannerRecoverySourceLink` (FN-7512/FN-7513 decisions) into the FN-7520
-   * façade's `PlannerInterventionSourceLink` shape (`{kind, label, target, url}`),
-   * using `ref` as both `label` and `target` when no richer label exists.
-   * Never throws; an empty/undefined input yields `undefined` so callers can
-   * omit `sourceLinks` entirely rather than pass an empty array.
+   * FNXC:PlannerOversight 2026-07-27-17:02:
+   * Keep the established ProjectEngine prototype seams while delegating their
+   * implementation. Lazy construction preserves lightweight prototype-based
+   * harnesses that intentionally bypass the full engine constructor.
    */
-  private toInterventionSourceLinks(
-    links: ReadonlyArray<{ kind: string; ref: string; url?: string }> | undefined,
-  ): PlannerInterventionSourceLink[] | undefined {
-    if (!links || links.length === 0) return undefined;
-    return links.map((link) => ({
-      kind: link.kind as PlannerInterventionSourceLink["kind"],
-      label: link.ref || link.kind,
-      target: link.ref,
-      url: link.url,
-    }));
+  private getPlannerRecoveryWiring(): ProjectEnginePlannerRecoveryWiring {
+    return this.plannerRecoveryWiring ??= new ProjectEnginePlannerRecoveryWiring();
   }
 
-  /**
-   * FNXC:PlannerOversight 2026-07-04-19:45:
-   * FN-7551: best-effort wrapper shared by every non-observation emission
-   * call-site (steering/retry/targeted-fix/confirmation/escalation) —
-   * swallows and logs any façade/store failure so an audit-emission error
-   * never breaks the dispatching handler or the poll (mirrors the
-   * try/catch-degrade-to-no-op contract every FN-7512/FN-7513/FN-7514
-   * handler already follows).
-   */
-  private emitOverseerInterventionSafe(fn: () => void): void {
-    try {
-      fn();
-    } catch (err) {
-      runtimeLog.warn(`Failed to emit overseer intervention: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  private buildPlannerRecoveryHandlers(
+    store: TaskStore,
+  ): ReturnType<ProjectEnginePlannerRecoveryWiring["buildHandlers"]> {
+    return this.getPlannerRecoveryWiring().buildHandlers(store);
   }
 
-  /**
-   * FNXC:PlannerOversight 2026-07-04-19:45:
-   * FN-7551: emits one `overseer:intervention` `observe` entry through
-   * `emitOverseerObservation` for a real `OverseerStageObservation`, deduped
-   * per `(taskId, stage:signal)` so a 45s poll of an unchanged watched stage
-   * does not append a new observation entry every cycle — only a changed
-   * `(stage, signal)` pair emits. Best-effort: any store/façade failure is
-   * swallowed so it never breaks `PlannerOverseerMonitor#observeTask`/the poll.
-   */
-  private emitOverseerObservationDeduped(store: TaskStore, observation: import("./planner-overseer.js").OverseerStageObservation): void {
-    try {
-      const dedupKey = `${observation.stage}:${observation.signal}`;
-      const last = this.plannerObservationEmitDedup.get(observation.taskId);
-      if (last === dedupKey) {
-        return;
-      }
-      this.plannerObservationEmitDedup.set(observation.taskId, dedupKey);
-      emitOverseerObservation({
-        store,
-        taskId: observation.taskId,
-        stage: observation.stage,
-        reason: observation.reason,
-        sourceLinks: this.toInterventionSourceLinks(observation.sources),
-      });
-    } catch (err) {
-      runtimeLog.warn(
-        `Failed to emit overseer observation intervention for ${observation.taskId}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+  private emitOverseerObservationDeduped(
+    store: TaskStore,
+    observation: Parameters<ProjectEnginePlannerRecoveryWiring["emitObservationDeduped"]>[1],
+  ): void {
+    this.getPlannerRecoveryWiring().emitObservationDeduped(store, observation);
   }
 
-  /**
-   * FNXC:PlannerOversight 2026-07-04-19:45:
-   * FN-7551: emits one `overseer:intervention` `escalate` entry through
-   * `emitOverseerEscalation` when a `(taskId, stage)` pair's bounded-recovery
-   * budget is exhausted, deduped so it is emitted exactly once while the
-   * stage stays exhausted across subsequent polls (a stage that later
-   * un-exhausts — e.g. cleared via `clear(taskId)` on terminal transition —
-   * clears the dedup entry and may escalate again in a future exhaustion).
-   * Best-effort; never throws out of the poll.
-   */
   private emitOverseerEscalationDeduped(
     store: TaskStore,
     taskId: string,
-    decision: { watchedStage: PlannerOversightStage | null; reason: string; attemptCount: number; attemptLimit: number; sourceLinks: ReadonlyArray<{ kind: string; ref: string; url?: string }> },
+    decision: Parameters<ProjectEnginePlannerRecoveryWiring["emitEscalationDeduped"]>[2],
   ): void {
-    if (!decision.watchedStage) return;
-    const dedupKey = `${taskId}::${decision.watchedStage}`;
-    if (this.plannerEscalationEmitDedup.has(dedupKey)) {
-      return;
-    }
-    this.plannerEscalationEmitDedup.add(dedupKey);
-    this.emitOverseerInterventionSafe(() =>
-      emitOverseerEscalation({
-        store,
-        taskId,
-        stage: decision.watchedStage as PlannerOversightStage,
-        reason: decision.reason,
-        attemptCount: decision.attemptCount,
-        attemptLimit: decision.attemptLimit,
-        sourceLinks: this.toInterventionSourceLinks(decision.sourceLinks),
-      }),
-    );
-  }
-
-  /** FN-7551: clears any escalation-dedup entries for `taskId` across every watched stage. */
-  private clearPlannerEscalationDedup(taskId: string): void {
-    const prefix = `${taskId}::`;
-    for (const key of [...this.plannerEscalationEmitDedup]) {
-      if (key.startsWith(prefix)) {
-        this.plannerEscalationEmitDedup.delete(key);
-      }
-    }
-  }
-
-  /**
-   * FNXC:PlannerOversight 2026-07-04-12:00:
-   * Concrete FN-7512 handler wiring — ONLY reuses existing mechanisms:
-   * `injectGuidance`/`requestTargetedFix` post a planner-authored steering
-   * comment via `store.addSteeringComment` (the same channel the executor's
-   * real-time injection listener already watches); `retryStep` calls the
-   * store's existing in-progress→todo retry/re-enqueue path
-   * (`moveTask(id, "todo", { preserveProgress: true })`), preserving
-   * progress exactly like the auto-recovery/self-healing retry handlers do.
-   * No new session/tool/merge channel is introduced.
-   */
-  private buildPlannerRecoveryHandlers(store: TaskStore): PlannerRecoveryHandlers {
-    return {
-      injectGuidance: async (task, decision) => {
-        const text = `[planner-oversight] ${decision.reason}`;
-        await store.addSteeringComment(task.id, text, "agent");
-        // FN-7551: emit the steering intervention entry AFTER the steering
-        // comment succeeds, through the real store, so the timeline reflects
-        // the same guidance the agent actually saw.
-        this.emitOverseerInterventionSafe(() =>
-          emitOverseerSteering({
-            store,
-            taskId: task.id,
-            stage: (decision.watchedStage ?? "executor") as PlannerOversightStage,
-            reason: decision.reason,
-            sourceLinks: this.toInterventionSourceLinks(decision.sourceLinks),
-          }),
-        );
-      },
-      retryStep: async (task, decision) => {
-        await store.moveTask(task.id, "todo", { preserveProgress: true, moveSource: "engine" } as Parameters<TaskStore["moveTask"]>[2]);
-        // FN-7551: the attempt just dispatched — record it as attemptCount + 1
-        // (decision.attemptCount is the count BEFORE this dispatch).
-        this.emitOverseerInterventionSafe(() =>
-          emitOverseerRetry({
-            store,
-            taskId: task.id,
-            stage: (decision.watchedStage ?? "executor") as PlannerOversightStage,
-            reason: decision.reason,
-            attemptCount: decision.attemptCount + 1,
-            attemptLimit: decision.attemptLimit,
-            sourceLinks: this.toInterventionSourceLinks(decision.sourceLinks),
-          }),
-        );
-      },
-      requestTargetedFix: async (task, decision) => {
-        const sourceRef = decision.sourceLinks[0]?.ref;
-        const text = sourceRef
-          ? `[planner-oversight] targeted-fix requested: ${decision.reason} (source: ${sourceRef})`
-          : `[planner-oversight] targeted-fix requested: ${decision.reason}`;
-        await store.addSteeringComment(task.id, text, "agent");
-        this.emitOverseerInterventionSafe(() =>
-          emitOverseerRecoveryAttempt({
-            store,
-            taskId: task.id,
-            stage: (decision.watchedStage ?? "executor") as PlannerOversightStage,
-            reason: decision.reason,
-            attemptCount: decision.attemptCount + 1,
-            attemptLimit: decision.attemptLimit,
-            sourceLinks: this.toInterventionSourceLinks(decision.sourceLinks),
-          }),
-        );
-      },
-      // FNXC:PlannerOversight 2026-07-04-13:00:
-      // FN-7513 requirement: merge/PR actions beyond guidance/retry, and any
-      // destructive/external-service side effect, must never run
-      // autonomously — `requestConfirmation` ONLY records a pending
-      // `PlannerConfirmationRequest` via a planner-authored steering comment
-      // (reusing the same `addSteeringComment` channel as bounded recovery)
-      // so a human sees it; it never performs the side effect itself. The
-      // dashboard confirmation UI/badge that lets a human act on this is
-      // owned by FN-7515+/FN-7517.
-      // FNXC:PlannerOversight 2026-07-08-00:00:
-      // FN-7692 fix: this prefix previously read "confirmation required"
-      // unconditionally, which contradicted `request.reason` once FN-7692
-      // made that reason accurately advisory under an active auto-merge
-      // policy. "checkpoint" is neutral and consistent whether the trailing
-      // `reason` describes an advisory (auto-merge will proceed) or a
-      // genuine block (human approval required) — messaging-only, no change
-      // to the `addSteeringComment` channel/timing or `emitOverseerConfirmation`
-      // below.
-      requestConfirmation: async (task, request) => {
-        const text = `[planner-oversight] merge checkpoint (${request.sideEffectClass}): ${request.reason}`;
-        await store.addSteeringComment(task.id, text, "agent");
-        this.emitOverseerInterventionSafe(() =>
-          emitOverseerConfirmation({
-            store,
-            taskId: task.id,
-            stage: request.watchedStage as PlannerOversightStage,
-            reason: request.reason,
-            sourceLinks: this.toInterventionSourceLinks(request.sourceLinks),
-          }),
-        );
-      },
-      // FNXC:PlannerOversight 2026-07-04-19:45:
-      // FN-7551: audit-only confirmation-RESOLUTION emission. Invoked from
-      // `PlannerRecoveryController.resolveConfirmation` for both "approved"
-      // and "denied" outcomes, mirroring the request-path emission above so
-      // the timeline shows both the request and its resolution. Never touches
-      // the approve/deny execution path itself.
-      onConfirmationResolved: async (taskId, request, resolution) => {
-        this.emitOverseerInterventionSafe(() =>
-          emitOverseerConfirmation({
-            store,
-            taskId,
-            stage: request.watchedStage as PlannerOversightStage,
-            reason: request.reason,
-            outcome: resolution === "approved" ? "succeeded" : "skipped",
-            sourceLinks: this.toInterventionSourceLinks(request.sourceLinks),
-          }),
-        );
-      },
-      // FNXC:PlannerOversight 2026-07-04-14:30:
-      // FN-7513 code-review fix: a `"merge_pr"`-classified confirmation covers
-      // TWO distinct proposed actions (`decidePlannerRecovery` sets
-      // `proposedAction: "advance_merge"` for the `merger` stage and
-      // `"advance_pull_request"` for the `pull-request` stage) — they must NOT
-      // share one handler. Calling `store.mergeTask` unconditionally on every
-      // approved merge_pr request would let an approved PR-stage confirmation
-      // perform a direct task merge/cleanup instead of a PR-specific action,
-      // bypassing the PR workflow entirely. Branch on `request.proposedAction`
-      // (falling back to `request.watchedStage` defensively) and ONLY reuse
-      // the existing `store.mergeTask` merge-advance mechanism for
-      // `"advance_merge"` / the `merger` stage. `"advance_pull_request"` has
-      // no existing PR-advance mechanism to reuse yet (FN-7515+/FN-7517 own
-      // the PR-specific execution wiring) — it is intentionally a no-op here
-      // so an approved PR confirmation never falls through to a merge.
-      executeMergePrAction: async (taskId, request) => {
-        const proposedAction = request.proposedAction;
-        const isMergeAdvance = proposedAction === "advance_merge" || (!proposedAction && request.watchedStage === "merger");
-        if (!isMergeAdvance) {
-          // PR-stage (or any other non-merge-advance) approval: no reusable
-          // PR-advance mechanism exists yet — deliberately do nothing rather
-          // than fall back to a task merge.
-          return;
-        }
-        await store.mergeTask(taskId);
-      },
-      // FN-7513: no destructive/external execution handler is wired yet —
-      // `decidePlannerRecovery` does not currently produce a
-      // `destructive_external` action (FN-7511 has no destructive-action
-      // signal), so this is intentionally left unset; a future task can wire
-      // a concrete handler using existing safe helpers when one is needed.
-      // FNXC:PlannerOverseer 2026-07-04-15:00:
-      // FN-7514 requirement: when the human-control guard (user-paused, or
-      // autoMerge:false/human-review) withholds ALL oversight for a task,
-      // record a bounded `overseer:oversight-withheld-human-control` no-action
-      // run-audit event (metadata: taskId/reason/stage/oversightLevel) so the
-      // withholding is observable, mirroring the `*-no-action` self-healing
-      // convention. Audit-only — this handler performs no lifecycle mutation.
-      recordHumanControlWithheld: async (task, decision, ctx) => {
-        try {
-          const auditor = createRunAuditor(store, {
-            runId: generateSyntheticRunId("planner-overseer-human-control", task.id),
-            agentId: "planner-overseer",
-            taskId: task.id,
-            phase: "planner-overseer-poll",
-          });
-          await auditor.database({
-            type: "overseer:oversight-withheld-human-control",
-            target: task.id,
-            metadata: {
-              taskId: task.id,
-              reason: decision.reason,
-              stage: (ctx as { stage?: string }).stage,
-              oversightLevel: (ctx as { oversightLevel?: string }).oversightLevel,
-            },
-          });
-        } catch (err: unknown) {
-          runtimeLog.warn(
-            `Failed to record overseer:oversight-withheld-human-control for ${task.id}: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      },
-    };
+    this.getPlannerRecoveryWiring().emitEscalationDeduped(store, taskId, decision);
   }
 
   /** Get the CronRunner (if initialized). */
@@ -3542,8 +3272,7 @@ export class ProjectEngine {
         if (!inFlightIds.has(taskId)) {
           overseer.clear(taskId);
           this.plannerRecoveryController?.clear(taskId);
-          this.plannerObservationEmitDedup.delete(taskId);
-          this.clearPlannerEscalationDedup(taskId);
+          this.getPlannerRecoveryWiring().clearTask(taskId);
         }
       }
     } catch {

@@ -1,0 +1,373 @@
+/*
+FNXC:RoomCockpitCommandPanelStyles 2026-07-27-15:38:
+Keep the explicit command, confirmation, and audit surfaces legible on desktop and narrow layouts using only dashboard design tokens. The compact launcher minimizes unopened Route cost, while focus and reduced-motion treatments preserve keyboard and motion-sensitive operation.
+*/
+.panel {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface);
+  border: thin solid var(--border-strong);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  box-shadow: var(--shadow-sm);
+}
+
+.heading,
+.confirmation,
+.form,
+.auditSection {
+  padding: var(--space-lg);
+}
+
+.heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  background: var(--surface-1);
+  border-bottom: thin solid var(--border-subtle);
+}
+
+.heading h2,
+.confirmation h3,
+.auditHeading h3 {
+  margin: var(--space-xs) 0 0;
+  color: var(--text);
+  font-family: var(--font-primary);
+}
+
+.heading > div > p:last-child {
+  max-width: 72ch;
+  margin: var(--space-sm) 0 0;
+  color: var(--text-muted);
+  font-family: var(--font-primary);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+.eyebrow {
+  margin: 0;
+  color: var(--todo);
+  font-size: var(--font-size-2xs);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.boundary {
+  flex: 0 0 auto;
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--todo);
+  border: thin solid color-mix(in srgb, var(--todo) 55%, var(--border));
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-2xs);
+  text-transform: uppercase;
+}
+
+.form,
+.confirmation {
+  display: grid;
+  gap: var(--space-lg);
+}
+
+.compactBoundary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  margin: 0;
+  padding: var(--space-lg);
+  color: var(--text-muted);
+  background: var(--surface-subtle);
+  border-bottom: thin solid var(--border-subtle);
+  font-family: var(--font-primary);
+  font-size: var(--font-size-sm);
+}
+
+.compactBoundary p {
+  margin: 0;
+}
+
+.operationTabs {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+  padding: var(--space-md) var(--space-lg);
+  background: var(--surface-subtle);
+  border-bottom: thin solid var(--border-subtle);
+}
+
+.operationTabs button {
+  min-height: calc(var(--space-2xl) + var(--space-xs));
+  padding: var(--space-sm) var(--space-md);
+  color: var(--text-muted);
+  background: var(--surface-2);
+  border: thin solid var(--border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+}
+
+.operationTabs button[aria-pressed="true"] {
+  color: var(--text);
+  background: color-mix(in srgb, var(--todo) 12%, var(--surface));
+  border-color: var(--todo);
+}
+
+.operationTabs button:focus-visible {
+  outline: medium solid var(--todo);
+  outline-offset: var(--space-xs);
+}
+
+.fieldset {
+  display: grid;
+  gap: var(--space-md);
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-lg);
+  background: var(--surface-subtle);
+  border: thin solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.fieldset legend {
+  padding: 0 var(--space-sm);
+  color: var(--todo);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.formGrid,
+.policyGrid,
+.reviewLedger {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-md);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-xs);
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  min-width: 0;
+  color: var(--text);
+  background: var(--surface-2);
+  border: thin solid var(--border);
+  border-radius: var(--radius-sm);
+  font: inherit;
+}
+
+.field input,
+.field select {
+  min-height: calc(var(--space-2xl) + var(--space-xs));
+  padding: var(--space-sm);
+}
+
+.field textarea {
+  min-height: calc(var(--space-2xl) * 3);
+  padding: var(--space-sm);
+  resize: vertical;
+}
+
+.field input:focus-visible,
+.field select:focus-visible,
+.field textarea:focus-visible,
+.primaryButton:focus-visible,
+.secondaryButton:focus-visible {
+  outline: medium solid var(--todo);
+  outline-offset: var(--space-xs);
+}
+
+.certificateBoundary,
+.validation {
+  margin: 0;
+  padding: var(--space-md);
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--color-warning) 8%, var(--surface));
+  border-left: medium solid var(--color-warning);
+  font-family: var(--font-primary);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+}
+
+.validation[role="alert"] {
+  color: var(--color-error);
+  background: color-mix(in srgb, var(--color-error) 8%, var(--surface));
+  border-left-color: var(--color-error);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.primaryButton,
+.secondaryButton {
+  min-height: calc(var(--space-2xl) + var(--space-xs));
+  padding: var(--space-sm) var(--space-lg);
+  border: thin solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+}
+
+.primaryButton {
+  color: var(--bg);
+  background: var(--todo);
+  border-color: var(--todo);
+}
+
+.secondaryButton {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.primaryButton:hover:not(:disabled),
+.secondaryButton:hover:not(:disabled) {
+  background: var(--surface-hover-strong);
+  color: var(--text);
+}
+
+.primaryButton:disabled,
+.secondaryButton:disabled,
+.fieldset:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.confirmation {
+  background: color-mix(in srgb, var(--color-warning) 5%, var(--surface));
+}
+
+.reviewLedger {
+  margin: 0;
+}
+
+.reviewLedger > div {
+  min-width: 0;
+  padding: var(--space-md);
+  background: var(--surface-2);
+  border: thin solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.reviewLedger dt {
+  color: var(--text-muted);
+  font-size: var(--font-size-2xs);
+  text-transform: uppercase;
+}
+
+.reviewLedger dd {
+  margin: var(--space-xs) 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: var(--font-size-xs);
+}
+
+.auditSection {
+  display: grid;
+  gap: var(--space-md);
+  border-top: thin solid var(--border-subtle);
+}
+
+.auditList {
+  display: grid;
+  gap: var(--space-sm);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.auditList li {
+  display: grid;
+  gap: var(--space-xs);
+  padding: var(--space-md);
+  background: var(--surface-2);
+  border-left: medium solid var(--color-warning);
+  border-radius: var(--radius-sm);
+}
+
+.auditList li[data-state="accepted"] {
+  border-left-color: var(--color-success);
+}
+
+.auditList strong,
+.auditList span,
+.auditList small {
+  overflow-wrap: anywhere;
+}
+
+.auditList strong {
+  color: var(--text);
+  font-size: var(--font-size-xs);
+}
+
+.auditList span {
+  color: var(--text-muted);
+  font-family: var(--font-primary);
+  font-size: var(--font-size-sm);
+}
+
+.auditList small {
+  color: var(--text-dim);
+  font-size: var(--font-size-2xs);
+}
+
+@media (max-width: 48rem) {
+  .heading {
+    flex-direction: column;
+  }
+
+  .operationTabs {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .boundary {
+    align-self: flex-start;
+  }
+
+  .formGrid,
+  .policyGrid,
+  .reviewLedger {
+    grid-template-columns: 1fr;
+  }
+
+  .actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .compactBoundary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .primaryButton,
+  .secondaryButton {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .primaryButton,
+  .secondaryButton {
+    transition: none;
+  }
+}

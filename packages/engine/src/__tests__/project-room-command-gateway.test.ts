@@ -21,7 +21,10 @@ import type {
 } from "../room-existing-session-preflight.js";
 import type {
   CreateRoomWithExistingSessionsInput,
+  RequestAddExistingSessionAtTurnBoundaryInput,
+  RequestRemoveExistingSessionAtTurnBoundaryInput,
   RecordRoomPhaseGateEvidenceAtCompletedTurnBoundaryInput,
+  RestoreRoomExistingSessionsInput,
   RouteStructuredRoomProtocolMessageInput,
   SendToRoomSeatInput,
   TransitionRoomRoleAssignmentAtCompletedTurnBoundaryInput,
@@ -66,7 +69,8 @@ function createGateway(
 
 function createSpine(): ProjectRoomCommandSpineV1 {
   const room = {
-    room: { id: "room-1", projectId: PROJECT_ID },
+    room: { id: "room-1", projectId: PROJECT_ID, aggregateVersion: 3 },
+    membershipVersion: 1,
   } as unknown as RoomAggregateV1;
   const routed = {
     roomId: "room-1",
@@ -82,6 +86,13 @@ function createSpine(): ProjectRoomCommandSpineV1 {
 
   return {
     createRoomWithExistingSessions: vi.fn(async (_input: CreateRoomWithExistingSessionsInput) => room),
+    restoreRoomExistingSessions: vi.fn(async (_input: RestoreRoomExistingSessionsInput) => room),
+    requestAddExistingSessionAtTurnBoundary: vi.fn(
+      async (_input: RequestAddExistingSessionAtTurnBoundaryInput) => room,
+    ),
+    requestRemoveExistingSessionAtTurnBoundary: vi.fn(
+      async (_input: RequestRemoveExistingSessionAtTurnBoundaryInput) => room,
+    ),
     routeStructuredProtocolMessage: vi.fn(async (_input: RouteStructuredRoomProtocolMessageInput) => routed),
     recordPhaseGateEvidenceAtCompletedTurnBoundary: vi.fn(
       async (_input: RecordRoomPhaseGateEvidenceAtCompletedTurnBoundaryInput) => phaseGateEvidence,
@@ -113,6 +124,63 @@ function createExistingSessionPreflightCommand(): ProjectRoomCommandV1 {
       connectorId: "happier-runtime",
       canonicalSessionUri: "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
       requiredHostId: "windows-host-1",
+    },
+  };
+}
+
+function createRestoreExistingSessionsCommand(): ProjectRoomCommandV1 {
+  return {
+    type: "room.restore-existing-sessions.v1",
+    projectId: PROJECT_ID,
+    commandId: "restore-existing-room-1",
+    input: {
+      roomId: "room-1",
+      expectedAggregateVersion: 3,
+      idempotencyKey: "restore-existing-room-1",
+    },
+  };
+}
+
+function createAddExistingSessionCommand(): ProjectRoomCommandV1 {
+  return {
+    type: "room.request-add-existing-session.v1",
+    projectId: PROJECT_ID,
+    commandId: "add-existing-session-1",
+    input: {
+      roomId: "room-1",
+      expectedAggregateVersion: 3,
+      expectedMembershipVersion: 1,
+      changeId: "change-add-reviewer",
+      idempotencyKey: "add-existing-session-1",
+      reason: "Add an independent reviewer",
+      session: {
+        seatId: "seat-reviewer",
+        bindingId: "binding-reviewer-1",
+        role: "reviewer",
+        permissionScope: ["room:message", "candidate:review"],
+        connectorId: "happier",
+        canonicalSessionUri: "claude://sessions/reviewer-session",
+        requiredHostId: "windows-host-1",
+        requiredMachineId: "machine-1",
+        idempotencyKey: "ensure-reviewer-session-1",
+      },
+    },
+  };
+}
+
+function createRemoveExistingSessionCommand(): ProjectRoomCommandV1 {
+  return {
+    type: "room.request-remove-existing-session.v1",
+    projectId: PROJECT_ID,
+    commandId: "remove-existing-session-1",
+    input: {
+      roomId: "room-1",
+      seatId: "seat-reviewer",
+      expectedAggregateVersion: 3,
+      expectedMembershipVersion: 1,
+      changeId: "change-remove-reviewer",
+      idempotencyKey: "remove-existing-session-1",
+      reason: "Reviewer completed the assignment",
     },
   };
 }
@@ -293,6 +361,43 @@ describe("ProjectRoomCommandGateway", () => {
       commandId: "create-existing-room-1",
       actor: { kind: "dashboard_operator", principalId: "operator-1" },
       value: { room: { id: "room-1", projectId: PROJECT_ID } },
+    });
+  });
+
+  it("routes restore and safe-boundary membership requests through the authenticated operator", async () => {
+    const spine = createSpine();
+    const gateway = createGateway(spine);
+    const restore = createRestoreExistingSessionsCommand();
+    const add = createAddExistingSessionCommand();
+    const remove = createRemoveExistingSessionCommand();
+
+    const restoreResult = await gateway.execute(restore, DASHBOARD_OPERATOR);
+    const addResult = await gateway.execute(add, DASHBOARD_OPERATOR);
+    const removeResult = await gateway.execute(remove, DASHBOARD_OPERATOR);
+
+    expect(spine.restoreRoomExistingSessions).toHaveBeenCalledWith(restore.input);
+    expect(spine.requestAddExistingSessionAtTurnBoundary).toHaveBeenCalledWith(add.input);
+    expect(spine.requestRemoveExistingSessionAtTurnBoundary).toHaveBeenCalledWith(remove.input);
+    expect([restoreResult, addResult, removeResult]).toEqual([
+      expect.objectContaining({
+        type: "room.restore-existing-sessions.v1",
+        actor: { kind: "dashboard_operator", principalId: "operator-1" },
+        value: expect.objectContaining({ room: expect.objectContaining({ aggregateVersion: 3 }) }),
+      }),
+      expect.objectContaining({
+        type: "room.request-add-existing-session.v1",
+        actor: { kind: "dashboard_operator", principalId: "operator-1" },
+        value: expect.objectContaining({ membershipVersion: 1 }),
+      }),
+      expect.objectContaining({
+        type: "room.request-remove-existing-session.v1",
+        actor: { kind: "dashboard_operator", principalId: "operator-1" },
+        value: expect.objectContaining({ membershipVersion: 1 }),
+      }),
+    ]);
+
+    await expect(gateway.execute(add, CONNECTOR_ADAPTER)).rejects.toMatchObject({
+      code: "PROJECT_ROOM_COMMAND_PRINCIPAL_FORBIDDEN",
     });
   });
 

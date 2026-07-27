@@ -231,7 +231,7 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
 
   /*
   FNXC:CITestGate 2026-06-26-06:40:
-  The merge gate is the thin trusted CI surface. ci-workflow.test.ts must pin not only that the Gate job invokes `pnpm test:gate`, but also test:gate's internal composition (guards + engine test:core + cli test:ci-shape) and that engine test:core references the engine-core vitest project — otherwise a rename could hollow the gate while this CI-shape test stays green (FN-7059).
+  The merge gate is the thin trusted CI surface. ci-workflow.test.ts must pin not only that the Gate job invokes `pnpm test:gate`, but also the cross-platform runner that owns the engine/core pair and the cli CI-shape suite. The runner itself has a focused policy test for both child commands, so the package script stays platform-neutral.
   */
   it("pins test:gate to the audited guard scripts and curated suites", () => {
     const testGateScript = rootPackageJson.scripts?.["test:gate"] ?? "";
@@ -240,8 +240,7 @@ describe("Merge gate (.github/workflows/pr-checks.yml)", () => {
     expect(testGateScript).toContain("node scripts/check-no-kill-" + "40" + "40" + ".mjs"); // port-4040-allowlist: asserts the gate wires the checker; not a real port bind
     expect(testGateScript).toContain("node scripts/check-no-test-timeout-appeasement.mjs");
     expect(testGateScript).toContain("node scripts/check-changeset-format.mjs");
-    expect(testGateScript).toContain("pnpm --filter @fusion/engine test:core");
-    expect(testGateScript).toContain("pnpm --filter @fusion/core test:pg-gate");
+    expect(testGateScript).toContain("node scripts/test-gate.mjs");
     expect(testGateScript).toContain("pnpm --filter @runfusion/fusion test:ci-shape");
   });
 

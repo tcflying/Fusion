@@ -5,20 +5,24 @@ import {
   buildHappierInvocation,
   buildHappierProcessEnv,
   resolveHappierCliSettings,
+  resolveHappierWaitTimeoutMs,
 } from "./cli-spawn.js";
 import {
   HappierCliError,
   type HappierCliSettings,
   type HappierJsonRecord,
 } from "./types.js";
+import { terminateAndWaitHappierProcessTree } from "./process-lifecycle.js";
+import {
+  HAPPIER_OFFICIAL_MCP_TOOLS,
+} from "./official-session-control-contract.js";
+import { HAPPIER_SESSION_CONNECTOR_VERSION } from "./session-connector-contract.js";
 
-export const HAPPIER_OFFICIAL_MCP_TOOLS = {
-  list: "session_list",
-  status: "session_status_get",
-  send: "session_message_send",
-  wait: "session_wait_idle",
-  stop: "session_stop",
-} as const;
+export {
+  HAPPIER_OFFICIAL_MCP_TOOLS,
+  HAPPIER_OFFICIAL_SESSION_CONTROL_SOURCE,
+} from "./official-session-control-contract.js";
+export type { HappierOfficialMcpToolName } from "./official-session-control-contract.js";
 
 /**
  * Not part of Happier's upstream public MCP contract. These tool names are
@@ -29,8 +33,6 @@ export const HAPPIER_LOCAL_MCP_EXTENSION_TOOLS = {
   reconciliationHistory: "fusion_reconciliation_history_get",
   providerTelemetry: "fusion_provider_telemetry_get",
 } as const;
-
-export type HappierOfficialMcpToolName = (typeof HAPPIER_OFFICIAL_MCP_TOOLS)[keyof typeof HAPPIER_OFFICIAL_MCP_TOOLS];
 
 export interface HappierMcpToolDefinition {
   readonly name: string;
@@ -94,6 +96,70 @@ function requiredResultRecord(value: unknown, operation: string): HappierJsonRec
   return value;
 }
 
+/*
+ * FNXC:HappierTimeoutHierarchy 2026-07-27-03:01:
+ * Process creation, MCP negotiation, ordinary tools, and provider waits have
+ * distinct deadlines. Prove spawn before starting the connect timer so one
+ * budget cannot silently consume another.
+ */
+function waitForHappierMcpSpawn(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (typeof child.pid === "number" && child.pid > 0) return Promise.resolve();
+  if (signal?.aborted) {
+    return terminateAndWaitHappierProcessTree(child).then((cleaned) => Promise.reject(
+      cleaned
+        ? new HappierCliError("timeout", "Happier MCP spawn was aborted")
+        : new HappierCliError("process", "Happier MCP spawn abort cleanup could not be confirmed"),
+    ));
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = (): void => {
+      clearTimeout(timeout);
+      child.off("spawn", onSpawn);
+      child.off("error", onError);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (error?: HappierCliError): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve();
+    };
+    const terminateThenReject = (error: HappierCliError): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      void terminateAndWaitHappierProcessTree(child).then(
+        (cleaned) => reject(cleaned
+          ? error
+          : new HappierCliError("process", "Happier MCP spawn cleanup could not be confirmed")),
+        () => reject(new HappierCliError("process", "Happier MCP spawn cleanup failed")),
+      );
+    };
+    const onSpawn = (): void => finish();
+    const onError = (): void => finish(new HappierCliError("process", "Happier MCP process could not be started"));
+    const onAbort = (): void => {
+      terminateThenReject(new HappierCliError("timeout", "Happier MCP spawn was aborted"));
+    };
+    const timeout = setTimeout(() => {
+      terminateThenReject(new HappierCliError(
+        "timeout",
+        "Happier MCP process spawn timed out",
+        undefined,
+        "cli_spawn_timeout",
+      ));
+    }, timeoutMs);
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /**
  * FNXC:HappierOfficialMcpBridge 2026-07-19-19:29:
  * Fusion invokes only Happier's documented external MCP server (`happier mcp
@@ -104,11 +170,14 @@ class HappierStdioMcpClient implements HappierMcpClient {
   private readonly pending = new Map<number, PendingRequest>();
   private readonly decoder = new StringDecoder("utf8");
   private readonly maxOutputBytes: number;
-  private readonly timeoutMs: number;
+  private readonly settings: HappierCliSettings;
+  private readonly connectTimeoutMs: number;
+  private readonly toolTimeoutMs: number;
   private nextId = 1;
   private buffered = "";
   private stderrBytes = 0;
   private closed = false;
+  private processCleanup: Promise<boolean> | null = null;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
@@ -116,7 +185,9 @@ class HappierStdioMcpClient implements HappierMcpClient {
   ) {
     const resolved = resolveHappierCliSettings(settings);
     this.maxOutputBytes = resolved.maxOutputBytes;
-    this.timeoutMs = resolved.timeoutMs;
+    this.settings = resolved;
+    this.connectTimeoutMs = resolved.connectTimeoutMs!;
+    this.toolTimeoutMs = resolved.toolTimeoutMs!;
     this.child.stdout.on("data", this.onStdout);
     this.child.stderr.on("data", this.onStderr);
     this.child.once("error", this.onProcessError);
@@ -129,14 +200,17 @@ class HappierStdioMcpClient implements HappierMcpClient {
       capabilities: {},
       clientInfo: {
         name: "fusion-happier-runtime",
-        version: "0.2.73",
+        version: HAPPIER_SESSION_CONNECTOR_VERSION,
       },
-    }, signal);
+    }, signal, this.connectTimeoutMs);
     this.notify("notifications/initialized", {});
   }
 
   async listTools(signal?: AbortSignal): Promise<readonly HappierMcpToolDefinition[]> {
-    const result = requiredResultRecord(await this.request("tools/list", {}, signal), "tools/list");
+    const result = requiredResultRecord(
+      await this.request("tools/list", {}, signal, this.toolTimeoutMs),
+      "tools/list",
+    );
     if (!Array.isArray(result.tools)) {
       throw new HappierCliError("protocol", "Happier MCP tools/list returned no tools array");
     }
@@ -158,10 +232,16 @@ class HappierStdioMcpClient implements HappierMcpClient {
   ): Promise<HappierMcpToolResult> {
     const name = nonEmptyString(input.name);
     if (!name) throw new HappierCliError("protocol", "Happier MCP tool name is required");
+    const argumentsRecord = input.arguments ?? {};
+    const waitsForProvider = name === HAPPIER_OFFICIAL_MCP_TOOLS.wait
+      || (name === HAPPIER_OFFICIAL_MCP_TOOLS.send && argumentsRecord.wait === true);
+    const requestTimeoutMs = waitsForProvider
+      ? resolveHappierWaitTimeoutMs(Number(argumentsRecord.timeoutSeconds), this.settings)
+      : this.toolTimeoutMs;
     const result = requiredResultRecord(await this.request("tools/call", {
       name,
-      arguments: input.arguments ?? {},
-    }, signal), `tool ${name}`);
+      arguments: argumentsRecord,
+    }, signal, requestTimeoutMs), `tool ${name}`);
     if (result.isError !== undefined && typeof result.isError !== "boolean") {
       throw new HappierCliError("protocol", `Happier MCP tool ${name} returned an invalid isError flag`);
     }
@@ -169,21 +249,18 @@ class HappierStdioMcpClient implements HappierMcpClient {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return;
-    this.closed = true;
-    try {
-      this.child.stdin.end();
-    } catch {
-      // The process is already closing; settle pending requests below.
-    }
-    this.rejectAll(new HappierCliError("process", "Happier MCP client closed"));
-    this.detachListeners();
-    if (this.child.exitCode === null && this.child.signalCode === null) {
+    if (!this.closed) {
+      this.closed = true;
       try {
-        this.child.kill("SIGTERM");
+        this.child.stdin.end();
       } catch {
-        // Closing a failed child is best effort and must not surface credentials.
+        // The process is already closing; settle pending requests below.
       }
+      this.rejectAll(new HappierCliError("process", "Happier MCP client closed"));
+      this.detachListeners();
+    }
+    if (!await this.cleanupProcess()) {
+      throw new HappierCliError("process", "Happier MCP process-tree cleanup could not be confirmed");
     }
   }
 
@@ -244,7 +321,12 @@ class HappierStdioMcpClient implements HappierMcpClient {
     pending.resolve(response.result);
   }
 
-  private request(method: string, params: HappierJsonRecord, signal?: AbortSignal): Promise<unknown> {
+  private request(
+    method: string,
+    params: HappierJsonRecord,
+    signal?: AbortSignal,
+    timeoutMs = this.toolTimeoutMs,
+  ): Promise<unknown> {
     if (this.closed) return Promise.reject(new HappierCliError("process", "Happier MCP client is closed"));
     if (signal?.aborted) return Promise.reject(new HappierCliError("timeout", "Happier MCP request was aborted"));
     const id = this.nextId;
@@ -258,7 +340,7 @@ class HappierStdioMcpClient implements HappierMcpClient {
         this.clearPending(pending);
         rejectError(new HappierCliError("timeout", `Happier MCP ${method} timed out`));
         void this.close();
-      }, this.timeoutMs);
+      }, timeoutMs);
       const onAbort = signal ? () => {
         const pending = this.pending.get(id);
         if (!pending) return;
@@ -314,11 +396,12 @@ class HappierStdioMcpClient implements HappierMcpClient {
     this.closed = true;
     this.rejectAll(error);
     this.detachListeners();
-    try {
-      this.child.kill("SIGTERM");
-    } catch {
-      // The client has already surfaced a bounded error to callers.
-    }
+    void this.cleanupProcess();
+  }
+
+  private cleanupProcess(): Promise<boolean> {
+    this.processCleanup ??= terminateAndWaitHappierProcessTree(this.child).catch(() => false);
+    return this.processCleanup;
   }
 
   private detachListeners(): void {
@@ -350,6 +433,7 @@ export async function openHappierMcpClient(
   } catch {
     throw new HappierCliError("process", "Happier MCP process could not be started");
   }
+  await waitForHappierMcpSpawn(child, settings.spawnTimeoutMs!, input.signal);
   const client = new HappierStdioMcpClient(child, settings);
   try {
     await client.initialize(input.signal);

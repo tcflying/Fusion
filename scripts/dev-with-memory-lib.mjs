@@ -17,6 +17,21 @@ export function buildDevNodeArgs({
   ];
 }
 
+/*
+FNXC:ServerSupervisor 2026-07-27-03:54:
+The memory/prebuild wrapper is not the long-lived command supervisor. Remove
+inherited supervisor stamps before launching the CLI so dashboard, serve, and
+daemon can create their own pid-stamped crash-budget parent by default.
+*/
+export function buildDevChildEnv(env = process.env) {
+  const {
+    FUSION_RESTART_SUPERVISED: _supervised,
+    FUSION_SUPERVISOR_PID: _supervisorPid,
+    ...childEnv
+  } = env;
+  return childEnv;
+}
+
 const VALID_PREBUILD_MODES = new Set(["auto", "none", "client", "full"]);
 
 export function normalizePrebuildMode(value) {

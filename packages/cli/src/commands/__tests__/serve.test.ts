@@ -362,8 +362,9 @@ const mocks = vi.hoisted(() => {
     pluginLoaderInstances.push(pluginLoader);
     return pluginLoader;
   });
-
   const authStorage = {
+    // FNXC:CliTests 2026-07-27-03:54: The model-registry factory binds its runtime into auth storage, so this startup double keeps that auth/supervisor-to-createServer boundary.
+    setModelRuntime: vi.fn(),
     getApiKey: vi.fn().mockResolvedValue(undefined),
     reload: vi.fn(),
     getOAuthProviders: vi.fn().mockReturnValue([]),
@@ -623,7 +624,6 @@ vi.mock("@fusion/core", async (importOriginal) => {
   resolveGlobalDir: vi.fn().mockReturnValue("/mock/global"),
   });
 });
-
 vi.mock("@fusion/dashboard", () => ({
   // FNXC:TestInfrastructure 2026-07-13-10:25: Source files named-import these from @fusion/dashboard barrel; mock must surface them.
   registerGithubTrackingHook: vi.fn(),
@@ -633,6 +633,8 @@ resolveCliPackageVersionInfo: vi.fn(() => ({ version: "0.0.0-test", isUnresolved
   getCliPackageVersion: vi.fn(() => "0.0.0"),
   // FNXC:CliTests 2026-07-13-08:00: getCliPackageVersion added to @fusion/dashboard barrel export; mock must surface it for daemon/serve startup model sync.
   createServer: mocks.createServerMock,
+  createDashboardAuthContext: vi.fn((input: { host: string; noAuth?: boolean; token?: string }) => input.noAuth
+    ? { mode: "loopback-no-auth", host: input.host } : { mode: "bearer", host: input.host, token: input.token }),
   createDaemonRoomControlPlaneAuthorizer: vi.fn(() => vi.fn()),
   GitHubClient: vi.fn().mockImplementation(function () {
     return {};
@@ -647,6 +649,7 @@ vi.mock("@fusion/engine", async (importOriginal) => {
   const { createCliEngineMock } = await import("../../test/mockCoreEngine");
   return createCliEngineMock(() => importOriginal<typeof import("@fusion/engine")>(), {
     createFusionAuthStorage: vi.fn(() => mocks.authStorage),
+    createFusionModelRegistry: vi.fn().mockResolvedValue(mocks.modelRegistry),
     createWindowsNativeRoomHostCompositionAdapterRegistry: mockRoomHostCompositionAdapterRegistryFactory,
     ProjectEngine: mocks.projectEngineCtor,
     ProjectEngineManager: vi.fn().mockImplementation(function (centralCore: any, options: any) {
@@ -768,7 +771,6 @@ vi.mock("../project-context.js", () => ({
 
 const { runServe } = await import("../serve.js");
 const ensureProjectRegisteredModule = await import("../ensure-project-registered.js");
-
 describe("runServe", () => {
   it("invokes shared startup model sync", async () => {
     const { runServe } = await import("../serve.js");
@@ -1152,6 +1154,8 @@ describe("runServe — Plugin wiring", () => {
 
   it("initializes PluginLoader with pluginStore and taskStore", async () => {
     const { PluginLoader } = await import("@fusion/core");
+    const { getCliPackageVersion } = await import("@fusion/dashboard");
+    vi.mocked(getCliPackageVersion).mockReturnValue("0.74.0-beta.3");
 
     await runServe(4040, {});
 
@@ -1159,6 +1163,7 @@ describe("runServe — Plugin wiring", () => {
     const loaderOptions = PluginLoader.mock.calls[0][0];
     expect(loaderOptions).toHaveProperty("pluginStore");
     expect(loaderOptions).toHaveProperty("taskStore");
+    expect(loaderOptions).toHaveProperty("fusionVersion", "0.74.0-beta.3");
 
     await triggerSignal("SIGINT");
   });
@@ -2115,7 +2120,7 @@ describe("runServe — multi-project cwd/default engine resolution", () => {
     expect(serverOpts2.engine).toBe(originalEngine);
   });
 
-  it("wires Room authorization only when daemon authentication is enabled", async () => {
+  it("wires Room authorization when bearer authentication is enabled", async () => {
     const { createServer, createDaemonRoomControlPlaneAuthorizer } = await import("@fusion/dashboard");
     const factoryMock = createDaemonRoomControlPlaneAuthorizer as ReturnType<typeof vi.fn>;
     const token = "fn_room_serve_authorizer";
@@ -2125,9 +2130,7 @@ describe("runServe — multi-project cwd/default engine resolution", () => {
       await runServe(4040, { daemon: true });
 
       expect(factoryMock).toHaveBeenCalledWith(token);
-      const serverOptions = (createServer as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1] as {
-        roomControlPlaneAuthorizeProject?: unknown;
-      };
+      const serverOptions = (createServer as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1] as { roomControlPlaneAuthorizeProject?: unknown };
       expect(serverOptions.roomControlPlaneAuthorizeProject).toBe(factoryMock.mock.results.at(-1)?.value);
     } finally {
       await triggerSignal("SIGINT");

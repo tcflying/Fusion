@@ -6,23 +6,56 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 import {
   archiveHappierSession,
   createHappierSession,
   getHappierSessionHistory,
   getHappierSessionStatus,
+  listHappierSessions,
   resolveHappierCliSettings,
   sendHappierMessage,
+  setHappierSessionModel,
+  setHappierSessionPermissionMode,
+  setHappierSessionTitle,
+  stopHappierSession,
+  type HappierResumeProcessLease,
 } from "./cli-spawn.js";
+import { resolveHappierBackend } from "./backend-resolver.js";
+import {
+  verifyHappierCliAttestation,
+  type HappierCliAttestation,
+} from "./cli-attestation.js";
+import {
+  buildHappierCreateIntentIdentity,
+  createHappierCreateIntentStore,
+  type HappierCreateIntentIdentity,
+  type HappierCreateIntentRecord,
+  type HappierCreateIntentState,
+  type HappierCreateIntentStore,
+} from "./create-intent-store.js";
+import {
+  buildHappierStopIdentity,
+  createHappierStopStateStore,
+  type HappierStopReasonCode,
+  type HappierStopState,
+  type HappierStopStateStore,
+} from "./stop-state-store.js";
+import {
+  resolveHappierRuntimeModelId,
+  resolveHappierRuntimePermissionMode,
+  type HappierRuntimePermissionMode,
+} from "./runtime-options.js";
+import { resumeHappierSessionStrictly } from "./strict-resume.js";
 import type {
   HappierCliSettings,
   HappierRawHistoryRow,
   HappierSessionHistoryResult,
+  HappierSessionListItem,
   HappierSessionStatusResult,
 } from "./types.js";
 import {
-  HAPPIER_BACKENDS,
   HappierCliError,
   type AgentRuntime,
   type AgentRuntimeOptions,
@@ -46,6 +79,14 @@ const RESUMABLE_STATES = new Set([
   "paused",
   "recoverable",
 ]);
+
+export interface HappierRuntimeAdapterDependencies {
+  readonly attestCli: (settings: HappierCliSettings) => Promise<HappierCliAttestation>;
+}
+
+const defaultRuntimeAdapterDependencies: HappierRuntimeAdapterDependencies = {
+  attestCli: verifyHappierCliAttestation,
+};
 
 interface ParsedHistoryRow {
   id: string;
@@ -98,12 +139,14 @@ function readStatusValue(value: unknown): string | undefined {
   );
 }
 
-function statusProvesResumable(result: { session: Record<string, unknown>; agentState?: Record<string, unknown> }): boolean {
+function statusAllowsResumeAttempt(result: { session: Record<string, unknown>; agentState?: Record<string, unknown> }): boolean {
   const session = result.session;
   const agentState = result.agentState;
   if (session.resumable === false || agentState?.resumable === false) return false;
+  // Official status guarantees `active`; official `happier resume` owns the
+  // stronger vendor-resume eligibility check that status does not expose.
+  if (session.active === false) return true;
   if (session.resumable === true || agentState?.resumable === true) return true;
-  if (session.active === false) return false;
   if (session.active === true) return true;
   const state = (readStatusValue(agentState) ?? readStatusValue(session))?.toLowerCase();
   return state !== undefined && RESUMABLE_STATES.has(state);
@@ -292,7 +335,15 @@ type ManagedHappierSession = HappierAgentSession & {
   needsPersistence: boolean;
   activePrompt?: Promise<void>;
   activePromptController?: AbortController;
+  remoteStop?: Promise<void>;
+  stopRecoveryPending: boolean;
   stopped: boolean;
+  taskTitle: string;
+  beforeSpawnSession?: AgentRuntimeOptions["beforeSpawnSession"];
+  modelId?: string;
+  permissionMode?: HappierRuntimePermissionMode;
+  runtimeOptionsApplied: boolean;
+  resumeProcess?: HappierResumeProcessLease;
   abort(): Promise<void>;
 };
 
@@ -304,6 +355,22 @@ function throwIfPromptAborted(signal: AbortSignal): void {
   if (signal.aborted) throw happierPromptAbortError();
 }
 
+function normalizedComparablePath(value: string): string {
+  const normalized = resolve(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function isCreateIntentCandidate(
+  session: HappierSessionListItem,
+  identity: HappierCreateIntentIdentity,
+): boolean {
+  return session.tag === identity.tag
+    && typeof session.path === "string"
+    && normalizedComparablePath(session.path) === normalizedComparablePath(identity.cwd)
+    && session.agentId === identity.backend
+    && (session.archivedAt === undefined || session.archivedAt === null);
+}
+
 export class HappierRuntimeAdapter implements AgentRuntime {
   readonly id = "happier";
   readonly name = "Happier Runtime";
@@ -311,18 +378,41 @@ export class HappierRuntimeAdapter implements AgentRuntime {
   private readonly settings: ReturnType<typeof resolveHappierCliSettings>;
   private readonly backend: HappierBackend;
   private readonly timeoutSeconds: number;
-  constructor(settings?: Record<string, unknown> | HappierCliSettings) {
+  private readonly createIntentStore: HappierCreateIntentStore;
+  private readonly stopStateStore: HappierStopStateStore;
+  private readonly dependencies: HappierRuntimeAdapterDependencies;
+  constructor(
+    settings?: Record<string, unknown> | HappierCliSettings,
+    dependencies: Partial<HappierRuntimeAdapterDependencies> = {},
+  ) {
     const raw = (settings ?? {}) as Record<string, unknown>;
     this.settings = resolveHappierCliSettings(settings);
-    const configuredBackend = nonEmptyString(raw.backend);
-    this.backend = HAPPIER_BACKENDS.includes(configuredBackend as HappierBackend)
-      ? (configuredBackend as HappierBackend)
-      : "codex";
-    const configuredTimeout = Number(raw.timeoutSeconds ?? 120);
-    this.timeoutSeconds = Number.isInteger(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 120;
+    this.backend = resolveHappierBackend(raw);
+    const configuredTimeout = this.settings.timeoutSeconds;
+    if (
+      typeof configuredTimeout !== "number"
+      || !Number.isInteger(configuredTimeout)
+      || configuredTimeout < 1
+      || configuredTimeout > 3_600
+    ) {
+      throw new HappierCliError(
+        "protocol",
+        "Happier provider wait timeout must be an integer from 1 through 3600",
+        undefined,
+        "timeout_hierarchy_invalid",
+      );
+    }
+    this.timeoutSeconds = configuredTimeout;
+    const createIntentDirectory = this.settings.createIntentDirectory;
+    this.createIntentStore = createHappierCreateIntentStore({
+      ...(createIntentDirectory ? { directory: createIntentDirectory } : {}),
+    });
+    this.stopStateStore = createHappierStopStateStore();
+    this.dependencies = { ...defaultRuntimeAdapterDependencies, ...dependencies };
   }
 
   async createSession(options: AgentRuntimeOptions): Promise<AgentSessionResult> {
+    await this.assertCliAttested();
     if (!options.nativeSession) {
       throw new HappierRecoveryError(
         "native-session-binding-missing",
@@ -354,17 +444,91 @@ export class HappierRuntimeAdapter implements AgentRuntime {
       nativeSession: options.nativeSession,
       needsReconciliation: Boolean(sessionId),
       needsPersistence: false,
+      stopRecoveryPending: false,
       stopped: false,
+      taskTitle: nonEmptyString(options.taskTitle) ?? "Fusion Happier session",
+      beforeSpawnSession: options.beforeSpawnSession,
+      modelId: resolveHappierRuntimeModelId(options.defaultModelId),
+      permissionMode: resolveHappierRuntimePermissionMode(options.tools),
+      runtimeOptionsApplied: false,
       abort: async () => {
         session.stopped = true;
         session.activePromptController?.abort();
         await session.activePrompt?.catch(() => undefined);
+        if (!session.sessionId) return;
+        await this.assertCliAttested();
+        /*
+         * FNXC:HappierRuntimeRemoteStop 2026-07-27-16:38:
+         * Cancellation owns both the long-running official resume process and
+         * the remote Session. Do not report completion until the Provider
+         * process tree has closed and official stop echoes exact stopped:true.
+         */
+        session.remoteStop ??= (async () => {
+          await this.writeStopState(session, "stop_requested", null);
+          const processStopConfirmed = session.resumeProcess
+            ? await session.resumeProcess.stop()
+            : true;
+          let remoteStopError: unknown;
+          try {
+            await stopHappierSession(session.sessionId, this.settings);
+          } catch (error) {
+            remoteStopError = error;
+          }
+          if (processStopConfirmed && remoteStopError === undefined) {
+            await this.writeStopState(session, "stopped", null);
+            session.state.status = "completed";
+            session.state.errorMessage = undefined;
+            return;
+          }
+          session.state.status = "recovering";
+          const stopErrorMessage = processStopConfirmed
+            ? "Happier did not confirm that the remote session stopped"
+            : "Happier did not confirm that the Provider process and remote session stopped";
+          session.state.errorMessage = stopErrorMessage;
+          await this.writeStopState(session, "recovering", "stop_unconfirmed");
+          throw new HappierRecoveryError(
+            "stop-unconfirmed",
+            stopErrorMessage,
+            session.sessionId,
+            remoteStopError,
+          );
+        })();
+        await session.remoteStop;
       },
       dispose: () => {
         session.stopped = true;
         session.activePromptController?.abort();
       },
     } as unknown as ManagedHappierSession;
+    if (sessionId) {
+      const identity = this.buildStopIdentity(session);
+      const durableStop = await this.stopStateStore.read(identity.keyHash);
+      if (durableStop) {
+        const identityMatches = (
+          durableStop.happierSessionId === identity.happierSessionId
+          && durableStop.serverProfileId === identity.serverProfileId
+          && durableStop.machineId === identity.machineId
+          && durableStop.providerId === identity.providerId
+          && durableStop.providerSessionId === identity.providerSessionId
+          && durableStop.canonicalSessionUri === identity.canonicalSessionUri
+        );
+        if (!identityMatches) {
+          throw new HappierRecoveryError(
+            "stop-unconfirmed",
+            `Happier durable stop identity drifted for session ${sessionId}`,
+            sessionId,
+          );
+        }
+        if (durableStop.state === "stop_requested" || durableStop.state === "recovering") {
+          session.stopRecoveryPending = true;
+          session.state.status = "recovering";
+          session.state.errorMessage = "Happier did not confirm that the remote session stopped";
+        } else if (durableStop.state === "stopped") {
+          session.stopped = true;
+          session.state.status = "completed";
+        }
+      }
+    }
     return { session, sessionFile: undefined };
   }
 
@@ -392,19 +556,29 @@ export class HappierRuntimeAdapter implements AgentRuntime {
     session: ManagedHappierSession,
     prompt: string,
   ): Promise<void> {
+    await this.assertCliAttested();
     if (session.stopped) throw happierPromptAbortError();
+    if (session.stopRecoveryPending) {
+      throw new HappierRecoveryError(
+        "stop-unconfirmed",
+        `Happier session ${session.sessionId} remains fenced by an unconfirmed remote stop`,
+        session.sessionId,
+      );
+    }
     const promptController = new AbortController();
     session.activePromptController = promptController;
     const { signal } = promptController;
     let localUserMessageAdded = false;
     try {
-      await this.ensureNativeSession(session);
+      await this.ensureNativeSession(session, signal);
       throwIfPromptAborted(signal);
 
       if (session.needsReconciliation) {
         await this.reconcilePersistedSession(session, signal);
         session.needsReconciliation = false;
       }
+
+      await this.applyRuntimeOptions(session, signal);
 
       let watermark: HistoryWatermark;
       try {
@@ -428,7 +602,15 @@ export class HappierRuntimeAdapter implements AgentRuntime {
 
       try {
         await sendHappierMessage(
-          { sessionId: session.sessionId, message: prompt, localId, timeoutSeconds: this.timeoutSeconds },
+          {
+            sessionId: session.sessionId,
+            message: prompt,
+            localId,
+            timeoutSeconds: this.timeoutSeconds,
+            systemPrompt: session.systemPrompt,
+            ...(session.modelId ? { modelId: session.modelId } : {}),
+            ...(session.permissionMode ? { permissionMode: session.permissionMode } : {}),
+          },
           this.settings,
           signal,
         );
@@ -488,9 +670,83 @@ export class HappierRuntimeAdapter implements AgentRuntime {
     }
   }
 
-  private async ensureNativeSession(
-    session: HappierAgentSession & { needsPersistence: boolean },
+  private async assertCliAttested(): Promise<void> {
+    const attestation = await this.dependencies.attestCli(this.settings);
+    if (!attestation.ok) {
+      throw new HappierCliError(
+        "process",
+        "Happier CLI supply-chain attestation failed closed",
+        undefined,
+        attestation.reasonCode,
+      );
+    }
+  }
+
+  /**
+   * FNXC:HappierRuntimeVisibleOptions 2026-07-27-16:19:
+   * Configure every operator-visible runtime option before the first task
+   * message. Mark the group applied only after all official controls confirm
+   * the exact Session, so partial failures never silently degrade permissions.
+   */
+  private async applyRuntimeOptions(
+    session: ManagedHappierSession,
+    signal: AbortSignal,
   ): Promise<void> {
+    if (session.runtimeOptionsApplied) return;
+    await setHappierSessionTitle(
+      session.sessionId,
+      session.taskTitle,
+      this.settings,
+      signal,
+    );
+    if (session.modelId) {
+      await setHappierSessionModel(
+        session.sessionId,
+        session.modelId,
+        this.settings,
+        signal,
+      );
+    }
+    if (session.permissionMode) {
+      await setHappierSessionPermissionMode(
+        session.sessionId,
+        session.permissionMode,
+        this.settings,
+        signal,
+      );
+    }
+    session.runtimeOptionsApplied = true;
+  }
+
+  private async ensureNativeSession(
+    session: ManagedHappierSession,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const createIdentity = buildHappierCreateIntentIdentity({
+      bindingKey: session.nativeSession.key,
+      cwd: session.cwd,
+      backend: this.backend,
+    });
+    let intent: HappierCreateIntentRecord | null;
+    try {
+      intent = await this.createIntentStore.read(createIdentity.keyHash);
+      if (intent && (
+        intent.tag !== createIdentity.tag
+        || intent.cwd !== createIdentity.cwd
+        || intent.backend !== createIdentity.backend
+      )) {
+        throw new Error("Happier create intent identity does not match the runtime binding");
+      }
+    } catch (error) {
+      session.state.status = "blocked";
+      throw new HappierRecoveryError(
+        "create-intent-recovery-failed",
+        "Unable to validate the durable Happier create intent",
+        session.sessionId,
+        error,
+      );
+    }
+
     let persisted: string | null;
     try {
       persisted = await session.nativeSession.refreshNativeSessionId();
@@ -504,6 +760,24 @@ export class HappierRuntimeAdapter implements AgentRuntime {
       );
     }
     if (persisted) {
+      if (intent?.cleanupSessionIds.length) {
+        const failedCleanup = await this.archiveCreateCandidates(intent.cleanupSessionIds, persisted);
+        await this.writeCreateIntent(
+          createIdentity,
+          failedCleanup.length > 0 ? "cleanup_required" : "claimed",
+          intent.candidateSessionIds,
+          persisted,
+          failedCleanup,
+        );
+        if (failedCleanup.length > 0) {
+          session.state.status = "blocked";
+          throw new HappierRecoveryError(
+            "orphan-cleanup-failed",
+            "Unable to finish Happier orphan cleanup for the canonical native session",
+            persisted,
+          );
+        }
+      }
       const learnedPersistedId = !session.sessionId;
       if (session.sessionId && session.sessionId !== persisted) {
         session.state.status = "blocked";
@@ -521,46 +795,245 @@ export class HappierRuntimeAdapter implements AgentRuntime {
     }
 
     session.state.status = "starting";
-    const created = await createHappierSession(
-      { cwd: session.cwd, backend: this.backend, title: "Fusion Happier session" },
-      this.settings,
-    );
-    let claim: { claimed: boolean; nativeSessionId: string };
+    const mayCreate = intent === null || intent.state === "cleaned";
+    if (mayCreate) {
+      intent = await this.writeCreateIntent(
+        createIdentity,
+        "pending_create",
+        [],
+        null,
+        [],
+      );
+    }
+
+    let listed: Awaited<ReturnType<typeof listHappierSessions>>;
     try {
-      claim = await session.nativeSession.claimNativeSessionId(created.sessionId);
+      listed = await listHappierSessions(this.settings, signal);
     } catch (error) {
-      session.state.status = "blocked";
+      if (signal.aborted) throw error;
+      session.state.status = "recovering";
       throw new HappierRecoveryError(
-        "native-session-persistence-failed",
-        `Unable to atomically claim Happier session ${created.sessionId}`,
-        created.sessionId,
+        "create-intent-recovery-failed",
+        "Unable to reconcile the durable Happier create intent against remote sessions",
+        "",
         error,
       );
     }
-    if (!claim.claimed && claim.nativeSessionId !== created.sessionId) {
-      try {
-        await archiveHappierSession(created.sessionId, this.settings);
-      } catch (error) {
-        session.state.status = "blocked";
+    const candidates = listed.sessions
+      .filter((candidate) => isCreateIntentCandidate(candidate, createIdentity))
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const recoveredCandidateIds = candidates.map((candidate) => candidate.id);
+    let createdInThisAttempt = false;
+    if (candidates.length === 0) {
+      if (!mayCreate) {
+        session.state.status = "recovering";
         throw new HappierRecoveryError(
-          "native-session-persistence-failed",
-          `Native session claim lost to ${claim.nativeSessionId}; failed to archive orphan ${created.sessionId}`,
-          claim.nativeSessionId,
-          error,
+          "create-intent-recovery-failed",
+          "A prior Happier create intent has no exact remote candidate yet; duplicate create is blocked",
+          intent?.canonicalSessionId ?? "",
         );
       }
-      session.needsReconciliation = true;
+      /*
+       * FNXC:HappierBeforeSpawnSession 2026-07-27-16:13:
+       * Fire the caller's pause/abort gate after durable intent and complete
+       * remote-list reconciliation. Only a synchronous abort check remains
+       * between this hook and the official remote create operation.
+       */
+      await session.beforeSpawnSession?.();
+      throwIfPromptAborted(signal);
+      const created = await createHappierSession(
+        {
+          cwd: createIdentity.cwd,
+          backend: this.backend,
+          title: session.taskTitle,
+          tag: createIdentity.tag,
+        },
+        this.settings,
+        signal,
+      );
+      candidates.push({
+        id: created.sessionId,
+        createdAt: Number.MAX_SAFE_INTEGER,
+        updatedAt: Number.MAX_SAFE_INTEGER,
+        active: true,
+        archivedAt: null,
+        tag: createIdentity.tag,
+        path: createIdentity.cwd,
+        agentId: createIdentity.backend,
+      });
+      createdInThisAttempt = true;
+      intent = await this.writeCreateIntent(
+        createIdentity,
+        "candidate_observed",
+        [created.sessionId],
+        null,
+        [],
+      );
+    } else {
+      intent = await this.writeCreateIntent(
+        createIdentity,
+        "candidate_observed",
+        recoveredCandidateIds,
+        null,
+        [],
+      );
     }
+
+    const candidateIds = candidates.map((candidate) => candidate.id);
+    if (signal.aborted) {
+      const failedCleanup = await this.archiveCreateCandidates(candidateIds, null);
+      await this.writeCreateIntent(
+        createIdentity,
+        failedCleanup.length > 0 ? "cleanup_required" : "cleaned",
+        candidateIds,
+        null,
+        failedCleanup,
+      );
+      throwIfPromptAborted(signal);
+    }
+
+    const selected = candidates[0]!;
+    let claim: { claimed: boolean; nativeSessionId: string };
+    try {
+      claim = await session.nativeSession.claimNativeSessionId(selected.id);
+    } catch (error) {
+      const failedCleanup = await this.archiveCreateCandidates(candidateIds, null);
+      await this.writeCreateIntent(
+        createIdentity,
+        failedCleanup.length > 0 ? "cleanup_required" : "cleaned",
+        candidateIds,
+        null,
+        failedCleanup,
+      );
+      session.state.status = "blocked";
+      if (failedCleanup.length > 0) {
+        throw new HappierRecoveryError(
+          "orphan-cleanup-failed",
+          `Unable to atomically claim or clean up Happier session ${selected.id}`,
+          selected.id,
+          { claimError: error, failedCleanup },
+        );
+      }
+      throw new HappierRecoveryError(
+        "native-session-persistence-failed",
+        `Unable to atomically claim Happier session ${selected.id}; orphan cleanup completed`,
+        selected.id,
+        error,
+      );
+    }
+    const failedCleanup = await this.archiveCreateCandidates(candidateIds, claim.nativeSessionId);
+    await this.writeCreateIntent(
+      createIdentity,
+      failedCleanup.length > 0 ? "cleanup_required" : "claimed",
+      candidateIds,
+      claim.nativeSessionId,
+      failedCleanup,
+    );
+    if (failedCleanup.length > 0) {
+      session.state.status = "blocked";
+      throw new HappierRecoveryError(
+        "orphan-cleanup-failed",
+        `Canonical Happier session ${claim.nativeSessionId} was claimed but orphan cleanup is incomplete`,
+        claim.nativeSessionId,
+        { failedCleanup },
+      );
+    }
+    session.needsReconciliation = !createdInThisAttempt || !claim.claimed;
     session.sessionId = claim.nativeSessionId;
     session.nativeSession.nativeSessionId = claim.nativeSessionId;
     session.needsPersistence = false;
   }
 
-  private async reconcilePersistedSession(session: HappierAgentSession, signal: AbortSignal): Promise<void> {
+  private async writeCreateIntent(
+    identity: HappierCreateIntentIdentity,
+    state: HappierCreateIntentState,
+    candidateSessionIds: readonly string[],
+    canonicalSessionId: string | null,
+    cleanupSessionIds: readonly string[],
+  ): Promise<HappierCreateIntentRecord> {
+    const record: HappierCreateIntentRecord = {
+      contractVersion: 1,
+      ...identity,
+      state,
+      candidateSessionIds: [...new Set(candidateSessionIds)].sort(),
+      canonicalSessionId,
+      cleanupSessionIds: [...new Set(cleanupSessionIds)].sort(),
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      await this.createIntentStore.write(record);
+      return record;
+    } catch (error) {
+      throw new HappierRecoveryError(
+        "create-intent-recovery-failed",
+        "Unable to persist the durable Happier create intent",
+        canonicalSessionId ?? candidateSessionIds[0] ?? "",
+        error,
+      );
+    }
+  }
+
+  private async archiveCreateCandidates(
+    candidateSessionIds: readonly string[],
+    canonicalSessionId: string | null,
+  ): Promise<readonly string[]> {
+    const failed: string[] = [];
+    for (const candidateSessionId of [...new Set(candidateSessionIds)].sort()) {
+      if (candidateSessionId === canonicalSessionId) continue;
+      try {
+        await archiveHappierSession(candidateSessionId, this.settings);
+      } catch {
+        failed.push(candidateSessionId);
+      }
+    }
+    return failed;
+  }
+
+  /**
+   * FNXC:HappierStopStateDurability 2026-07-27-16:05:
+   * Persist the exact known server/machine/provider/native-thread tuple around
+   * every remote stop. Unknown identity fields remain explicit nulls; a
+   * configured direct-session binding is never reduced to a bare Session id.
+   */
+  private async writeStopState(
+    session: HappierAgentSession,
+    state: HappierStopState,
+    reasonCode: HappierStopReasonCode,
+  ): Promise<void> {
+    const identity = this.buildStopIdentity(session);
+    await this.stopStateStore.write({
+      contractVersion: 1,
+      ...identity,
+      state,
+      reasonCode,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  private buildStopIdentity(session: HappierAgentSession) {
+    const matchingBindings = (this.settings.happierSessionBindings ?? [])
+      .filter((binding) => binding.happierSessionId === session.sessionId);
+    if (matchingBindings.length > 1) {
+      throw new HappierRecoveryError(
+        "stop-unconfirmed",
+        `Happier stop identity is ambiguous for session ${session.sessionId}`,
+        session.sessionId,
+      );
+    }
+    return buildHappierStopIdentity({
+      bindingKey: session.nativeSession.key,
+      happierSessionId: session.sessionId,
+      backend: this.backend,
+      ...(matchingBindings[0] ? { binding: matchingBindings[0] } : {}),
+    });
+  }
+
+  private async reconcilePersistedSession(session: ManagedHappierSession, signal: AbortSignal): Promise<void> {
     session.state.status = "recovering";
     try {
       const status = await getHappierSessionStatus(session.sessionId, this.settings, signal);
-      if (!statusProvesResumable(status)) {
+      if (status.session.active === true) return;
+      if (status.session.active !== false || !statusAllowsResumeAttempt(status)) {
         session.state.status = "blocked";
         throw new HappierRecoveryError(
           "session-not-resumable",
@@ -568,10 +1041,30 @@ export class HappierRuntimeAdapter implements AgentRuntime {
           session.sessionId,
         );
       }
+      /*
+       * FNXC:HappierStrictResume 2026-07-27-16:38:
+       * A persisted inactive Session is never replaced. Resume the exact
+       * official Happier id and re-read the full Fusion binding after active
+       * status proves the canonical Session, machine, and Provider thread did
+       * not drift.
+       */
+      const expectedIdentity = this.buildStopIdentity(session);
+      session.resumeProcess = await resumeHappierSessionStrictly({
+        expectedIdentity,
+        settings: this.settings,
+        signal,
+        readCurrentIdentity: async () => this.buildStopIdentity(session),
+      });
     } catch (error) {
       if (signal.aborted) throw error;
       if (error instanceof HappierRecoveryError) throw error;
-      const code = error instanceof HappierCliError && error.code === "session" ? "session-missing" : "status-check-failed";
+      const strictResumeFailure = error instanceof HappierCliError
+        && error.officialCode?.startsWith("resume_");
+      const code = error instanceof HappierCliError
+        && error.code === "session"
+        && !strictResumeFailure
+        ? "session-missing"
+        : "status-check-failed";
       session.state.status = code === "session-missing" ? "blocked" : "recovering";
       throw new HappierRecoveryError(
         code,

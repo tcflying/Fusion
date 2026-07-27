@@ -47,7 +47,6 @@ import {
 const pgTest = pgDescribe;
 const h = createPgExtensionHarness("fn-extension");
 
-
 function makeCtx(cwd: string): ToolExecuteContext {
   return { cwd };
 }
@@ -87,6 +86,7 @@ describe("fn pi extension session lifecycle", () => {
     await expect(shutdownPromise).resolves.toBeUndefined();
   });
 });
+
 interface ToolMeta {
   description?: string;
   promptGuidelines?: string[];

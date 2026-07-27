@@ -229,6 +229,7 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
   private readonly ensureGitRepositoryForProjectPath: typeof ensureGitRepositoryForProjectPath;
   private ownedBackendShutdown: (() => Promise<void>) | null = null;
   private ownedBackendReleaseConnections: (() => Promise<void>) | null = null;
+  private localNodeOfflinePersisted = false;
 
   /**
    * FNXC:CentralCore 2026-06-26-12:30:
@@ -394,20 +395,19 @@ export class CentralCore extends EventEmitter<CentralCoreEvents> {
       (this as { asyncLayer: AsyncDataLayer | null }).asyncLayer = null;
     }
     this.initialized = false;
+    this.localNodeOfflinePersisted = false;
     this.removeAllListeners();
   }
 
   /** Persist the local mesh node's terminal state before its backend closes. */
   async markLocalNodeOffline(): Promise<void> {
-    if (!this.initialized) return;
-    /*
-    FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
-    Mesh shutdown state must be committed before project engines release the PostgreSQL pool that CentralCore adopted. Keep this operation on the central authority so dashboard, server, and manager shutdown paths cannot reorder the write behind backend closure.
-    */
+    if (!this.initialized || this.localNodeOfflinePersisted) return;
+    /* FNXC:PostgresResourceLifecycle 2026-07-27-03:39: Commit mesh shutdown before project engines release the adopted PostgreSQL pool, and cache success so close() never queries a released shared layer. */
     const localNode = await this.getLocalNode();
     if (localNode && localNode.status !== "offline") {
       await this.updateNode(localNode.id, { status: "offline" });
     }
+    this.localNodeOfflinePersisted = true;
   }
 
   /**

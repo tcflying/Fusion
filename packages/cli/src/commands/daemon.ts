@@ -29,7 +29,7 @@ import {
   createPostgresRoomRbacRegistry,
 } from "@fusion/core";
 import type { AutomationRunResult, RoomRbacRegistry, ScheduledTask } from "@fusion/core";
-import { createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
+import { createDashboardAuthContext, createServer, GitHubClient, createSkillsAdapter, getCliPackageVersion, getProjectSettingsPath, isUnresolvedCliPackageVersion, loadTlsCredentialsFromEnv, refreshAllCustomProviderModels, registerGithubTrackingHook } from "@fusion/dashboard";
 import {
   ProjectEngineManager,
   PeerExchangeService,
@@ -86,6 +86,10 @@ import { handleOpencodeGoApiKeySaved, syncStartupModels } from "./startup-model-
 import { registerCustomProviders, reregisterCustomProviders } from "./custom-provider-registry.js";
 import { ensureCwdProjectRegistered } from "./ensure-project-registered.js";
 import { createWindowsNativeRoomHostCompositionAdapterRegistry } from "../room-windows-host-composition-adapter-registry.js";
+import {
+  createHostSystemRestartControl,
+  hasLiveSupervisingParent,
+} from "./server-supervisor.js";
 
 const DIAGNOSTIC_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 let daemonStartTime = 0;
@@ -298,6 +302,22 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   }
 
   const selectedHost = opts.host ?? "127.0.0.1";
+  const dashboardAuthContext = createDashboardAuthContext({
+    host: selectedHost,
+    token: daemonToken,
+  });
+  /*
+  FNXC:ServerSupervisor 2026-07-27-03:54:
+  A daemon child accepts System restart only from the HTTP surface when its
+  pid-stamped parent is live; exit 86 then follows the normal graceful teardown.
+  */
+  let shuttingDown = false;
+  const systemRestartControl = createHostSystemRestartControl({
+    supervised: hasLiveSupervisingParent(),
+    canRestart: () => !shuttingDown,
+    log: (message) => console.log(`[daemon] ${message}`),
+    error: (message) => console.error(`[daemon] ${message}`),
+  });
   const cwd = await resolveRuntimeProjectPath();
 
   /*
@@ -606,9 +626,11 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   await pluginStore.init();
 
   // ── PluginLoader: plugin lifecycle management ───────────────────────
+  const pluginHostVersion = getCliPackageVersion(import.meta.url);
   const pluginLoader = new PluginLoader({
     pluginStore,
     taskStore: store,
+    fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
   });
 
   try {
@@ -875,6 +897,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
         pluginStore: scopedPluginStore,
         taskStore: targetStore,
         persistRuntimeState: false,
+        fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
       });
       try {
         await scopedPluginStore.init();
@@ -914,6 +937,7 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   );
 
   const app = createServer(store, {
+    fusionVersion: isUnresolvedCliPackageVersion(pluginHostVersion) ? undefined : pluginHostVersion,
     engine: primaryEngine,
     engineManager,
     centralCore: sharedCentralCore ?? undefined,
@@ -1010,6 +1034,8 @@ export async function runDaemon(opts: DaemonOptions = {}) {
     headless: true,
     ...(roomControlPlaneRbac ? { roomControlPlaneRbac } : {}),
     daemon: { token: daemonToken },
+    dashboardAuthContext,
+    systemControl: systemRestartControl.systemControl,
     skillsAdapter,
     https: loadTlsCredentialsFromEnv(),
   });
@@ -1074,8 +1100,6 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   console.log(`  Press Ctrl+C to stop`);
   console.log();
 
-  let shuttingDown = false;
-
   /*
   FNXC:DaemonSignalExit 2026-07-10-14:00:
   When the host terminates the daemon under memory pressure it sends SIGTERM, which
@@ -1089,7 +1113,10 @@ export async function runDaemon(opts: DaemonOptions = {}) {
   */
   const SIGNAL_EXIT_CODES: Record<string, number> = { SIGINT: 130, SIGTERM: 143 };
 
-  const shutdown = async (signal?: NodeJS.Signals) => {
+  const shutdown = async (
+    signal?: NodeJS.Signals,
+    requestedExitCode = 0,
+  ) => {
     if (shuttingDown) return;
     shuttingDown = true;
 
@@ -1148,8 +1175,14 @@ export async function runDaemon(opts: DaemonOptions = {}) {
       // best-effort
     }
 
-    process.exit(signal ? (SIGNAL_EXIT_CODES[signal] ?? 128) : 0);
+    process.exit(
+      requestedExitCode ||
+        (signal ? (SIGNAL_EXIT_CODES[signal] ?? 128) : 0),
+    );
   };
+  systemRestartControl.bindShutdown((exitCode) =>
+    shutdown(undefined, exitCode),
+  );
 
   process.on("SIGINT", () => {
     void shutdown("SIGINT");

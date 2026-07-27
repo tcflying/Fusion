@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
 import type {
@@ -13,16 +13,15 @@ import type {
   MessageStore,
   RoutineStore,
   GithubIssueAction,
-  CliSession,
-  NotificationPayload,
   WorkflowWorkItem,
+  CentralClaimStore,
 } from "@fusion/core";
 import {
+  AsyncCentralClaimStore,
   ChatStore,
   createCentralDatabase,
   isEphemeralAgent,
-  isSessionRoomControlPlaneEnabled,
-  MissionStore,
+  isSessionRoomControlPlaneRequested,
   resolveWorkflowIrForTask,
 } from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
@@ -50,7 +49,7 @@ import type {
 import { runtimeLog } from "../logger.js";
 import { getActiveNotificationService } from "../notifier.js";
 import { StuckTaskDetector } from "../stuck-task-detector.js";
-import type { UsageLimitPauser } from "../usage-limit-detector.js";
+import { UsageLimitPauser } from "../usage-limit-detector.js";
 import { SelfHealingManager, VALIDATOR_RUN_STALE_MAX_AGE_MS } from "../self-healing.js";
 import { RestartRecoveryCoordinator } from "../restart-recovery-coordinator.js";
 import { MeshLeaseManager } from "../mesh-lease-manager.js";
@@ -75,255 +74,53 @@ import { attachAgentLinkSync } from "../task-agent-sync.js";
 import { createRunAuditor, generateSyntheticRunId } from "../run-audit.js";
 import { setImmediate as setImmediateCb } from "node:timers";
 import { seedPreReleasePlanReviewContinuation } from "../plan-review-continuation.js";
+import { StartupBackgroundTaskTracker } from "../startup-background-task-tracker.js";
+import {
+  CLI_AGENT_AWAITING_INPUT_EVENT,
+  buildCliAgentAwaitingInputNotificationPayload,
+  type CliAgentAwaitingInputNotificationInfo,
+} from "./cli-agent-awaiting-input-notification.js";
+import {
+  resolvePlanningContinuationCandidate,
+} from "./planning-continuation-selection.js";
+import {
+  bootstrapRoomSessionConnectors,
+  evaluateRoomSessionConnectorBootstrap,
+  normalizeRoomSessionConnectorIds,
+  type RoomSessionConnectorBootstrapStatusV1,
+} from "./room-session-connector-bootstrap.js";
+
+export {
+  CLI_AGENT_AWAITING_INPUT_EVENT,
+  buildCliAgentAwaitingInputNotificationPayload,
+} from "./cli-agent-awaiting-input-notification.js";
+export {
+  isPlanningContinuationTaskDispatchable,
+  resolvePlanningContinuationCandidate,
+  selectActionablePlanningContinuations,
+} from "./planning-continuation-selection.js";
+export {
+  bootstrapRoomSessionConnectors,
+  evaluateRoomSessionConnectorBootstrap,
+} from "./room-session-connector-bootstrap.js";
+export type {
+  CliAgentAwaitingInputNotificationInfo,
+} from "./cli-agent-awaiting-input-notification.js";
+export type {
+  PlanningContinuationCandidate,
+  PlanningContinuationResolution,
+} from "./planning-continuation-selection.js";
+export type {
+  BootstrapRoomSessionConnectorsInputV1,
+  RoomSessionConnectorBootstrapInputV1,
+  RoomSessionConnectorBootstrapRunnerV1,
+  RoomSessionConnectorBootstrapStateV1,
+  RoomSessionConnectorBootstrapStatusV1,
+} from "./room-session-connector-bootstrap.js";
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
-export type RoomSessionConnectorBootstrapStateV1 = "not_required" | "ready" | "withheld";
-
-export interface RoomSessionConnectorBootstrapStatusV1 {
-  readonly state: RoomSessionConnectorBootstrapStateV1;
-  readonly reasonCode: "required_session_connector_not_loaded" | null;
-  readonly requiredConnectorIds: readonly string[];
-  readonly loadedConnectorIds: readonly string[];
-  readonly missingConnectorIds: readonly string[];
-}
-
-export interface RoomSessionConnectorBootstrapInputV1 {
-  readonly requiredConnectorIds: readonly string[];
-  readonly loadedConnectorRegistrations: readonly Readonly<{
-    pluginId: string;
-    connectorId: string;
-  }>[];
-}
-
-export interface RoomSessionConnectorBootstrapRunnerV1 {
-  init(): Promise<void>;
-  getPluginSessionConnectors(): readonly Readonly<{
-    pluginId: string;
-    sessionConnector: Readonly<{
-      metadata: Readonly<{
-        connectorId: string;
-      }>;
-    }>;
-  }>[];
-  getStore(): Readonly<{
-    getPlugin(pluginId: string): Promise<Readonly<{
-      id: string;
-      enabled: boolean;
-    }>>;
-  }>;
-}
-
-export interface BootstrapRoomSessionConnectorsInputV1 {
-  readonly resolveRequiredConnectorIds: () => Promise<readonly string[]>;
-  readonly pluginRunner: RoomSessionConnectorBootstrapRunnerV1;
-}
-
-function normalizeRoomSessionConnectorIds(ids: unknown): string[] {
-  if (!Array.isArray(ids)) return [];
-  return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))]
-    .sort((left, right) => left.localeCompare(right));
-}
-
-/*
- * FNXC:RoomSessionConnectorBootstrap 2026-07-20-22:39:
- * A bundled manifest or persisted install record is not authority to use a
- * Session Connector. A Room-selected connector is usable only when its
- * installed plugin is still enabled and has loaded a registration; the check
- * completes before ProjectEngine can freeze the Room registry or start provider delivery.
- */
-export function evaluateRoomSessionConnectorBootstrap(
-  input: RoomSessionConnectorBootstrapInputV1,
-): RoomSessionConnectorBootstrapStatusV1 {
-  const requiredConnectorIds = normalizeRoomSessionConnectorIds(input.requiredConnectorIds);
-  const loadedConnectorIds = normalizeRoomSessionConnectorIds(
-    input.loadedConnectorRegistrations.map((registration) => registration.connectorId),
-  );
-  const missingConnectorIds = requiredConnectorIds.filter(
-    (connectorId) => !loadedConnectorIds.includes(connectorId),
-  );
-
-  if (requiredConnectorIds.length === 0) {
-    return {
-      state: "not_required",
-      reasonCode: null,
-      requiredConnectorIds,
-      loadedConnectorIds,
-      missingConnectorIds,
-    };
-  }
-
-  if (missingConnectorIds.length > 0) {
-    return {
-      state: "withheld",
-      reasonCode: "required_session_connector_not_loaded",
-      requiredConnectorIds,
-      loadedConnectorIds,
-      missingConnectorIds,
-    };
-  }
-
-  return {
-    state: "ready",
-    reasonCode: null,
-    requiredConnectorIds,
-    loadedConnectorIds,
-    missingConnectorIds,
-  };
-}
-
-async function collectEnabledLoadedRoomSessionConnectors(
-  pluginRunner: RoomSessionConnectorBootstrapRunnerV1,
-): Promise<Array<{ pluginId: string; connectorId: string }>> {
-  const registrations = pluginRunner.getPluginSessionConnectors();
-  const verified = await Promise.all(registrations.map(async (registration) => {
-    try {
-      const installation = await pluginRunner.getStore().getPlugin(registration.pluginId);
-      if (!installation.enabled || installation.id !== registration.pluginId) return null;
-      return {
-        pluginId: registration.pluginId,
-        connectorId: registration.sessionConnector.metadata.connectorId,
-      };
-    } catch {
-      // Missing install state is not equivalent to an enabled bundled manifest.
-      return null;
-    }
-  }));
-  return verified.filter(
-    (registration): registration is { pluginId: string; connectorId: string } => registration !== null,
-  );
-}
-
-export async function bootstrapRoomSessionConnectors(
-  input: BootstrapRoomSessionConnectorsInputV1,
-): Promise<RoomSessionConnectorBootstrapStatusV1> {
-  const requiredConnectorIds = await input.resolveRequiredConnectorIds();
-  await input.pluginRunner.init();
-  return evaluateRoomSessionConnectorBootstrap({
-    requiredConnectorIds,
-    loadedConnectorRegistrations: await collectEnabledLoadedRoomSessionConnectors(input.pluginRunner),
-  });
-}
-
-export const CLI_AGENT_AWAITING_INPUT_EVENT = "cli-agent-awaiting-input" as const;
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
-
-export interface PlanningContinuationCandidate {
-  item: WorkflowWorkItem;
-  task: Task | null | undefined;
-}
-
-export function isPlanningContinuationTaskDispatchable(
-  task: Task | null | undefined,
-): task is Task {
-  if (task == null || task.paused === true || task.userPaused === true || task.deletedAt) return false;
-  return task.column !== "archived" && task.column !== "done";
-}
-
-export type PlanningContinuationResolution =
-  | { kind: "actionable"; item: WorkflowWorkItem; task: Task }
-  | { kind: "skip"; item: WorkflowWorkItem; reason: "not-planning" | "paused" }
-  | { kind: "orphan"; item: WorkflowWorkItem; reason: "task-not-found" | "task-terminal" };
-
-export function resolvePlanningContinuationCandidate(
-  item: WorkflowWorkItem,
-  task: Task | null | undefined,
-  opts?: { taskLookupFailed?: boolean },
-): PlanningContinuationResolution {
-  if (opts?.taskLookupFailed === true || task == null) {
-    return { kind: "orphan", item, reason: "task-not-found" };
-  }
-  if (task.deletedAt || task.column === "archived" || task.column === "done") {
-    return { kind: "orphan", item, reason: "task-terminal" };
-  }
-  if (item.waitReason !== "planning") {
-    return { kind: "skip", item, reason: "not-planning" };
-  }
-  if (task.paused === true || task.userPaused === true) {
-    return { kind: "skip", item, reason: "paused" };
-  }
-  return { kind: "actionable", item, task };
-}
-
-export function selectActionablePlanningContinuations(
-  candidates: readonly PlanningContinuationCandidate[],
-): Array<{ item: WorkflowWorkItem; task: Task }> {
-  return candidates.flatMap((candidate) => {
-    const resolved = resolvePlanningContinuationCandidate(candidate.item, candidate.task);
-    return resolved.kind === "actionable" ? [{ item: resolved.item, task: resolved.task }] : [];
-  });
-}
-
-export interface CliAgentAwaitingInputNotificationInfo {
-  sessionId: string;
-  notification: Record<string, unknown> | undefined;
-}
-
-function stableNotificationJson(value: unknown): string {
-  if (value === undefined) {
-    return "undefined";
-  }
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value) ?? String(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => stableNotificationJson(entry)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  const fields = Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableNotificationJson(record[key])}`);
-  return `{${fields.join(",")}}`;
-}
-
-function buildCliAgentNotificationDedupeKey(input: {
-  projectId: string;
-  info: CliAgentAwaitingInputNotificationInfo;
-  session: CliSession | undefined;
-}): string {
-  const notificationFingerprint = createHash("sha256")
-    .update(stableNotificationJson(input.info.notification ?? null))
-    .digest("hex")
-    .slice(0, 16);
-  const waitingEpoch = input.session?.updatedAt ?? "unknown-waiting-epoch";
-  return [
-    "cli-agent",
-    input.projectId,
-    input.info.sessionId,
-    CLI_AGENT_AWAITING_INPUT_EVENT,
-    waitingEpoch,
-    notificationFingerprint,
-  ].join(":");
-}
-
-export function buildCliAgentAwaitingInputNotificationPayload(input: {
-  projectId: string;
-  info: CliAgentAwaitingInputNotificationInfo;
-  session: CliSession | undefined;
-  task: Task | undefined;
-}): NotificationPayload {
-  const taskId = input.session?.taskId ?? undefined;
-  const adapterId = input.session?.adapterId;
-  const notificationKind = typeof input.info.notification?.kind === "string"
-    ? input.info.notification.kind
-    : "waiting_on_input";
-
-  return {
-    ...(taskId ? { taskId } : {}),
-    taskTitle: input.task?.title,
-    taskDescription: input.task?.description,
-    event: CLI_AGENT_AWAITING_INPUT_EVENT,
-    metadata: {
-      sessionId: input.info.sessionId,
-      projectId: input.projectId,
-      ...(adapterId ? { adapterId } : {}),
-      notificationKind,
-      notification: input.info.notification ?? null,
-      // FNXC:ToolPermissionNotifications 2026-06-27-00:00: CLI adapters can emit duplicate waiting-on-input records for one blocked prompt. The external notification path carries a waiting-epoch plus prompt-fingerprint key so repeated telemetry for the same blocked prompt does not spam providers, while later tool requests in the same session still notify operators.
-      notificationDedupeKey: buildCliAgentNotificationDedupeKey(input),
-    },
-  };
-}
 
 /**
  * InProcessRuntime runs a project within the main process.
@@ -403,7 +200,8 @@ export class InProcessRuntime
   private usageLimitPauser?: UsageLimitPauser;
   private selfHealingManager?: SelfHealingManager;
   private leaseManager?: MeshLeaseManager;
-  private leaseCentralClaimStore?: ReturnType<typeof createCentralDatabase>;
+  private leaseCentralClaimStore?: CentralClaimStore;
+  private closeLeaseCentralClaimStore?: () => void;
   private agentStore?: AgentStore;
   private heartbeatMonitor?: HeartbeatMonitor;
   private triggerScheduler?: HeartbeatTriggerScheduler;
@@ -457,6 +255,17 @@ export class InProcessRuntime
   private startupRecoveryDeferred = false;
   /** Prevent duplicate unpause recovery dispatches from racing each other. */
   private resumeAfterUnpauseRunning = false;
+  /** Startup/recovery work that must settle before the owned backend closes. */
+  private readonly startupBackgroundTasks = new StartupBackgroundTaskTracker({
+    onFailure: (label, error) => {
+      runtimeLog.error(`${label} failed:`, error instanceof Error ? error.message : String(error));
+    },
+    onTimeout: (timeoutMs, pendingCount) => {
+      runtimeLog.warn(
+        `Startup recovery drain timed out after ${timeoutMs}ms with ${pendingCount} task(s) still running`,
+      );
+    },
+  });
   private restartRecoveryCoordinator?: RestartRecoveryCoordinator;
 
   /**
@@ -474,7 +283,7 @@ export class InProcessRuntime
 
   private async resolveRequiredRoomSessionConnectorIds(): Promise<readonly string[]> {
     const settings = await this.taskStore.getSettings();
-    if (!isSessionRoomControlPlaneEnabled(settings)) return [];
+    if (!isSessionRoomControlPlaneRequested(settings)) return [];
 
     const authorityReader = this.centralCore as unknown as {
       readRoomHostCompositionOperatorPolicyAuthorityV1?: (scope: {
@@ -562,6 +371,14 @@ export class InProcessRuntime
           runtimeLog.log(`TaskStore initialized for project ${this.config.projectId}`);
         }
       }
+
+      /*
+       * FNXC:UsageLimitPauserComposition 2026-07-27-03:25:
+       * The runtime-owned TaskStore is the authoritative pause surface. Create
+       * the pauser before executor and triage composition unless an embedding
+       * host deliberately injected an override before start().
+       */
+      this.usageLimitPauser ??= new UsageLimitPauser(this.taskStore);
 
       // Initialize MessageStore early so TaskExecutor receives send_message capability.
       // FNXC:RuntimeSatelliteAsync 2026-06-24-12:45:
@@ -663,7 +480,7 @@ export class InProcessRuntime
       if (messageLayer) {
         this.messageStore = new MessageStoreClass(null, { asyncLayer: messageLayer });
       } else {
-        this.messageStore = new MessageStoreClass(this.taskStore.getDatabase());
+        this.messageStore = new MessageStoreClass(this.taskStore.db);
       }
 
       await yieldEventLoop();
@@ -681,6 +498,7 @@ export class InProcessRuntime
       this.pluginLoader = new PluginLoaderClass({
         pluginStore: this.pluginStore,
         taskStore: this.taskStore,
+        fusionVersion: this.config.fusionVersion,
       });
 
       this.pluginRunner = new PluginRunner({
@@ -816,22 +634,25 @@ export class InProcessRuntime
 
       // 5. Initialize Scheduler
       /*
-       * FNXC:SqliteFinalRemoval 2026-06-24-15:55:
-       * In backend mode (PostgreSQL), getMissionStore() throws because the
-       * MissionStore has not been converted to async yet. Catch the error and
-       * degrade gracefully: mission autopilot and mission execution loop are
-       * disabled until the MissionStore is fully converted to the async path.
+       * FNXC:PostgresMissionRuntimeParity 2026-07-27-03:08:
+       * The scheduler, mission execution loop, and autopilot all accept the
+       * canonical sync-or-async mission-store union. PostgreSQL therefore uses
+       * the same mission runtime composition as the local store; only a genuine
+       * store initialization failure disables the mission services.
        */
-      let missionStore: import("@fusion/core").MissionStore | undefined;
+      let missionStore:
+        | import("@fusion/core").MissionStore
+        | import("@fusion/core").AsyncMissionStore
+        | undefined;
       // FNXC:MissionStore 2026-06-28-12:45:
       // MissionAutopilot's STORE-access path was ported to drive BOTH backends —
       // it types its store as `MissionStore | AsyncMissionStore` and awaits every
       // call (mirrors the ResearchOrchestrator union+await port). So the autopilot
       // is constructed from `autopilotMissionStore`, resolved in BOTH backends with
       // NO `instanceof MissionStore` gate; the autopilot LOOP (watch/recover/
-      // recompute/persist) now runs in PG mode. The sync-only `missionStore` below
-      // stays gated for the Scheduler + MissionExecutionLoop, whose slice EXECUTION
-      // and validator-loop paths are NOT yet ported to async (out of scope).
+      // recompute/persist) now runs in PG mode. Scheduler and MissionExecutionLoop
+      // consume the same awaitable union so validation and reconciliation do not
+      // retain a second, sync-only runtime lane.
       let autopilotMissionStore:
         | import("@fusion/core").MissionStore
         | import("@fusion/core").AsyncMissionStore
@@ -840,9 +661,7 @@ export class InProcessRuntime
         const resolvedMissionStore = this.taskStore.getMissionStore();
         // Union store for the autopilot — works in both SQLite and PG backends.
         autopilotMissionStore = resolvedMissionStore;
-        // Sync-only narrowing for the Scheduler + MissionExecutionLoop, which still
-        // call the store synchronously and are skipped in PG backend mode.
-        missionStore = resolvedMissionStore instanceof MissionStore ? resolvedMissionStore : undefined;
+        missionStore = resolvedMissionStore;
       } catch (msErr) {
         runtimeLog.warn(
           `MissionStore unavailable (${this.taskStore.isBackendMode() ? "backend mode" : "init error"}); mission autopilot disabled:`,
@@ -865,17 +684,26 @@ export class InProcessRuntime
               ? {
                   notifyValidationComplete: async (featureId: string) => {
                     // Pass the feature's linked taskId to handleTaskCompletion, not the featureId
-                    const feature = missionStore.getFeature(featureId);
+                    const feature = await missionStore.getFeature(featureId);
                     if (!feature?.taskId) {
                       return;
                     }
-                    const slice = missionStore.getSlice(feature.sliceId);
-                    const milestone = slice ? missionStore.getMilestone(slice.milestoneId) : undefined;
+                    const slice = await missionStore.getSlice(feature.sliceId);
+                    const milestone = slice
+                      ? await missionStore.getMilestone(slice.milestoneId)
+                      : undefined;
                     const missionId = milestone?.missionId;
                     if (missionId) {
-                      const mission = missionStore.getMission(missionId);
+                      const mission = await missionStore.getMission(missionId);
                       if (mission?.autopilotEnabled && !missionAutopilot.isWatching(missionId)) {
-                        missionAutopilot.watchMission(missionId);
+                        /*
+                         * FNXC:PostgresMissionRuntimeParity 2026-07-27-05:12:
+                         * Persist the watch before handling completion. PostgreSQL
+                         * necessarily yields during watchMission(); launching it
+                         * in the background let handleTaskCompletion observe an
+                         * unwatched mission and silently skip slice advancement.
+                         */
+                        await missionAutopilot.watchMission(missionId);
                       }
                     }
                     await missionAutopilot.handleTaskCompletion(feature.taskId);
@@ -891,23 +719,27 @@ export class InProcessRuntime
       // FN-4823/FN-4819 §2.5: central-claim-aware recovery when central DB is reachable;
       // fallback to local-only recovery remains in MeshLeaseManager for single-node contexts.
       //
-      // FNXC:CentralCore 2026-06-26-13:00:
-      // In backend mode (PostgreSQL), do NOT construct the legacy SQLite
-      // CentralDatabase for mesh lease recovery. The sync CentralClaimStore
-      // contract cannot be satisfied by the async PostgreSQL helpers without a
-      // blocking bridge, and the single-node embedded-PG default does not need
-      // cross-node claim coordination. MeshLeaseManager falls back to its
-      // local-only recovery path (the centralClaimStore=undefined guard). The
-      // SQLite path remains for FUSION_NO_EMBEDDED_PG (legacy) mode.
+      // FNXC:PostgresCentralClaimParity 2026-07-27-03:26:
+      // CentralClaimStore is explicitly awaitable. Compose its PostgreSQL
+      // adapter over the runtime-owned layer so lease recovery does not silently
+      // degrade to local-only semantics in the production backend.
       if (this.taskStore.isBackendMode()) {
-        this.leaseCentralClaimStore = undefined;
+        const claimLayer = centralHostLayer ?? messageLayer;
+        if (!claimLayer) {
+          throw new Error("PostgreSQL runtime is missing its central claim layer");
+        }
+        this.leaseCentralClaimStore = new AsyncCentralClaimStore(claimLayer);
+        this.closeLeaseCentralClaimStore = undefined;
       } else {
         try {
-          this.leaseCentralClaimStore = createCentralDatabase(this.centralCore.getGlobalDir());
-          this.leaseCentralClaimStore.init();
+          const centralClaimStore = createCentralDatabase(this.centralCore.getGlobalDir());
+          centralClaimStore.init();
+          this.leaseCentralClaimStore = centralClaimStore;
+          this.closeLeaseCentralClaimStore = () => centralClaimStore.close();
         } catch (error) {
           runtimeLog.warn(`Failed to initialize central claim store for mesh lease recovery: ${error instanceof Error ? error.message : String(error)}`);
           this.leaseCentralClaimStore = undefined;
+          this.closeLeaseCentralClaimStore = undefined;
         }
       }
 
@@ -932,9 +764,15 @@ export class InProcessRuntime
         missionAutopilot,
         missionExecutionLoop,
         leaseManager: this.leaseManager,
-        onTaskFailed: (taskId) => {
+        onTaskFailed: async (taskId) => {
           if (missionAutopilot) {
-            void missionAutopilot.handleTaskFailure(taskId);
+            /*
+             * FNXC:PostgresMissionFailureReconciliation 2026-07-27-05:38:
+             * Scheduler reconciliation awaits this callback as its durable
+             * failure boundary. Return the real autopilot promise so PostgreSQL
+             * feature/task writes finish before reconciliation reports success.
+             */
+            await missionAutopilot.handleTaskFailure(taskId);
           }
         },
         onSchedule: (task) => {
@@ -1308,6 +1146,7 @@ export class InProcessRuntime
           stuckTaskDetector: this.stuckTaskDetector,
           agentStore: this.agentStore,
           pluginRunner: this.pluginRunner,
+          usageLimitPauser: this.usageLimitPauser,
           globalCapacityLegacyRecoveryGate,
           globalCapacityLegacyDispatchControl,
           // FNXC:NodeWorktreeIsolation 2026-07-25-22:10: planning acquires (or reuses) the task's own
@@ -1479,9 +1318,10 @@ export class InProcessRuntime
         // both of which can block the event loop for several seconds.
         // Running it in the background lets the HTTP server become
         // responsive sooner while still performing the recovery work.
-        void this.resumeStartupRecoverySequence().catch((err) => {
-          runtimeLog.error("Deferred startup recovery sequence failed:", err);
-        });
+        this.trackStartupBackgroundTask(
+          "deferred startup recovery",
+          this.resumeStartupRecoverySequence(),
+        );
       }
 
       // 11. Start scheduler and triage processor
@@ -1493,24 +1333,27 @@ export class InProcessRuntime
       if (missionExecutionLoop) {
         missionExecutionLoop.start();
         // Recover active missions to re-enqueue pending validations
-        void missionExecutionLoop.recoverActiveMissions().catch((err) => {
-          runtimeLog.error("Failed to recover active missions:", err);
-        });
+        this.trackStartupBackgroundTask(
+          "active mission recovery",
+          missionExecutionLoop.recoverActiveMissions().then(() => undefined),
+        );
       }
 
       // Mission crash recovery: restore autopilot state for missions that were active before crash
       /*
-       * FNXC:SqliteFinalRemoval 2026-06-24-16:00:
-       * In backend mode, getMissionStore() throws (MissionStore not yet async).
-       * Wrap in try/catch to degrade gracefully — mission crash recovery is
-       * skipped, same as mission autopilot above.
+       * FNXC:PostgresMissionRestartRecovery 2026-07-27-06:19:
+       * Resolve the canonical awaitable mission-store union for every recovery
+       * consumer. PostgreSQL is a first-class path; the catch now represents
+       * only a genuine store initialization failure.
        */
-      let activeMissionStore: import("@fusion/core").MissionStore | undefined;
+      let activeMissionStore:
+        | import("@fusion/core").MissionStore
+        | import("@fusion/core").AsyncMissionStore
+        | undefined;
       // FNXC:MissionStore 2026-06-28-12:45: autopilot crash-recovery now runs in BOTH
       // backends. `recoverMissions` accepts the `MissionStore | AsyncMissionStore`
       // union and awaits every store call, so resolve the store WITHOUT an instanceof
-      // gate here. The sync-only `activeMissionStore` below still gates the
-      // scheduler-driven `reconcileAllMissionFeatures` (not yet ported to async).
+      // gate here. Scheduler reconciliation consumes the same awaited union.
       let activeAutopilotMissionStore:
         | import("@fusion/core").MissionStore
         | import("@fusion/core").AsyncMissionStore
@@ -1518,12 +1361,7 @@ export class InProcessRuntime
       try {
         const resolvedActive = this.taskStore.getMissionStore();
         activeAutopilotMissionStore = resolvedActive;
-        activeMissionStore = resolvedActive instanceof MissionStore ? resolvedActive : undefined;
-        // FNXC:MissionStore 2026-06-27-16:30 (review): log the PG-mode degrade for the
-        // scheduler-driven feature reconciliation that stays sync-only.
-        if (!activeMissionStore) {
-          runtimeLog.warn("[runtime] scheduler feature reconciliation skipped: sync MissionStore not available in PG backend mode");
-        }
+        activeMissionStore = resolvedActive;
       } catch (error) {
         activeMissionStore = undefined;
         activeAutopilotMissionStore = undefined;
@@ -1531,12 +1369,24 @@ export class InProcessRuntime
       }
       const activeMissionAutopilot = this.scheduler.getMissionAutopilot?.();
       if (activeAutopilotMissionStore && activeMissionAutopilot) {
-        void activeMissionAutopilot.recoverMissions(activeAutopilotMissionStore);
+        this.trackStartupBackgroundTask(
+          "mission autopilot recovery",
+          activeMissionAutopilot.recoverMissions(activeAutopilotMissionStore).then(() => undefined),
+        );
       }
 
-      // 13. Reconcile feature status for all active missions (not just autopilot)
+      /*
+      FNXC:PostgresMissionRuntimeParity 2026-07-27-03:08:
+      MissionExecutionLoop and Scheduler reconciliation expose awaited
+      MissionStore | AsyncMissionStore contracts. Compose that union directly
+      so PostgreSQL validation, slice progression, failure recovery, and
+      feature/task reconciliation are not silently disabled at startup.
+      */
       if (activeMissionStore) {
-        void this.scheduler.reconcileAllMissionFeatures();
+        this.trackStartupBackgroundTask(
+          "mission feature reconciliation",
+          this.scheduler.reconcileAllMissionFeatures().then(() => undefined),
+        );
       }
 
       // 14. Start MissionAutopilot background polling
@@ -1553,19 +1403,14 @@ export class InProcessRuntime
       // engine death. Non-blocking; errors are logged, never thrown.
       if (this.cliAgentRuntime) {
         const cliRuntime = this.cliAgentRuntime;
-        void cliRuntime.resumeCoordinator
-          .recoverOnStart()
-          .then((results) => {
+        this.trackStartupBackgroundTask(
+          "CLI session recovery",
+          cliRuntime.resumeCoordinator.recoverOnStart().then((results) => {
             if (results.length > 0) {
               runtimeLog.log(`CLI Agent Executor recovered ${results.length} orphaned session(s) on start`);
             }
-          })
-          .catch((err) => {
-            runtimeLog.warn(
-              `CLI Agent Executor recoverOnStart failed (continuing):`,
-              err instanceof Error ? err.message : err,
-            );
-          });
+          }),
+        );
       }
 
       this.setStatus("active");
@@ -1777,6 +1622,15 @@ export class InProcessRuntime
         );
       }
 
+      /*
+       * FNXC:StartupRecoveryShutdownDrain 2026-07-27-03:35:
+       * Startup recovery used to outlive the runtime-owned PostgreSQL pool,
+       * producing CONNECTION_ENDED/ECONNRESET noise and nondeterministic test
+       * teardown. Stop new work first, then give every tracked startup task a
+       * bounded opportunity to settle before shutting down plugins and storage.
+       */
+      await this.drainStartupBackgroundTasks(Math.max(shutdownTimeout, 15_000));
+
       // 8. Shutdown plugin runner
       if (this.pluginRunner) {
         await this.pluginRunner.shutdown();
@@ -1791,10 +1645,9 @@ export class InProcessRuntime
         }
       }
 
-      if (this.leaseCentralClaimStore) {
-        this.leaseCentralClaimStore.close();
-        this.leaseCentralClaimStore = undefined;
-      }
+      this.closeLeaseCentralClaimStore?.();
+      this.closeLeaseCentralClaimStore = undefined;
+      this.leaseCentralClaimStore = undefined;
 
       // FNXC:RuntimeStartupWiring 2026-06-24-10:00:
       // When the runtime booted a PostgreSQL-backed TaskStore via
@@ -1907,6 +1760,14 @@ export class InProcessRuntime
     }
   }
 
+  private trackStartupBackgroundTask(label: string, operation: Promise<unknown>): void {
+    this.startupBackgroundTasks.track(label, operation);
+  }
+
+  private async drainStartupBackgroundTasks(timeoutMs: number): Promise<void> {
+    await this.startupBackgroundTasks.drain(timeoutMs);
+  }
+
   private async resumeStartupRecoverySequence(): Promise<void> {
     // Restart recovery decides when interrupted runs can safely resume versus
     // when they must be reset to todo for a clean retry.
@@ -1916,9 +1777,7 @@ export class InProcessRuntime
     // they no longer have a tracked session/worktree, so the stuck detector
     // cannot recover them. Delegate the startup recovery pass to
     // SelfHealingManager so the policy lives in one place.
-    void this.selfHealingManager!.runStartupRecovery().catch((err) => {
-      runtimeLog.error("Self-healing startup recovery failed:", err);
-    });
+    await this.selfHealingManager!.runStartupRecovery();
   }
 
   /**

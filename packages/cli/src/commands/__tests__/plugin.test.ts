@@ -113,6 +113,7 @@ vi.mock("node:fs", async () => {
 });
 
 import {
+  createPluginLoader,
   resolvePluginEntryFile,
   runPluginAvailable,
   runPluginInstall,
@@ -206,7 +207,7 @@ describe("plugin commands", () => {
   });
 
 
-  it("includes getRootDir on the plugin loader taskStore mock (FN-2687)", async () => {
+  it("passes the resolved PostgreSQL TaskStore to the plugin loader", async () => {
     const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
       throw new Error(`exit:${code}`);
     }) as never);
@@ -227,17 +228,28 @@ describe("plugin commands", () => {
     ]);
     tempDirs.push(pluginDir);
 
-    await expect(runPluginInstall(pluginDir)).resolves.toBeUndefined();
+    const pluginStore = {};
+    const contextStore = {
+      getPluginStore: vi.fn().mockReturnValue(pluginStore),
+      getRootDir: () => "/tmp/fn-project",
+      preflightPluginSchema: vi.fn(),
+      runPluginSchemaInits: vi.fn(),
+    };
+    vi.mocked(resolveProject).mockResolvedValue({
+      projectPath: "/tmp/fn-project",
+      store: contextStore,
+    } as never);
+
+    await expect(createPluginLoader(pluginStore as never)).resolves.toEqual({
+      store: pluginStore,
+      loader: expect.anything(),
+    });
     expect(exitSpy).not.toHaveBeenCalled();
 
-    const registerCall = mocks.pluginStoreInstances[0]?.registerPlugin.mock.calls[0]?.[0];
-    expect(registerCall.path).toBe(resolve(pluginDir, "dist/index.js"));
-
     const taskStore = mocks.getLoaderTaskStore();
-    expect(taskStore).toBeDefined();
-    expect(taskStore?.getRootDir).toBeTypeOf("function");
-    expect(taskStore?.getRootDir?.()).toBe("/tmp/fn-project");
-    expect(mocks.getLoaderRootDir()).toBe("/tmp/fn-project");
+    expect(taskStore).toBe(contextStore);
+    expect(taskStore?.preflightPluginSchema).toBe(contextStore.preflightPluginSchema);
+    expect(taskStore?.runPluginSchemaInits).toBe(contextStore.runPluginSchemaInits);
   });
 
   it("exits non-zero when plugin entry cannot resolve to built JavaScript", async () => {

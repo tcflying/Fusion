@@ -47,6 +47,28 @@ import {
 import type { RegisteredProject, CentralCore } from "@fusion/core";
 import { ScopedAgentSemaphore } from "../concurrency.js";
 
+function installDefaultProjectEngineMock(): void {
+  (ProjectEngine as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+    function (config: any) {
+      return {
+        start: vi.fn().mockResolvedValue(undefined),
+        stop: vi.fn().mockResolvedValue(undefined),
+        getTaskStore: vi.fn().mockReturnValue({ projectId: config.projectId }),
+        getHeartbeatMonitor: vi.fn().mockReturnValue(undefined),
+        getHeartbeatTriggerScheduler: vi.fn().mockReturnValue(undefined),
+        getAutomationStore: vi.fn().mockReturnValue(undefined),
+        getRuntime: vi.fn().mockReturnValue({
+          getMissionAutopilot: vi.fn().mockReturnValue(undefined),
+          getMissionExecutionLoop: vi.fn().mockReturnValue(undefined),
+        }),
+        getWorkingDirectory: vi.fn().mockReturnValue(config.workingDirectory),
+        onMerge: vi.fn().mockResolvedValue(undefined),
+        _config: config,
+      };
+    },
+  );
+}
+
 function createMockCentralCore(projects: RegisteredProject[]): CentralCore {
   const projectMap = new Map(projects.map((p) => [p.id, p]));
   return {
@@ -63,6 +85,11 @@ function createMockCentralCore(projects: RegisteredProject[]): CentralCore {
     updateProjectHealth: vi.fn().mockResolvedValue(undefined),
     stopDiscovery: vi.fn(),
     markLocalNodeOffline: vi.fn().mockResolvedValue(undefined),
+    getGlobalConcurrencyState: vi.fn().mockResolvedValue({
+      globalMaxConcurrent: 4,
+      activeCount: 0,
+      availableCount: 4,
+    }),
     resolveLocalProjectWorkingDirectory: vi
       .fn()
       .mockImplementation((projectId: string) => Promise.resolve(`/mapped/${projectId}`)),
@@ -89,6 +116,7 @@ describe("ProjectEngineManager", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    installDefaultProjectEngineMock();
     centralCore = createMockCentralCore([projectA, projectB, projectC]);
   });
 
@@ -224,11 +252,15 @@ describe("ProjectEngineManager", () => {
       const getMergeStrategy = vi.fn();
       const processPullRequestMerge = vi.fn();
       const getTaskMergeBlocker = vi.fn();
+      const roomProductionReadinessProofProvider = vi.fn() as unknown as NonNullable<
+        ProjectEngineOptions["roomProductionReadinessProofProvider"]
+      >;
 
       const manager = new ProjectEngineManager(centralCore, {
         getMergeStrategy,
         processPullRequestMerge,
         getTaskMergeBlocker,
+        roomProductionReadinessProofProvider,
       });
 
       await manager.ensureEngine("proj_aaa");
@@ -241,6 +273,7 @@ describe("ProjectEngineManager", () => {
           getMergeStrategy,
           processPullRequestMerge,
           getTaskMergeBlocker,
+          roomProductionReadinessProofProvider,
         }),
       );
     });
@@ -406,6 +439,77 @@ describe("ProjectEngineManager", () => {
   });
 
   describe("startAll", () => {
+    it("waits for the authoritative limit and bounds startup fanout to that hydrated limit", async () => {
+      let resolveLimit!: (value: {
+        globalMaxConcurrent: number;
+        activeCount: number;
+        availableCount: number;
+      }) => void;
+      (centralCore.getGlobalConcurrencyState as unknown as ReturnType<typeof vi.fn>)
+        .mockImplementation(() => new Promise((resolve) => {
+          resolveLimit = resolve;
+        }));
+
+      let activeStarts = 0;
+      let peakStarts = 0;
+      const releaseStarts: Array<() => void> = [];
+      (ProjectEngine as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        function (config: any) {
+          return {
+            start: vi.fn(async () => {
+              activeStarts++;
+              peakStarts = Math.max(peakStarts, activeStarts);
+              await new Promise<void>((resolve) => releaseStarts.push(resolve));
+              activeStarts--;
+            }),
+            stop: vi.fn().mockResolvedValue(undefined),
+            getTaskStore: vi.fn().mockReturnValue({ projectId: config.projectId }),
+            getWorkingDirectory: vi.fn().mockReturnValue(config.workingDirectory),
+            _config: config,
+          };
+        },
+      );
+
+      const manager = new ProjectEngineManager(centralCore);
+      const startup = manager.startAll();
+      try {
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(ProjectEngine).not.toHaveBeenCalled();
+
+        resolveLimit({
+          globalMaxConcurrent: 1,
+          activeCount: 0,
+          availableCount: 1,
+        });
+
+        await vi.waitFor(() => expect(ProjectEngine).toHaveBeenCalledTimes(1));
+        releaseStarts.shift()?.();
+        await vi.waitFor(() => expect(ProjectEngine).toHaveBeenCalledTimes(2));
+        releaseStarts.shift()?.();
+        await vi.waitFor(() => expect(ProjectEngine).toHaveBeenCalledTimes(3));
+        releaseStarts.shift()?.();
+        await startup;
+
+        expect(peakStarts).toBe(1);
+      } finally {
+        for (const release of releaseStarts.splice(0)) {
+          release();
+        }
+        await startup.catch(() => undefined);
+      }
+    });
+
+    it("fails closed without starting engines when the authoritative limit cannot hydrate", async () => {
+      (centralCore.getGlobalConcurrencyState as unknown as ReturnType<typeof vi.fn>)
+        .mockRejectedValue(new Error("central capacity unavailable"));
+
+      const manager = new ProjectEngineManager(centralCore);
+
+      await expect(manager.startAll()).rejects.toThrow("central capacity unavailable");
+      expect(ProjectEngine).not.toHaveBeenCalled();
+    });
+
     it("starts engines for all registered projects", async () => {
       const manager = new ProjectEngineManager(centralCore);
       await manager.startAll();
@@ -711,6 +815,60 @@ describe("ProjectEngineManager", () => {
       vi.useRealTimers();
     });
 
+    it("bounds reconciliation startup fanout to the hydrated global limit", async () => {
+      (centralCore.getGlobalConcurrencyState as unknown as ReturnType<typeof vi.fn>)
+        .mockResolvedValue({
+          globalMaxConcurrent: 1,
+          activeCount: 0,
+          availableCount: 1,
+        });
+
+      let activeStarts = 0;
+      let peakStarts = 0;
+      const releaseStarts: Array<() => void> = [];
+      (ProjectEngine as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+        function (config: any) {
+          return {
+            start: vi.fn(async () => {
+              activeStarts++;
+              peakStarts = Math.max(peakStarts, activeStarts);
+              await new Promise<void>((resolve) => releaseStarts.push(resolve));
+              activeStarts--;
+            }),
+            stop: vi.fn().mockResolvedValue(undefined),
+            getTaskStore: vi.fn().mockReturnValue({ projectId: config.projectId }),
+            getWorkingDirectory: vi.fn().mockReturnValue(config.workingDirectory),
+            _config: config,
+          };
+        },
+      );
+
+      const manager = new ProjectEngineManager(centralCore);
+      const reconciliation = (manager as any).reconcile() as Promise<void>;
+      try {
+        expect((manager as any).reconcile()).toBe(reconciliation);
+        await vi.waitFor(() => expect(ProjectEngine).toHaveBeenCalledTimes(1));
+        expect(peakStarts).toBe(1);
+
+        releaseStarts.shift()?.();
+        await vi.waitFor(() => expect(ProjectEngine).toHaveBeenCalledTimes(2));
+        expect(peakStarts).toBe(1);
+
+        releaseStarts.shift()?.();
+        await vi.waitFor(() => expect(ProjectEngine).toHaveBeenCalledTimes(3));
+        expect(peakStarts).toBe(1);
+
+        releaseStarts.shift()?.();
+        await reconciliation;
+        expect(peakStarts).toBe(1);
+      } finally {
+        for (const release of releaseStarts.splice(0)) {
+          release();
+        }
+        await reconciliation.catch(() => undefined);
+      }
+    });
+
     it("starts reconciliation and detects new projects on interval", async () => {
       const manager = new ProjectEngineManager(centralCore);
 
@@ -756,6 +914,12 @@ describe("ProjectEngineManager", () => {
           Promise.resolve(projectMap.get(id) ?? null),
         ),
         getProjectByPath: vi.fn().mockResolvedValue(null),
+        getGlobalConcurrencyState: vi.fn().mockResolvedValue({
+          globalMaxConcurrent: 4,
+          activeCount: 0,
+          availableCount: 4,
+          projects: [],
+        }),
         resolveLocalProjectWorkingDirectory: vi
           .fn()
           .mockImplementation((projectId: string) => Promise.resolve(`/mapped/${projectId}`)),

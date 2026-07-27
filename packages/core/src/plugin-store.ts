@@ -18,6 +18,14 @@ import type {
 } from "./plugin-types.js";
 import { validatePluginManifest } from "./plugin-types.js";
 import { assertProjectRootDir } from "./project-root-guard.js";
+import {
+  HAPPIER_RUNTIME_PLUGIN_ID,
+  HAPPIER_RUNTIME_SETTING_KEYS,
+  normalizeHappierSessionBindings,
+  safeHappierSettingString,
+  validateHappierRuntimeSettings,
+  type HappierRuntimeSessionBinding,
+} from "./happier-runtime-settings.js";
 import type { AsyncDataLayer } from "./postgres/data-layer.js";
 /*
  * FNXC:SqliteFinalRemoval 2026-06-26-10:00:
@@ -39,27 +47,14 @@ import {
   updatePluginInstall as updatePluginInstallAsync,
 } from "./async-plugin-store.js";
 
-export const HAPPIER_RUNTIME_PLUGIN_ID = "fusion-plugin-happier-runtime";
-const HAPPIER_RUNTIME_SETTING_KEYS = new Set([
-  "executable",
-  "entrypoint",
-  "homeDir",
-  "activeServerId",
-  "serverUrl",
-  "publicServerUrl",
-  "webappUrl",
-  "profile",
-  "backend",
-  "timeoutMs",
-  "maxOutputBytes",
-  "happierSessionBindings",
-]);
+export { HAPPIER_RUNTIME_PLUGIN_ID } from "./happier-runtime-settings.js";
 
 const HAPPIER_SESSION_BINDING_FIELDS = new Set([
   "canonicalSessionUri",
   "happierSessionId",
   "serverProfileId",
   "machineId",
+  "takeoverConfirmedAt",
 ]);
 const HAPPIER_LEGACY_STORED_SESSION_BINDING_FIELDS = new Set([
   ...HAPPIER_SESSION_BINDING_FIELDS,
@@ -67,12 +62,7 @@ const HAPPIER_LEGACY_STORED_SESSION_BINDING_FIELDS = new Set([
   "takeoverConfirmedAt",
 ]);
 
-type HappierSessionBinding = Readonly<{
-  canonicalSessionUri: string;
-  happierSessionId: string;
-  serverProfileId: string;
-  machineId: string;
-}>;
+type HappierSessionBinding = HappierRuntimeSessionBinding;
 
 type HappierStoredSessionBinding = Readonly<{
   projectPath: string;
@@ -87,52 +77,16 @@ function hasOwn(value: Record<string, unknown>, key: string): boolean {
 }
 
 function safeHappierString(value: unknown, maximum = 512): string | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  return trimmed && trimmed.length <= maximum && !/[\u0000-\u001f\u007f]/u.test(trimmed) ? trimmed : null;
-}
-
-function canonicalHappierSessionUri(value: unknown): string | null {
-  const candidate = safeHappierString(value, 2_000);
-  if (!candidate) return null;
-  try {
-    const uri = new URL(candidate);
-    const providerId = uri.protocol.slice(0, -1);
-    if (providerId !== "codex" && providerId !== "claude" && providerId !== "opencode") return null;
-    const expectedHost = providerId === "codex" ? "threads" : "sessions";
-    if (uri.hostname !== expectedHost || uri.username || uri.password || uri.port || uri.search || uri.hash) return null;
-    const nativeSessionId = safeHappierString(decodeURIComponent(uri.pathname.replace(/^\/+/u, "")), 512);
-    if (!nativeSessionId || nativeSessionId.includes("/")) return null;
-    const canonical = `${providerId}://${expectedHost}/${encodeURIComponent(nativeSessionId)}`;
-    return candidate === canonical ? canonical : null;
-  } catch {
-    return null;
-  }
+  return safeHappierSettingString(value, maximum);
 }
 
 function exactFields(value: Record<string, unknown>, allowed: ReadonlySet<string>): string[] {
   return Object.keys(value).filter((key) => !allowed.has(key)).sort();
 }
 
-function validateHappierBinding(value: unknown): string[] {
-  if (!isRecord(value)) return ["must be an object"];
-  const unsupported = exactFields(value, HAPPIER_SESSION_BINDING_FIELDS);
-  if (unsupported.length > 0) return [`contains unsupported field(s): ${unsupported.join(", ")}`];
-  if (!canonicalHappierSessionUri(value.canonicalSessionUri)) return ["has an invalid canonicalSessionUri"];
-  for (const key of ["happierSessionId", "serverProfileId", "machineId"] as const) {
-    if (!safeHappierString(value[key])) return [`has an invalid ${key}`];
-  }
-  return [];
-}
-
 function normalizeHappierBinding(value: unknown): HappierSessionBinding | null {
-  if (validateHappierBinding(value).length > 0 || !isRecord(value)) return null;
-  const canonicalSessionUri = canonicalHappierSessionUri(value.canonicalSessionUri);
-  const happierSessionId = safeHappierString(value.happierSessionId);
-  const serverProfileId = safeHappierString(value.serverProfileId);
-  const machineId = safeHappierString(value.machineId);
-  if (!canonicalSessionUri || !happierSessionId || !serverProfileId || !machineId) return null;
-  return { canonicalSessionUri, happierSessionId, serverProfileId, machineId };
+  const normalized = normalizeHappierSessionBindings([value]);
+  return normalized.errors.length === 0 ? normalized.bindings[0] ?? null : null;
 }
 
 function normalizeLegacyStoredHappierBinding(value: unknown): HappierStoredSessionBinding | null {
@@ -151,64 +105,33 @@ function normalizeLegacyStoredHappierBinding(value: unknown): HappierStoredSessi
 }
 
 function validateHappierSessionBindings(value: unknown): string[] {
-  if (!Array.isArray(value)) return ["happierSessionBindings must be an array"];
-  const seenCanonicalSessions = new Set<string>();
-  const seenHappierSessions = new Set<string>();
-  const errors: string[] = [];
-  for (const [index, binding] of value.entries()) {
-    const bindingErrors = validateHappierBinding(binding);
-    if (bindingErrors.length > 0) {
-      errors.push(`happierSessionBindings[${index}] ${bindingErrors.join(", ")}`);
-      continue;
-    }
-    const normalized = normalizeHappierBinding(binding);
-    if (!normalized) {
-      errors.push(`happierSessionBindings[${index}] has an invalid canonical form`);
-      continue;
-    }
-    const canonicalKey = normalized.canonicalSessionUri;
-    const happierKey = normalized.happierSessionId;
-    if (seenCanonicalSessions.has(canonicalKey) || seenHappierSessions.has(happierKey)) {
-      errors.push(`happierSessionBindings[${index}] conflicts with an existing binding in this project`);
-      continue;
-    }
-    seenCanonicalSessions.add(canonicalKey);
-    seenHappierSessions.add(happierKey);
-  }
-  return errors;
+  return [...normalizeHappierSessionBindings(value).errors];
 }
 
 function storedHappierBindings(value: unknown): readonly HappierStoredSessionBinding[] {
   if (!Array.isArray(value)) return [];
-  const normalized: HappierStoredSessionBinding[] = [];
-  const seenCanonicalSessions = new Set<string>();
-  const seenHappierSessions = new Set<string>();
+  const byProject = new Map<string, HappierSessionBinding[]>();
   for (const candidate of value) {
     const binding = normalizeLegacyStoredHappierBinding(candidate);
     if (!binding) continue;
-    const canonicalKey = `${binding.projectPath}\u0000${binding.canonicalSessionUri}`;
-    const happierKey = `${binding.projectPath}\u0000${binding.happierSessionId}`;
-    if (seenCanonicalSessions.has(canonicalKey) || seenHappierSessions.has(happierKey)) continue;
-    seenCanonicalSessions.add(canonicalKey);
-    seenHappierSessions.add(happierKey);
-    normalized.push(binding);
+    const { projectPath, ...projectBinding } = binding;
+    const group = byProject.get(projectPath) ?? [];
+    group.push(projectBinding);
+    byProject.set(projectPath, group);
+  }
+  const normalized: HappierStoredSessionBinding[] = [];
+  for (const [projectPath, candidates] of [...byProject.entries()].sort(([left], [right]) =>
+    left.localeCompare(right, "en"))) {
+    const project = normalizeHappierSessionBindings(candidates);
+    if (project.errors.length > 0) continue;
+    normalized.push(...project.bindings.map((binding) => ({ projectPath, ...binding })));
   }
   return normalized;
 }
 
 function normalizedProjectHappierBindings(value: unknown): readonly HappierSessionBinding[] {
-  if (!Array.isArray(value)) return [];
-  const normalized: HappierSessionBinding[] = [];
-  const seenCanonicalSessions = new Set<string>();
-  const seenHappierSessions = new Set<string>();
-  for (const candidate of value) {
-    const binding = normalizeHappierBinding(candidate);
-    if (!binding || seenCanonicalSessions.has(binding.canonicalSessionUri) || seenHappierSessions.has(binding.happierSessionId)) continue;
-    seenCanonicalSessions.add(binding.canonicalSessionUri);
-    seenHappierSessions.add(binding.happierSessionId);
-    normalized.push(binding);
-  }
-  return normalized;
+  const normalized = normalizeHappierSessionBindings(value);
+  return normalized.errors.length === 0 ? normalized.bindings : [];
 }
 
 function projectHappierSettings(value: unknown): Record<string, unknown> {
@@ -267,14 +190,7 @@ export function validatePluginSettingsPolicy(
   settings: Record<string, unknown>,
 ): string[] {
   if (pluginId !== HAPPIER_RUNTIME_PLUGIN_ID) return [];
-  const unsupported = Object.keys(settings).filter((key) => !HAPPIER_RUNTIME_SETTING_KEYS.has(key));
-  const errors = unsupported.length > 0
-    ? [`Unsupported Happier setting(s): ${unsupported.sort().join(", ")}`]
-    : [];
-  if ("happierSessionBindings" in settings) {
-    errors.push(...validateHappierSessionBindings(settings.happierSessionBindings));
-  }
-  return errors;
+  return validateHappierRuntimeSettings(settings);
 }
 
 export function sanitizePersistedPluginSettings(

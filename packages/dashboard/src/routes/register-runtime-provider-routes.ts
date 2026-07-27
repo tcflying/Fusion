@@ -1,6 +1,6 @@
 import { HAPPIER_RUNTIME_PLUGIN_ID, validatePluginSettingsPolicy } from "@fusion/core";
 import { ApiError, badRequest, unauthorized } from "../api-error.js";
-import { isDaemonAuthActive } from "../auth-middleware.js";
+import { resolveDashboardAuthContext } from "../dashboard-auth-context.js";
 import {
   discoverPaperclipCli,
   listHermesProviderProfiles,
@@ -15,29 +15,37 @@ import {
   probePaperclipProvider,
   probePaperclipViaCliFacade,
 } from "../runtime-provider-probes.js";
+import { registerHappierRuntimeSetupRoutes } from "./register-happier-runtime-setup-routes.js";
 import type { ApiRouteRegistrar } from "./types.js";
 
 /**
  * Registers three read-only status probes for the runtime provider plugins:
  *
- *   POST /providers/happier/status (bearer-token protected)
+ *   POST /providers/happier/status (Dashboard auth-context protected)
  *   GET /providers/hermes/status
  *   GET /providers/openclaw/status
  *   GET /providers/paperclip/status
  *
  * The Happier probe is different from the other binary-only introspection
  * routes: official auth status reads credentials and contacts the selected
- * server, so callers may control its target only behind daemon authentication.
+ * server, so callers may control its target only behind the host's resolved
+ * Dashboard auth context.
  */
 export const registerRuntimeProviderRoutes: ApiRouteRegistrar = (ctx) => {
   const { router, rethrowAsApiError } = ctx;
 
+  registerHappierRuntimeSetupRoutes(ctx);
+
   router.post("/providers/happier/status", async (req, res) => {
     try {
-      // FNXC:HappierRuntime 2026-07-14-10:13: A tokenless Dashboard must never
-      // become an SSRF or credential-forwarding surface through Happier CLI.
-      if (!isDaemonAuthActive(ctx.options)) {
-        throw unauthorized("Happier probing requires Fusion bearer-token authentication");
+      /*
+      FNXC:HappierRuntimeAuth 2026-07-27-03:54:
+      Happier status uses the exact Dashboard transport-auth context installed
+      by the host. Bearer mode and explicitly validated loopback no-auth are
+      accepted; a bare legacy no-auth option remains untrusted and fails closed.
+      */
+      if (!resolveDashboardAuthContext(ctx.options)) {
+        throw unauthorized("Happier probing requires a trusted Dashboard authentication context");
       }
       if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
         throw badRequest("Request body must be a Happier settings object");

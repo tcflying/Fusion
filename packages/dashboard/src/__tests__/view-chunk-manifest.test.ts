@@ -17,6 +17,10 @@ afterEach(() => {
 });
 
 describe("view chunk manifest", () => {
+  it("does not publish a standalone Reliability chunk after the view moved into Command Center", () => {
+    expect(VIEW_SOURCE_MAP).not.toHaveProperty("reliability");
+  });
+
   it("keeps Command Center mapped with css assets for Vite runtime in-app navigation", () => {
     const clientDir = makeClientDir("command-center-runtime");
     mkdirSync(join(clientDir, ".vite"), { recursive: true });
@@ -52,10 +56,6 @@ describe("view chunk manifest", () => {
           file: "assets/CommandCenter-abc123.js",
           css: ["assets/CommandCenter-abc123.css"],
         },
-        [VIEW_SOURCE_MAP.reliability]: {
-          file: "assets/ReliabilityView-ghi789.js",
-          css: ["assets/ReliabilityView-ghi789.css"],
-        },
       }),
     );
 
@@ -66,10 +66,7 @@ describe("view chunk manifest", () => {
       file: "/assets/CommandCenter-abc123.js",
       css: ["/assets/CommandCenter-abc123.css"],
     });
-    expect(map.reliability).toEqual({
-      file: "/assets/ReliabilityView-ghi789.js",
-      css: ["/assets/ReliabilityView-ghi789.css"],
-    });
+    expect(map.reliability).toBeUndefined();
 
     rmSync(clientDir, { recursive: true, force: true });
   });

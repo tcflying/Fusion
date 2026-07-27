@@ -20,6 +20,7 @@ vi.mock("../runtime-provider-probes.js", () => ({
 }));
 
 import { registerRuntimeProviderRoutes } from "../routes/register-runtime-provider-routes.js";
+import { createDashboardAuthContext } from "../dashboard-auth-context.js";
 
 describe("POST /providers/happier/status", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -41,12 +42,17 @@ describe("POST /providers/happier/status", () => {
     const routes = new Map<string, (req: any, res: any) => Promise<void>>();
     registerRuntimeProviderRoutes({
       router: { get: vi.fn(), post: (path: string, handler: (req: any, res: any) => Promise<void>) => routes.set(path, handler) },
-      options: { daemon: { token: "fn_test" } },
+      options: {
+        dashboardAuthContext: createDashboardAuthContext({
+          host: "0.0.0.0",
+          token: "fn_test",
+        }),
+      },
       rethrowAsApiError: (error: unknown) => { throw error; },
     } as never);
     const json = vi.fn();
-    await routes.get("/providers/happier/status")!({ body: { executable: "node", entrypoint: "happier.mjs", homeDir: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli", activeServerId: "stack_fusion__id_default", serverUrl: "http://127.0.0.1:52211", publicServerUrl: "http://localhost:52211", webappUrl: "http://stack.localhost:52211", backend: "codex", timeoutMs: 999999, maxOutputBytes: 999999999 } }, { json });
-    expect(probeHappierProvider).toHaveBeenCalledWith(expect.objectContaining({ executable: "node", entrypoint: "happier.mjs", homeDir: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli", activeServerId: "stack_fusion__id_default", serverUrl: "http://127.0.0.1:52211", publicServerUrl: "http://localhost:52211", webappUrl: "http://stack.localhost:52211", backend: "codex", timeoutMs: 120_000, maxOutputBytes: 16_777_216 }));
+    await routes.get("/providers/happier/status")!({ body: { executable: process.execPath, homeDir: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli", activeServerId: "stack_fusion__id_default", serverUrl: "http://127.0.0.1:52211", publicServerUrl: "http://localhost:52211", webappUrl: "http://stack.localhost:52211", backend: "codex", timeoutMs: 120_000, maxOutputBytes: 16_777_216 } }, { json });
+    expect(probeHappierProvider).toHaveBeenCalledWith(expect.objectContaining({ executable: process.execPath, homeDir: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli", activeServerId: "stack_fusion__id_default", serverUrl: "http://127.0.0.1:52211", publicServerUrl: "http://localhost:52211", webappUrl: "http://stack.localhost:52211", backend: "codex", timeoutMs: 120_000, maxOutputBytes: 16_777_216 }));
     expect(probeHappierProvider.mock.calls[0]?.[0]).not.toHaveProperty("token");
     expect(json).toHaveBeenCalledWith(health);
   });
@@ -58,7 +64,7 @@ describe("POST /providers/happier/status", () => {
       options: { daemon: { token: "fn_test" } },
       rethrowAsApiError: (error: unknown) => { throw error; },
     } as never);
-    await expect(routes.get("/providers/happier/status")!({ body: { backend: "other" } }, { json: vi.fn() })).rejects.toThrow(/Invalid backend/);
+    await expect(routes.get("/providers/happier/status")!({ body: { backend: "other" } }, { json: vi.fn() })).rejects.toThrow(/backend must be codex/);
     expect(probeHappierProvider).not.toHaveBeenCalled();
   });
 
@@ -75,6 +81,28 @@ describe("POST /providers/happier/status", () => {
     expect(probeHappierProvider).not.toHaveBeenCalled();
   });
 
+  it("uses the explicit loopback no-auth Dashboard context for the host probe", async () => {
+    probeHappierProvider.mockResolvedValue({ ready: true });
+    const routes = new Map<string, (req: any, res: any) => Promise<void>>();
+    registerRuntimeProviderRoutes({
+      router: { get: vi.fn(), post: (path: string, handler: (req: any, res: any) => Promise<void>) => routes.set(path, handler) },
+      options: {
+        noAuth: true,
+        dashboardAuthContext: createDashboardAuthContext({
+          host: "127.0.0.1",
+          noAuth: true,
+        }),
+      },
+      rethrowAsApiError: (error: unknown) => { throw error; },
+    } as never);
+    const json = vi.fn();
+
+    await routes.get("/providers/happier/status")!({ body: {} }, { json });
+
+    expect(probeHappierProvider).toHaveBeenCalledTimes(1);
+    expect(json).toHaveBeenCalledWith({ ready: true });
+  });
+
   it("refuses credential-bearing probes when daemon authentication is disabled", async () => {
     const routes = new Map<string, (req: any, res: any) => Promise<void>>();
     registerRuntimeProviderRoutes({
@@ -84,7 +112,7 @@ describe("POST /providers/happier/status", () => {
     } as never);
 
     await expect(routes.get("/providers/happier/status")!({ body: {} }, { json: vi.fn() })).rejects.toThrow(
-      /bearer-token authentication/i,
+      /trusted Dashboard authentication context/i,
     );
     expect(probeHappierProvider).not.toHaveBeenCalled();
   });

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RoomCockpitNavigationEntry } from "../../App";
@@ -472,7 +472,6 @@ describe("RoomCockpitRoute", () => {
   });
 
   it("renders a deliberate empty boundary before a Room is selected and only displays a validated projection", async () => {
-    const user = userEvent.setup();
     const sources: ControlledRoomEventSource[] = [];
     const fetchProjection = createCockpitFetcher();
     const onClose = vi.fn();
@@ -486,12 +485,13 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
+    expect(screen.getByRole("heading", { name: "Room command console" })).toBeVisible();
     expect(screen.getByRole("heading", { name: "No Room projection yet" })).toBeInTheDocument();
     expect(screen.getByText(/No demo telemetry is shown here/i)).toBeInTheDocument();
     expect(fetchProjection).not.toHaveBeenCalled();
 
-    await user.type(screen.getByRole("textbox", { name: "Room ID" }), "room-live");
-    await user.click(screen.getByRole("button", { name: "Load verified Room" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Room ID" }), { target: { value: "room-live" } });
+    fireEvent.click(screen.getByRole("button", { name: "Load verified Room" }));
 
     await waitFor(() => expect(fetchProjection).toHaveBeenCalledWith(
       "/api/rooms/room-live?projectId=project-live",
@@ -500,12 +500,57 @@ describe("RoomCockpitRoute", () => {
     expect(await screen.findByRole("main", { name: "Room cockpit for room-live" })).toBeInTheDocument();
     expect(screen.getByText(projection.objective)).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Back to workspace" }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to workspace" }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("opens the compact command console and routes a confirmed restore through the canonical Room action endpoint", async () => {
+    const fetchProjection = vi.fn(async () => jsonResponse({ accepted: true, aggregateVersion: 9 }, 202));
+
+    const { container } = render(
+      <RoomCockpitRoute
+        projectId="project-live"
+        onClose={vi.fn()}
+        fetchProjection={fetchProjection}
+      />,
+    );
+
+    expect(fetchProjection).not.toHaveBeenCalled();
+    /*
+    FNXC:RoomCockpitTests 2026-07-27-18:18:
+    Keep this Route integration assertion scoped to the mounted command region so Windows runs measure command wiring instead of repeatedly walking the unrelated preflight and projection DOM under package-level CPU contention. The 15-second timeout, confirmation boundary, canonical request, CAS body, and visible receipt assertions remain unchanged.
+    */
+    const commandPanelElement = container.querySelector<HTMLElement>(
+      'section[aria-labelledby="room-command-console-title"]',
+    );
+    expect(commandPanelElement).toBeInstanceOf(HTMLElement);
+    const commandPanel = within(commandPanelElement!);
+    fireEvent.click(commandPanel.getByRole("button", { name: "Open Room command console" }));
+    fireEvent.click(commandPanel.getByRole("button", { name: "Restore existing Sessions" }));
+    fireEvent.change(commandPanel.getByLabelText("Command ID"), { target: { value: "route-restore-command-1" } });
+    fireEvent.change(commandPanel.getByLabelText("Expected aggregate version (CAS)"), { target: { value: "8" } });
+    fireEvent.change(commandPanel.getByLabelText("Target Room ID"), { target: { value: "room-live" } });
+
+    fireEvent.click(commandPanel.getByRole("button", { name: "Review restore command" }));
+    expect(fetchProjection).not.toHaveBeenCalled();
+    expect(commandPanel.getByRole("heading", { name: "Confirm restore existing Sessions" })).toBeVisible();
+    fireEvent.click(commandPanel.getByRole("button", { name: "Confirm and execute restore" }));
+
+    await waitFor(() => expect(fetchProjection).toHaveBeenCalledTimes(1));
+    const [path, init] = fetchProjection.mock.calls[0] ?? [];
+    expect(path).toBe("/api/rooms/room-live/actions?projectId=project-live");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      expectedAggregateVersion: 8,
+      commandId: "route-restore-command-1",
+      action: "restore_existing_sessions",
+      payload: {},
+    });
+    expect(await commandPanel.findByRole("list", { name: "Room command audit results" })).toHaveTextContent(
+      "restore / route-restore-command-1",
+    );
+  });
+
   it("preflights multiple existing Sessions through the Cockpit without creating or attaching a Room", async () => {
-    const user = userEvent.setup();
     const fetchProjection = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (isExistingSessionPreflightRequest(input)) {
         const body = JSON.parse(String(init?.body)) as { readonly sessions: readonly {
@@ -533,18 +578,26 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    expect(screen.getByRole("heading", { name: "Preflight old Sessions" })).toBeInTheDocument();
-    expect(screen.getByText(/no attach/i)).toBeInTheDocument();
-    await user.type(
-      screen.getByRole("textbox", { name: "Canonical Session URI 1" }),
-      "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d",
-    );
-    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), "windows-host-1");
-    await user.click(screen.getByRole("button", { name: "Add Session" }));
-    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 2" }), "claude://sessions/claude-session-2");
-    await user.type(screen.getByRole("textbox", { name: "Required host 2" }), "windows-host-2");
-    await user.type(screen.getByRole("textbox", { name: "Required machine 2" }), "windows-machine-2");
-    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+    const preflight = within(screen.getByRole("region", { name: "Preflight old Sessions" }));
+    expect(preflight.getByRole("heading", { name: "Preflight old Sessions" })).toBeInTheDocument();
+    expect(preflight.getByText(/no attach/i)).toBeInTheDocument();
+    fireEvent.change(preflight.getByLabelText("Canonical Session URI 1"), {
+      target: { value: "codex://threads/019f22f6-6581-7781-bb37-84cf4d63d81d" },
+    });
+    fireEvent.change(preflight.getByLabelText("Required host 1"), {
+      target: { value: "windows-host-1" },
+    });
+    fireEvent.click(preflight.getByRole("button", { name: "Add Session" }));
+    fireEvent.change(preflight.getByLabelText("Canonical Session URI 2"), {
+      target: { value: "claude://sessions/claude-session-2" },
+    });
+    fireEvent.change(preflight.getByLabelText("Required host 2"), {
+      target: { value: "windows-host-2" },
+    });
+    fireEvent.change(preflight.getByLabelText("Required machine 2"), {
+      target: { value: "windows-machine-2" },
+    });
+    fireEvent.click(preflight.getByRole("button", { name: "Verify existing Sessions" }));
 
     await waitFor(() => expect(fetchProjection).toHaveBeenCalledWith(
       "/api/rooms/session-preflight?projectId=project-live",
@@ -574,15 +627,14 @@ describe("RoomCockpitRoute", () => {
         ],
       }),
     });
-    expect(await screen.findAllByText("identity verified")).toHaveLength(2);
-    expect(screen.getAllByText("No provider turn was started.")).toHaveLength(2);
-    expect(screen.getAllByText("019f22f6-6581-7781-bb37-84cf4d63d81d")).toHaveLength(2);
-    expect(screen.getAllByText("Provider snapshot withheld")).toHaveLength(2);
-    expect(screen.getAllByText("connector_telemetry_unsupported")).toHaveLength(2);
+    expect(await preflight.findAllByText("identity verified")).toHaveLength(2);
+    expect(preflight.getAllByText("No provider turn was started.")).toHaveLength(2);
+    expect(preflight.getAllByText("019f22f6-6581-7781-bb37-84cf4d63d81d")).toHaveLength(2);
+    expect(preflight.getAllByText("Provider snapshot withheld")).toHaveLength(2);
+    expect(preflight.getAllByText("connector_telemetry_unsupported")).toHaveLength(2);
   });
 
   it("renders a fresh persisted Codex provider snapshot without treating it as provider readiness", async () => {
-    const user = userEvent.setup();
     const session = {
       connectorId: "happier-runtime",
       canonicalSessionUri: "codex://threads/provider-telemetry-1",
@@ -608,9 +660,13 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
-    await user.type(screen.getByRole("textbox", { name: "Canonical Session URI 1" }), session.canonicalSessionUri);
-    await user.type(screen.getByRole("textbox", { name: "Required host 1" }), session.requiredHostId);
-    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Canonical Session URI 1" }), {
+      target: { value: session.canonicalSessionUri },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Required host 1" }), {
+      target: { value: session.requiredHostId },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
 
     expect(await screen.findByText("Fresh persisted Codex snapshot observed")).toBeInTheDocument();
     expect(screen.getByText("2026-07-21T02:40:00.000Z")).toBeInTheDocument();
@@ -701,7 +757,6 @@ describe("RoomCockpitRoute", () => {
   });
 
   it("fails malformed, unknown, extra, and sensitive provider telemetry closed without exposing it", async () => {
-    const user = userEvent.setup();
     const sessions = [
       {
         connectorId: "happier-runtime",
@@ -775,20 +830,25 @@ describe("RoomCockpitRoute", () => {
       />,
     );
 
+    const preflight = within(screen.getByRole("region", { name: "Preflight old Sessions" }));
     for (const [index, session] of sessions.entries()) {
-      if (index > 0) await user.click(screen.getByRole("button", { name: "Add Session" }));
-      await user.type(screen.getByRole("textbox", { name: `Canonical Session URI ${index + 1}` }), session.canonicalSessionUri);
-      await user.type(screen.getByRole("textbox", { name: `Required host ${index + 1}` }), session.requiredHostId);
+      if (index > 0) fireEvent.click(preflight.getByRole("button", { name: "Add Session" }));
+      fireEvent.change(preflight.getByLabelText(`Canonical Session URI ${index + 1}`), {
+        target: { value: session.canonicalSessionUri },
+      });
+      fireEvent.change(preflight.getByLabelText(`Required host ${index + 1}`), {
+        target: { value: session.requiredHostId },
+      });
     }
-    await user.click(screen.getByRole("button", { name: "Verify existing Sessions" }));
+    fireEvent.click(preflight.getByRole("button", { name: "Verify existing Sessions" }));
 
-    expect(await screen.findAllByText("Provider snapshot withheld")).toHaveLength(4);
-    expect(screen.getAllByText("telemetry_contract_invalid")).toHaveLength(4);
-    expect(screen.getAllByText("identity verified")).toHaveLength(4);
-    expect(screen.queryByText(accountEmail)).not.toBeInTheDocument();
-    expect(screen.queryByText("provider-plan-must-not-render")).not.toBeInTheDocument();
-    expect(screen.queryByText("424242")).not.toBeInTheDocument();
-    expect(screen.queryByText(rawError)).not.toBeInTheDocument();
+    expect(await preflight.findAllByText("Provider snapshot withheld")).toHaveLength(4);
+    expect(preflight.getAllByText("telemetry_contract_invalid")).toHaveLength(4);
+    expect(preflight.getAllByText("identity verified")).toHaveLength(4);
+    expect(preflight.queryByText(accountEmail)).not.toBeInTheDocument();
+    expect(preflight.queryByText("provider-plan-must-not-render")).not.toBeInTheDocument();
+    expect(preflight.queryByText("424242")).not.toBeInTheDocument();
+    expect(preflight.queryByText(rawError)).not.toBeInTheDocument();
   });
 
   it("withholds malformed existing-Session preflight data before it reaches Cockpit fields", async () => {

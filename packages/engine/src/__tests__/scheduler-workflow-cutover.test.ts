@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTransitionRejection, TransitionRejectionError, buildBootstrapPrompt, type Task, type TaskStore, type WorkflowIr } from "@fusion/core";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { Scheduler } from "../scheduler.js";
 import { AgentSemaphore } from "../concurrency.js";
 
@@ -315,7 +316,7 @@ describe("Scheduler workflow cutover", () => {
     const moveOptions = vi.mocked(store.moveTaskIf).mock.calls[0]?.[3] as {
       allocateWorktree?: (reservedNames: Set<string>) => string | null;
     };
-    expect(moveOptions.allocateWorktree?.(new Set())).toBe("/tmp/project/custom-worktrees/fn-102");
+    expect(moveOptions.allocateWorktree?.(new Set())).toBe(resolve("/tmp/project", "custom-worktrees", "fn-102"));
   });
 
   it("continues executor handoff for all released tasks when post-release metadata or logs fail", async () => {

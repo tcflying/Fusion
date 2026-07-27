@@ -29,6 +29,10 @@ import {
   readHappierDirectSessionTranscript,
   resolveHappierCliSettings,
   sendHappierMessage,
+  setHappierSessionModel,
+  setHappierSessionPermissionMode,
+  setHappierSessionTitle,
+  startHappierResumeProcess,
 } from "../cli-spawn.js";
 import {
   HAPPIER_DIRECT_SESSION_CAPABILITY_FINGERPRINT,
@@ -83,7 +87,10 @@ function settings(overrides: Partial<HappierCliSettings> = {}): HappierCliSettin
   };
 }
 
-function fakeChild(pid?: number): {
+function fakeChild(
+  pid?: number,
+  options: Readonly<{ emitSpawn?: boolean; closeOnKill?: boolean }> = {},
+): {
   child: ChildProcess;
   stdout: (value: string) => void;
   stderr: (value: string) => void;
@@ -94,8 +101,12 @@ function fakeChild(pid?: number): {
   const child = new EventEmitter() as ChildProcess;
   const stdout = new EventEmitter();
   const stderr = new EventEmitter();
-  const kill = vi.fn(() => true);
+  const kill = vi.fn(() => {
+    if (options.closeOnKill !== false) queueMicrotask(() => child.emit("close", null));
+    return true;
+  });
   Object.assign(child, { stdout, stderr, kill, pid });
+  if (options.emitSpawn !== false) queueMicrotask(() => child.emit("spawn"));
   return {
     child,
     stdout: (value) => stdout.emit("data", Buffer.from(value)),
@@ -177,6 +188,29 @@ describe("Happier CLI settings and invocation", () => {
     });
   });
 
+  it("rejects an explicit wait deadline that is shorter than the inner wait plus grace before spawn", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(sendHappierMessage(
+      {
+        sessionId: "sess-timeout-schema",
+        message: "wait safely",
+        localId: "local-timeout-schema",
+        timeoutSeconds: 31,
+      },
+      settings({
+        waitTimeoutMs: 35_999,
+        waitTimeoutGraceMs: 5_000,
+      }),
+      controller.signal,
+    )).rejects.toMatchObject({
+      code: "protocol",
+      officialCode: "timeout_hierarchy_invalid",
+    });
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
   it("passes local extension opt-ins explicitly and clears inherited enablement otherwise", () => {
     expect(buildHappierProcessEnv({
       enableLocalRuntimeSnapshot: true,
@@ -195,6 +229,40 @@ describe("Happier CLI settings and invocation", () => {
       HAPPIER_ENABLE_FUSION_RUNTIME_SNAPSHOT_V1: "0",
       HAPPIER_ENABLE_FUSION_RECONCILIATION_HISTORY_V1: "0",
     });
+  });
+
+  it("forwards only the explicit process environment allowlist", () => {
+    const environment = buildHappierProcessEnv({
+      homeDir: "C:\\safe-happier-home",
+    }, {
+      Path: "C:\\Windows\\System32",
+      SystemRoot: "C:\\Windows",
+      TEMP: "C:\\Temp",
+      HTTPS_PROXY: "http://127.0.0.1:7890",
+      NODE_OPTIONS: "--require C:\\untrusted.js",
+      OPENAI_API_KEY: "must-not-cross",
+      refreshToken: "must-not-cross",
+      cookie: "must-not-cross",
+      sessionSecret: "must-not-cross",
+      key: "must-not-cross",
+      FUSION_PRIVATE_MARKER: "must-not-cross",
+      HAPPIER_HOME_DIR: "C:\\attacker-home",
+    });
+
+    expect(environment).toMatchObject({
+      Path: "C:\\Windows\\System32",
+      SystemRoot: "C:\\Windows",
+      TEMP: "C:\\Temp",
+      HTTPS_PROXY: "http://127.0.0.1:7890",
+      HAPPIER_HOME_DIR: "C:\\safe-happier-home",
+    });
+    expect(environment).not.toHaveProperty("NODE_OPTIONS");
+    expect(environment).not.toHaveProperty("OPENAI_API_KEY");
+    expect(environment).not.toHaveProperty("refreshToken");
+    expect(environment).not.toHaveProperty("cookie");
+    expect(environment).not.toHaveProperty("sessionSecret");
+    expect(environment).not.toHaveProperty("key");
+    expect(environment).not.toHaveProperty("FUSION_PRIVATE_MARKER");
   });
 });
 
@@ -223,11 +291,15 @@ describe("Happier official JSON envelopes", () => {
   });
 
   it("redacts textual secrets in parseable invalid-envelope diagnostics", async () => {
-    const raw = '{"message":"Bearer live-token; accessToken=live-access; keep this context"}';
+    const raw = '{"message":"Bearer live-token; accessToken=live-access; refreshToken=live-refresh; cookie=live-cookie; sessionSecret=live-session; key=live-key; keep this context"}';
 
     await expect(parseHappierJson(raw)).rejects.toMatchObject({ code: "invalid-json" });
     await expect(parseHappierJson(raw)).rejects.not.toThrow("live-token");
     await expect(parseHappierJson(raw)).rejects.not.toThrow("live-access");
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("live-refresh");
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("live-cookie");
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("live-session");
+    await expect(parseHappierJson(raw)).rejects.not.toThrow("live-key");
     await expect(parseHappierJson(raw)).rejects.not.toThrow("keep this context");
     await expect(parseHappierJson(raw)).rejects.toThrow("invalid JSON envelope");
   });
@@ -262,7 +334,7 @@ describe("Happier official JSON envelopes", () => {
 });
 
 describe("Happier JSON process boundary", () => {
-  it("passes the selected Happier stack identity to the child without dropping inherited env", async () => {
+  it("passes the selected Happier stack identity without forwarding arbitrary inherited env", async () => {
     vi.stubEnv("FUSION_HAPPIER_TEST_MARKER", "preserved");
     const fake = fakeChild();
     mockSpawn.mockReturnValue(fake.child);
@@ -301,7 +373,6 @@ describe("Happier JSON process boundary", () => {
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
         env: expect.objectContaining({
-          FUSION_HAPPIER_TEST_MARKER: "preserved",
           HAPPIER_HOME_DIR: "C:\\Users\\datoo\\.happier\\stacks\\fusion\\cli",
           HAPPIER_ACTIVE_SERVER_ID: "stack_fusion__id_default",
           HAPPIER_SERVER_URL: "http://127.0.0.1:52211",
@@ -310,6 +381,8 @@ describe("Happier JSON process boundary", () => {
         }),
       }),
     );
+    const spawnedEnvironment = mockSpawn.mock.calls[0]?.[2]?.env as NodeJS.ProcessEnv;
+    expect(spawnedEnvironment).not.toHaveProperty("FUSION_HAPPIER_TEST_MARKER");
   });
 
   it("returns data from an official success envelope", async () => {
@@ -333,6 +406,96 @@ describe("Happier JSON process boundary", () => {
     await expect(promise).rejects.toMatchObject({ code: "timeout" });
     expect(fake.kill).toHaveBeenCalled();
     expect(mockSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the spawn budget before the ordinary one-shot tool budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = fakeChild(undefined, { emitSpawn: false });
+      mockSpawn.mockReturnValue(fake.child);
+      const controller = new AbortController();
+      let outcome: Readonly<{ code?: string; officialCode?: string }> | undefined;
+      const observed = invokeHappierJson(
+        ["session", "status", "abc", "--json"],
+        settings({
+          spawnTimeoutMs: 1_000,
+          toolTimeoutMs: 10_000,
+          timeoutMs: 30_000,
+        }),
+        controller.signal,
+      ).then(
+        () => {
+          outcome = {};
+        },
+        (error: Readonly<{ code?: string; officialCode?: string }>) => {
+          outcome = error;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      const observedAtSpawnDeadline = outcome;
+      controller.abort();
+      await observed;
+      expect(observedAtSpawnDeadline).toMatchObject({
+        code: "timeout",
+        officialCode: "cli_spawn_timeout",
+      });
+      expect(fake.kill).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the outer CLI deadline beyond 31, 121, and 301 second provider waits without retrying send", async () => {
+    /*
+     * FNXC:HappierTimeoutHierarchy 2026-07-27-02:50:
+     * A provider wait owns its advertised inner deadline. The controlling CLI
+     * process must retain an additional bounded grace period, even when the
+     * legacy generic tool timeout is 30 seconds, and one wait may spawn once.
+     */
+    vi.useFakeTimers();
+    try {
+      for (const timeoutSeconds of [31, 121, 301]) {
+        const fake = fakeChild();
+        const sessionId = `sess-wait-${timeoutSeconds}`;
+        const localId = `local-wait-${timeoutSeconds}`;
+        mockSpawn.mockReturnValueOnce(fake.child);
+        let outcome:
+          | Readonly<{ ok: true; value: unknown }>
+          | Readonly<{ ok: false; error: unknown }>
+          | undefined;
+        const observed = sendHappierMessage(
+          { sessionId, message: "wait for provider", localId, timeoutSeconds },
+          settings({ timeoutMs: 30_000 }),
+        ).then(
+          (value) => {
+            outcome = { ok: true, value };
+            return outcome;
+          },
+          (error: unknown) => {
+            outcome = { ok: false, error };
+            return outcome;
+          },
+        );
+
+        await vi.advanceTimersByTimeAsync(timeoutSeconds * 1_000);
+
+        expect(outcome).toBeUndefined();
+        expect(fake.kill).not.toHaveBeenCalled();
+        fake.stdout(JSON.stringify({
+          v: 1,
+          ok: true,
+          kind: "session_send",
+          data: { sessionId, localId, waited: true },
+        }));
+        fake.close(0);
+        await expect(observed).resolves.toMatchObject({ ok: true });
+      }
+      expect(mockSpawn).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("terminates when stdout exceeds the hard output cap", async () => {
@@ -365,6 +528,37 @@ describe("Happier JSON process boundary", () => {
     await expect(promise).rejects.toMatchObject({ code: "timeout" });
     expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
     expect(mockSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not reject an aborted invocation until the controlled process confirms close", async () => {
+    const fake = fakeChild(undefined, { emitSpawn: false, closeOnKill: false });
+    mockSpawn.mockReturnValue(fake.child);
+    const controller = new AbortController();
+    let settled = false;
+    const outcome = invokeHappierJson(
+      ["session", "status", "abc", "--json"],
+      settings(),
+      controller.signal,
+    ).then(
+      () => {
+        settled = true;
+        return "resolved" as const;
+      },
+      () => {
+        settled = true;
+        return "rejected" as const;
+      },
+    );
+
+    controller.abort();
+    await Promise.resolve();
+
+    expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(settled).toBe(false);
+
+    fake.close(null);
+
+    await expect(outcome).resolves.toBe("rejected");
   });
 
   it("maps nonzero process failures using textual fallback and redacts diagnostics", async () => {
@@ -754,6 +948,7 @@ describe("Happier session wrappers", () => {
     callback(new Error("taskkill timed out with private-plaintext"));
     fake.close(0);
 
+    await Promise.resolve();
     expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
     await expect(next).resolves.toEqual({ done: true, value: undefined });
     await returnedFailure;
@@ -927,6 +1122,125 @@ describe("Happier session wrappers", () => {
       ["session", "status", "sess_integration_status_123", "--json"],
       ["session", "history", "sess_integration_history_123", "--limit", "10", "--format", "raw", "--json"],
     ]);
+  });
+
+  it("maps system instructions, model, and readonly permission into exact official send argv", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+    const input = {
+      sessionId: "sess_integration_send_123",
+      message: "Inspect the repository without modifying files.",
+      localId: "local-1",
+      timeoutSeconds: 30,
+      systemPrompt: "Follow the Fusion task contract.",
+      modelId: "gpt-5.6-sol",
+      permissionMode: "read-only" as const,
+    };
+    const promise = sendHappierMessage(input, settings());
+    fake.stdout(SEND_SUCCESS);
+    fake.close(0);
+
+    await expect(promise).resolves.toMatchObject({
+      sessionId: "sess_integration_send_123",
+      localId: "local-1",
+    });
+    expect(mockSpawn).toHaveBeenLastCalledWith(
+      "happier",
+      [
+        "session",
+        "send",
+        "sess_integration_send_123",
+        "[Fusion runtime envelope v1]\n{\"systemInstructions\":\"Follow the Fusion task contract.\",\"userMessage\":\"Inspect the repository without modifying files.\"}",
+        "--local-id",
+        "local-1",
+        "--permission-mode",
+        "read-only",
+        "--model",
+        "gpt-5.6-sol",
+        "--wait",
+        "--timeout",
+        "30",
+        "--json",
+      ],
+      expect.objectContaining({ shell: false, stdio: ["ignore", "pipe", "pipe"] }),
+    );
+  });
+
+  it("constructs exact official persistent title, model, and permission commands", async () => {
+    const fake = fakeChild();
+    mockSpawn.mockReturnValue(fake.child);
+
+    const title = setHappierSessionTitle("session-1", "Visible task title", settings());
+    fake.stdout('{"v":1,"ok":true,"kind":"session_set_title","data":{"sessionId":"session-1","title":"Visible task title"}}');
+    fake.close(0);
+    await expect(title).resolves.toBeUndefined();
+
+    const model = setHappierSessionModel("session-1", "gpt-5.6-sol", settings());
+    fake.stdout('{"v":1,"ok":true,"kind":"session_set_model","data":{"sessionId":"session-1","modelId":"gpt-5.6-sol","updatedAt":1}}');
+    fake.close(0);
+    await expect(model).resolves.toBeUndefined();
+
+    const permission = setHappierSessionPermissionMode("session-1", "read-only", settings());
+    fake.stdout('{"v":1,"ok":true,"kind":"session_set_permission_mode","data":{"sessionId":"session-1","permissionMode":"read-only","updatedAt":2}}');
+    fake.close(0);
+    await expect(permission).resolves.toBeUndefined();
+
+    expect(mockSpawn.mock.calls.map((call) => call[1])).toEqual([
+      ["session", "set-title", "session-1", "Visible task title", "--json"],
+      ["session", "set-model", "session-1", "gpt-5.6-sol", "--json"],
+      ["session", "set-permission-mode", "session-1", "read-only", "--json"],
+    ]);
+  });
+
+  it("starts exact official resume argv and keeps its lease until process close is confirmed", async () => {
+    const fake = fakeChild(undefined, { emitSpawn: false, closeOnKill: false });
+    mockSpawn.mockReturnValue(fake.child);
+    const started = startHappierResumeProcess("session-1", settings());
+    fake.child.emit("spawn");
+    const lease = await started;
+
+    expect(mockSpawn).toHaveBeenLastCalledWith(
+      "happier",
+      ["resume", "session-1"],
+      expect.objectContaining({
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "ignore", "ignore"],
+      }),
+    );
+
+    let stopped = false;
+    const stop = lease.stop().then((value) => {
+      stopped = true;
+      return value;
+    });
+    await Promise.resolve();
+    expect(fake.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(stopped).toBe(false);
+
+    fake.close(null);
+    await expect(stop).resolves.toBe(true);
+  });
+
+  it("never returns a resume lease when an already-aborted signal races an immediate pid", async () => {
+    const fake = fakeChild(42);
+    mockSpawn.mockReturnValue(fake.child);
+    const controller = new AbortController();
+    controller.abort();
+
+    const started = startHappierResumeProcess("session-1", settings(), controller.signal);
+    await vi.waitFor(() => expect(mockExecFile).toHaveBeenCalledOnce());
+    const callback = mockExecFile.mock.calls[0]?.[3] as (error: Error | null) => void;
+    callback(null);
+    fake.close(null);
+
+    await expect(started).rejects.toMatchObject({ code: "timeout" });
+    expect(mockExecFile).toHaveBeenCalledWith(
+      "taskkill.exe",
+      ["/PID", "42", "/T", "/F"],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+      expect.any(Function),
+    );
   });
 
   it("rejects invalid official session data instead of inventing an id", async () => {

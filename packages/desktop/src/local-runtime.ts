@@ -5,6 +5,10 @@ import type { AddressInfo } from "node:net";
 
 import { resolveDesktopRuntimePrimaryProject } from "./engine-runtime.js";
 import { resolveDesktopBundlePluginDirs } from "./bundled-plugin-dirs.js";
+import {
+  createDesktopRoomRbacOptions,
+  DESKTOP_LOCAL_BIND_HOST,
+} from "./room-rbac-composition.js";
 
 /*
  * FNXC:DesktopRuntime 2026-07-02-14:35:
@@ -42,22 +46,21 @@ export interface DesktopRuntimeStatus {
  * FN-7623: the embedded desktop server must wire a PluginStore + PluginLoader into createServer
  * (as the CLI dashboard command does) or the Settings -> Plugins Browse-registry sub-router never
  * mounts ("Plugin \"registry\" not found") and plugin install throws "Plugin install mode is not
- * supported: plugin loader not available". getPluginStore()/getDatabase() are the two TaskStore
- * members this wiring needs beyond the pre-existing init/watch/close surface.
+ * supported: plugin loader not available". getPluginStore() is the only TaskStore member this host
+ * needs beyond the pre-existing init/watch/close surface; PluginLoader owns schema execution.
  */
 type PluginStoreLike = { init(): Promise<void> };
-type PluginDatabaseLike = { runPluginSchemaInits(hooks: Array<{ pluginId: string; hook: unknown }>): Promise<void> };
 
 type TaskStoreLike = {
   init(): Promise<void>;
   watch(): Promise<void>;
   close(): void;
   getPluginStore(): PluginStoreLike;
-  getDatabase(): PluginDatabaseLike;
 };
 
 type BackendOwnedTaskStoreLike = TaskStoreLike & {
   __backendShutdown?: () => Promise<void>;
+  __backendDetachKeepingEmbedded?: () => Promise<void>;
   /** Unscoped sibling of the project TaskStore layer; owned by the backend boot result. */
   __backendHostAsyncLayer?: import("@fusion/core").AsyncDataLayer;
 };
@@ -118,6 +121,12 @@ async function createStoreDefault(rootDir: string): Promise<TaskStoreLike> {
     const backendStore = store as BackendOwnedTaskStoreLike;
     // Attach the backend shutdown so LocalRuntimeManager can invoke it on stop.
     backendStore.__backendShutdown = backendBoot.shutdown;
+    /*
+     * FNXC:DesktopClosePolicy 2026-07-27-15:49:
+     * Preserve the backend's explicit detach handle so the Windows quit choice can close pools and
+     * release this process's lease without stopping an embedded PostgreSQL shared by other clients.
+     */
+    backendStore.__backendDetachKeepingEmbedded = backendBoot.detachKeepingEmbedded;
     // Keep the CentralCore layer with the same store instance so the default server factory can
     // use it without adding a second connection pool or widening the project TaskStore layer.
     backendStore.__backendHostAsyncLayer = backendBoot.hostAsyncLayer;
@@ -176,8 +185,14 @@ export async function resolveDesktopSystemControl(): Promise<
 }
 
 async function createDashboardServerDefault(store: TaskStoreLike, rootDir: string): Promise<{ server: Server; cleanup: RuntimeCleanup }> {
-  const { CentralCore, PluginLoader, ensureBundledPluginInstalled, isBundledPluginId } = await import("@fusion/core");
-  const { createServer } = await import("@fusion/dashboard");
+  const {
+    CentralCore,
+    PluginLoader,
+    createPostgresRoomRbacRegistry,
+    ensureBundledPluginInstalled,
+    isBundledPluginId,
+  } = await import("@fusion/core");
+  const { createDashboardAuthContext, createServer, getCliPackageVersion, isUnresolvedCliPackageVersion } = await import("@fusion/dashboard");
   const {
     ProjectEngineManager,
     createFusionAuthStorage,
@@ -206,8 +221,19 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
    */
   const roomHostCompositionOperatorAdapterRegistry =
     createWindowsNativeRoomHostCompositionAdapterRegistry({ hostAsyncLayer });
+  const resolvedFusionVersion = getCliPackageVersion(import.meta.url);
+  const fusionVersion = isUnresolvedCliPackageVersion(resolvedFusionVersion) ? undefined : resolvedFusionVersion;
   const engineManager = new ProjectEngineManager(centralCore, {
+    cliPackageVersion: fusionVersion,
     roomHostCompositionOperatorAdapterRegistry,
+  });
+  const roomControlPlaneRbac = createDesktopRoomRbacOptions({
+    engineManager,
+    createRegistry: createPostgresRoomRbacRegistry,
+  });
+  const dashboardAuthContext = createDashboardAuthContext({
+    host: DESKTOP_LOCAL_BIND_HOST,
+    noAuth: true,
   });
   const providerSeeding: { dispose?: () => void } = {};
   const cleanup = async () => {
@@ -252,7 +278,12 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
     const authStorage = createFusionAuthStorage();
     // FNXC:DesktopRuntime 2026-07-03-07:00: a ModelRegistry is required for the /api/models endpoint;
     // without it the onboarding model picker shows "no models" even with a provider connected.
-    const modelRegistry = createFusionModelRegistry(authStorage);
+    /*
+     * FNXC:DesktopModelRegistry 2026-07-27-15:49:
+     * ModelRuntime initialization is asynchronous, so provider seeding and createServer must receive
+     * the resolved registry rather than a Promise that lacks the registry runtime methods.
+     */
+    const modelRegistry = await createFusionModelRegistry(authStorage);
     strace("createDashboardServer: seedDashboardProviders");
     const { authStorage: wrappedAuthStorage, dispose } = await seedDashboardProviders({
       store: store as never,
@@ -290,7 +321,7 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
       strace("createDashboardServer: pluginStore.init");
       pluginStore = store.getPluginStore();
       await pluginStore.init();
-      pluginLoader = new PluginLoader({ pluginStore: pluginStore as never, taskStore: store as never });
+      pluginLoader = new PluginLoader({ pluginStore: pluginStore as never, taskStore: store as never, fusionVersion });
 
       const boundPluginStore = pluginStore;
       const boundPluginLoader = pluginLoader;
@@ -313,10 +344,12 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
       strace("createDashboardServer: pluginLoader.loadAllPlugins");
       const { loaded, errors } = await pluginLoader.loadAllPlugins();
       strace(`createDashboardServer: plugins loaded=${loaded} errors=${errors}`);
-      const schemaHooks = pluginLoader.getPluginSchemaInitHooks();
-      if (schemaHooks.length > 0) {
-        await store.getDatabase().runPluginSchemaInits(schemaHooks);
-      }
+      /*
+       * FNXC:DesktopPluginSchema 2026-07-27-15:49:
+       * PluginLoader preflights and executes each schema contract before it publishes the plugin.
+       * Do not replay getPluginSchemaInitHooks() here: PostgreSQL-only contracts need no legacy
+       * hook, and a second execution creates competing schema ownership.
+       */
 
       ensureBundledPluginInstalledCallback = async (pluginId: string): Promise<boolean> => {
         if (!isBundledPluginId(pluginId)) {
@@ -348,10 +381,19 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
     }
 
     strace("createDashboardServer: createServer");
+    /*
+     * FNXC:DesktopRoomRbacComposition 2026-07-27-15:23:
+     * The packaged local runtime always supplies the host-owned durable Room RBAC composition.
+     * Its Dashboard no-auth context is valid only for the proven loopback bind and is not Room
+     * authority; paired trusted-device policy remains mandatory.
+     */
     const app = createServer(store as never, {
+      fusionVersion,
       ...(primaryEngine ? { engine: primaryEngine } : {}),
       engineManager,
       centralCore,
+      dashboardAuthContext,
+      roomControlPlaneRbac,
       authStorage: wrappedAuthStorage,
       modelRegistry,
       ...(pluginStore && pluginLoader ? { pluginStore: pluginStore as never, pluginLoader, pluginRunner: pluginLoader } : {}),
@@ -360,8 +402,8 @@ async function createDashboardServerDefault(store: TaskStoreLike, rootDir: strin
       ...(await resolveDesktopSystemControl()),
     });
 
-    strace("createDashboardServer: app.listen(0)");
-    const server = app.listen(0);
+    strace(`createDashboardServer: app.listen(0, ${DESKTOP_LOCAL_BIND_HOST})`);
+    const server = app.listen(0, DESKTOP_LOCAL_BIND_HOST);
     strace("createDashboardServer: returning server object");
     return {
       server,
@@ -636,12 +678,12 @@ export class LocalRuntimeManager {
     }
   }
 
-  async stopLocal(): Promise<DesktopRuntimeStatus> {
+  async stopLocal(options: { keepEmbeddedPostgres?: boolean } = {}): Promise<DesktopRuntimeStatus> {
     if (this.stopPromise) {
       return this.stopPromise;
     }
 
-    this.stopPromise = this.stopInternal();
+    this.stopPromise = this.stopInternal(options);
     try {
       return await this.stopPromise;
     } finally {
@@ -649,21 +691,31 @@ export class LocalRuntimeManager {
     }
   }
 
-  private async stopInternal(): Promise<DesktopRuntimeStatus> {
+  private async stopInternal(options: { keepEmbeddedPostgres?: boolean }): Promise<DesktopRuntimeStatus> {
     if (this.runtime) {
       const runtime = this.runtime;
       this.runtime = null;
       runtime.detachTerminationListeners?.();
       await closeServerBestEffort(runtime.server);
       await runtime.cleanup?.();
-      runtime.store.close();
       // FNXC:RuntimeStartupWiring 2026-06-24-10:30:
       // Release the backend connection pool / embedded PG cluster if the store
       // was booted via the startup factory. store.close() already closes the
       // AsyncDataLayer pool; this adds embedded-cluster teardown. Best-effort.
-      const backendShutdown = (runtime.store as BackendOwnedTaskStoreLike).__backendShutdown;
-      if (backendShutdown) {
-        await backendShutdown().catch(() => undefined);
+      /*
+       * FNXC:DesktopClosePolicy 2026-07-27-15:49:
+       * The operator's keep choice selects the backend detach lifecycle; every other stop remains a
+       * full shutdown. A non-backend/custom store still owns its direct close fallback.
+       */
+      const backendStore = runtime.store as BackendOwnedTaskStoreLike;
+      if (options.keepEmbeddedPostgres && backendStore.__backendDetachKeepingEmbedded) {
+        await backendStore.__backendDetachKeepingEmbedded().catch(() => undefined);
+      } else if (options.keepEmbeddedPostgres) {
+        runtime.store.close();
+      } else if (backendStore.__backendShutdown) {
+        await backendStore.__backendShutdown().catch(() => undefined);
+      } else {
+        runtime.store.close();
       }
       this.status = { source: "none", state: "stopped" };
       return this.status;

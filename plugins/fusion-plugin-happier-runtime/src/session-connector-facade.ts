@@ -24,6 +24,7 @@ import type {
   HappierPluginWriteAuthorization,
   HappierSessionConnectorOptions,
 } from "./session-connector.js";
+import type { HappierCapabilityProbeSample } from "./capability-probe.js";
 
 const pluginWriteAuthorizers = new WeakMap<object, HappierPluginWriteAuthorization>();
 
@@ -80,6 +81,15 @@ export class HappierSessionConnector implements SessionConnectorV1, SessionConne
 
   getCapabilities(...args: Parameters<SessionConnectorV1["getCapabilities"]>): ReturnType<SessionConnectorV1["getCapabilities"]> {
     return this.implementation().then((connector) => connector.getCapabilities(...args));
+  }
+
+  getCapabilityProbeEvidence(): Promise<readonly HappierCapabilityProbeSample[]> {
+    return this.implementation().then((connector) => {
+      const source = connector as SessionConnectorV1 & {
+        getCapabilityProbeEvidence?: () => readonly HappierCapabilityProbeSample[];
+      };
+      return source.getCapabilityProbeEvidence?.() ?? [];
+    });
   }
 
   preflightExisting(

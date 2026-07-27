@@ -116,6 +116,26 @@ export interface ElevatedStartOptions {
 
 let elevatedCache: boolean | null = null;
 
+export function buildWindowsElevationProbe(): {
+  command: "net.exe";
+  args: ["session"];
+  options: {
+    encoding: "utf8";
+    shell: false;
+    windowsHide: true;
+  };
+} {
+  return {
+    command: "net.exe",
+    args: ["session"],
+    options: {
+      encoding: "utf8",
+      shell: false,
+      windowsHide: true,
+    },
+  };
+}
+
 /**
  * True only on Windows when the current process holds an elevated admin token.
  * `net session` succeeds (exit 0) exclusively under an elevated admin token, so
@@ -124,7 +144,14 @@ let elevatedCache: boolean | null = null;
 export function isWindowsElevatedAdmin(): boolean {
   if (process.platform !== "win32") return false;
   if (elevatedCache !== null) return elevatedCache;
-  const r = spawnSync("net", ["session"], { encoding: "utf8", shell: true });
+  /*
+  FNXC:WindowsElevationProbeNoShell 2026-07-27-02:57:
+  Node emits DEP0190 when arguments are combined with shell:true, and a shell
+  is unnecessary for the native net.exe elevation probe. Keep the executable
+  and argv static so no command text is reparsed by cmd.exe.
+  */
+  const probe = buildWindowsElevationProbe();
+  const r = spawnSync(probe.command, probe.args, probe.options);
   elevatedCache = r.status === 0;
   return elevatedCache;
 }

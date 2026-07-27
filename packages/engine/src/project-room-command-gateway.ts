@@ -7,8 +7,11 @@ import type {
 } from "@fusion/core";
 import type {
   CreateRoomWithExistingSessionsInput,
+  RequestAddExistingSessionAtTurnBoundaryInput,
+  RequestRemoveExistingSessionAtTurnBoundaryInput,
   RoomExistingSessionSpine,
   RecordRoomPhaseGateEvidenceAtCompletedTurnBoundaryInput,
+  RestoreRoomExistingSessionsInput,
   RouteStructuredRoomProtocolMessageInput,
   SendToRoomSeatInput,
   TransitionRoomRoleAssignmentAtCompletedTurnBoundaryInput,
@@ -71,6 +74,27 @@ export interface ProjectRoomPreflightExistingSessionCommandV1 {
   readonly input: RoomExistingSessionPreflightRequestV1;
 }
 
+export interface ProjectRoomRestoreExistingSessionsCommandV1 {
+  readonly type: "room.restore-existing-sessions.v1";
+  readonly projectId: string;
+  readonly commandId: string;
+  readonly input: RestoreRoomExistingSessionsInput;
+}
+
+export interface ProjectRoomRequestAddExistingSessionCommandV1 {
+  readonly type: "room.request-add-existing-session.v1";
+  readonly projectId: string;
+  readonly commandId: string;
+  readonly input: RequestAddExistingSessionAtTurnBoundaryInput;
+}
+
+export interface ProjectRoomRequestRemoveExistingSessionCommandV1 {
+  readonly type: "room.request-remove-existing-session.v1";
+  readonly projectId: string;
+  readonly commandId: string;
+  readonly input: RequestRemoveExistingSessionAtTurnBoundaryInput;
+}
+
 export interface ProjectRoomIngestStructuredProtocolCommandV1 {
   readonly type: "room.ingest-structured-protocol.v1";
   readonly projectId: string;
@@ -110,6 +134,9 @@ export interface ProjectRoomRecordEvolutionShadowCommandV1 {
 export type ProjectRoomCommandV1 =
   | ProjectRoomPreflightExistingSessionCommandV1
   | ProjectRoomCreateExistingSessionCommandV1
+  | ProjectRoomRestoreExistingSessionsCommandV1
+  | ProjectRoomRequestAddExistingSessionCommandV1
+  | ProjectRoomRequestRemoveExistingSessionCommandV1
   | ProjectRoomIngestStructuredProtocolCommandV1
   | ProjectRoomRecordPhaseGateEvidenceCommandV1
   | ProjectRoomTransitionRoleAssignmentCommandV1
@@ -130,6 +157,18 @@ export type ProjectRoomCommandResultV1 =
     })
   | (ProjectRoomCommandResultBaseV1 & {
       readonly type: "room.create-existing-session.v1";
+      readonly value: RoomAggregateV1;
+    })
+  | (ProjectRoomCommandResultBaseV1 & {
+      readonly type: "room.restore-existing-sessions.v1";
+      readonly value: RoomAggregateV1;
+    })
+  | (ProjectRoomCommandResultBaseV1 & {
+      readonly type: "room.request-add-existing-session.v1";
+      readonly value: RoomAggregateV1;
+    })
+  | (ProjectRoomCommandResultBaseV1 & {
+      readonly type: "room.request-remove-existing-session.v1";
       readonly value: RoomAggregateV1;
     })
   | (ProjectRoomCommandResultBaseV1 & {
@@ -173,6 +212,9 @@ export class ProjectRoomCommandError extends Error {
 export type ProjectRoomCommandSpineV1 = Pick<
   RoomExistingSessionSpine,
   | "createRoomWithExistingSessions"
+  | "restoreRoomExistingSessions"
+  | "requestAddExistingSessionAtTurnBoundary"
+  | "requestRemoveExistingSessionAtTurnBoundary"
   | "routeStructuredProtocolMessage"
   | "recordPhaseGateEvidenceAtCompletedTurnBoundary"
   | "transitionRoleAssignmentAtCompletedTurnBoundary"
@@ -214,6 +256,12 @@ An Evolution Shadow request is admitted only from the authenticated dashboard
 operator and receives the gateway-owned command id. It reaches a bounded
 ledger receipt runner, never the source-candidate, provider, evaluator,
 canary, promotion, or rollback paths.
+
+FNXC:SessionRoomMembershipControl 2026-07-27-06:25:
+Restore and dynamic membership requests cross the same authenticated,
+project-bound command gateway as create/send. Operators may request a staged
+add/remove, but only Core activates it at a completed turn boundary; connector
+adapters cannot self-attach or widen membership.
 */
 export class ProjectRoomCommandGateway {
   constructor(private readonly options: ProjectRoomCommandGatewayOptions) {
@@ -282,6 +330,36 @@ export class ProjectRoomCommandGateway {
     switch (command.type) {
       case "room.create-existing-session.v1": {
         const value = await spine.createRoomWithExistingSessions(command.input);
+        return {
+          type: command.type,
+          projectId: this.options.projectId,
+          commandId: command.commandId,
+          actor,
+          value,
+        };
+      }
+      case "room.restore-existing-sessions.v1": {
+        const value = await spine.restoreRoomExistingSessions(command.input);
+        return {
+          type: command.type,
+          projectId: this.options.projectId,
+          commandId: command.commandId,
+          actor,
+          value,
+        };
+      }
+      case "room.request-add-existing-session.v1": {
+        const value = await spine.requestAddExistingSessionAtTurnBoundary(command.input);
+        return {
+          type: command.type,
+          projectId: this.options.projectId,
+          commandId: command.commandId,
+          actor,
+          value,
+        };
+      }
+      case "room.request-remove-existing-session.v1": {
+        const value = await spine.requestRemoveExistingSessionAtTurnBoundary(command.input);
         return {
           type: command.type,
           projectId: this.options.projectId,
@@ -386,6 +464,9 @@ function assertCommand(command: ProjectRoomCommandV1): void {
   if (
     command.type !== "room.create-existing-session.v1"
     && command.type !== "room.preflight-existing-session.v1"
+    && command.type !== "room.restore-existing-sessions.v1"
+    && command.type !== "room.request-add-existing-session.v1"
+    && command.type !== "room.request-remove-existing-session.v1"
     && command.type !== "room.ingest-structured-protocol.v1"
     && command.type !== "room.record-phase-gate-evidence.v1"
     && command.type !== "room.transition-role-assignment.v1"
@@ -407,6 +488,10 @@ function assertCommandPermission(
     commandType === "room.preflight-existing-session.v1"
       ? actor.kind === "dashboard_operator" || actor.kind === "controller"
       : commandType === "room.create-existing-session.v1"
+      ? actor.kind === "dashboard_operator" || actor.kind === "controller"
+      : commandType === "room.restore-existing-sessions.v1"
+        || commandType === "room.request-add-existing-session.v1"
+        || commandType === "room.request-remove-existing-session.v1"
       ? actor.kind === "dashboard_operator" || actor.kind === "controller"
     : commandType === "room.record-evolution-shadow.v1"
       ? actor.kind === "dashboard_operator"

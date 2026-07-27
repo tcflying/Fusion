@@ -147,7 +147,11 @@ import type { RoomHostCompositionProviderV1 } from "../room-host-composition.js"
 import { RoomControlPlaneLiveEventService } from "../room-control-plane-live-event-service.js";
 import { runtimeLog } from "../logger.js";
 import { SessionConnectorRegistry } from "../session-connector-registry.js";
-import { SESSION_CONNECTOR_CAPABILITIES } from "@fusion/core";
+import {
+  SESSION_CONNECTOR_CAPABILITIES,
+  SESSION_ROOM_REQUIRED_PRODUCTION_CONTROLS,
+  type SessionRoomControlPlaneProductionReadinessProofV1,
+} from "@fusion/core";
 import type {
   ProjectRoomCommandV1,
   ProjectRoomTrustedPrincipalV1,
@@ -288,6 +292,28 @@ type RoomControllerFactory = (context: RoomControllerFactoryContext) => RoomCont
 
 const asyncLayer = { projectId: "project-1" };
 
+function createRoomProductionReadinessProof(
+  connectorIds: readonly string[],
+): SessionRoomControlPlaneProductionReadinessProofV1 {
+  const now = Date.now();
+  return {
+    contractVersion: 1,
+    proofId: "project-engine-room-production-proof-r1",
+    issuer: "project-engine-lifecycle-test",
+    projectId: "project-1",
+    connectorIds,
+    issuedAt: new Date(now - 1_000).toISOString(),
+    expiresAt: new Date(now + 60_000).toISOString(),
+    controls: SESSION_ROOM_REQUIRED_PRODUCTION_CONTROLS.map((control) => ({
+      control,
+      state: "verified",
+      evidenceRef: `test://project-engine-room-production/${control}`,
+      sourceRevision: "project-engine-lifecycle-test-r1",
+      verifiedAt: new Date(now - 1_000).toISOString(),
+    })),
+  };
+}
+
 function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((next) => {
@@ -411,6 +437,10 @@ function createEngine(
   }));
   const options = {
     skipNotifier: true,
+    roomProductionReadinessProofProvider: vi.fn(async (
+      context: { readonly connectorIds: readonly string[] },
+    ) =>
+      createRoomProductionReadinessProof(context.connectorIds)),
     roomGlobalConcurrencyVerifiedPolicy,
     roomProviderBackpressureVerifiedFactory,
     roomCapabilityRegistryRefreshVerifiedFactory,
@@ -576,6 +606,26 @@ ProjectEngine owns the RoomController backend lifecycle. It must start Room
 workers only after the project runtime has initialized their durable stores.
 */
 describe("ProjectEngine RoomController lifecycle integration", () => {
+  it("withholds Room execution when the flag has no per-control production proof", async () => {
+    const engine = createEngine(undefined, {
+      roomProductionReadinessProofProvider: undefined,
+    });
+
+    await engine.start();
+    try {
+      expect(engine.getRoomControlPlaneReadService()).toBeDefined();
+      expect(engine.getRoomControlPlaneLiveEventService()).toBeUndefined();
+      expect(roomControllerSeams.construct).not.toHaveBeenCalled();
+      expect(engine.getRoomControlPlaneExecutionStatus()).toMatchObject({
+        state: "read_only_withheld",
+        reasonCodes: ["production_readiness_proof_missing"],
+        controllerStarted: false,
+      });
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("constructs provider send enforcement only from an explicit verified host factory", async () => {
     const corePorts = {
       read: vi.fn(),
@@ -792,13 +842,16 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
       },
       providerLimits: [],
     };
+    const capabilityRoutingPolicySource = {
+      getCapabilityRoutingPolicy: vi.fn(async () => capabilityRoutingPolicy),
+    };
     const roomCapabilityRegistryRefreshVerifiedFactory = vi.fn(() => ({
       ...capabilityRegistryRefresh,
       observationPort: forgedObservationPort,
     }));
     const roomTaskDispatchCapacityAdmissionVerifiedFactory = vi.fn(() => ({
       capacityAdmissionSource,
-      capabilityRoutingPolicy,
+      capabilityRoutingPolicySource,
     }));
     const engine = createEngine(undefined, {
       roomSessionConnectorRegistry: connectorRegistry,
@@ -908,7 +961,10 @@ describe("ProjectEngine RoomController lifecycle integration", () => {
       const taskDispatcher = controllerOptions.taskDispatcher as object;
       const dispatcherOptions = Reflect.get(taskDispatcher, "options") as Record<string, unknown>;
       expect(dispatcherOptions.capacityAdmissionSource).toBe(capacityAdmissionSource);
-      expect(dispatcherOptions.capabilityRoutingPolicy).toBe(capabilityRoutingPolicy);
+      expect(dispatcherOptions.capabilityRoutingPolicy).toBeUndefined();
+      expect(dispatcherOptions.capabilityRoutingPolicySource).toBe(
+        capabilityRoutingPolicySource,
+      );
       expect(capacityAdmissionSource.getCapacityGovernorInput).not.toHaveBeenCalled();
     } finally {
       await engine.stop();

@@ -9,6 +9,7 @@ import type {
 } from "@fusion/core";
 
 import { createLogger } from "./logger.js";
+import { persistTaskDispatchCapacityAdmissions } from "./room-task-capacity-admission-audit.js";
 import {
   ROOM_GLOBAL_CONCURRENCY_ACCOUNTING_CONTRACT_VERSION,
   type RoomGlobalConcurrencyAcquireInputV1,
@@ -244,10 +245,8 @@ function isRoomWorkerAuthorityError(error: unknown): error is RoomWorkerAuthorit
 }
 
 export type RoomControllerAuditMutationType =
-  | "room:worker-lease-acquired"
-  | "room:worker-lease-taken-over"
-  | "room:worker-capacity-admitted"
-  | "room:worker-capacity-withheld"
+  | "room:worker-lease-acquired" | "room:worker-lease-taken-over"
+  | "room:worker-capacity-admitted" | "room:worker-capacity-withheld" | "room:task-capacity-admission"
   | "room:capability-registry-withheld"
   | "room:worker-lease-lost"
   | "room:worker-started"
@@ -1105,6 +1104,7 @@ export class RoomController {
           },
           canContinue: () => this.canStartLeaseMutation(lifecycleGeneration),
         });
+        await persistTaskDispatchCapacityAdmissions(handle, dispatched.capacityAdmissions, this.recordLifecycleAudit.bind(this));
         authoritativeRoom = this.validateDispatchedRoom(
           room.room.id,
           authoritativeRoom,

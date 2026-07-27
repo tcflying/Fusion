@@ -33,6 +33,8 @@ export interface RuntimeMetrics {
  * Configuration for creating a ProjectRuntime instance.
  */
 export interface ProjectRuntimeConfig {
+  /** Resolved Fusion host version forwarded to the runtime-owned PluginLoader. */
+  fusionVersion?: string;
   /** Unique project ID (e.g., "proj_abc123") */
   projectId: string;
   /** Absolute path to the project working directory */

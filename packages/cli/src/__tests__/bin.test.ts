@@ -132,6 +132,11 @@ const commandMocks = vi.hoisted(() => ({
   runResearchRetry: vi.fn(),
 }));
 
+const supervisorMocks = vi.hoisted(() => ({
+  shouldSuperviseServerCommand: vi.fn(() => false),
+  runServerCommandSupervised: vi.fn(),
+}));
+
 const onboardEnv = vi.hoisted(() => ({
   centralDbPath: "/tmp/fusion-central.db",
 }));
@@ -162,6 +167,7 @@ vi.mock("../commands/dashboard.js", () => ({
 }));
 vi.mock("../commands/serve.js", () => ({ runServe: commandMocks.runServe }));
 vi.mock("../commands/daemon.js", () => ({ runDaemon: commandMocks.runDaemon }));
+vi.mock("../commands/server-supervisor.js", () => supervisorMocks);
 vi.mock("../commands/desktop.js", () => ({ runDesktop: commandMocks.runDesktop }));
 vi.mock("../commands/init.js", () => ({ runInit: commandMocks.runInit }));
 
@@ -354,6 +360,7 @@ describe("bin command routing and fallbacks", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    supervisorMocks.shouldSuperviseServerCommand.mockReturnValue(false);
     delete process.env.PI_PACKAGE_DIR;
     delete process.env.FUSION_SKIP_ONBOARDING;
     ttyState.isTTYAvailable = true;

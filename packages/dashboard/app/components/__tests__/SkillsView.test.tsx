@@ -177,6 +177,34 @@ describe("SkillsView", () => {
       });
     });
 
+    it("shows the semantic-search fallback warning and concrete source", async () => {
+      mockFetchSkillsCatalog.mockResolvedValue({
+        entries: mockCatalogEntries,
+        auth: {
+          mode: "unauthenticated",
+          tokenPresent: false,
+          fallbackUsed: false,
+        },
+        search: {
+          source: "brute-force",
+          fallbackUsed: true,
+          fallbackSource: "sqlite-fts",
+          warning:
+            "Semantic skill search was unavailable; showing keyword fallback results.",
+        },
+      });
+
+      render(<SkillsView addToast={mockAddToast} onClose={onClose} />);
+
+      await waitFor(() => {
+        const warning = screen.getByTestId("skills-search-fallback-warning");
+        expect(warning.textContent).toContain(
+          "Semantic skill search was unavailable; showing keyword fallback results.",
+        );
+        expect(warning.textContent).toContain("sqlite-fts");
+      });
+    });
+
     it("renders catalog tags as badges", async () => {
       render(<SkillsView addToast={mockAddToast} onClose={onClose} />);
 

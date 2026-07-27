@@ -3,6 +3,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Request, Response, NextFunction } from "express";
 import { createAuthMiddleware, isDaemonAuthActive } from "../auth-middleware.js";
+import { createDashboardAuthContext } from "../dashboard-auth-context.js";
 
 describe("createAuthMiddleware", () => {
   let mockReq: Partial<Request>;
@@ -169,5 +170,24 @@ describe("isDaemonAuthActive", () => {
     process.env.FUSION_DAEMON_TOKEN = "fn_env_token";
     const result = isDaemonAuthActive({ daemon: { token: "fn_option_token" } });
     expect(result).toBe(true);
+  });
+
+  it("uses the explicit host context for bearer and loopback no-auth modes", () => {
+    expect(
+      isDaemonAuthActive({
+        dashboardAuthContext: createDashboardAuthContext({
+          host: "0.0.0.0",
+          token: "fn_lan_token",
+        }),
+      }),
+    ).toBe(true);
+    expect(
+      isDaemonAuthActive({
+        dashboardAuthContext: createDashboardAuthContext({
+          host: "127.0.0.1",
+          noAuth: true,
+        }),
+      }),
+    ).toBe(false);
   });
 });

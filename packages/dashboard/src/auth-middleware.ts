@@ -1,5 +1,5 @@
 /**
- * Bearer token authentication middleware for daemon mode.
+ * Bearer token authentication middleware for Dashboard host mode.
  *
  * Provides secure constant-time token validation to protect API endpoints
  * while allowing unauthenticated access to health checks.
@@ -8,6 +8,11 @@
 import { timingSafeEqual } from "node:crypto";
 import type { Request, Response, NextFunction } from "express";
 import type { IncomingMessage } from "node:http";
+import {
+  getDashboardBearerToken,
+  resolveDashboardAuthContext,
+  type DashboardAuthContextOptions,
+} from "./dashboard-auth-context.js";
 
 /**
  * Query-string fallback used when the client can't set an Authorization
@@ -41,35 +46,22 @@ function isApiPath(path: string): boolean {
 }
 
 /**
- * Check if daemon auth should be active.
- * Auth is enabled when FUSION_DAEMON_TOKEN env var is set OR daemon options are provided.
- * Always returns false when options.noAuth is true (CLI --no-auth override).
+ * Legacy name retained for callers that ask whether the host's resolved
+ * Dashboard context uses bearer authentication.
  */
-export function isDaemonAuthActive(options?: { daemon?: { token: string }; noAuth?: boolean }): boolean {
-  if (options?.noAuth) {
-    return false;
-  }
-  if (options?.daemon?.token) {
-    return true;
-  }
-  if (process.env.FUSION_DAEMON_TOKEN) {
-    return true;
-  }
-  return false;
+export function isDaemonAuthActive(
+  options?: DashboardAuthContextOptions,
+): boolean {
+  return resolveDashboardAuthContext(options)?.mode === "bearer";
 }
 
 /**
- * Get the daemon token from options or environment.
- * Returns undefined when options.noAuth is true, regardless of env.
+ * Get the bearer token from the host-resolved Dashboard context.
  */
-export function getDaemonToken(options?: { daemon?: { token: string }; noAuth?: boolean }): string | undefined {
-  if (options?.noAuth) {
-    return undefined;
-  }
-  if (options?.daemon?.token) {
-    return options.daemon.token;
-  }
-  return process.env.FUSION_DAEMON_TOKEN;
+export function getDaemonToken(
+  options?: DashboardAuthContextOptions,
+): string | undefined {
+  return getDashboardBearerToken(options);
 }
 
 /**

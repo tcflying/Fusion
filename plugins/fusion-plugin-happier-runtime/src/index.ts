@@ -5,11 +5,14 @@
  */
 
 import { HappierRuntimeAdapter } from "./runtime-adapter.js";
+import { resolveHappierBackend } from "./backend-resolver.js";
 import { resolveHappierCliSettings } from "./cli-spawn.js";
 import {
   HAPPIER_SESSION_CONNECTOR_ID,
   HAPPIER_SESSION_CONNECTOR_VERSION,
 } from "./session-connector-contract.js";
+import { HAPPIER_RUNTIME_PROVENANCE } from "./provenance.js";
+import { HAPPIER_RUNTIME_SETTINGS_SCHEMA } from "./settings-schema.js";
 import {
   createHappierSessionConnectorWithHostWriteAuthorization,
   HappierSessionConnector,
@@ -24,7 +27,6 @@ import type {
   PluginSessionConnectorFactory,
   PluginSessionConnectorManifestMetadata,
 } from "@fusion/plugin-sdk";
-import type { HappierBackend } from "./types.js";
 
 export const HAPPIER_RUNTIME_ID = HAPPIER_SESSION_CONNECTOR_ID;
 export const HAPPIER_RUNTIME_VERSION = HAPPIER_SESSION_CONNECTOR_VERSION;
@@ -32,7 +34,7 @@ export const HAPPIER_RUNTIME_VERSION = HAPPIER_SESSION_CONNECTOR_VERSION;
 export const happierRuntimeMetadata: PluginRuntimeManifestMetadata = {
   runtimeId: HAPPIER_RUNTIME_ID,
   name: "Happier Runtime",
-  description: "Drives official Happier JSON CLI sessions with durable native ids",
+  description: "Local/custom adapter for pinned Happier JSON CLI sessions with durable native ids",
   version: HAPPIER_RUNTIME_VERSION,
 };
 
@@ -42,18 +44,15 @@ export const happierRuntimeFactory: PluginRuntimeFactory = async (ctx) =>
 export const happierSessionConnectorMetadata: PluginSessionConnectorManifestMetadata = {
   connectorId: HAPPIER_SESSION_CONNECTOR_ID,
   name: "Happier Session Connector",
-  description: "Connects manually bound Happier Sessions through official MCP stdio",
+  description: "Local/custom connector for manually bound Sessions using the pinned official Happier MCP contract",
   version: HAPPIER_SESSION_CONNECTOR_VERSION,
 };
 
 function connectorSettings(ctx: PluginContext) {
   const settings = ctx.settings as Record<string, unknown>;
-  const backend = settings.backend === "codex" || settings.backend === "claude" || settings.backend === "opencode"
-    ? settings.backend as HappierBackend
-    : undefined;
   return {
     ...resolveHappierCliSettings(settings),
-    ...(backend ? { backend } : {}),
+    backend: resolveHappierBackend(settings),
   };
 }
 
@@ -125,9 +124,11 @@ const plugin: FusionPlugin = definePlugin({
     id: "fusion-plugin-happier-runtime",
     name: "Happier Runtime Plugin",
     version: HAPPIER_RUNTIME_VERSION,
-    description: "Drives official Happier JSON CLI sessions for Fusion agents",
-    author: "Fusion Team",
-    homepage: "https://github.com/Runfusion/Fusion",
+    description: "Local/custom Fusion adapter for a pinned Happier CLI and MCP contract",
+    author: HAPPIER_RUNTIME_PROVENANCE.maintainer,
+    homepage: HAPPIER_RUNTIME_PROVENANCE.repository,
+    fusionVersion: ">=0.74.0-beta.3 <0.75.0",
+    settingsSchema: HAPPIER_RUNTIME_SETTINGS_SCHEMA,
     runtime: happierRuntimeMetadata,
     sessionConnector: happierSessionConnectorMetadata,
   },
@@ -157,6 +158,15 @@ export default plugin;
 export { ensureHappierDirectSession } from "./cli-spawn.js";
 export type { HappierDirectSessionEnsureResult } from "./types.js";
 export * from "./cli-spawn.js";
+export * from "./backend-resolver.js";
+export * from "./binding-identity.js";
+export * from "./cli-attestation.js";
+export * from "./mcp-result-contract.js";
+export * from "./health-reasons.js";
+export * from "./provenance.js";
+export * from "./send-receipt.js";
+export * from "./settings-schema.js";
+export * from "./official-session-control-contract.js";
 export * from "./happier-mcp-client.js";
 export * from "./operations.js";
 export * from "./probe.js";

@@ -19,6 +19,7 @@ import {
 import { SessionConnectorRegistry } from "../session-connector-registry.js";
 import {
   dispatchRoomDelivery,
+  reconcileApprovedRoomDelivery,
   reconcileAmbiguousRoomDelivery,
   type RoomDeliveryCoordinatorStore,
 } from "../room-delivery-coordinator.js";
@@ -625,6 +626,106 @@ describe("Room connector delivery reconciliation", () => {
     expect(store.beginCalls[0]?.senderFence).toBe(SENDER_FENCE);
     expect(store.completeCalls).toHaveLength(1);
     expect(store.completeCalls[0]?.senderFence).toEqual(SENDER_FENCE);
+  });
+
+  it("durably preserves connector approval details instead of flattening them to unavailable", async () => {
+    const store = new MemoryDeliveryStore();
+    const fixture = connectorFixture({
+      sendResult: {
+        ok: false,
+        error: {
+          code: "unavailable",
+          message: "Approval required",
+          retryable: false,
+          safeDetails: {
+            actionState: "approval_request_created",
+            artifactId: "approval-engine-1",
+            operation: "session_message_send",
+            sessionIdentity: IDENTITY,
+            approvalStateRef: "c".repeat(64),
+            runtimeState: "waitingOnInput",
+            reconciliationRequired: true,
+          },
+        },
+      },
+    });
+
+    await expect(dispatchRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      attemptId: "attempt-approval-1",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      reconciliationFromCursor: "cursor-before-send",
+      now: NOW,
+      audit: { runId: "run-approval-1", agentId: "worker-1" },
+    })).resolves.toMatchObject({
+      state: "delivery_uncertain",
+      connectorAcknowledgementId: "approval-engine-1",
+      lastErrorCode: "connector_approval_waiting",
+    });
+    expect(store.completeCalls).toEqual([
+      expect.objectContaining({
+        outcome: "delivery_uncertain",
+        connectorAcknowledgementId: "approval-engine-1",
+        errorCode: "connector_approval_waiting",
+      }),
+    ]);
+  });
+
+  it("explicitly reconciles an approved delivery without invoking connector send again", async () => {
+    const store = new MemoryDeliveryStore({
+      ...delivery("delivery_uncertain"),
+      connectorAcknowledgementId: "approval-engine-2",
+      lastErrorCode: "connector_approval_waiting",
+    });
+    const fixture = connectorFixture({});
+    const reconcileApproval = async (input: {
+      artifactId: string;
+      request: SessionConnectorSendRequestV1;
+    }): Promise<SessionConnectorResultV1<SessionConnectorSendReceiptV1>> => {
+      expect(input.artifactId).toBe("approval-engine-2");
+      expect(input.request).toMatchObject({
+        identity: IDENTITY,
+        localMessageId: store.current.localMessageId,
+        deliveryAuthorization: {
+          outboxId: "outbox-1",
+          senderFence: SENDER_FENCE,
+        },
+      });
+      return {
+        ok: true,
+        value: {
+          outcome: "confirmed",
+          connectorAcknowledgementId: "happier:happier-session-1:approved",
+          nativeMessageId: "native-approved-2",
+          cursor: "cursor-approved-2",
+          acceptedAt: NOW,
+        },
+      };
+    };
+    Object.assign(fixture.connector, { reconcileApproval });
+
+    await expect(reconcileApprovedRoomDelivery({
+      store,
+      registry: fixture.registry,
+      identity: IDENTITY,
+      outboxId: "outbox-1",
+      senderFence: SENDER_FENCE,
+      content: "Only this payload may be delivered.",
+      now: NOW,
+      audit: { runId: "run-approval-reconcile-2", agentId: "recovery-worker-1" },
+    })).resolves.toMatchObject({
+      state: "confirmed",
+      connectorAcknowledgementId: "happier:happier-session-1:approved",
+      nativeMessageId: "native-approved-2",
+      nativeCursor: "cursor-approved-2",
+    });
+    expect(fixture.sendCalls).toBe(0);
+    expect(store.beginCalls).toHaveLength(0);
+    expect(store.reconciliationCalls).toHaveLength(1);
   });
 
   it("carries the original sender fence through every external-send completion branch", async () => {

@@ -12,24 +12,79 @@ function createResolutionContext(
 ): RoomHostCompositionOperatorAdapterResolutionContextV1 {
   return {
     authorityRecord: {
-      policy: { adapterBindings },
+      contractVersion: 1,
+      projectId: "project-1",
+      hostId: "windows-host-1",
+      bundleId: "windows-room-bundle-1",
+      issuer: "fusion-operator",
+      policy: {
+        connectorIds: ["happier"],
+        controllerAdmission: {
+          workClass: "normal",
+          slots: 4,
+        },
+        adapterBindings,
+      },
+      policyHash: "policy-hash-1",
+      revision: 1,
+      issuedAt: "2026-07-27T05:00:00.000Z",
+      updatedAt: "2026-07-27T05:00:00.000Z",
+      expiresAt: "2026-07-27T07:00:00.000Z",
+      revokedAt: null,
+      revokedReason: null,
     },
     roomContext: {
+      projectId: "project-1",
+      hostId: "windows-host-1",
       connectorIds: ["happier"],
+      taskStore: {},
+      asyncLayer: { projectId: "project-1" },
+      roomStore: {
+        getRoom: async () => undefined,
+        getRoomCapabilityRegistry: async () => null,
+        getTaskGraph: async () => null,
+        assertWorkerAuthority: async () => undefined,
+      },
+      connectorRegistry: {
+        ids: () => ["happier"],
+      },
     },
   } as unknown as RoomHostCompositionOperatorAdapterResolutionContextV1;
 }
 
 describe("Windows native Room host composition adapter registry", () => {
-  it("withholds rather than fabricating provider admission from a host layer or connector label", async () => {
+  it("resolves the fixed Windows bundle to host-owned durable admission dependencies", async () => {
     const registry = createWindowsNativeRoomHostCompositionAdapterRegistry({
       hostAsyncLayer: {} as AsyncDataLayer,
     });
 
-    expect(registry.resolve(createResolutionContext())).toEqual({
-      state: "withheld",
-      reason: "windows_provider_admission_telemetry_unavailable",
+    expect(registry.resolve(createResolutionContext())).toMatchObject({
+      state: "ready",
+      dependencies: {
+        providerBackpressureVerifiedFactory: expect.any(Function),
+        capabilityRegistryRefreshVerifiedFactory: expect.any(Function),
+        taskDispatchCapacityAdmissionVerifiedFactory: expect.any(Function),
+      },
     });
+  });
+
+  it("withholds without a project-bound durable Room store", async () => {
+    const registry = createWindowsNativeRoomHostCompositionAdapterRegistry({
+      hostAsyncLayer: {} as AsyncDataLayer,
+    });
+    const context = createResolutionContext();
+
+    expect(registry.resolve({
+      ...context,
+      roomContext: {
+        ...context.roomContext,
+        roomStore: undefined,
+      },
+    } as unknown as RoomHostCompositionOperatorAdapterResolutionContextV1))
+      .toEqual({
+        state: "withheld",
+        reason: "windows_host_runtime_context_invalid",
+      });
   });
 
   it("rejects operator bindings that do not name this Windows host's fixed adapter set", async () => {

@@ -1,12 +1,32 @@
 import { SESSION_CONNECTOR_CAPABILITIES, type SessionConnectorIdentityV1 } from "@fusion/core";
 import { describe, expect, it, vi } from "vitest";
 
+vi.mock("../cli-attestation.js", () => ({
+  verifyHappierCliAttestation: vi.fn(async () => ({
+    ok: true,
+    trustLevel: "local_custom_pinned_source_build",
+    sourceRoot: "G:\\codex-project\\happier",
+    entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+    cliVersion: "0.2.10",
+    sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+    entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786",
+    verifiedAt: "2026-07-27T04:48:00.000Z",
+    evidence: {
+      version: "cli_--version",
+      package: "package_json",
+      source: "git_head",
+      artifact: "sha256_file_bytes",
+    },
+  })),
+}));
+
 import {
   HAPPIER_LOCAL_DIRECT_SESSION_EXTENSION_STATE,
   HAPPIER_OFFICIAL_MCP_SOURCE_REVISION,
   createHappierSessionConnectorWithHostWriteAuthorization,
   HappierSessionConnector,
 } from "../session-connector.js";
+import type { HappierCliAttestation } from "../cli-attestation.js";
 import { HAPPIER_OFFICIAL_MCP_TOOLS, type HappierMcpClientFactoryInput } from "../happier-mcp-client.js";
 
 const NOW = "2026-07-19T19:29:00.000Z";
@@ -19,6 +39,22 @@ const IDENTITY: SessionConnectorIdentityV1 = {
   serverProfileId: "server-1",
   machineId: "machine-1",
   hostId: "fusion-host-1",
+};
+const PROBE_ATTESTATION: HappierCliAttestation = {
+  ok: true as const,
+  trustLevel: "local_custom_pinned_source_build" as const,
+  sourceRoot: "G:\\codex-project\\happier",
+  entrypointPath: "G:\\codex-project\\happier\\apps\\cli\\package-dist\\index.mjs",
+  cliVersion: "0.2.10",
+  sourceCommit: "6e059c41d865343c1efc9c98676e5af3882d85ff",
+  entrypointSha256: "sha256:8ad722284c12ca87c946f3a94b66b14f5640bf768e719c8791b1cb0234312786",
+  verifiedAt: NOW,
+  evidence: {
+    version: "cli_--version" as const,
+    package: "package_json" as const,
+    source: "git_head" as const,
+    artifact: "sha256_file_bytes" as const,
+  },
 };
 
 function connectorFor(options: { binding?: boolean; takeover?: boolean; hostAuthorization?: boolean; tools?: string[] } = {}) {
@@ -54,6 +90,9 @@ function connectorFor(options: { binding?: boolean; takeover?: boolean; hostAuth
         backend: true,
         ready: true,
         backendId: "claude" as const,
+        modelId: null,
+        modelState: "not_reported" as const,
+        attestation: PROBE_ATTESTATION,
         details: [],
       })),
     },
@@ -77,6 +116,7 @@ describe("Happier official MCP capability conformance", () => {
       status: "session_status_get",
       send: "session_message_send",
       wait: "session_wait_idle",
+      history: "session_history_get",
       stop: "session_stop",
     });
   });
@@ -93,7 +133,7 @@ describe("Happier official MCP capability conformance", () => {
     expect(capabilities.capabilities).toMatchObject({
       ensureExisting: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_list+session_status_get" },
       status: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_status_get" },
-      send: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_message_send+session_wait_idle" },
+      send: { state: "verified", evidenceRef: "happier-mcp:tool-discovery:session_history_get+session_message_send+session_wait_idle" },
       interrupt: { state: "unavailable", reasonCode: "operation_unavailable" },
       create: { state: "unavailable", reasonCode: "operation_unavailable" },
       history: { state: "unavailable", reasonCode: "operation_unavailable" },
@@ -190,6 +230,9 @@ describe("Happier official MCP capability conformance", () => {
           backend: true,
           ready: true,
           backendId: "codex" as const,
+          modelId: null,
+          modelState: "not_reported" as const,
+          attestation: PROBE_ATTESTATION,
           details: [],
         })),
       },

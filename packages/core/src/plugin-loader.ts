@@ -10,7 +10,7 @@
  */
 
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { copyFile, readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { EventEmitter } from "node:events";
@@ -49,8 +49,27 @@ import { getCreateAiSessionFactory, getCreateInteractiveAiSessionFactory } from 
 import { scanPluginSecurity } from "./plugin-security-scan.js";
 import { resolvePluginRootFromEntryPath } from "./plugin-skill-paths.js";
 
-// Minimum Fusion version for plugin compatibility checks (can be expanded later)
-const MINIMUM_FUSION_VERSION = "0.1.0";
+interface FusionVersion {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string[];
+}
+
+function readFallbackFusionVersion(): string | undefined {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      version?: unknown;
+    };
+    return typeof manifest.version === "string" && manifest.version.length > 0
+      ? manifest.version
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const FALLBACK_FUSION_VERSION = readFallbackFusionVersion();
 let moduleImportVersion = 0;
 const PLUGIN_MANIFEST_PARENT_DIR_NAMES = new Set(["dist", "build", "lib", "src"]);
 type CurrentManifestDashboardViewsResult =
@@ -151,6 +170,67 @@ export function resolvePluginEntryPath(pluginDir: string): string | null {
   return null;
 }
 
+function parseFusionVersion(version: string): FusionVersion | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version.trim());
+  if (!match) return null;
+
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4]?.split(".") ?? [],
+  };
+}
+
+function compareFusionVersions(left: FusionVersion, right: FusionVersion): number {
+  for (const key of ["major", "minor", "patch"] as const) {
+    if (left[key] !== right[key]) return left[key] > right[key] ? 1 : -1;
+  }
+  if (left.prerelease.length === 0 || right.prerelease.length === 0) {
+    if (left.prerelease.length === right.prerelease.length) return 0;
+    return left.prerelease.length === 0 ? 1 : -1;
+  }
+  for (let index = 0; index < Math.max(left.prerelease.length, right.prerelease.length); index += 1) {
+    const leftPart = left.prerelease[index];
+    const rightPart = right.prerelease[index];
+    if (leftPart === rightPart) continue;
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    const leftNumeric = /^\d+$/.test(leftPart);
+    const rightNumeric = /^\d+$/.test(rightPart);
+    if (leftNumeric && rightNumeric) return Number(leftPart) > Number(rightPart) ? 1 : -1;
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return leftPart > rightPart ? 1 : -1;
+  }
+  return 0;
+}
+
+/**
+ * Tests whether a concrete Fusion host version satisfies a space-delimited
+ * comparator range from a plugin manifest. Unsupported or malformed ranges are
+ * incompatible so a plugin declaration can never be accepted accidentally.
+ */
+export function isFusionVersionCompatible(hostVersion: string, requiredRange: string): boolean {
+  const host = parseFusionVersion(hostVersion);
+  const comparators = requiredRange.trim().split(/\s+/).filter(Boolean);
+  if (!host || comparators.length === 0) return false;
+
+  return comparators.every((comparator) => {
+    const match = /^(>=|<=|>|<|=)?(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z.-]+)?)$/.exec(comparator);
+    if (!match) return false;
+    const required = parseFusionVersion(match[2]);
+    if (!required) return false;
+    const comparison = compareFusionVersions(host, required);
+    switch (match[1] ?? "=") {
+      case ">=": return comparison >= 0;
+      case "<=": return comparison <= 0;
+      case ">": return comparison > 0;
+      case "<": return comparison < 0;
+      default: return comparison === 0;
+    }
+  });
+}
+
 export interface PluginLoaderOptions {
   /** Plugin store for persistence */
   pluginStore: PluginStore;
@@ -162,6 +242,8 @@ export interface PluginLoaderOptions {
   npmPrefix?: string;
   /** Persist started/stopped/error runtime state transitions (default true). */
   persistRuntimeState?: boolean;
+  /** Running Fusion application version, resolved by the host executable. */
+  fusionVersion?: string;
 }
 
 /**
@@ -337,6 +419,28 @@ export class PluginLoader extends EventEmitter<{
     return hasWorkflowExtensions ? "extension" : "plugin";
   }
 
+  private async preparePluginSchema(
+    pluginId: string,
+    hooks: FusionPlugin["hooks"],
+  ): Promise<LoadedPluginSchemaContract | null> {
+    const preflightPluginSchema = this.options.taskStore.preflightPluginSchema;
+    const runPluginSchemaInits = this.options.taskStore.runPluginSchemaInits;
+    const declaresSchema = Boolean(hooks.onSchemaInit || hooks.onPostgresSchemaInit);
+
+    if (typeof preflightPluginSchema !== "function" || typeof runPluginSchemaInits !== "function") {
+      if (declaresSchema) {
+        throw new Error(
+          `Plugin "${pluginId}" declares schema initialization but the current TaskStore cannot safely apply plugin schemas`,
+        );
+      }
+      return null;
+    }
+
+    const schemaContract = preflightPluginSchema.call(this.options.taskStore, pluginId, hooks);
+    if (schemaContract) await runPluginSchemaInits.call(this.options.taskStore, [schemaContract]);
+    return schemaContract;
+  }
+
   // ── Plugin Loading ─────────────────────────────────────────────────
 
   /**
@@ -438,14 +542,22 @@ export class PluginLoader extends EventEmitter<{
 
       await this.refreshPersistedManifestMetadata(installation, plugin.manifest);
 
-      // Check version compatibility
+      /*
+       * FNXC:PluginCompatibility 2026-07-27-22:15:
+       * The runtime plugin's bounded Fusion prerelease range must be evaluated
+       * against the host executable version, never the old 0.1.0 placeholder.
+       * A missing or malformed host/range remains incompatible and visible in
+       * logs; do not weaken a plugin declaration or suppress the warning.
+       */
+      // Check version compatibility.
       if (plugin.manifest.fusionVersion) {
-        const compatible = this.checkVersionCompatibility(
-          plugin.manifest.fusionVersion,
-        );
+        const fusionVersion = this.options.fusionVersion ?? FALLBACK_FUSION_VERSION;
+        const compatible = fusionVersion
+          ? isFusionVersionCompatible(fusionVersion, plugin.manifest.fusionVersion)
+          : false;
         if (!compatible) {
           this.log.warn(
-            `Plugin ${pluginId} requires Fusion ${plugin.manifest.fusionVersion}, minimum is ${MINIMUM_FUSION_VERSION}`,
+            `Plugin ${pluginId} requires Fusion ${plugin.manifest.fusionVersion}, but this host is ${fusionVersion ?? "unknown"}`,
           );
         }
       }
@@ -459,8 +571,7 @@ export class PluginLoader extends EventEmitter<{
       publication, or onLoad. A SQLite-only third-party plugin therefore fails
       without leaving subscriptions, timers, or other onLoad side effects.
       */
-      const schemaContract = this.options.taskStore.preflightPluginSchema(pluginId, plugin.hooks);
-      if (schemaContract) await this.options.taskStore.runPluginSchemaInits([schemaContract]);
+      const schemaContract = await this.preparePluginSchema(pluginId, plugin.hooks);
 
       // Update state to started
       await this.updatePluginState(pluginId, "started");
@@ -763,8 +874,7 @@ export class PluginLoader extends EventEmitter<{
       }
 
       // Update plugin state
-      const schemaContract = this.options.taskStore.preflightPluginSchema(pluginId, newPlugin.hooks);
-      if (schemaContract) await this.options.taskStore.runPluginSchemaInits([schemaContract]);
+      const schemaContract = await this.preparePluginSchema(pluginId, newPlugin.hooks);
       newPlugin.state = "started";
 
       // Replace in plugins map
@@ -896,28 +1006,6 @@ export class PluginLoader extends EventEmitter<{
     }
 
     return plugin;
-  }
-
-  private checkVersionCompatibility(requiredVersion: string): boolean {
-    // Simple version comparison for now
-    // In a real implementation, use a proper semver library
-    const required = this.parseVersion(requiredVersion);
-    const minimum = this.parseVersion(MINIMUM_FUSION_VERSION);
-
-    if (required.major > minimum.major) return false;
-    if (required.major < minimum.major) return true;
-    if (required.minor > minimum.minor) return false;
-    if (required.minor < minimum.minor) return true;
-    return required.patch <= minimum.patch;
-  }
-
-  private parseVersion(version: string): { major: number; minor: number; patch: number } {
-    const parts = version.split(".").map(Number);
-    return {
-      major: parts[0] || 0,
-      minor: parts[1] || 0,
-      patch: parts[2] || 0,
-    };
   }
 
   private async resolveDependencies(plugin: FusionPlugin): Promise<void> {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildDevChildEnv,
   buildForwardedDevArgs,
   buildDevNodeArgs,
   getPrebuildCommand,
@@ -30,6 +31,18 @@ describe("buildDevNodeArgs", () => {
       "--host",
       "0.0.0.0",
     ]);
+  });
+});
+
+describe("buildDevChildEnv", () => {
+  it("does not impersonate the command supervisor in the source wrapper", () => {
+    expect(
+      buildDevChildEnv({
+        KEEP: "yes",
+        FUSION_RESTART_SUPERVISED: "1",
+        FUSION_SUPERVISOR_PID: "1234",
+      }),
+    ).toEqual({ KEEP: "yes" });
   });
 });
 

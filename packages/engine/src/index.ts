@@ -4,6 +4,7 @@ export * from "./session-connector-ingestion.js";
 export * from "./room-session-connector-ingestion-persistence.js";
 export * from "./room-delivery-coordinator.js";
 export * from "./room-existing-session-spine.js";
+export * from "./room-participant-run-task-projection.js";
 export * from "./room-existing-session-preflight.js";
 export * from "./room-evolution-runtime.js";
 export * from "./project-room-command-gateway.js";

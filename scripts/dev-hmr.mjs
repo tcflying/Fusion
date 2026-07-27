@@ -5,7 +5,7 @@
  * live API/WebSocket backend.
  *
  * Two processes:
- *   1. API:  `pnpm dev --prebuild=none dashboard --no-auth --port <API_PORT>`
+ *   1. API:  `pnpm dev --prebuild=none dashboard --port <API_PORT>`
  *            (source-mode API/engine; Vite serves the browser UI)
  *   2. Vite: `vite dev` in packages/dashboard
  *            (serves app/ with HMR; proxies /api and WS to the API)
@@ -21,6 +21,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -30,6 +31,20 @@ const dashboardDir = resolve(repoRoot, "packages/dashboard");
 
 const API_PORT = globalThis.process.env.FUSION_API_PORT ?? "4050";
 const VITE_PORT = globalThis.process.env.FUSION_VITE_PORT ?? "5173";
+/*
+FNXC:DevHmrAuth 2026-07-27-03:54:
+HMR remains authenticated without exposing a token to browser JavaScript.
+The Vite proxy and API child share one server-only token; the proxy injects
+the bearer header for HTTP and WebSocket upstream requests.
+*/
+const DASHBOARD_TOKEN =
+  globalThis.process.env.FUSION_DASHBOARD_TOKEN ??
+  `fn_hmr_${randomBytes(24).toString("hex")}`;
+const childEnv = {
+  ...globalThis.process.env,
+  FUSION_API_PORT: API_PORT,
+  FUSION_DASHBOARD_TOKEN: DASHBOARD_TOKEN,
+};
 
 const children = [];
 let shuttingDown = false;
@@ -94,8 +109,8 @@ launch(
   "api",
   "32",
   "pnpm",
-  ["dev", "--prebuild=none", "dashboard", "--no-auth", "--port", API_PORT, "--host", "127.0.0.1"],
-  { cwd: repoRoot, env: { ...globalThis.process.env, FUSION_API_PORT: API_PORT } },
+  ["dev", "--prebuild=none", "dashboard", "--port", API_PORT, "--host", "127.0.0.1"],
+  { cwd: repoRoot, env: childEnv },
 );
 
 // Vite: cyan. Starts once; proxies /api (including WS) to the API port.
@@ -104,5 +119,5 @@ launch(
   "36",
   "pnpm",
   ["exec", "vite", "dev", "--port", VITE_PORT],
-  { cwd: dashboardDir, env: { ...globalThis.process.env, FUSION_API_PORT: API_PORT } },
+  { cwd: dashboardDir, env: childEnv },
 );

@@ -8,11 +8,10 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const WORKFLOW_THINKING_LEVEL_SET: ReadonlySet<string> = new Set(THINKING_LEVELS);
-
 import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
-import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
+import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
 import { RetryStormError, TaskDeletedError, serializeRetryStormError, isExperimentalFeatureEnabled, resolveWorkflowIrForTask, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, AgentStore } from "@fusion/core";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
@@ -1759,7 +1758,8 @@ export interface TaskExecutorOptions {
   pluginRunner?: PluginRunner;
   /** MessageStore for sending messages to other agents. When provided, executor agents gain fn_send_message capability. */
   messageStore?: import("@fusion/core").MessageStore;
-  missionStore?: MissionStore;
+  /** FNXC:PostgresMissionRuntimeParity 2026-07-27-03:51: Transports the awaited mission-store union without forcing PostgreSQL callers to use a synchronous store. */
+  missionStore?: MissionStore | AsyncMissionStore;
   secretsStore?: Pick<import("@fusion/core").SecretsStore, "listEnvExportable">;
   onSliceComplete?: (slice: Slice) => void;
   onStart?: (task: Task, worktreePath: string) => void;
@@ -2633,7 +2633,10 @@ export class TaskExecutor {
   private get approvalRequestStore(): ApprovalRequestStore {
     if (!this._approvalRequestStore) {
       const layer = this.store.getAsyncLayer();
-      this._approvalRequestStore = new ApprovalRequestStore(layer ? null : this.store.getDatabase(), { asyncLayer: layer });
+      if (!layer) {
+        throw new Error("TaskExecutor approval requests require an AsyncDataLayer");
+      }
+      this._approvalRequestStore = new ApprovalRequestStore(null, { asyncLayer: layer });
     }
     return this._approvalRequestStore;
   }

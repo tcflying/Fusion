@@ -6,7 +6,7 @@
  * - localhost only
  * - first free port at/above 4050
  * - dashboard/API with the AI engine unless --no-engine is passed
- * - no bearer-token auth on localhost
+ * - bearer-token auth on every host unless loopback --no-auth is explicit
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import net from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { shouldDisableLocalAuth } from "./lib/start-local-auth.mjs";
 import { hasLocalProjectMigrationInput } from "./lib/start-local-project.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -31,8 +32,8 @@ Options:
   --paused            Start with automation paused.
   --port <port>       Preferred port. Default: 4050. Port 4040 is reserved.
   --host <host>       Host to bind. Default: 127.0.0.1.
-  --auth              Keep bearer-token auth enabled on localhost.
-  --no-auth           Disable auth even for a non-localhost host.
+  --auth              Explicitly keep default bearer-token auth enabled.
+  --no-auth           Disable auth only on a verified loopback host.
   --prebuild <mode>   Startup prebuild: client, none, or full. Default: client.
   --skip-install      Do not auto-run pnpm install when node_modules is missing.
   --skip-register     Do not auto-register this repo in Fusion's project registry.
@@ -325,12 +326,6 @@ async function pickPort(preferredPort, host, allow4040) {
   fail(`No free port found from ${preferredPort} to ${Math.min(preferredPort + 49, 65535)} on ${host}`);
 }
 
-function shouldDisableAuth(opts) {
-  if (opts.noAuth) return true;
-  if (opts.auth) return false;
-  return opts.host === "127.0.0.1" || opts.host === "localhost" || opts.host === "::1";
-}
-
 function printSummary(opts, port, dashboardArgs) {
   const mode = opts.engine ? "dashboard + AI engine" : "dashboard/API only";
   const auth = dashboardArgs.includes("--no-auth") ? "disabled" : "enabled";
@@ -370,11 +365,7 @@ async function main() {
   const dashboardArgs = ["dashboard", "--host", opts.host, "--port", String(port)];
   if (!opts.engine) dashboardArgs.push("--no-engine");
   if (opts.paused) dashboardArgs.push("--paused");
-  if (shouldDisableAuth(opts)) dashboardArgs.push("--no-auth");
-
-  if (opts.host === "0.0.0.0" && dashboardArgs.includes("--no-auth")) {
-    warn("Auth is disabled while binding to 0.0.0.0. Only do this on a trusted network.");
-  }
+  if (shouldDisableLocalAuth(opts)) dashboardArgs.push("--no-auth");
 
   printSummary(opts, port, dashboardArgs);
 

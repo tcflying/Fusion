@@ -41,9 +41,10 @@
 
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { describe as vitestDescribe } from "vitest";
 import postgres from "postgres";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
@@ -66,13 +67,64 @@ import {
   centralTableNames,
   archiveTableNames,
 } from "../postgres/schema/index.js";
+import { resolveGlobalDirForHome } from "../global-settings.js";
+import {
+  DEFAULT_EMBEDDED_PASSWORD,
+  DEFAULT_EMBEDDED_USER,
+} from "../postgres/embedded-lifecycle.js";
 
 /**
- * Base URL for the test PostgreSQL server. Defaults to the local Homebrew
- * instance on localhost:5432. Override via FUSION_PG_TEST_URL_BASE.
+ * Resolve the test PostgreSQL authority without inheriting the operating-system
+ * account from a credential-less localhost URL.
  */
-export const PG_TEST_URL_BASE =
-  process.env.FUSION_PG_TEST_URL_BASE ?? "postgresql://localhost:5432";
+export function resolvePgTestUrlBase(options: {
+  configuredUrl?: string;
+  globalDir?: string;
+  readPostmasterPid?: (path: string) => string;
+} = {}): string {
+  const configuredUrl = options.configuredUrl?.trim();
+  if (configuredUrl) {
+    return configuredUrl;
+  }
+
+  /*
+   * FNXC:EmbeddedPgTestAuthority 2026-07-27-03:43:
+   * A bare `postgresql://localhost:5432` makes postgres.js authenticate as the
+   * current Windows user (for example `datoo`) and treats a listening but
+   * unrelated PostgreSQL service as Fusion's test authority. Prefer Fusion's
+   * own embedded test cluster and its canonical credentials. If it is absent,
+   * return an empty authority so pgDescribe skips instead of mutating an
+   * arbitrary local server.
+   */
+  const postmasterPidPath = join(
+    options.globalDir ?? resolveGlobalDirForHome(homedir()),
+    "embedded-postgres",
+    "test",
+    "postmaster.pid",
+  );
+  try {
+    const content = (options.readPostmasterPid ?? ((path) => readFileSync(path, "utf8")))(
+      postmasterPidPath,
+    );
+    const lines = content.split(/\r?\n/);
+    const pid = Number.parseInt(lines[0] ?? "", 10);
+    const port = Number.parseInt(lines[3] ?? "", 10);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isSafeInteger(port) || port <= 0 || port > 65_535) {
+      return "";
+    }
+    return `postgresql://${DEFAULT_EMBEDDED_USER}:${DEFAULT_EMBEDDED_PASSWORD}@127.0.0.1:${port}`;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Base URL for the test PostgreSQL server. An explicit environment override
+ * wins; otherwise the currently running Fusion embedded test cluster is used.
+ */
+export const PG_TEST_URL_BASE = resolvePgTestUrlBase({
+  configuredUrl: process.env.FUSION_PG_TEST_URL_BASE,
+});
 
 /**
  * FNXC:FixPgTestsAndCi 2026-06-26-09:00:
@@ -205,6 +257,8 @@ export const pgDescribe: typeof vitestDescribe = PG_AVAILABLE
 export interface PgTestHarness {
   /** A TaskStore constructed in backend mode (asyncLayer injected, no SQLite). */
   readonly store: TaskStore;
+  /** The raw connection set for migration-focused fixtures that need a scoped layer. */
+  readonly connections: PostgresConnections;
   /** The AsyncDataLayer backing the store. Use `.db` for Drizzle queries. */
   readonly layer: AsyncDataLayer;
   /** A separate admin Drizzle connection for direct row inspection/seeding. */
@@ -810,6 +864,7 @@ export async function createTaskStoreForTest(options?: {
 
   return {
     store,
+    connections,
     layer,
     adminDb,
     rootDir,

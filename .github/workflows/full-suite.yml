@@ -204,11 +204,9 @@ jobs:
       - name: Setup Node.js and pnpm
         uses: ./.github/actions/setup-node-pnpm
 
-      # FNXC:TestInfrastructure 2026-06-21-10:26:
-      # Keep line-count drift visible in automated post-merge signal without restoring it to the blocking PR gate.
-      # The guard is intentionally absent from pretest/pr-checks so task verification and merge progress are not blocked by file-size cleanup work.
+      # FNXC:CI 2026-07-27-17:02:
+      # FUS-P1-009 turns the production line-count ratchet into a real CI gate. Grandfathered files may retain only their frozen ceiling; fresh growth and newly oversized tracked or untracked source files must fail this job.
       - name: Run line-count audit
-        continue-on-error: true
         run: pnpm check:line-count
 
   # The engine-slow tier (src/**/*.slow.test.ts) runs here with a non-empty

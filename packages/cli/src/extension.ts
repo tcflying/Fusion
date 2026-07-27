@@ -77,6 +77,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { executeExtensionSkillsSearch } from "./extension-skills-search.js";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -5436,41 +5437,7 @@ export default function kbExtension(pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      // Dynamic import to match existing extension patterns
-      const { searchSkills, formatInstalls } = await import("./commands/skills.js");
-
-      const skills = await searchSkills(params.query, params.limit ?? 10);
-
-      if (skills.length === 0) {
-        return {
-          content: [{ type: "text", text: `No skills found for '${params.query}'` }],
-          details: { count: 0, skills: [] },
-        };
-      }
-
-      const lines: string[] = [];
-      lines.push(`Found ${skills.length} skills matching '${params.query}':\n`);
-
-      for (let i = 0; i < skills.length; i++) {
-        const skill = skills[i]!;
-        const installs = formatInstalls(skill.installs);
-        lines.push(`${i + 1}. ${skill.name} (${skill.source})${installs ? ` — ${installs}` : ""}`);
-      }
-
-      lines.push("\nInstall a skill with: fn_skills_install({ source: \"<owner/repo>\", skill: \"<name>\" })");
-
-      return {
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: {
-          count: skills.length,
-          skills: skills.map((s) => ({
-            name: s.name,
-            source: s.source,
-            installs: s.installs,
-            installCommand: `fn skills install ${s.source} --skill ${s.name}`,
-          })),
-        },
-      };
+      return executeExtensionSkillsSearch(params);
     },
   });
 

@@ -32,10 +32,13 @@ function createMockAsyncLayer(opts?: {
   configRow?: Record<string, unknown>;
   taskRows?: Record<string, unknown>[];
   mergeQueueRows?: Record<string, unknown>[];
+  projectId?: string;
+  selectRows?: Record<string, unknown>[];
 }): AsyncDataLayer {
   const configRow = opts?.configRow ?? { id: 1, settings: { taskPrefix: "KB" }, nextId: 1, nextWorkflowStepId: 1 };
   const taskRows = opts?.taskRows ?? [];
   const mergeQueueRows = opts?.mergeQueueRows ?? [];
+  const selectRows = opts?.selectRows ?? [configRow];
 
   // A chainable awaitable that resolves to `result` regardless of how it's chained.
   function awaitableChain(result: unknown): unknown {
@@ -54,7 +57,7 @@ function createMockAsyncLayer(opts?: {
   }
 
   const mockDb = {
-    select: vi.fn().mockReturnValue(awaitableChain([configRow])),
+    select: vi.fn().mockReturnValue(awaitableChain(selectRows)),
     insert: vi.fn().mockReturnValue(awaitableChain(undefined)),
     update: vi.fn().mockReturnValue(awaitableChain(undefined)),
     execute: vi.fn().mockReturnValue(awaitableChain(undefined)),
@@ -62,12 +65,48 @@ function createMockAsyncLayer(opts?: {
 
   return {
     db: mockDb as unknown as AsyncDataLayer["db"],
+    projectId: opts?.projectId,
     transaction: vi.fn().mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockDb)),
     transactionImmediate: vi.fn().mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockDb)),
     ping: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
   };
 }
+
+describe("runtime-persistence-async: run-audit project scope", () => {
+  it("uses the bound query scope while preserving event projectId for every dashboard audit type", async () => {
+    const mutationTypes = [
+      "session:runtime-resolved",
+      "merge:integration-ref-advance",
+      "merge:integration-worktree-state",
+      "merge:auto-sync",
+    ];
+    const layer = createMockAsyncLayer({
+      projectId: "project-alpha",
+      selectRows: mutationTypes.map((mutationType, index) => ({
+        id: `audit-${index + 1}`,
+        timestamp: `2026-07-27T00:00:0${index}.000Z`,
+        projectId: "project-alpha",
+        taskId: "FN-001",
+        agentId: "agent-1",
+        runId: "run-1",
+        domain: mutationType === "session:runtime-resolved" ? "database" : "git",
+        mutationType,
+        target: "FN-001",
+        metadata: { mutationType },
+      })),
+    });
+    const store = new TaskStore("/project-alpha", undefined, { asyncLayer: layer });
+
+    const events = await store.getRunAuditEventsAsync();
+
+    expect(events.map((event) => event.mutationType)).toEqual(mutationTypes);
+    expect(events.every((event) => event.projectId === "project-alpha")).toBe(true);
+    await expect(store.getRunAuditEventsAsync({ projectId: "project-beta" })).rejects.toMatchObject({
+      code: "run_audit_event_project_scope_required",
+    });
+  });
+});
 
 describe("runtime-persistence-async: settings delegation", () => {
   let rootDir: string;

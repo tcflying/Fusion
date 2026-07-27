@@ -350,13 +350,33 @@ export class StaleBinarySchemaError extends Error {
     readonly databaseVersion: string,
     readonly binaryVersion: string,
   ) {
+    /*
+    FNXC:CliBuildGeneration 2026-07-27-05:07:
+    A newer PostgreSQL ledger is a dist-generation mismatch, not an opaque
+    migration failure. Name both generations so CLI and Dashboard startup logs
+    direct the operator to rebuild/upgrade the whole compatibility artifact.
+    */
     super(
-      `This Fusion binary is older than the database it opened: the database has schema `
-      + `migration ${databaseVersion} applied, but this binary only knows up to `
-      + `${binaryVersion}. Refusing to open so an old binary cannot write rows the newer `
-      + `schema's invariants depend on. Upgrade Fusion (e.g. \`brew upgrade fusion\`) and retry.`,
+      `Fusion dist stale: PostgreSQL schema ${databaseVersion} is newer than this runtime's `
+      + `build-info schema ${binaryVersion}. Refusing to open so older CLI/Dashboard/plugin `
+      + `bytes cannot write rows the newer schema's invariants depend on. Rebuild or upgrade `
+      + `the complete Fusion compatibility artifact and retry.`,
     );
     this.name = "StaleBinarySchemaError";
+  }
+}
+
+export class DistBuildInfoSchemaError extends Error {
+  constructor(
+    readonly distBuildInfoVersion: string,
+    readonly bundledRuntimeVersion: string,
+  ) {
+    super(
+      `Fusion dist stale: CLI dist build-info schema ${distBuildInfoVersion} does not match `
+      + `bundled runtime schema ${bundledRuntimeVersion}. Rebuild the complete CLI/Dashboard/plugin `
+      + `compatibility artifact before opening PostgreSQL.`,
+    );
+    this.name = "DistBuildInfoSchemaError";
   }
 }
 
@@ -377,6 +397,24 @@ skipping non-numeric versions, or the marker would present as a "newer database"
 brick every open.
 */
 export function assertBinaryNotOlderThanDatabase(applied: readonly string[]): void {
+  /*
+  FNXC:CliBuildGeneration 2026-07-27-05:09:
+  bin.mjs publishes the attested schema generation through a process-local env
+  value. The first PostgreSQL schema read must prove that metadata describes the
+  bundled Core code before comparing either generation with the database.
+  */
+  const distBuildInfoVersion =
+    process.env.FUSION_CLI_DIST_SCHEMA_VERSION?.trim();
+  if (
+    distBuildInfoVersion
+    && distBuildInfoVersion !== SCHEMA_BASELINE_VERSION
+  ) {
+    throw new DistBuildInfoSchemaError(
+      distBuildInfoVersion,
+      SCHEMA_BASELINE_VERSION,
+    );
+  }
+
   const binaryVersion = Number(SCHEMA_BASELINE_VERSION);
   if (!Number.isFinite(binaryVersion)) return;
   let highest = -Infinity;

@@ -19,7 +19,12 @@ import {
   type RoomCapacityGovernorPolicyV1,
   type RoomCapacityGovernorTelemetryV1,
 } from "./room-capacity-governor.js";
-import type { RoomTaskDispatchCapacityAdmissionSource } from "./room-dependency-dispatch-coordinator.js";
+import type {
+  RoomTaskDispatchCapacityAdmissionSource,
+  RoomTaskDispatchCapacitySourceFailureCode,
+  RoomTaskDispatchCapacitySourceFailureStage,
+  RoomTaskDispatchCapacitySourceFailureV1,
+} from "./room-dependency-dispatch-coordinator.js";
 
 export const ROOM_TASK_DISPATCH_CAPACITY_ADMISSION_POLICY_CONTRACT_VERSION = 1 as const;
 
@@ -109,6 +114,17 @@ export interface CreateRoomTaskDispatchCapacityAdmissionSourceOptions {
 type CapacityAdmissionInputV1 = Parameters<
   RoomTaskDispatchCapacityAdmissionSource["getCapacityGovernorInput"]
 >[0];
+
+function capacitySourceFailure(
+  reasonCode: RoomTaskDispatchCapacitySourceFailureCode,
+  stage: RoomTaskDispatchCapacitySourceFailureStage
+): RoomTaskDispatchCapacitySourceFailureV1 {
+  return Object.freeze({
+    state: "withheld",
+    reasonCode,
+    stage,
+  });
+}
 
 interface SelectedCapabilityV1 {
   readonly recommendation: RoomCapabilityRegistry.RoomCapabilityRecommendationV1;
@@ -565,23 +581,54 @@ export class VerifiedRoomTaskDispatchCapacityAdmissionSource
 
   async getCapacityGovernorInput(
     input: CapacityAdmissionInputV1
-  ): Promise<RoomCapacityGovernorInputV1 | null> {
+  ): Promise<
+    RoomCapacityGovernorInputV1
+    | RoomTaskDispatchCapacitySourceFailureV1
+    | null
+  > {
     try {
       return await this.getCapacityGovernorInputUnchecked(input);
     } catch {
-      return null;
+      return capacitySourceFailure(
+        "capacity_source_internal_error",
+        "source_internal"
+      );
     }
   }
 
   private async getCapacityGovernorInputUnchecked(
     input: CapacityAdmissionInputV1
-  ): Promise<RoomCapacityGovernorInputV1 | null> {
-    if (!isCanonicalTimestamp(input.asOf)) return null;
+  ): Promise<
+    RoomCapacityGovernorInputV1
+    | RoomTaskDispatchCapacitySourceFailureV1
+  > {
+    if (!isCanonicalTimestamp(input.asOf)) {
+      return capacitySourceFailure(
+        "capacity_request_invalid",
+        "request_validation"
+      );
+    }
     const policy = verifiedPolicy(this.policy, input.asOf);
+    if (!policy) {
+      return capacitySourceFailure(
+        "capacity_policy_unverified",
+        "policy_validation"
+      );
+    }
     const roomAndGraph = validRoomAndGraph(input);
-    if (!policy || !roomAndGraph) return null;
+    if (!roomAndGraph) {
+      return capacitySourceFailure(
+        "capacity_snapshot_invalid",
+        "snapshot_validation"
+      );
+    }
     const selection = selectedCapability(input, policy, roomAndGraph);
-    if (!selection) return null;
+    if (!selection) {
+      return capacitySourceFailure(
+        "capacity_binding_selection_unavailable",
+        "binding_selection"
+      );
+    }
 
     let observation: RoomTaskDispatchVerifiedCapacityTelemetryObservationV1 | null;
     try {
@@ -597,10 +644,22 @@ export class VerifiedRoomTaskDispatchCapacityAdmissionSource
         },
       });
     } catch {
-      return null;
+      return capacitySourceFailure(
+        "capacity_telemetry_observer_failed",
+        "telemetry_observation"
+      );
     }
-    if (!observation || !observationHasConsistentTelemetry(observation, selection, roomAndGraph, policy, input.asOf)) {
-      return null;
+    if (!observation) {
+      return capacitySourceFailure(
+        "capacity_telemetry_missing",
+        "telemetry_observation"
+      );
+    }
+    if (!observationHasConsistentTelemetry(observation, selection, roomAndGraph, policy, input.asOf)) {
+      return capacitySourceFailure(
+        "capacity_telemetry_invalid",
+        "telemetry_validation"
+      );
     }
 
     const governorInput: RoomCapacityGovernorInputV1 = {
@@ -618,7 +677,12 @@ export class VerifiedRoomTaskDispatchCapacityAdmissionSource
       capabilityRegistry: input.capabilityRegistryProof,
     };
     const validation = governRoomCapacity(governorInput);
-    if (validation.issues.length > 0 || validation.telemetry.state !== "fresh") return null;
+    if (validation.issues.length > 0 || validation.telemetry.state !== "fresh") {
+      return capacitySourceFailure(
+        "capacity_governor_input_invalid",
+        "governor_validation"
+      );
+    }
     return cloneAndFreeze(governorInput);
   }
 }

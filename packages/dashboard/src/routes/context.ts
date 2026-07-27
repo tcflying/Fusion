@@ -324,7 +324,17 @@ export function createApiRoutesContext(store: TaskStore, options?: ServerOptions
 
     let fallback = fallbackProjectLoaders.get(scopedStore);
     if (!fallback) {
-      const loader = new PluginLoader({ pluginStore: scopedPluginStore as PluginStore, taskStore: scopedStore });
+      /*
+       * FNXC:PluginVersionPropagation 2026-07-27-23:20:
+       * A request-scoped loader is still hosted by this Dashboard process. Preserve the
+       * host package version so compatible runtime plugins do not fall back to core's
+       * development version during authenticated cross-project requests.
+       */
+      const loader = new PluginLoader({
+        pluginStore: scopedPluginStore as PluginStore,
+        taskStore: scopedStore,
+        fusionVersion: options?.fusionVersion,
+      });
       /*
       FNXC:PluginEnablementScope 2026-07-21-20:15:
       Dashboard-only projects lack an engine startup pass, so initialize their persistent scoped
@@ -366,6 +376,7 @@ export function createApiRoutesContext(store: TaskStore, options?: ServerOptions
         const fallbackLoader = new PluginLoader({
           pluginStore: context.store.getPluginStore() as PluginStore,
           taskStore: context.store,
+          fusionVersion: options?.fusionVersion,
         });
         fallback = {
           loader: fallbackLoader,
@@ -385,6 +396,7 @@ export function createApiRoutesContext(store: TaskStore, options?: ServerOptions
         createScopedLoader: (otherStore) => new PluginLoader({
           pluginStore: otherStore.getPluginStore() as PluginStore,
           taskStore: otherStore as TaskStore,
+          fusionVersion: options?.fusionVersion,
         }),
       });
       projectMcpProviders.set(loader, provider);
