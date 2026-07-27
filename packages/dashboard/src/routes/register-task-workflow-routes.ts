@@ -3284,7 +3284,7 @@ export function registerTaskWorkflowRoutes(ctx: ApiRoutesContext, deps: TaskWork
       if (err instanceof ApiError) {
         throw err;
       }
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err instanceof Error && err.message === `Task ${req.params.id} not found`)) {
         throw notFound(`Task ${req.params.id} not found`);
       } else {
         rethrowAsApiError(err);
