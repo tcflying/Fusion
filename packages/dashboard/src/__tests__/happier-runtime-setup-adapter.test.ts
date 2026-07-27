@@ -275,4 +275,42 @@ describe("buildHappierRuntimeSetupStatus", () => {
       ],
     });
   });
+
+  it("keeps an available identity unverified when only its capability probe is withheld", () => {
+    const status = buildHappierRuntimeSetupStatus({
+      settings: {
+        backend: "codex",
+        activeServerId: "server-main",
+        happierSessionBindings: [{
+          canonicalSessionUri: "codex://threads/native-1",
+          happierSessionId: "happy-1",
+          serverProfileId: "server-main",
+          machineId: "machine-a",
+        }],
+      },
+      runtimeHealth: {
+        discovered: true, executable: true, server: true, serverState: "reachable",
+        authenticated: true, daemon: true, backend: true, ready: true,
+        backendId: "codex", modelId: null, modelState: "not_reported",
+        attestation: { ok: false, reasonCode: "cli_version_probe_failed" }, details: [],
+      },
+      connectorHealth: null,
+      capabilityEvidence: [{
+        canonicalSessionUri: "codex://threads/native-1", providerId: "codex",
+        happierSessionId: "happy-1", serverProfileId: "server-main", machineId: "machine-a",
+        state: "unavailable", toolNames: [], sampledAt: "2026-07-27T08:00:01.000Z", latencyMs: 20,
+      }],
+      nativeDiscovery: { state: "available", candidates: [{
+        canonicalSessionUri: "codex://threads/native-1", providerId: "codex",
+        nativeSessionId: "native-1", sourceSessionId: "cli-1",
+      }] },
+      happierDiscovery: { state: "available", candidates: [{ happierSessionId: "happy-1", updatedAt: 10 }] },
+    });
+
+    expect(status.failClosed).toBe(true);
+    expect(status.bindings[0]).toMatchObject({
+      state: "unverified",
+      driftReasons: ["probe-unavailable"],
+    });
+  });
 });

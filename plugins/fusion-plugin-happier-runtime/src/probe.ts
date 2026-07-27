@@ -263,8 +263,20 @@ export async function probeHappierRuntime(
 
   if (executable) {
     let authServerUnreachable = false;
-    try {
-      const authRaw = await dependencies.run(["auth", "status", "--json"], settings);
+    /*
+     * The three host observations are independent. Running them serially made
+     * one slow `status --json` consume the whole setup budget before the bound
+     * session could be checked. Each child still owns its own timeout and
+     * process-tree cleanup; concurrency changes latency, not trust criteria.
+     */
+    const [authAttempt, statusAttempt, profilesAttempt] = await Promise.allSettled([
+      dependencies.run(["auth", "status", "--json"], settings),
+      dependencies.run(["status", "--json"], settings),
+      dependencies.run(["profiles", "list", "--json"], settings),
+    ]);
+    if (authAttempt.status === "fulfilled") {
+      try {
+        const authRaw = authAttempt.value;
       const auth = await parseHappierJson(authRaw.stdout, 64 * 1024);
       authenticated = authRaw.exitCode === 0 && authFromEnvelope(auth);
       if (!authenticated) {
@@ -273,7 +285,11 @@ export async function probeHappierRuntime(
         if (authServerUnreachable) details.push("server-unreachable");
         details.push("authentication-required");
       }
-    } catch (error) {
+      } catch {
+        details.push("authentication-invalid");
+      }
+    } else {
+      const error = authAttempt.reason;
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "authentication-timeout" : "authentication-invalid");
     }
 
@@ -282,8 +298,9 @@ export async function probeHappierRuntime(
     if (authServerUnreachable) serverState = "unreachable";
     server = false;
 
-    try {
-      const status = parseRawJson(await dependencies.run(["status", "--json"], settings));
+    if (statusAttempt.status === "fulfilled") {
+      try {
+        const status = parseRawJson(statusAttempt.value);
       const daemonStatus = isRecord(status.daemonStatus) ? status.daemonStatus : status;
       const daemonRecord = isRecord(daemonStatus.daemon) ? daemonStatus.daemon : undefined;
       daemon = daemonRecord?.running === true;
@@ -294,13 +311,19 @@ export async function probeHappierRuntime(
       server = serverState === "reachable";
       if (!server) details.push(serverState === "unreachable" ? "server-unreachable" : "server-not-probed");
       if (!daemon) details.push("daemon-stopped");
-    } catch (error) {
+      } catch {
+        details.push("status-invalid");
+        if (serverState === "not-probed") details.push("server-not-probed");
+      }
+    } else {
+      const error = statusAttempt.reason;
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "status-timeout" : "status-invalid");
       if (serverState === "not-probed") details.push("server-not-probed");
     }
 
-    try {
-      const profilesRaw = await dependencies.run(["profiles", "list", "--json"], settings);
+    if (profilesAttempt.status === "fulfilled") {
+      try {
+        const profilesRaw = profilesAttempt.value;
       const profiles = await parseHappierJson(profilesRaw.stdout, 64 * 1024);
       const profileAvailable = profileSupportsBackend(profiles, backendId);
       const binding = resolveHealthBinding(settings, backendId);
@@ -316,22 +339,32 @@ export async function probeHappierRuntime(
          */
         details.push("backend-machine-availability-unverified");
       } else {
-        const sessionStatusRaw = await dependencies.run(
-          ["session", "status", binding.happierSessionId, "--live", "--json"],
-          settings,
-        );
-        const sessionStatus = await parseHappierJson(sessionStatusRaw.stdout, 64 * 1024);
-        const modelInventoryRaw = await dependencies.run([
-          "session",
-          "actions",
-          "execute",
-          binding.happierSessionId,
-          "agents.models.list",
-          "--input-json",
-          JSON.stringify({ agentId: backendId, limit: 200 }),
-          "--json",
-        ], settings);
-        const modelInventory = await parseHappierJson(modelInventoryRaw.stdout, 64 * 1024);
+        const [sessionStatusAttempt, modelInventoryAttempt] = await Promise.allSettled([
+          dependencies.run(
+            ["session", "status", binding.happierSessionId, "--live", "--json"],
+            settings,
+          ),
+          dependencies.run([
+            "session",
+            "actions",
+            "execute",
+            binding.happierSessionId,
+            "agents.models.list",
+            "--input-json",
+            JSON.stringify({ agentId: backendId, limit: 200 }),
+            "--json",
+          ], settings),
+        ]);
+        if (sessionStatusAttempt.status !== "fulfilled" || modelInventoryAttempt.status !== "fulfilled") {
+          if (sessionStatusAttempt.status === "rejected") throw sessionStatusAttempt.reason;
+          if (modelInventoryAttempt.status === "rejected") throw modelInventoryAttempt.reason;
+        }
+        const sessionStatusRaw = sessionStatusAttempt.value;
+        const modelInventoryRaw = modelInventoryAttempt.value;
+        const [sessionStatus, modelInventory] = await Promise.all([
+          parseHappierJson(sessionStatusRaw.stdout, 64 * 1024),
+          parseHappierJson(modelInventoryRaw.stdout, 64 * 1024),
+        ]);
         backend = sessionStatusRaw.exitCode === 0
           && modelInventoryRaw.exitCode === 0
           && isExactBoundSessionStatus(sessionStatus, binding.happierSessionId)
@@ -348,7 +381,11 @@ export async function probeHappierRuntime(
           details.push("backend-machine-availability-unverified");
         }
       }
-    } catch (error) {
+      } catch (error) {
+        details.push(error instanceof HappierCliError && error.code === "timeout" ? "backend-timeout" : "backend-invalid");
+      }
+    } else {
+      const error = profilesAttempt.reason;
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "backend-timeout" : "backend-invalid");
     }
   }

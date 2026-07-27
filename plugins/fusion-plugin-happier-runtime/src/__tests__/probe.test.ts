@@ -200,6 +200,38 @@ describe("probeHappierRuntime", () => {
     });
   });
 
+  it("starts independent host observations concurrently after executable verification", async () => {
+    const pending = new Map<string, (value: typeof authOk) => void>();
+    const started: string[] = [];
+    const command = (args: readonly string[]) => args.join(" ");
+    const dependency: HappierProbeDependencies = {
+      attestCli: async () => attestationOk,
+      run: async (args) => {
+        const key = command(args);
+        if (key === "codex --help") return help;
+        started.push(key);
+        return new Promise((resolve) => pending.set(key, resolve));
+      },
+    };
+
+    const result = probeHappierRuntime({}, dependency);
+    await vi.waitFor(() => expect(started.sort()).toEqual([
+      "auth status --json",
+      "profiles list --json",
+      "status --json",
+    ]));
+    pending.get("auth status --json")?.(authOk);
+    pending.get("status --json")?.(status());
+    pending.get("profiles list --json")?.(profiles);
+
+    await expect(result).resolves.toMatchObject({
+      authenticated: true,
+      daemon: true,
+      server: true,
+      backend: false,
+    });
+  });
+
   it("distinguishes an unreachable server", async () => {
     const health = await probeHappierRuntime({}, runner({
       "codex --help": help,

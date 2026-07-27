@@ -57,7 +57,10 @@ function stringSetting(settings: Record<string, unknown>, key: string, maximum =
   return safeHappierSettingString(settings[key], maximum);
 }
 
-export const HAPPIER_SETUP_READ_TIMEOUT_MS = 12_000;
+/* Windows process-tree termination is part of a timed CLI observation. Keep the
+ * setup response bounded while allowing one 5s command to be reaped and the
+ * independently verified bound-session observations to finish. */
+export const HAPPIER_SETUP_READ_TIMEOUT_MS = 20_000;
 const HAPPIER_SETUP_OPERATION_TIMEOUT_MS = 5_000;
 
 function boundedHappierSetupSettings(settings: Record<string, unknown>): HappierCliSettings {
@@ -189,10 +192,12 @@ export function buildHappierRuntimeSetupStatus(
       && sources.runtimeHealth.details.includes("backend-machine-availability-unverified");
     if (openCodeMachineUnverified) driftReasons.push("machine-availability-unverified");
 
+    // A failed or withheld probe cannot establish that the exact remote
+    // identity changed. Keep it fail-closed, but render it as unverified so
+    // operators can distinguish transient observation loss from real drift.
     const hasKnownDrift = driftReasons.some((reason) =>
       reason === "native-session-missing"
-      || reason === "happier-session-missing"
-      || reason === "probe-unavailable");
+      || reason === "happier-session-missing");
     const state: HappierBindingState = conflicts.length > 0
       ? "conflict"
       : hasKnownDrift
