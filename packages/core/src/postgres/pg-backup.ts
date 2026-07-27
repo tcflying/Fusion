@@ -35,7 +35,8 @@
 import { execFile } from "node:child_process";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { homedir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -84,26 +85,19 @@ export interface PgBackupOptions {
   readonly includeCentral?: boolean;
   /**
    * FNXC:PostgresBackup 2026-06-26-17:30 (fix migration-review P1 #26):
-   * Override the pg_dump binary path (default: `pg_dump` resolved from PATH).
+   * Override the pg_dump binary path (default: discovered from PATH, the
+   * embedded runtime cache, or a standard Windows PostgreSQL installation).
    *
-   * REQUIREMENT: pg_dump and pg_restore are NOT bundled with the
-   * `embedded-postgres` package, which only ships `initdb`, `pg_ctl`, and the
-   * `postgres` server binary. Operators using the embedded backend (the
-   * default when DATABASE_URL is unset) MUST have `pg_dump` and `pg_restore`
-   * available on PATH for backup/restore to work. On macOS install via
-   * `brew install postgresql@15` (or libpq); on Linux use the system postgresql
-   * client package; on Windows use the PostgreSQL installer or the
-   * `PostgreSQL Binaries` zip. The major version of pg_dump SHOULD match the
-   * embedded server major version (15) to avoid format-incompatibility warnings.
-   *
-   * For a fully self-contained distribution, a future change may bundle the
-   * EnterpriseDB / Zonky pg_dump binaries alongside the embedded server; until
-   * then, the requirement is documented here and surfaced as a clear error if
-   * the binary is missing when a backup is attempted.
+   * `embedded-postgres` currently ships server binaries only. On Windows,
+   * Fusion also discovers clients already installed under
+   * `%ProgramFiles%\\PostgreSQL\\<version>\\bin` and clients materialized with a
+   * bundled embedded runtime. No database data is touched while resolving a
+   * client. Set this explicit path when a non-standard client location must win.
    */
   readonly pgDumpPath?: string;
   /**
-   * Override the pg_restore binary path (default: `pg_restore` from PATH).
+   * Override the pg_restore binary path (default: uses the same discovery as
+   * {@link PgBackupOptions.pgDumpPath}).
    * See {@link PgBackupOptions.pgDumpPath} for the bundling/availability note.
    */
   readonly pgRestorePath?: string;
@@ -134,7 +128,59 @@ the matching major version (15) and its successors. When nothing resolves we
 keep the bare name so the eventual error stays actionable ("pg_dump failed:
 ... ENOENT" + the install guidance in PgBackupOptions.pgDumpPath).
 */
-function resolveClientBinary(name: "pg_dump" | "pg_restore"): string {
+export interface PgClientBinaryResolutionOptions {
+  readonly platform?: NodeJS.Platform;
+  readonly arch?: string;
+  readonly home?: string;
+  readonly execDir?: string;
+  readonly path?: string;
+  readonly embeddedRuntimeDir?: string;
+  readonly programFilesRoots?: readonly string[];
+}
+
+const WINDOWS_POSTGRES_CLIENT_VERSIONS = ["15", "16", "17", "18", "14", "13", "12"] as const;
+
+/**
+ * Find an existing PostgreSQL client without changing PATH or touching a
+ * database. This is deliberately discovery-only: custom paths still take
+ * precedence through PgBackupOptions, and a missing client returns the bare
+ * command so execFile preserves its normal actionable ENOENT error.
+ */
+export function resolvePgClientBinary(
+  name: "pg_dump" | "pg_restore",
+  options: PgClientBinaryResolutionOptions = {},
+): string {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const binaryName = platform === "win32" ? `${name}.exe` : name;
+  const pathDelimiter = platform === "win32" ? ";" : delimiter;
+  const pathDirs = (options.path ?? process.env.PATH ?? "").split(pathDelimiter).filter(Boolean);
+
+  // PATH remains the explicit operator preference, but resolve its actual file
+  // so Windows does not rely on PATHEXT handling inside child_process.
+  for (const dir of pathDirs) {
+    const candidate = join(dir, binaryName);
+    if (existsSync(candidate)) return candidate;
+  }
+
+  const home = options.home ?? homedir();
+  const execDir = options.execDir ?? dirname(process.execPath);
+  const embeddedRuntimeDir = options.embeddedRuntimeDir ?? process.env.FUSION_EMBEDDED_PG_RUNTIME_DIR;
+  const bundledCandidates = [
+    // Existing desktop materialization cache. Current upstream payloads omit
+    // clients, but this supports a package that ships them without an external install.
+    join(home, ".fusion", "embedded-postgres", "runtime-bin", `${platform}-${arch}`, "bin", binaryName),
+    ...(embeddedRuntimeDir ? [join(embeddedRuntimeDir, "native", "bin", binaryName)] : []),
+    // Standalone fn packages stage the embedded payload next to the executable.
+    join(execDir, "runtime", `${platform}-${arch}`, "embedded-postgres", "native", "bin", binaryName),
+    ...(platform === "win32"
+      ? [join(execDir, "runtime", `windows-${arch}`, "embedded-postgres", "native", "bin", binaryName)]
+      : []),
+  ];
+  for (const candidate of bundledCandidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
   const candidates = [
     // Homebrew (Apple Silicon / Intel), matching-major first.
     `/opt/homebrew/opt/postgresql@15/bin/${name}`,
@@ -150,10 +196,17 @@ function resolveClientBinary(name: "pg_dump" | "pg_restore"): string {
     // Postgres.app (macOS).
     `/Applications/Postgres.app/Contents/Versions/latest/bin/${name}`,
   ];
-  // PATH lookup first: if the plain name resolves, keep it (operator intent).
-  const pathDirs = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
-  for (const dir of pathDirs) {
-    if (existsSync(join(dir, name))) return name;
+  if (platform === "win32") {
+    const programFilesRoots = options.programFilesRoots ?? [
+      process.env.ProgramW6432,
+      process.env.ProgramFiles,
+      process.env["ProgramFiles(x86)"],
+    ].filter((value): value is string => Boolean(value));
+    for (const root of programFilesRoots) {
+      for (const version of WINDOWS_POSTGRES_CLIENT_VERSIONS) {
+        candidates.push(join(root, "PostgreSQL", version, "bin", binaryName));
+      }
+    }
   }
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;
@@ -176,8 +229,8 @@ export class PgBackupManager {
     this.backupDir = options?.backupDir ?? ".fusion/backups";
     this.retention = options?.retention ?? 7;
     this.includeCentral = options?.includeCentral ?? true;
-    this.pgDumpPath = options?.pgDumpPath ?? resolveClientBinary("pg_dump");
-    this.pgRestorePath = options?.pgRestorePath ?? resolveClientBinary("pg_restore");
+    this.pgDumpPath = options?.pgDumpPath ?? resolvePgClientBinary("pg_dump");
+    this.pgRestorePath = options?.pgRestorePath ?? resolvePgClientBinary("pg_restore");
   }
 
   private getBackupDirPath(): string {

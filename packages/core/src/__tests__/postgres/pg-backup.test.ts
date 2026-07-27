@@ -22,7 +22,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chmodSync } from "node:fs";
-import { PgBackupManager, parsePgUrl } from "../../postgres/pg-backup.js";
+import { PgBackupManager, parsePgUrl, resolvePgClientBinary } from "../../postgres/pg-backup.js";
 
 /** Write a fake pg_dump script that creates the output file and records invocation. */
 function writeFakePgDump(dir: string): string {
@@ -57,6 +57,44 @@ exit 0
   writeFileSync(scriptPath, script, { mode: 0o755 });
   return scriptPath;
 }
+
+describe("resolvePgClientBinary", () => {
+  it("discovers a Windows PostgreSQL client installed outside PATH", () => {
+    const root = mkdtempSync(join(tmpdir(), "fusion-pg-client-discovery-"));
+    try {
+      const pgDump = join(root, "PostgreSQL", "17", "bin", "pg_dump.exe");
+      mkdirSync(join(root, "PostgreSQL", "17", "bin"), { recursive: true });
+      writeFileSync(pgDump, "client");
+
+      expect(resolvePgClientBinary("pg_dump", {
+        platform: "win32",
+        path: "",
+        programFilesRoots: [root],
+      })).toBe(pgDump);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("discovers a client materialized with the embedded Windows runtime", () => {
+    const home = mkdtempSync(join(tmpdir(), "fusion-pg-runtime-discovery-"));
+    try {
+      const pgDump = join(home, ".fusion", "embedded-postgres", "runtime-bin", "win32-x64", "bin", "pg_dump.exe");
+      mkdirSync(join(home, ".fusion", "embedded-postgres", "runtime-bin", "win32-x64", "bin"), { recursive: true });
+      writeFileSync(pgDump, "client");
+
+      expect(resolvePgClientBinary("pg_dump", {
+        platform: "win32",
+        arch: "x64",
+        home,
+        path: "",
+        programFilesRoots: [],
+      })).toBe(pgDump);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("PgBackupManager", () => {
   let tempDir: string;
