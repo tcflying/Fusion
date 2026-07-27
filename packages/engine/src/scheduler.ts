@@ -1501,6 +1501,14 @@ export class Scheduler {
       const maxConcurrent = settings.maxConcurrent ?? this.options.maxConcurrent ?? 2;
       const maxWorktrees = settings.maxWorktrees ?? this.options.maxWorktrees ?? 4;
 
+      /*
+      FNXC:WorkflowReviewGates 2026-07-26-13:10:
+      DEAD CODE — deliberately NOT carrying the review-gate WIP-occupancy fix here.
+      `shouldRunWorkflowColumnScheduler()` returns an unconditional `true` and the branch above it
+      always returns, so this legacy dispatcher is unreachable. The live capacity accounting is in
+      `runHoldReleaseSweepPass` (`reservedWorktreeSlots`/`reservedConcurrentSlots`). Mirroring the
+      fix into this block would only imply coverage that never executes.
+      */
       // Count only in-progress tasks toward the worktree limit.
       // In-review tasks with worktrees are idle (waiting to merge) and
       // should not block new tasks from starting.

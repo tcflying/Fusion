@@ -157,6 +157,60 @@ const planningGuardCases: PlanningGuardCase[] = [
     },
     stillPlanning: false,
   },
+  /*
+  FNXC:WorkflowReplan 2026-07-26-18:40 (FN-8596 strand):
+  The stale-stamp case, and the exact shape that stranded a card in production. Triage CLAIMED a
+  rebounded replan card, overwriting `needs-replan` with the transient `planning`, so the durable-
+  park escape no longer applied and the card fell through to the execution stamps — which were set
+  on its FIRST pass and are never cleared. It read as advanced, every guarded planner write silently
+  no-opped, and the finalize never handed the card off.
+  The discriminator is arrival order: the stamp PREDATES `columnMovedAt`, so it belongs to the
+  previous pass. Contrast with the FN-8361 case above, where the stamp lands after arrival (there,
+  no `columnMovedAt` at all) and execution genuinely won the race.
+  */
+  {
+    label: "triage replan card claimed by triage, stamps left over from its previous pass",
+    task: {
+      column: "triage",
+      steps: [planStep("step-1")],
+      status: "planning",
+      worktree: "/tmp/brave-otter",
+      executionStartedAt: "2026-07-26T13:50:57.686Z",
+      firstExecutionAt: "2026-07-26T13:50:57.686Z",
+      columnMovedAt: "2026-07-26T13:51:33.266Z",
+    },
+    stillPlanning: true,
+  },
+  {
+    label: "triage planning card whose execution stamp lands AFTER arrival (live claim, FN-8361)",
+    task: {
+      column: "triage",
+      steps: [],
+      status: "planning",
+      columnMovedAt: "2026-07-26T13:51:33.266Z",
+      executionStartedAt: "2026-07-26T13:52:10.000Z",
+    },
+    stillPlanning: false,
+  },
+  /*
+  FNXC:WorkflowReplan 2026-07-26-20:30 (FN-8596, second strand):
+  A stale stamp with NO status is STILL plannable — this deliberately differs from the
+  no-`columnMovedAt` PR #2360 case above, and production forced the distinction. After the stale-
+  status sweep cleared `planning` to null, this exact shape was owned by NOBODY: planning excluded
+  it (stamps read as advanced) and `recoverAdvancedTriageTasks` also excluded it, because it bails
+  on `workflowIrPinColumnId === "triage"` — it cannot resume a card into the column it already
+  occupies. The card sat indefinitely. Arrival order is the honest signal regardless of status.
+  */
+  {
+    label: "triage card with stale stamps and NO status is still plannable (nobody else owns it)",
+    task: {
+      column: "triage",
+      steps: [planStep("step-1")],
+      executionStartedAt: "2026-07-26T13:50:57.686Z",
+      columnMovedAt: "2026-07-26T14:17:59.396Z",
+    },
+    stillPlanning: true,
+  },
   {
     label: "triage card parked by a reviewer outage after an execution attempt",
     task: {
@@ -238,7 +292,7 @@ describe("moveTaskToReplanColumn", () => {
     const store = storeWithSelection("builtin:coding-ideas");
     const target = await moveTaskToReplanColumn(store, { id: "FN-1", column: "in-progress" });
     expect(target).toBe("todo");
-    expect(store.moveTask).toHaveBeenCalledWith("FN-1", "todo");
+    expect(store.moveTask).toHaveBeenCalledWith("FN-1", "todo", { preserveWorktree: true });
   });
 
   it("skips the move when the card is already in the replan column (plan-in-place)", async () => {
@@ -246,5 +300,60 @@ describe("moveTaskToReplanColumn", () => {
     const target = await moveTaskToReplanColumn(store, { id: "FN-1", column: "todo" });
     expect(target).toBe("todo");
     expect(store.moveTask).not.toHaveBeenCalled();
+  });
+});
+
+/*
+FNXC:WorkflowReplan 2026-07-26-11:05:
+Symptom (FN-8603): two Plan Review REVISE bounces each logged "Removed conflicting worktree /
+Deleted branch / Cleaned up conflicting worktree, retrying" and rebuilt the checkout from scratch
+(~10s init each). `moveTask`'s reopen block clears `worktree` but keeps `branch`, so the replan
+row lost its checkout while still owning `fusion/<id>` — the next planning acquisition could not
+resume, re-created the same branch, and collided with the worktree it had just orphaned.
+
+Surface enumeration — every replan-bounce mover routes through `moveTaskToReplanColumn`, so the
+invariant is asserted at that seam for ALL of them, not just the Plan Review repro:
+ - Plan Review REVISE -> automatic replan (executor.ts, the reported case)
+ - required-workflow-artifact planning recovery (executor.ts)
+ - spec-staleness rebound inside execute() (executor.ts)
+ - scheduler filesystem-validation and spec-staleness rebounds, legacy loop + workflow sweep
+Both replan-column shapes are covered (default Coding "triage" and plan-in-place Coding (Ideas)
+"todo"), as is every reopen origin column that `moveTask` treats as a reopen (in-progress,
+in-review, done). The already-in-column no-op case cannot strand a worktree because it never
+moves.
+*/
+describe("replan bounces preserve the task worktree (FN-8603)", () => {
+  const REPLAN_BOUNCE_ORIGINS = ["in-progress", "in-review", "done"] as const;
+  const REPLAN_COLUMN_SHAPES = [
+    { workflowId: undefined, expected: "triage", label: "default Coding (triage replan column)" },
+    { workflowId: "builtin:coding-ideas", expected: "todo", label: "Coding (Ideas) (plan-in-place todo)" },
+  ] as const;
+
+  for (const shape of REPLAN_COLUMN_SHAPES) {
+    for (const from of REPLAN_BOUNCE_ORIGINS) {
+      it(`preserves the worktree bouncing ${from} -> ${shape.expected} — ${shape.label}`, async () => {
+        const store = storeWithSelection(shape.workflowId);
+        const target = await moveTaskToReplanColumn(store, { id: "FN-8603", column: from });
+        expect(target).toBe(shape.expected);
+        expect(store.moveTask).toHaveBeenCalledWith(
+          "FN-8603",
+          shape.expected,
+          expect.objectContaining({ preserveWorktree: true }),
+        );
+      });
+    }
+  }
+
+  it("preserves the worktree when the caller pre-resolved the replan column", async () => {
+    // The Plan Review REVISE handler resolves the column first so it can log it, then passes
+    // it in — that overload must carry the same option as the self-resolving one.
+    const store = storeWithSelection(undefined);
+    const target = await moveTaskToReplanColumn(store, { id: "FN-8603", column: "in-progress" }, "triage");
+    expect(target).toBe("triage");
+    expect(store.moveTask).toHaveBeenCalledWith(
+      "FN-8603",
+      "triage",
+      expect.objectContaining({ preserveWorktree: true }),
+    );
   });
 });

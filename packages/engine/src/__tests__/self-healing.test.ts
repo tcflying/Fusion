@@ -117,6 +117,7 @@ vi.mock("../worktree-pool.js", async () => {
 const { selfHealingLoggerMock } = vi.hoisted(() => ({
   selfHealingLoggerMock: {
     log: vi.fn(),
+    debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   },
@@ -124,7 +125,7 @@ const { selfHealingLoggerMock } = vi.hoisted(() => ({
 
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn((_name: string) => selfHealingLoggerMock),
-  schedulerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  schedulerLog: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 vi.mock("../merger.js", () => ({
@@ -163,6 +164,7 @@ const mockedClassifyOwnedLandedEvidence = vi.mocked(classifyOwnedLandedEvidence)
 
 type MockLogger = {
   log: ReturnType<typeof vi.fn>;
+  debug: ReturnType<typeof vi.fn>;
   warn: ReturnType<typeof vi.fn>;
   error: ReturnType<typeof vi.fn>;
 };
@@ -10486,7 +10488,11 @@ describe("maintenance cycle concurrency", () => {
 
     await (manager as any).runMaintenance();
 
-    expect(getSelfHealingLogger().log).toHaveBeenCalledWith(
+    // Steady-state PG no-ops are debug-gated so they do not fill the TUI log pane.
+    expect(getSelfHealingLogger().debug).toHaveBeenCalledWith(
+      expect.stringContaining("wal-checkpoint\" skipped — PostgreSQL manages WAL + autovacuum"),
+    );
+    expect(getSelfHealingLogger().log).not.toHaveBeenCalledWith(
       expect.stringContaining("wal-checkpoint\" skipped — PostgreSQL manages WAL + autovacuum"),
     );
   });

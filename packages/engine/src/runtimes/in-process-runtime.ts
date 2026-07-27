@@ -10,6 +10,7 @@ import type {
   AgentHeartbeatRun,
   PluginStore,
   PluginLoader,
+  PluginLoaderOptions,
   MessageStore,
   RoutineStore,
   GithubIssueAction,
@@ -120,6 +121,39 @@ export type {
 
 const yieldEventLoop = (): Promise<void> => new Promise((resolve) => setImmediateCb(resolve));
 
+/**
+ * FNXC:PluginMcpServers 2026-07-23-12:00:
+ * FN-8596 keeps cross-root MCP discovery private to its throwaway loader. This
+ * exported production seam lets regression tests prove runtime construction
+ * cannot reintroduce shared lifecycle registration or state persistence.
+ */
+export function createDiscoveryPluginLoaderOptions(
+  scopedStore: { getPluginStore(): unknown },
+): PluginLoaderOptions {
+  return {
+    pluginStore: scopedStore.getPluginStore() as PluginStore,
+    taskStore: scopedStore as TaskStore,
+    lifecycleScope: "isolated",
+    persistRuntimeState: false,
+  };
+}
+
+export function createRuntimePluginMcpProviderOptions(input: {
+  hostRootDir: string;
+  hostLoader: Pick<PluginLoader, "getPluginMcpServers">;
+  PluginLoaderClass: new (options: PluginLoaderOptions) => PluginLoader;
+}): {
+  hostRootDir: string;
+  hostLoader: Pick<PluginLoader, "getPluginMcpServers">;
+  createScopedLoader: (store: { getPluginStore(): unknown }) => PluginLoader;
+} {
+  return {
+    hostRootDir: input.hostRootDir,
+    hostLoader: input.hostLoader,
+    createScopedLoader: (scopedStore) => new input.PluginLoaderClass(createDiscoveryPluginLoaderOptions(scopedStore)),
+  };
+}
+
 const TASK_PLANNER_CHAT_AGENT_ID_PREFIX = "task-planner:";
 
 /**
@@ -198,6 +232,8 @@ export class InProcessRuntime
    */
   private cliAgentRuntime?: BootstrappedCliAgentRuntime;
   private usageLimitPauser?: UsageLimitPauser;
+  /** FNXC:PlanReviewLease 2026-07-26-20:42: cluster node id stamped onto review-gate leases; undefined until start() resolves it, or if resolution fails. */
+  private localNodeId?: string;
   private selfHealingManager?: SelfHealingManager;
   private leaseManager?: MeshLeaseManager;
   private leaseCentralClaimStore?: CentralClaimStore;
@@ -229,6 +265,8 @@ export class InProcessRuntime
   private workflowContinuationTimer?: ReturnType<typeof setInterval>;
   private workflowContinuationDrainActive = false;
   private messageStore?: MessageStore;
+  /** FNXC:TaskDeleteNotice 2026-07-26-16:10: identity-guarded teardown for the delete-notice mailbox seam. */
+  private unregisterTaskDeleteNoticeMailbox?: () => void;
   private chatStore?: ChatStore;
   private detachAgentLinkSync?: () => void;
   private concurrencyChangedListener?: (state: { globalMaxConcurrent: number }) => void;
@@ -349,6 +387,8 @@ export class InProcessRuntime
         // the engine owns the result's shutdown() for process teardown.
         createTaskStoreForBackend,
         createGlobalCapacityLegacyAttemptStore,
+        createProjectScopedPluginMcpProvider,
+        registerTaskDeleteNoticeMailbox,
       } = await import("@fusion/core");
       if (this.config.externalTaskStore) {
         this.taskStore = this.config.externalTaskStore;
@@ -483,6 +523,18 @@ export class InProcessRuntime
         this.messageStore = new MessageStoreClass(this.taskStore.db);
       }
 
+      /*
+      FNXC:TaskDeleteNotice 2026-07-26-16:10:
+      Core owns the delete path but has no mailbox, so it exposes a store-scoped seam and the
+      runtime supplies the MessageStore. Registering here (rather than process-globally) keeps one
+      project's "a task was deleted by someone who is not you" notice out of another project's
+      inbox. A store with no registration degrades to no notice — never to a failed delete.
+      */
+      this.unregisterTaskDeleteNoticeMailbox = registerTaskDeleteNoticeMailbox(
+        this.taskStore,
+        this.messageStore,
+      );
+
       await yieldEventLoop();
 
       // 2. Initialize Plugin system (PluginStore + PluginLoader + PluginRunner)
@@ -507,6 +559,7 @@ export class InProcessRuntime
         taskStore: this.taskStore,
         rootDir: this.config.workingDirectory,
       });
+      await this.pluginRunner.init();
       this.roomSessionConnectorBootstrapStatus = await bootstrapRoomSessionConnectors({
         resolveRequiredConnectorIds: () => this.resolveRequiredRoomSessionConnectorIds(),
         pluginRunner: this.pluginRunner,
@@ -516,6 +569,27 @@ export class InProcessRuntime
           `Room Session Connector bootstrap withheld for ${this.config.projectId}: ${this.roomSessionConnectorBootstrapStatus.reasonCode} (${this.roomSessionConnectorBootstrapStatus.missingConnectorIds.join(", ")})`,
         );
       }
+      /*
+       * FNXC:PluginMcpServers 2026-07-22-12:00:
+       * FN-8491 installs the sole session-facing provider on the project store.
+       * resolveMcpServersForStore consumes this filtered seam across every AI
+       * lane; it never sees PluginRunner's raw contribution list.
+       */
+      const projectScopedPluginMcpProvider = createProjectScopedPluginMcpProvider(
+        createRuntimePluginMcpProviderOptions({
+          hostRootDir: this.config.workingDirectory,
+          hostLoader: this.pluginLoader,
+          PluginLoaderClass,
+        }),
+      );
+      (this.taskStore as TaskStore & { getProjectScopedPluginMcpServers?: () => Promise<ReturnType<PluginRunner["getPluginMcpServers"]>> }).getProjectScopedPluginMcpServers = () => projectScopedPluginMcpProvider.get(this.taskStore);
+      /*
+       * FNXC:PluginMcpServers 2026-07-22-15:35:
+       * FN-8491 / #2401 requires the runtime seam to use the core provider,
+       * not an ad-hoc enabled-ID filter. The provider owns same-root caching
+       * and non-persisting other-root discovery so all project contexts retain
+       * their own plugin enablement state.
+      */
       runtimeLog.log(`PluginRunner initialized`);
 
       await yieldEventLoop();
@@ -883,6 +957,13 @@ export class InProcessRuntime
       const prNodeGithubOps = this.config.prNodeGithubOps;
       const workflowAuthoritativeDriverRef: { current?: WorkflowAuthoritativeDriver } = {};
       const executorOptions: TaskExecutorOptions = {
+        /*
+        FNXC:PlanReviewLease 2026-07-26-21:12:
+        Getter, not a value: `this.localNodeId` is resolved later in start() (it needs an async
+        CentralCore read), so capturing it here would freeze `undefined` and silently disable lease
+        attribution. Reading it lazily at runner-construction time picks up the resolved id.
+        */
+        getLocalNodeId: () => this.localNodeId,
         semaphore: this.projectSemaphore,
         pool: this.worktreePool,
         usageLimitPauser: this.usageLimitPauser,
@@ -1229,8 +1310,26 @@ export class InProcessRuntime
         if (!chatLayer2) throw new Error("SelfHealingManager requires the TaskStore PostgreSQL AsyncDataLayer");
         this.chatStore ??= new ChatStore(chatLayer2);
       }
+      /*
+      FNXC:PlanReviewLease 2026-07-26-20:40:
+      Resolve this engine's cluster node id once at start so review-gate leases can be attributed.
+      Attribution is what lets self-healing tell "a lease my own dead process left behind" from "a
+      peer node's lease that is genuinely running" — the former is reclaimed immediately, the latter
+      keeps the 15-minute staleness floor. Fail-soft: on any error the id stays undefined, leases are
+      written unattributed, and floor-only semantics (the pre-existing behavior) apply.
+      */
+      let localNodeId: string | undefined;
+      try {
+        const registeredNodes = await this.centralCore.listNodes();
+        localNodeId = registeredNodes.find((node) => node.type === "local")?.id;
+      } catch (error) {
+        runtimeLog.warn(`Could not resolve local node id for review-gate lease attribution: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.localNodeId = localNodeId;
+
       this.selfHealingManager = new SelfHealingManager(this.taskStore, {
         rootDir: this.config.workingDirectory,
+        localNodeId,
         agentStore: this.agentStore,
         isWorktreeResumeReserved: this.cliAgentRuntime?.isWorktreeResumeReserved,
         recoverCompletedTask: (task) => this.executor.recoverCompletedTask(task),
@@ -1456,6 +1555,17 @@ export class InProcessRuntime
     this.setStatus("stopping");
     runtimeLog.log(`Stopping InProcessRuntime for project ${this.config.projectId}`);
 
+    /*
+    FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
+    Runtime shutdown owns the startup-factory backend handle. Capture and clear it before any subsystem cleanup so concurrent/retried stop calls cannot invoke it twice, then release it from finally even when settings, plugins, or worktree cleanup fails. The first subsystem error remains the observable stop failure; backend cleanup is best-effort and never masks it.
+    */
+    const backendShutdown = this.backendShutdown;
+    this.backendShutdown = undefined;
+    // FNXC:TaskDeleteNotice 2026-07-26-16:10: drop the mailbox seam first so a stopping runtime
+    // cannot keep writing notices; the unregister is identity-guarded against a newer runtime.
+    this.unregisterTaskDeleteNoticeMailbox?.();
+    this.unregisterTaskDeleteNoticeMailbox = undefined;
+    let stopError: Error | undefined;
     try {
       if (this.workflowContinuationTimer) {
         clearInterval(this.workflowContinuationTimer);
@@ -1649,34 +1759,28 @@ export class InProcessRuntime
       this.closeLeaseCentralClaimStore = undefined;
       this.leaseCentralClaimStore = undefined;
 
-      // FNXC:RuntimeStartupWiring 2026-06-24-10:00:
-      // When the runtime booted a PostgreSQL-backed TaskStore via
-      // createTaskStoreForBackend, release the connection pool and stop the
-      // embedded PostgreSQL process (if one was started) now that every
-      // subsystem has drained. Best-effort: a failure is logged but does not
-      // mask the (already-clean) stop. On the legacy SQLite path this is a
-      // no-op (backendShutdown is undefined and the TaskStore closes its own
-      // SQLite database lazily).
-      if (this.backendShutdown) {
+      this.setStatus("stopped");
+      runtimeLog.log(`InProcessRuntime stopped for project ${this.config.projectId}`);
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      stopError = err;
+      this.setStatus("errored");
+      runtimeLog.error(`Error during shutdown:`, err.message);
+      this.emit("error", err);
+    } finally {
+      // FNXC:PostgresResourceLifecycle 2026-07-14-18:42: release the captured
+      // factory handle after every shutdown path; cleanup never masks the stop error.
+      if (backendShutdown) {
         try {
-          await this.backendShutdown();
+          await backendShutdown();
         } catch (err) {
           runtimeLog.warn(
             `Backend shutdown failed: ${err instanceof Error ? err.message : err}`,
           );
         }
-        this.backendShutdown = undefined;
       }
-
-      this.setStatus("stopped");
-      runtimeLog.log(`InProcessRuntime stopped for project ${this.config.projectId}`);
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      this.setStatus("errored");
-      runtimeLog.error(`Error during shutdown:`, err.message);
-      this.emit("error", err);
-      throw err;
     }
+    if (stopError) throw stopError;
   }
 
   /**

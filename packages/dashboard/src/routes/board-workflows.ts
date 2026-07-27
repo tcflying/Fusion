@@ -1,3 +1,6 @@
+import { createLogger } from "@fusion/core";
+
+const severityAuditLog = createLogger("dashboard-board-workflows");
 /**
  * Board multi-lane payload assembly (U9, R16/R17).
  *
@@ -206,7 +209,7 @@ export async function buildBoardWorkflowsPayload(
     // Older/partial test stores may not expose definition listing; the referenced
     // workflow set above is still sufficient for task rendering. Production
     // failures are logged so empty workflow definitions do not disappear silently.
-    console.warn("[board-workflows] listWorkflowDefinitions failed; using referenced workflows only", err);
+    severityAuditLog.warn("[board-workflows] listWorkflowDefinitions failed; using referenced workflows only", err);
   }
 
   const workflows: BoardWorkflowDefinition[] = [];

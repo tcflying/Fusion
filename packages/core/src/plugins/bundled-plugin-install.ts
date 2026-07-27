@@ -1,3 +1,6 @@
+import { createLogger } from "../logger.js";
+
+const severityAuditLog = createLogger("core-bundled-plugin-install");
 /**
  * FNXC:PluginLoader 2026-07-07-00:00:
  * Bundled-plugin auto-install is host-agnostic in @fusion/core. Hosts (the CLI's
@@ -121,7 +124,7 @@ export async function ensureBundledPluginInstalled(
   const entryPath = resolvePluginEntryPath(bundledDir);
 
   if (!entryPath) {
-    console.warn(`[plugins] Bundled plugin "${pluginId}" is missing a loadable entry file in ${bundledDir}`);
+    severityAuditLog.warn(`[plugins] Bundled plugin "${pluginId}" is missing a loadable entry file in ${bundledDir}`);
     return "missing-bundle";
   }
 
@@ -135,7 +138,7 @@ export async function ensureBundledPluginInstalled(
         try {
           await pluginLoader.loadPlugin(existingPlugin.id);
         } catch (err) {
-          console.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
+          severityAuditLog.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
         }
       }
       return "already-installed";
@@ -150,7 +153,7 @@ export async function ensureBundledPluginInstalled(
       try {
         await pluginLoader.loadPlugin(existingPlugin.id);
       } catch (err) {
-        console.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
+        severityAuditLog.warn("[plugins] failed to load bundled plugin", existingPlugin.id, err);
       }
     }
 
@@ -166,7 +169,7 @@ export async function ensureBundledPluginInstalled(
     try {
       await pluginLoader.loadPlugin(plugin.id);
     } catch (err) {
-      console.warn("[plugins] failed to load bundled plugin", plugin.id, err);
+      severityAuditLog.warn("[plugins] failed to load bundled plugin", plugin.id, err);
     }
   }
 

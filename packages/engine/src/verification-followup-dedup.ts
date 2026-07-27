@@ -69,9 +69,9 @@ function normalizeMatchedPath(input: string | undefined): string | null {
   const withoutDecorators = firstToken
     .replace(/^\(+/, "")
     .replace(/\)+$/, "")
-    .replace(/^['"`]/, "")
-    .replace(/['"`:,;]+$/, "");
-  if (!withoutDecorators || !/[\\/]|\.[cm]?[jt]sx?$/.test(withoutDecorators)) {
+    .replace(/^[\"'`]/, "")
+    .replace(/[\"'`:,;]+$/, "");
+  if (!withoutDecorators || !/[\\\\/]|\.[cm]?[jt]sx?$/.test(withoutDecorators)) {
     return null;
   }
   return basename(withoutDecorators);
@@ -222,7 +222,7 @@ export async function createAutomatedFollowup(
         );
       }
       await auditor.database({
-        type: "verification:followup-deduped",
+        type: "task:log-entry",
         target: decision.existingTaskId,
         metadata: {
           kind: params.kind,
@@ -256,7 +256,7 @@ export async function createAutomatedFollowup(
     });
 
     await auditor.database({
-      type: "verification:followup-created",
+      type: "task:create",
       target: task.id,
       metadata: {
         kind: params.kind,
