@@ -86,7 +86,8 @@ const mocks = vi.hoisted(() => {
   };
 });
 
-vi.mock("@fusion/core", () => ({
+vi.mock("@fusion/core", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@fusion/core")>(),
   PluginStore: mocks.PluginStore,
   PluginLoader: mocks.PluginLoader,
   CentralCore: vi.fn(function CentralCore() {
@@ -102,6 +103,7 @@ vi.mock("@fusion/core", () => ({
 
 vi.mock("../../project-context.js", () => ({
   resolveProject: vi.fn().mockResolvedValue({ projectPath: "/tmp/fn-project" }),
+  closeProjectStore: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("node:fs", async () => {
@@ -120,7 +122,7 @@ import {
   runPluginSettings,
   runPluginRescan,
 } from "../plugin.js";
-import { resolveProject } from "../../project-context.js";
+import { closeProjectStore, resolveProject } from "../../project-context.js";
 
 async function createTempPluginFixture(
   files: Array<{ path: string; content: string }>,
@@ -176,6 +178,7 @@ describe("plugin commands", () => {
         listPlugins: vi.fn().mockResolvedValue([]),
         getPlugin: vi.fn(),
         updatePluginSettings: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
       }),
     };
     vi.mocked(resolveProject).mockResolvedValue({
@@ -204,6 +207,8 @@ describe("plugin commands", () => {
 
     expect(contextStore.getPluginStore).toHaveBeenCalledTimes(1);
     expect(mocks.PluginStore).not.toHaveBeenCalled();
+    expect(resolveProject).toHaveBeenCalledTimes(1);
+    expect(closeProjectStore).toHaveBeenCalledTimes(1);
   });
 
 

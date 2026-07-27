@@ -429,11 +429,6 @@ export function createApiRoutesContext(store: TaskStore, options?: ServerOptions
       provider = createDashboardProjectScopedPluginMcpProvider({
         hostRootDir: context.store.getRootDir(),
         hostLoader: loader,
-        createScopedLoader: (otherStore) => new PluginLoader({
-          pluginStore: otherStore.getPluginStore() as PluginStore,
-          taskStore: otherStore as TaskStore,
-          fusionVersion: options?.fusionVersion,
-        }),
       });
       projectMcpProviders.set(loader, provider);
     }

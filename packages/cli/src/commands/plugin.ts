@@ -15,7 +15,7 @@ import { readFile, stat } from "node:fs/promises";
 import * as readline from "node:readline";
 import { PluginStore, PluginLoader, validatePluginManifest, resolveGlobalDir, CentralCore } from "@fusion/core";
 import { getCliPackageVersion, isUnresolvedCliPackageVersion } from "@fusion/dashboard";
-import { resolveProject } from "../project-context.js";
+import { closeProjectStore, resolveProject, type ProjectContext } from "../project-context.js";
 import { promptOutputStream, result } from "../output.js";
 
 export interface BuiltinPluginCatalogEntry {
@@ -90,6 +90,27 @@ export const BUILTIN_PLUGINS: BuiltinPluginCatalogEntry[] = [
   },
 ];
 
+const pluginStoreProjectContexts = new WeakMap<PluginStore, ProjectContext>();
+
+function bindPluginStoreProjectContext(pluginStore: PluginStore, context: ProjectContext): void {
+  const originalClose = pluginStore.close.bind(pluginStore);
+  let closing: Promise<void> | undefined;
+  pluginStore.close = async () => {
+    if (!closing) {
+      closing = (async () => {
+        try {
+          await originalClose();
+        } finally {
+          await closeProjectStore(context);
+          pluginStoreProjectContexts.delete(pluginStore);
+        }
+      })();
+    }
+    await closing;
+  };
+  pluginStoreProjectContexts.set(pluginStore, context);
+}
+
 /**
  * Get the project path for plugin operations.
  */
@@ -118,6 +139,7 @@ export async function createPluginStore(
     const context = await resolveProject(projectName, process.cwd(), options?.centralGlobalDir);
     const pluginStore = context.store.getPluginStore();
     await pluginStore.init();
+    bindPluginStoreProjectContext(pluginStore, context);
     return pluginStore;
   } catch {
     /*
@@ -178,7 +200,8 @@ export async function createPluginLoader(
   pluginStore: PluginStore,
   projectName?: string,
 ): Promise<{ store: PluginStore; loader: PluginLoader }> {
-  const context = await resolveProject(projectName).catch(() => undefined);
+  const context = pluginStoreProjectContexts.get(pluginStore)
+    ?? await resolveProject(projectName).catch(() => undefined);
   const projectPath = context?.projectPath ?? await getProjectPath(projectName);
   /*
   FNXC:PluginDevPostgresSchema 2026-07-27:
@@ -383,23 +406,24 @@ export async function runPluginInstall(
   options?: { projectName?: string; aiScan?: boolean },
 ): Promise<void> {
   const projectName = options?.projectName;
-  const { store, loader } = await createPluginLoader(await createPluginStore(projectName), projectName);
+  const pluginStore = await createPluginStore(projectName);
+  const { store, loader } = await createPluginLoader(pluginStore, projectName);
 
-  // Determine if source is a local path or npm package
-  if (source.startsWith("@")) {
+  try {
+    // Determine if source is a local path or npm package
+    if (source.startsWith("@")) {
     // npm package
     console.error("Installing plugins from npm packages is not yet implemented");
     console.error("Please provide a local path to the plugin directory.");
     process.exit(1);
-  }
+    }
 
-  // Local path
-  if (!existsSync(source)) {
+    // Local path
+    if (!existsSync(source)) {
     console.error(`Plugin path does not exist: ${source}`);
     process.exit(1);
-  }
+    }
 
-  try {
     const entryPath = await resolvePluginEntryFile(source);
     const { manifest } = await loadManifestFromPath(source);
 
@@ -430,6 +454,8 @@ export async function runPluginInstall(
     console.error(`  Failed to install plugin: ${err instanceof Error ? err.message : String(err)}`);
     console.error();
     process.exit(1);
+  } finally {
+    await pluginStore.close();
   }
 }
 
@@ -624,29 +650,33 @@ export async function runPluginSettings(
   options?: { projectName?: string },
 ): Promise<void> {
   const pluginStore = await createPluginStore(options?.projectName);
-  const plugin = await pluginStore.getPlugin(id);
+  try {
+    const plugin = await pluginStore.getPlugin(id);
 
-  if (!key) {
-    console.log(JSON.stringify(plugin.settings ?? {}, null, 2));
-    return;
-  }
-
-  if (value === undefined) {
-    const currentValue = (plugin.settings ?? {})[key];
-    console.log(currentValue === undefined ? "undefined" : JSON.stringify(currentValue, null, 2));
-    return;
-  }
-
-  const parsedValue = (() => {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return value;
+    if (!key) {
+      console.log(JSON.stringify(plugin.settings ?? {}, null, 2));
+      return;
     }
-  })();
 
-  await pluginStore.updatePluginSettings(id, { [key]: parsedValue });
-  console.log(`✓ Updated ${id}.${key}`);
+    if (value === undefined) {
+      const currentValue = (plugin.settings ?? {})[key];
+      console.log(currentValue === undefined ? "undefined" : JSON.stringify(currentValue, null, 2));
+      return;
+    }
+
+    const parsedValue = (() => {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    })();
+
+    await pluginStore.updatePluginSettings(id, { [key]: parsedValue });
+    console.log(`✓ Updated ${id}.${key}`);
+  } finally {
+    await pluginStore.close();
+  }
 }
 
 export async function runPluginRescan(
