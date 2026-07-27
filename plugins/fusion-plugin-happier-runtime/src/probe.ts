@@ -153,6 +153,15 @@ function activeReachability(status: HappierJsonRecord): string | undefined {
   return isRecord(active) && typeof active.reachability === "string" ? active.reachability : undefined;
 }
 
+function daemonRunningFromStatus(status: HappierJsonRecord): boolean {
+  const directDaemon = isRecord(status.daemon) ? status.daemon : undefined;
+  const legacyDaemonStatus = isRecord(status.daemonStatus) ? status.daemonStatus : undefined;
+  const daemon = directDaemon ?? (legacyDaemonStatus && isRecord(legacyDaemonStatus.daemon)
+    ? legacyDaemonStatus.daemon
+    : undefined);
+  return daemon?.running === true;
+}
+
 function resolveHealthBinding(
   settings: HappierCliSettings,
   backend: HappierBackend,
@@ -269,9 +278,9 @@ export async function probeHappierRuntime(
      * session could be checked. Each child still owns its own timeout and
      * process-tree cleanup; concurrency changes latency, not trust criteria.
      */
-    const [authAttempt, statusAttempt, profilesAttempt] = await Promise.allSettled([
+    const [authAttempt, daemonAttempt, profilesAttempt] = await Promise.allSettled([
       dependencies.run(["auth", "status", "--json"], settings),
-      dependencies.run(["status", "--json"], settings),
+      dependencies.run(["daemon", "status", "--json"], settings),
       dependencies.run(["profiles", "list", "--json"], settings),
     ]);
     if (authAttempt.status === "fulfilled") {
@@ -298,27 +307,27 @@ export async function probeHappierRuntime(
     if (authServerUnreachable) serverState = "unreachable";
     server = false;
 
-    if (statusAttempt.status === "fulfilled") {
+    if (daemonAttempt.status === "fulfilled") {
       try {
-        const status = parseRawJson(statusAttempt.value);
-      const daemonStatus = isRecord(status.daemonStatus) ? status.daemonStatus : status;
-      const daemonRecord = isRecord(daemonStatus.daemon) ? daemonStatus.daemon : undefined;
-      daemon = daemonRecord?.running === true;
+        const status = parseRawJson(daemonAttempt.value);
+      daemon = daemonRunningFromStatus(status);
       const reachability = activeReachability(status);
-      // FNXC:HappierRuntime 2026-07-14-12:46: Current Happier reports a successfully checked active relay as "verified"; normalize it to Fusion's public reachable state so a healthy native Windows stack is not shown as unavailable.
-      if (reachability === "reachable" || reachability === "verified") serverState = "reachable";
-      else if (reachability === "unreachable") serverState = "unreachable";
-      server = serverState === "reachable";
-      if (!server) details.push(serverState === "unreachable" ? "server-unreachable" : "server-not-probed");
+      // Kept for compatibility with older official status envelopes. The
+      // current lightweight daemon command has no relay reachability field;
+      // a successful bound-session --live action below provides that proof.
+      if (reachability === "reachable" || reachability === "verified") {
+        serverState = "reachable";
+        server = true;
+      } else if (reachability === "unreachable") {
+        serverState = "unreachable";
+      }
       if (!daemon) details.push("daemon-stopped");
       } catch {
-        details.push("status-invalid");
-        if (serverState === "not-probed") details.push("server-not-probed");
+        details.push("daemon-status-invalid");
       }
     } else {
-      const error = statusAttempt.reason;
-      details.push(error instanceof HappierCliError && error.code === "timeout" ? "status-timeout" : "status-invalid");
-      if (serverState === "not-probed") details.push("server-not-probed");
+      const error = daemonAttempt.reason;
+      details.push(error instanceof HappierCliError && error.code === "timeout" ? "daemon-status-timeout" : "daemon-status-invalid");
     }
 
     if (profilesAttempt.status === "fulfilled") {
@@ -369,6 +378,11 @@ export async function probeHappierRuntime(
           && modelInventoryRaw.exitCode === 0
           && isExactBoundSessionStatus(sessionStatus, binding.happierSessionId)
           && isExactBoundBackendModelInventory(modelInventory, binding.happierSessionId, backendId);
+        if (sessionStatusRaw.exitCode === 0
+          && isExactBoundSessionStatus(sessionStatus, binding.happierSessionId)) {
+          server = true;
+          serverState = "reachable";
+        }
         if (backend) {
           /*
            * FNXC:HappierRuntimeHealthTruth 2026-07-27-16:15:
@@ -388,6 +402,10 @@ export async function probeHappierRuntime(
       const error = profilesAttempt.reason;
       details.push(error instanceof HappierCliError && error.code === "timeout" ? "backend-timeout" : "backend-invalid");
     }
+  }
+
+  if (executable && !server) {
+    details.push(serverState === "unreachable" ? "server-unreachable" : "server-not-probed");
   }
 
   const ready = executable

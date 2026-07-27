@@ -122,7 +122,8 @@ function runner(
     attestCli: attestation,
     run: async (args) => {
       const key = args.join(" ");
-      const value = results[key];
+      const value = results[key]
+        ?? (key === "daemon status --json" ? results["status --json"] : undefined);
       if (value instanceof Error) throw value;
       if (!value) throw new Error(`unexpected command: ${key}`);
       return value as { exitCode: number | null; stdout: string };
@@ -217,11 +218,11 @@ describe("probeHappierRuntime", () => {
     const result = probeHappierRuntime({}, dependency);
     await vi.waitFor(() => expect(started.sort()).toEqual([
       "auth status --json",
+      "daemon status --json",
       "profiles list --json",
-      "status --json",
     ]));
     pending.get("auth status --json")?.(authOk);
-    pending.get("status --json")?.(status());
+    pending.get("daemon status --json")?.(status());
     pending.get("profiles list --json")?.(profiles);
 
     await expect(result).resolves.toMatchObject({
@@ -328,7 +329,7 @@ describe("probeHappierRuntime", () => {
     expect(health.server).toBe(false);
     expect(health.serverState).toBe("not-probed");
     expect(health.details).toContain("server-not-probed");
-    expect(health.details).toContain("status-invalid");
+    expect(health.details).toContain("daemon-status-invalid");
     expect(JSON.stringify(health)).not.toContain("top-secret");
   });
 
@@ -345,7 +346,7 @@ describe("probeHappierRuntime", () => {
     expect(health.server).toBe(false);
     expect(health.serverState).toBe("unreachable");
     expect(health.details).toContain("server-unreachable");
-    expect(health.details).toContain("status-invalid");
+    expect(health.details).toContain("daemon-status-invalid");
   });
 
   it("reports timeouts without leaking exception text", async () => {
@@ -414,6 +415,36 @@ describe("probeHappierRuntime", () => {
       ready: false,
     });
     expect(health.details).toContain("model-not-reported");
+  });
+
+  it("uses lightweight daemon status and a live bound session instead of the doctor report", async () => {
+    const run = vi.fn(runner({
+      "codex --help": help,
+      "auth status --json": authOk,
+      "daemon status --json": {
+        exitCode: 0,
+        stdout: JSON.stringify({ daemon: { running: true } }),
+      },
+      "profiles list --json": profiles,
+      [`session status ${boundSessionId} --live --json`]: boundSessionStatus,
+      [`session actions execute ${boundSessionId} agents.models.list --input-json {\"agentId\":\"codex\",\"limit\":200} --json`]:
+        boundSessionModels,
+    }).run);
+
+    const health = await probeHappierRuntime(boundCodexSettings, {
+      run,
+      attestCli: async () => attestationOk,
+    });
+
+    expect(run).toHaveBeenCalledWith(["daemon", "status", "--json"], boundCodexSettings);
+    expect(run).not.toHaveBeenCalledWith(["status", "--json"], boundCodexSettings);
+    expect(health).toMatchObject({
+      daemon: true,
+      server: true,
+      serverState: "reachable",
+      backend: true,
+      ready: false,
+    });
   });
 
   it("does not infer OpenCode machine availability from catalog compatibility", async () => {
