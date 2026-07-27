@@ -315,16 +315,17 @@ const NATIVE_ADAPTER_PROVIDERS: Readonly<Record<string, HappierRuntimeBackend>> 
 export function discoverNativeHappierSessions(
   sessions: readonly HappierNativeSessionRecord[] | undefined,
   projectId?: string,
+  confirmedBindings: readonly HappierRuntimeSessionBinding[] = [],
 ): HappierDiscoveryResult<HappierNativeSessionCandidate> {
-  if (!sessions) {
+  if (!sessions && confirmedBindings.length === 0) {
     return {
       state: "unavailable",
       candidates: [],
-      reason: "Fusion CLI session availability is unavailable",
+      reason: "Fusion CLI session availability and confirmed external bindings are unavailable",
     };
   }
   const byCanonicalUri = new Map<string, HappierNativeSessionCandidate>();
-  for (const session of sessions) {
+  for (const session of sessions ?? []) {
     if (projectId && session.projectId !== projectId) continue;
     const providerId = NATIVE_ADAPTER_PROVIDERS[session.adapterId];
     const nativeSessionId = safeHappierSettingString(session.nativeSessionId);
@@ -337,6 +338,24 @@ export function discoverNativeHappierSessions(
       providerId,
       nativeSessionId,
       sourceSessionId,
+      source: "fusion-cli-session",
+    });
+  }
+  // A persisted binding is only created by the explicitly-confirmed mutation
+  // route. Project it for reconciliation when Fusion has no local CLI record,
+  // but keep its provenance visible and do not synthesize a CLI session.
+  for (const binding of confirmedBindings) {
+    if (byCanonicalUri.has(binding.canonicalSessionUri)) continue;
+    const providerId = providerFromCanonicalSession(binding.canonicalSessionUri);
+    const nativeSessionId = nativeIdFromCanonicalSession(binding.canonicalSessionUri);
+    const sourceSessionId = safeHappierSettingString(binding.happierSessionId);
+    if (!nativeSessionId || !sourceSessionId) continue;
+    byCanonicalUri.set(binding.canonicalSessionUri, {
+      canonicalSessionUri: binding.canonicalSessionUri,
+      providerId,
+      nativeSessionId,
+      sourceSessionId,
+      source: "confirmed-happier-binding",
     });
   }
   return {
@@ -380,6 +399,7 @@ export async function readHappierRuntimeSetupStatus(
   const nativeDiscovery = discoverNativeHappierSessions(
     input.nativeSessions,
     input.projectId,
+    normalizeHappierSessionBindings(input.settings.happierSessionBindings ?? []).bindings,
   );
   let happierDiscovery: HappierDiscoveryResult<HappierRemoteSessionCandidate>;
   if (!runtimeHealth.attestation.ok || !runtimeHealth.authenticated) {

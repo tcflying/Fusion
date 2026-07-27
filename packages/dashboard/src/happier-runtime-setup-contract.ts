@@ -26,6 +26,12 @@ export interface HappierNativeSessionCandidate {
   readonly providerId: HappierRuntimeBackend;
   readonly nativeSessionId: string;
   readonly sourceSessionId: string;
+  /**
+   * `confirmed-happier-binding` is a project-scoped, user-confirmed projection
+   * of an existing external session. It is not a Fusion-created CLI session
+   * and must never be treated as an import or creation request.
+   */
+  readonly source: "fusion-cli-session" | "confirmed-happier-binding";
 }
 
 export interface HappierRemoteSessionCandidate {

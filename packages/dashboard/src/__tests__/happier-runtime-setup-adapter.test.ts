@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildHappierRuntimeSetupStatus,
+  discoverNativeHappierSessions,
   withinHappierSetupDeadline,
 } from "../happier-runtime-setup-adapter.js";
 
@@ -312,5 +313,31 @@ describe("buildHappierRuntimeSetupStatus", () => {
       state: "unverified",
       driftReasons: ["probe-unavailable"],
     });
+  });
+
+  it("projects only a confirmed external binding when Fusion has no local CLI session", () => {
+    const discovery = discoverNativeHappierSessions(undefined, "project-a", [{
+      canonicalSessionUri: "codex://threads/native-1",
+      happierSessionId: "happy-1",
+      serverProfileId: "server-main",
+      machineId: "machine-a",
+    }]);
+
+    expect(discovery).toEqual({
+      state: "available",
+      candidates: [{
+        canonicalSessionUri: "codex://threads/native-1",
+        providerId: "codex",
+        nativeSessionId: "native-1",
+        sourceSessionId: "happy-1",
+        source: "confirmed-happier-binding",
+      }],
+    });
+  });
+
+  it("does not invent a native candidate from remote discovery alone", () => {
+    const discovery = discoverNativeHappierSessions([], "project-a");
+
+    expect(discovery).toEqual({ state: "available", candidates: [] });
   });
 });
