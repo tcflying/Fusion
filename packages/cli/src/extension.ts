@@ -1229,7 +1229,17 @@ export default function kbExtension(pi: ExtensionAPI) {
           projectSettingsForGate,
           globalSettings,
         );
-        const workflowId = params.workflow_id?.trim() || undefined;
+        /*
+        FNXC:OriginWorkflowSelection 2026-07-26-19:40:
+        Precedence for the new task's workflow: the caller's explicit `workflow_id`
+        argument wins, then the project `taskCreateWorkflowId` setting (a pinned workflow,
+        else the mirrored Board lane = the "Selected workflow" option), then `undefined`
+        so createTask keeps its existing project-default path unchanged.
+        Note the sibling fn_delegate_task tool deliberately does NOT consult this setting:
+        the setting is scoped to task CREATION origins, not delegation.
+        */
+        const workflowId = params.workflow_id?.trim()
+          || (await store.resolveOriginWorkflowOverrideId("task-create"));
 
         const { task, wasDuplicate } = await createAgentTask(store, {
           description: params.description.trim(),
@@ -2174,9 +2184,17 @@ export default function kbExtension(pi: ExtensionAPI) {
         allowResurrection: params.allowResurrection === true,
         removeLineageReferences: params.removeLineageReferences === true,
         auditContext: {
+          /*
+          FNXC:TaskDeleteAttribution 2026-07-26-14:30:
+          `agentId` names the TOOL SURFACE, not the actor. Before callerKind/callerTaskId were
+          persisted, an agent deleting a task through this tool produced a row indistinguishable
+          from any other pi-extension write and the calling task was lost. `taskId` was already
+          passed here (the store's self-delete guard reads it) but never reached metadata.
+          */
           agentId: "pi-extension",
           runId: `synthetic-pi-delete-${params.id}-${Date.now()}`,
           taskId: callerTaskId,
+          callerKind: "agent-tool",
         },
       });
 

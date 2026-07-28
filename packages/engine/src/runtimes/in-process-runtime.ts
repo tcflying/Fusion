@@ -10,12 +10,14 @@ import type {
   AgentHeartbeatRun,
   PluginStore,
   PluginLoader,
+  PluginLoaderOptions,
   MessageStore,
   RoutineStore,
   GithubIssueAction,
   CliSession,
   NotificationPayload,
   WorkflowWorkItem,
+  WorkflowWorkItemState,
 } from "@fusion/core";
 import {
   ChatStore,
@@ -239,6 +241,21 @@ export function resolvePlanningContinuationCandidate(
   if (item.waitReason !== "planning") {
     return { kind: "skip", item, reason: "not-planning" };
   }
+  /*
+  FNXC:PlanApprovalHold 2026-07-27-19:30 (U7 / R4):
+  Dispatching a planning continuation starts a Plan Review run, so a card blocked
+  on a pending human approval decision must not be dispatched. The status-only
+  hold shape the plan-approval gate writes (`status: "awaiting-approval"`, no
+  pause flag) fell straight through the pause check below and was dispatched.
+
+  SKIP, never `orphan`: an orphan is cancelled and terminalized, so an approval
+  landing a minute later would find nothing left to resume and would need a second
+  repair (FN-8592's sweep) to come back. Skipping leaves the item due and
+  claimable, which is what "the operator has not decided yet" actually means.
+  */
+  if (isTaskBlockedOnApproval(task)) {
+    return { kind: "skip", item, reason: "awaiting-approval" };
+  }
   if (task.paused === true || task.userPaused === true) {
     return { kind: "skip", item, reason: "paused" };
   }
@@ -401,6 +418,8 @@ export class InProcessRuntime
    */
   private cliAgentRuntime?: BootstrappedCliAgentRuntime;
   private usageLimitPauser?: UsageLimitPauser;
+  /** FNXC:PlanReviewLease 2026-07-26-20:42: cluster node id stamped onto review-gate leases; undefined until start() resolves it, or if resolution fails. */
+  private localNodeId?: string;
   private selfHealingManager?: SelfHealingManager;
   private leaseManager?: MeshLeaseManager;
   private leaseCentralClaimStore?: ReturnType<typeof createCentralDatabase>;
@@ -431,6 +450,8 @@ export class InProcessRuntime
   private workflowContinuationTimer?: ReturnType<typeof setInterval>;
   private workflowContinuationDrainActive = false;
   private messageStore?: MessageStore;
+  /** FNXC:TaskDeleteNotice 2026-07-26-16:10: identity-guarded teardown for the delete-notice mailbox seam. */
+  private unregisterTaskDeleteNoticeMailbox?: () => void;
   private chatStore?: ChatStore;
   private detachAgentLinkSync?: () => void;
   private concurrencyChangedListener?: (state: { globalMaxConcurrent: number }) => void;
@@ -665,6 +686,18 @@ export class InProcessRuntime
       } else {
         this.messageStore = new MessageStoreClass(this.taskStore.getDatabase());
       }
+
+      /*
+      FNXC:TaskDeleteNotice 2026-07-26-16:10:
+      Core owns the delete path but has no mailbox, so it exposes a store-scoped seam and the
+      runtime supplies the MessageStore. Registering here (rather than process-globally) keeps one
+      project's "a task was deleted by someone who is not you" notice out of another project's
+      inbox. A store with no registration degrades to no notice — never to a failed delete.
+      */
+      this.unregisterTaskDeleteNoticeMailbox = registerTaskDeleteNoticeMailbox(
+        this.taskStore,
+        this.messageStore,
+      );
 
       await yieldEventLoop();
 
@@ -1045,6 +1078,13 @@ export class InProcessRuntime
       const prNodeGithubOps = this.config.prNodeGithubOps;
       const workflowAuthoritativeDriverRef: { current?: WorkflowAuthoritativeDriver } = {};
       const executorOptions: TaskExecutorOptions = {
+        /*
+        FNXC:PlanReviewLease 2026-07-26-21:12:
+        Getter, not a value: `this.localNodeId` is resolved later in start() (it needs an async
+        CentralCore read), so capturing it here would freeze `undefined` and silently disable lease
+        attribution. Reading it lazily at runner-construction time picks up the resolved id.
+        */
+        getLocalNodeId: () => this.localNodeId,
         semaphore: this.projectSemaphore,
         pool: this.worktreePool,
         usageLimitPauser: this.usageLimitPauser,
@@ -1390,8 +1430,26 @@ export class InProcessRuntime
         if (!chatLayer2) throw new Error("SelfHealingManager requires the TaskStore PostgreSQL AsyncDataLayer");
         this.chatStore ??= new ChatStore(chatLayer2);
       }
+      /*
+      FNXC:PlanReviewLease 2026-07-26-20:40:
+      Resolve this engine's cluster node id once at start so review-gate leases can be attributed.
+      Attribution is what lets self-healing tell "a lease my own dead process left behind" from "a
+      peer node's lease that is genuinely running" — the former is reclaimed immediately, the latter
+      keeps the 15-minute staleness floor. Fail-soft: on any error the id stays undefined, leases are
+      written unattributed, and floor-only semantics (the pre-existing behavior) apply.
+      */
+      let localNodeId: string | undefined;
+      try {
+        const registeredNodes = await this.centralCore.listNodes();
+        localNodeId = registeredNodes.find((node) => node.type === "local")?.id;
+      } catch (error) {
+        runtimeLog.warn(`Could not resolve local node id for review-gate lease attribution: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      this.localNodeId = localNodeId;
+
       this.selfHealingManager = new SelfHealingManager(this.taskStore, {
         rootDir: this.config.workingDirectory,
+        localNodeId,
         agentStore: this.agentStore,
         isWorktreeResumeReserved: this.cliAgentRuntime?.isWorktreeResumeReserved,
         recoverCompletedTask: (task) => this.executor.recoverCompletedTask(task),
@@ -2152,14 +2210,36 @@ export class InProcessRuntime
     });
   }
 
+  /**
+   * FNXC:WorkflowScheduling 2026-07-21-12:20:
+   * A single runtime drain owns selection at a time. Concurrent wakeups collapse
+   * behind this guard and the recurring processor supplies the next bounded pass.
+   *
+   * The pass itself lives in `drainDuePlanningContinuations` (see its header for
+   * the FN-8470/FN-8471 orphan rationale and the deferral); this method is the
+   * runtime-lifecycle wrapper — re-entry guard, active-status check, and the
+   * adapters that bind the pass to this runtime's store and executor.
+   */
   private async drainWorkflowContinuations(): Promise<void> {
     if (this.workflowContinuationDrainActive || this.status !== "active") return;
     this.workflowContinuationDrainActive = true;
     try {
-      const items = await this.taskStore.listDueWorkflowWorkItems({
-        kinds: ["task"],
-        states: ["runnable", "retrying"],
-        limit: 20,
+      await drainDuePlanningContinuations({
+        listDue: () => this.taskStore.listDueWorkflowWorkItems({
+          kinds: ["task"],
+          states: ["runnable", "retrying"],
+          limit: DUE_PLANNING_CONTINUATION_BATCH_LIMIT,
+        }),
+        getTask: (taskId) => Promise.resolve(this.taskStore.getTask(taskId)),
+        cancelOrphan: (item, reason) => this.cancelOrphanedWorkflowWorkItem(item, reason),
+        defer: (deferral) => this.deferParkedWorkflowWorkItem(deferral),
+        dispatch: (task, item) => {
+          void this.executor.execute(task).catch((error) => {
+            runtimeLog.error(`Workflow continuation ${item.id} failed:`, error);
+          });
+        },
+        nowMs: () => Date.now(),
+        warn: (message) => runtimeLog.warn(message),
       });
       for (const item of items) {
         let task: Task | undefined;

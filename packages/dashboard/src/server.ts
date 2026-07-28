@@ -1,3 +1,6 @@
+import { createLogger } from "@fusion/core";
+
+const severityAuditLog = createLogger("dashboard-server");
 import express, { type Router } from "express";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
@@ -904,7 +907,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
     // Some unit tests mock @fusion/core with narrow export surfaces. Keep
     // server bootstrap resilient when hook registration is unavailable.
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[github-tracking-hook] registration skipped: ${message}`);
+    severityAuditLog.warn(`[github-tracking-hook] registration skipped: ${message}`);
   }
   const cliPackageVersion = getCliPackageVersion(import.meta.url);
   // ── Derive defaults from engine when provided (explicit options override) ──
@@ -1145,7 +1148,7 @@ export function createServer(store: TaskStore, options?: ServerOptions): ReturnT
       res.setHeader("Cache-Control", "no-store, max-age=0");
       res.status(200).send(html);
     } catch (err) {
-      console.error("[dashboard] serveIndexHtml failed:", err);
+      severityAuditLog.error("[dashboard] serveIndexHtml failed:", err);
       // Drop the cached HTML so the next request retries from disk rather
       // than re-throwing the same failure until the server restarts.
       cachedIndexHtml = null;

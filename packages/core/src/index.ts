@@ -120,6 +120,15 @@ export * from "./planning-plan-md.js";
 export * from "./file-scope-classification.js";
 export { MAX_TASK_LIST_TEXT_CHARS, clampTaskListText, formatTaskListText } from "./task-list-format.js";
 export {
+  DEFAULT_TOOL_OUTPUT_MAX_CHARS,
+  TOOL_OUTPUT_UNLIMITED_SETTING_VALUE,
+  buildToolOutputTruncationMarker,
+  clampToolOutputText,
+  clampToolOutputBlocks,
+  resolveAgentToolOutputMaxChars,
+  resolveToolOutputBudget,
+} from "./tool-output-budget.js";
+export {
   WAKE_DELTA_ASSIGNED_TASKS_CAP,
   rankAssignedTasksForWakeDelta,
   formatAssignedTasksWakeDeltaSection,
@@ -235,6 +244,8 @@ export type {
   WorkflowIrColumn,
   WorkflowIrColumnTrait,
   WorkflowColumnAgent,
+  WorkflowColumnRecovery,
+  WorkflowColumnOnStale,
   WorkflowHoldRelease,
   WorkflowJoinMode,
   WorkflowJoinBranchFailure,
@@ -275,6 +286,8 @@ export type {
   EffectiveAgentInput,
   EffectiveAgentResult,
 } from "./column-agent-resolver.js";
+export { evaluateForeachMergeProof } from "./workflow-merge-proof.js";
+export type { ForeachMergeProof, ForeachMergeProofInput } from "./workflow-merge-proof.js";
 export { BUILTIN_CODING_WORKFLOW_IR } from "./builtin-coding-workflow-ir.js";
 export { BUILTIN_CODING_IDEAS_WORKFLOW_IR } from "./builtin-coding-ideas-workflow-ir.js";
 export { PLAN_REVIEW_GROUP_ID } from "./builtin-plan-review-group.js";
@@ -300,6 +313,7 @@ export {
   BUILTIN_MOVED_WORKFLOW_SETTINGS,
   BUILTIN_TRIAGE_POLICY_SETTINGS,
   BUILTIN_OVERSIGHT_SETTINGS,
+  DEFAULT_MAX_POST_REVIEW_FIXES,
   DEFAULT_PLANNER_OVERSEER_EXECUTOR_STUCK_AFTER_MS,
   PLANNER_HEARTBEAT_PATROL_ENABLED_SETTING_ID,
   renderTriagePolicyPlaceholders,
@@ -423,7 +437,6 @@ export {
   workflowHasColumn,
 } from "./workflow-transitions.js";
 export type { ColumnAdjacency } from "./workflow-transitions.js";
-export { isWorkflowColumnsEnabled } from "./workflow-columns-settings.js";
 // ── U8: pre-evaluated plugin gate verdicts (KTD-2) ───────────────────────────
 export {
   findWorkflowColumn,
@@ -431,8 +444,13 @@ export {
 } from "./plugin-gate-verdict.js";
 export type { PluginGateVerdict, ColumnPluginGate } from "./plugin-gate-verdict.js";
 // ── U6: workflow capacity (WIP) resolution shared by store + sweep ───────────
-export { resolveColumnCapacity, resolveWipBudgetColumns, DEFAULT_WORKFLOW_POOL_ID } from "./workflow-capacity.js";
-export { columnsWithFlag, columnHasFlag, resolveReboundTarget, resolveCompleteColumn, resolveMergeOrchestrationColumn } from "./workflow-lifecycle-traits.js";
+export { resolveColumnCapacity, resolveWipBudgetColumns, DEFAULT_WORKFLOW_POOL_ID, resolveCapacityPoolId } from "./workflow-capacity.js";
+export { createWorkflowEventBus, getWorkflowEventBus, emitWorkflowLifecycleEvent, resetWorkflowEventBusForTesting } from "./workflow-events.js";
+export type { WorkflowEventBus, WorkflowEventSubscriber, WorkflowEventSubscription } from "./workflow-events.js";
+export { findWorkflowEventShapeViolations, isIdsOnlyWorkflowEvent, MAX_ID_VALUE_LENGTH } from "./types/workflow-events.js";
+export type { WorkflowLifecycleEvent, WorkflowLifecycleEventType, WorkflowLifecycleEventBase, TaskTransitionedEvent, NodeEnteredEvent, NodeCompletedEvent, RunSuspendedEvent, RunResumedEvent, WorkflowEventShapeViolation } from "./types/workflow-events.js";
+export { columnsWithFlag, columnHasFlag, resolveReboundTarget, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveLifecycleColumns, resolveTaskLifecycleColumns } from "./workflow-lifecycle-traits.js";
+export type { LifecycleColumns } from "./workflow-lifecycle-traits.js";
 export { resolveReviewLevelSteps, applyReviewLevelPreset } from "./review-level-preset.js";
 export {
   LEGACY_STATUS_ADOPTION,
@@ -770,6 +788,10 @@ export {
   SelfDefeatingDependencyError,
   DependencyCycleError,
   TaskDeletedError,
+  // FNXC:TaskLookup404 2026-07-26-11:20: typed task-miss signal + guard so API
+  // boundaries can return 404 instead of 500 for an unknown task id.
+  TaskNotFoundError,
+  isTaskNotFoundError,
   TombstonedTaskResurrectionError,
   MergeQueueTaskNotFoundError,
   MergeQueueInvalidColumnError,
@@ -799,6 +821,7 @@ export {
 } from "./near-duplicate.js";
 export { getTaskDuplicateLineage } from "./duplicate-lineage.js";
 export {
+  parseDuplicateMarkerFromSessionText,
   parseExplicitDuplicateMarker,
   type ExplicitDuplicateMarker,
 } from "./explicit-duplicate-marker.js";
@@ -1072,19 +1095,6 @@ export {
   DEFAULT_CAPACITY_RISK_TODO_THRESHOLD,
 } from "./capacity.js";
 export type { CapacityRiskSignal } from "./capacity.js";
-export {
-  computeDependencyBlockedTodoReport,
-  DEFAULT_DEPENDENCY_BLOCKED_TODO_FRESH_MS,
-  DEFAULT_DEPENDENCY_BLOCKED_TODO_STALE_MS,
-  DEFAULT_DEPENDENCY_BLOCKED_TODO_MIN_COUNT,
-  DEFAULT_DEPENDENCY_BLOCKED_TODO_MAX_GROUPS,
-} from "./dependency-blocked-todo-report.js";
-export type {
-  DependencyBlockedTodoCode,
-  DependencyBlockedTodoGroup,
-  DependencyBlockedTodoReport,
-  DependencyBlockedTodoReportContext,
-} from "./dependency-blocked-todo-report.js";
 export { getPrimaryPrInfo, taskHasManualOpenPullRequest } from "./task-helpers.js";
 export {
   getTaskMergeBlocker,
@@ -2118,41 +2128,6 @@ export {
   postMergeVerificationOptionalGroupNode,
 } from "./builtin-post-merge-group.js";
 export type { PostMergeOptionalGroupSpec } from "./builtin-post-merge-group.js";
-export {
-  WORKFLOW_COMPARABLE_AUDIT_MUTATIONS,
-  WORKFLOW_PARITY_OBSERVED_MUTATION,
-  WORKFLOW_PARITY_DRIFT_MUTATION,
-  compareWorkflowRunAudits,
-  compareWorkflowRunObservations,
-  extractWorkflowAuditObservations,
-  DEFAULT_WORKFLOW_INVARIANTS,
-  deriveStageTransitions,
-  buildWorkflowObservationFromTask,
-  buildWorkflowObservation,
-  checkTransitionParity,
-  countDualAcceptDisagreements,
-  computeWorkflowColumnsGraduationReport,
-  DUAL_ACCEPT_PARITY_MUTATIONS,
-} from "./workflow-parity.js";
-export type {
-  WorkflowAuditObservation,
-  WorkflowParityDiff,
-  WorkflowParityDiffCategory,
-  WorkflowParityDiffSeverity,
-  WorkflowParityDriftReport,
-  WorkflowReliabilityInvariantSignals,
-  WorkflowRunObservation,
-  WorkflowStage,
-  WorkflowObservationTaskInput,
-  WorkflowObservationBuildOptions,
-  WorkflowObservationParts,
-  WorkflowParitySummary,
-  TransitionParityDiff,
-  TransitionParityReport,
-  DualAcceptDisagreementReport,
-  WorkflowColumnsGraduationReport,
-  GraduationReportInputs,
-} from "./workflow-parity.js";
 export { isResearchExperimentalEnabled, resolveResearchSettings } from "./research-settings.js";
 export type { ResolvedResearchSettings } from "./research-settings.js";
 export { isEvalsExperimentalEnabled, resolveEvalSettings } from "./eval-settings.js";

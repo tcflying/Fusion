@@ -15,6 +15,7 @@ import {
   TaskDeletedError,
   buildTriageMemoryInstructions,
   isUnplannedSeedPrompt,
+  isTaskAwaitingPlanning,
   getTaskDuplicateLineage,
   parseExplicitDuplicateMarker,
   resolveAgentPrompt,
@@ -130,6 +131,15 @@ import { isTransientError, isSilentTransientError } from "./transient-error-dete
 import { withRateLimitRetry } from "./rate-limit-retry.js";
 import { computeRecoveryDecision, formatDelay, MAX_RECOVERY_RETRIES } from "./recovery-policy.js";
 import type { StuckTaskDetector } from "./stuck-task-detector.js";
+
+/*
+FNXC:TriageStalePlanning 2026-07-26-17:20:
+Staleness floor before the periodic sweep may clear a `status:"planning"` claim. Generous on
+purpose: it must never race a slow-but-healthy planner, including one owned by another node whose
+in-process `processing` set this engine cannot see. A genuinely stranded card waits at most this
+long instead of until the next engine restart.
+*/
+const STALE_PLANNING_STATUS_GRACE_MS = 20 * 60_000;
 import { exec } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -242,6 +252,13 @@ export class TriageProcessor {
   private wasGlobalPaused = false;
   private wasEnginePaused = false;
   private idleSemaphoreLeakCandidateSince: number | null = null;
+  /**
+   * FNXC:ConcurrencyAdmission 2026-07-26-09:30:
+   * Signature of the last emitted `task:plan-admission-throttled` event, so a steady stall records
+   * one row instead of one per poll. `null` means "not currently throttled" — the next throttle,
+   * even with identical numbers, is a NEW stall and is emitted again.
+   */
+  private lastPlanThrottleSignature: string | null = null;
   /** Active agent sessions per task, used to terminate on pause. */
   private activeSessions = new Map<string, { dispose: () => void }>();
   /**
@@ -696,6 +713,53 @@ export class TriageProcessor {
     this.pollInterval = setInterval(() => this.poll(), interval);
     this.poll();
     planLog.log("Processor started");
+  }
+
+  /*
+  FNXC:TriageStalePlanning 2026-07-26-17:20:
+  PERIODIC counterpart to `clearStaleSpecifyingStatuses`, which runs at STARTUP ONLY.
+  Observed strand (FN-8596): a plan-review REVISE routed to `plan-replan`, triage claimed the card
+  with `status:"planning"` and ran the revision session, the session wrote the revised PROMPT.md and
+  then died WITHOUT finalizing. The card was left in `triage` with `status:"planning"`, a live
+  worktree, and no workflow continuation. Nothing re-dispatched it: triage rediscovery skips cards
+  already marked `planning` (they look claimed), and the only sweep that clears that status ran at
+  startup — so the card sat stranded until an operator restarted the engine. The leaked-slot reaper
+  then reclaimed its concurrency slot, which made the card look idle without making it runnable.
+
+  Clearing the status is the whole repair: the card is back in triage with a real spec, so ordinary
+  rediscovery re-picks it on the next poll. This does NOT move, pause, or fail the card.
+
+  Two guards keep it from racing a healthy planner:
+    - `this.processing` excludes sessions this process owns.
+    - a staleness floor excludes cards touched recently, which covers planners owned by ANOTHER
+      node/process that this process's `processing` set cannot see.
+  User-paused cards are never touched (an operator park is authoritative).
+  */
+  private async sweepStalePlanningStatuses(allTasks: Task[], now: number): Promise<void> {
+    try {
+      const stale = allTasks.filter((t) => {
+        if (t.status !== "planning") return false;
+        if (t.column !== "triage" && t.column !== "todo") return false;
+        if (this.processing.has(t.id)) return false;
+        if (t.userPaused === true || t.paused === true) return false;
+        const touchedAt = Date.parse(t.updatedAt ?? t.columnMovedAt ?? "");
+        if (!Number.isFinite(touchedAt)) return false;
+        return now - touchedAt >= STALE_PLANNING_STATUS_GRACE_MS;
+      });
+      for (const t of stale) {
+        planLog.warn(
+          `Stale 'planning' status on ${t.id} (column=${t.column}, no live planner) — clearing so triage can re-pick it`,
+        );
+        await this.store.updateTask(t.id, { status: null });
+        await this.store.logEntry(
+          t.id,
+          "Auto-recovered: cleared stale planning status left by a planner that never finished",
+        ).catch(() => undefined);
+      }
+    } catch (err) {
+      // Never let a housekeeping sweep break the poll.
+      planLog.warn(`Stale planning-status sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async clearStaleSpecifyingStatuses(): Promise<void> {
@@ -1163,10 +1227,18 @@ export class TriageProcessor {
       Only ENOENT is treated as unplanned; a genuine read fault (permissions, a directory in the
       file's place) still skips the card, but now says so in the log instead of vanishing.
       */
+      /*
+      FNXC:CodingIdeasWorkflow 2026-07-26-15:30:
+      Shared with the `GET /api/tasks` `awaitingPlanning` enrichment that drives the
+      "Queued to plan" / "Ready" badge pair, so the board cannot label a card's wait differently
+      from the lane that actually decides it. The three clauses of `isTaskAwaitingPlanning` are
+      exactly this loop's three branches: the `needs-replan` early-continue above, this content
+      check, and the ENOENT branch below (the helper's `null` case).
+      */
       try {
         const promptPath = join(this.rootDir, ".fusion", "tasks", todoTask.id, "PROMPT.md");
         const content = await readFile(promptPath, "utf-8");
-        if (isUnplannedSeedPrompt(content, todoTask.id, todoTask.title, todoTask.description)) {
+        if (isTaskAwaitingPlanning(todoTask, content)) {
           eligibleTodoTasks.push(todoTask);
         }
       } catch (err) {
@@ -1228,6 +1300,14 @@ export class TriageProcessor {
   /** Coalescing window for requestImmediatePoll, so a multi-card drag causes one poll, not N. */
   private static readonly NUDGE_DEBOUNCE_MS = 150;
 
+  /**
+   * FNXC:DuplicateIntake 2026-07-26-10:40:
+   * How much of the planner's visible reply is retained for duplicate-verdict recovery. The marker
+   * convention places the verdict in the closing summary, so a tail is sufficient and keeps a long
+   * planning run from accumulating every streamed token in memory.
+   */
+  private static readonly SESSION_TEXT_TAIL_CHARS = 4000;
+
   private async poll(): Promise<void> {
     if (!this.running) return;
     if (this.polling) return;
@@ -1263,6 +1343,8 @@ export class TriageProcessor {
       // Fetch all tasks (not just triage) to count active agents across columns.
       const allTasks = await this.store.listTasks({ slim: true, includeArchived: false });
       const now = Date.now();
+
+      await this.sweepStalePlanningStatuses(allTasks, now);
 
       if (this.options.semaphore) {
         const result = recoverIdleSemaphoreLeakCandidate({
@@ -1372,6 +1454,90 @@ export class TriageProcessor {
           `planning=${activeAgents}/${maxTriageConcurrent}, processing=${this.processing.size}` +
           `${processingIds.length > 0 ? ` [${processingIds.join(", ")}]` : ""}${semaphoreDetail}`,
         );
+        /*
+        FNXC:ConcurrencyAdmission 2026-07-26-09:30:
+        Durable counterpart to the log line above. Requirement from a real incident (FN-8600,
+        2026-07-26): an operator asked why a started card sat "Queued to plan" for seven minutes, and
+        it was UNANSWERABLE after the fact — the binding gate existed only in this `planLog.log`,
+        which lands in the TUI's in-memory pane (truncated to ~40 chars) and is persisted nowhere.
+        Reconstructing it cost a full DB forensics pass and still could not separate "host semaphore
+        exhausted" from "project cap consumed". Emitting the gate to run-audit makes it answerable at
+        all. Caveat: today the only run-audit READ route resolves through a durable agent's heartbeat
+        run, and this event carries a synthetic run id under agentId "triage", so it is reachable by
+        direct DB query but not yet through any dashboard route or fn_* tool -- the same blind spot
+        every synthetic-run self-healing/scheduler diagnostic shares. A task/type-scoped run-audit
+        read surface would close it for all of them at once.
+
+        Metadata stays ids/counts/outcomes-only per the run-audit contract: gate name, caps, counts,
+        and at most five eligible/processing task IDs — never prompts, titles, or reasons prose.
+
+        Deduped on the gate signature, not on time: while the gate and the cards behind it hold
+        steady a long stall collapses to ONE row instead of ~28 at a 15s poll, which is what keeps
+        operators reading the event. The signature deliberately includes the eligible task IDs --
+        counts alone would let a NEW card's stall be swallowed whenever the numbers happened to land
+        on the same tuple, and "why is THIS card queued" is the question the event exists to answer.
+        Live counts still jitter as unrelated lanes cycle, so this bounds write volume rather than
+        guaranteeing exactly one row.
+        */
+        const throttleSignature = [
+          blockedBy,
+          maxConcurrent,
+          claimed,
+          triageTasks.length,
+          this.processing.size,
+          semaphoreSnapshot?.activeCount ?? -1,
+          semaphoreSnapshot?.limit ?? -1,
+          eligibleIds.join(","),
+        ].join("|");
+        if (this.lastPlanThrottleSignature !== throttleSignature) {
+          const throttleAuditor = createRunAuditor(this.store, {
+            taskId: eligibleIds[0],
+            agentId: "triage",
+            runId: generateSyntheticRunId("plan-admission-throttled", eligibleIds[0] ?? this.rootDir),
+            phase: "triage",
+            source: "triage",
+          });
+          /*
+          FNXC:ConcurrencyAdmission 2026-07-26-10:45:
+          Fire-and-forget. Awaiting a store write inside the 15s poll let a slow/hung write delay the
+          NEXT poll's chance to notice freed capacity -- compounding the very stall being recorded.
+          */
+          void throttleAuditor.database({
+            type: "task:plan-admission-throttled",
+            target: eligibleIds[0] ?? this.rootDir,
+            metadata: {
+              blockedBy,
+              maxConcurrent,
+              claimed,
+              projectRoom,
+              eligibleCount: triageTasks.length,
+              eligibleTaskIds: eligibleIds,
+              processingCount: this.processing.size,
+              processingTaskIds: processingIds,
+              semaphoreActiveCount: semaphoreSnapshot?.activeCount,
+              semaphoreLimit: semaphoreSnapshot?.limit,
+              semaphoreAvailableCount: semaphoreSnapshot?.availableCount,
+              semaphoreWaitingCount: semaphoreSnapshot?.waitingCount,
+            },
+          })
+            .then(() => {
+              /*
+              FNXC:ConcurrencyAdmission 2026-07-26-10:45:
+              Mark the stall as recorded ONLY once the write lands. Setting the marker up front meant
+              a failed write -- most likely exactly when the store is contended, the condition this
+              event is meant to explain -- was swallowed for the whole stall with no retry, leaving
+              the incident as unanswerable as before the event existed. On failure the marker stays
+              put so the next poll retries.
+              */
+              this.lastPlanThrottleSignature = throttleSignature;
+            })
+            .catch((auditErr: unknown) => {
+              planLog.warn(`Failed to write plan-admission-throttled run-audit event: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`);
+            });
+        }
+      } else {
+        // Capacity is available again — the next distinct stall must re-announce itself.
+        this.lastPlanThrottleSignature = null;
       }
 
       for (let i = 0; i < Math.min(triageTasks.length, maxToStart); i++) {
@@ -1423,6 +1589,21 @@ export class TriageProcessor {
     if (this.processing.has(task.id)) return;
     this.processing.add(task.id);
     this.processingSince.set(task.id, Date.now());
+
+    /*
+    FNXC:NodeWorktreeIsolation 2026-07-26-09:10:
+    Holds the worktree path this planning run published to `activeSessionRegistry`, so the outer
+    `finally` can release exactly what it registered (and nothing when planning ran in the shared
+    checkout). Declared at method scope because registration happens deep inside the try.
+    */
+    let registeredPlanningPath: string | null = null;
+
+    /*
+    FNXC:DuplicateIntake 2026-07-26-10:40:
+    Bounded tail of the planner's visible reply, used only to recover a duplicate verdict the planner
+    announced in prose instead of writing to PROMPT.md (FN-8600).
+    */
+    let sessionTextTail = "";
 
     planLog.log(
       `Specifying ${task.id}: ${task.title || task.description.slice(0, 60)}`,
@@ -1693,8 +1874,50 @@ export class TriageProcessor {
         same shared-path shape behind the reported Plan Review session collision. The worktree acquired
         here is the one Plan Review and the implementation session then reuse.
         */
-        const planningCwd = (await this.options.acquirePlanningWorktree?.(task.id).catch(() => null)) || this.rootDir;
+        let planningCwd = (await this.options.acquirePlanningWorktree?.(task.id).catch(() => null)) || this.rootDir;
         if (planningCwd !== this.rootDir) {
+          /*
+          FNXC:NodeWorktreeIsolation 2026-07-26-09:10:
+          Publish the planner's worktree as a live session for as long as this planning run owns it.
+          Registration is what makes `activeSessionRegistry.isPathActive()` true, which is the single
+          guard every worktree-removal path consults. Without it the self-healing reclaim sweep tore
+          the worktree out from under a running planner and paused the task
+          `branch-conflict-unrecoverable` (FN-8600). Registered ONLY for a real task worktree — the
+          shared `rootDir` fallback is the operator's checkout and must never be marked task-owned.
+          The reciprocal unregister lives in this method's outer `finally`, so an early throw between
+          here and there cannot leak a permanent entry that blocks later legitimate cleanup.
+          */
+          /*
+          FNXC:NodeWorktreeIsolation 2026-07-26-10:25:
+          Acquire through the reclaim-aware seam, not raw `registerPath`. `acquireActiveSessionPath`
+          is what lets a leaked entry from a crashed/dead holder be reclaimed instead of hard-failing
+          a legitimate new registration; raw `registerPath` throws on any foreign-held path, so one
+          stale record would wedge planning for that worktree until the engine restarted. The
+          executor already registers exclusively through this seam
+          (`TaskExecutor.acquireSessionRegistryPath`) — planning must not be the one holder that
+          bypasses it. `contended` means a genuinely live foreign holder, so planning falls back to
+          the shared checkout rather than running in a worktree someone else owns.
+          */
+          const acquired = acquireActiveSessionPath(activeSessionRegistry, planningCwd, {
+            taskId: task.id,
+            kind: "planning",
+            ownerKey: `planning:${task.id}`,
+          }, {
+            holderLiveProbe: (holderTaskId) => this.processing.has(holderTaskId) || this.hasLivePlanningWork(holderTaskId),
+          });
+          if (acquired.action === "contended") {
+            planLog.warn(
+              `${task.id}: planning worktree ${planningCwd} is held by live task ${acquired.holderTaskId} (${acquired.holderKind}) — planning in the shared checkout instead`,
+            );
+            planningCwd = this.rootDir;
+          } else {
+            if (acquired.action === "reclaimed-stale-foreign") {
+              planLog.warn(
+                `${task.id}: reclaimed a stale active-session entry on ${planningCwd} from dead task ${acquired.holderTaskId} (idle ${acquired.ageMs}ms)`,
+              );
+            }
+            registeredPlanningPath = planningCwd;
+          }
           await this.store.logEntry(task.id, `Planning session running in task worktree ${planningCwd}`).catch(() => undefined);
         }
         const { session } = await createResolvedAgentSession({
@@ -1706,7 +1929,20 @@ export class TriageProcessor {
           systemPromptLayers: triageLayers,
           tools: "coding",
           customTools,
-          onText: agentLogger.onText,
+          onText: (text: string) => {
+            /*
+            FNXC:DuplicateIntake 2026-07-26-10:40:
+            Tee the planner's visible text into a bounded tail so a duplicate verdict announced in the
+            REPLY (rather than written to PROMPT.md) is still recoverable at finalize — see the
+            recovery block below. AgentLogger flushes and clears its own buffer on a timer, so it
+            cannot be read back for this; this tail is independent of it and never replaces it.
+            Bounded to the last SESSION_TEXT_TAIL_CHARS characters because the marker convention puts
+            the verdict in the closing summary, and an unbounded accumulator would grow with every
+            streamed token of a long planning run.
+            */
+            sessionTextTail = `${sessionTextTail}${text}`.slice(-TriageProcessor.SESSION_TEXT_TAIL_CHARS);
+            agentLogger.onText(text);
+          },
           onThinking: agentLogger.onThinking,
           onToolStart: agentLogger.onToolStart,
           onToolEnd: agentLogger.onToolEnd,
@@ -1855,8 +2091,11 @@ export class TriageProcessor {
               await this.store.deleteTask(task.id, {
                 removeLineageReferences: true,
                 auditContext: {
+                  // FNXC:TaskDeleteAttribution 2026-07-26-14:30: labelling only — this
+                  // split-close delete is intended engine behavior and is unchanged.
                   agentId: task.assignedAgentId ?? "triage",
                   runId: generateSyntheticRunId("triage-delete", task.id),
+                  callerKind: "engine",
                 },
               });
               planLog.log(`✓ ${task.id} split into subtasks (${childTaskIds}) and closed`);
@@ -1908,7 +2147,7 @@ export class TriageProcessor {
             ).catch(() => undefined);
           }
 
-          const written = await readFile(
+          let written = await readFile(
             join(this.rootDir, promptPath),
             "utf-8",
           ).catch((err: unknown) => {
@@ -1916,6 +2155,46 @@ export class TriageProcessor {
             planLog.warn(`${task.id}: failed to read generated PROMPT.md before finalization (${promptPath}): ${msg}`);
             return "";
           });
+
+          /*
+          FNXC:DuplicateIntake 2026-07-26-10:40:
+          Recover a duplicate verdict the planner reported in its REPLY instead of writing it to
+          PROMPT.md. FN-8600: the planner found the duplicate, said `DUPLICATE: FN-8595`, and stated
+          "No new PROMPT.md written" — a reasonable reading of an instruction that said not to write a
+          spec. The engine reads the verdict only from the file, so it saw no plan at all, failed
+          deterministic validation, retried, terminalized, self-healed to todo, and re-planned in a
+          loop, never recording the operator's keep-or-delete decision.
+
+          Recovery WRITES the canonical marker file rather than routing the verdict through a second
+          code path, so everything downstream — marker parse, keep/delete resolution, the
+          `nearDuplicateOf` metadata the dashboard decision renders from — runs unchanged and cannot
+          drift from the file-based contract.
+
+          Gated on a genuinely absent plan: only when the file read produced nothing does prose get a
+          vote. A planner that wrote a real spec is never second-guessed by something it said, and the
+          line-anchored parser ignores a marker merely mentioned mid-sentence.
+          */
+          if (!written.trim()) {
+            const recoveredMarker = fusionCore.parseDuplicateMarkerFromSessionText(sessionTextTail);
+            if (recoveredMarker) {
+              const markerBody = `DUPLICATE: ${recoveredMarker.canonicalId}\n`;
+              const recovered = await writeFile(join(this.rootDir, promptPath), markerBody, "utf-8")
+                .then(() => true)
+                .catch((err: unknown) => {
+                  const msg = err instanceof Error ? err.message : String(err);
+                  planLog.warn(`${task.id}: failed to persist recovered duplicate marker: ${msg}`);
+                  return false;
+                });
+              if (recovered) {
+                written = markerBody;
+                planLog.log(`${task.id}: recovered duplicate verdict ${recoveredMarker.canonicalId} from the planner's reply (no PROMPT.md was written)`);
+                await this.store.logEntry(
+                  task.id,
+                  `Recovered duplicate verdict from the planning reply — the planner reported ${recoveredMarker.canonicalId} without writing PROMPT.md`,
+                ).catch(() => undefined);
+              }
+            }
+          }
 
           // FN-5220: planning agents that emit a `DUPLICATE: FN-NNNN` redirect
           // short-circuit normal spec finalization.

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type SetStateAction } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type SetStateAction } from "react";
 import { Globe, Folder, GitBranch, Power, RefreshCw, Star, Settings as SettingsIcon, Search, X as SearchToggleCloseIcon } from "lucide-react";
 import {
   getErrorMessage,
@@ -67,14 +67,13 @@ import { DatabaseBackupsSection } from "./settings/sections/DatabaseBackupsSecti
 import { LoadingSpinner } from "./LoadingSpinner";
 import { PluginsSection } from "./settings/sections/PluginsSection";
 import { useMemoryBackendStatus } from "../hooks/useMemoryBackendStatus";
-import { useOverlayDismiss } from "../hooks/useOverlayDismiss";
 import type { ToastType } from "../hooks/useToast";
 import { useTranslation } from "react-i18next";
 import { useSessionBannersHidden, setSessionBannersHidden } from "../hooks/useSessionBannerPref";
 import "./SettingsModal.css";
 import { FileBrowser } from "./FileBrowser";
 import { useWorkspaceFileBrowser } from "../hooks/useWorkspaceFileBrowser";
-import { useModalResizePersist } from "../hooks/useModalResizePersist";
+import { FloatingWindow } from "./FloatingWindow";
 import { ProviderIcon } from "./ProviderIcon";
 import { generateUniquePresetId } from "../utils/modelPresets";
 import { copyTextToClipboard } from "../utils/copyToClipboard";
@@ -93,6 +92,7 @@ import { SETTINGS_SEARCH_ENTRIES } from "./settings/search/entries";
 import { rankSettingsSearchResults, matchedSectionIds } from "./settings/search/match";
 import { SettingsSearchHighlightProvider } from "./settings/SettingsSearchHighlightContext";
 import { subscribeSse } from "../sse-bus";
+import { SETTINGS_SECTION_METADATA } from "../../src/shared/settings-sections";
 
 // ---------------------------------------------------------------------------
 // GitHub star count — cached locally and refreshed only while Settings is visible.
@@ -486,17 +486,11 @@ function resolveNonNegativeExecutorToolFailureSetting(value: unknown, fallback: 
   return Number.isFinite(configured) && configured >= 0 ? Math.floor(configured) : fallback;
 }
 
-export const SETTINGS_SECTIONS: SettingsSection[] = [
-  { id: "__preferences_header", label: "Preferences", labelKey: "settings.nav.preferencesHeader", scope: undefined, isGroupHeader: true },
-  { id: "appearance", label: "Appearance", labelKey: "settings.nav.appearance", scope: "global", searchableText: ["theme", "color", "sidebar", "dock", "task popup", "task popups", "board list popups", "popup view attachment", "open tasks as popups", "quick chat"] },
-  { id: "keyboard-shortcuts", label: "Keyboard Shortcuts", labelKey: "settings.nav.keyboardShortcuts", scope: "global", searchableText: ["keyboard shortcuts", "hotkeys", "quick chat shortcut", "terminal shortcut", "open files", "open settings", "command center", "new task shortcut", "record shortcut"] },
-  { id: "notifications", label: "Notifications", labelKey: "settings.nav.notifications", scope: "global", searchableText: ["ntfy", "webhook", "events", "failure notifications", "sticky", "toast"] },
-  { id: "global-general", label: "General · Global", labelKey: "settings.nav.globalGeneral", scope: "global", searchableText: ["global defaults", "modal outside dismiss", "agent logs", "persist tool output", "thinking logs"] },
-  /*
-  FNXC:SettingsNavigation 2026-07-16-12:00:
-  FN-8128 keeps the `fn` binary panel as a dedicated section rather than re-inlining machine plumbing at the top of General · Global, while restoring it to the default-visible Global group. Operators need installation, version, path, and diagnostic controls in Basic mode when setup or repair is needed.
-  */
-  { id: "cli-binary", label: "CLI Binary", labelKey: "settings.nav.cliBinary", scope: "global", searchableText: ["fn binary", "cli", "install", "version", "path", "upgrade", "homebrew", "binary check"] },
+const SETTINGS_SECTION_ICONS: Readonly<Record<string, typeof Globe>> = {
+  authentication: Globe,
+  "source-control-global": GitBranch,
+  "source-control": GitBranch,
+};
 
   { id: "__project_header", label: "Project", labelKey: "settings.nav.projectHeader", scope: undefined, isGroupHeader: true },
   /*
@@ -1150,7 +1144,7 @@ export function SettingsModal({
   onOpenWorkflowSettings,
   presentation = "modal",
 }: SettingsModalProps) {
-  const { isEmbedded, scrollLockEnabled, resizePersistEnabled, escapeEnabled, overlayDismissEnabled } = useEmbeddedPresentation(presentation);
+  const { isEmbedded, scrollLockEnabled, escapeEnabled, overlayDismissEnabled } = useEmbeddedPresentation(presentation);
   const { t } = useTranslation("app");
   const { confirm } = useConfirm();
   const viewportMode = useViewportMode();
@@ -1166,7 +1160,6 @@ export function SettingsModal({
         ...(viewportHeight !== null ? { "--vv-height": `${viewportHeight}px` } : {}),
       } as CSSProperties)
     : {};
-  const modalRef = useRef<HTMLDivElement>(null);
   const settingsContentRef = useRef<HTMLDivElement>(null);
   const workflowLaneSaverRef = useRef<SectionSaveHandler | null>(null);
   /*
@@ -1190,8 +1183,7 @@ export function SettingsModal({
       workflowLaneSaverRef.current = saver;
     }
   }, []);
-  // Modal-only: persist user-resized dialog dimensions. Embedded view fills its host and is not resizable.
-  useModalResizePersist(modalRef, resizePersistEnabled, "fusion:settings-modal-size");
+  // FNXC:ModalTouchGeometry 2026-07-26-14:10: FloatingWindow owns movable, clamped geometry for the modal branch; the embedded Settings view remains an inline, chrome-free destination.
   const sessionBannersHidden = useSessionBannersHidden();
   const [form, setForm] = useState<SettingsFormState>({
     maxConcurrent: 2,
@@ -3937,14 +3929,6 @@ export function SettingsModal({
     return () => document.removeEventListener("keydown", handleKey);
   }, [escapeEnabled, requestClose, resetDialogOpen]);
 
-  const modalOverlayDismissProps = useOverlayDismiss(() => { void requestClose(); });
-  /*
-  FNXC:SettingsAutoSave 2026-08-02-21:45:
-  Backdrop dismissal remains preference-gated, but every enabled modal path
-  shares requestClose so its latest dirty snapshot is flushed before unmount.
-  */
-  const overlayDismissProps = !isEmbedded && overlayDismissEnabled ? modalOverlayDismissProps : {};
-
 
   /*
   FNXC:SettingsReset 2026-07-04-00:25:
@@ -4660,18 +4644,45 @@ export function SettingsModal({
   FNXC:Settings 2026-06-22-00:00:
   Embedded settings is a main-content destination, not a dialog. It drops the fixed `.modal-overlay` backdrop and the inner card chrome (modal-overlay/modal/settings-modal classes), and instead uses `settings-embedded right-dock-embedded-view` (host) + `settings-modal--embedded` (panel) to fill the pane flush like other embedded views (Planning, Command Center). The modal path stays byte-identical.
   */
-  return (
+  /*
+  FNXC:ModalTouchGeometry 2026-07-26-19:40:
+  The shell MUST stay a plain render function, never a component declared inside this render. A nested component is a
+  new element type on every render, so React remounts the whole Settings subtree on each keystroke and text inputs lose
+  focus after one character. Keep the returned element types (div / FloatingWindow) stable by calling this directly.
+  */
+  const renderModalShell = (children: ReactNode) => isEmbedded ? (
     <div
-      className={isEmbedded ? "settings-embedded right-dock-embedded-view" : "modal-overlay open settings-modal-overlay"}
-      {...overlayDismissProps}
-      data-testid={isEmbedded ? "settings-view" : undefined}
-      role={isEmbedded ? "region" : "dialog"}
-      aria-label={isEmbedded ? t("settings.title", "Settings") : undefined}
-      aria-modal={isEmbedded ? undefined : "true"}
+      className="settings-embedded right-dock-embedded-view"
+      data-testid="settings-view"
+      role="region"
+      aria-label={t("settings.title", "Settings")}
     >
+      {children}
+    </div>
+  ) : (
+    <FloatingWindow
+      windowKey="settings"
+      title={t("settings.title", "Settings")}
+      ariaLabel={`${t("settings.title", "Settings")} dialog`}
+      onClose={() => void requestClose()}
+      hideHeader
+      dragHandleSelector=".settings-modal > .modal-header"
+      className="floating-window--settings"
+      defaultSize={{ width: 1100, height: 720 }}
+      minSize={{ width: 520, height: 480 }}
+      persistGeometryKey="floating-window:settings"
+      suspendGeometryPersistenceOnMobile
+      suspendGeometryPersistenceOnShortViewport
+      closeOnOutsidePointerDown={overlayDismissEnabled}
+    >
+      {children}
+    </FloatingWindow>
+  );
+
+  return renderModalShell(
+    <>
       <div
         className={isEmbedded ? "modal modal-lg settings-modal settings-modal--embedded" : "modal modal-lg settings-modal"}
-        ref={modalRef}
         style={isEmbedded ? undefined : keyboardStyle}
       >
         <div className={isEmbedded ? "modal-header modal-header--embedded" : "modal-header"}>
@@ -5411,7 +5422,7 @@ export function SettingsModal({
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
 

@@ -7,7 +7,7 @@
 
 import { EventEmitter } from "node:events";
 import { join, resolve } from "node:path";
-import { Database, fromJson, toJson } from "./db.js";
+import { Database, fromJson } from "./db.js";
 import { CentralDatabase } from "./central-db.js";
 import type {
   PluginInstallation,
@@ -889,24 +889,17 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
     const plugin = await this.getPlugin(manifest.id);
     this.emit("plugin:registered", plugin);
     return plugin;
-  }
+}
 
   async unregisterPlugin(id: string): Promise<PluginInstallation> {
     /*
      * FNXC:SqliteFinalRemoval 2026-06-26-10:15:
      * Backend-mode: delegate to the async Drizzle unregisterPlugin helper.
      */
-    if (this.backendMode) {
-      const plugin = await unregisterPluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
-      this.emit("plugin:unregistered", plugin);
-      return plugin;
-    }
-    const plugin = await this.getPlugin(id);
-    this.centralDb.prepare("DELETE FROM plugin_installs WHERE id = ?").run(id);
-    this.centralDb.bumpLastModified();
+        const plugin = await unregisterPluginAsync(this.asyncLayer!.db, id, this.normalizedProjectPath);
     this.emit("plugin:unregistered", plugin);
     return plugin;
-  }
+}
 
   async getPlugin(id: string): Promise<PluginInstallation> {
     /*
@@ -1143,7 +1136,7 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
     const updated = await this.getPlugin(id);
     this.emit("plugin:updated", updated);
     return updated;
-  }
+}
 
   async updatePlugin(id: string, updates: PluginUpdateInput): Promise<PluginInstallation> {
     await this.getPlugin(id);
@@ -1152,80 +1145,19 @@ export class PluginStore extends EventEmitter<PluginStoreEvents> {
      * FNXC:SqliteFinalRemoval 2026-06-26-10:25:
      * Backend-mode: delegate install-field persistence to the async helper.
      */
-    if (this.backendMode) {
-      await updatePluginInstallAsync(this.asyncLayer!.db, id, {
-        name: updates.name,
-        version: updates.version,
-        description: updates.description,
-        author: updates.author,
-        homepage: updates.homepage,
-        path: updates.path,
-        dependencies: updates.dependencies,
-        aiScanOnLoad: updates.aiScanOnLoad,
-        lastSecurityScan: updates.lastSecurityScan,
-      });
-      const updated = await this.getPlugin(id);
-      this.emit("plugin:updated", updated);
-      return updated;
-    }
-
-    const now = new Date().toISOString();
-
-    const setClauses: string[] = ["updatedAt = ?"];
-    const params: (string | null | number)[] = [now];
-
-    if (updates.name !== undefined) {
-      setClauses.push("name = ?");
-      params.push(updates.name);
-    }
-    if (updates.version !== undefined) {
-      setClauses.push("version = ?");
-      params.push(updates.version);
-    }
-    if (updates.description !== undefined) {
-      setClauses.push("description = ?");
-      params.push(updates.description ?? null);
-    }
-    if (updates.author !== undefined) {
-      setClauses.push("author = ?");
-      params.push(updates.author ?? null);
-    }
-    if (updates.homepage !== undefined) {
-      setClauses.push("homepage = ?");
-      params.push(updates.homepage ?? null);
-    }
-    if (updates.path !== undefined) {
-      setClauses.push("path = ?");
-      params.push(updates.path);
-    }
-    if (updates.dependencies !== undefined) {
-      setClauses.push("dependencies = ?");
-      params.push(toJson(updates.dependencies));
-    }
-    /*
-    FNXC:Plugins 2026-07-12-10:59:
-    FN-7855 requires updatePlugin to persist manifest settingsSchema changes independently from per-project setting values so path-registered plugin reloads can refresh dashboard metadata without unregistering the plugin.
-    Undefined means "leave schema unchanged"; null explicitly clears the persisted schema when a rebuilt manifest removes it.
-    */
-    if (updates.settingsSchema !== undefined) {
-      setClauses.push("settingsSchema = ?");
-      params.push(updates.settingsSchema === null ? null : toJson(updates.settingsSchema));
-    }
-    if (updates.aiScanOnLoad !== undefined) {
-      setClauses.push("aiScanOnLoad = ?");
-      params.push(updates.aiScanOnLoad ? 1 : 0);
-    }
-    if (updates.lastSecurityScan !== undefined) {
-      setClauses.push("lastSecurityScan = ?");
-      params.push(toJson(updates.lastSecurityScan));
-    }
-
-    params.push(id);
-    this.centralDb.prepare(`UPDATE plugin_installs SET ${setClauses.join(", ")} WHERE id = ?`).run(...params);
-    this.centralDb.bumpLastModified();
-
+        await updatePluginInstallAsync(this.asyncLayer!.db, id, {
+      name: updates.name,
+      version: updates.version,
+      description: updates.description,
+      author: updates.author,
+      homepage: updates.homepage,
+      path: updates.path,
+      dependencies: updates.dependencies,
+      aiScanOnLoad: updates.aiScanOnLoad,
+      lastSecurityScan: updates.lastSecurityScan,
+    });
     const updated = await this.getPlugin(id);
     this.emit("plugin:updated", updated);
     return updated;
-  }
+}
 }

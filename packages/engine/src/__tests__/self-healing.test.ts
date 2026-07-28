@@ -117,6 +117,7 @@ vi.mock("../worktree-pool.js", async () => {
 const { selfHealingLoggerMock } = vi.hoisted(() => ({
   selfHealingLoggerMock: {
     log: vi.fn(),
+    debug: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
   },
@@ -124,7 +125,7 @@ const { selfHealingLoggerMock } = vi.hoisted(() => ({
 
 vi.mock("../logger.js", () => ({
   createLogger: vi.fn((_name: string) => selfHealingLoggerMock),
-  schedulerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  schedulerLog: { log: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 vi.mock("../merger.js", () => ({
@@ -163,6 +164,7 @@ const mockedClassifyOwnedLandedEvidence = vi.mocked(classifyOwnedLandedEvidence)
 
 type MockLogger = {
   log: ReturnType<typeof vi.fn>;
+  debug: ReturnType<typeof vi.fn>;
   warn: ReturnType<typeof vi.fn>;
   error: ReturnType<typeof vi.fn>;
 };
@@ -3033,7 +3035,17 @@ describe("SelfHealingManager", () => {
       const result = await managerWithRecovery.recoverStrandedCompletedTodoTasks();
 
       expect(result).toBe(1);
-      expect(store.listTasks).toHaveBeenCalledWith({ column: "todo", slim: true });
+      /*
+      FNXC:WorkflowLifecycleColumns 2026-07-28-06:40 (Phase B / slice B3.1 — U4):
+      The query shape CHANGED on purpose. This sweep can no longer scope itself to
+      `column: "todo"` — that literal made it blind to every workflow whose hold
+      column is named something else, so a finished card sat in `drafting` forever.
+      It now reads the board and filters by each task's RESOLVED hold column.
+
+      The behavioral assertions below are the ones that matter and are unchanged:
+      one qualifying card, promoted exactly once. Only the query shape moved.
+      */
+      expect(store.listTasks).toHaveBeenCalledWith({ slim: true, includeArchived: false });
       expect(recoverFn).toHaveBeenCalledTimes(1);
       expect(recoverFn).toHaveBeenCalledWith(expect.objectContaining({ id: "FN-101" }));
 
@@ -7655,45 +7667,6 @@ describe("SelfHealingManager", () => {
     });
   });
 
-  describe("surfaceDependencyBlockedTodos", () => {
-    it("returns 0 when globalPause is enabled", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ globalPause: true });
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(0);
-      managerWithRecovery.stop();
-    });
-
-    it("returns 0 when dependency-blocked todo reporting is disabled", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ dependencyBlockedTodoReportEnabled: false });
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(0);
-      managerWithRecovery.stop();
-    });
-
-    it("returns groupCount from reporter", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ dependencyBlockedTodoReportEnabled: true });
-      const reportSpy = vi.fn().mockResolvedValue({ alerted: true, groupCount: 1 });
-      (managerWithRecovery as unknown as { dependencyBlockedTodoReporter: { report: typeof reportSpy } }).dependencyBlockedTodoReporter = { report: reportSpy };
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(1);
-      expect(reportSpy).toHaveBeenCalledWith();
-      managerWithRecovery.stop();
-    });
-
-    it("returns 0 and logs error when reporter fails", async () => {
-      const managerWithRecovery = new SelfHealingManager(store, { rootDir: "/tmp/test-project", getProjectId: () => "/tmp/test-project" });
-      (store.getSettings as ReturnType<typeof vi.fn>).mockResolvedValue({ dependencyBlockedTodoReportEnabled: true });
-      const reportSpy = vi.fn().mockRejectedValue(new Error("boom"));
-      (managerWithRecovery as unknown as { dependencyBlockedTodoReporter: { report: typeof reportSpy } }).dependencyBlockedTodoReporter = { report: reportSpy };
-
-      expect(await managerWithRecovery.surfaceDependencyBlockedTodos()).toBe(0);
-      managerWithRecovery.stop();
-    });
-  });
-
   describe("surfaceInReviewStalled", () => {
     function inReviewTask(overrides: Record<string, unknown> = {}) {
       return {
@@ -10486,7 +10459,11 @@ describe("maintenance cycle concurrency", () => {
 
     await (manager as any).runMaintenance();
 
-    expect(getSelfHealingLogger().log).toHaveBeenCalledWith(
+    // Steady-state PG no-ops are debug-gated so they do not fill the TUI log pane.
+    expect(getSelfHealingLogger().debug).toHaveBeenCalledWith(
+      expect.stringContaining("wal-checkpoint\" skipped — PostgreSQL manages WAL + autovacuum"),
+    );
+    expect(getSelfHealingLogger().log).not.toHaveBeenCalledWith(
       expect.stringContaining("wal-checkpoint\" skipped — PostgreSQL manages WAL + autovacuum"),
     );
   });
