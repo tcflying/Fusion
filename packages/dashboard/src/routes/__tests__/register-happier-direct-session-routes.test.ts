@@ -465,7 +465,7 @@ describe("Happier direct-session task routes", () => {
     expect(second.status).toBe(200);
     expect(second.body).toMatchObject({ created: false, nativeSessionId: "thread-1", happierSessionId: "happier-session-1" });
     expect(assignTaskToBridge).toHaveBeenCalledTimes(2);
-    expect(ensureHarness.ensure).toHaveBeenCalledTimes(2);
+    expect(ensureHarness.ensure).toHaveBeenCalledTimes(1);
     expect(ensureHarness.sessions).toHaveLength(1);
   });
 });

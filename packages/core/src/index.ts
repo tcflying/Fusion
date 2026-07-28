@@ -2623,6 +2623,21 @@ export type { LanguageFamily, DetectedContentLanguage } from "./detect-content-l
 export { promoteResearchFinding } from "./research-feature-promotion.js";
 export type { ResearchFeaturePromotionInput } from "./research-feature-promotion.js";
 export { getTotalAgentActiveMs, startPlanningSegment, finalizePlanningSegment } from "./task-timing.js";
+export { createLogger, type Logger } from "./logger.js";
+export * from "./workflow-parity.js";
+export * from "./workflow-cutover.js";
+export * from "./task-delete-attribution.js";
+export {
+  NOTIFIED_TASK_DELETE_CALLER_KINDS,
+  shouldNotifyOperatorOfDelete,
+  registerTaskDeleteNoticeMailbox,
+  getTaskDeleteNoticeMailbox,
+  buildTaskDeleteNoticeContent,
+  buildTaskDeleteNoticeIdempotencyKey,
+  notifyOperatorOfNonOperatorDelete,
+  type TaskDeleteNoticeMailbox,
+  type TaskDeleteNoticeSnapshot,
+} from "./task-delete-notice.js";
 
 // Session Room control-plane extensions staged after the upstream schema base.
 export * from "./room-terminalization.js";
@@ -2650,7 +2665,6 @@ export * as RoomRbacPolicy from "./room-rbac-policy.js";
 export * from "./room-rbac-registry.js";
 export * from "./room-rbac-registry-postgres.js";
 export { AsyncCliSessionStore } from "./async-cli-session-store.js";
-export * from "./workflow-cutover.js";
 export * from "./room-evaluation-profiles.js";
 export * from "./room-observability-metrics.js";
 export * from "./room-phase-gate-evidence.js";
@@ -2669,9 +2683,7 @@ export * as RoomDeterministicGatePolicy from "./room-deterministic-gate-policy.j
 // the Session Room additions in this barrel while upstream moved several
 // task/mission/plugin contracts into dedicated files; expose both surfaces so
 // engine consumers compiled against either generation remain valid.
-export {
-  resolveSelectedWorkflowModelLane,
-} from "./model-resolution.js";
+export * from "./model-resolution.js";
 export { resolveProjectWorkflowModelLaneBaseline } from "./workflow-settings-resolver.js";
 export { resolveEffectiveSettingsDetailedById } from "./workflow-settings-resolver.js";
 export { enrichRunningAgentTaskShape, enrichRunningAgentTaskShapeFromFlags } from "./live-agent-count.js";

@@ -26,12 +26,13 @@ import {
   isSessionRoomControlPlaneEnabled,
   MissionStore,
   resolveWorkflowIrForTask,
+  isTaskBlockedOnApproval,
+  registerTaskDeleteNoticeMailbox,
 } from "@fusion/core";
 import { Scheduler } from "../scheduler.js";
 import type { PrMonitor, PrComment } from "../pr-monitor.js";
 import type { PrInfo } from "@fusion/core";
 import { TaskExecutor, type TaskExecutorOptions } from "../executor.js";
-import { WorkflowAuthoritativeDriver } from "../workflow-authoritative-driver.js";
 import { buildPrNodeDeps } from "../pr-nodes.js";
 import { isExperimentalFeatureEnabled } from "@fusion/core";
 import { createCliAgentRuntime, type BootstrappedCliAgentRuntime } from "../cli-agent/runtime.js";
@@ -224,7 +225,7 @@ export function isPlanningContinuationTaskDispatchable(
 
 export type PlanningContinuationResolution =
   | { kind: "actionable"; item: WorkflowWorkItem; task: Task }
-  | { kind: "skip"; item: WorkflowWorkItem; reason: "not-planning" | "paused" }
+  | { kind: "skip"; item: WorkflowWorkItem; reason: "not-planning" | "paused" | "awaiting-approval" }
   | { kind: "orphan"; item: WorkflowWorkItem; reason: "task-not-found" | "task-terminal" };
 
 export function resolvePlanningContinuationCandidate(
@@ -1076,7 +1077,6 @@ export class InProcessRuntime
       }
 
       const prNodeGithubOps = this.config.prNodeGithubOps;
-      const workflowAuthoritativeDriverRef: { current?: WorkflowAuthoritativeDriver } = {};
       const executorOptions: TaskExecutorOptions = {
         /*
         FNXC:PlanReviewLease 2026-07-26-21:12:
@@ -1104,10 +1104,6 @@ export class InProcessRuntime
         onSliceComplete: (slice) => {
           void this.scheduler.onSliceComplete(slice);
         },
-        workflowAuthoritativeDispatch: async (task) =>
-          (await workflowAuthoritativeDriverRef.current?.maybeRun(task))?.handled ?? false,
-        globalCapacityLegacyRecoveryGate,
-        globalCapacityLegacyDispatchControl,
         onStart: (task, worktreePath) => {
           this.recordActivity();
           runtimeLog.log(`Started executing task ${task.id} in ${worktreePath}`);
@@ -1150,10 +1146,6 @@ export class InProcessRuntime
         this.config.workingDirectory,
         executorOptions
       );
-      workflowAuthoritativeDriverRef.current = new WorkflowAuthoritativeDriver({
-        store: this.taskStore,
-        executor: this.executor,
-      });
       if (this.mergeRequester) {
         this.executor.setMergeRequester(this.mergeRequester);
       }
@@ -1348,8 +1340,6 @@ export class InProcessRuntime
           stuckTaskDetector: this.stuckTaskDetector,
           agentStore: this.agentStore,
           pluginRunner: this.pluginRunner,
-          globalCapacityLegacyRecoveryGate,
-          globalCapacityLegacyDispatchControl,
           // FNXC:NodeWorktreeIsolation 2026-07-25-22:10: planning acquires (or reuses) the task's own
           // worktree through the executor's acquisition path, so no lane runs in the shared checkout.
           acquirePlanningWorktree: (taskId) => this.executor.ensureTaskWorktreeForPlanning(taskId),
@@ -2224,22 +2214,10 @@ export class InProcessRuntime
     if (this.workflowContinuationDrainActive || this.status !== "active") return;
     this.workflowContinuationDrainActive = true;
     try {
-      await drainDuePlanningContinuations({
-        listDue: () => this.taskStore.listDueWorkflowWorkItems({
-          kinds: ["task"],
-          states: ["runnable", "retrying"],
-          limit: DUE_PLANNING_CONTINUATION_BATCH_LIMIT,
-        }),
-        getTask: (taskId) => Promise.resolve(this.taskStore.getTask(taskId)),
-        cancelOrphan: (item, reason) => this.cancelOrphanedWorkflowWorkItem(item, reason),
-        defer: (deferral) => this.deferParkedWorkflowWorkItem(deferral),
-        dispatch: (task, item) => {
-          void this.executor.execute(task).catch((error) => {
-            runtimeLog.error(`Workflow continuation ${item.id} failed:`, error);
-          });
-        },
-        nowMs: () => Date.now(),
-        warn: (message) => runtimeLog.warn(message),
+      const items = await this.taskStore.listDueWorkflowWorkItems({
+        kinds: ["task"],
+        states: ["runnable", "retrying"],
+        limit: 25,
       });
       for (const item of items) {
         let task: Task | undefined;

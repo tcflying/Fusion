@@ -15358,7 +15358,9 @@ async function verifyLegacyHappierBindingSource(
   const rows = await tx
     .select()
     .from(cliSessions)
-    .where(and(eq(cliSessions.projectId, projectId), eq(cliSessions.id, source.cliSessionId)))
+    // project_id is the connection/trigger-owned RLS partition; the domain
+    // project identity used by the import contract lives in owner_project_id.
+    .where(and(eq(cliSessions.ownerProjectId, projectId), eq(cliSessions.id, source.cliSessionId)))
     .limit(1);
   const row = rows[0];
   if (!row) {

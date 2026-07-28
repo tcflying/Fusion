@@ -765,7 +765,10 @@ export async function createTaskStoreForTest(options?: {
     poolMax,
     connectTimeoutSeconds: 5,
   });
-  const layer = createAsyncDataLayer(connections);
+  // The shared harness models Fusion's canonical default project (`""`). Bind
+  // that scope explicitly so project audit writes inherit it transactionally;
+  // a layer without projectId is intentionally an unbound/admin layer.
+  const layer = createAsyncDataLayer(connections, { projectId: "" });
 
   // Admin connection for direct row inspection/seeding in tests.
   const adminSql = postgres(testUrl, {

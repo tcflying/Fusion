@@ -352,6 +352,7 @@ describe.each<Backend>(["async"])("%s store", (backend) => {
       taskId,
       worktreePath: "G:\\fusion-test-project",
       ensured: ensuredA,
+      sourceSessionUri: "codex://threads/requested-a",
     });
 
     expect(result).toMatchObject({
@@ -361,13 +362,14 @@ describe.each<Backend>(["async"])("%s store", (backend) => {
       happierSessionId: ensuredA.sessionId,
       machineId: "machine-a",
       serverProfileId: "server-a",
+      sourceSessionUri: "codex://threads/requested-a",
     });
     expect(Date.parse(result.linkedAt)).not.toBeNaN();
     expect(harness.operations).toEqual(["claim", "metadata"]);
     expect(harness.readPosture(taskId)).toEqual({
       autoApprove: true,
       unrelated: { keep: "yes" },
-      happierDirectSession: { schemaVersion: 2, ...result },
+      happierDirectSession: { schemaVersion: 3, ...result },
     });
     expect(harness.readPosture(taskId)?.happierDirectSession).not.toHaveProperty("openUrl");
   });

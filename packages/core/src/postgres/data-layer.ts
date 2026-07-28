@@ -290,6 +290,10 @@ function normalizeRunAuditJson(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
+        // JSON object serialization omits undefined properties. PostgreSQL's
+        // jsonb driver follows that contract, so the idempotency comparison
+        // must not invent a persisted `null` field that was never written.
+        .filter(([, nested]) => nested !== undefined)
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([key, nested]) => [key, normalizeRunAuditJson(nested)]),
     );
@@ -444,15 +448,24 @@ function resolveRunAuditProjectId(
 ): string {
   const hasTransactionScope = transactionRunAuditScopes.has(tx);
   const transactionProjectId = transactionRunAuditScopes.get(tx);
-  if (hasTransactionScope && transactionProjectId) {
-    if (inputProjectId && inputProjectId !== transactionProjectId) {
+  const normalizedInputProjectId = inputProjectId === undefined
+    ? undefined
+    : projectOwnershipPartition(inputProjectId);
+  // The canonical default project is represented by the empty string. Test
+  // harnesses and default-project runtimes bind that logical scope, while the
+  // ownership trigger persists it as the legacy-unscoped partition sentinel.
+  // Normalize before both insert and read so trigger rewriting cannot make the
+  // just-inserted audit row invisible to its own transaction.
+  if (hasTransactionScope && typeof transactionProjectId === "string") {
+    const normalizedTransactionProjectId = projectOwnershipPartition(transactionProjectId);
+    if (normalizedInputProjectId !== undefined && normalizedInputProjectId !== normalizedTransactionProjectId) {
       throw new RunAuditEventProjectScopeError(
-        `Run-audit write attempted to override bound projectId ${transactionProjectId} with ${inputProjectId}`,
+        `Run-audit write attempted to override bound projectId ${normalizedTransactionProjectId} with ${normalizedInputProjectId}`,
       );
     }
-    return transactionProjectId;
+    return normalizedTransactionProjectId;
   }
-  if (inputProjectId) return inputProjectId;
+  if (normalizedInputProjectId !== undefined) return normalizedInputProjectId;
   throw new RunAuditEventProjectScopeError();
 }
 

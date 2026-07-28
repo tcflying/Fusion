@@ -418,34 +418,9 @@ export async function recordRunAuditEventImpl(store: TaskStore, input: RunAuditE
     // Backend-mode: delegate to the async data-layer helper. The data-layer
     // RunAuditEvent has taskId: string | null (DB shape); the store's public
     // RunAuditEvent type has taskId: string | undefined. Map null → undefined.
-    if (store.backendMode) {
-      const layer = store.asyncLayer!;
-      const raw = await recordRunAuditEventAsync(layer, {
-        id: input.id,
-        timestamp: input.timestamp,
-        projectId: input.projectId,
-        taskId: input.taskId,
-        agentId: input.agentId,
-        runId: input.runId,
-        domain: input.domain,
-        mutationType: input.mutationType,
-        target: input.target,
-        metadata: input.metadata,
-      });
-      return {
-        ...raw,
-        projectId: raw.projectId ?? undefined,
-        taskId: raw.taskId ?? undefined,
-        domain: raw.domain as RunAuditEvent["domain"],
-        metadata: raw.metadata ?? undefined,
-      };
-    }
-    const id = input.id ?? randomUUID();
-    const timestamp = input.timestamp ?? new Date().toISOString();
-
-    const event: RunAuditEvent = {
-      id,
-      timestamp,
+    const raw = await recordRunAuditEventAsync(store.asyncLayer!, {
+      id: input.id,
+      timestamp: input.timestamp,
       projectId: input.projectId,
       taskId: input.taskId,
       agentId: input.agentId,
@@ -457,6 +432,7 @@ export async function recordRunAuditEventImpl(store: TaskStore, input: RunAuditE
     });
     return {
       ...raw,
+      projectId: raw.projectId ?? undefined,
       taskId: raw.taskId ?? undefined,
       domain: raw.domain as RunAuditEvent["domain"],
       metadata: raw.metadata ?? undefined,

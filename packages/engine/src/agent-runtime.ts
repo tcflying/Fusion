@@ -92,7 +92,7 @@ export function resolveTaskHappierCliSessionId(input: {
  */
 export function createCliSessionNativeSessionBinding(
   options: {
-    store: Pick<CliSessionStore, "getSession" | "claimNativeSessionId">;
+    store: Pick<CliSessionStore, "getSession" | "claimNativeSessionId" | "flush">;
     sessionId: string;
     bindingKey?: string;
   },
@@ -105,6 +105,10 @@ export function createCliSessionNativeSessionBinding(
     return current.nativeSessionId;
   };
   const claimNativeSessionId = async (candidate: string) => {
+    // createSession is cache-synchronous but PostgreSQL-asynchronous. Flush its
+    // queued INSERT before the direct atomic UPDATE/SELECT claim, otherwise a
+    // newly-created owner can be invisible to its first native-session claim.
+    await options.store.flush();
     const result = await options.store.claimNativeSessionId(options.sessionId, candidate);
     if (!result) throw new Error(`CLI session not found: ${options.sessionId}`);
     return result;

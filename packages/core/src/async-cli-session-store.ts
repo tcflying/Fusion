@@ -27,7 +27,7 @@ function rowToSession(row: CliSessionRow): CliSession {
     taskId: row.taskId ?? null,
     chatSessionId: row.chatSessionId ?? null,
     purpose: row.purpose as CliSession["purpose"],
-    projectId: row.projectId,
+    projectId: row.ownerProjectId ?? "",
     adapterId: row.adapterId,
     agentState: row.agentState as CliSession["agentState"],
     terminationReason: (row.terminationReason as CliSession["terminationReason"]) ?? null,
@@ -67,7 +67,10 @@ export class AsyncCliSessionStore {
         taskId: input.taskId ?? null,
         chatSessionId: input.chatSessionId ?? null,
         purpose: input.purpose,
-        projectId: input.projectId,
+        // project_id is the trigger/GUC-owned RLS partition. The caller's
+        // domain project belongs in owner_project_id (migration 0011), matching
+        // CliSessionStore and keeping project-scoped hydration interoperable.
+        ownerProjectId: input.projectId,
         adapterId: input.adapterId,
         agentState: input.agentState ?? "starting",
         terminationReason: input.terminationReason ?? null,

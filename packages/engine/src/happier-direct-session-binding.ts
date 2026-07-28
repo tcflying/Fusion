@@ -32,10 +32,17 @@ export type TaskHappierDirectSessionBinding = {
   machineId: string;
   serverProfileId: string;
   linkedAt: string;
+  /** Original provider URI accepted by Happier; retained for idempotent retries. */
+  sourceSessionUri?: string;
 };
 
 type PersistedTaskHappierDirectSessionBindingV2 = TaskHappierDirectSessionBinding & {
   schemaVersion: 2;
+};
+
+type PersistedTaskHappierDirectSessionBindingV3 = TaskHappierDirectSessionBinding & {
+  schemaVersion: 3;
+  sourceSessionUri: string;
 };
 
 export type Store = Pick<TaskStore, "getFusionDir" | "getDatabase" | "getAsyncLayer">;
@@ -107,10 +114,11 @@ function parsePersistedBinding(
   }
   if (candidate.schemaVersion !== undefined) {
     if (
-      candidate.schemaVersion === 2
+      (candidate.schemaVersion === 2 || candidate.schemaVersion === 3)
       && isNonEmptyString(candidate.nativeSessionId)
       && isNonEmptyString(candidate.happierSessionId)
       && isNonEmptyString(candidate.serverProfileId)
+      && (candidate.schemaVersion === 2 || isNonEmptyString(candidate.sourceSessionUri))
     ) {
       return {
         cliSessionId: expectedCliSessionId,
@@ -120,6 +128,9 @@ function parsePersistedBinding(
         machineId: candidate.machineId,
         serverProfileId: candidate.serverProfileId,
         linkedAt: candidate.linkedAt,
+        ...(candidate.schemaVersion === 3
+          ? { sourceSessionUri: candidate.sourceSessionUri as string }
+          : {}),
       };
     }
     return null;
@@ -212,6 +223,7 @@ function createConnectedBinding(input: {
   cliSessionId: string;
   happierSessionId: string;
   ensured: HappierDirectSessionEnsureMetadata;
+  sourceSessionUri?: string;
 }): TaskHappierDirectSessionBinding {
   return {
     cliSessionId: input.cliSessionId,
@@ -221,11 +233,18 @@ function createConnectedBinding(input: {
     machineId: input.ensured.machineId,
     serverProfileId: input.ensured.serverId,
     linkedAt: new Date().toISOString(),
+    ...(isNonEmptyString(input.sourceSessionUri)
+      ? { sourceSessionUri: input.sourceSessionUri }
+      : {}),
   };
 }
 
-function persistedBinding(binding: TaskHappierDirectSessionBinding): PersistedTaskHappierDirectSessionBindingV2 {
-  return { schemaVersion: 2, ...binding };
+function persistedBinding(
+  binding: TaskHappierDirectSessionBinding,
+): PersistedTaskHappierDirectSessionBindingV2 | PersistedTaskHappierDirectSessionBindingV3 {
+  return binding.sourceSessionUri
+    ? { schemaVersion: 3, ...binding, sourceSessionUri: binding.sourceSessionUri }
+    : { schemaVersion: 2, ...binding };
 }
 
 function assertClaimedHappierSession(input: {
@@ -248,6 +267,7 @@ async function bindAsyncTransaction(input: {
   taskId: string;
   cliSessionId: string;
   ensured: HappierDirectSessionEnsureMetadata;
+  sourceSessionUri?: string;
 }): Promise<TaskHappierDirectSessionBinding> {
   const currentSession = await input.sessionStore.getSession(input.cliSessionId);
   if (!currentSession) throw new Error(`CLI session not found: ${input.cliSessionId}`);
@@ -282,6 +302,7 @@ async function bindAsyncTransaction(input: {
     cliSessionId: input.cliSessionId,
     happierSessionId: claim.nativeSessionId,
     ensured: input.ensured,
+    sourceSessionUri: input.sourceSessionUri,
   });
   const autonomyPosture: CliAutonomyPosture = {
     ...(latestSession.autonomyPosture ?? {}),
@@ -297,6 +318,7 @@ async function bindWithDatabaseSerialization(input: {
   taskId: string;
   cliSessionId: string;
   ensured: HappierDirectSessionEnsureMetadata;
+  sourceSessionUri?: string;
 }): Promise<TaskHappierDirectSessionBinding> {
   const asyncLayer = input.store.getAsyncLayer();
   if (asyncLayer) {
@@ -331,6 +353,7 @@ export async function bindTaskHappierDirectSession(input: {
   taskId: string;
   worktreePath?: string | null;
   ensured: HappierDirectSessionEnsureMetadata;
+  sourceSessionUri?: string;
 }): Promise<TaskHappierDirectSessionBinding> {
   const cliSessionId = resolveTaskHappierCliSessionId({
     taskId: input.taskId,
@@ -352,5 +375,6 @@ export async function bindTaskHappierDirectSession(input: {
     taskId: input.taskId,
     cliSessionId,
     ensured: input.ensured,
+    sourceSessionUri: input.sourceSessionUri,
   });
 }

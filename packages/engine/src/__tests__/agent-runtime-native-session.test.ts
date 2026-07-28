@@ -15,10 +15,14 @@ const cli = vi.hoisted(() => ({
 }));
 
 vi.mock("../../../../plugins/fusion-plugin-happier-runtime/src/cli-spawn.js", () => cli);
-vi.mock("../logger.js", () => ({
-  createLogger: vi.fn(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn() })),
-  reviewerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
-}));
+vi.mock("../logger.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../logger.js")>();
+  return {
+    ...actual,
+    createLogger: vi.fn(() => ({ log: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() })),
+    reviewerLog: { log: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  };
+});
 vi.mock("../pi.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../pi.js")>();
   return { ...actual, createFnAgent: vi.fn() };
@@ -70,6 +74,11 @@ pgDescribe("AgentRuntime native session persistence binding", () => {
 
   it("wires persistence through the production reviewer path and reloads it for a fresh runtime", async () => {
     const taskStore = h.store();
+    vi.spyOn(taskStore, "getSecretsStore").mockReturnValue({
+      revealSecret: vi.fn(async () => {
+        throw new Error("No MCP secrets configured in native-session test");
+      }),
+    } as never);
     const projectRoot = taskStore.getRootDir();
     const task = await taskStore.createTask({
       title: "Happier production reviewer binding",
@@ -161,7 +170,8 @@ pgDescribe("AgentRuntime native session persistence binding", () => {
       const first = await reviewStep(projectRoot, task.id, 1, "Runtime", "code", task.description, undefined, reviewOptions);
       expect(first.verdict).toBe("APPROVE");
 
-      const persistedStore = await CliSessionStore.create(h.layer(), taskStore.getFusionDir());
+      const persistedProjectId = h.layer().projectId || taskStore.getFusionDir();
+      const persistedStore = await CliSessionStore.create(h.layer(), persistedProjectId);
       const persistedSessions = persistedStore.listByTask(task.id);
       expect(persistedSessions).toHaveLength(1);
       expect(persistedSessions[0].nativeSessionId).toBe("hp_engine_durable");

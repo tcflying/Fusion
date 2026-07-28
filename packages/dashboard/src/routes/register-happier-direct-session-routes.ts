@@ -228,10 +228,11 @@ function connectedResponse(input: {
   created?: boolean;
   agentId?: string;
 }) {
+  const { sourceSessionUri: _sourceSessionUri, ...publicBinding } = input.binding;
   return {
     connected: true,
     taskId: input.taskId,
-    ...input.binding,
+    ...publicBinding,
     openUrl: input.buildOpenUrl(
       input.webappUrl,
       input.binding.serverProfileId,
@@ -243,6 +244,7 @@ function connectedResponse(input: {
 }
 
 function canonicalSessionUriForBinding(binding: TaskHappierDirectSessionBinding): string {
+  if (binding.sourceSessionUri) return binding.sourceSessionUri;
   const host = binding.providerId === "codex" ? "threads" : "sessions";
   return `${binding.providerId}://${host}/${encodeURIComponent(binding.nativeSessionId)}`;
 }
@@ -392,6 +394,7 @@ export function registerHappierDirectSessionRoutes(
         taskId,
         worktreePath: task.worktree,
         ensured,
+        sourceSessionUri: uri,
       });
     } catch (error) {
       mapPreBindingError(error);
