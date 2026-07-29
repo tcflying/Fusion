@@ -119,6 +119,7 @@ export const PROJECT_SECTION_KEYS: Readonly<Record<string, readonly string[]>> =
   worktrees: [
     "executorAllowSiblingBranchRename",
     "maxWorktrees",
+    "worktreeLimitEnabled",
     "recycleWorktrees",
     "showWorktreeGrouping",
     "worktreeCopyFiles",
@@ -148,7 +149,6 @@ export const PROJECT_SECTION_KEYS: Readonly<Record<string, readonly string[]>> =
     "maxConcurrent",
     "maxConcurrentVerifications",
     "maxStuckKills",
-    "maxTriageConcurrent",
     "overlapIgnorePaths",
     "pollIntervalMs",
     "preserveProgressOnStuckRequeue",

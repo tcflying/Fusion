@@ -426,9 +426,16 @@ export const DEFAULT_PROJECT_SETTINGS = {
   Default one verification at a time process-wide so concurrent tasks cannot each run verify:fast / full builds simultaneously and peg the host. Operators with spare cores may raise this in Scheduling settings (clamped 1–8 at runtime).
   */
   maxConcurrentVerifications: 1,
-  maxTriageConcurrent: 2,
   globalMaxConcurrent: 4,
   maxWorktrees: 4,
+  /*
+  FNXC:CapacityModel 2026-07-28-11:20:
+  Worktrees ON is the default and the supported shape — everything (planning
+  included) runs in a worktree. OFF drops maxWorktrees from the dispatch gate so
+  capacity is total agents only; it is a counting statement, not permission for
+  concurrent agents to share one checkout.
+  */
+  worktreeLimitEnabled: true,
   pollIntervalMs: 15000,
   heartbeatMultiplier: 1,
   autoClaimCandidatesInPrompt: 5,

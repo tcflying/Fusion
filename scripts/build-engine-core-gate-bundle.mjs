@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * FNXC:EngineTests 2026-07-08-04:10:
  * FN-7669 prototypes the #1 lever FN-7668 ranked: the `engine-core` merge

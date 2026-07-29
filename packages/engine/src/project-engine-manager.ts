@@ -13,10 +13,13 @@
  *   - Graceful shutdown of all engines via `stopAll()`
  */
 
+import { realpathSync } from "node:fs";
+import { resolve as pathResolve } from "node:path";
 import type {
   CentralCore,
   TaskStore,
   RegisteredProject,
+  MigrationProgressEvent,
 } from "@fusion/core";
 import { ProjectEngine } from "./project-engine.js";
 import type { ProjectEngineOptions } from "./project-engine.js";
@@ -26,7 +29,6 @@ import {
   type RoomHostCompositionOperatorAdapterRegistryV1,
 } from "./room-host-composition-operator-policy-provider.js";
 import type { ProjectRuntimeConfig } from "./project-runtime.js";
-import { AgentSemaphore } from "./concurrency.js";
 import {
   acquireEngineSingleton,
   EngineAlreadyRunningError,
@@ -69,9 +71,19 @@ export interface EngineManagerOptions {
   roomProviderBackpressureVerifiedFactory?: ProjectEngineOptions["roomProviderBackpressureVerifiedFactory"];
   roomCapabilityRegistryRefreshVerifiedFactory?: ProjectEngineOptions["roomCapabilityRegistryRefreshVerifiedFactory"];
   roomTaskDispatchCapacityAdmissionVerifiedFactory?: ProjectEngineOptions["roomTaskDispatchCapacityAdmissionVerifiedFactory"];
-  // FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
-  // backend boot so all engines reuse one connection pool (no second embedded PG).
+  /**
+   * FNXC:SqliteFinalRemoval 2026-06-26-11:20: shared TaskStore from the central
+   * backend boot so engines reuse one connection pool (no second embedded PG).
+   *
+   * FNXC:FasterStartup 2026-07-14-23:55:
+   * Inject only for the project whose resolved working directory matches this
+   * store's rootDir. Multi-project engines must factory-boot (or receive) their
+   * own bound store — a cwd-partitioned TaskStore must never back a different
+   * project root. Callers may still pass per-call overrides via ensureEngine.
+   */
   externalTaskStore?: ProjectEngineOptions["externalTaskStore"];
+  /** Forward first-boot SQLite migration progress to a fixed-port holding server. */
+  onMigrationProgress?: (event: MigrationProgressEvent) => void;
 }
 
 /** Default interval for background reconciliation (30 seconds). */
@@ -95,14 +107,14 @@ export class ProjectEngineManager {
   private externalEngines = new Set<string>();
   private stopped = false;
 
-  /**
-   * Shared global semaphore — ONE instance across ALL project engines.
-   * Enforces the cross-project globalMaxConcurrent limit. Without this,
-   * each engine creates its own semaphore and the global limit is not shared.
-   */
-  private globalSemaphore: AgentSemaphore;
-  private currentGlobalLimit = 4;
-  private concurrencyListener?: (...args: unknown[]) => void;
+  /*
+  FNXC:CapacityModel 2026-07-28-20:10 (drop the cross-project cap):
+  The shared cross-project semaphore, its mutable limit and the
+  `concurrency:changed` subscription are DELETED. Capacity is two numbers per
+  project; a machine-wide cap was a third limiter with its own separate authority
+  (a central-DB singleton row), and reconciling it against the per-project gates is
+  exactly the multi-limiter arbitration this simplification removes.
+  */
 
   /** Reconciliation state for background project startup. */
   private reconciliationInterval: ReturnType<typeof setInterval> | null = null;
@@ -148,32 +160,6 @@ export class ProjectEngineManager {
           authorityReader: centralCore,
           adapterRegistry: options.roomHostCompositionOperatorAdapterRegistry,
         }));
-    // Dynamic getter so live changes to globalMaxConcurrent take effect immediately
-    this.globalSemaphore = new AgentSemaphore(() => this.currentGlobalLimit);
-
-    // Listen for concurrency changes from CentralCore
-    if (typeof centralCore.on === "function") {
-      this.concurrencyListener = (state: unknown) => {
-        const s = state as { globalMaxConcurrent?: number };
-        if (typeof s.globalMaxConcurrent === "number") {
-          this.currentGlobalLimit = s.globalMaxConcurrent;
-          runtimeLog.log(`Global concurrency limit updated to ${this.currentGlobalLimit}`);
-        }
-      };
-      centralCore.on("concurrency:changed", this.concurrencyListener);
-    }
-
-    // Read initial limit from CentralCore (async — updates the mutable limit)
-    this.refreshGlobalLimit();
-  }
-
-  private async refreshGlobalLimit(): Promise<void> {
-    try {
-      const state = await this.centralCore.getGlobalConcurrencyState();
-      this.currentGlobalLimit = state.globalMaxConcurrent;
-    } catch {
-      // Keep default of 4
-    }
   }
 
   // ── Public accessors ──
@@ -339,10 +325,15 @@ export class ProjectEngineManager {
       this.reconciliationInterval = null;
     }
 
-    // Remove concurrency change listener
-    if (this.concurrencyListener && typeof this.centralCore.off === "function") {
-      this.centralCore.off("concurrency:changed", this.concurrencyListener);
-      this.concurrencyListener = undefined;
+    /*
+    FNXC:PostgresResourceLifecycle 2026-07-14-18:42:
+    Project runtimes own the PostgreSQL pools CentralCore may have adopted. Persist mesh-offline state before stopping any engine so runtime backend shutdown cannot race the final central write against a closed pool.
+    */
+    try {
+      this.centralCore.stopDiscovery();
+      await this.centralCore.markLocalNodeOffline();
+    } catch (error) {
+      runtimeLog.warn(`Failed to persist local node offline before engine shutdown: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     const stops = Array.from(this.engines.entries()).map(
@@ -516,7 +507,7 @@ export class ProjectEngineManager {
     }
 
     const runtimeConfig = await this.buildRuntimeConfig(project);
-    const engineOptions = this.buildEngineOptions(project, overrides);
+    const engineOptions = this.buildEngineOptions(project, runtimeConfig.workingDirectory, overrides);
 
     // Acquire the per-machine singleton guard before spinning up any engine
     // subsystems. This prevents two fusion processes from running engines for
@@ -588,15 +579,27 @@ export class ProjectEngineManager {
         "in-process",
       maxConcurrent: (settings?.maxConcurrent as number) ?? 4,
       maxWorktrees: (settings?.maxWorktrees as number) ?? 10,
-      // Shared global semaphore — all engines share one concurrency pool
-      globalSemaphore: this.globalSemaphore,
+      onMigrationProgress: this.options.onMigrationProgress,
     };
   }
 
   private buildEngineOptions(
     project: RegisteredProject,
+    workingDirectory: string,
     overrides?: Partial<ProjectEngineOptions>,
   ): ProjectEngineOptions {
+    /*
+    FNXC:FasterStartup 2026-07-14-23:55 / 2026-07-15-00:40:
+    Share the CLI-booted TaskStore only when the engine's working directory is
+    the same project root as the store. Compare realpath when available so a
+    symlinked CLI cwd and a registry-canonical path still share one pool
+    (Greptile: path.resolve alone double-boots symlink aliases).
+    */
+    const sharedStore = this.options.externalTaskStore;
+    const shareForThisProject = Boolean(
+      sharedStore
+      && sameProjectRoot(sharedStore.getRootDir(), workingDirectory),
+    );
     return {
       projectId: project.id,
       cliPackageVersion: this.options.cliPackageVersion,
@@ -613,11 +616,25 @@ export class ProjectEngineManager {
       roomProviderBackpressureVerifiedFactory: this.options.roomProviderBackpressureVerifiedFactory,
       roomCapabilityRegistryRefreshVerifiedFactory: this.options.roomCapabilityRegistryRefreshVerifiedFactory,
       roomTaskDispatchCapacityAdmissionVerifiedFactory: this.options.roomTaskDispatchCapacityAdmissionVerifiedFactory,
-      // FNXC:SqliteFinalRemoval 2026-06-26-11:20: forward the shared external
-      // TaskStore so engines reuse the central boot's connection pool instead
-      // of starting a second embedded PostgreSQL on the same data dir.
-      ...(this.options.externalTaskStore ? { externalTaskStore: this.options.externalTaskStore } : {}),
+      ...(shareForThisProject && sharedStore ? { externalTaskStore: sharedStore } : {}),
       ...overrides,
     };
   }
+}
+
+/**
+ * FNXC:FasterStartup 2026-07-15-00:40:
+ * Path identity for externalTaskStore matching: resolve then realpath so
+ * symlinked project roots compare equal to their canonical registry path.
+ */
+function sameProjectRoot(a: string, b: string): boolean {
+  const normalize = (p: string): string => {
+    const resolved = pathResolve(p);
+    try {
+      return realpathSync(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  return normalize(a) === normalize(b);
 }

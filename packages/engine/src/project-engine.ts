@@ -68,7 +68,8 @@ import type { RoutineRunner } from "./routine-runner.js";
 import { sweepStaleAutostashes, VerificationError } from "./merger.js";
 import { runAiMerge, landWorkspaceTask, WorkspacePartialLandError, WorkspaceRepoLandBusyError } from "./merger-ai.js";
 import { promoteBranchGroup, type BranchGroupPromotionResult, type CreateGroupPrFn, type SyncGroupPrFn } from "./group-merge-coordinator.js";
-import { PRIORITY_MERGE } from "./concurrency.js";
+import { computeTopLevelConcurrencyClaimedFromStore, projectAdmissionCoordinator } from "./concurrency.js";
+import { canStartNextMergeBody } from "./merge-reclaim-policy.js";
 import { runtimeLog } from "./logger.js";
 import type { HeartbeatTriggerScheduler } from "./agent-heartbeat.js";
 import { ResearchOrchestrator } from "./research-orchestrator.js";
@@ -704,10 +705,17 @@ export class ProjectEngine {
   // ── Auto-merge state ──
   private mergeQueue: string[] = [];
   private mergeActive = new Set<string>();
+  /** Merge ids selected by the shared coordinator but not yet handed to rawMerge. */
+  private readonly coordinatorAdmittedMergeTaskIds = new Set<string>();
+  private unregisterMergeAdmissionProvider?: () => void;
   private pausedReviewTaskIds = new Set<string>();
   private mergeRunning = false;
   private activeMergeSession: { dispose: () => void } | null = null;
   private activeMergeTaskId: string | null = null;
+  /** Wall-clock when `activeMergeTaskId` was claimed; self-healing uses this when agent logs are silent. */
+  private activeMergeStartedAtMs: number | null = null;
+  /** Underlying merge body latch retained across abort races. */
+  private mergeBodyInFlight: Promise<unknown> | null = null;
   private mergeAbortController: AbortController | null = null;
   private mergeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private autostashSweepTimer: ReturnType<typeof setTimeout> | null = null;
@@ -848,16 +856,14 @@ export class ProjectEngine {
     //
     // Tests substitute a minimal runtime mock that may not implement this hook.
     this.runtime.setActiveMergeTaskIdProvider?.(() => this.getActiveMergeTaskId());
+    this.runtime.setActiveMergeStartedAtMsProvider?.(() => this.activeMergeStartedAtMs);
+    this.runtime.setActiveMergeAborter?.((taskId, reason) => this.abortActiveMerge(taskId, reason));
     this.runtime.setMergeEnqueuer?.((taskId) => {
       // If the wedged attempt was the active one, abort its in-flight signal
       // and dispose its session so subsequent code paths can release file
       // handles / child processes promptly.
       if (this.activeMergeTaskId === taskId) {
-        this.mergeAbortController?.abort();
-        this.mergeAbortController = null;
-        this.activeMergeSession?.dispose();
-        this.activeMergeSession = null;
-        this.activeMergeTaskId = null;
+        this.abortActiveMerge(taskId, "merge-enqueuer-reclaim");
       }
       this.mergeActive.delete(taskId);
       return this.internalEnqueueMerge(taskId);
@@ -873,10 +879,134 @@ export class ProjectEngine {
     // eligibility gate (requestInterpreterMerge), NOT the human "merge now"
     // bypass, so a graph merge node can't override an autoMerge-off project.
     this.runtime.setMergeRequester?.((taskId, options) => this.requestInterpreterMerge(taskId, options));
+
+    const projectId = this.config.projectId || this.config.workingDirectory;
+    this.unregisterMergeAdmissionProvider = projectAdmissionCoordinator.registerProvider(`merge:${projectId}`, {
+      projectId,
+      refresh: async () => {
+        if (this.shuttingDown || !this.started || this.coordinatorAdmittedMergeTaskIds.size > 0) return [];
+        const store = this.runtime.getTaskStore();
+        const queuedTaskIds = [...this.mergeQueue];
+        const tasks = await Promise.all(
+          queuedTaskIds.map(async (taskId) => await store.getTask(taskId).catch(() => null)),
+        );
+        return tasks.flatMap((task) => {
+          if (!task || task.paused || task.userPaused || task.column !== "in-review") return [];
+          return [{
+            taskId: task.id,
+            projectId,
+            createdAt: task.createdAt,
+            start: async () => {
+              if (!this.mergeQueue.includes(task.id) || this.shuttingDown) return false;
+              this.coordinatorAdmittedMergeTaskIds.add(task.id);
+              void this.drainMergeQueue().catch((error: unknown) => {
+                runtimeLog.error(
+                  `Coordinator-admitted merge drain failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              });
+            },
+          }];
+        });
+      },
+    });
   }
 
   getActiveMergeTaskId(): string | null {
     return this.activeMergeTaskId;
+  }
+
+  getActiveMergeStartedAtMs(): number | null {
+    return this.activeMergeStartedAtMs;
+  }
+
+  abortActiveMerge(taskId: string, reason: string): boolean {
+    if (this.activeMergeTaskId !== taskId) return false;
+    runtimeLog.log(`Aborting active merge for ${taskId} (${reason})`);
+    this.mergeAbortController?.abort();
+    this.mergeAbortController = null;
+    if (this.activeMergeSession) {
+      this.activeMergeSession.dispose();
+      this.activeMergeSession = null;
+    }
+    this.mergeActive.delete(taskId);
+    this.activeMergeTaskId = null;
+    this.activeMergeStartedAtMs = null;
+    return true;
+  }
+
+  private claimActiveMerge(taskId: string): AbortSignal {
+    this.activeMergeTaskId = taskId;
+    this.activeMergeStartedAtMs = Date.now();
+    this.mergeAbortController = new AbortController();
+    return this.mergeAbortController.signal;
+  }
+
+  private clearActiveMergeClaim(taskId: string): void {
+    if (this.activeMergeTaskId === taskId) {
+      this.activeMergeTaskId = null;
+      this.activeMergeStartedAtMs = null;
+    }
+  }
+
+  private mergeBodySettleTimeoutMs = 60_000;
+
+  private trackMergeBody<T>(body: Promise<T>): Promise<T> {
+    const tracked = body.finally(() => {
+      if (this.mergeBodyInFlight === tracked) this.mergeBodyInFlight = null;
+    });
+    this.mergeBodyInFlight = tracked;
+    return tracked;
+  }
+
+  private async awaitPriorMergeBodySettle(): Promise<void> {
+    const prior = this.mergeBodyInFlight;
+    if (canStartNextMergeBody(prior)) return;
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeoutMs = this.mergeBodySettleTimeoutMs;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
+      timeoutHandle.unref?.();
+    });
+    try {
+      const winner = await Promise.race([
+        prior!.then(() => "settled" as const).catch(() => "settled" as const),
+        timeout,
+      ]);
+      if (winner === "timeout" && this.mergeBodyInFlight === prior) {
+        runtimeLog.warn(`Prior merge body did not settle within ${timeoutMs}ms after abort — releasing latch`);
+        this.mergeBodyInFlight = null;
+      }
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+
+  private createMergeAbortedError(taskId: string): Error {
+    const error = new Error(`Merge aborted for ${taskId}: pause or cancel requested`);
+    error.name = "MergeAbortedError";
+    return error;
+  }
+
+  private raceMergeWithAbort<T>(work: Promise<T>, signal: AbortSignal, taskId: string): Promise<T> {
+    if (signal.aborted) return Promise.reject(this.createMergeAbortedError(taskId));
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = (): void => reject(this.createMergeAbortedError(taskId));
+      signal.addEventListener("abort", onAbort, { once: true });
+      work.then(
+        (value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private runAbortableMergeBody<T>(bodyFactory: () => Promise<T>, signal: AbortSignal, taskId: string): Promise<T> {
+    return this.raceMergeWithAbort(this.trackMergeBody(bodyFactory()), signal, taskId);
   }
 
   /**
@@ -1870,6 +2000,8 @@ export class ProjectEngine {
 
     this.lifecycleGeneration += 1;
     this.shuttingDown = true;
+    this.unregisterMergeAdmissionProvider?.();
+    this.unregisterMergeAdmissionProvider = undefined;
     this.setRoomControlPlaneExecutionStatus("stopping");
     const operation = Promise.resolve()
       .then(async () => {
@@ -1963,6 +2095,7 @@ export class ProjectEngine {
     this.mergeAbortController?.abort();
     this.mergeAbortController = null;
     this.activeMergeTaskId = null;
+    this.activeMergeStartedAtMs = null;
     this.pausedReviewTaskIds.clear();
 
     const queuedTaskIds = [...this.mergeQueue];
@@ -2856,10 +2989,7 @@ export class ProjectEngine {
       abort = () => {
         this.removeMergeResolver(taskId, resolver);
         if (this.activeMergeTaskId === taskId) {
-          this.mergeAbortController?.abort();
-          this.mergeAbortController = null;
-          this.activeMergeSession?.dispose();
-          this.activeMergeSession = null;
+          this.abortActiveMerge(taskId, "manual-request-aborted");
         } else if (!this.hasMergeResolvers(taskId)) {
           this.mergeQueue = this.mergeQueue.filter((queuedTaskId) => queuedTaskId !== taskId);
           this.mergeActive.delete(taskId);
@@ -3244,6 +3374,8 @@ export class ProjectEngine {
    */
   private async pickNextMergeTaskId(store: TaskStore): Promise<string | undefined> {
     if (this.mergeQueue.length === 0) return undefined;
+    const admittedIndex = this.mergeQueue.findIndex((taskId) => this.coordinatorAdmittedMergeTaskIds.has(taskId));
+    if (admittedIndex !== -1) return this.mergeQueue.splice(admittedIndex, 1)[0];
     // Fast path: with a single queued task there's nothing to reorder. Avoid an
     // extra getTask round-trip (and keep callers that mock getTask once happy).
     if (this.mergeQueue.length === 1) {
@@ -4073,15 +4205,85 @@ export class ProjectEngine {
           const mergeCandidate = await store.getTask(taskId).catch(() => null);
           const routeWorkspaceDirect = !!mergeCandidate && isWorkspaceTask(mergeCandidate);
 
+          // FNXC:MergeQueue 2026-07-15-10:05: Wait for any orphan body from a prior abort race before claiming the next generation.
+          await this.awaitPriorMergeBodySettle();
+
+          const coordinatorReservedMerge = this.coordinatorAdmittedMergeTaskIds.delete(taskId);
+          /*
+          FNXC:ConcurrencyAdmission 2026-08-07-10:30:
+          FN-8453/#2359 applies the same top-level slot reservation to direct and
+          pull-request merge bodies. The current queue item is passed as a
+          one-shot candidate after dequeue because durable merge providers only
+          see remaining queue entries; without it a sole merge endlessly defers.
+          */
+          /*
+          FNXC:CapacityModel 2026-07-28-20:40 (drop the cross-project cap):
+          The `if (!semaphore) return await start()` early-return is DELETED, not
+          left to fire. It was unreachable while a global semaphore always existed;
+          with the semaphore gone it would have fired on EVERY merge and skipped
+          project admission altogether — silently stopping merges from counting
+          against the per-project agent count. That is the opposite of the intent:
+          a merge IS an agent, so it still consumes one of the project's slots; it
+          just no longer consumes a machine-wide slot too.
+
+          `admitOldest` already takes `semaphore` as optional and enforces
+          `maxConcurrent` independently of it (see its `claimed() + reservations >=
+          maxConcurrent` check), so dropping the argument keeps per-project
+          admission and oldest-first fairness exactly as they were.
+          */
+          const runWithMergeAdmission = async <T>(start: () => Promise<T>): Promise<T | undefined> => {
+            if (coordinatorReservedMerge) {
+              try {
+                return await start();
+              } finally {
+                projectAdmissionCoordinator.releaseReservation(taskId);
+              }
+            }
+            let selected = false;
+            let value: T | undefined;
+            await projectAdmissionCoordinator.admitOldest({
+              projectId: cwd,
+              maxConcurrent: (await store.getSettings()).maxConcurrent ?? 2,
+              claimed: async () => computeTopLevelConcurrencyClaimedFromStore({
+                store,
+                tasks: await store.listTasks({ slim: true, includeArchived: false }),
+              }),
+              refresh: async () => [{
+                taskId,
+                projectId: cwd,
+                createdAt: mergeCandidate?.createdAt,
+                start: async () => {
+                  selected = true;
+                  value = await start();
+                  return true;
+                },
+              }],
+            });
+            if (!selected) return undefined;
+            projectAdmissionCoordinator.releaseReservation(taskId);
+            return value;
+          };
+
           if (mergeStrategy === "pull-request" && this.options.processPullRequestMerge && !routeWorkspaceDirect) {
-            this.activeMergeTaskId = taskId;
-            runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge processing PR flow for ${taskId}...`);
-            const result = await this.options.processPullRequestMerge(
-              store,
-              cwd,
-              taskId,
-              (this.runtime as any).worktreePool,
-            );
+            const result = await runWithMergeAdmission(async () => {
+              const abortSignal = this.claimActiveMerge(taskId);
+              runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge processing PR flow for ${taskId}...`);
+              return await this.runAbortableMergeBody(
+                () => this.options.processPullRequestMerge!(
+                  store,
+                  cwd,
+                  taskId,
+                  (this.runtime as any).worktreePool,
+                ),
+                abortSignal,
+                taskId,
+              );
+            });
+            if (result === undefined) {
+              this.mergeActive.delete(taskId);
+              this.internalEnqueueMerge(taskId);
+              continue;
+            }
             if (result === "merged") {
               runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge PR merged: ${taskId}`);
               const mergedTask = await store.getTask(taskId).catch(() => null);
@@ -4114,10 +4316,8 @@ export class ProjectEngine {
               } as MergeResult);
             }
           } else {
-            // Direct merge via AI agent, gated by semaphore
+            // Direct merge via AI agent, gated by project admission.
             runtimeLog.log(`${hasManualResolver ? "Manual" : "Auto"}-merge merging ${taskId}...`);
-
-            const semaphore = (this.runtime as any).projectSemaphore ?? (this.runtime as any).globalSemaphore;
 
             const pool = (this.runtime as any).worktreePool;
 
@@ -4126,19 +4326,19 @@ export class ProjectEngine {
             const usageLimitPauser = (this.runtime as any).usageLimitPauser;
 
             const rawMerge = async () => {
-              this.activeMergeTaskId = taskId;
-              this.mergeAbortController = new AbortController();
+              const abortSignal = this.claimActiveMerge(taskId);
               const mergerOptions = {
                 manual: hasManualResolver,
                 pool,
                 usageLimitPauser,
                 agentStore,
-                signal: this.mergeAbortController.signal,
+                signal: abortSignal,
                 syncGroupPr: this.options.syncGroupPr,
                 onSession: (session: { dispose: () => void }) => {
                   this.activeMergeSession = session;
                 },
               };
+              return this.runAbortableMergeBody(async () => {
               // FNXC:Workspace 2026-06-21-23:40 (Phase C U1, KTD2):
               // Engine merge dispatch door. A workspace-mode task (non-empty
               // `workspaceWorktrees`) routes to the per-repo merge loop
@@ -4221,13 +4421,14 @@ export class ProjectEngine {
                 allowDirtyLocalCheckoutSync: settings.merger?.allowDirtyLocalCheckoutSync === true,
               };
               return runAiMerge(store, cwd, taskId, mergeOptionsWithSettings);
+              }, abortSignal, taskId);
             };
 
-            let result: MergeResult;
-            if (semaphore) {
-              result = await semaphore.run(rawMerge, PRIORITY_MERGE);
-            } else {
-              result = await rawMerge();
+            const result = await runWithMergeAdmission(rawMerge);
+            if (!result) {
+              this.mergeActive.delete(taskId);
+              this.internalEnqueueMerge(taskId);
+              continue;
             }
 
             this.activeMergeSession = null;
@@ -4917,9 +5118,12 @@ export class ProjectEngine {
             }
           }
         } finally {
-          if (this.activeMergeTaskId === taskId) {
-            this.activeMergeTaskId = null;
+          // A selected queue entry can fail eligibility before reaching rawMerge.
+          // Return its coordinator reservation rather than pinning a top-level slot.
+          if (this.coordinatorAdmittedMergeTaskIds.delete(taskId)) {
+            projectAdmissionCoordinator.releaseReservation(taskId);
           }
+          this.clearActiveMergeClaim(taskId);
           this.mergeAbortController = null;
           this.mergeActive.delete(taskId);
           // If a manual merge was requested while this task was already in-flight,
@@ -5159,15 +5363,7 @@ export class ProjectEngine {
         }
 
         runtimeLog.log(`Paused in-review task interrupting active merge: ${task.id}`);
-        this.mergeAbortController?.abort();
-        this.mergeAbortController = null;
-
-        if (this.activeMergeSession) {
-          this.activeMergeSession.dispose();
-          this.activeMergeSession = null;
-        }
-
-        this.mergeActive.delete(task.id);
+        this.abortActiveMerge(task.id, "task-paused");
         return;
       }
 
@@ -5213,16 +5409,7 @@ export class ProjectEngine {
       }
 
       runtimeLog.log(`Soft-deleted task interrupting active merge: ${task.id}`);
-      this.mergeAbortController?.abort();
-      this.mergeAbortController = null;
-
-      if (this.activeMergeSession) {
-        this.activeMergeSession.dispose();
-        this.activeMergeSession = null;
-      }
-
-      this.mergeActive.delete(task.id);
-      this.activeMergeTaskId = null;
+      this.abortActiveMerge(task.id, "task-soft-deleted");
     };
 
     store.on("task:updated", this.taskUpdatedHandler);

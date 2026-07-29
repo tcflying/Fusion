@@ -10,6 +10,11 @@ export * from "./api/legacy";
 export * from "./api/chat";
 export * from "./api-node";
 export * from "./api/report";
+export {
+  isAgentHeartbeatEnabled,
+  withAgentHeartbeatEnabled,
+} from "./api/agents";
+export type { PlanningContextualComment } from "./api/planning";
 
 export type HappierDirectSessionProviderId = "codex" | "claude" | "opencode";
 

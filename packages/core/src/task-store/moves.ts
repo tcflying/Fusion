@@ -9,7 +9,7 @@
 import {type TaskStore, type MoveTaskOptions, type MoveTaskInternalOptions, storeLog, isWorkflowColumnsCompatibilityFlagEnabled} from "../store.js";
 import * as schema from "../postgres/schema/index.js";
 import {TaskDeletedError, HandoffInvariantViolationError, TransitionRejectionError} from "./errors.js";
-import {eq, sql} from "drizzle-orm";
+import {and, eq, sql} from "drizzle-orm";
 import type {Task, Column, ColumnId, HandoffToReviewOptions} from "../types.js";
 import {VALID_TRANSITIONS, COLUMNS} from "../types.js";
 import {serializeWorkflowIr} from "../workflow-ir.js";
@@ -29,6 +29,8 @@ import {type DefaultWorkflowMoveContext, applyDefaultWorkflowMoveEffects} from "
 import {makeTransitionRejection, makeTransitionPending} from "../transition-types.js";
 import {writeTransitionPendingAsync, clearTransitionPendingAsync} from "./async-transition-pending.js";
 import type {WorkflowIr} from "../workflow-ir-types.js";
+import type {DbTransaction} from "../postgres/data-layer.js";
+import {acquireTaskAdvisoryXactLock} from "./task-advisory-lock.js";
 import "../builtin-traits.js";
 import {recordRunAuditEventWithinTransaction} from "../postgres/data-layer.js";
 import {getTaskMergeBlocker} from "../task-merge.js";
@@ -47,9 +49,22 @@ builtin:coding — which rejected every move out of a custom workflow column
 getTaskWorkflowSelectionAsync and map it to the same IR the sync path would.
 */
 async function resolveTaskWorkflowIrForMove(store: TaskStore, id: string): Promise<WorkflowIr> {
-  
   const selection = await store.getTaskWorkflowSelectionAsync(id);
-  const workflowId = selection?.workflowId;
+  return resolveWorkflowIrForSelectedWorkflowId(store, selection?.workflowId);
+}
+
+/*
+FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — split capacity snapshot):
+IR resolution split out of the selection READ so a caller holding an already-read
+selection can derive the IR from THAT read instead of issuing a second one.
+
+Why this seam exists at all: the capacity gate derives two things from the task's
+workflow selection — the LIMIT (from the IR) and the POOL KEY the occupancy count
+buckets on. Resolving them from two independent reads lets them disagree, which is
+precisely the R1 sentinel defect in a new costume: gate and counter talking about
+different pools, so a finite limit cannot bind. One read in, both derived from it.
+*/
+async function resolveWorkflowIrForSelectedWorkflowId(store: TaskStore, workflowId: string | undefined): Promise<WorkflowIr> {
   /* FNXC:WorkflowBuiltins 2026-07-19-10:24: every no-selection/unresolvable fallback goes through resolveDefaultWorkflowIr() so this resolver and prepareWorkflowMovePolicyPreflightImpl agree on the default IR (see the helper's note on the "preflight is stale" drift). */
   if (!workflowId) {
     return store.applyBuiltInPromptOverridesAsync(DEFAULT_WORKFLOW_ID, resolveDefaultWorkflowIr());
@@ -70,6 +85,42 @@ async function resolveTaskWorkflowIrForMove(store: TaskStore, id: string): Promi
   }
 }
 import {enqueueMergeQueueInTransaction, dequeueMergeQueueOnColumnExitInTransaction} from "../task-store/async-merge-coordination.js";
+
+/*
+FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — split capacity snapshot):
+Read the task's workflow selection ON THE MOVE'S OWN TRANSACTION HANDLE.
+
+`getTaskWorkflowSelectionAsync` issues its query against `layer.db` — a different
+connection from the in-flight move transaction — so a selection read through it is
+NOT serialized with the occupancy count, which runs on `tx`. Reading the same row
+through `tx` puts the snapshot inside the transaction that also does the counting
+and the write, so the limit, the pool key, and the count all describe one
+consistent state of the world.
+
+Mirrors getTaskWorkflowSelectionAsyncImpl's query exactly, including the
+project-id scoping (FNXC:WorkflowModelLanes): shared PostgreSQL deployments reuse
+task ids across projects, so an unscoped read could resolve another project's
+workflow and gate this move against the wrong pool entirely.
+*/
+async function readTaskWorkflowSelectionInTransaction(
+  tx: DbTransaction,
+  projectId: string | undefined,
+  taskId: string,
+): Promise<string | undefined> {
+  const scopedProjectId = projectId?.trim() || "__legacy_unscoped__";
+  const rows = await tx
+    .select({ workflowId: schema.project.taskWorkflowSelection.workflowId })
+    .from(schema.project.taskWorkflowSelection)
+    .where(and(
+      eq(schema.project.taskWorkflowSelection.projectId, scopedProjectId),
+      eq(schema.project.taskWorkflowSelection.taskId, taskId),
+    ))
+    .limit(1);
+  const workflowId = rows[0]?.workflowId;
+  return typeof workflowId === "string" && workflowId.length > 0 ? workflowId : undefined;
+}
+
+
 
 /*
 FNXC:WorkflowReviewGates 2026-07-26-15:05:
@@ -323,11 +374,21 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     (`resolveCapacityPoolId`, shared); the WORKFLOW id is telemetry and must stay
     a real workflow id, never the bucketing sentinel.
     */
-    const workflowSelectionForMove = useWorkflow
-      ? await store.getTaskWorkflowSelectionAsync(id)
-      : undefined;
+    /*
+    FNXC:WorkflowCapacity 2026-07-28-10:20 (R2 — make the gate bind for real projects):
+    The selection is read REGARDLESS of the compatibility flag. Previously this was
+    flag-gated, which is one of the two reasons the gate could not bind.
+
+    FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — split capacity state):
+    This read now serves TELEMETRY ONLY. The capacity pool id is no longer derived
+    here: it is taken from a single snapshot read on the move's own transaction
+    handle, alongside the IR, so the limit and the occupancy pool cannot come from
+    two different observations of the selection. Deriving a pool id at this point
+    again would reintroduce that split — the telemetry read is pre-transaction and
+    is allowed to be stale; a capacity decision is not.
+    */
+    const workflowSelectionForMove = await store.getTaskWorkflowSelectionAsync(id);
     const effectiveWorkflowIdForMove = workflowSelectionForMove?.workflowId ?? DEFAULT_WORKFLOW_ID;
-    const capacityPoolIdForMove = resolveCapacityPoolId(workflowSelectionForMove?.workflowId);
     const workflowIr: WorkflowIr | undefined = useWorkflow
       ? await resolveTaskWorkflowIrForMove(store, id)
       : undefined;
@@ -928,13 +989,82 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
     await layer.transactionImmediate(async (tx) => {
       // Capacity check (KTD-10). In backend mode, count active tasks in the
       // target column via async Drizzle instead of the sync helper.
-      if (useWorkflow && workflowIr && fromColumn !== toColumn) {
-        const capacity = resolveColumnCapacity(workflowIr, toColumn, mergedSettingsForMove);
+      /*
+      FNXC:WorkflowCapacity 2026-07-28-10:20 (R2 — make the gate bind for real projects):
+      NO LONGER GATED ON `useWorkflow`. `workflow-capacity.ts` states this enforcement
+      "runs INSIDE moveTaskInternal's transaction and is NEVER bypassable"; that was
+      false twice over. Phase A3 R1 was the pool-id sentinel (fixed separately). R2 is
+      this condition: `useWorkflow` reads `experimentalFeatures.workflowColumns`, which
+      is absent from DEFAULT_GLOBAL_SETTINGS and has no production writer, so the whole
+      block was unreachable on the path every real project takes. A limit the product
+      documents and the UI exposes was silently not enforced.
+
+      SCOPE, deliberately narrow: only the CAPACITY check is un-gated. `workflowIr`
+      stays flag-gated so transition VALIDATION keeps its current behavior — the
+      inline path's bare-Error/"Valid targets:" contract is unchanged, and none of the
+      Phase A2 divergences are flipped here. `capacityIr` is resolved separately for
+      this one purpose, so a flag-off project pays one extra IR resolution per
+      cross-column move and gets its configured limit actually enforced.
+      */
+      /*
+      FNXC:WorkflowCapacity 2026-07-28-16:10 (PR #2499 review — greptile: split capacity state):
+      ONE selection snapshot, read on `tx`, feeding BOTH derived values.
+
+      The defect this replaces: the pool id came from `capacityPoolIdForMove`
+      (resolved pre-transaction, near the top of the move) while the IR came from a
+      SECOND, independent `getTaskWorkflowSelectionAsync` inside
+      `resolveTaskWorkflowIrForMove`. A workflow-selection change landing between
+      those two reads made the gate resolve its LIMIT from workflow B's IR while
+      counting occupancy in workflow A's POOL — an empty pool measured against a
+      populated column's limit, so the move is admitted into a full pool.
+
+      That is the SAME SHAPE as the R1 sentinel this PR's sibling fixed: gate and
+      counter disagreeing about which pool, so a finite limit cannot bind. It is
+      not acceptable to argue the window is small — this PR is the moment capacity
+      starts actually binding, so a gate that leaks under concurrent selection
+      change is a defect introduced exactly where operators begin depending on it.
+
+      Deliberately NOT reusing `workflowIr` here even when the compatibility flag is
+      on: that value is resolved pre-transaction from its own separate read, so
+      reusing it would preserve the very split this fixes on the flag-on path.
+      `workflowIr` remains the input to transition VALIDATION, which is a different
+      question asked at a different time and is unchanged.
+      */
+      /*
+      FNXC:WorkflowCapacity 2026-07-28-18:05 (PR #2499 review — cross-process race):
+      Take the per-task advisory lock BEFORE reading the selection.
+
+      A consistent snapshot alone fixed only the INTRA-process split. The read was
+      still unlocked: `transactionImmediate` runs at READ COMMITTED, where a plain
+      SELECT takes no row lock, so another TaskStore on another node sharing the
+      same central database could change this task's workflow selection right after
+      the read. The move would then enforce the OLD workflow's pool and limit while
+      committing the task under the NEW one — the gate leaking at exactly the moment
+      operators start trusting it.
+
+      `withTaskLock`, which the selection writer holds, does NOT help here: it is an
+      in-process promise chain, so it serializes one store instance and nothing
+      across nodes. Multi-node is several nodes against one PostgreSQL database, so
+      this is a supported deployment shape, not a hypothetical.
+
+      With the lock held for the rest of this transaction, the selection cannot
+      change until the move commits or rolls back — so the pool id and limit
+      enforced below are the ones the commit lands under. The matching acquire is in
+      `writeTaskWorkflowSelectionImpl`; both go through
+      `acquireTaskAdvisoryXactLock` so neither side can restate the key differently
+      (the failure mode that made the R1 sentinel unbindable).
+      */
+      await acquireTaskAdvisoryXactLock(tx, layer.projectId, id);
+      const capacityWorkflowId = await readTaskWorkflowSelectionInTransaction(tx, layer.projectId, id);
+      const capacityPoolId = resolveCapacityPoolId(capacityWorkflowId);
+      const capacityIr = await resolveWorkflowIrForSelectedWorkflowId(store, capacityWorkflowId);
+      if (capacityIr && fromColumn !== toColumn) {
+        const capacity = resolveColumnCapacity(capacityIr, toColumn, mergedSettingsForMove);
         if (capacity.hasCapacity && Number.isFinite(capacity.limit)) {
           // Shared pooled-budget enforcement (see enforcePooledColumnCapacity);
           // this path supplies the async in-transaction counter.
           await enforcePooledColumnCapacity({
-            workflowIr,
+            workflowIr: capacityIr,
             toColumn,
             taskId: id,
             capacity,
@@ -942,7 +1072,7 @@ export async function moveTaskInternalImpl(store: TaskStore, id: string, toColum
               store.countActiveInCapacitySlotAsync({
                 tx,
                 targetColumn: budgetColumn,
-                workflowId: capacityPoolIdForMove,
+                workflowId: capacityPoolId,
                 countPending,
                 excludeTaskId: id,
               }),

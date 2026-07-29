@@ -170,3 +170,222 @@ describe("workflow graph entry contract — the executor honors it", () => {
     expect(calls).not.toContain("planning-session");
   });
 });
+
+/*
+FNXC:MergedPlanningColumn 2026-07-28-14:05 (U11, PR #2503 review — greptile + coderabbit):
+
+The entry contract under the MERGED planning column — one column carrying `intake` + `hold`,
+which is what U11 leaves behind once `triage` is deleted and `todo` becomes "Planning".
+
+REWRITTEN after review. The first cut of this block did two things wrong, and both are the
+difference between proving something and appearing to:
+
+1. It asserted against a hand-written synthetic graph. A toy graph proves the RESOLVER's
+   arithmetic, not that the operator's board survives — production planning/review topology could
+   drift away from the shape under test and nothing here would notice. `mergeTodoIntoPlanning`
+   below is instead the literal U11 edit expressed as a transformation, applied to the REAL
+   production IR, so these assertions track production topology by construction.
+
+2. It asserted that `resolveColumnResumeNode` returns `undefined` for a card stranded in the
+   deleted `triage` column, and that a start node exists. Both can hold while cards strand: the
+   thing that actually rescues such a card is the `?? ir.nodes.find(kind === "start")` fallback in
+   `run()`, and neither assertion touches it. Deleting that fallback left the old test GREEN. The
+   stranded case now drives `executor.run()` and asserts the card really traverses — and going red
+   when the fallback is removed is verified, not assumed.
+*/
+describe("workflow graph entry contract — merged intake+hold planning column (U11)", () => {
+  /**
+   * The U11 IR edit, as a transformation of a real workflow: `triage`'s traits merge into `todo`,
+   * `todo` becomes "Planning", `triage` is deleted, and every node that named `triage` is repointed.
+   * Applying this to the production IR is what makes the assertions below track production.
+   */
+  function mergeTodoIntoPlanning(source: WorkflowIr): WorkflowIr {
+    const ir = structuredClone(source) as WorkflowIr & {
+      columns: Array<{ id: string; name?: string; traits?: unknown[] }>;
+      nodes: Array<{ id: string; column?: string }>;
+    };
+    const triage = ir.columns.find((column) => column.id === "triage");
+    const todo = ir.columns.find((column) => column.id === "todo");
+    if (!triage || !todo) throw new Error("source IR is not the split-column shape this merge transforms");
+
+    todo.name = "Planning";
+    // intake first, then the existing hold/reset-on-entry — the union U11 declares.
+    todo.traits = [...(triage.traits ?? []), ...(todo.traits ?? [])];
+    ir.columns = ir.columns.filter((column) => column.id !== "triage");
+    for (const node of ir.nodes) {
+      if (node.column === "triage") node.column = "todo";
+    }
+    return ir as WorkflowIr;
+  }
+
+  const mergedCodingIr = mergeTodoIntoPlanning(codingIr);
+
+  it("is a faithful merge of the production IR (guards the transformation itself)", () => {
+    // If this drifts, every assertion below is measuring the wrong thing.
+    expect(mergedCodingIr.columns.map((column) => column.id)).not.toContain("triage");
+    expect(mergedCodingIr.nodes.every((node) => node.column !== "triage")).toBe(true);
+    const planning = mergedCodingIr.columns.find((column) => column.id === "todo")!;
+    const traits = (planning.traits ?? []).map((trait) => (trait as { trait: string }).trait);
+    expect(traits).toContain("intake");
+    expect(traits).toContain("hold");
+    // Node COUNT is unchanged: this is a column merge, not a graph edit.
+    expect(mergedCodingIr.nodes.length).toBe(codingIr.nodes.length);
+  });
+
+  it("enters the specification phase for a card in the merged planning column", () => {
+    const resumed = resolveColumnResumeNode(mergedCodingIr, "todo");
+
+    expect(resumed?.column).toBe("todo");
+    // The failure this guards: entering at an implementation node would put an unspecified card
+    // into implementation with no plan.
+    expect(resumed?.id).not.toBe("parse");
+  });
+
+  it("reaches the production specification node from the merged entry point in one hop", () => {
+    /*
+    The merged shape answers `start` where the split shape answers the planning node, because
+    `start` becomes the first node in that column once the columns collapse. That is equivalent
+    ONLY because `start` reaches the specification node by a single unconditional success edge.
+    Asserted against the PRODUCTION graph, so inserting a node between them fails here rather than
+    silently admitting an unspecified card into implementation.
+    */
+    const entry = resolveColumnResumeNode(mergedCodingIr, "todo")!;
+    const splitAnswer = resolveColumnResumeNode(codingIr, "todo")!;
+
+    if (entry.id === splitAnswer.id) return; // no collapse happened; nothing to bridge.
+
+    const successors = mergedCodingIr.edges.filter(
+      (edge) => edge.from === entry.id && (edge.condition === undefined || edge.condition === "success") && edge.kind !== "rework",
+    );
+    expect(successors).toHaveLength(1);
+    expect(successors[0]!.to).toBe(splitAnswer.id);
+  });
+
+  it("NEVER re-plans a card past the merged column — the drag that aborts a live session", () => {
+    const resumed = resolveColumnResumeNode(mergedCodingIr, "in-progress");
+
+    expect(resumed?.id).toBe("parse");
+    expect(resumed?.column).toBe("in-progress");
+    expect(["start", "plan", "planning", "plan-review", "plan-replan"]).not.toContain(resumed?.id);
+  });
+
+  it("re-enters a review-column card at the production first review node, not the merge region", () => {
+    const resumed = resolveColumnResumeNode(mergedCodingIr, "in-review");
+
+    /*
+    ABSOLUTE, not merely equal-to-production. A differential assertion alone is tautological here:
+    if the production review lane were reordered, both sides of the comparison would move together
+    and the test would stay green while the merged board silently skipped a gate. The literal is
+    the same one the production block above pins, so a real topology change fails in both places.
+    */
+    expect(resumed?.id).toBe("browser-verification");
+    expect(resumed?.column).toBe("in-review");
+    // …and it still agrees with production, which is the property the merge must preserve.
+    expect(resumed?.id).toBe(resolveColumnResumeNode(codingIr, "in-review")?.id);
+  });
+
+  it("produces the same answer as the production IR at every position past planning", () => {
+    // Absolutes first, so production drift cannot move both sides of the differential in step.
+    expect(resolveColumnResumeNode(mergedCodingIr, "in-progress")?.id).toBe("parse");
+    expect(resolveColumnResumeNode(mergedCodingIr, "in-review")?.id).toBe("browser-verification");
+
+    for (const column of ["in-progress", "in-review", "done"]) {
+      expect(resolveColumnResumeNode(mergedCodingIr, column)?.id)
+        .toBe(resolveColumnResumeNode(codingIr, column)?.id);
+    }
+  });
+});
+
+/*
+FNXC:MergedPlanningColumn 2026-07-28-14:20 (U11, PR #2503 review — coderabbit):
+The stranded-card case, driven through `executor.run()` rather than through the resolver.
+
+Rows persisted in `triage` outlive the column U11 deletes. `resolveColumnResumeNode` returns
+undefined for a column the IR does not declare, and the ONLY thing that then rescues the card is
+`run()`'s `?? ir.nodes.find(kind === "start")` fallback. Asserting "the resolver returns undefined"
+and "a start node exists" is compatible with the card stranding, which is why this drives the real
+traversal and asserts the card moves.
+
+Verified red: deleting the `?? ir.nodes.find(...)` fallback makes `run()` throw
+`WorkflowIrError: Workflow IR missing start node` and this test fails.
+*/
+describe("workflow graph entry contract — a card stranded in a deleted column still runs (U11)", () => {
+  const promptWithOneStep = "# Task\n\n## Steps\n\n### Step 0: Implement\n- [ ] do it\n";
+
+  function silentPrimitives(): WorkflowRuntimePrimitives {
+    const ok = { outcome: "success" as const };
+    return {
+      prepareWorktree: async () => ({ outcome: "success", data: { worktreePath: "/memory/worktree" } }),
+      readArtifact: async (_c: unknown, _t: unknown, key: string) => (key === "PROMPT.md" ? promptWithOneStep : undefined),
+      writeArtifact: async (_c: unknown, _t: unknown, key: string) => ({ outcome: "success", data: { key } }),
+      runPlanningSession: async () => ({ outcome: "success", data: { approved: true, artifactKeys: ["PROMPT.md"] } }),
+      runCodingSession: async () => ({ outcome: "success", data: { taskDone: true, modifiedFiles: [] } }),
+      runTaskStep: async () => ({ outcome: "success", baselineSha: "b", checkpointId: "c" }),
+      resetTaskStep: async () => ({ ok: true }),
+      runReview: async () => ({ outcome: "success", data: { verdict: "APPROVE" } }),
+      runVerification: async () => ({ outcome: "success", data: { verdict: "skipped" } }),
+      updateSteps: async (_c: unknown, target: TaskDetail, steps: TaskStep[]) => {
+        target.steps = steps;
+        return { outcome: "success", data: { count: steps.length } };
+      },
+      transitionTask: async () => ok,
+      requestMerge: async () => ({ outcome: "success", value: "merged", data: { status: "merged" } }),
+      abortRun: async () => ok,
+      audit: () => undefined,
+    } as unknown as WorkflowRuntimePrimitives;
+  }
+
+  function mergedIrWithoutTriage(): WorkflowIr {
+    const ir = structuredClone(codingIr) as WorkflowIr & {
+      columns: Array<{ id: string; name?: string; traits?: unknown[] }>;
+      nodes: Array<{ id: string; column?: string }>;
+    };
+    const triage = ir.columns.find((column) => column.id === "triage")!;
+    const todo = ir.columns.find((column) => column.id === "todo")!;
+    todo.name = "Planning";
+    todo.traits = [...(triage.traits ?? []), ...(todo.traits ?? [])];
+    ir.columns = ir.columns.filter((column) => column.id !== "triage");
+    for (const node of ir.nodes) if (node.column === "triage") node.column = "todo";
+    return ir as WorkflowIr;
+  }
+
+  it("runs a card still stored in the DELETED triage column instead of stranding it", async () => {
+    const task = {
+      id: "FN-STRANDED",
+      title: "Left behind in a deleted column",
+      description: "",
+      // The migration case: the row outlived the column its workflow declared.
+      column: "triage",
+      dependencies: [],
+      steps: [],
+      currentStep: 0,
+      log: [],
+      prompt: promptWithOneStep,
+      workflowStepResults: [],
+      createdAt: "2026-07-28T00:00:00.000Z",
+      updatedAt: "2026-07-28T00:00:00.000Z",
+    } as unknown as TaskDetail;
+
+    const executor = new WorkflowGraphExecutor({
+      primitives: silentPrimitives(),
+      parseStepsDeps: {
+        readArtifact: async (_target: unknown, key: string) => (key === "PROMPT.md" ? promptWithOneStep : undefined),
+        writeSteps: async (target: TaskDetail, steps: TaskStep[]) => {
+          target.steps = steps;
+        },
+      },
+    } as never);
+
+    const merged = mergedIrWithoutTriage();
+    expect(merged.columns.map((column) => column.id)).not.toContain("triage");
+
+    // No continuation node id — the "replay from start" path the fallback governs.
+    const result = await executor.run(task, { experimentalFeatures: {} } as never, merged);
+
+    // The card must actually traverse. An empty trace IS the stranding this guards.
+    expect(result.visitedNodeIds.length).toBeGreaterThan(0);
+    // …and it re-enters at the top of the pipeline, which is the only safe answer for a column
+    // the workflow no longer declares: it cannot be placed relative to any node.
+    expect(result.visitedNodeIds[0]).toBe(merged.nodes.find((node) => node.kind === "start")?.id);
+  });
+});

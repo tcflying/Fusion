@@ -14,7 +14,9 @@ import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import type { TaskStore, Task, TaskDetail, TaskTokenUsage, StepStatus, Settings, WorkflowStep, MissionStore, AsyncMissionStore, Slice, AgentState, AgentCapability, RunMutationContext, AgentHeartbeatConfig, Agent, AgentMemoryInclusionMode, ProjectSettings, MergeResult, WorkflowIrNode, WorkflowIrNodeKind, WorkflowStepResult as CoreWorkflowStepResult, ThinkingLevel } from "@fusion/core";
 import { getUnmetSchedulingDependencies } from "./scheduler.js";
-import { RetryStormError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, evaluateForeachMergeProof, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, DEFAULT_MAX_POST_REVIEW_FIXES, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
+import type { ImplementationExit, ImplementationExitReporter } from "./executor/implementation-exit.js";
+import { emitWorkflowLifecycleEvent } from "@fusion/core";
+import { RetryStormError, serializeRetryStormError, evaluateCompletedPromotionFailureProvenance, evaluateSkipBypassTaint, resolveWorkflowIrForTask, evaluateForeachMergeProof, resolveCompleteColumn, resolveMergeOrchestrationColumn, resolveReboundTarget, resolveLifecycleColumns, resolveColumnAgentBinding, resolveEffectiveAgent, instanceNodeId, getWorkflowExtensionRegistry, getBuiltinWorkflow, parseNoOpCompletionMarker, allowsAutoMergeProcessing, resolveEffectiveAutoMerge, isLiveSharedBranchGroupMemberIntegration, resolveMaxAutoMergeRetries, resolveMaxConsecutiveToolFailureRetries, resolveConsecutiveToolFailureRetryBackoffMs, resolveConsecutiveToolFailureThreshold, resolveExecutorEscalationTarget, resolveOptionalStepRevisionBudget, resolveOptionalReviewRevisionBudget, DEFAULT_MAX_POST_REVIEW_FIXES, COMPLETION_SUMMARY_NODE_ID, upsertWorkflowStepResult, AWAITING_APPROVAL_PAUSE_REASON, THINKING_LEVELS, ACTIVE_WORKFLOW_WORK_ITEM_STATES, AgentStore, resolveExecutorFallbackModel } from "@fusion/core";
 import { finalizeProvenAutoMergeTask } from "./auto-merge-finalization.js";
 import { mergeEffectiveSettings } from "./effective-settings.js";
 import { generateFeatureVideo, type GenerateFeatureVideoOptions } from "./review-artifacts/feature-video.js";
@@ -6917,10 +6919,14 @@ export class TaskExecutor {
   private async runImplementationPhase(
     task: Task,
     prepared?: PreparedWorktree,
-  ): Promise<{ taskDone: boolean; modifiedFiles: string[] }> {
-    let captured: { taskDone: boolean; modifiedFiles: string[] } = { taskDone: false, modifiedFiles: [] };
+  ): Promise<{ taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit }> {
+    let captured: { taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit } = { taskDone: false, modifiedFiles: [] };
     const graphCompletion: GraphCompletionCallback = (info) => {
-      captured = { taskDone: true, modifiedFiles: info.modifiedFiles };
+      captured = { ...captured, taskDone: true, modifiedFiles: info.modifiedFiles };
+    };
+    /* Recorded independently of `graphCompletion`: the out-of-band exits never call it. */
+    const reportExit: ImplementationExitReporter = (exit) => {
+      captured = { ...captured, exit };
     };
     const executionTask = prepared
       ? {
@@ -6929,7 +6935,7 @@ export class TaskExecutor {
           branch: prepared.branchName || task.branch,
         }
       : task;
-    await this.runImplementation(executionTask, graphCompletion);
+    await this.runImplementation(executionTask, graphCompletion, reportExit);
     return captured;
   }
 
@@ -7754,7 +7760,7 @@ export class TaskExecutor {
         if (typeof seamThinkingLevel === "string" && WORKFLOW_THINKING_LEVEL_SET.has(seamThinkingLevel)) {
           this.graphSeamThinkingLevel.set(seamTask.id, seamThinkingLevel as ThinkingLevel);
         }
-        let result: { taskDone: boolean; modifiedFiles: string[] };
+        let result: { taskDone: boolean; modifiedFiles: string[]; exit?: ImplementationExit };
         try {
           result = await this.runImplementationPhase(seamTask);
         } finally {
@@ -7781,6 +7787,29 @@ export class TaskExecutor {
         compensating classifiers are the acceptance test — they become unreachable, and then
         deletable, exactly when the last out-of-band transition is gone.
         */
+        /*
+        FNXC:WorkflowExecutionOwnership 2026-07-28-20:25 (U8 / R4, R5):
+        Announce the exit on the U3 lifecycle bus. Until this, the two out-of-band review
+        handoffs left NO trace anywhere that the executor — not the graph — moved the card;
+        they surfaced as an ordinary `implementation-incomplete` failure that
+        `handleGraphFailure` then quietly compensated for. An operator could not tell the two
+        apart, and neither could a test.
+
+        Emission is deliberately AFTER the phase and BEFORE the return, and it changes nothing:
+        the outcome/value below are byte-identical to what this seam returned before, for every
+        exit, which `executor-implementation-exit-events.test.ts` pins by driving each exit and
+        asserting the seam's return. Per R5 an exit id is a REACTION — dropping every subscriber
+        must change no execution outcome, and that is asserted too.
+        */
+        emitWorkflowLifecycleEvent({
+          type: "NodeCompleted",
+          taskId: seamTask.id,
+          at: new Date().toISOString(),
+          runId: this.getRunContextFor(seamTask.id)?.runId,
+          nodeId: typeof governingNodeId === "string" ? governingNodeId : "execute",
+          outcome: result.taskDone ? "success" : "failure",
+          ...(result.exit ? { exit: result.exit } : {}),
+        });
         if (result.taskDone) {
           return { outcome: "success", value: "implemented" };
         }
@@ -10778,8 +10807,60 @@ export class TaskExecutor {
       const failedNode = result.visitedNodeIds[result.visitedNodeIds.length - 1];
       const mergeGraphFailure = this.isMergeGraphFailure(failedNode);
       const failureValue = this.graphFailureValue(result);
+      /*
+      FNXC:WorkflowExecutionOwnership 2026-07-28-09:40 (U8 / R3):
+      The execution-policy ladder below — the FN-7863/FN-7926 dispatch-loop gate, the FN-7996
+      tool-failure retry, and the FN-7998 escalation — decided the task's own lifecycle by
+      naming `"todo"` and `"in-progress"` literally. Under any workflow that renames those
+      columns the whole ladder was unreachable and its failure was SILENT in the worst
+      direction: the `live.column !== wip` guard below classified a card sitting in its own
+      implementation column as "already advanced — no further action needed", so the graph
+      failure was swallowed, no status was written, and the scheduler re-dispatched the same
+      doomed run. Nothing failed; the retry budgets, the escalation, and the bounded
+      terminalization simply never ran.
+
+      Resolve ONCE per failure and thread the pair through the ladder. One IR read per graph
+      failure: this is a terminal recovery path, not an enumeration loop.
+
+      FNXC:WorkflowExecutionOwnership 2026-07-28-14:05 (U8 / R3, PR #2497 review — greptile P1):
+      THE FALLBACK IS PER-WORKFLOW, NEVER PER-ROLE. The first cut wrote `columns?.hold ?? "todo"`,
+      which conflates two different situations: "no workflow could be resolved" and "this
+      workflow resolved fine and simply declares no hold column". Only the first justifies the
+      legacy literal. For the second, substituting `todo` invents a column the workflow does not
+      declare — and node-target escalation then PERSISTS it, stranding the card somewhere the
+      board cannot route and defeating the scheduler node re-resolution the escalation exists
+      for. U1 returns `undefined` per missing role precisely so a caller cannot borrow an
+      unrelated column; `?? "todo"` threw that guarantee away one line after asking for it.
+
+      So:
+        - IR unresolvable          -> the legacy literals, i.e. exactly pre-conversion behavior.
+        - IR resolved              -> `resolveReboundTarget` (KTD-10: hold -> intake -> first
+                                      column), which can only ever name a DECLARED column, and
+                                      `undefined` for wip when the workflow declares none.
+
+      A `wipColumn` of `undefined` is not a wildcard — every gate below treats "I cannot prove
+      where the wip column is" as "do not take the shortcut", so an unprovable card terminalizes
+      VISIBLY rather than being swallowed by the already-advanced branch. Fail closed toward the
+      operator seeing the failure.
+
+      The two literals that remain are ONLY the unresolvable-workflow fallback, and they are the
+      same pre-conversion values `resolveReboundColumnFor` already falls back to at its ~16
+      executor call sites — this adds no new rule and no new reachable-by-a-valid-workflow
+      literal. They are legacy-compat for a task whose workflow cannot be read at all, and they
+      belong to the same sweep that retires `resolveReboundColumnFor`'s own `?? "todo"` when U11
+      removes the column; they are deliberately NOT a per-role default, which is what made the
+      first cut wrong.
+      */
+      let lifecycleIr: WorkflowIr | undefined;
+      try {
+        lifecycleIr = await resolveWorkflowIrForTask(this.store, task.id);
+      } catch {
+        lifecycleIr = undefined;
+      }
+      const wipColumn = lifecycleIr ? resolveLifecycleColumns(lifecycleIr)?.wip : "in-progress";
+      const holdColumn = lifecycleIr ? resolveReboundTarget(lifecycleIr) : "todo";
       const executeNodeSelfRequeued = failedNode === "execute" && this.graphExecuteSelfRequeued.has(task.id);
-      if (failedNode === "execute" && (live.column === "todo" || executeNodeSelfRequeued)) {
+      if (failedNode === "execute" && ((holdColumn !== undefined && live.column === holdColumn) || executeNodeSelfRequeued)) {
         /*
         FNXC:WorkflowLifecycle 2026-06-23-12:03:
         The graph execute node delegates to the authoritative executor. If that inner executor requeues the task to todo for self-heal/retry, the outer graph failure must not override it by parking the task in review.
@@ -10878,7 +10959,14 @@ export class TaskExecutor {
       if (await this.routeGraphFailureToExecutionResume(live, failedNode ?? "unknown", failureValue)) {
         return;
       }
-      if (live.column !== "in-progress") {
+      /*
+      FNXC:WorkflowExecutionOwnership 2026-07-28-14:10 (U8 / R3, PR #2497 review):
+      `wipColumn === undefined` means the workflow declares no implementation column, so there
+      is no evidence the card "already advanced" past one. Swallowing the failure on a guess is
+      the exact silent-loss this conversion exists to remove — require a KNOWN wip column before
+      taking the benign shortcut.
+      */
+      if (wipColumn !== undefined && live.column !== wipColumn) {
         const benignMessage = `Workflow graph run ended after task already advanced to '${live.column}' — no further action needed`;
         executorLog.log(`${task.id}: ${benignMessage}`);
         await this.store.logEntry(task.id, benignMessage, undefined, this.getRunContextFor(task.id));
@@ -10948,7 +11036,7 @@ export class TaskExecutor {
       const message = `Workflow graph terminated with failure at node '${failedNode ?? "unknown"}'`;
       const settings = await this.store.getSettings();
       const maxToolFailureRetries = resolveMaxConsecutiveToolFailureRetries(settings);
-      if (maxToolFailureRetries > 0 && isExecuteFamilyNode && !live.paused && !live.userPaused && !live.deletedAt && live.column === "in-progress") {
+      if (maxToolFailureRetries > 0 && isExecuteFamilyNode && !live.paused && !live.userPaused && !live.deletedAt && live.column === wipColumn) {
         // Prefer the execution-local boundary; recovery paths refetch durable state rather than use the stale failure snapshot.
         const cursor = this.graphToolFailureRunCursors.get(task.id) ?? (await this.store.getTask(task.id))?.toolFailureDetectorLogCursor;
         const threshold = resolveConsecutiveToolFailureThreshold(settings);
@@ -10958,7 +11046,7 @@ export class TaskExecutor {
             await this.store.updateTask(task.id, { status: null, error: null }, this.getRunContextFor(task.id));
             await this.store.logEntry(task.id, `Consecutive tool-call failures — auto-retrying same model (${claim.attempt}/${maxToolFailureRetries}) instead of parking`, undefined, this.getRunContextFor(task.id));
             await this.store.recordRunAuditEvent?.({ taskId: task.id, agentId: "executor", runId: generateSyntheticRunId("tool-failure-retry", task.id), domain: "database", mutationType: "task:execution-tool-failure-retry", target: task.id, metadata: { taskId: task.id, nodeId: failedNode ?? "unknown", attempt: claim.attempt, maxAttempts: maxToolFailureRetries, consecutiveToolFailures: threshold, mode: "same-model" } });
-            const schedule = () => { void (async () => { const resume = await this.store.getTask(task.id); if (resume && !resume.deletedAt && !resume.paused && !resume.userPaused && resume.column === "in-progress") await this.execute(resume); })().catch((error) => executorLog.error(`${task.id}: tool-failure retry failed`, error)); };
+            const schedule = () => { void (async () => { const resume = await this.store.getTask(task.id); if (resume && !resume.deletedAt && !resume.paused && !resume.userPaused && resume.column === wipColumn) await this.execute(resume); })().catch((error) => executorLog.error(`${task.id}: tool-failure retry failed`, error)); };
             const delay = resolveConsecutiveToolFailureRetryBackoffMs(settings);
             setTimeout(schedule, delay).unref?.();
             return;
@@ -10970,7 +11058,21 @@ export class TaskExecutor {
           */
           const escalationTarget = resolveExecutorEscalationTarget(settings);
           const hasModelTarget = escalationTarget.provider !== undefined && escalationTarget.modelId !== undefined;
-          const hasNodeTarget = escalationTarget.nodeId !== undefined;
+          /*
+          FNXC:WorkflowExecutionOwnership 2026-07-28-14:15 (U8 / R3, PR #2497 review — greptile P1):
+          A node escalation is a REQUEUE: it parks the card back in the hold lane so the
+          scheduler re-resolves the effective node. Without a declared requeue target there is
+          nowhere legal to put it, and persisting an invented column is worse than not
+          escalating — the card lands where the board cannot route it and the node is never
+          dispatched. Degrade to the no-node-target shape (in-place retry, which is already how
+          an enabled escalation with no usable target behaves) rather than writing an
+          undeclared column.
+          */
+          const nodeTargetRequeueColumn = escalationTarget.nodeId !== undefined ? holdColumn : undefined;
+          const hasNodeTarget = escalationTarget.nodeId !== undefined && nodeTargetRequeueColumn !== undefined;
+          if (escalationTarget.nodeId !== undefined && nodeTargetRequeueColumn === undefined) {
+            await this.store.logEntry(task.id, "Node escalation downgraded to an in-place retry — this task's workflow declares no column to requeue into", undefined, this.getRunContextFor(task.id));
+          }
           let claimedEscalation = false;
           let priorEscalationRetryCount = 0;
           /*
@@ -10981,7 +11083,7 @@ export class TaskExecutor {
           */
           await this.store.updateTaskAtomic(task.id, (current) => {
             const ownsFailureRun = current.toolFailureDetectorLogCursor === cursor
-              && current.column === "in-progress"
+              && current.column === wipColumn
               && !current.paused
               && !current.userPaused
               && !current.deletedAt;
@@ -10990,7 +11092,7 @@ export class TaskExecutor {
             priorEscalationRetryCount = current.consecutiveToolFailureRetryCount ?? 0;
             return {
               ...(hasModelTarget ? { modelProvider: escalationTarget.provider, modelId: escalationTarget.modelId } : {}),
-              ...(hasNodeTarget ? { nodeId: escalationTarget.nodeId, column: "todo" as const } : {}),
+              ...(hasNodeTarget ? { nodeId: escalationTarget.nodeId, column: nodeTargetRequeueColumn } : {}),
               executorEscalationAttempted: true,
               /* FNXC:ExecutorEscalation 2026-07-16-22:40: Invalidate the exhausted run cursor before releasing the claim so concurrent stale handlers cannot park or audit the alternate execution; the alternate captures its own cursor at startup. */
               toolFailureDetectorLogCursor: null,
@@ -11002,7 +11104,7 @@ export class TaskExecutor {
             await this.store.logEntry(task.id, "Same-model retries exhausted — escalating to alternate model/node (one attempt) instead of parking", undefined, this.getRunContextFor(task.id));
             await this.store.recordRunAuditEvent?.({ taskId: task.id, agentId: "executor", runId: generateSyntheticRunId("escalation-retry", task.id), domain: "database", mutationType: "task:execution-escalation-retry", target: task.id, metadata: { taskId: task.id, nodeId: failedNode ?? "unknown", hasModelTarget, hasNodeTarget, priorConsecutiveToolFailureRetryCount: priorEscalationRetryCount } });
             if (!hasNodeTarget) {
-              const scheduleEscalation = () => { void (async () => { const resumeTask = await this.store.getTask(task.id); if (resumeTask && !resumeTask.deletedAt && !resumeTask.paused && !resumeTask.userPaused && resumeTask.column === "in-progress") await this.execute(resumeTask); })().catch((error) => executorLog.error(`${task.id}: escalation retry failed`, error)); };
+              const scheduleEscalation = () => { void (async () => { const resumeTask = await this.store.getTask(task.id); if (resumeTask && !resumeTask.deletedAt && !resumeTask.paused && !resumeTask.userPaused && resumeTask.column === wipColumn) await this.execute(resumeTask); })().catch((error) => executorLog.error(`${task.id}: escalation retry failed`, error)); };
               const handle = setTimeout(scheduleEscalation, resolveConsecutiveToolFailureRetryBackoffMs(settings));
               handle.unref?.();
             }
@@ -11024,7 +11126,7 @@ export class TaskExecutor {
           await this.store.updateTaskAtomic(task.id, (current) => {
             if (
               current.toolFailureDetectorLogCursor !== cursor
-              || current.column !== "in-progress"
+              || current.column !== wipColumn
               || current.paused
               || current.userPaused
               || current.deletedAt
@@ -11066,7 +11168,7 @@ export class TaskExecutor {
         await this.store.updateTaskAtomic(task.id, (current) => {
           if (
             current.toolFailureDetectorLogCursor !== failureCursor
-            || current.column !== "in-progress"
+            || current.column !== wipColumn
             || current.paused
             || current.userPaused
             || current.deletedAt
@@ -11530,6 +11632,16 @@ export class TaskExecutor {
     an implementation pass whose completion nothing owns can no longer be constructed.
     */
     graphCompletion: GraphCompletionCallback,
+    /*
+    FNXC:WorkflowExecutionOwnership 2026-07-28-20:15 (U8 / R4, R5):
+    Optional exit reporter. `graphCompletion` can only say "done"; the endings it cannot express
+    are the ones the executor transitions itself (see `executor/implementation-exit.ts`). This
+    names them so they are OBSERVABLE before they are moved — it changes no routing and nothing
+    branches on it, by R5: an exit id is a reaction, and a dropped reaction must never cost a
+    state change. Optional so the ~22 uninstrumented dispositions stay silent rather than
+    forcing a 3k-line diff; the ownership ledger is the record of that gap, not this callback.
+    */
+    reportImplementationExit?: ImplementationExitReporter,
   ): Promise<void> {
 
     // FN-4811 follow-up (FN-4814/FN-4809/FN-4811 production failure): claim a
@@ -12480,6 +12592,7 @@ export class TaskExecutor {
             this.clearCompletedTaskWatchdog(task.id);
             executorLog.log(`✓ ${task.id} implementation complete — graph interpreter owns the remaining lifecycle`);
             const liveModified = (await this.store.getTask(task.id).catch(() => task)).modifiedFiles ?? [];
+            reportImplementationExit?.("complete-from-live-files");
             graphCompletion({ modifiedFiles: liveModified });
             return;
           } else {
@@ -13341,6 +13454,7 @@ export class TaskExecutor {
               FN-6644/FN-6641: the graceful-session-exit handoff must also record durable completed-finalize state because a later teardown can re-mark the abort as `hard-cancel`. The classifier uses that durable handoff marker, not the volatile provenance alone, to keep completed no-commit tasks from being re-parked failed.
               */
               this.markCompletionFinalized(task.id);
+              reportImplementationExit?.("review-handoff-paused-after-completion");
               await this.handoffTaskToReview(task, "paused-after-completion");
               this.clearCompletedTaskWatchdog(task.id);
               this.signalTaskComplete(task);
@@ -13408,6 +13522,7 @@ export class TaskExecutor {
             // at the implementation-complete boundary and hand control back.
             this.clearCompletedTaskWatchdog(task.id);
             executorLog.log(`✓ ${task.id} implementation complete — graph interpreter owns the remaining lifecycle`);
+            reportImplementationExit?.("complete");
             graphCompletion({ modifiedFiles });
             return;
           } else {
@@ -13472,6 +13587,7 @@ export class TaskExecutor {
                 // the task in review without setting status=failed; otherwise the
                 // merge/review queue deadlocks on a task that is both in-review and
                 // failed.
+                reportImplementationExit?.("review-handoff-pending-review");
                 await this.handoffTaskToReview(task, "executor-exit-while-review-pending");
                 pendingReviewParked = true;
                 break;
@@ -13698,6 +13814,7 @@ export class TaskExecutor {
               // executeWorkflowGraph, KTD-5) — nothing to gate before handoff.
               this.clearCompletedTaskWatchdog(task.id);
               executorLog.log(`✓ ${task.id} implementation complete (retry) — graph interpreter owns the remaining lifecycle`);
+              reportImplementationExit?.("complete-after-retry");
               graphCompletion({ modifiedFiles });
               return;
             } else if (terminallyParked) {
@@ -13931,7 +14048,8 @@ export class TaskExecutor {
           FN-6644/FN-6641: the finally-block handoff must record durable completed-finalize state because a later teardown can overwrite provenance to `hard-cancel`. The classifier must still resolve that completed no-commit tail failure benignly without weakening genuine pause or active hard-cancel behavior.
           */
           this.markCompletionFinalized(task.id);
-          await this.handoffTaskToReview(task, "paused-after-completion");
+          reportImplementationExit?.("review-handoff-paused-after-completion");
+              await this.handoffTaskToReview(task, "paused-after-completion");
           this.signalTaskComplete(task);
         } else if (finalizationDecision === "blocked") {
           await this.persistTokenUsage(task.id);
